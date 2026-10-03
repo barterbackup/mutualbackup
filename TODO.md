@@ -165,15 +165,19 @@
   the same removal journal; a tombstone survives remount without requiring
   the original worktree path to exist. The nested captured-directory probe
   removes its last file, removes the directory, and remounts successfully on
-  both filesystems. Thirteen nonprivileged journal regressions and 107 normal
-  store tests pass, as do all eleven privileged FUSE probes on ext4 and fresh
-  local Btrfs and strict workspace Clippy. Directory rename, remaining metadata
-  and allocation modes, concurrent handles, mount supervision/recovery, and whole-worktree
-  enrollment remain open. Directory reconstruction now indexes captured and
-  dynamically created directories together by their durable current paths;
-  a control-reopen regression resolves a captured subtree beneath a dynamic
-  parent and its descendant file. This prepares directory rename replay but
-  does not yet expose directory rename through FUSE.
+  both filesystems. Directory reconstruction indexes captured and dynamically
+  created directories together by their durable current paths. Directory
+  rename now journals the native identity and old/new names before the pinned
+  lower move, then atomically publishes the new paths of every tracked
+  descendant and retires the intent. Reopen finishes either side of the move,
+  and a foreign target fails closed. Ordinary-user FUSE probes rename a
+  populated captured subtree beneath a dynamic parent, edit its captured file
+  without changing the anchor, then rename the captured and dynamic subtrees
+  again across remounts. The 109 normal store tests, 12 privileged FUSE probes
+  on ext4 and fresh local Btrfs, and strict workspace Clippy pass. Directory
+  replacement onto an occupied target, remaining metadata and allocation
+  modes, concurrent handles, mount supervision/recovery, and whole-worktree
+  enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

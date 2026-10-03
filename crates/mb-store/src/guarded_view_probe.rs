@@ -47,6 +47,7 @@ const REPLACE_KIND: &str = "guarded-view-replace-v1";
 const DIRECTORY_KIND: &str = "guarded-view-directory-v1";
 const DIRECTORY_CREATE_KIND: &str = "guarded-view-directory-create-v1";
 const DIRECTORY_REMOVE_KIND: &str = "guarded-view-directory-remove-v1";
+const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NamespaceRecord {
@@ -83,6 +84,14 @@ struct DirectoryCreateIntent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DirectoryRemoveIntent {
     version: u16,
+    target: Vec<u8>,
+    expected: NativeFileId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectoryRenameIntent {
+    version: u16,
+    source: Vec<u8>,
     target: Vec<u8>,
     expected: NativeFileId,
 }
@@ -387,6 +396,209 @@ impl GuardedNamespace {
             .map_err(io::Error::other)
     }
 
+    fn store_directory_rename(&self, inode: u64, intent: &DirectoryRenameIntent) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
+        let inserted = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record_if_absent(DIRECTORY_RENAME_KIND, &self.record_id(inode), &bytes)
+            .map_err(io::Error::other)?;
+        if !inserted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "guarded directory rename is already pending",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_directory_rename_source(
+        &self,
+        inode: u64,
+        intent: &DirectoryRenameIntent,
+        captured: &CapturedDirectories,
+        first_dynamic_inode: u64,
+    ) -> anyhow::Result<()> {
+        if inode < first_dynamic_inode {
+            ensure!(
+                captured
+                    .get(&inode)
+                    .is_some_and(|(_, expected, _)| *expected == intent.expected),
+                "guarded directory rename aliases captured file or changed identity"
+            );
+        }
+        let record = match self.directory_record_opt(inode)? {
+            Some(record) => record,
+            None => {
+                let (path, expected, _) = captured
+                    .get(&inode)
+                    .context("guarded directory rename has no source record")?;
+                DirectoryRecord {
+                    version: 1,
+                    expected: *expected,
+                    current: Some(path.clone()),
+                }
+            }
+        };
+        ensure!(
+            record.version == 1
+                && record.expected == intent.expected
+                && record.current.as_deref() == Some(intent.source.as_slice()),
+            "guarded directory rename differs from source record"
+        );
+        Ok(())
+    }
+
+    fn finish_directory_rename(
+        &self,
+        lower_root: &PinnedDirectory,
+        captured: &CapturedDirectories,
+        defaults: &HashMap<u64, NamespaceRecord>,
+        first_dynamic_inode: u64,
+        inode: u64,
+        intent: &DirectoryRenameIntent,
+    ) -> anyhow::Result<Vec<(u64, NamespaceRecord)>> {
+        ensure!(
+            intent.version == 1,
+            "unsupported guarded directory rename intent"
+        );
+        let source = checked_namespace_relative_path(&intent.source)?;
+        let target = checked_namespace_relative_path(&intent.target)?;
+        ensure!(
+            source != target && !target.starts_with(&source),
+            "invalid guarded directory rename paths"
+        );
+        ensure!(
+            intent.expected.filesystem_id == lower_root.identity()?.filesystem_id,
+            "guarded directory rename belongs to another filesystem"
+        );
+        let mut directories = HashMap::new();
+        for (&captured_inode, (path, expected, _)) in captured {
+            directories.insert(
+                captured_inode,
+                DirectoryRecord {
+                    version: 1,
+                    expected: *expected,
+                    current: Some(path.clone()),
+                },
+            );
+        }
+        for (stored_inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
+            let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(record.version == 1, "invalid guarded directory record");
+            if stored_inode < first_dynamic_inode {
+                ensure!(
+                    captured
+                        .get(&stored_inode)
+                        .is_some_and(|(_, expected, _)| *expected == record.expected),
+                    "guarded directory record differs from capture"
+                );
+            }
+            directories.insert(stored_inode, record);
+        }
+        let root_record = directories
+            .get(&inode)
+            .context("guarded directory rename has no source record")?;
+        ensure!(
+            root_record.current.as_deref() == Some(intent.source.as_slice())
+                && root_record.expected == intent.expected,
+            "guarded directory rename differs from source record"
+        );
+
+        let mut files = defaults.clone();
+        for (stored_inode, bytes) in self.owned_records(NAMESPACE_KIND)? {
+            let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(record.version == 1, "invalid guarded namespace record");
+            if stored_inode < first_dynamic_inode {
+                ensure!(
+                    defaults.get(&stored_inode).is_some_and(|default| {
+                        default.captured_path == record.captured_path
+                            && default.expected == record.expected
+                    }),
+                    "guarded namespace record differs from capture"
+                );
+            } else {
+                ensure!(
+                    record.captured_path.is_empty()
+                        && record.expected.filesystem_id == intent.expected.filesystem_id,
+                    "invalid dynamic guarded namespace record"
+                );
+            }
+            files.insert(stored_inode, record);
+        }
+
+        let mut occupied = std::collections::HashSet::new();
+        let mut writes = Vec::new();
+        let mut changed_files = Vec::new();
+        for (entry_inode, mut record) in directories {
+            let Some(current) = &record.current else {
+                continue;
+            };
+            let before = checked_namespace_relative_path(current)?;
+            let after = rebased_namespace_path(&before, &source, &target);
+            ensure!(
+                occupied.insert(after.clone()),
+                "duplicate guarded namespace path"
+            );
+            if after != before {
+                let actual = lower_root.open_descendant_directory(&after)?.identity()?;
+                ensure!(
+                    actual == record.expected,
+                    "renamed guarded directory changed identity"
+                );
+                record.current = Some(after.into_os_string().into_vec());
+                writes.push((
+                    DIRECTORY_KIND.to_owned(),
+                    self.record_id(entry_inode),
+                    mb_core::canonical_bytes(&record)?,
+                ));
+            }
+        }
+        for (entry_inode, mut record) in files {
+            let Some(current) = &record.current else {
+                continue;
+            };
+            let before = checked_namespace_relative_path(current)?;
+            let after = rebased_namespace_path(&before, &source, &target);
+            ensure!(
+                occupied.insert(after.clone()),
+                "duplicate guarded namespace path"
+            );
+            if after != before {
+                ensure!(
+                    record.pending.is_none(),
+                    "guarded rename overlaps file transition"
+                );
+                let parent = namespace_parent(lower_root, &after)?;
+                let parent = parent.as_ref().unwrap_or(lower_root);
+                ensure!(
+                    parent.entry_identity(after.file_name().unwrap(), false)?
+                        == Some(record.expected),
+                    "renamed guarded file changed identity"
+                );
+                record.current = Some(after.into_os_string().into_vec());
+                writes.push((
+                    NAMESPACE_KIND.to_owned(),
+                    self.record_id(entry_inode),
+                    mb_core::canonical_bytes(&record)?,
+                ));
+                changed_files.push((entry_inode, record));
+            }
+        }
+        let bytes = mb_core::canonical_bytes(intent)?;
+        self.control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_records_and_retire_if_value(
+                &writes,
+                DIRECTORY_RENAME_KIND,
+                &self.record_id(inode),
+                &bytes,
+            )?;
+        Ok(changed_files)
+    }
+
     fn finish_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
         let record = NamespaceRecord {
             version: 1,
@@ -584,6 +796,66 @@ impl GuardedNamespace {
                 _ => anyhow::bail!("guarded directory changed before removal replay"),
             }
             self.finish_directory_remove(inode, &intent)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_directory_renames(
+        &self,
+        lower_root: &PinnedDirectory,
+        captured: &CapturedDirectories,
+        defaults: &HashMap<u64, NamespaceRecord>,
+        first_dynamic_inode: u64,
+    ) -> anyhow::Result<()> {
+        let pending = self.owned_records(DIRECTORY_RENAME_KIND)?;
+        ensure!(
+            pending.len() <= 1,
+            "multiple guarded directory renames are pending"
+        );
+        for (inode, bytes) in pending {
+            let intent: DirectoryRenameIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1,
+                "unsupported guarded directory rename intent"
+            );
+            self.validate_directory_rename_source(inode, &intent, captured, first_dynamic_inode)?;
+            let source = checked_namespace_relative_path(&intent.source)?;
+            let target = checked_namespace_relative_path(&intent.target)?;
+            ensure!(
+                source != target && !target.starts_with(&source),
+                "invalid guarded directory rename paths"
+            );
+            let old_owned = namespace_parent(lower_root, &source)?;
+            let new_owned = namespace_parent(lower_root, &target)?;
+            let old_parent = old_owned.as_ref().unwrap_or(lower_root);
+            let new_parent = new_owned.as_ref().unwrap_or(lower_root);
+            let old_name = source.file_name().unwrap();
+            let new_name = target.file_name().unwrap();
+            let old_id = old_parent.entry_identity(old_name, true)?;
+            let new_id = new_parent.entry_identity(new_name, true)?;
+            match (old_id, new_id) {
+                (Some(actual), None) if actual == intent.expected => {
+                    old_parent.move_child_directory_no_replace(
+                        old_name,
+                        intent.expected,
+                        new_parent,
+                        new_name,
+                    )?;
+                }
+                (None, Some(actual)) if actual == intent.expected => {
+                    old_parent.sync_all()?;
+                    new_parent.sync_all()?;
+                }
+                _ => anyhow::bail!("guarded directory rename cannot be safely replayed"),
+            }
+            self.finish_directory_rename(
+                lower_root,
+                captured,
+                defaults,
+                first_dynamic_inode,
+                inode,
+                &intent,
+            )?;
         }
         Ok(())
     }
@@ -965,26 +1237,35 @@ impl GuardedNamespace {
     }
 }
 
+fn checked_namespace_relative_path(bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    ensure!(
+        path.components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && path.file_name().is_some(),
+        "invalid guarded namespace path"
+    );
+    Ok(path)
+}
+
+fn rebased_namespace_path(path: &Path, source: &Path, target: &Path) -> PathBuf {
+    match path.strip_prefix(source) {
+        Ok(suffix) => target.join(suffix),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 fn namespace_path(
     bytes: &[u8],
     directories: &HashMap<PathBuf, INodeNo>,
 ) -> anyhow::Result<(PathBuf, INodeNo)> {
-    let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
-    ensure!(
-        path.components()
-            .all(|part| matches!(part, std::path::Component::Normal(_))),
-        "invalid guarded namespace path"
-    );
+    let path = checked_namespace_relative_path(bytes)?;
     let parent = path
         .parent()
         .context("guarded namespace path has no parent")?;
     let inode = *directories
         .get(parent)
         .context("guarded namespace parent is not captured")?;
-    ensure!(
-        path.file_name().is_some(),
-        "guarded namespace name is empty"
-    );
     Ok((path, inode))
 }
 
@@ -1033,6 +1314,9 @@ pub struct GuardedProbeView {
     directories: HashMap<u64, GuardedProbeDirectory>,
     dynamic_directories: Mutex<HashMap<u64, GuardedProbeDirectory>>,
     removed_directories: Mutex<std::collections::HashSet<u64>>,
+    captured_directories: CapturedDirectories,
+    file_defaults: HashMap<u64, NamespaceRecord>,
+    first_dynamic_inode: u64,
     names: Mutex<HashMap<(u64, OsString), u64>>,
     lower_root: Option<crate::PinnedDirectory>,
     staging_area: Option<crate::PinnedDirectory>,
@@ -1119,13 +1403,164 @@ impl GuardedProbeView {
         if self.removed_directories.lock().unwrap().contains(&inode) {
             return None;
         }
-        self.directories.get(&inode).cloned().or_else(|| {
+        self.dynamic_directories
+            .lock()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .or_else(|| self.directories.get(&inode).cloned())
+    }
+
+    fn rename_directory(
+        &self,
+        inode: u64,
+        old_key: &(u64, OsString),
+        new_key: &(u64, OsString),
+        names: &mut HashMap<(u64, OsString), u64>,
+    ) -> io::Result<()> {
+        let lower_root = self
+            .lower_root
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
+        let namespace = self
+            .namespace
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
+        let directory = self
+            .directory(inode)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if directory.parent.0 != old_key.0 || directory.name != old_key.1 {
+            return Err(io::Error::other("guarded directory location changed"));
+        }
+        let new_name = Path::new(&new_key.1);
+        if new_key.1.as_bytes().contains(&0)
+            || new_name.components().count() != 1
+            || !matches!(
+                new_name.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let new_parent_path = if new_key.0 == INodeNo::ROOT.0 {
+            PathBuf::new()
+        } else {
+            self.directory(new_key.0)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
+                .relative_path
+        };
+        let target = new_parent_path.join(&new_key.1);
+        let source = directory.relative_path.clone();
+        if target.starts_with(&source) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        checked_namespace_relative_path(target.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        let intent = DirectoryRenameIntent {
+            version: 1,
+            source: source.as_os_str().as_bytes().to_vec(),
+            target: target.as_os_str().as_bytes().to_vec(),
+            expected: directory.native_id,
+        };
+        namespace
+            .validate_directory_rename_source(
+                inode,
+                &intent,
+                &self.captured_directories,
+                self.first_dynamic_inode,
+            )
+            .map_err(io::Error::other)?;
+        // Keep writable opens from observing a moved lower path before its
+        // durable namespace records and in-memory locations are updated.
+        let mut files: Vec<_> = self
+            .files
+            .iter()
+            .map(|(&inode, file)| (inode, Arc::clone(file)))
+            .collect();
+        files.extend(
+            self.dynamic_files
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(&inode, file)| (inode, Arc::clone(file))),
+        );
+        files.sort_by_key(|(inode, _)| *inode);
+        let mut locations: Vec<_> = files
+            .iter()
+            .map(|(inode, file)| (*inode, file.location.lock().unwrap()))
+            .collect();
+        let mut directory_inodes: Vec<_> = self.directories.keys().copied().collect();
+        directory_inodes.extend(self.dynamic_directories.lock().unwrap().keys().copied());
+        directory_inodes.sort_unstable();
+        directory_inodes.dedup();
+        let mut directory_updates = Vec::new();
+        for entry_inode in directory_inodes {
+            let Some(mut entry) = self.directory(entry_inode) else {
+                continue;
+            };
+            if entry.relative_path.starts_with(&source) {
+                entry.relative_path =
+                    rebased_namespace_path(&entry.relative_path, &source, &target);
+                if entry_inode == inode {
+                    entry.parent = INodeNo(new_key.0);
+                    entry.name = new_key.1.clone();
+                }
+                directory_updates.push((entry_inode, entry));
+            }
+        }
+        let old_owned = namespace_parent(lower_root, &source).map_err(io::Error::other)?;
+        let new_owned = namespace_parent(lower_root, &target).map_err(io::Error::other)?;
+        let old_parent = old_owned.as_ref().unwrap_or(lower_root);
+        let new_parent = new_owned.as_ref().unwrap_or(lower_root);
+        namespace.store_directory_rename(inode, &intent)?;
+        let result = (|| -> io::Result<()> {
+            old_parent
+                .move_child_directory_no_replace(
+                    &old_key.1,
+                    directory.native_id,
+                    new_parent,
+                    &new_key.1,
+                )
+                .map_err(io::Error::other)?;
+            let changed_files = namespace
+                .finish_directory_rename(
+                    lower_root,
+                    &self.captured_directories,
+                    &self.file_defaults,
+                    self.first_dynamic_inode,
+                    inode,
+                    &intent,
+                )
+                .map_err(io::Error::other)?;
+            for (file_inode, record) in &changed_files {
+                let (_, location) = locations
+                    .iter_mut()
+                    .find(|(candidate, _)| candidate == file_inode)
+                    .ok_or_else(|| io::Error::other("renamed guarded file is absent from view"))?;
+                let current = location
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("renamed guarded file has no location"))?;
+                current.relative_path =
+                    PathBuf::from(OsString::from_vec(record.current.clone().unwrap()));
+            }
             self.dynamic_directories
                 .lock()
                 .unwrap()
-                .get(&inode)
-                .cloned()
-        })
+                .extend(directory_updates);
+            self.namespace
+                .as_ref()
+                .unwrap()
+                .records
+                .lock()
+                .unwrap()
+                .extend(changed_files);
+            names.remove(old_key);
+            names.insert(new_key.clone(), inode);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        result
     }
 
     fn replace_existing_file(
@@ -1294,6 +1729,12 @@ impl GuardedProbeView {
             staging_area.identity()?.filesystem_id == lower_root.identity()?.filesystem_id,
             "guarded staging area is on another filesystem"
         );
+        namespace.reconcile_directory_renames(
+            &lower_root,
+            &captured_directories,
+            &defaults,
+            first_dynamic_inode,
+        )?;
         let directory_paths = namespace
             .load_directories(
                 &lower_root,
@@ -1503,6 +1944,9 @@ impl GuardedProbeView {
         );
         view.namespace = Some(namespace);
         view.staging_area = Some(staging_area);
+        view.captured_directories = captured_directories;
+        view.file_defaults = defaults;
+        view.first_dynamic_inode = first_dynamic_inode;
         Ok(view)
     }
 
@@ -1583,6 +2027,9 @@ impl GuardedProbeView {
             directories: by_directory,
             dynamic_directories: Mutex::new(HashMap::new()),
             removed_directories: Mutex::new(std::collections::HashSet::new()),
+            captured_directories: HashMap::new(),
+            file_defaults: HashMap::new(),
+            first_dynamic_inode: 2,
             names: Mutex::new(names),
             lower_root,
             staging_area: None,
@@ -2236,24 +2683,44 @@ impl Filesystem for GuardedProbeView {
             return;
         }
         let mut names = self.names.lock().unwrap();
+        if (parent != INodeNo::ROOT && self.directory(parent.0).is_none())
+            || (newparent != INodeNo::ROOT && self.directory(newparent.0).is_none())
+        {
+            reply.error(Errno::ENOENT);
+            return;
+        }
         let old_key = (parent.0, name.to_os_string());
         let new_key = (newparent.0, newname.to_os_string());
         let Some(&inode) = names.get(&old_key) else {
             reply.error(Errno::ENOENT);
             return;
         };
+        if parent == newparent && name == newname {
+            reply.ok();
+            return;
+        }
+        if self.directory(inode).is_some() {
+            if names.contains_key(&new_key) {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+            let result = self.rename_directory(inode, &old_key, &new_key, &mut names);
+            match result {
+                Ok(()) => reply.ok(),
+                Err(error) => {
+                    reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)))
+                }
+            }
+            return;
+        }
         let Some(file) = self.file(inode) else {
-            reply.error(Errno::EISDIR);
+            reply.error(Errno::ENOENT);
             return;
         };
         let Some(lower_root) = &self.lower_root else {
             reply.error(Errno::EACCES);
             return;
         };
-        if parent == newparent && name == newname {
-            reply.ok();
-            return;
-        }
         if let Some(&target_inode) = names.get(&new_key) {
             if flags == RenameFlags::RENAME_NOREPLACE {
                 reply.error(Errno::EEXIST);
@@ -2749,10 +3216,220 @@ mod tests {
 
     use super::{
         CREATE_KIND, CreateIntent, DIRECTORY_CREATE_KIND, DIRECTORY_KIND, DIRECTORY_REMOVE_KIND,
-        DirectoryCreateIntent, DirectoryRecord, DirectoryRemoveIntent, FILE_INODE,
-        GuardedNamespace, GuardedProbeFile, GuardedProbeView, NAMESPACE_KIND, NamespaceRecord,
-        ProbeLocation, REPLACE_KIND, probe_file_attr,
+        DIRECTORY_RENAME_KIND, DirectoryCreateIntent, DirectoryRecord, DirectoryRemoveIntent,
+        DirectoryRenameIntent, FILE_INODE, GuardedNamespace, GuardedProbeFile, GuardedProbeView,
+        NAMESPACE_KIND, NamespaceRecord, ProbeLocation, REPLACE_KIND, probe_file_attr,
     };
+
+    #[test]
+    fn populated_directory_rename_replays_each_boundary() {
+        for phase in 0..3 {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(lower.join("parent")).unwrap();
+            fs::create_dir(lower.join("parent/sub")).unwrap();
+            fs::write(lower.join("parent/file"), b"captured bytes").unwrap();
+            fs::write(lower.join("parent/sub/new"), b"dynamic bytes").unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let parent_id = root
+                .open_descendant_directory("parent")
+                .unwrap()
+                .identity()
+                .unwrap();
+            let sub_id = root
+                .open_descendant_directory("parent/sub")
+                .unwrap()
+                .identity()
+                .unwrap();
+            let file_id = root
+                .open_descendant_directory("parent")
+                .unwrap()
+                .entry_identity("file", false)
+                .unwrap()
+                .unwrap();
+            let new_id = root
+                .open_descendant_directory("parent/sub")
+                .unwrap()
+                .entry_identity("new", false)
+                .unwrap()
+                .unwrap();
+            let captured = HashMap::from([(2, (b"parent".to_vec(), parent_id, 0o755))]);
+            let defaults = HashMap::from([(
+                3,
+                NamespaceRecord {
+                    version: 1,
+                    captured_path: "parent/file".to_owned(),
+                    expected: file_id,
+                    current: Some(b"parent/file".to_vec()),
+                    pending: None,
+                },
+            )]);
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([105; 32]));
+            let control_path = area.path().join("control.db");
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let anchor_id = uuid::Uuid::new_v4();
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            journal
+                .store_directory_if_absent(
+                    4,
+                    &DirectoryRecord {
+                        version: 1,
+                        expected: sub_id,
+                        current: Some(b"parent/sub".to_vec()),
+                    },
+                )
+                .unwrap();
+            journal
+                .store(
+                    5,
+                    &NamespaceRecord {
+                        version: 1,
+                        captured_path: String::new(),
+                        expected: new_id,
+                        current: Some(b"parent/sub/new".to_vec()),
+                        pending: None,
+                    },
+                )
+                .unwrap();
+            let intent = DirectoryRenameIntent {
+                version: 1,
+                source: b"parent".to_vec(),
+                target: b"relocated".to_vec(),
+                expected: parent_id,
+            };
+            journal.store_directory_rename(2, &intent).unwrap();
+            if phase >= 1 {
+                root.move_child_directory_no_replace("parent", parent_id, &root, "relocated")
+                    .unwrap();
+            }
+            if phase >= 2 {
+                journal
+                    .finish_directory_rename(&root, &captured, &defaults, 4, 2, &intent)
+                    .unwrap();
+            }
+            drop(journal);
+            drop(control);
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            journal
+                .reconcile_directory_renames(&root, &captured, &defaults, 4)
+                .unwrap();
+            let index = journal
+                .load_directories(&root, &captured, 4, 65534, 65534)
+                .unwrap();
+            assert_eq!(index.paths[Path::new("relocated")], INodeNo(2));
+            assert_eq!(index.paths[Path::new("relocated/sub")], INodeNo(4));
+            assert_eq!(
+                journal
+                    .load_or_replay(3, "parent/file", file_id, &root, &index.paths)
+                    .unwrap()
+                    .unwrap()
+                    .relative_path,
+                Path::new("relocated/file")
+            );
+            assert_eq!(
+                journal
+                    .load_or_replay(5, "", new_id, &root, &index.paths)
+                    .unwrap()
+                    .unwrap()
+                    .relative_path,
+                Path::new("relocated/sub/new")
+            );
+            assert_eq!(
+                fs::read(lower.join("relocated/file")).unwrap(),
+                b"captured bytes"
+            );
+            assert_eq!(
+                fs::read(lower.join("relocated/sub/new")).unwrap(),
+                b"dynamic bytes"
+            );
+            assert!(
+                control
+                    .lock()
+                    .unwrap()
+                    .get_record(DIRECTORY_RENAME_KIND, &journal.record_id(2))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn directory_rename_replay_refuses_foreign_target() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(lower.join("source")).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let expected = root
+            .open_descendant_directory("source")
+            .unwrap()
+            .identity()
+            .unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([106; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+        ));
+        let journal = GuardedNamespace {
+            control: Arc::clone(&control),
+            anchor_id: uuid::Uuid::new_v4(),
+            records: Mutex::new(HashMap::new()),
+        };
+        let captured = HashMap::from([(2, (b"source".to_vec(), expected, 0o755))]);
+        let intent = DirectoryRenameIntent {
+            version: 1,
+            source: b"source".to_vec(),
+            target: b"target".to_vec(),
+            expected,
+        };
+        journal.store_directory_rename(2, &intent).unwrap();
+        fs::create_dir(lower.join("target")).unwrap();
+        let foreign = root
+            .open_descendant_directory("target")
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert!(
+            journal
+                .reconcile_directory_renames(&root, &captured, &HashMap::new(), 3)
+                .is_err()
+        );
+        assert_eq!(
+            root.open_descendant_directory("source")
+                .unwrap()
+                .identity()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            root.open_descendant_directory("target")
+                .unwrap()
+                .identity()
+                .unwrap(),
+            foreign
+        );
+        assert!(
+            control
+                .lock()
+                .unwrap()
+                .get_record(DIRECTORY_RENAME_KIND, &journal.record_id(2))
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn directory_creation_replays_each_staging_and_publication_boundary() {
@@ -4307,6 +4984,122 @@ mod tests {
 
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn populated_guarded_directory_rename_survives_remount() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-view-dir-rename-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        let control_dir = area.path().join("control");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(lower.join("source")).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::create_dir(&control_dir).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(lower.join("source"), fs::Permissions::from_mode(0o755)).unwrap();
+        let original = b"directory\r\nanchor\0";
+        fs::write(lower.join("source/leaf"), original).unwrap();
+        fs::set_permissions(lower.join("source/leaf"), fs::Permissions::from_mode(0o666)).unwrap();
+        let source_inode = fs::metadata(lower.join("source")).unwrap().ino();
+        let leaf_inode = fs::metadata(lower.join("source/leaf")).unwrap().ino();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([107; 32]));
+        let control = ControlStore::open(control_dir.join("control.db"), &keys).unwrap();
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan.capture(&control).unwrap();
+        let control = Arc::new(Mutex::new(control));
+        let mut config = Config::default();
+        config.acl = SessionACL::All;
+        let view =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
+        let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
+        let result = (|| -> anyhow::Result<()> {
+            let operation = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; root=sys.argv[1]; os.mkdir(root+'/destination'); os.mkdir(root+'/source/created'); fd=os.open(root+'/source/created/new',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.write(fd,b'dynamic'); os.close(fd); os.rename(root+'/source',root+'/destination/moved'); fd=os.open(root+'/destination/moved/leaf',os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                .arg(&mountpoint)
+                .output()?;
+            anyhow::ensure!(
+                operation.status.success(),
+                "directory rename failed: {}",
+                String::from_utf8_lossy(&operation.stderr)
+            );
+            anyhow::ensure!(!lower.join("source").exists());
+            anyhow::ensure!(fs::metadata(lower.join("destination/moved"))?.ino() == source_inode);
+            anyhow::ensure!(
+                fs::metadata(lower.join("destination/moved/leaf"))?.ino() == leaf_inode
+            );
+            anyhow::ensure!(fs::read(lower.join("destination/moved/leaf"))?.starts_with(b"EDIT"));
+            anyhow::ensure!(
+                fs::read(mountpoint.join("destination/moved/created/new"))? == b"dynamic"
+            );
+            let mut anchor = manifest.file_locator("source/leaf".to_string())?.open()?;
+            let mut bytes = Vec::new();
+            anchor.read_to_end(&mut bytes)?;
+            anyhow::ensure!(bytes == original && anchor.metadata()?.ino() != leaf_inode);
+            Ok(())
+        })();
+        let unmounted = session.umount_and_join();
+        result.unwrap();
+        unmounted.unwrap();
+        let rebuilt =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
+        let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
+        let replayed = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(!mountpoint.join("source").exists());
+            anyhow::ensure!(
+                fs::read(mountpoint.join("destination/moved/leaf"))?.starts_with(b"EDIT")
+            );
+            anyhow::ensure!(
+                fs::read(mountpoint.join("destination/moved/created/new"))? == b"dynamic"
+            );
+            let rename_again = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2]); os.rename(sys.argv[3],sys.argv[4])")
+                .arg(mountpoint.join("destination/moved"))
+                .arg(mountpoint.join("final"))
+                .arg(mountpoint.join("final/created"))
+                .arg(mountpoint.join("dynamic-moved"))
+                .output()?;
+            anyhow::ensure!(
+                rename_again.status.success(),
+                "second directory rename failed: {}",
+                String::from_utf8_lossy(&rename_again.stderr)
+            );
+            anyhow::ensure!(fs::read(mountpoint.join("dynamic-moved/new"))? == b"dynamic");
+            Ok(())
+        })();
+        let unmounted = session.umount_and_join();
+        replayed.unwrap();
+        unmounted.unwrap();
+        let rebuilt =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
+        let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
+        assert!(
+            fs::read(mountpoint.join("final/leaf"))
+                .unwrap()
+                .starts_with(b"EDIT")
+        );
+        assert_eq!(
+            fs::read(mountpoint.join("dynamic-moved/new")).unwrap(),
+            b"dynamic"
+        );
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn nested_guarded_root_file_renames_and_detaches_through_view() {
         let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
             Some(root) => tempfile::Builder::new()
@@ -4366,15 +5159,15 @@ mod tests {
                 .output()?;
             anyhow::ensure!(guest_read.status.success());
             anyhow::ensure!(guest_read.stdout == leaf_bytes);
-            let unsupported_directory_rename = Command::new("python3")
+            let cyclic_directory_rename = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
                 .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
                 .arg(mountpoint.join("nested"))
-                .arg(mountpoint.join("other"))
+                .arg(mountpoint.join("nested/inside"))
                 .output()?;
-            anyhow::ensure!(!unsupported_directory_rename.status.success());
+            anyhow::ensure!(!cyclic_directory_rename.status.success());
             anyhow::ensure!(fs::read(mountpoint.join("nested/leaf"))? == leaf_bytes);
             let no_replace = Command::new("python3")
                 .uid(65534)

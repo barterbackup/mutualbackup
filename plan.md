@@ -1229,11 +1229,17 @@ partially completed removal and refuses a foreign replacement. Nested removal
 and remount pass on both filesystems. Captured empty directories now have
 manifest-verified identities and durable removal tombstones; removing their
 last child, then the captured directory, survives remount on ext4 and fresh
-local Btrfs. Directory rename, remaining metadata and allocation modes,
-concurrent handles, mount supervision/recovery, and guarded enrollment remain
-open. Rebuild now indexes captured and dynamic directories together by recorded
-current path, with a control-reopen regression for a moved captured subtree and
-descendant file; the durable directory-rename transition remains to be built.
+local Btrfs. Rebuild indexes captured and dynamic directories together by
+recorded current path. A directory rename now writes an identity-bound intent
+before moving the lower directory and publishes every tracked descendant's
+new path in one transaction; replay completes either side of interruption or
+rejects a foreign target. Ordinary-user FUSE probes move a populated captured
+subtree beneath a dynamic parent, edit without changing its anchor, then move
+captured and dynamic subtrees again across remounts. The 109 normal store tests,
+12 privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
+Clippy pass. Replacement of an occupied directory, remaining metadata and
+allocation modes, concurrent handles, mount supervision/recovery, and guarded
+enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
