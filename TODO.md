@@ -11,9 +11,12 @@
   attributes file with text/filter/ident/encoding rules, configured
   clean/smudge/process commands, and `merge.renormalize`. Add, status, diff,
   restore, switch, ordinary-Git fetch/pull/push, and their blob IDs remain raw;
-  no filter marker is created. Complete the cross-command audit required by
-  plan.md, including system and repository settings, `.git/info/attributes`,
-  merge results, linked worktrees, and all remaining supported commands.
+  no filter marker is created. The expanded local Btrfs regression also covers
+  a system clean filter, a repository filter setting and `info/attributes` on
+  the ordinary-Git side, native content merge, and linked-worktree checkout and
+  merge; its raw merged blob and restored bytes match. Complete the remaining
+  cross-command audit required by plan.md, especially reset/restore and import
+  paths under conflicting conversion settings and every supported CLI command.
 - [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out

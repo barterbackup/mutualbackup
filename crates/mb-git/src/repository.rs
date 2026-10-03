@@ -3456,6 +3456,15 @@ mod tests {
                 external_attributes.stdout,
                 format!("{}\n", run_root.join("global-attributes").display()).as_bytes()
             );
+            let system_filter = Command::new("git")
+                .args(["config", "--get", "filter.convert.clean"])
+                .output()
+                .unwrap();
+            assert!(system_filter.status.success());
+            assert_eq!(
+                system_filter.stdout,
+                format!("touch {}\n", run_root.join("filter-executed").display()).as_bytes()
+            );
             let attribute_probe = run_root.join("attribute-probe");
             let initialized = Command::new("git")
                 .args(["init", "-q"])
@@ -3463,6 +3472,17 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(initialized.status.success());
+            fs::write(
+                attribute_probe.join(".git/info/attributes"),
+                b"*.txt text eol=crlf filter=convert ident working-tree-encoding=UTF-16\n",
+            )
+            .unwrap();
+            let probe_repository = git2::Repository::open(&attribute_probe).unwrap();
+            probe_repository
+                .config()
+                .unwrap()
+                .set_str("core.eol", "crlf")
+                .unwrap();
             let selected = Command::new("git")
                 .arg("-C")
                 .arg(&attribute_probe)
@@ -3473,7 +3493,7 @@ mod tests {
             let selected = String::from_utf8(selected.stdout).unwrap();
             for rule in [
                 "text: set",
-                "eol: lf",
+                "eol: crlf",
                 "filter: convert",
                 "ident: set",
                 "working-tree-encoding: UTF-16",
@@ -3485,10 +3505,16 @@ mod tests {
             }
             fs::write(source_root.join(".gitattributes"), b"*.other text=auto\n").unwrap();
             fs::write(source_root.join("tracked.txt"), b"one\r\ntwo\n").unwrap();
+            let merge_base = b"first\r\nsecond\nthird\r\nfourth\nfifth\r\n";
+            let merge_ours = b"our first\r\nsecond\nthird\r\nfourth\nfifth\r\n";
+            let merge_theirs = b"first\r\nsecond\nthird\r\nfourth\ntheir fifth\r\n";
+            let merge_result = b"our first\r\nsecond\nthird\r\nfourth\ntheir fifth\r\n";
+            fs::write(source_root.join("merge.txt"), merge_base).unwrap();
             let repository_id = Uuid::new_v4();
             let local = GitRepository::init(&source_root, repository_id, &[103; 32]).unwrap();
             local.stage_file(".gitattributes").unwrap();
             let staged = local.stage_file("tracked.txt").unwrap();
+            local.stage_file("merge.txt").unwrap();
             let expected = Oid::hash_object(git2::ObjectType::Blob, b"one\r\ntwo\n").unwrap();
             assert_eq!(staged.oid, expected.as_bytes());
             local.commit("Author", "a@example.test", "raw").unwrap();
@@ -3515,16 +3541,78 @@ mod tests {
             let staged = local.stage_file("tracked.txt").unwrap();
             let expected = Oid::hash_object(git2::ObjectType::Blob, b"topic\nraw\r\n").unwrap();
             assert_eq!(staged.oid, expected.as_bytes());
+            fs::write(source_root.join("merge.txt"), merge_theirs).unwrap();
+            local.stage_file("merge.txt").unwrap();
             local.commit("Author", "a@example.test", "topic").unwrap();
             local.switch_branch("main").unwrap();
             assert_eq!(
                 fs::read(source_root.join("tracked.txt")).unwrap(),
                 b"one\r\ntwo\n"
             );
+            fs::write(source_root.join("merge.txt"), merge_ours).unwrap();
+            local.stage_file("merge.txt").unwrap();
+            local
+                .commit("Author", "a@example.test", "main edit")
+                .unwrap();
+            let linked_root = run_root.join("linked");
+            fs::create_dir(&linked_root).unwrap();
+            let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
+            assert_eq!(
+                fs::read(linked_root.join("merge.txt")).unwrap(),
+                merge_theirs
+            );
+            assert_eq!(
+                fs::read(linked_root.join("tracked.txt")).unwrap(),
+                b"topic\nraw\r\n"
+            );
+            local
+                .merge_branch("topic", "Author", "a@example.test")
+                .unwrap();
+            assert_eq!(
+                fs::read(source_root.join("merge.txt")).unwrap(),
+                merge_result
+            );
+            assert_eq!(
+                local.staged_entry("merge.txt").unwrap().unwrap().oid,
+                Oid::hash_object(git2::ObjectType::Blob, merge_result)
+                    .unwrap()
+                    .as_bytes()
+            );
+            local
+                .linked_merge_branch(linked.worktree_id, "main", "Author", "a@example.test")
+                .unwrap();
+            assert_eq!(
+                fs::read(linked_root.join("merge.txt")).unwrap(),
+                merge_result
+            );
+            assert_eq!(
+                fs::read(linked_root.join("tracked.txt")).unwrap(),
+                b"topic\nraw\r\n"
+            );
             let bare_root = run_root.join("remote.git");
-            git2::Repository::init_bare(&bare_root).unwrap();
+            let remote = git2::Repository::init_bare(&bare_root).unwrap();
+            fs::write(
+                bare_root.join("info/attributes"),
+                b"*.txt text eol=crlf filter=convert ident working-tree-encoding=UTF-16\n",
+            )
+            .unwrap();
+            remote
+                .config()
+                .unwrap()
+                .set_str(
+                    "filter.convert.clean",
+                    &format!("touch {}", run_root.join("filter-executed").display()),
+                )
+                .unwrap();
+            let remote_attributes = Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare_root)
+                .args(["check-attr", "eol", "--", "tracked.txt"])
+                .output()
+                .unwrap();
+            assert!(remote_attributes.status.success());
+            assert_eq!(remote_attributes.stdout, b"tracked.txt: eol: crlf\n");
             local.push_current_branch_to_bare(&bare_root).unwrap();
-            let remote = git2::Repository::open_bare(&bare_root).unwrap();
             let parent = remote
                 .find_commit(remote.refname_to_id("refs/heads/main").unwrap())
                 .unwrap();
@@ -3585,6 +3673,15 @@ mod tests {
         );
         let run_root = test_root.join(format!("git-inherited-config-{}", Uuid::new_v4()));
         fs::create_dir(&run_root).unwrap();
+        let system_config = run_root.join("system-config");
+        fs::write(
+            &system_config,
+            format!(
+                "[filter \"convert\"]\n\tclean = touch {}\n",
+                run_root.join("filter-executed").display()
+            ),
+        )
+        .unwrap();
         let attributes_path = run_root.join("global-attributes");
         fs::write(
             &attributes_path,
@@ -3595,9 +3692,8 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "[core]\n\tautocrlf = true\n\tsafecrlf = true\n\tattributesFile = {}\n[merge]\n\trenormalize = true\n[filter \"convert\"]\n\tclean = touch {}\n\tsmudge = touch {}\n\tprocess = touch {}\n\trequired = true\n",
+                "[core]\n\tautocrlf = true\n\tsafecrlf = true\n\tattributesFile = {}\n[merge]\n\trenormalize = true\n[filter \"convert\"]\n\tsmudge = touch {}\n\tprocess = touch {}\n\trequired = true\n",
                 attributes_path.display(),
-                run_root.join("filter-executed").display(),
                 run_root.join("filter-executed").display(),
                 run_root.join("filter-executed").display(),
             ),
@@ -3612,7 +3708,7 @@ mod tests {
             ])
             .env(CHILD_ROOT, &run_root)
             .env("GIT_CONFIG_GLOBAL", &config_path)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", &system_config)
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "core.eol")
             .env("GIT_CONFIG_VALUE_0", "crlf")
