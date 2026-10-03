@@ -1600,6 +1600,7 @@ pub struct GuardedProbeView {
     next_inode: AtomicU64,
     denied_writable: Arc<AtomicU64>,
     backing: Mutex<HashMap<u64, ActiveBacking>>,
+    directory_handles: Mutex<HashMap<u64, OpenDirectory>>,
 }
 
 struct ActiveBacking {
@@ -1607,6 +1608,11 @@ struct ActiveBacking {
     mode: OpenAccMode,
     inode: INodeNo,
     source: File,
+}
+
+struct OpenDirectory {
+    inode: INodeNo,
+    source: PinnedDirectory,
 }
 
 struct CreatedGuardedFile {
@@ -2426,6 +2432,7 @@ impl GuardedProbeView {
             next_inode: AtomicU64::new(next_inode),
             denied_writable,
             backing: Mutex::default(),
+            directory_handles: Mutex::default(),
         }
     }
 
@@ -2596,15 +2603,67 @@ impl Filesystem for GuardedProbeView {
         }
     }
 
+    fn opendir(&self, _request: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if flags.acc_mode() != OpenAccMode::O_RDONLY {
+            reply.error(Errno::EACCES);
+            return;
+        }
+        let _names = self.names.lock().unwrap();
+        let result = (|| -> io::Result<PinnedDirectory> {
+            let lower_root = self
+                .lower_root
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
+            if inode == INodeNo::ROOT {
+                return lower_root.try_clone().map_err(io::Error::other);
+            }
+            let visible = self
+                .directory(inode.0)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            let source = lower_root
+                .open_descendant_directory(&visible.relative_path)
+                .map_err(io::Error::other)?;
+            if source.identity().map_err(io::Error::other)? != visible.native_id {
+                return Err(io::Error::other("guarded directory changed during open"));
+            }
+            Ok(source)
+        })();
+        match result {
+            Ok(source) => {
+                let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+                self.directory_handles
+                    .lock()
+                    .unwrap()
+                    .insert(handle, OpenDirectory { inode, source });
+                reply.opened(FileHandle(handle), FopenFlags::empty());
+            }
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+        }
+    }
+
     fn readdir(
         &self,
         _request: &Request,
         inode: INodeNo,
-        _handle: FileHandle,
+        handle: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
         if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if !self
+            .directory_handles
+            .lock()
+            .unwrap()
+            .get(&handle.0)
+            .is_some_and(|opened| opened.inode == inode)
+        {
             reply.error(Errno::EIO);
             return;
         }
@@ -2643,11 +2702,31 @@ impl Filesystem for GuardedProbeView {
         reply.ok();
     }
 
+    fn releasedir(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        let mut handles = self.directory_handles.lock().unwrap();
+        if !handles
+            .get(&handle.0)
+            .is_some_and(|opened| opened.inode == inode)
+        {
+            reply.error(Errno::EIO);
+            return;
+        }
+        handles.remove(&handle.0);
+        reply.ok();
+    }
+
     fn fsyncdir(
         &self,
         _request: &Request,
         inode: INodeNo,
-        _handle: FileHandle,
+        handle: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
@@ -2655,32 +2734,21 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        let _names = self.names.lock().unwrap();
-        let result = (|| -> io::Result<()> {
-            let lower_root = self
-                .lower_root
-                .as_ref()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
-            let directory = if inode == INodeNo::ROOT {
-                lower_root.try_clone().map_err(io::Error::other)?
-            } else {
-                let visible = self
-                    .directory(inode.0)
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-                let directory = lower_root
-                    .open_descendant_directory(&visible.relative_path)
-                    .map_err(io::Error::other)?;
-                if directory.identity().map_err(io::Error::other)? != visible.native_id {
-                    return Err(io::Error::other("guarded directory changed during fsync"));
-                }
-                directory
-            };
-            if datasync {
-                directory.as_file().sync_data()
-            } else {
-                directory.as_file().sync_all()
+        let source = {
+            let handles = self.directory_handles.lock().unwrap();
+            handles
+                .get(&handle.0)
+                .filter(|opened| opened.inode == inode)
+                .map(|opened| opened.source.try_clone())
+        };
+        let result = match source {
+            Some(Ok(source)) if datasync => source.as_file().sync_data(),
+            Some(Ok(source)) => source.as_file().sync_all(),
+            _ => {
+                reply.error(Errno::EIO);
+                return;
             }
-        })();
+        };
         match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
@@ -6228,7 +6296,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import os,sys; os.mkdir(sys.argv[2]); os.rename(sys.argv[1],sys.argv[2])")
+                .arg("import os,sys; os.mkdir(sys.argv[2]); displaced=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY); os.rename(sys.argv[1],sys.argv[2]); os.fsync(displaced); os.close(displaced)")
                 .arg(mountpoint.join("final"))
                 .arg(mountpoint.join("occupied"))
                 .output()?;

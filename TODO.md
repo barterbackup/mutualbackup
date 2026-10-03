@@ -295,10 +295,12 @@
   observed fail-closed kernel behavior, while supervised remount, recovered
   metadata, and guarded enrollment remain open.
   The FUSE view now handles file `fsync`/`fdatasync` through the retained source
-  descriptor and directory sync through a pinned, identity-checked current
-  path. An ordinary-user probe syncs a captured directory after rename and
-  newly created and detached files. All 18 privileged guarded-view probes pass
-  on fresh local ext4; the renamed-directory probe passes on fresh local Btrfs.
+  descriptor. `opendir` pins an identity-checked lower descriptor; `fsyncdir`
+  uses it after rename or replacement removes the old name, and `readdir` and
+  `releasedir` validate its handle. An ordinary-user probe syncs a captured
+  directory after rename, the displaced directory after replacement, and newly
+  created and detached files. All 18 privileged guarded-view probes pass on
+  fresh local ext4; the renamed-directory probe passes on fresh local Btrfs.
   The 113 normal store tests, formatting, and strict workspace Clippy pass.
   Mount supervision and protected view-metadata recovery remain open.
   Keep Git staging and checkout gated until the complete privileged probe

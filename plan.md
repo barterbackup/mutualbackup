@@ -772,8 +772,8 @@ Proactive background repair comes later.
   their publication must be replayable across a crash. Atomic replacement must
   keep the replaced file's immutable anchor intact. File `fsync`/`fdatasync`
   must sync the retained inode even after rename, unlink, or replacement;
-  directory sync must use an identity-checked current directory, including
-  after rename, and propagate storage errors. A mount/daemon failure
+  directory handles must pin an identity-checked inode so sync still reaches
+  it after rename or removal. Propagate storage errors. A mount/daemon failure
   must make the view fail closed, never expose the private source path or
   silently resume through it.
   Probe the mount, passthrough capability, and inaccessible lower path locally
