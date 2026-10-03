@@ -399,6 +399,12 @@ pub(crate) fn require_mount_claim_retired(
     Ok(())
 }
 
+pub(crate) fn mount_claim_exists(control: &ControlStore, anchor_id: Uuid) -> anyhow::Result<bool> {
+    Ok(control
+        .get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())?
+        .is_some())
+}
+
 fn mount_source(anchor_id: Uuid) -> String {
     format!("mutualbackup-guarded-{anchor_id}")
 }

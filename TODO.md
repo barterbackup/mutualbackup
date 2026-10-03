@@ -587,6 +587,19 @@
   the successful held-descriptor mount probe passes on both, as do 115 normal
   store tests and strict workspace Clippy. Durable ownership isolation and
   protected view-metadata recovery remain open.
+  A versioned lower-ownership snapshot now durably binds the published capture
+  plan to every captured root, directory, and frozen file identity, UID, GID,
+  pre-isolation mode, and access ACL before any ownership transition. The
+  file-freeze journal separately retains the original file access state.
+  Reopen verifies its format and plan binding; cancellation rechecks frozen
+  bytes and original metadata, and anchor retirement refuses a surviving
+  record. A privileged
+  probe changes a frozen file's owner after the snapshot, confirms cancellation
+  and retirement fail closed, restores the owner, and then cancels and retires;
+  it passes on ext4 and fresh local Btrfs. All 115 normal store tests and strict
+  workspace Clippy pass. The actual guarded ownership/mode transition, its
+  replay and restoration, and signed recovery of mutable view metadata remain
+  open; this snapshot alone does not make the lower tree private.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

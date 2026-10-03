@@ -840,7 +840,7 @@ impl LinkFreezeEditIntent {
     }
 }
 
-fn read_access_acl(file: &File) -> io::Result<AccessAclSnapshot> {
+pub(crate) fn read_access_acl(file: &File) -> io::Result<AccessAclSnapshot> {
     let fd = file.as_raw_fd();
     // SAFETY: the pinned descriptor and NUL-terminated xattr name are valid.
     let length = unsafe { libc::fgetxattr(fd, ACCESS_ACL_NAME.as_ptr(), std::ptr::null_mut(), 0) };

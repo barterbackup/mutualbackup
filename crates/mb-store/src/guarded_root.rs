@@ -23,6 +23,7 @@ use super::{
     open_source_root, open_stable_anchor_area, probe_guarded_link_freeze, reopen_pinned_file,
     resolve_anchor_area, unix_mode, validate_relative,
 };
+use crate::link_freeze::{AccessAclSnapshot, read_access_acl};
 use crate::{
     ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase, LinkFreezeEditIntent,
     LinkFreezeEditPhase,
@@ -33,6 +34,7 @@ const ROOT_CLAIM_KIND: &str = "guarded-root-claim-v1";
 const DIRECTORY_CLAIM_PREFIX: &str = "guarded-root-directory-v1/";
 const MANIFEST_CLAIM_KIND: &str = "guarded-root-manifest-v1";
 const RETIRE_KIND: &str = "guarded-root-retire-v1";
+const LOWER_OWNERSHIP_KIND: &str = "guarded-root-lower-ownership-v1";
 const MARKER_PREFIX: &str = ".mutualbackup-guarded-root-v1-";
 
 pub(super) fn guarded_root_marker_name(anchor_id: Uuid) -> String {
@@ -71,6 +73,24 @@ struct RootRetirement {
     format_version: u16,
     anchor_id: Uuid,
     plan_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LowerOwnershipEntry {
+    path: String,
+    native_id: NativeFileId,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    access_acl: AccessAclSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LowerOwnershipSnapshot {
+    format_version: u16,
+    anchor_id: Uuid,
+    plan_hash: [u8; 32],
+    entries: Vec<LowerOwnershipEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -329,6 +349,193 @@ impl GuardedRootCapturePlan {
         Ok(())
     }
 
+    fn lower_ownership_entry(
+        path: String,
+        file: &File,
+        native_id: NativeFileId,
+        directory: bool,
+        planned_mode: u32,
+    ) -> anyhow::Result<LowerOwnershipEntry> {
+        let before = file.metadata()?;
+        anyhow::ensure!(
+            before.ino() == native_id.inode
+                && before.is_dir() == directory
+                && (if directory {
+                    unix_mode(&before) & 0o7777 == planned_mode & 0o7777
+                } else {
+                    before.is_file() && unix_mode(&before) & 0o222 == 0
+                }),
+            "guarded lower entry changed before ownership snapshot: {path}"
+        );
+        let access_acl = read_access_acl(file)?;
+        let after = file.metadata()?;
+        anyhow::ensure!(
+            (
+                before.dev(),
+                before.ino(),
+                before.uid(),
+                before.gid(),
+                before.mode(),
+                before.ctime(),
+                before.ctime_nsec()
+            ) == (
+                after.dev(),
+                after.ino(),
+                after.uid(),
+                after.gid(),
+                after.mode(),
+                after.ctime(),
+                after.ctime_nsec()
+            ),
+            "guarded lower metadata changed during ownership snapshot: {path}"
+        );
+        Ok(LowerOwnershipEntry {
+            path,
+            native_id,
+            uid: before.uid(),
+            gid: before.gid(),
+            mode: unix_mode(&before) & 0o7777,
+            access_acl,
+        })
+    }
+
+    fn current_lower_ownership(
+        &self,
+        control: &ControlStore,
+        manifest: &StableAnchorManifest,
+    ) -> anyhow::Result<LowerOwnershipSnapshot> {
+        self.validate()?;
+        anyhow::ensure!(
+            Self::load_active_for_view(control, manifest)? == *self,
+            "guarded lower ownership snapshot has another capture plan"
+        );
+        anyhow::ensure!(
+            self.capture(control)? == *manifest,
+            "guarded frozen bytes changed before ownership snapshot"
+        );
+        let lower = PinnedDirectory::open(&self.source_root)?;
+        let root_id = self.source_root_identity();
+        anyhow::ensure!(lower.identity()? == root_id, "guarded lower root changed");
+        let mut entries = Vec::with_capacity(self.entries.len() + 1);
+        entries.push(Self::lower_ownership_entry(
+            String::new(),
+            lower.as_file(),
+            root_id,
+            true,
+            self.root_mode,
+        )?);
+        for entry in &self.entries {
+            let path = entry.path();
+            let native_id = NativeFileId {
+                filesystem_id: entry.version().filesystem_id,
+                inode: entry.version().inode,
+            };
+            let (mode, _, _) = entry.mode_and_modified();
+            let file = match entry {
+                GuardedRootEntry::Directory { .. } => lower
+                    .open_descendant_directory(path)?
+                    .as_file()
+                    .try_clone()?,
+                GuardedRootEntry::File { capture_id, .. } => {
+                    let intent = LinkFreezeCaptureIntent::load(control, *capture_id)?
+                        .ok_or_else(|| anyhow::anyhow!("guarded file capture disappeared"))?;
+                    anyhow::ensure!(
+                        intent.phase() == LinkFreezeCapturePhase::Frozen,
+                        "guarded file was edited before lower isolation"
+                    );
+                    let relative = Path::new(path);
+                    let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+                    let directory = if parent.as_os_str().is_empty() {
+                        lower.try_clone()?
+                    } else {
+                        lower.open_descendant_directory(parent)?
+                    };
+                    let file = directory
+                        .open_child_file(
+                            relative
+                                .file_name()
+                                .ok_or(AnchorError::InvalidGuardedPlan)?,
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("guarded lower file disappeared: {path}"))?;
+                    let anchor = manifest.file_locator(path.to_owned())?.open()?;
+                    anyhow::ensure!(
+                        anchor.metadata()?.ino() == native_id.inode
+                            && file.metadata()?.nlink() == 2,
+                        "guarded lower file no longer shares its frozen anchor: {path}"
+                    );
+                    file
+                }
+            };
+            entries.push(Self::lower_ownership_entry(
+                path.to_owned(),
+                &file,
+                native_id,
+                entry.is_directory(),
+                mode,
+            )?);
+        }
+        let snapshot = LowerOwnershipSnapshot {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes(),
+            entries,
+        };
+        anyhow::ensure!(
+            mb_core::canonical_bytes(&snapshot)?.len() <= V1_MAX_CATALOG_BYTES / 2,
+            AnchorError::CatalogTooLarge
+        );
+        Ok(snapshot)
+    }
+
+    /// Save original ownership and pre-isolation modes and access ACLs before
+    /// any private lower-inode transition. The original file access state is
+    /// also retained by each file-freeze journal. This stage changes no inodes;
+    /// future replay must use this immutable record before each ownership step.
+    pub fn prepare_private_lower_ownership(
+        &self,
+        control: &ControlStore,
+        manifest: &StableAnchorManifest,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !crate::guarded_mount::mount_claim_exists(control, self.anchor_id)?,
+            "guarded view is already claimed"
+        );
+        let snapshot = self.current_lower_ownership(control, manifest)?;
+        let bytes = mb_core::canonical_bytes(&snapshot)?;
+        if !control.put_record_if_absent(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes(), &bytes)? {
+            anyhow::ensure!(
+                control.get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())? == Some(bytes),
+                "guarded lower ownership changed after its durable snapshot"
+            );
+        }
+        Ok(())
+    }
+
+    /// An unstarted isolation may be canceled only while every pinned lower
+    /// inode still matches the original snapshot. A changed owner keeps the
+    /// recovery obligation durable and blocks ordinary anchor retirement.
+    pub fn cancel_private_lower_ownership(
+        &self,
+        control: &ControlStore,
+        manifest: &StableAnchorManifest,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !crate::guarded_mount::mount_claim_exists(control, self.anchor_id)?,
+            "guarded view is already claimed"
+        );
+        let Some(bytes) = control.get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
+        else {
+            return Ok(());
+        };
+        let recorded: LowerOwnershipSnapshot = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            recorded == self.current_lower_ownership(control, manifest)?,
+            "guarded lower ownership changed before cancellation"
+        );
+        control.delete_record_if_value(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes(), &bytes)?;
+        Ok(())
+    }
+
     /// A frozen inode has guard-restricted lower permissions, so its captured
     /// mode is the visible one. Once the edit journal made that inode
     /// independent, the lower inode's mode includes later owner chmods and is
@@ -447,6 +654,48 @@ impl GuardedRootCapturePlan {
                         == *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes(),
                 "guarded root retirement belongs to another plan"
             );
+        }
+        if let Some(bytes) = control.get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())? {
+            anyhow::ensure!(
+                bytes.len() <= V1_MAX_CATALOG_BYTES / 2,
+                "guarded lower ownership snapshot exceeds its bound"
+            );
+            let snapshot: LowerOwnershipSnapshot = mb_core::decode_canonical(&bytes)?;
+            anyhow::ensure!(
+                snapshot.format_version == 1
+                    && snapshot.anchor_id == self.anchor_id
+                    && snapshot.plan_hash
+                        == *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes()
+                    && snapshot.entries.len() == self.entries.len() + 1,
+                "guarded lower ownership snapshot differs from its capture plan"
+            );
+            for (index, recorded) in snapshot.entries.iter().enumerate() {
+                let (path, expected, directory, planned_mode) = if index == 0 {
+                    ("", self.source_root_identity(), true, self.root_mode)
+                } else {
+                    let planned = &self.entries[index - 1];
+                    (
+                        planned.path(),
+                        NativeFileId {
+                            filesystem_id: planned.version().filesystem_id,
+                            inode: planned.version().inode,
+                        },
+                        planned.is_directory(),
+                        planned.mode_and_modified().0,
+                    )
+                };
+                anyhow::ensure!(
+                    recorded.path == path
+                        && recorded.native_id == expected
+                        && recorded.mode & !0o7777 == 0
+                        && if directory {
+                            recorded.mode == planned_mode & 0o7777
+                        } else {
+                            recorded.mode & 0o222 == 0
+                        },
+                    "guarded lower ownership entry differs from its capture plan: {path}"
+                );
+            }
         }
         Ok(())
     }
@@ -1148,6 +1397,12 @@ impl GuardedRootCapturePlan {
     /// interrupted retirement.
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
+        anyhow::ensure!(
+            control
+                .get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
+                .is_none(),
+            "guarded lower ownership must be restored or canceled before retirement"
+        );
         crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
         let plan_bytes = mb_core::canonical_bytes(self)?;
         let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
@@ -2545,6 +2800,77 @@ mod tests {
                 .join(plan.anchor_id.to_string())
                 .exists()
         );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events and root for chown"]
+    fn lower_ownership_snapshot_survives_reopen_and_fences_retirement() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-lower-owner-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let source = root.join("nested/file");
+        fs::write(&source, b"original\r\n\0bytes").unwrap();
+        let encoded = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([115; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan.capture(&store).unwrap();
+        plan.prepare_private_lower_ownership(&store, &manifest)
+            .unwrap();
+        let bytes = store
+            .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        let snapshot: LowerOwnershipSnapshot = mb_core::decode_canonical(&bytes).unwrap();
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "nested", "nested/file"]
+        );
+        assert_eq!(snapshot.entries[2].uid, 65534);
+        assert_eq!(snapshot.entries[2].gid, 65534);
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        store
+            .put_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes(), &[0xff])
+            .unwrap();
+        assert!(plan.reconcile(&store).is_err());
+        store
+            .put_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes(), &bytes)
+            .unwrap();
+        plan.prepare_private_lower_ownership(&store, &manifest)
+            .unwrap();
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 0, 0) }, 0);
+        assert!(
+            plan.cancel_private_lower_ownership(&store, &manifest)
+                .is_err()
+        );
+        assert!(plan.discard_unreferenced(&store).is_err());
+        assert_eq!(
+            store
+                .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+                .unwrap(),
+            Some(bytes.clone())
+        );
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        plan.cancel_private_lower_ownership(&store, &manifest)
+            .unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"original\r\n\0bytes");
     }
 
     #[test]

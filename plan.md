@@ -1547,6 +1547,14 @@ that an unsafe nested directory leaves a pending rename record untouched;
 it passes on ext4 and fresh local Btrfs, alongside the successful
 held-descriptor mount probe, 115 normal store tests, and strict workspace
 Clippy. This closes the preflight ordering gap, not guarded enrollment.
+A versioned lower-ownership record now captures the original identities and
+owners plus pre-isolation modes and access ACLs before isolation can begin;
+file-freeze journals separately retain the original file access state. Reopen
+checks its plan binding; a changed frozen-file owner blocks cancellation and
+anchor retirement until restored. The privileged reopen/retirement probe passes on
+ext4 and fresh local Btrfs, as do 115 normal store tests and strict Clippy.
+The record preserves rollback evidence, but the ownership transition and
+signed recovery of mutable view metadata are still required for enrollment.
 Guarded enrollment therefore still needs durable private-inode ownership and
 mode isolation plus virtualized, protected metadata before ordinary user-owned
 source trees are admissible.
