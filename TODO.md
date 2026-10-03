@@ -220,6 +220,9 @@
   filesystems, formatting, and strict workspace Clippy pass. Directory and
   change-time fidelity, protected root-mode recovery, and mount supervision
   remain open.
+  The two-file guarded-root probe also sets nanosecond timestamps on a newly
+  created file after atomic replacement, remounts the view, and verifies the
+  rebuilt attributes on ext4 and fresh local Btrfs.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

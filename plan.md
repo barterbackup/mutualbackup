@@ -1276,6 +1276,9 @@ accepts owner `utime` only after durable detach. A first-mutation probe verifies
 nanosecond values and exact anchor bytes on ext4 and fresh local Btrfs; all 13
 privileged guarded probes, 112 normal store tests, formatting, and strict
 workspace Clippy pass. Directory and change-time metadata remain to be done.
+The two-file guarded-root probe additionally verifies that nanosecond access
+and modified times on a created, atomically moved file survive view remount on
+ext4 and fresh local Btrfs.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

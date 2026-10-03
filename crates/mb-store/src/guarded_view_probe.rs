@@ -5561,6 +5561,18 @@ mod tests {
                 .read_to_end(&mut beta_bytes)?;
             anyhow::ensure!(beta_bytes == original_beta);
             anyhow::ensure!(fs::read(mountpoint.join("alpha"))?.starts_with(b"EDIT"));
+            let timestamp = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.utime(sys.argv[1],ns=(1600000001987654321,1600000000123456789))")
+                .arg(mountpoint.join("moved"))
+                .output()?;
+            anyhow::ensure!(
+                timestamp.status.success(),
+                "guarded timestamp update failed: {}",
+                String::from_utf8_lossy(&timestamp.stderr)
+            );
             let unlink = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
@@ -5599,6 +5611,21 @@ mod tests {
             anyhow::ensure!(!mountpoint.join("alpha").exists());
             anyhow::ensure!(!mountpoint.join("beta").exists());
             anyhow::ensure!(!mountpoint.join("delta").exists());
+            let moved_metadata = fs::metadata(mountpoint.join("moved"))?;
+            anyhow::ensure!(
+                moved_metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+                    == 1_600_000_000_123_456_789
+            );
+            anyhow::ensure!(
+                moved_metadata
+                    .accessed()?
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+                    == 1_600_000_001_987_654_321
+            );
             anyhow::ensure!(fs::read(mountpoint.join("moved"))?.starts_with(b"EDIT"));
             let edit_created = Command::new("python3")
                 .uid(65534)
