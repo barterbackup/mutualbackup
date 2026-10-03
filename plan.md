@@ -1492,6 +1492,12 @@ The complete P2P unit suite passes (135 tests, 2 provisioned tests ignored)
 after its activation fixture waits for receipt cleanup and the intended pending
 activation. Those waits exposed an existing race on the prior committed tree;
 they do not change production activation decisions.
+The isolated local five-daemon topology and seed-recovery test passed on code
+commit `a870a46` in 1,497.88 seconds. Its recovered-topology backups committed
+after transient missing signatures and coding-coverage waits, and all disposable
+Btrfs and network resources were removed. Duplicate-retirement dispatch has
+now passed a real topology gate, but the earlier 5,400-second signer stall is
+not causally explained; keep that reliability gate open.
 The guarded FUSE view now answers `statfs` from the pinned lower-root
 descriptor, reporting real filesystem capacity and name limits. A privileged
 ordinary-user `statvfs` probe and comparison with the native filesystem pass

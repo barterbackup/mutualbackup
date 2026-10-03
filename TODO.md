@@ -228,6 +228,13 @@
   The fixture now waits with bounds for those separate transitions and reports
   concise pending-job state on timeout. The full P2P suite passes with 135
   tests and 2 provisioned tests ignored; strict workspace Clippy passes.
+  The isolated five-daemon topology and seed-recovery test passed on code
+  commit `a870a46` in 1,497.88 seconds. Both recovered-topology backups
+  committed despite transient missing signatures and coverage waits; the
+  second backup advanced through event 43. Its local Btrfs image, mount,
+  daemons, namespaces, and firewall rules were removed. This passing run
+  validates the corrected request path in a real topology but does not prove
+  it caused the historical 5,400-second stall, so this gate remains open.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
