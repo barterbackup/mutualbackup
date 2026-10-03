@@ -1364,6 +1364,14 @@ permission checking and pass on ext4 and fresh local Btrfs; the claimed-mount
 recovery probe also passes there. Normal store tests, formatting, and strict
 workspace Clippy pass. Enrollment remains gated on daemon ownership and
 protected view-metadata recovery.
+Claimed-mount recovery now reconstructs its manifest from the sealed native
+anchor catalog, then checks the durable plan and manifest claim before mounting.
+The privileged recovery test reopens the control store and remounts after a
+clean stop and a killed process on ext4 and fresh local Btrfs; it no longer
+supplies the old process's manifest. An unprivileged store test rejects changed
+sealed catalog bytes. All 115 normal store tests and strict workspace Clippy
+pass. This covers local restart metadata, while seed-only recovery of mutable
+view state and safe node enrollment remain open.
 `b69ce33` further makes signed endpoint sets authoritative over persistent
 bootstrap and attempt-scoped recovery hints, and prevents a pending dial to a
 withdrawn direct endpoint from holding transport selection on direct. The

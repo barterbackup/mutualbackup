@@ -51,6 +51,37 @@ pub struct GuardedViewMount {
 }
 
 impl GuardedViewMount {
+    /// Reopen a claimed view after process loss using only its durable local
+    /// claim, capture plan, and sealed manifest. No caller-held manifest is
+    /// needed; `start` still verifies the lower and placeholder identities.
+    pub fn recover_claimed(
+        anchor_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+    ) -> anyhow::Result<Self> {
+        let (claim, manifest) = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            let bytes = control
+                .get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())?
+                .ok_or_else(|| anyhow::anyhow!("guarded view has no durable mount claim"))?;
+            let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                claim.version == 1 && claim.anchor_id == anchor_id,
+                "guarded mount claim changed"
+            );
+            let manifest = GuardedRootCapturePlan::load_published_manifest(&control, anchor_id)?;
+            (claim, manifest)
+        };
+        Self::start(
+            &manifest,
+            control,
+            claim.mountpoint,
+            claim.view_uid,
+            claim.view_gid,
+        )
+    }
+
     /// Mount an existing private guarded capture. A durable claim binds the
     /// mountpoint and lower inode before FUSE becomes visible. On restart, only
     /// a dead FUSE mount with this exact source may be detached.
@@ -317,7 +348,7 @@ mod tests {
 
     use mb_core::{KeyMaterial, Seed};
 
-    use crate::{ControlStore, GuardedRootCapturePlan, StableAnchorManifest};
+    use crate::{ControlStore, GuardedRootCapturePlan};
 
     use super::{GuardedViewMount, decode_mountinfo_path};
 
@@ -340,11 +371,11 @@ mod tests {
             let control = Arc::new(Mutex::new(
                 ControlStore::open(root.join("control/control.db"), &keys).unwrap(),
             ));
-            let manifest: StableAnchorManifest =
-                mb_core::decode_canonical(&fs::read(root.join("manifest.bin")).unwrap()).unwrap();
-            let _mount =
-                GuardedViewMount::start(&manifest, control, root.join("view"), 65534, 65534)
-                    .unwrap();
+            let anchor_id: uuid::Uuid = fs::read_to_string(root.join("anchor-id"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let _mount = GuardedViewMount::recover_claimed(anchor_id, control).unwrap();
             fs::write(root.join("ready"), b"mounted").unwrap();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -445,16 +476,20 @@ mod tests {
         assert_eq!(frozen, exact_bytes);
         mount.stop().unwrap();
 
+        drop(control);
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(&control_path, &keys).unwrap(),
+        ));
+
         let remounted =
-            GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
-                .unwrap();
+            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
         remounted.check_health().unwrap();
         assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), edited);
         remounted.stop().unwrap();
 
         fs::write(
-            area.path().join("manifest.bin"),
-            mb_core::canonical_bytes(&manifest).unwrap(),
+            area.path().join("anchor-id"),
+            manifest.anchor_id.to_string(),
         )
         .unwrap();
         let mut dead = DeadMount {
@@ -485,8 +520,7 @@ mod tests {
         assert!(!dead.child.wait().unwrap().success());
         assert!(fs::read(mountpoint.join("sample")).is_err());
         let recovered =
-            GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
-                .unwrap();
+            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
         recovered.check_health().unwrap();
         assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), edited);
         recovered.stop().unwrap();

@@ -346,6 +346,54 @@ impl GuardedRootCapturePlan {
         Ok(plan)
     }
 
+    /// Rebuild a published view from the sealed anchor catalog after the
+    /// process that held its manifest has exited. The manifest claim and plan
+    /// must still identify the exact catalog bytes before a caller remounts.
+    pub(crate) fn load_published_manifest(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<StableAnchorManifest> {
+        let plan_bytes = control
+            .get_record(PLAN_KIND, anchor_id.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("guarded root has no durable capture plan"))?;
+        let plan: Self = mb_core::decode_canonical(&plan_bytes)?;
+        plan.validate()?;
+        anyhow::ensure!(plan.anchor_id == anchor_id, "guarded plan ID changed");
+        let area_path = resolve_anchor_area(&plan.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &plan.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: plan.area.filesystem_id,
+        };
+        let anchor_root = area
+            .open_child_directory(anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("guarded anchor root disappeared"))?;
+        let catalog = anchor_root
+            .open_child_file(capture_manifest_name(anchor_id))?
+            .ok_or_else(|| anyhow::anyhow!("guarded sealed manifest disappeared"))?;
+        let metadata = catalog.metadata()?;
+        anyhow::ensure!(
+            metadata.len() <= V1_MAX_CATALOG_BYTES as u64
+                && metadata.nlink() == 1
+                && unix_mode(&metadata) & 0o222 == 0,
+            "guarded sealed manifest metadata changed"
+        );
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        catalog
+            .take(V1_MAX_CATALOG_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() == metadata.len() as usize,
+            "guarded sealed manifest changed"
+        );
+        let manifest: StableAnchorManifest = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            Self::load_active_for_view(control, &manifest)? == plan,
+            "guarded sealed manifest differs from its active plan"
+        );
+        Ok(manifest)
+    }
+
     /// Decode a pending guarded plan without requiring its source volume to
     /// be online. Capture itself performs the descriptor and journal checks.
     pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
@@ -1876,6 +1924,7 @@ fn scan_directory(
 mod tests {
     use std::fs;
     use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use mb_core::{KeyMaterial, Seed};
@@ -2207,6 +2256,32 @@ mod tests {
                 .is_none()
         );
         assert!(root.join("parent/child").is_dir());
+    }
+
+    #[test]
+    fn published_manifest_recovery_rejects_changed_sealed_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([112; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let manifest = plan.capture(&store).unwrap();
+        assert_eq!(
+            GuardedRootCapturePlan::load_published_manifest(&store, plan.anchor_id).unwrap(),
+            manifest
+        );
+        let catalog = plan
+            .area
+            .path_hint
+            .join(plan.anchor_id.to_string())
+            .join(capture_manifest_name(plan.anchor_id));
+        let mut bytes = fs::read(&catalog).unwrap();
+        bytes[0] ^= 1;
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&catalog, bytes).unwrap();
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(GuardedRootCapturePlan::load_published_manifest(&store, plan.anchor_id).is_err());
     }
 
     #[test]

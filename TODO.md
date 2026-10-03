@@ -385,6 +385,14 @@
   18 privileged view probes now mount with kernel default permission checking
   and pass on ext4 and fresh local Btrfs, as does the claimed-mount recovery
   test. Normal store tests, formatting, and strict workspace Clippy pass.
+  Claimed-mount recovery now reads the published manifest from its sealed
+  anchor catalog and verifies it against the durable plan and manifest claim;
+  no caller-held manifest is needed after a daemon restart. The privileged
+  test reopens `control.db`, recovers after clean and killed-process unmounts
+  on ext4 and fresh local Btrfs, and keeps the private lower root inaccessible.
+  A normal test rejects altered sealed catalog bytes. The 115 normal store
+  tests, formatting, and strict workspace Clippy pass. Seed-only recovery of
+  mutable view metadata and node enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
