@@ -187,6 +187,70 @@ impl LinkFreezeCaptureIntent {
         Ok(OwnerIsolation::load(control, anchor_id)?.is_some())
     }
 
+    /// Once the anchor is an independent inode, restore the working inode's
+    /// original owner before the guarded view returns a writable handle. The
+    /// owner record remains until the inode and its directory entry are synced,
+    /// so a crash after `fchown` can safely repeat this step.
+    pub(crate) fn restore_detached_owner_at(
+        &self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        source_name: &Path,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Detached);
+        self.check_private_anchor(anchor_parent, self.private_inode.unwrap())?;
+        let source = source_parent.open_child_file(source_name)?.ok_or_else(|| {
+            anyhow::anyhow!("detached working file disappeared before owner restore")
+        })?;
+        let source_id = source_parent.entry_identity(source_name, false)?;
+        let metadata = source.metadata()?;
+        anyhow::ensure!(
+            source_id == Some(self.source_id)
+                && metadata.ino() == self.source_id.inode
+                && metadata.nlink() == 1,
+            "detached working file changed before owner restore"
+        );
+        let Some(owner) = OwnerIsolation::load(control, self.anchor_id)? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            owner.source_id == self.source_id
+                && ((metadata.uid(), metadata.gid()) == (owner.private_uid, owner.private_gid)
+                    || (metadata.uid(), metadata.gid())
+                        == (owner.original_uid, owner.original_gid)),
+            "detached working file has an unjournaled owner"
+        );
+        if (metadata.uid(), metadata.gid()) != (owner.original_uid, owner.original_gid) {
+            let result = unsafe {
+                libc::fchown(
+                    source.as_raw_fd(),
+                    owner.original_uid as libc::uid_t,
+                    owner.original_gid as libc::gid_t,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        source.sync_all()?;
+        let restored = source.metadata()?;
+        anyhow::ensure!(
+            (restored.uid(), restored.gid()) == (owner.original_uid, owner.original_gid)
+                && restored.ino() == self.source_id.inode
+                && restored.nlink() == 1
+                && source_parent.entry_identity(source_name, false)? == Some(self.source_id),
+            "detached working owner was not restored"
+        );
+        source_parent.sync_all()?;
+        control.delete_record_if_value(
+            OWNER_ISOLATION_KIND,
+            self.anchor_id.as_bytes(),
+            &mb_core::canonical_bytes(&owner)?,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn original_owner_for_snapshot(
         &self,
         control: &ControlStore,

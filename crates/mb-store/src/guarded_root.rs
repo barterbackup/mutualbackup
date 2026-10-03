@@ -1972,18 +1972,6 @@ impl GuardedRootCapturePlan {
             &anchor_parent,
             Path::new(anchor_name),
         )?);
-        if intent.phase() == LinkFreezeCapturePhase::Detached {
-            intent.verify_detached_anchor(control, &anchor_parent)?;
-            return Ok(());
-        }
-        anyhow::ensure!(intent.phase() == LinkFreezeCapturePhase::Frozen);
-        if LinkFreezeEditIntent::load(control, *capture_id)?
-            .as_ref()
-            .is_some_and(|edit| edit.phase() == LinkFreezeEditPhase::Editable)
-        {
-            intent.finish_detached_edit(control, &anchor_parent)?;
-            return Ok(());
-        }
         let source_root = PinnedDirectory::open(&self.source_root)?;
         anyhow::ensure!(
             source_root.identity()?
@@ -2004,7 +1992,25 @@ impl GuardedRootCapturePlan {
         let source_name = current_relative_path
             .file_name()
             .ok_or(AnchorError::UnsafePath)?;
-        intent.detach_for_edit_at(control, &source_parent, source_name, &anchor_parent)?;
+        let detached = if intent.phase() == LinkFreezeCapturePhase::Detached {
+            intent.verify_detached_anchor(control, &anchor_parent)?
+        } else {
+            anyhow::ensure!(intent.phase() == LinkFreezeCapturePhase::Frozen);
+            if LinkFreezeEditIntent::load(control, *capture_id)?
+                .as_ref()
+                .is_some_and(|edit| edit.phase() == LinkFreezeEditPhase::Editable)
+            {
+                intent.finish_detached_edit(control, &anchor_parent)?
+            } else {
+                intent.detach_for_edit_at(control, &source_parent, source_name, &anchor_parent)?
+            }
+        };
+        detached.restore_detached_owner_at(
+            control,
+            &source_parent,
+            Path::new(source_name),
+            &anchor_parent,
+        )?;
         Ok(())
     }
 
@@ -4020,6 +4026,79 @@ mod tests {
             fs::metadata(&already_private).unwrap().permissions().mode() & 0o7777,
             0o666
         );
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded owner-first capture"]
+    fn private_root_edit_restores_detached_source_owner_before_retirement() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-detached-owner-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("file");
+        let original = b"exact\r\n\0source";
+        fs::write(&source, original).unwrap();
+        let encoded = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([125; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&store, 65534, 0, 0)
+            .unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 0);
+        let capture_id = match &plan.entries[0] {
+            GuardedRootEntry::File { capture_id, .. } => *capture_id,
+            _ => panic!("planned file became a directory"),
+        };
+        let area_path = resolve_anchor_area(&plan.area).unwrap();
+        let area = PinnedDirectory {
+            file: open_stable_anchor_area(&area_path, &plan.area).unwrap(),
+            filesystem_id: plan.area.filesystem_id,
+        };
+        let anchor_root = area
+            .open_child_directory(plan.anchor_id.to_string())
+            .unwrap()
+            .unwrap();
+        let plan_hash = *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes();
+        let anchor_parent = plan
+            .claimed_file_parent(&store, &anchor_root, plan_hash, Path::new("file"))
+            .unwrap();
+        let source_parent = PinnedDirectory::open(&root).unwrap();
+        let intent = LinkFreezeCaptureIntent::load(&store, capture_id)
+            .unwrap()
+            .unwrap();
+        intent
+            .detach_for_edit_at(&store, &source_parent, Path::new("file"), &anchor_parent)
+            .unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 0);
+        assert!(LinkFreezeCaptureIntent::owner_isolation_pending(&store, capture_id).unwrap());
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        plan.prepare_file_edit_at(&store, "file", "file").unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
+        assert!(!LinkFreezeCaptureIntent::owner_isolation_pending(&store, capture_id).unwrap());
+        fs::write(&source, b"edited bytes").unwrap();
+        let mut anchor = manifest
+            .file_locator("file".to_owned())
+            .unwrap()
+            .open()
+            .unwrap();
+        let mut retained = Vec::new();
+        anchor.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, original);
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
+        assert_eq!(fs::read(&source).unwrap(), b"edited bytes");
     }
 
     #[test]

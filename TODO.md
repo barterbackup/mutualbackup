@@ -681,9 +681,14 @@
   inventory still enforces the exact final namespace before mount publication.
   Normal create/remove/replace/rename crash states, ext4 remount, and fresh
   local Btrfs remount/replace/rename probes pass, alongside 117 normal store
-  tests and strict workspace Clippy. Guarded enrollment still needs
-  restoration after FUSE path changes, owner restoration after file detach,
-  protected mutable-view metadata, and the complete privileged mount gate.
+  tests and strict workspace Clippy. A detached named file now restores its
+  original UID/GID from the durable owner journal before a writable view handle
+  returns; replay also handles a crash after detach and before owner restore.
+  The focused privileged root test passes on ext4 and fresh local Btrfs, and
+  117 normal store tests plus strict workspace Clippy pass. Guarded enrollment
+  still needs retirement after FUSE path changes, recovery of detached owner
+  obligations for removed or replaced names, protected mutable-view metadata,
+  and the complete privileged mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

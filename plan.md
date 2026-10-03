@@ -1605,9 +1605,13 @@ path before replay can mutate the lower tree; the later post-replay inventory
 still checks the exact final namespace before mount publication. Normal
 create/remove/replace/rename crash states, ext4 remount, and fresh local Btrfs
 remount/replace/rename probes pass, alongside 117 normal store tests and strict
-workspace Clippy. Restoration after FUSE path changes, detached-file owner
-recovery, signed mutable-view recovery, and the complete privileged mount gate
-remain open before ordinary user-owned roots can be enrolled.
+workspace Clippy. A detached named file now restores its original owner from
+the durable isolation journal before returning a writable handle, replaying a
+crash after detach; the focused privileged root test passes on ext4 and fresh
+local Btrfs. Retirement after FUSE path changes, removed or replaced detached-
+file owner obligations, signed mutable-view recovery, and the complete
+privileged mount gate remain open before ordinary user-owned roots can be
+enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
