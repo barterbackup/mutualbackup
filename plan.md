@@ -1147,7 +1147,10 @@ that add, checkout, merge, restore, pull, and import/export ignore inherited
 conversion settings and attributes on every file-content path.
 The local Btrfs attribute regression now also verifies that an LF-only edit
 is dirty, appears as raw bytes in `diff`, and restores the original CRLF bytes;
-the broader inherited-config and cross-command audit remains open.
+a child-process Btrfs regression also verifies raw add, status, diff, restore,
+switch, fetch/pull/push under inherited global and environment conversion
+settings, an external attributes file, and configured filters without executing
+them. The broader system/repository-config and cross-command audit remains open.
 The provisioned Git acceptance run on `3155689` passed its Git-specific slices
 but failed the five-daemon topology backup after the 5,400-second timeout
 following relay-only storage recovery. Two later isolated smoke runs and the

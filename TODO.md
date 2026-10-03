@@ -6,11 +6,14 @@
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
   now treats an LF-only edit as dirty, shows its raw diff, and restores the
-  original CRLF bytes. Complete the cross-command audit required by plan.md:
-  inherited system/global/repository/environment conversion settings,
-  `.gitattributes` and external attributes files, clean/smudge/process filters,
-  `ident`, working-tree encodings, merge renormalization, and ordinary-Git
-  import/export must never transform our file bytes or execute a filter.
+  original CRLF bytes. A child-process Btrfs regression now runs under confirmed
+  inherited `core.autocrlf`, `core.safecrlf`, environment `core.eol`, an external
+  attributes file with text/filter/ident/encoding rules, configured
+  clean/smudge/process commands, and `merge.renormalize`. Add, status, diff,
+  restore, switch, ordinary-Git fetch/pull/push, and their blob IDs remain raw;
+  no filter marker is created. Complete the cross-command audit required by
+  plan.md, including system and repository settings, `.git/info/attributes`,
+  merge results, linked worktrees, and all remaining supported commands.
 - [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out

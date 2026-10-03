@@ -1629,6 +1629,7 @@ fn publish_marker(
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
 
     use mb_store::{GIT_CATALOG_DIRECTORY, git_catalog_marker};
 
@@ -3423,6 +3424,207 @@ mod tests {
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn inherited_git_conversion_config_is_inert_for_native_history() {
+        const CHILD_ROOT: &str = "MUTUALBACKUP_RAW_CONFIG_CHILD_ROOT";
+        if let Some(run_root) = std::env::var_os(CHILD_ROOT) {
+            let run_root = PathBuf::from(run_root);
+            let source_root = run_root.join("work");
+            fs::create_dir(&source_root).unwrap();
+            let inherited = Command::new("git")
+                .args(["config", "--get", "core.autocrlf"])
+                .output()
+                .unwrap();
+            assert!(inherited.status.success());
+            assert_eq!(inherited.stdout, b"true\n");
+            let injected = Command::new("git")
+                .args(["config", "--get", "core.eol"])
+                .output()
+                .unwrap();
+            assert!(injected.status.success());
+            assert_eq!(injected.stdout, b"crlf\n");
+            let external_attributes = Command::new("git")
+                .args(["config", "--get", "core.attributesFile"])
+                .output()
+                .unwrap();
+            assert!(external_attributes.status.success());
+            assert_eq!(
+                external_attributes.stdout,
+                format!("{}\n", run_root.join("global-attributes").display()).as_bytes()
+            );
+            let attribute_probe = run_root.join("attribute-probe");
+            let initialized = Command::new("git")
+                .args(["init", "-q"])
+                .arg(&attribute_probe)
+                .output()
+                .unwrap();
+            assert!(initialized.status.success());
+            let selected = Command::new("git")
+                .arg("-C")
+                .arg(&attribute_probe)
+                .args(["check-attr", "--all", "--", "tracked.txt"])
+                .output()
+                .unwrap();
+            assert!(selected.status.success());
+            let selected = String::from_utf8(selected.stdout).unwrap();
+            for rule in [
+                "text: set",
+                "eol: lf",
+                "filter: convert",
+                "ident: set",
+                "working-tree-encoding: UTF-16",
+            ] {
+                assert!(
+                    selected.contains(rule),
+                    "missing inherited attribute {rule}: {selected}"
+                );
+            }
+            fs::write(source_root.join(".gitattributes"), b"*.other text=auto\n").unwrap();
+            fs::write(source_root.join("tracked.txt"), b"one\r\ntwo\n").unwrap();
+            let repository_id = Uuid::new_v4();
+            let local = GitRepository::init(&source_root, repository_id, &[103; 32]).unwrap();
+            local.stage_file(".gitattributes").unwrap();
+            let staged = local.stage_file("tracked.txt").unwrap();
+            let expected = Oid::hash_object(git2::ObjectType::Blob, b"one\r\ntwo\n").unwrap();
+            assert_eq!(staged.oid, expected.as_bytes());
+            local.commit("Author", "a@example.test", "raw").unwrap();
+            fs::write(source_root.join("tracked.txt"), b"one\ntwo\n").unwrap();
+            assert!(local.status().unwrap().changes.iter().any(|change| {
+                change.path == b"tracked.txt" && change.worktree == Some(crate::GitChange::Modified)
+            }));
+            let patch = local.diff(false).unwrap().patch;
+            assert!(
+                patch
+                    .windows(b"-one\r\n+one\n".len())
+                    .any(|part| part == b"-one\r\n+one\n")
+            );
+            local
+                .restore_worktree(&[PathBuf::from("tracked.txt")])
+                .unwrap();
+            assert_eq!(
+                fs::read(source_root.join("tracked.txt")).unwrap(),
+                b"one\r\ntwo\n"
+            );
+            local.create_branch("topic").unwrap();
+            local.switch_branch("topic").unwrap();
+            fs::write(source_root.join("tracked.txt"), b"topic\nraw\r\n").unwrap();
+            let staged = local.stage_file("tracked.txt").unwrap();
+            let expected = Oid::hash_object(git2::ObjectType::Blob, b"topic\nraw\r\n").unwrap();
+            assert_eq!(staged.oid, expected.as_bytes());
+            local.commit("Author", "a@example.test", "topic").unwrap();
+            local.switch_branch("main").unwrap();
+            assert_eq!(
+                fs::read(source_root.join("tracked.txt")).unwrap(),
+                b"one\r\ntwo\n"
+            );
+            let bare_root = run_root.join("remote.git");
+            git2::Repository::init_bare(&bare_root).unwrap();
+            local.push_current_branch_to_bare(&bare_root).unwrap();
+            let remote = git2::Repository::open_bare(&bare_root).unwrap();
+            let parent = remote
+                .find_commit(remote.refname_to_id("refs/heads/main").unwrap())
+                .unwrap();
+            let base_tree = parent.tree().unwrap();
+            let raw_remote = remote.blob(b"remote\r\nraw\0").unwrap();
+            let mut builder = remote.treebuilder(Some(&base_tree)).unwrap();
+            builder.insert("tracked.txt", raw_remote, 0o100644).unwrap();
+            let tree = remote.find_tree(builder.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("Remote", "remote@example.test").unwrap();
+            remote
+                .commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    "remote raw bytes",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            drop(tree);
+            drop(builder);
+            drop(base_tree);
+            drop(parent);
+            local.pull_bare(&bare_root, "", "").unwrap();
+            assert_eq!(
+                fs::read(source_root.join("tracked.txt")).unwrap(),
+                b"remote\r\nraw\0"
+            );
+            fs::write(source_root.join("tracked.txt"), b"outgoing\nraw\r\n").unwrap();
+            local.stage_file("tracked.txt").unwrap();
+            local
+                .commit("Author", "a@example.test", "outgoing")
+                .unwrap();
+            local.push_current_branch_to_bare(&bare_root).unwrap();
+            let pushed = remote
+                .find_commit(remote.refname_to_id("refs/heads/main").unwrap())
+                .unwrap();
+            let pushed_tree = pushed.tree().unwrap();
+            let pushed_blob = remote
+                .find_blob(pushed_tree.get_name("tracked.txt").unwrap().id())
+                .unwrap();
+            assert_eq!(pushed_blob.content(), b"outgoing\nraw\r\n");
+            drop(pushed_blob);
+            drop(pushed_tree);
+            drop(pushed);
+            drop(remote);
+            assert!(!run_root.join("filter-executed").exists());
+            let graph = local.export_graph_source().unwrap();
+            drop(local);
+            for blob in graph.blobs {
+                blob.anchor.remove().unwrap();
+            }
+            return;
+        }
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-inherited-config-{}", Uuid::new_v4()));
+        fs::create_dir(&run_root).unwrap();
+        let attributes_path = run_root.join("global-attributes");
+        fs::write(
+            &attributes_path,
+            b"*.txt text eol=lf filter=convert ident working-tree-encoding=UTF-16\n",
+        )
+        .unwrap();
+        let config_path = run_root.join("global-config");
+        fs::write(
+            &config_path,
+            format!(
+                "[core]\n\tautocrlf = true\n\tsafecrlf = true\n\tattributesFile = {}\n[merge]\n\trenormalize = true\n[filter \"convert\"]\n\tclean = touch {}\n\tsmudge = touch {}\n\tprocess = touch {}\n\trequired = true\n",
+                attributes_path.display(),
+                run_root.join("filter-executed").display(),
+                run_root.join("filter-executed").display(),
+                run_root.join("filter-executed").display(),
+            ),
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "repository::tests::inherited_git_conversion_config_is_inert_for_native_history",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &run_root)
+            .env("GIT_CONFIG_GLOBAL", &config_path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.eol")
+            .env("GIT_CONFIG_VALUE_0", "crlf")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child raw-config regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!run_root.join("filter-executed").exists());
         fs::remove_dir_all(run_root).unwrap();
     }
 
