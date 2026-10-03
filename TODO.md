@@ -68,6 +68,17 @@
   transitions. The gate pass establishes recovery in this run, but not the
   cause of the original intermittent missing-signer stall; keep this item open
   until that path is explained and corrected.
+  Source tracing found two further stale-address paths: persistent bootstrap
+  and attempt-scoped recovery hints were still unioned with a newer signed
+  endpoint set, and an in-flight dial to a withdrawn direct endpoint counted
+  as evidence that the direct tier remained available. The current correction
+  lets the signed set supersede those hints, moves tier selection to a current
+  endpoint or healthy connection, and retries queued requests after replacement.
+  A focused regression holds the obsolete direct dial pending while installing
+  a signed relay endpoint, then checks relay selection and signed empty-set
+  withdrawal. Verify the full provisioned topology gate on exact committed
+  source. Also inspect same-tier endpoint replacement: a pending old dial can
+  still delay a new endpoint in that tier until the old attempt terminates.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

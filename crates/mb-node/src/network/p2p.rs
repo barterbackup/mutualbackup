@@ -4142,6 +4142,14 @@ impl P2pEventLoop {
     }
 
     fn retained_peer_addresses(&self, peer: PeerId) -> BTreeSet<Multiaddr> {
+        if let Some(learned) = self.learned_addresses.get(&peer)
+            && learned.signed_record
+        {
+            // A current publisher record supersedes bootstrap, roster,
+            // Identify, and attempt-scoped hints, even when it withdraws all
+            // endpoints. The expiry sweep restores those hints later.
+            return learned.addresses.clone();
+        }
         let mut addresses = BTreeSet::new();
         if let Some(persistent) = self.persistent_addresses.get(&peer) {
             addresses.extend(persistent.iter().cloned());
@@ -4162,8 +4170,7 @@ impl P2pEventLoop {
         let tiers = policy_address_tiers(self.tor_mode, retained);
         let requested_tier = self.selected_transport_tier(peer);
         let requested_is_available = tiers.contains_key(&requested_tier)
-            || self.healthy_connection_at_tier(peer, requested_tier, None)
-            || self.policy_dial_exists(peer, requested_tier);
+            || self.healthy_connection_at_tier(peer, requested_tier, None);
         let selected_tier = if requested_is_available {
             requested_tier
         } else {
@@ -4615,6 +4622,7 @@ impl P2pEventLoop {
             },
         );
         self.reconcile_policy_addresses(peer);
+        self.drain_queued_requests(peer);
         self.forget_transfer_history_if_unretained(peer);
         Ok(())
     }
@@ -23079,12 +23087,35 @@ mod tests {
                 .unwrap();
 
         event_loop
+            .persistent_addresses
+            .insert(peer, BTreeSet::from([old_direct.clone()]));
+        event_loop
+            .add_recovery_addresses(
+                Uuid::new_v4(),
+                peer,
+                vec![old_direct.clone()],
+                unix_seconds() + 300,
+            )
+            .unwrap();
+        event_loop
             .add_learned_address(peer, old_direct.clone())
             .unwrap();
         assert_eq!(event_loop.selected_path_hint(peer), Some(P2pPath::Direct));
+        let direct_tier = path_preference_rank(event_loop.tor_mode, P2pPath::Direct);
+        let relay_tier = path_preference_rank(event_loop.tor_mode, P2pPath::Relayed);
+        assert!(event_loop.start_policy_dial(
+            peer,
+            direct_tier,
+            vec![old_direct.clone()],
+            PolicyDialKind::Selected,
+        ));
         event_loop
             .replace_learned_addresses(peer, vec![current_relay.clone()], unix_seconds() + 300)
             .unwrap();
+        assert!(event_loop.policy_dial_exists(peer, direct_tier));
+        assert_eq!(event_loop.selected_transport_tier(peer), relay_tier);
+        event_loop.ensure_selected_transport(peer);
+        assert!(event_loop.policy_dial_exists(peer, relay_tier));
         event_loop
             .add_learned_address(peer, old_direct.clone())
             .unwrap();
@@ -23095,6 +23126,10 @@ mod tests {
             event_loop.retained_peer_addresses(peer),
             BTreeSet::from([normalize_known_address(peer, current_relay).unwrap()])
         );
+        event_loop
+            .replace_learned_addresses(peer, Vec::new(), unix_seconds() + 300)
+            .unwrap();
+        assert!(event_loop.retained_peer_addresses(peer).is_empty());
     }
 
     #[tokio::test]
