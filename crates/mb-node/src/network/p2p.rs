@@ -115,6 +115,7 @@ const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
 const PREFERRED_PATH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGICAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const CODING_EVENT_DISSEMINATION_WAIT: Duration = Duration::from_secs(20);
 // A valid empty tail is only evidence that one peer is current. Keep other
 // requests alive for their full bounded logical lifetime so a slow relay or
 // Tor path can still supply the advancing tail.
@@ -8091,24 +8092,50 @@ async fn commit_verified_coding_group(
     }
     let certified = QuorumGuildEvent { event, signatures };
     state.verify_event(&certified)?;
-    for peer in guild
-        .peers
-        .iter()
-        .filter(|peer| peer.member.node_id != local_id)
-    {
-        if let Err(error) = p2p
-            .install_coding_group_event(peer.member.node_id, certified.clone(), transcript.clone())
-            .await
-        {
-            tracing::debug!(peer = %peer.member.node_id, %error, "coding-group event dissemination deferred to tail sync");
-        }
-    }
     let local_certified = certified.clone();
     let local_transcript = transcript.clone();
     node_blocking(node, move |node| {
         node.install_coding_group_event(local_certified, local_transcript)
     })
-    .await
+    .await?;
+    // The local certified tail must become available before a slow install
+    // request can delay the coordinator. Other members can also pull it from
+    // the peer-exchange loop if this bounded eager dissemination expires.
+    let mut installs = FuturesUnordered::new();
+    for peer in guild
+        .peers
+        .iter()
+        .filter(|peer| peer.member.node_id != local_id)
+    {
+        let peer_id = peer.member.node_id;
+        let event = certified.clone();
+        let evidence = transcript.clone();
+        installs.push(async move {
+            (
+                peer_id,
+                p2p.install_coding_group_event(peer_id, event, evidence)
+                    .await,
+            )
+        });
+    }
+    let deadline = tokio::time::Instant::now() + CODING_EVENT_DISSEMINATION_WAIT;
+    while !installs.is_empty() {
+        match tokio::time::timeout_at(deadline, installs.next()).await {
+            Ok(Some((peer, Err(error)))) => {
+                tracing::debug!(%peer, %error, "coding-group event dissemination deferred to tail sync");
+            }
+            Ok(Some((_, Ok(())))) => {}
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(
+                    pending = installs.len(),
+                    "coding-group event dissemination is waiting for peer tail sync"
+                );
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn finish_coding_activation(
