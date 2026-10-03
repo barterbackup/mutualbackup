@@ -1141,6 +1141,10 @@ through the Git command slices while keeping the original backend deliverables
 in scope: a command is complete only when its raw-byte, crash/reopen, and
 native-anchor storage checks pass; the milestone still requires protected graph
 recovery, physical prune, guarded link-freeze, and platform backends.
+Before closing the Git phase, re-audit commands implemented before the
+byte-exact policy was adopted. Their earlier functional gates do not establish
+that add, checkout, merge, restore, pull, and import/export ignore inherited
+conversion settings and attributes on every file-content path.
 The provisioned Git acceptance run on `3155689` passed its Git-specific slices
 but failed the five-daemon topology backup after the 5,400-second timeout
 following relay-only storage recovery. Two later isolated smoke runs and the
@@ -3272,7 +3276,8 @@ backend gates. A command being present does not by itself close its slice.
   and exported blob bytes and IDs remain identical even when a stock Git peer
   has different line-ending or filter settings; mixed LF/CRLF, binary NUL, non-UTF-8
   payloads, and conversion-inducing system/global/repository/environment
-  `core.autocrlf`, `core.eol`, and `merge.renormalize` settings and rules from
+  `core.autocrlf`, `core.eol`, `core.safecrlf`, `merge.renormalize`, and
+  `filter.<driver>.*` settings and rules from
   `.gitattributes`, `core.attributesFile`, and `.git/info/attributes` for
   `text=auto`, `eol`, `filter`, `ident`, and `working-tree-encoding` across add,
   merge, reset/restore, pull, worktree checkout, import, and export; verify a configured
