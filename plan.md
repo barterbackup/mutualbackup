@@ -1169,6 +1169,14 @@ A separate local Btrfs regression confirms that a stock Git peer's CRLF
 worktree can yield an LF blob and that our import, checkout, restore, and export
 preserve the exchanged LF blob and object ID. The Git-facing help explains that
 we do not reverse conversions already performed by a stock peer.
+The complete local Git acceptance script passed on exact source `1d961d5`:
+all 62 ignored Btrfs Git library cases, Btrfs extent measurements, node
+reopen/recovery and encrypted-history cases, stock-Git remote-helper exchange,
+and five-daemon seed recovery. The disposable Btrfs mount, network namespaces,
+firewall rules, and test daemons were cleaned up. Transient four-of-five coding
+signatures and obsolete-loopback dial warnings appeared during the network
+run, so the intermittent topology reliability issue remains open despite this
+pass.
 The provisioned Git acceptance run on `3155689` passed its Git-specific slices
 but failed the five-daemon topology backup after the 5,400-second timeout
 following relay-only storage recovery. Two later isolated smoke runs and the

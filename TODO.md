@@ -20,6 +20,10 @@
   stock-Git round trip confirms that a CRLF worktree normalized by stock Git
   imports as its LF blob, remains clean until edited, restores the exact blob
   bytes, and exports the same object ID. The CLI help explains this limit.
+  The complete local Git acceptance script passed on exact source `1d961d5`,
+  including all 62 Btrfs Git library cases, extent measurements, node recovery,
+  stock-Git remote helper, and five-daemon smoke. This does not replace the
+  remaining command-by-command byte-policy audit.
 - [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out
@@ -40,7 +44,9 @@
   coding-activation request failure recovered before the topology completed.
   `31018a0` preserves relevant signer warnings in future timeout output. Keep this
   reliability issue open until the missing-signer path is explained and
-  corrected.
+  corrected. The full local Git gate passed again on `1d961d5`; during its
+  five-daemon run, logs still showed transient four-of-five coding signatures
+  and failed dials to obsolete loopback addresses before recovery completed.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
