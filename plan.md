@@ -1210,9 +1210,12 @@ anchors through remount on ext4 and fresh local Btrfs. Directory creation now
 stages a same-filesystem inode in the protected anchor area, records its
 identity before worktree publication, and replays an interrupted creation
 without accepting a foreign target. Ordinary-user nested creation and remount
-pass on ext4 and fresh local Btrfs. Directory rename/removal, remaining
-metadata and allocation modes, concurrent handles, mount supervision/recovery,
-and guarded enrollment remain open.
+pass on ext4 and fresh local Btrfs. Empty dynamically created directories can
+now be removed through a durable identity-bound intent; restart finishes a
+partially completed removal and refuses a foreign replacement. Nested removal
+and remount pass on both filesystems. Captured-directory removal, directory
+rename, remaining metadata and allocation modes, concurrent handles, mount
+supervision/recovery, and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

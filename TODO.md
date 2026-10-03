@@ -145,11 +145,15 @@
   and rebuilds the directory map after restart. Ordinary-user nested directory
   and file creation survive FUSE remount; interruption tests cover each staging
   and publication boundary and reject a foreign target without deleting it.
-  Nine nonprivileged journal regressions, 103 normal store tests, all eleven
+  Empty dynamically created directories can now be removed through the view.
+  Removal writes a durable intent before the lower `rmdir`, and remount either
+  finishes the removal or rejects a foreign replacement. Nested removal after
+  file unlink and a second FUSE remount pass on ext4 and fresh local Btrfs.
+  Eleven nonprivileged journal regressions, 105 normal store tests, all eleven
   privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
-  Clippy pass locally. Directory rename/removal, remaining metadata and
-  allocation modes, concurrent handles, mount supervision/recovery, and
-  whole-worktree enrollment remain open.
+  Clippy pass locally. Captured-directory removal, directory rename, remaining
+  metadata and allocation modes, concurrent handles, mount supervision/recovery,
+  and whole-worktree enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
