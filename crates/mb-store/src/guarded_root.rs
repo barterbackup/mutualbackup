@@ -2501,6 +2501,44 @@ impl GuardedRootCapturePlan {
                 Some(capture)
             };
             if let Some(capture) = capture {
+                if capture.phase() == LinkFreezeCapturePhase::Detached
+                    && LinkFreezeCaptureIntent::owner_isolation_pending(control, *capture_id)?
+                {
+                    let (_, snapshot) = lower_ownership.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("detached owner has no lower ownership snapshot")
+                    })?;
+                    let original = &snapshot.entries[index + 1];
+                    let original = FileOwner {
+                        uid: original.uid,
+                        gid: original.gid,
+                    };
+                    if let Some(current) = current_path.as_deref() {
+                        let parent = self.open_source_parent_at_retirement_path(current)?;
+                        let name = current.file_name().ok_or(AnchorError::UnsafePath)?;
+                        anyhow::ensure!(
+                            parent.entry_identity(name, false)? == Some(expected_source),
+                            "detached working file differs from its namespace record"
+                        );
+                        capture.restore_detached_owner_at(
+                            control,
+                            &parent,
+                            Path::new(name),
+                            &anchor_parent,
+                        )?;
+                    } else {
+                        let lower = PinnedDirectory::open(&self.source_root)?;
+                        anyhow::ensure!(
+                            lower.identity()? == self.source_root_identity(),
+                            "guarded lower root changed before retirement"
+                        );
+                        capture.clear_unlinked_detached_owner(
+                            control,
+                            &lower,
+                            &anchor_parent,
+                            original,
+                        )?;
+                    }
+                }
                 if let Some((_, snapshot)) = &lower_ownership {
                     let original = &snapshot.entries[index + 1];
                     capture.retire_unreferenced_with_original_owner(
@@ -3205,10 +3243,16 @@ fn scan_directory(
 mod tests {
     use std::fs;
     use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     use std::path::Path;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
 
     use mb_core::{KeyMaterial, Seed};
+
+    use crate::GuardedViewMount;
 
     use super::{scan_root_inventory, *};
 
@@ -4253,6 +4297,173 @@ mod tests {
         plan.discard_unreferenced(&store).unwrap();
         assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
         assert_eq!(fs::read(&source).unwrap(), b"edited bytes");
+    }
+
+    #[test]
+    #[ignore = "requires root, CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn detached_owner_journal_retires_after_view_remove_replace_or_move() {
+        for operation in ["remove", "replace", "move"] {
+            let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+                Some(root) => tempfile::Builder::new()
+                    .prefix("mb-guarded-detached-retire-")
+                    .tempdir_in(root)
+                    .unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let public = tempfile::Builder::new()
+                .prefix("mb-guarded-detached-view-")
+                .tempdir_in(area.path().parent().unwrap())
+                .unwrap();
+            fs::set_permissions(public.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let lower = area.path().join("lower");
+            let mountpoint = public.path().join("view");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(&mountpoint).unwrap();
+            fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+            let target = lower.join("target");
+            let original = b"detached\r\n\0bytes";
+            fs::write(&target, original).unwrap();
+            let target_path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                unsafe { libc::chown(target_path.as_ptr(), 65534, 65534) },
+                0
+            );
+            if operation == "replace" {
+                let source = lower.join("source");
+                fs::write(&source, b"replacement bytes").unwrap();
+                let source_path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+                assert_eq!(
+                    unsafe { libc::chown(source_path.as_ptr(), 65533, 65533) },
+                    0
+                );
+            }
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([129; 32]));
+            let database_path = area.path().join("control.db");
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&database_path, &keys).unwrap(),
+            ));
+            let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+            let manifest = plan
+                .capture_private_file_owners(&control.lock().unwrap(), 65534, 0, 0)
+                .unwrap();
+            plan.isolate_lower_directories(&control.lock().unwrap(), &manifest)
+                .unwrap();
+            let capture_id = plan
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GuardedRootEntry::File {
+                        path, capture_id, ..
+                    } if path == "target" => Some(*capture_id),
+                    _ => None,
+                })
+                .unwrap();
+            {
+                let store = control.lock().unwrap();
+                let area_path = resolve_anchor_area(&plan.area).unwrap();
+                let area_root = PinnedDirectory {
+                    file: open_stable_anchor_area(&area_path, &plan.area).unwrap(),
+                    filesystem_id: plan.area.filesystem_id,
+                };
+                let anchor_root = area_root
+                    .open_child_directory(plan.anchor_id.to_string())
+                    .unwrap()
+                    .unwrap();
+                let plan_hash = *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes();
+                let anchor_parent = plan
+                    .claimed_file_parent(&store, &anchor_root, plan_hash, Path::new("target"))
+                    .unwrap();
+                let source_parent = PinnedDirectory::open(&lower).unwrap();
+                let detached = LinkFreezeCaptureIntent::load(&store, capture_id)
+                    .unwrap()
+                    .unwrap()
+                    .detach_for_edit_at(&store, &source_parent, Path::new("target"), &anchor_parent)
+                    .unwrap();
+                if operation == "remove" {
+                    let alias = lower.join("moved-target");
+                    fs::rename(&target, &alias).unwrap();
+                    assert!(
+                        detached
+                            .clear_unlinked_detached_owner(
+                                &store,
+                                &source_parent,
+                                &anchor_parent,
+                                FileOwner {
+                                    uid: 65534,
+                                    gid: 65534,
+                                },
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        LinkFreezeCaptureIntent::owner_isolation_pending(&store, capture_id)
+                            .unwrap()
+                    );
+                    fs::rename(&alias, &target).unwrap();
+                }
+                assert!(
+                    LinkFreezeCaptureIntent::owner_isolation_pending(&store, capture_id).unwrap()
+                );
+            }
+            let mount =
+                GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
+                    .unwrap();
+            let (script, from, to) = match operation {
+                "remove" => (
+                    "import os,sys; os.unlink(sys.argv[2])",
+                    mountpoint.join("source"),
+                    mountpoint.join("target"),
+                ),
+                "replace" => (
+                    "import os,sys; os.rename(sys.argv[1],sys.argv[2])",
+                    mountpoint.join("source"),
+                    mountpoint.join("target"),
+                ),
+                "move" => (
+                    "import os,sys; os.rename(sys.argv[1],sys.argv[2])",
+                    mountpoint.join("target"),
+                    mountpoint.join("moved"),
+                ),
+                _ => unreachable!(),
+            };
+            let result = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg(script)
+                .arg(from)
+                .arg(to)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{operation}: {result:?}");
+            mount.stop().unwrap();
+            drop(control);
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&database_path, &keys).unwrap(),
+            ));
+            let remounted =
+                GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control))
+                    .unwrap();
+            assert_eq!(mountpoint.join("target").exists(), operation == "replace");
+            assert_eq!(mountpoint.join("moved").exists(), operation == "move");
+            remounted.stop().unwrap();
+            let store = control.lock().unwrap();
+            assert!(LinkFreezeCaptureIntent::owner_isolation_pending(&store, capture_id).unwrap());
+            GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
+            plan.discard_unreferenced(&store).unwrap();
+            assert!(!LinkFreezeCaptureIntent::owner_isolation_pending(&store, capture_id).unwrap());
+            assert_eq!(target.exists(), operation == "replace");
+            if operation == "replace" {
+                assert_eq!(fs::read(&target).unwrap(), b"replacement bytes");
+                assert_eq!(fs::metadata(&target).unwrap().uid(), 65533);
+                assert!(!lower.join("source").exists());
+            } else if operation == "move" {
+                let moved = lower.join("moved");
+                assert_eq!(fs::read(&moved).unwrap(), original);
+                assert_eq!(fs::metadata(&moved).unwrap().uid(), 65534);
+            }
+        }
     }
 
     #[test]

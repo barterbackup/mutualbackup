@@ -1620,10 +1620,14 @@ owner-before-mode restore; malformed or replaced directories refuse retirement.
 Captured directory removal/replacement now retires after a bounded lower-tree
 inode-absence proof; a replacement directory restores its owner and mode at the
 verified target path. Ordinary-user rmdir/replace, remount, and retirement pass
-on ext4 and fresh local Btrfs, alongside 118 normal store tests and strict
-workspace Clippy. Removed or replaced detached-file owner obligations, signed
-mutable-view recovery, and the complete privileged mount gate remain open
-before ordinary user-owned roots can be enrolled.
+on ext4 and fresh local Btrfs. A detached capture's pending owner journal now
+restores the original owner at a verified moved view name, or is released after
+unlink/replacement only after a bounded lower-tree inode-absence proof. A
+surviving moved name refuses cleanup. Ordinary-user remove, replace, move,
+remount, and retirement pass on ext4 and fresh local Btrfs, alongside 118
+normal store tests and strict workspace Clippy. Signed mutable-view recovery
+and the complete privileged mount gate remain open before ordinary user-owned
+roots can be enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

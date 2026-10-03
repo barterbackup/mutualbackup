@@ -161,9 +161,13 @@ impl LinkFreezeCaptureIntent {
     ) -> anyhow::Result<()> {
         let isolated = OwnerIsolation::load(control, self.anchor_id)?;
         if let Some(record) = &isolated {
+            // A crash can leave the owner journal after the anchor detached;
+            // root retirement resolves that journal against the final view name.
             anyhow::ensure!(
-                self.phase == LinkFreezeCapturePhase::Frozen
-                    && record.source_id == self.source_id
+                matches!(
+                    self.phase,
+                    LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
+                ) && record.source_id == self.source_id
                     && (record.original_uid, record.original_gid) == (original.uid, original.gid),
                 "frozen owner isolation differs from lower ownership snapshot"
             );
@@ -243,6 +247,40 @@ impl LinkFreezeCaptureIntent {
             "detached working owner was not restored"
         );
         source_parent.sync_all()?;
+        control.delete_record_if_value(
+            OWNER_ISOLATION_KIND,
+            self.anchor_id.as_bytes(),
+            &mb_core::canonical_bytes(&owner)?,
+        )?;
+        Ok(())
+    }
+
+    /// A detached working inode that was removed through the guarded view has
+    /// no surviving name at which to restore ownership. Release its journal
+    /// only after proving that the original inode is absent from the lower
+    /// tree; a move or unknown hard-link alias must keep retirement blocked.
+    pub(crate) fn clear_unlinked_detached_owner(
+        &self,
+        control: &ControlStore,
+        lower: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+        original: FileOwner,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Detached);
+        self.clone()
+            .verify_detached_anchor(control, anchor_parent)?;
+        let Some(owner) = OwnerIsolation::load(control, self.anchor_id)? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            owner.source_id == self.source_id
+                && (owner.original_uid, owner.original_gid) == (original.uid, original.gid),
+            "detached owner journal differs from lower ownership snapshot"
+        );
+        anyhow::ensure!(
+            !lower.contains_descendant_id(self.source_id)?,
+            "detached working file still has a lower-tree name"
+        );
         control.delete_record_if_value(
             OWNER_ISOLATION_KIND,
             self.anchor_id.as_bytes(),

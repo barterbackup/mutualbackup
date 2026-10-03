@@ -702,11 +702,15 @@
   bounded descriptor walk proves that the removed inode has no remaining name
   in the lower tree; a replacement source directory still restores its owner
   and mode at the verified target path. An ordinary-user rmdir/replace,
-  remount, and final retirement pass on ext4 and fresh local Btrfs, alongside
-  118 normal store tests and strict workspace Clippy. Guarded enrollment still
-  needs recovery of detached owner obligations for removed or replaced file
-  names, protected mutable-view metadata, and the complete privileged mount
-  gate.
+  remount, and final retirement pass on ext4 and fresh local Btrfs. A detached
+  file whose owner journal survived a crash now restores its original owner at
+  a verified moved view name, or clears that journal after unlink/replacement
+  only when a bounded scan proves the original inode has no lower-tree name.
+  A surviving moved name refuses journal cleanup. Ordinary-user remove,
+  replace, move, remount, and final retirement pass on ext4 and fresh local
+  Btrfs; 118 normal store tests and strict workspace Clippy pass. Guarded
+  enrollment still needs protected mutable-view metadata and the complete
+  privileged mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
