@@ -42,7 +42,9 @@ them as ADRs and test vectors before promising wire compatibility.
   and configuration that request conversion are inert for file content in our
   binary; their presence must not prevent raw-byte operations. This policy
   covers local staging, history, checkout, merge, and interoperability with
-  ordinary Git.
+  ordinary Git. A later change to attributes or configuration must not rewrite
+  a staged or committed blob; only an explicit stage of changed file bytes may
+  change its blob ID.
   Git-compatible object IDs describe the bytes actually retained in native
   anchors. Treat Git's automatic conversion settings as disabled in our binary,
   including when opening an existing repository or importing a commit. `add`
@@ -3505,7 +3507,8 @@ backend gates. A command being present does not by itself close its slice.
   prune/GC. Verify a configured filter is never executed, and reject command
   options that enable renormalization or filters without changing index, refs,
   anchors, or worktree. Verify that transforming rules remain present but inert
-  while raw-byte commands succeed;
+  while raw-byte commands succeed, including after those rules change between
+  staging, commit, checkout, and an ordinary-Git exchange;
   verify `status` and `diff` report a line-ending-only edit as dirty and
   destructive worktree operations protect that edit;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
