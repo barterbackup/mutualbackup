@@ -1340,6 +1340,20 @@ A separate-process probe now kills the mounted FUSE daemon and confirms new
 view access fails while an ordinary user remains unable to read the private
 lower file. It passes on ext4 and fresh local Btrfs. Mount supervision and
 recovered guarded enrollment remain open.
+`b69ce33` further makes signed endpoint sets authoritative over persistent
+bootstrap and attempt-scoped recovery hints, and prevents a pending dial to a
+withdrawn direct endpoint from holding transport selection on direct. The
+focused direct-to-relay regression and strict workspace Clippy pass. The full
+provisioned Git gate passed on this exact commit, including all 62 Btrfs Git
+cases and the five-daemon recovery test in 1,503.94 seconds; disposable mount,
+image, daemon, namespace, link, and firewall resources were cleaned up. During
+the topology test, the coordinator temporarily had four of five signatures at
+event 36 while all four peers were connected, including the recovered storage
+peer over RelayFallback. Read-only state copies showed matching proposal-lock
+prefixes for event 37 on all five members. The guild advanced to event 42 and
+the backup committed. Keep the intermittent signature-response issue open;
+obsolete loopback retries continued but did not prevent relay traffic in this
+run.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

@@ -76,9 +76,21 @@
   endpoint or healthy connection, and retries queued requests after replacement.
   A focused regression holds the obsolete direct dial pending while installing
   a signed relay endpoint, then checks relay selection and signed empty-set
-  withdrawal. Verify the full provisioned topology gate on exact committed
-  source. Also inspect same-tier endpoint replacement: a pending old dial can
+  withdrawal. Also inspect same-tier endpoint replacement: a pending old dial can
   still delay a new endpoint in that tier until the old attempt terminates.
+  The complete provisioned Git gate passed on exact commit `b69ce33`: all 62
+  Btrfs Git cases, extent and node/recovery tests, stock-Git remote helper,
+  and the five-daemon test (1,503.94 seconds). Its disposable mount, image,
+  daemons, namespaces, links, and firewall chains were removed. The topology
+  run nevertheless reproduced temporary four-of-five signatures at guild
+  event sequence 36 and old loopback retries. Read-only status showed all four
+  peers active, including increasing RelayFallback traffic to the recovered
+  storage peer; read-only state copies showed the same proposed-event-37 lock
+  prefix on all five members. The guild later advanced to event 42 and the
+  backup committed. Thus stale loopback retries alone do not explain the
+  missing response in this run. Identify the failing signer/request path and
+  distinguish transport loss from signature collection or lock handling;
+  plain lifecycle signer failures are currently logged only at debug level.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
