@@ -4024,19 +4024,12 @@ struct DirectoryStream(*mut libc::DIR);
 #[cfg(target_os = "linux")]
 impl DirectoryStream {
     fn open(directory: &File) -> Result<Self, AnchorError> {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::IntoRawFd;
 
-        let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if descriptor < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if unsafe { libc::lseek(descriptor, 0, libc::SEEK_SET) } < 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(descriptor);
-            }
-            return Err(error.into());
-        }
+        // dup would share the parent's directory offset with other inventory
+        // walks. Open the pinned inode again so each bounded scan has its own
+        // cursor and does not advance the user's atime where O_NOATIME applies.
+        let descriptor = reopen_pinned_file(directory, true, Path::new(""))?.into_raw_fd();
         let stream = unsafe { libc::fdopendir(descriptor) };
         if stream.is_null() {
             let error = std::io::Error::last_os_error();
@@ -5229,6 +5222,30 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(root.entry_identity("source", true).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_directory_streams_have_independent_cursors() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["first", "second", "third"] {
+            fs::write(temp.path().join(name), b"content").unwrap();
+        }
+        let root = PinnedDirectory::open(temp.path()).unwrap();
+        let mut left = DirectoryStream::open(root.as_file()).unwrap();
+        let mut right = DirectoryStream::open(root.as_file()).unwrap();
+        let first = left.next_name().unwrap().unwrap();
+        assert_eq!(right.next_name().unwrap(), Some(first.clone()));
+        let mut left_names = BTreeSet::from([first.clone()]);
+        let mut right_names = BTreeSet::from([first]);
+        while let Some(name) = left.next_name().unwrap() {
+            left_names.insert(name);
+        }
+        while let Some(name) = right.next_name().unwrap() {
+            right_names.insert(name);
+        }
+        assert_eq!(left_names, right_names);
+        assert_eq!(left_names.len(), 3);
     }
 
     #[cfg(target_os = "linux")]

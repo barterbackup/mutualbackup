@@ -719,6 +719,12 @@
   ext4 and fresh default-atime Btrfs after these corrections, alongside 118
   normal store tests and strict workspace Clippy. Signed view-metadata
   recovery and guarded enrollment remain open.
+  Concurrent inventory walks now open independent, identity-checked directory
+  descriptors instead of duplicating one shared read offset. A regression
+  interleaves two streams over the same directory and proves that both see all
+  names. The 119 normal store tests, strict workspace Clippy, and all 18
+  privileged FUSE probes pass on ext4 and fresh default-atime Btrfs. Signed
+  metadata recovery and guarded enrollment remain open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

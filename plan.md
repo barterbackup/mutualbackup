@@ -1634,6 +1634,11 @@ reads advanced a user-set atime during remount; pinned reads now request
 `O_NOATIME` where permitted. The passthrough probe also places its temporary
 parent on the provisioned filesystem. These local corrections preserve view
 atime but do not provide signed recovery or finish guarded enrollment.
+Internal inventory streams now reopen the pinned directory with an independent
+read offset and identity check, so concurrent scans cannot consume each
+other's entries. The interleaved-stream regression, 119 normal store tests,
+strict workspace Clippy, and all 18 privileged FUSE probes pass on ext4 and
+fresh default-atime Btrfs. Signed metadata recovery remains open.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
