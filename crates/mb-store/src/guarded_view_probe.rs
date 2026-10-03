@@ -50,6 +50,7 @@ const DIRECTORY_REMOVE_KIND: &str = "guarded-view-directory-remove-v1";
 const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
 const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
+const DIRECTORY_MODE_KIND: &str = "guarded-view-directory-mode-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NamespaceRecord {
@@ -108,6 +109,12 @@ struct DirectoryReplaceIntent {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RootModeRecord {
+    version: u16,
+    mode: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectoryModeRecord {
     version: u16,
     mode: u16,
 }
@@ -189,6 +196,34 @@ impl GuardedNamespace {
             .lock()
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
             .put_record(ROOT_MODE_KIND, self.anchor_id.as_bytes(), &bytes)
+            .map_err(io::Error::other)
+    }
+
+    fn directory_mode(&self, inode: u64) -> anyhow::Result<Option<u16>> {
+        let bytes = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .get_record(DIRECTORY_MODE_KIND, &self.record_id(inode))?;
+        bytes
+            .map(|bytes| {
+                let record: DirectoryModeRecord = mb_core::decode_canonical(&bytes)?;
+                ensure!(
+                    record.version == 1 && record.mode & !0o7777 == 0,
+                    "invalid guarded directory mode record"
+                );
+                Ok(record.mode)
+            })
+            .transpose()
+    }
+
+    fn store_directory_mode(&self, inode: u64, mode: u16) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(&DirectoryModeRecord { version: 1, mode })
+            .map_err(io::Error::other)?;
+        self.control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record(DIRECTORY_MODE_KIND, &self.record_id(inode), &bytes)
             .map_err(io::Error::other)
     }
 
@@ -313,21 +348,44 @@ impl GuardedNamespace {
         Ok(())
     }
 
-    fn store_directory_create(&self, inode: u64, intent: &DirectoryCreateIntent) -> io::Result<()> {
-        let bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
-        let inserted = self
+    fn store_directory_create_with_mode(
+        &self,
+        inode: u64,
+        intent: &DirectoryCreateIntent,
+        mode: u16,
+    ) -> io::Result<()> {
+        let id = self.record_id(inode);
+        let intent_bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
+        let mode_bytes = mb_core::canonical_bytes(&DirectoryModeRecord { version: 1, mode })
+            .map_err(io::Error::other)?;
+        let mut control = self
             .control
             .lock()
-            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
-            .put_record_if_absent(DIRECTORY_CREATE_KIND, &self.record_id(inode), &bytes)
-            .map_err(io::Error::other)?;
-        if !inserted {
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        if control
+            .get_record(DIRECTORY_CREATE_KIND, &id)
+            .map_err(io::Error::other)?
+            .is_some()
+            || control
+                .get_record(DIRECTORY_MODE_KIND, &id)
+                .map_err(io::Error::other)?
+                .is_some()
+            || control
+                .get_record(DIRECTORY_KIND, &id)
+                .map_err(io::Error::other)?
+                .is_some()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "guarded directory inode already recorded",
             ));
         }
-        Ok(())
+        control
+            .put_records(&[
+                (DIRECTORY_CREATE_KIND.to_owned(), id.clone(), intent_bytes),
+                (DIRECTORY_MODE_KIND.to_owned(), id, mode_bytes),
+            ])
+            .map_err(io::Error::other)
     }
 
     fn advance_directory_create(
@@ -443,7 +501,10 @@ impl GuardedNamespace {
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
             .put_records_and_delete(
                 &[(DIRECTORY_KIND.to_owned(), id.clone(), bytes)],
-                &[(DIRECTORY_REMOVE_KIND.to_owned(), id)],
+                &[
+                    (DIRECTORY_REMOVE_KIND.to_owned(), id.clone()),
+                    (DIRECTORY_MODE_KIND.to_owned(), id),
+                ],
             )
             .map_err(io::Error::other)
     }
@@ -904,14 +965,22 @@ impl GuardedNamespace {
                         "unidentified guarded staging directory is not empty"
                     );
                 }
-                self.control
+                let id = self.record_id(inode);
+                let control = self
+                    .control
                     .lock()
-                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
-                    .delete_record_if_value(
-                        DIRECTORY_CREATE_KIND,
-                        &self.record_id(inode),
-                        &bytes,
-                    )?;
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                ensure!(
+                    control.get_record(DIRECTORY_CREATE_KIND, &id)? == Some(bytes),
+                    "guarded directory creation intent changed during replay"
+                );
+                control.put_records_and_delete(
+                    &[],
+                    &[
+                        (DIRECTORY_CREATE_KIND.to_owned(), id.clone()),
+                        (DIRECTORY_MODE_KIND.to_owned(), id),
+                    ],
+                )?;
             }
         }
         Ok(())
@@ -1211,9 +1280,12 @@ impl GuardedNamespace {
                 lower.identity()? == expected,
                 "guarded directory changed after publication"
             );
-            // Directory inodes are never frozen. Their lower mode is the
-            // user's current mode, including a chmod after capture.
-            let mode = (lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
+            // Historical views kept user-visible directory modes on the lower
+            // inode. New mode records take precedence so lower directories
+            // can remain private even after owner chmod or mkdir.
+            let mode = self
+                .directory_mode(inode)?
+                .unwrap_or((lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16);
             let mut attr = probe_directory_attr(lower.as_file(), INodeNo(inode), mode)?;
             attr.uid = view_uid;
             attr.gid = view_gid;
@@ -2506,7 +2578,14 @@ impl GuardedProbeView {
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
         attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
-        attr.perm = (metadata.permissions().mode() & 0o7777) as u16;
+        attr.perm = self
+            .namespace
+            .as_ref()
+            .map(|namespace| namespace.directory_mode(directory.attr.ino.0))
+            .transpose()
+            .map_err(io::Error::other)?
+            .flatten()
+            .unwrap_or((metadata.permissions().mode() & 0o7777) as u16);
         Ok(attr)
     }
 }
@@ -2959,9 +3038,11 @@ impl Filesystem for GuardedProbeView {
                     return Err(io::Error::other("guarded directory identity changed"));
                 }
                 if let Some(mode) = mode {
-                    lower
-                        .as_file()
-                        .set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
+                    let namespace = self
+                        .namespace
+                        .as_ref()
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
+                    namespace.store_directory_mode(inode.0, (mode & 0o7777) as u16)?;
                 }
                 if let Some(times) = requested_file_times(atime, mtime) {
                     lower.as_file().set_times(times)?;
@@ -3233,7 +3314,9 @@ impl Filesystem for GuardedProbeView {
             target: target.as_os_str().as_bytes().to_vec(),
             expected: None,
         };
-        if let Err(error) = namespace.store_directory_create(inode, &intent) {
+        let visible_mode = ((mode & !umask) & 0o777) as u16;
+        if let Err(error) = namespace.store_directory_create_with_mode(inode, &intent, visible_mode)
+        {
             reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
             return;
         }
@@ -3241,11 +3324,11 @@ impl Filesystem for GuardedProbeView {
             let staged = staging_area
                 .create_child_directory(&intent.staging_name)
                 .map_err(io::Error::other)?;
-            // Staging is daemon-owned, so never install setuid/setgid bits
-            // requested through the view's remapped owner.
+            // The visible mode is journaled separately. Never make this
+            // private lower directory writable through group or other bits.
             staged
                 .as_file()
-                .set_permissions(fs::Permissions::from_mode((mode & !umask) & 0o777))?;
+                .set_permissions(fs::Permissions::from_mode(0o700))?;
             staged.sync_all().map_err(io::Error::other)?;
             staging_area.sync_all().map_err(io::Error::other)?;
             let before = intent.clone();
@@ -3266,8 +3349,7 @@ impl Filesystem for GuardedProbeView {
                 .move_child_directory_no_replace(&intent.staging_name, expected, lower_parent, name)
                 .map_err(io::Error::other)?;
             namespace.finish_directory_create(inode, &intent)?;
-            let actual_mode = (staged.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
-            let mut attr = probe_directory_attr(staged.as_file(), INodeNo(inode), actual_mode)?;
+            let mut attr = probe_directory_attr(staged.as_file(), INodeNo(inode), visible_mode)?;
             attr.uid = self.root_uid;
             attr.gid = self.root_gid;
             Ok(GuardedProbeDirectory {
@@ -4495,7 +4577,9 @@ mod tests {
                 target: name.as_bytes().to_vec(),
                 expected: None,
             };
-            journal.store_directory_create(2, &intent).unwrap();
+            journal
+                .store_directory_create_with_mode(2, &intent, 0o755)
+                .unwrap();
             let mut staged = None;
             if phase >= 1 {
                 let directory = staging.create_child_directory(&stage_name).unwrap();
@@ -4554,6 +4638,10 @@ mod tests {
             let published = phase >= 2;
             assert_eq!(lower.join(&name).is_dir(), published);
             assert_eq!(visible.len(), usize::from(published));
+            assert_eq!(
+                journal.directory_mode(2).unwrap(),
+                published.then_some(0o755)
+            );
             assert_eq!(
                 control
                     .lock()
@@ -4614,7 +4702,9 @@ mod tests {
                 target: name.as_bytes().to_vec(),
                 expected: None,
             };
-            journal.store_directory_create(2, &intent).unwrap();
+            journal
+                .store_directory_create_with_mode(2, &intent, 0o755)
+                .unwrap();
             let staged = staging.create_child_directory(&stage_name).unwrap();
             if identity_recorded {
                 let before = intent.clone();
@@ -4656,6 +4746,7 @@ mod tests {
                 foreign_id
             );
             assert!(staging.open_child_directory(&stage_name).unwrap().is_some());
+            assert_eq!(journal.directory_mode(2).unwrap(), Some(0o755));
             assert!(
                 control
                     .lock()
@@ -6657,7 +6748,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import os,sys; os.chmod(sys.argv[1],0o755); os.chmod(sys.argv[2],0o750); os.chmod(sys.argv[3],0o710)")
+                .arg("import os,sys; os.chmod(sys.argv[1],0o755); os.chmod(sys.argv[2],0o750); os.chmod(sys.argv[3],0o777)")
                 .arg(&mountpoint)
                 .arg(mountpoint.join("nested"))
                 .arg(mountpoint.join("nested/newdir"))
@@ -6669,7 +6760,24 @@ mod tests {
             );
             anyhow::ensure!(fs::metadata(&lower)?.permissions().mode() & 0o7777 == 0o700);
             anyhow::ensure!(fs::metadata(&mountpoint)?.permissions().mode() & 0o7777 == 0o755);
-            anyhow::ensure!(fs::metadata(&nested)?.permissions().mode() & 0o7777 == 0o750);
+            anyhow::ensure!(fs::metadata(&nested)?.permissions().mode() & 0o7777 == 0o700);
+            anyhow::ensure!(
+                fs::metadata(nested.join("newdir"))?.permissions().mode() & 0o7777 == 0o700
+            );
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("nested"))?
+                    .permissions()
+                    .mode()
+                    & 0o7777
+                    == 0o750
+            );
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("nested/newdir"))?
+                    .permissions()
+                    .mode()
+                    & 0o7777
+                    == 0o777
+            );
             let private_read = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
@@ -6756,7 +6864,7 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o7777
-                    == 0o710
+                    == 0o777
             );
             anyhow::ensure!(!mountpoint.join("nested/leaf").exists());
             anyhow::ensure!(fs::read(mountpoint.join("nested/moved"))?.starts_with(b"EDIT"));

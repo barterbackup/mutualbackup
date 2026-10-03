@@ -534,6 +534,18 @@
   The manual ownership step is not a replayable enrollment transition and does
   not protect mutable view metadata in signed recovery, so enrollment remains
   gated.
+  New guarded-view directories now keep their lower inodes at `0700`, while an
+  atomic create intent and virtual mode record preserve the requested mode
+  through replay and remount. Owner `chmod` of captured and dynamic directories
+  changes that virtual mode without widening lower access. A privileged mount
+  probe verifies that an ordinary-user `0777` directory stays `0700` below the
+  view before and after remount; the nested guarded probe checks the same for
+  captured and newly created directories. All 18 privileged guarded-view
+  probes pass on ext4 and, sequentially, fresh local Btrfs; the mount-recovery
+  probe passes on both, as do 115 normal store tests and strict workspace
+  Clippy. Existing captured lower directories still need a replayable
+  ownership/mode isolation transition, and virtual view modes still need
+  protected seed-only recovery before guarded enrollment can be enabled.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

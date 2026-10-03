@@ -824,6 +824,32 @@ print('DONE', flush=True)
         let mut frozen = Vec::new();
         anchor.read_to_end(&mut frozen).unwrap();
         assert_eq!(frozen, exact_bytes);
+        let public_directory = mountpoint.join("public");
+        let user_mkdir = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; os.mkdir(sys.argv[1],0o777); os.chmod(sys.argv[1],0o777)")
+            .arg(&public_directory)
+            .output()
+            .unwrap();
+        assert!(user_mkdir.status.success(), "{user_mkdir:?}");
+        assert_eq!(
+            fs::metadata(&public_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(lower.join("public"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
         mount.stop().unwrap();
 
         drop(control);
@@ -837,6 +863,31 @@ print('DONE', flush=True)
         let remounted = recovered_mounts.pop().unwrap();
         remounted.check_health().unwrap();
         assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), edited);
+        assert_eq!(
+            fs::metadata(&public_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(lower.join("public"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        let user_rmdir = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; os.rmdir(sys.argv[1])")
+            .arg(&public_directory)
+            .output()
+            .unwrap();
+        assert!(user_rmdir.status.success(), "{user_rmdir:?}");
         remounted.stop().unwrap();
 
         fs::write(
