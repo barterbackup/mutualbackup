@@ -1271,6 +1271,11 @@ supervision, and protected recovery of the virtual root mode remain gated.
 The ordinary-user two-file probe also verifies that `fchmod` through a
 read-only descriptor detaches the source before changing its mode and leaves
 the private anchor intact on ext4 and fresh local Btrfs.
+The guarded view now reports real regular-file access/modified times and
+accepts owner `utime` only after durable detach. A first-mutation probe verifies
+nanosecond values and exact anchor bytes on ext4 and fresh local Btrfs; all 13
+privileged guarded probes, 112 normal store tests, formatting, and strict
+workspace Clippy pass. Directory and change-time metadata remain to be done.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

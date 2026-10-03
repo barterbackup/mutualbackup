@@ -213,6 +213,13 @@
   first detaches the source and changes its visible mode while the private
   anchor remains byte-exact at its protected mode; it passes on ext4 and fresh
   local Btrfs.
+  Regular-file `atime` and `mtime` now come from the source inode rather than
+  epoch placeholders. Owner `utime` detaches a frozen file before changing its
+  nanosecond timestamps; its privileged probe passes on ext4 and fresh local
+  Btrfs. The 112 normal store tests, all 13 privileged guarded probes on both
+  filesystems, formatting, and strict workspace Clippy pass. Directory and
+  change-time fidelity, protected root-mode recovery, and mount supervision
+  remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

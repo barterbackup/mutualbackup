@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1616,6 +1616,8 @@ impl GuardedProbeFile {
         attr.size = metadata.len();
         attr.blocks = metadata.blocks();
         attr.nlink = metadata.nlink() as u32;
+        attr.atime = metadata.accessed()?;
+        attr.mtime = metadata.modified()?;
         Ok(*attr)
     }
 
@@ -2445,8 +2447,8 @@ fn probe_file_attr(source: &File, inode: INodeNo, advertised_mode: u16) -> io::R
         ino: inode,
         size: metadata.len(),
         blocks: metadata.blocks(),
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
+        atime: metadata.accessed()?,
+        mtime: metadata.modified()?,
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
         kind: FileType::RegularFile,
@@ -2618,11 +2620,9 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        if (mode.is_none() && size.is_none())
+        if (mode.is_none() && size.is_none() && atime.is_none() && mtime.is_none())
             || uid.is_some()
             || gid.is_some()
-            || atime.is_some()
-            || mtime.is_some()
             || ctime.is_some()
             || crtime.is_some()
             || chgtime.is_some()
@@ -2738,6 +2738,22 @@ impl Filesystem for GuardedProbeView {
             }
             if let Some(mode) = mode {
                 source.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
+            }
+            if atime.is_some() || mtime.is_some() {
+                let mut times = FileTimes::new();
+                if let Some(atime) = atime {
+                    times = times.set_accessed(match atime {
+                        TimeOrNow::SpecificTime(time) => time,
+                        TimeOrNow::Now => SystemTime::now(),
+                    });
+                }
+                if let Some(mtime) = mtime {
+                    times = times.set_modified(match mtime {
+                        TimeOrNow::SpecificTime(time) => time,
+                        TimeOrNow::Now => SystemTime::now(),
+                    });
+                }
+                source.set_times(times)?;
             }
             source.sync_all()?;
             if let Some(mode) = mode {
@@ -5072,6 +5088,7 @@ mod tests {
     enum FirstMutation {
         WritableOpen,
         OwnerChmod,
+        OwnerTimes,
         PathTruncate,
         OpenTruncate,
         Allocate,
@@ -5176,6 +5193,9 @@ mod tests {
                     "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)"
                 }
                 FirstMutation::OwnerChmod => "import os,sys; os.chmod(sys.argv[1],0o600)",
+                FirstMutation::OwnerTimes => {
+                    "import os,sys; os.utime(sys.argv[1],ns=(1600000001987654321,1600000000123456789))"
+                }
                 FirstMutation::PathTruncate => "import os,sys; os.truncate(sys.argv[1],3)",
                 FirstMutation::OpenTruncate => {
                     "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_TRUNC); os.write(fd,b'REPLACED'); os.fsync(fd); os.close(fd)"
@@ -5230,6 +5250,26 @@ mod tests {
                             & 0o777
                             == 0o600
                     );
+                }
+                FirstMutation::OwnerTimes => {
+                    let visible = fs::metadata(mountpoint.join("sample"))?;
+                    let lower = fs::metadata(&lower_path)?;
+                    anyhow::ensure!(
+                        visible
+                            .modified()?
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_nanos()
+                            == 1_600_000_000_123_456_789
+                    );
+                    anyhow::ensure!(
+                        visible
+                            .accessed()?
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_nanos()
+                            == 1_600_000_001_987_654_321
+                    );
+                    anyhow::ensure!(visible.modified()? == lower.modified()?);
+                    anyhow::ensure!(fs::read(&lower_path)? == original);
                 }
                 FirstMutation::PathTruncate => {
                     anyhow::ensure!(fs::read(&lower_path)? == original[..3]);
@@ -5321,6 +5361,12 @@ mod tests {
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn owner_chmod_detaches_before_changing_source_mode() {
         guarded_view_mutation_case(FirstMutation::OwnerChmod);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn owner_utime_detaches_before_changing_source_timestamps() {
+        guarded_view_mutation_case(FirstMutation::OwnerTimes);
     }
 
     #[test]
