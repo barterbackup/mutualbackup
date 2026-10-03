@@ -8191,6 +8191,17 @@ pub async fn run_dht_publications(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Res
 }
 
 pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    // A tail request can use its full logical timeout while looking for an
+    // advancing peer. Keep the state-changing reconciliation behind that
+    // catch-up pass, but do not hold endpoint exchange behind its wait.
+    tokio::try_join!(
+        run_peer_reconciliation(node.clone(), p2p.clone()),
+        run_endpoint_exchange(node, p2p),
+    )?;
+    Ok(())
+}
+
+async fn run_peer_reconciliation(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
     loop {
         if let Err(error) = sync_guild_events_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild event-tail synchronization failed");
@@ -8216,6 +8227,12 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         if let Err(error) = reconcile_variable_group_lifecycle_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "variable coding-group lifecycle reconciliation failed");
         }
+        tokio::time::sleep(PEER_EXCHANGE_INTERVAL).await;
+    }
+}
+
+async fn run_endpoint_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    loop {
         if let Err(error) = exchange_guild_endpoints_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild peer endpoint exchange failed");
         }

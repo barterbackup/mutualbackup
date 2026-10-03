@@ -131,6 +131,16 @@
   still occurred. Both disposable Btrfs mounts, images, daemon processes,
   namespaces, and firewall chains were removed. One more successful run does
   not exclude the intermittent long stall, so this reliability gate stays open.
+  A source-level scheduling correction separates signed endpoint exchange from
+  the peer-exchange loop's guild-tail request, which can wait up to 90 seconds
+  for a slow advancing peer on every pass. Endpoint exchange can now circulate
+  current signed addresses without waiting for that tail, while recovery-key
+  and coding lifecycle proposals still follow the tail catch-up pass. Validate
+  this change with the provisioned topology and keep the intermittent gate open
+  until the missing-signer path is explained or repeatedly excluded. Formatting,
+  strict workspace Clippy, the focused tail-selection test, and the provisioned
+  five-node multi-owner QUIC/recovery test pass; the latter completed in 535.02
+  seconds on a disposable local Btrfs image, which was unmounted and removed.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
