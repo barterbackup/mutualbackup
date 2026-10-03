@@ -159,6 +159,16 @@
   coding worker's four sequential steps also warn if any one stays pending for
   60 seconds. The warnings do not cancel work or change quorum decisions.
   Use the next local topology run to identify the stage behind a long pause.
+  On exact commit `d0dddcb`, the isolated five-daemon topology/recovery test
+  passed in 1,647.75 seconds with each topology backup bounded to 900 seconds.
+  Its coding-coverage warnings showed the first recovered-topology checkpoint
+  advancing from event 30 to 37 and the relay-only checkpoint from event 40 to
+  43; no individual coding worker step logged a 60-second wait. Early signers
+  still exhausted transport tiers and temporarily rejected lifecycle requests
+  during recovery. The disposable Btrfs mount/image, daemons, namespaces, and
+  firewall chains were removed. This run distinguishes slow serial group
+  completion from a fixed sequence stall but does not explain the historical
+  5,400-second timeout, so this gate remains open.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

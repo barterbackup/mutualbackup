@@ -1432,6 +1432,14 @@ test and exact-commit isolated topology/recovery test passed, the latter in
 event 36 for over five minutes with a recovered peer reachable over
 RelayFallback, then advanced and committed. This does not close the
 intermittent missing-signer reliability gate.
+`d0dddcb` adds one-minute progress warnings for long coordinator stages,
+coding-worker steps, and the pending coding-coverage loop without changing
+their retry behavior. Its exact-source isolated five-daemon topology/recovery
+test passed in 1,647.75 seconds with 900-second per-backup diagnostic bounds
+and complete disposable-resource cleanup. Coverage warnings showed event
+sequences advancing through both recovered-topology backups; no worker step
+crossed the one-minute threshold. The earlier 5,400-second stall remains
+unexplained, so the reliability gate stays open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
