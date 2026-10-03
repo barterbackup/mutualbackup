@@ -35,6 +35,7 @@ const DIRECTORY_CLAIM_PREFIX: &str = "guarded-root-directory-v1/";
 const MANIFEST_CLAIM_KIND: &str = "guarded-root-manifest-v1";
 const RETIRE_KIND: &str = "guarded-root-retire-v1";
 const LOWER_OWNERSHIP_KIND: &str = "guarded-root-lower-ownership-v1";
+const PRIVATE_FILE_CAPTURE_KIND: &str = "guarded-root-private-file-capture-v1";
 const MARKER_PREFIX: &str = ".mutualbackup-guarded-root-v1-";
 
 pub(super) fn guarded_root_marker_name(anchor_id: Uuid) -> String {
@@ -91,6 +92,16 @@ struct LowerOwnershipSnapshot {
     anchor_id: Uuid,
     plan_hash: [u8; 32],
     entries: Vec<LowerOwnershipEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PrivateFileCapture {
+    format_version: u16,
+    anchor_id: Uuid,
+    plan_hash: [u8; 32],
+    view_uid: u32,
+    private_uid: u32,
+    private_gid: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -466,13 +477,33 @@ impl GuardedRootCapturePlan {
                     file
                 }
             };
-            entries.push(Self::lower_ownership_entry(
+            let mut ownership = Self::lower_ownership_entry(
                 path.to_owned(),
                 &file,
                 native_id,
                 entry.is_directory(),
                 mode,
-            )?);
+            )?;
+            if let GuardedRootEntry::File { capture_id, .. } = entry {
+                let intent = LinkFreezeCaptureIntent::load(control, *capture_id)?
+                    .ok_or_else(|| anyhow::anyhow!("guarded file capture disappeared"))?;
+                if let Some(original) = intent.original_owner_for_snapshot(
+                    control,
+                    FileOwner {
+                        uid: ownership.uid,
+                        gid: ownership.gid,
+                    },
+                    &crate::link_freeze::FileAccessSnapshot {
+                        format_version: 1,
+                        mode: ownership.mode,
+                        access_acl: ownership.access_acl.clone(),
+                    },
+                )? {
+                    ownership.uid = original.uid;
+                    ownership.gid = original.gid;
+                }
+            }
+            entries.push(ownership);
         }
         let snapshot = LowerOwnershipSnapshot {
             format_version: 1,
@@ -487,10 +518,10 @@ impl GuardedRootCapturePlan {
         Ok(snapshot)
     }
 
-    /// Save original ownership and pre-isolation modes and access ACLs before
-    /// any private lower-inode transition. The original file access state is
-    /// also retained by each file-freeze journal. This stage changes no inodes;
-    /// future replay must use this immutable record before each ownership step.
+    /// Save the lower tree's original owners and modes. The legacy freeze path
+    /// records this before owner isolation; an owner-first capture reconstructs
+    /// file owners from the journals written before its private transition.
+    /// The original file access state is retained by each freeze journal.
     pub fn prepare_private_lower_ownership(
         &self,
         control: &ControlStore,
@@ -509,6 +540,85 @@ impl GuardedRootCapturePlan {
             );
         }
         Ok(())
+    }
+
+    fn private_file_capture(
+        &self,
+        control: &ControlStore,
+    ) -> anyhow::Result<Option<PrivateFileCapture>> {
+        let Some(bytes) =
+            control.get_record(PRIVATE_FILE_CAPTURE_KIND, self.anchor_id.as_bytes())?
+        else {
+            return Ok(None);
+        };
+        let record: PrivateFileCapture = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            record.format_version == 1
+                && record.anchor_id == self.anchor_id
+                && record.plan_hash == *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes()
+                && record.private_uid != record.view_uid,
+            "guarded private file capture differs from its plan"
+        );
+        Ok(Some(record))
+    }
+
+    /// Select the owner-first file capture path durably before freezing any
+    /// file. Reopen uses the same selection even if the first attempt stopped
+    /// with a prepared file or a private source that has no anchor yet.
+    pub fn capture_private_file_owners(
+        &self,
+        control: &ControlStore,
+        view_uid: u32,
+        private_uid: u32,
+        private_gid: u32,
+    ) -> anyhow::Result<StableAnchorManifest> {
+        self.validate()?;
+        anyhow::ensure!(private_uid != view_uid, "private owner is the view owner");
+        anyhow::ensure!(
+            !crate::guarded_mount::mount_claim_exists(control, self.anchor_id)?,
+            "guarded view is already claimed"
+        );
+        let expected = PrivateFileCapture {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes(),
+            view_uid,
+            private_uid,
+            private_gid,
+        };
+        match self.private_file_capture(control)? {
+            Some(record) => anyhow::ensure!(
+                record == expected,
+                "guarded private file capture parameters changed"
+            ),
+            None => {
+                anyhow::ensure!(
+                    control
+                        .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
+                        .is_none()
+                        && control
+                            .get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
+                            .is_none(),
+                    "guarded root was already captured before private selection"
+                );
+                for entry in &self.entries {
+                    if let GuardedRootEntry::File { capture_id, .. } = entry {
+                        anyhow::ensure!(
+                            LinkFreezeCaptureIntent::load(control, *capture_id)?.is_none(),
+                            "guarded file was already frozen before private selection"
+                        );
+                    }
+                }
+                anyhow::ensure!(control.put_record_if_absent(
+                    PRIVATE_FILE_CAPTURE_KIND,
+                    self.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&expected)?,
+                )?);
+            }
+        }
+        let manifest = self.capture(control)?;
+        self.prepare_private_lower_ownership(control, &manifest)?;
+        Ok(manifest)
     }
 
     /// Isolate every frozen file owner using the durable root snapshot. Each
@@ -638,6 +748,18 @@ impl GuardedRootCapturePlan {
             !crate::guarded_mount::mount_claim_exists(control, self.anchor_id)?,
             "guarded view is already claimed"
         );
+        anyhow::ensure!(
+            self.private_file_capture(control)?.is_none(),
+            "private file capture needs journal-aware root retirement"
+        );
+        for entry in &self.entries {
+            if let GuardedRootEntry::File { capture_id, .. } = entry {
+                anyhow::ensure!(
+                    !LinkFreezeCaptureIntent::owner_isolation_pending(control, *capture_id)?,
+                    "isolated file owner needs journal-aware retirement"
+                );
+            }
+        }
         let Some(bytes) = control.get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
         else {
             return Ok(());
@@ -871,6 +993,7 @@ impl GuardedRootCapturePlan {
     /// be online. Capture itself performs the descriptor and journal checks.
     pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
+        self.private_file_capture(control)?;
         if let Some(recorded) = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())? {
             anyhow::ensure!(
                 recorded == mb_core::canonical_bytes(self)?,
@@ -1161,6 +1284,7 @@ impl GuardedRootCapturePlan {
         &self,
         control: &ControlStore,
     ) -> anyhow::Result<Vec<CapturedEntry>> {
+        let private_capture = self.private_file_capture(control)?;
         self.prepare_anchor_directories(control)?;
         let area_path = resolve_anchor_area(&self.area)?;
         let area_file = open_stable_anchor_area(&area_path, &self.area)?;
@@ -1288,6 +1412,20 @@ impl GuardedRootCapturePlan {
                         )?
                     };
                     anyhow::ensure!(matches_plan);
+                    if let Some(private) = &private_capture
+                        && intent.phase() == LinkFreezeCapturePhase::Prepared
+                    {
+                        intent.isolate_prepared_owner(
+                            control,
+                            &source_parent,
+                            &anchor_parent,
+                            FileOwner {
+                                uid: private.private_uid,
+                                gid: private.private_gid,
+                            },
+                            version,
+                        )?;
+                    }
                     let verified = intent
                         .resume(control, &source_parent, &anchor_parent)?
                         .ok_or_else(|| anyhow::anyhow!("planned guarded source changed: {path}"))?;
@@ -1295,6 +1433,16 @@ impl GuardedRootCapturePlan {
                         verified.phase(),
                         LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
                     ));
+                    if let Some(private) = &private_capture {
+                        let metadata = anchor_parent
+                            .open_child_file(name)?
+                            .ok_or_else(|| anyhow::anyhow!("private frozen anchor disappeared"))?
+                            .metadata()?;
+                        anyhow::ensure!(
+                            metadata.uid() != private.view_uid && unix_mode(&metadata) & 0o022 == 0,
+                            "private file capture retained a view-writable anchor"
+                        );
+                    }
                     let proof = verified.content_proof();
                     anyhow::ensure!(
                         proof.logical_len == version.logical_len,
@@ -1630,6 +1778,7 @@ impl GuardedRootCapturePlan {
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
         crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
+        let private_capture = self.private_file_capture(control)?;
         let plan_bytes = mb_core::canonical_bytes(self)?;
         let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
         let recorded_plan = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())?;
@@ -1646,6 +1795,38 @@ impl GuardedRootCapturePlan {
                 Ok::<_, anyhow::Error>((bytes, snapshot))
             })
             .transpose()?;
+        if recorded_plan.is_none()
+            && let Some(private) = &private_capture
+        {
+            anyhow::ensure!(
+                lower_ownership.is_none()
+                    && control
+                        .get_record(ROOT_CLAIM_KIND, self.anchor_id.as_bytes())?
+                        .is_none()
+                    && control
+                        .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
+                        .is_none()
+                    && control
+                        .get_record(RETIRE_KIND, self.anchor_id.as_bytes())?
+                        .is_none()
+                    && control.records(&self.directory_claim_kind())?.is_empty(),
+                "unstarted private capture has a root ownership obligation"
+            );
+            for entry in &self.entries {
+                if let GuardedRootEntry::File { capture_id, .. } = entry {
+                    anyhow::ensure!(
+                        LinkFreezeCaptureIntent::load(control, *capture_id)?.is_none(),
+                        "unstarted private capture has a file ownership obligation"
+                    );
+                }
+            }
+            control.delete_record_if_value(
+                PRIVATE_FILE_CAPTURE_KIND,
+                self.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(private)?,
+            )?;
+            return Ok(());
+        }
         if let Some((_, snapshot)) = &lower_ownership {
             anyhow::ensure!(
                 recorded_plan.is_some(),
@@ -1680,8 +1861,8 @@ impl GuardedRootCapturePlan {
             .transpose()?;
         let anchor_root = area.open_child_directory(self.anchor_id.to_string())?;
         anyhow::ensure!(
-            lower_ownership.is_none() || anchor_root.is_some(),
-            "guarded lower owner lost its anchor root"
+            (lower_ownership.is_none() && private_capture.is_none()) || anchor_root.is_some(),
+            "guarded private capture lost its anchor root"
         );
         if recorded_plan.is_none() || anchor_root.is_none() {
             anyhow::ensure!(
@@ -1809,6 +1990,24 @@ impl GuardedRootCapturePlan {
                     Ok(parent) => parent,
                     Err(_) => anchor_parent.try_clone()?,
                 };
+            if let Some(private) = &private_capture
+                && capture.phase() == LinkFreezeCapturePhase::Prepared
+            {
+                if !LinkFreezeCaptureIntent::owner_isolation_pending(control, *capture_id)? {
+                    capture.cancel_prepared_unlinked(control, &source_parent, &anchor_parent)?;
+                    continue;
+                }
+                capture.isolate_prepared_owner(
+                    control,
+                    &source_parent,
+                    &anchor_parent,
+                    FileOwner {
+                        uid: private.private_uid,
+                        gid: private.private_gid,
+                    },
+                    version,
+                )?;
+            }
             let capture = if capture.phase() == LinkFreezeCapturePhase::Prepared {
                 capture.resume(control, &source_parent, &anchor_parent)?
             } else {
@@ -1834,6 +2033,13 @@ impl GuardedRootCapturePlan {
         }
         if let Some((bytes, snapshot)) = &lower_ownership {
             self.finish_lower_ownership_retirement(control, snapshot, bytes)?;
+        }
+        if let Some(private) = &private_capture {
+            control.delete_record_if_value(
+                PRIVATE_FILE_CAPTURE_KIND,
+                self.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(private)?,
+            )?;
         }
         self.remove_claimed_manifest(control, &anchor_root, plan_hash)?;
         self.discard_empty_anchor_root(control)?;
@@ -2021,6 +2227,10 @@ impl GuardedRootCapturePlan {
     pub fn discard_empty_anchor_root(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
         crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
+        anyhow::ensure!(
+            self.private_file_capture(control)?.is_none(),
+            "private file capture needs journal-aware retirement"
+        );
         anyhow::ensure!(
             control
                 .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
@@ -3310,6 +3520,393 @@ mod tests {
             assert_eq!(fs::metadata(&path).unwrap().gid(), 65534);
             assert_eq!(fs::read(path).unwrap(), b"exact\r\n\0bytes");
         }
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded owner-first capture"]
+    fn root_private_capture_keeps_anchors_private_through_reopen_and_retirement() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-private-capture-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        for path in [root.join("a"), root.join("nested/b")] {
+            fs::write(&path, b"private\r\n\0bytes").unwrap();
+            let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        }
+        let already_private = root.join("already-private");
+        fs::write(&already_private, b"original private owner").unwrap();
+        fs::set_permissions(&already_private, fs::Permissions::from_mode(0o666)).unwrap();
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([123; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&store, 65534, 0, 0)
+            .unwrap();
+        assert!(
+            plan.cancel_private_lower_ownership(&store, &manifest)
+                .is_err()
+        );
+        let snapshot_bytes = store
+            .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        let snapshot: LowerOwnershipSnapshot = mb_core::decode_canonical(&snapshot_bytes).unwrap();
+        for entry in snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.path == "a" || entry.path == "nested/b")
+        {
+            assert_eq!((entry.uid, entry.gid), (65534, 65534));
+        }
+        for path in ["a", "nested/b"] {
+            assert_eq!(fs::metadata(root.join(path)).unwrap().uid(), 0);
+            assert_eq!(
+                manifest
+                    .file_locator(path.to_owned())
+                    .unwrap()
+                    .open()
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .uid(),
+                0
+            );
+        }
+        assert_eq!(fs::metadata(&already_private).unwrap().uid(), 0);
+        assert_eq!(
+            fs::metadata(&already_private).unwrap().permissions().mode() & 0o7777,
+            0o444
+        );
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        assert_eq!(
+            plan.capture_private_file_owners(&store, 65534, 0, 0)
+                .unwrap(),
+            manifest
+        );
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(
+            store
+                .get_record(PRIVATE_FILE_CAPTURE_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        for path in ["a", "nested/b"] {
+            let file = root.join(path);
+            assert_eq!(fs::metadata(&file).unwrap().uid(), 65534);
+            assert_eq!(fs::metadata(&file).unwrap().gid(), 65534);
+            assert_eq!(fs::read(file).unwrap(), b"private\r\n\0bytes");
+        }
+        assert_eq!(fs::metadata(&already_private).unwrap().uid(), 0);
+        assert_eq!(
+            fs::metadata(&already_private).unwrap().permissions().mode() & 0o7777,
+            0o666
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded owner-first capture"]
+    fn root_private_capture_replays_prepared_private_source_without_anchor() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-private-replay-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("file");
+        fs::write(&source, b"replay\r\n\0bytes").unwrap();
+        let encoded = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let GuardedRootEntry::File {
+            capture_id,
+            version,
+            ..
+        } = &plan.entries[0]
+        else {
+            panic!("expected file");
+        };
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([124; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let marker = PrivateFileCapture {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes(),
+            view_uid: 65534,
+            private_uid: 0,
+            private_gid: 0,
+        };
+        assert!(
+            store
+                .put_record_if_absent(
+                    PRIVATE_FILE_CAPTURE_KIND,
+                    plan.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&marker).unwrap(),
+                )
+                .unwrap()
+        );
+        plan.prepare_anchor_directories(&store).unwrap();
+        let source_parent = PinnedDirectory::open(&root).unwrap();
+        let area = PinnedDirectory::open(&plan.area.path_hint).unwrap();
+        let anchor_parent = area
+            .open_child_directory(plan.anchor_id.to_string())
+            .unwrap()
+            .unwrap();
+        let prepared = LinkFreezeCaptureIntent::begin_checked(
+            &store,
+            *capture_id,
+            &source_parent,
+            "file",
+            &anchor_parent,
+            "file",
+            version,
+        )
+        .unwrap();
+        prepared
+            .isolate_prepared_owner(
+                &store,
+                &source_parent,
+                &anchor_parent,
+                FileOwner { uid: 0, gid: 0 },
+                version,
+            )
+            .unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 0);
+        assert!(
+            !plan
+                .area
+                .path_hint
+                .join(plan.anchor_id.to_string())
+                .join("file")
+                .exists()
+        );
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        assert!(
+            plan.capture_private_file_owners(&store, 65534, 0, 1)
+                .is_err()
+        );
+        let manifest = plan
+            .capture_private_file_owners(&store, 65534, 0, 0)
+            .unwrap();
+        assert_eq!(
+            manifest
+                .file_locator("file".to_owned())
+                .unwrap()
+                .open()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .uid(),
+            0
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"replay\r\n\0bytes");
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
+        assert_eq!(fs::read(source).unwrap(), b"replay\r\n\0bytes");
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded prepared capture cancellation"]
+    fn root_private_capture_abandons_unlinked_prepared_source() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-private-abandon-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("file");
+        fs::write(&source, b"unlinked prepared bytes").unwrap();
+        let encoded = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let GuardedRootEntry::File {
+            capture_id,
+            version,
+            ..
+        } = &plan.entries[0]
+        else {
+            panic!("expected file");
+        };
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([125; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let marker = PrivateFileCapture {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes(),
+            view_uid: 65534,
+            private_uid: 0,
+            private_gid: 0,
+        };
+        assert!(
+            store
+                .put_record_if_absent(
+                    PRIVATE_FILE_CAPTURE_KIND,
+                    plan.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&marker).unwrap(),
+                )
+                .unwrap()
+        );
+        plan.prepare_anchor_directories(&store).unwrap();
+        let source_parent = PinnedDirectory::open(&root).unwrap();
+        let area = PinnedDirectory::open(&plan.area.path_hint).unwrap();
+        let anchor_parent = area
+            .open_child_directory(plan.anchor_id.to_string())
+            .unwrap()
+            .unwrap();
+        LinkFreezeCaptureIntent::begin_checked(
+            &store,
+            *capture_id,
+            &source_parent,
+            "file",
+            &anchor_parent,
+            "file",
+            version,
+        )
+        .unwrap();
+        assert!(
+            anchor_parent
+                .entry_identity("file", false)
+                .unwrap()
+                .is_none()
+        );
+        let moved = root.join("moved");
+        fs::rename(&source, &moved).unwrap();
+        assert!(plan.discard_unreferenced(&store).is_err());
+        assert!(
+            LinkFreezeCaptureIntent::load(&store, *capture_id)
+                .unwrap()
+                .is_some()
+        );
+        fs::rename(&moved, &source).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(
+            LinkFreezeCaptureIntent::load(&store, *capture_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_record(PRIVATE_FILE_CAPTURE_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
+        assert_eq!(fs::read(source).unwrap(), b"unlinked prepared bytes");
+    }
+
+    #[test]
+    fn unstarted_private_capture_marker_can_be_retired() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([126; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let marker = PrivateFileCapture {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes(),
+            view_uid: 65534,
+            private_uid: 0,
+            private_gid: 0,
+        };
+        assert!(
+            store
+                .put_record_if_absent(
+                    PRIVATE_FILE_CAPTURE_KIND,
+                    plan.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&marker).unwrap(),
+                )
+                .unwrap()
+        );
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(
+            store
+                .get_record(PRIVATE_FILE_CAPTURE_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root, POSIX ACLs, and CAP_SYS_ADMIN"]
+    fn private_capture_rejects_acl_without_publishing_an_anchor() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-private-acl-refusal-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("file");
+        fs::write(&source, b"acl private refusal").unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        if !crate::link_freeze::install_probe_acl(&file).unwrap() {
+            return;
+        }
+        drop(file);
+        let encoded = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([127; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        assert!(
+            plan.capture_private_file_owners(&store, 65534, 0, 0)
+                .is_err()
+        );
+        let anchor = plan
+            .area
+            .path_hint
+            .join(plan.anchor_id.to_string())
+            .join("file");
+        assert!(!anchor.exists());
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(!anchor.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"acl private refusal");
+        assert!(
+            store
+                .get_record(PRIVATE_FILE_CAPTURE_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

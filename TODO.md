@@ -626,9 +626,22 @@
   This path currently requires the recorded root and directories to remain
   unchanged; directory isolation and user-visible metadata changes need their
   own replayable restoration. Detached owner-isolated files remain fenced.
-  Enrollment still needs the initial freeze and owner change joined under one
-  guard, directory isolation and recovery, owner restoration after detach,
-  and signed mutable-view state.
+  An owner-first root capture path now records its private selection before
+  the first file, rechecks each prepared file under a write guard, and records
+  the original owner before freezing access and changing UID/GID. It creates
+  the hard-link anchor only after the source is private; a crash at the
+  intermediate points leaves no user-owned immutable link. Root replay
+  reconstructs the original-owner snapshot from file journals, and root
+  retirement restores the user owners. Prepared captures with no owner
+  journal can be canceled without publishing an anchor; missing/moved sources
+  fail closed. ACL-bearing files are refused before the private transition.
+  Per-file interruption, root reopen/retirement, prepared cancellation, ACL
+  refusal, 116 normal store tests, and strict Clippy pass; the privileged
+  cases pass on ext4 and fresh local Btrfs. The older ordinary guarded-capture
+  path remains available for non-enrollment use and must not be selected for
+  a private guarded mount. Guarded enrollment still needs directory isolation
+  and recovery, owner restoration after detach, signed mutable-view state,
+  and the complete privileged mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

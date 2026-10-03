@@ -187,6 +187,27 @@ impl LinkFreezeCaptureIntent {
         Ok(OwnerIsolation::load(control, anchor_id)?.is_some())
     }
 
+    pub(crate) fn original_owner_for_snapshot(
+        &self,
+        control: &ControlStore,
+        current: FileOwner,
+        access: &FileAccessSnapshot,
+    ) -> anyhow::Result<Option<FileOwner>> {
+        let Some(record) = OwnerIsolation::load(control, self.anchor_id)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            record.source_id == self.source_id
+                && (current.uid, current.gid) == (record.private_uid, record.private_gid)
+                && *access == record.frozen_access,
+            "frozen owner isolation is incomplete before lower snapshot"
+        );
+        Ok(Some(FileOwner {
+            uid: record.original_uid,
+            gid: record.original_gid,
+        }))
+    }
+
     /// Record original access metadata and exact sparse bytes before adding a
     /// hard link or changing permissions. A held kernel guard excludes both
     /// already-open writers and new opens during this initial proof.
@@ -364,7 +385,6 @@ impl LinkFreezeCaptureIntent {
         if let Some(owner) = OwnerIsolation::load(control, anchor_id)? {
             anyhow::ensure!(
                 owner.source_id == intent.source_id
-                    && owner.original_uid != owner.private_uid
                     && matches!(owner.frozen_access.access_acl, AccessAclSnapshot::Absent),
                 "frozen owner isolation differs from its capture"
             );
@@ -374,6 +394,147 @@ impl LinkFreezeCaptureIntent {
 
     pub fn phase(&self) -> LinkFreezeCapturePhase {
         self.phase
+    }
+
+    /// Prepare a private-owner freeze before publishing any hard-link anchor.
+    /// A crash can leave the source frozen or private, but cannot leave a
+    /// user-owned immutable link: the owner journal precedes both mutations
+    /// and the anchor is created only by a later `resume`.
+    pub(crate) fn isolate_prepared_owner(
+        &self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+        private: FileOwner,
+        expected_version: &CaptureVersion,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.phase == LinkFreezeCapturePhase::Prepared
+                && source_parent.identity()? == self.source_parent_id
+                && anchor_parent.identity()? == self.anchor_parent_id
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id)
+                && control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                    == Some(mb_core::canonical_bytes(self)?)
+                && LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none()
+                && !Self::retirement_pending(control, self.anchor_id)?,
+            "private owner preparation needs its original source and journal"
+        );
+        let source = source_parent
+            .open_child_file(&self.source_name)?
+            .ok_or_else(|| anyhow::anyhow!("private owner source disappeared"))?;
+        let guard = FileWriteExclusion::acquire(source)?;
+        let before = guard.file.metadata()?;
+        let anchor_entry = anchor_parent.entry_identity(&self.anchor_name, false)?;
+        anyhow::ensure!(
+            (anchor_entry.is_none() || anchor_entry == Some(self.source_id))
+                && before.ino() == self.source_id.inode
+                && before.nlink() == if anchor_entry.is_some() { 2 } else { 1 }
+                && self.content_matches(&guard.file)?
+                && guard.is_held()?,
+            "private owner source or anchor changed before preparation"
+        );
+        anyhow::ensure!(
+            matches!(
+                &self.proof.original_access.access_acl,
+                AccessAclSnapshot::Absent
+            ) && self.proof.original_access.mode & 0o6000 == 0,
+            "private owner preparation cannot preserve ACL or set-ID access"
+        );
+        let frozen_access = FileAccessSnapshot {
+            format_version: 1,
+            mode: self.proof.original_access.mode & !0o222,
+            access_acl: AccessAclSnapshot::Absent,
+        };
+        let current_access = FileAccessSnapshot::capture(&guard.file)?;
+        anyhow::ensure!(
+            current_access == self.proof.original_access || current_access == frozen_access,
+            "private owner source access changed outside its journal"
+        );
+        reject_file_capability(&guard.file)?;
+        let isolated = OwnerIsolation::load(control, self.anchor_id)?;
+        let record = match isolated {
+            Some(record) => {
+                anyhow::ensure!(
+                    record.source_id == self.source_id
+                        && record.private_uid == private.uid
+                        && record.private_gid == private.gid
+                        && record.frozen_access == frozen_access,
+                    "private owner preparation record changed"
+                );
+                record
+            }
+            None => {
+                anyhow::ensure!(
+                    anchor_entry.is_none()
+                        && current_access == self.proof.original_access
+                        && capture_version(self.source_id.filesystem_id, &before)
+                            == *expected_version,
+                    "private owner preparation requires its unchanged planned source"
+                );
+                let record = OwnerIsolation {
+                    format_version: 1,
+                    anchor_id: self.anchor_id,
+                    source_id: self.source_id,
+                    original_uid: before.uid(),
+                    original_gid: before.gid(),
+                    private_uid: private.uid,
+                    private_gid: private.gid,
+                    frozen_access: frozen_access.clone(),
+                };
+                anyhow::ensure!(control.put_record_if_absent(
+                    OWNER_ISOLATION_KIND,
+                    self.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&record)?,
+                )?);
+                record
+            }
+        };
+        anyhow::ensure!(
+            (before.uid(), before.gid()) == (record.original_uid, record.original_gid)
+                || (before.uid(), before.gid()) == (private.uid, private.gid),
+            "private owner source has an unjournaled owner"
+        );
+        anyhow::ensure!(
+            anchor_entry.is_none() || (before.uid(), before.gid()) == (private.uid, private.gid),
+            "a user-owned anchor appeared before private owner preparation"
+        );
+        if current_access != frozen_access {
+            guard
+                .file
+                .set_permissions(std::fs::Permissions::from_mode(frozen_access.mode))?;
+            guard.file.sync_all()?;
+        }
+        anyhow::ensure!(
+            FileAccessSnapshot::capture(&guard.file)? == frozen_access && guard.is_held()?,
+            "private owner source was not frozen"
+        );
+        if (before.uid(), before.gid()) != (private.uid, private.gid) {
+            let result = unsafe {
+                libc::fchown(
+                    guard.file.as_raw_fd(),
+                    private.uid as libc::uid_t,
+                    private.gid as libc::gid_t,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            guard.file.sync_all()?;
+        }
+        let after = guard.file.metadata()?;
+        anyhow::ensure!(
+            (after.uid(), after.gid()) == (private.uid, private.gid)
+                && after.ino() == self.source_id.inode
+                && after.nlink() == if anchor_entry.is_some() { 2 } else { 1 }
+                && FileAccessSnapshot::capture(&guard.file)? == frozen_access
+                && self.content_matches(&guard.file)?
+                && guard.is_held()?
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id)
+                && anchor_parent.entry_identity(&self.anchor_name, false)? == anchor_entry,
+            "private owner preparation did not preserve its source proof"
+        );
+        guard.release()?;
+        Ok(())
     }
 
     /// Move a verified frozen hard-link inode to an owner that cannot be the
@@ -486,6 +647,65 @@ impl LinkFreezeCaptureIntent {
         anchor_id: Uuid,
     ) -> anyhow::Result<bool> {
         Ok(RetireIntent::load(control, anchor_id)?.is_some())
+    }
+
+    /// Abandon a prepared private capture that never gained an owner journal
+    /// or anchor. No immutable link exists, so replay may restore a partially
+    /// frozen source's original access and then remove the capture intent.
+    pub(crate) fn cancel_prepared_unlinked(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.phase == LinkFreezeCapturePhase::Prepared
+                && source_parent.identity()? == self.source_parent_id
+                && anchor_parent.identity()? == self.anchor_parent_id
+                && control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                    == Some(mb_core::canonical_bytes(&self)?)
+                && OwnerIsolation::load(control, self.anchor_id)?.is_none()
+                && anchor_parent
+                    .entry_identity(&self.anchor_name, false)?
+                    .is_none()
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id)
+                && LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none()
+                && !Self::retirement_pending(control, self.anchor_id)?,
+            "prepared private capture still has an anchor or owner obligation"
+        );
+        let source = source_parent
+            .open_child_file(&self.source_name)?
+            .ok_or_else(|| anyhow::anyhow!("prepared source disappeared"))?;
+        let guard = FileWriteExclusion::acquire(source)?;
+        anyhow::ensure!(
+            guard.file.metadata()?.nlink() == 1
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id)
+                && guard.is_held()?,
+            "prepared source kept an unknown hard-link alias"
+        );
+        let access = FileAccessSnapshot::capture(&guard.file)?;
+        let frozen_access = FileAccessSnapshot {
+            format_version: 1,
+            mode: self.proof.original_access.mode & !0o222,
+            access_acl: self.proof.original_access.access_acl.clone(),
+        };
+        anyhow::ensure!(
+            access == self.proof.original_access || access == frozen_access,
+            "prepared source access changed outside its journal"
+        );
+        let source = guard.file.try_clone()?;
+        guard.release()?;
+        if access != self.proof.original_access {
+            self.proof
+                .original_access
+                .restore_unshared_after_abandon(&source)?;
+        }
+        control.delete_record_if_value(
+            CAPTURE_INTENT_KIND,
+            self.anchor_id.as_bytes(),
+            &mb_core::canonical_bytes(&self)?,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn retirement_ready_for_cleanup(
@@ -1106,6 +1326,14 @@ impl LinkFreezeCaptureIntent {
         let guard = FileWriteExclusion::acquire(source)?;
         let source_metadata = guard.file.metadata()?;
         let anchor_entry = anchor_parent.entry_identity(&self.anchor_name, false)?;
+        if let Some(owner) = OwnerIsolation::load(control, self.anchor_id)? {
+            anyhow::ensure!(
+                (source_metadata.uid(), source_metadata.gid())
+                    == (owner.private_uid, owner.private_gid)
+                    && FileAccessSnapshot::capture(&guard.file)? == owner.frozen_access,
+                "private owner preparation must finish before anchor publication"
+            );
+        }
         anyhow::ensure!(
             (anchor_entry.is_none() || anchor_entry == Some(self.source_id))
                 && source_metadata.nlink() == if anchor_entry.is_some() { 2 } else { 1 },
@@ -1116,6 +1344,10 @@ impl LinkFreezeCaptureIntent {
             && file_data_extents(&guard.file, source_metadata.len())?
                 == self.proof.content.data_extents;
         if !content_matches {
+            anyhow::ensure!(
+                OwnerIsolation::load(control, self.anchor_id)?.is_none(),
+                "private owner source changed before anchor publication"
+            );
             if anchor_entry == Some(self.source_id) {
                 anchor_parent.remove_child_file_if_identity(&self.anchor_name, self.source_id)?;
             }
@@ -1398,7 +1630,7 @@ mod tests {
         LinkFreezeCapturePhase, OWNER_ISOLATION_KIND, OwnerIsolation, RETIRE_INTENT_KIND,
         RetireIntent, RetirePhase,
     };
-    use crate::anchor::{NativeFileId, PinnedDirectory};
+    use crate::anchor::{NativeFileId, PinnedDirectory, capture_version};
     use crate::link_freeze::{
         AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof,
         IndependentSparseCopy, LinkFreezeEditIntent, install_probe_acl,
@@ -1616,6 +1848,105 @@ print('DONE', flush=True)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for held-descriptor write exclusion"]
+    fn prepared_owner_isolation_replays_before_anchor_publication() {
+        for interrupted_after in 0..4 {
+            let root = test_directory();
+            let source_path = root.path().join("source");
+            let anchor_path = root.path().join("anchor");
+            fs::write(&source_path, b"exact\r\n\0source").unwrap();
+            fs::set_permissions(&source_path, fs::Permissions::from_mode(0o644)).unwrap();
+            let name = std::ffi::CString::new(source_path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(name.as_ptr(), 65534, 65534) }, 0);
+            let parent = PinnedDirectory::open(root.path()).unwrap();
+            let expected = capture_version(
+                parent.identity().unwrap().filesystem_id,
+                &fs::metadata(&source_path).unwrap(),
+            );
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([122; 32]));
+            let database_path = root.path().join("control.db");
+            let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+            let anchor_id = uuid::Uuid::new_v4();
+            let prepared = LinkFreezeCaptureIntent::begin_checked(
+                &store, anchor_id, &parent, "source", &parent, "anchor", &expected,
+            )
+            .unwrap();
+            if interrupted_after > 0 {
+                let record = OwnerIsolation {
+                    format_version: 1,
+                    anchor_id,
+                    source_id: prepared.source_id,
+                    original_uid: 65534,
+                    original_gid: 65534,
+                    private_uid: 0,
+                    private_gid: 0,
+                    frozen_access: FileAccessSnapshot {
+                        format_version: 1,
+                        mode: 0o444,
+                        access_acl: AccessAclSnapshot::Absent,
+                    },
+                };
+                assert!(
+                    store
+                        .put_record_if_absent(
+                            OWNER_ISOLATION_KIND,
+                            anchor_id.as_bytes(),
+                            &mb_core::canonical_bytes(&record).unwrap(),
+                        )
+                        .unwrap()
+                );
+            }
+            if interrupted_after > 1 {
+                fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            if interrupted_after > 2 {
+                assert_eq!(unsafe { libc::chown(name.as_ptr(), 0, 0) }, 0);
+            }
+            assert!(!anchor_path.exists());
+            drop(store);
+
+            let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+            let prepared = LinkFreezeCaptureIntent::load(&store, anchor_id)
+                .unwrap()
+                .unwrap();
+            if interrupted_after == 1 || interrupted_after == 2 {
+                assert!(prepared.clone().resume(&store, &parent, &parent).is_err());
+                assert!(!anchor_path.exists());
+            }
+            prepared
+                .isolate_prepared_owner(
+                    &store,
+                    &parent,
+                    &parent,
+                    FileOwner { uid: 0, gid: 0 },
+                    &expected,
+                )
+                .unwrap();
+            assert_eq!(fs::metadata(&source_path).unwrap().uid(), 0);
+            assert_eq!(
+                fs::metadata(&source_path).unwrap().permissions().mode() & 0o7777,
+                0o444
+            );
+            assert!(!anchor_path.exists());
+            let frozen = prepared.resume(&store, &parent, &parent).unwrap().unwrap();
+            assert_eq!(frozen.phase(), LinkFreezeCapturePhase::Frozen);
+            assert_eq!(fs::metadata(&anchor_path).unwrap().uid(), 0);
+            assert_eq!(fs::read(&anchor_path).unwrap(), b"exact\r\n\0source");
+            frozen
+                .retire_unreferenced(&store, &parent, &parent)
+                .unwrap();
+            assert!(
+                LinkFreezeCaptureIntent::finish_completed_retirement(&store, anchor_id).unwrap()
+            );
+            assert_eq!(fs::metadata(&source_path).unwrap().uid(), 65534);
+            assert_eq!(
+                fs::metadata(&source_path).unwrap().permissions().mode() & 0o7777,
+                0o644
+            );
+        }
     }
 
     #[test]

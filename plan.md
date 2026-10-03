@@ -1568,9 +1568,15 @@ snapshot after all file retirements. Restart after one file completed and a
 changed-directory refusal pass on ext4 and fresh local Btrfs. The held file
 guard also checks an unjournaled owner before unlink. This path does
 not yet cover private or user-modified directories; detached owner-isolated
-files remain fenced. The initial freeze and ownership change still have a
-guard-release gap, so this is not yet an enrollment-safe transition;
-directory isolation and signed mutable-view recovery also remain open.
+files remain fenced. A separately selected owner-first root capture now
+journals its private policy before the first file, revalidates each prepared
+source under a new held write guard, and changes its mode and owner before
+creating a hard-link anchor. Thus the initial proof guard may end without
+leaving a user-owned immutable link; intermediate crashes replay or cancel
+from durable file journals. Privileged interruption, root replay/retirement,
+and ACL refusal pass on ext4 and fresh local Btrfs. The ordinary guarded
+capture path still must not be selected for enrollment. Directory isolation,
+detached-owner recovery, and signed mutable-view recovery remain open.
 Guarded enrollment therefore still needs durable private-inode ownership and
 mode isolation plus virtualized, protected metadata before ordinary user-owned
 source trees are admissible.
