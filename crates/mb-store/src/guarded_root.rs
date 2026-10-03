@@ -295,6 +295,40 @@ impl GuardedRootCapturePlan {
             })
     }
 
+    /// Before the first view mount, captured paths have not yet been renamed
+    /// through FUSE. Check their private lower directories before rebuilding
+    /// namespace journals, since replay itself can mutate that lower tree.
+    pub(crate) fn verify_initial_private_directories(
+        &self,
+        lower_root: &PinnedDirectory,
+        view_uid: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            lower_root.identity()? == self.source_root_identity(),
+            "guarded lower root changed after capture"
+        );
+        for entry in &self.entries {
+            let GuardedRootEntry::Directory { path, version, .. } = entry else {
+                continue;
+            };
+            let directory = lower_root.open_descendant_directory(path)?;
+            anyhow::ensure!(
+                directory.identity()?
+                    == (NativeFileId {
+                        filesystem_id: version.filesystem_id,
+                        inode: version.inode,
+                    }),
+                "guarded private directory changed before mounting: {path}"
+            );
+            let metadata = directory.as_file().metadata()?;
+            anyhow::ensure!(
+                metadata.uid() != view_uid && unix_mode(&metadata) & 0o077 == 0,
+                "guarded private directory remains accessible to the view owner: {path}"
+            );
+        }
+        Ok(())
+    }
+
     /// A frozen inode has guard-restricted lower permissions, so its captured
     /// mode is the visible one. Once the edit journal made that inode
     /// independent, the lower inode's mode includes later owner chmods and is

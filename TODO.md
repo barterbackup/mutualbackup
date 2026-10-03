@@ -579,6 +579,14 @@
   would bypass the private root path. The privileged refusal probe and an
   extended held-descriptor probe, which includes a nested child, pass on ext4
   and fresh local Btrfs. The actual enrollment transition remains gated.
+  First-mount admission now checks every captured lower directory's identity
+  and private owner/mode before rebuilding any FUSE namespace journal. An
+  unsafe nested directory wins over a malformed pending rename record, which
+  remains untouched, so failed admission cannot replay namespace mutations
+  first. The privileged refusal probe passes on ext4 and fresh local Btrfs;
+  the successful held-descriptor mount probe passes on both, as do 115 normal
+  store tests and strict workspace Clippy. Durable ownership isolation and
+  protected view-metadata recovery remain open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

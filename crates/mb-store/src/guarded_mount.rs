@@ -272,6 +272,11 @@ impl GuardedViewMount {
                 claim.mountpoint_id == placeholder_id,
                 "guarded mountpoint changed after the original mount"
             );
+        } else {
+            // No FUSE operation has yet changed captured paths. Refuse an
+            // accessible child before view reconstruction can replay a
+            // pending namespace operation against that lower directory.
+            plan.verify_initial_private_directories(&lower_root, view_uid)?;
         }
         // Build and validate the complete view before publishing a new mount
         // claim. A user-owned frozen anchor can be changed through a descriptor
@@ -545,6 +550,18 @@ mod tests {
             ));
             let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
             let manifest = plan.capture(&control.lock().unwrap()).unwrap();
+            // A first-mount preflight must reject the unsafe nested directory
+            // before it tries to decode or replay any view namespace intent.
+            let pending_rename = (unsafe_case == "directory-world-search").then(|| {
+                let mut id = manifest.anchor_id.as_bytes().to_vec();
+                id.extend_from_slice(&2_u64.to_le_bytes());
+                control
+                    .lock()
+                    .unwrap()
+                    .put_record("guarded-view-directory-rename-v1", &id, &[0xff])
+                    .unwrap();
+                id
+            });
             let error = match GuardedViewMount::start(
                 &manifest,
                 Arc::clone(&control),
@@ -570,6 +587,32 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            assert!(
+                control
+                    .lock()
+                    .unwrap()
+                    .records("guarded-view-namespace-v1")
+                    .unwrap()
+                    .is_empty(),
+                "unsafe lower {unsafe_case} replayed view namespace state"
+            );
+            if let Some(id) = pending_rename {
+                assert_eq!(
+                    control
+                        .lock()
+                        .unwrap()
+                        .get_record("guarded-view-directory-rename-v1", &id)
+                        .unwrap(),
+                    Some(vec![0xff])
+                );
+                assert!(
+                    control
+                        .lock()
+                        .unwrap()
+                        .delete_record("guarded-view-directory-rename-v1", &id)
+                        .unwrap()
+                );
+            }
             plan.discard_unreferenced(&control.lock().unwrap()).unwrap();
         }
     }

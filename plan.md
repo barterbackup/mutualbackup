@@ -1541,6 +1541,12 @@ blocks mount admission. An ordinary-user FUSE edit leaves the anchor exact. It p
 on ext4 and fresh local Btrfs, with 115 normal store tests and strict workspace
 Clippy. A replayable ownership transition and signed recovery of mutable view
 metadata are still required before enrollment.
+First-mount admission now verifies all captured lower directories before
+replaying view namespace journals. The privileged refusal regression checks
+that an unsafe nested directory leaves a pending rename record untouched;
+it passes on ext4 and fresh local Btrfs, alongside the successful
+held-descriptor mount probe, 115 normal store tests, and strict workspace
+Clippy. This closes the preflight ordering gap, not guarded enrollment.
 Guarded enrollment therefore still needs durable private-inode ownership and
 mode isolation plus virtualized, protected metadata before ordinary user-owned
 source trees are admissible.
