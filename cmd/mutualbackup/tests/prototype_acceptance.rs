@@ -1408,6 +1408,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     );
     let mut recovered_daemon =
         Daemon::new(recovered_config.clone(), run_root.join("recovered.log"));
+    recovered_daemon.set_env("RUST_LOG", "warn");
     recovered_daemon.start();
     wait_for_status(
         &recovered_socket,
@@ -1532,6 +1533,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         storage_recovered_config.clone(),
         run_root.join("storage-recovered.log"),
     );
+    storage_recovered_daemon.set_env("RUST_LOG", "warn");
     storage_recovered_daemon.start();
     wait_for_status(
         &storage_recovered_socket,
@@ -1690,6 +1692,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &[
             &daemons[0].log,
             &daemons[2].log,
+            &recovered_daemon.log,
             &storage_recovered_daemon.log,
         ],
     );
@@ -1813,6 +1816,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &[
             &daemons[0].log,
             &daemons[2].log,
+            &recovered_daemon.log,
             &storage_recovered_daemon.log,
         ],
     );
