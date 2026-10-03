@@ -609,6 +609,7 @@ struct InboundWorkerPause {
 struct LearnedAddresses {
     addresses: BTreeSet<Multiaddr>,
     expires_at: tokio::time::Instant,
+    signed_record: bool,
 }
 
 struct RecoveryAddresses {
@@ -4582,11 +4583,10 @@ impl P2pEventLoop {
             bail!("peer published too many endpoints");
         }
         let now_unix = unix_seconds();
-        if !addresses.is_empty() && expires_at_unix_seconds <= now_unix {
+        if expires_at_unix_seconds <= now_unix {
             bail!("peer endpoints are already expired");
         }
         if !self.learned_addresses.contains_key(&peer)
-            && !addresses.is_empty()
             && self.learned_addresses.len() >= MAX_LEARNED_ENDPOINT_PEERS
         {
             bail!("learned endpoint cache is full");
@@ -4599,21 +4599,21 @@ impl P2pEventLoop {
                 normalized.insert(address);
             }
         }
-        self.learned_addresses.remove(&peer);
-        if !normalized.is_empty() {
-            let lifetime = Duration::from_secs(
-                expires_at_unix_seconds
-                    .saturating_sub(now_unix)
-                    .min(DHT_TTL.as_secs()),
-            );
-            self.learned_addresses.insert(
-                peer,
-                LearnedAddresses {
-                    addresses: normalized,
-                    expires_at: tokio::time::Instant::now() + lifetime,
-                },
-            );
-        }
+        let lifetime = Duration::from_secs(
+            expires_at_unix_seconds
+                .saturating_sub(now_unix)
+                .min(DHT_TTL.as_secs()),
+        );
+        // Even an empty signed endpoint set withdraws earlier hints. Keep its
+        // expiry so stale roster and Identify addresses cannot revive it.
+        self.learned_addresses.insert(
+            peer,
+            LearnedAddresses {
+                addresses: normalized,
+                expires_at: tokio::time::Instant::now() + lifetime,
+                signed_record: true,
+            },
+        );
         self.reconcile_policy_addresses(peer);
         self.forget_transfer_history_if_unretained(peer);
         Ok(())
@@ -4625,6 +4625,11 @@ impl P2pEventLoop {
             return Ok(());
         }
         let existing = self.learned_addresses.get(&peer);
+        if existing.is_some_and(|known| known.signed_record) {
+            // Guild roster entries and Identify are useful discovery hints,
+            // but they must not override a newer signed endpoint set.
+            return Ok(());
+        }
         if existing.is_none() && self.learned_addresses.len() >= MAX_LEARNED_ENDPOINT_PEERS {
             bail!("learned endpoint cache is full");
         }
@@ -4639,6 +4644,7 @@ impl P2pEventLoop {
             .or_insert_with(|| LearnedAddresses {
                 addresses: BTreeSet::new(),
                 expires_at: tokio::time::Instant::now() + DHT_TTL,
+                signed_record: false,
             });
         learned.addresses.insert(address);
         learned.expires_at = tokio::time::Instant::now() + DHT_TTL;
@@ -4680,6 +4686,7 @@ impl P2pEventLoop {
                 .or_insert_with(|| LearnedAddresses {
                     addresses: BTreeSet::new(),
                     expires_at: tokio::time::Instant::now() + DHT_TTL,
+                    signed_record: false,
                 });
         if !addresses.addresses.contains(&address)
             && addresses.addresses.len() >= MAX_ENDPOINTS_PER_PEER
@@ -22984,14 +22991,14 @@ mod tests {
         assert!(!event_loop.persistent_addresses.contains_key(&peer));
         assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
         event_loop
-            .replace_learned_addresses(peer, vec![first], unix_seconds() + 300)
+            .replace_learned_addresses(peer, vec![first.clone()], unix_seconds() + 300)
             .unwrap();
         assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
         event_loop.record_transfer(peer, Some(P2pPath::Direct), 10, 20);
         assert!(event_loop.transfer_counters.contains_key(&peer));
         assert!(event_loop.path_transfer_counters.contains_key(&peer));
         event_loop
-            .replace_learned_addresses(peer, vec![second], unix_seconds() + 300)
+            .replace_learned_addresses(peer, vec![second.clone()], unix_seconds() + 300)
             .unwrap();
         assert_eq!(
             event_loop.learned_addresses[&peer]
@@ -23002,6 +23009,22 @@ mod tests {
                 .to_string(),
             "/ip4/127.0.0.1/udp/4102/quic-v1"
         );
+        event_loop.add_learned_address(peer, first.clone()).unwrap();
+        event_loop
+            .add_identified_address(peer, first.clone())
+            .unwrap();
+        assert_eq!(
+            event_loop.retained_peer_addresses(peer),
+            BTreeSet::from([normalize_known_address(peer, second).unwrap()])
+        );
+        event_loop
+            .replace_learned_addresses(peer, Vec::new(), unix_seconds() + 300)
+            .unwrap();
+        event_loop.add_learned_address(peer, first.clone()).unwrap();
+        event_loop
+            .add_identified_address(peer, first.clone())
+            .unwrap();
+        assert!(event_loop.retained_peer_addresses(peer).is_empty());
 
         event_loop
             .learned_addresses
@@ -23013,6 +23036,10 @@ mod tests {
         assert!(!event_loop.fallback_tiers.contains_key(&peer));
         assert!(!event_loop.transfer_counters.contains_key(&peer));
         assert!(!event_loop.path_transfer_counters.contains_key(&peer));
+        event_loop.add_learned_address(peer, first).unwrap();
+        assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
+        event_loop.learned_addresses.remove(&peer);
+        event_loop.reconcile_policy_addresses(peer);
 
         for port in 4200..4200 + MAX_ENDPOINTS_PER_PEER {
             let address = format!("/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{peer}")
@@ -23027,6 +23054,46 @@ mod tests {
         assert_eq!(
             event_loop.learned_addresses[&peer].addresses.len(),
             MAX_ENDPOINTS_PER_PEER
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_relay_endpoint_cannot_be_displaced_by_stale_direct_hints() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([73; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([72; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([71; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let old_direct: Multiaddr = "/ip4/127.0.0.1/udp/4101/quic-v1".parse().unwrap();
+        let current_relay: Multiaddr =
+            format!("/ip4/198.18.0.2/udp/4102/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+
+        event_loop
+            .add_learned_address(peer, old_direct.clone())
+            .unwrap();
+        assert_eq!(event_loop.selected_path_hint(peer), Some(P2pPath::Direct));
+        event_loop
+            .replace_learned_addresses(peer, vec![current_relay.clone()], unix_seconds() + 300)
+            .unwrap();
+        event_loop
+            .add_learned_address(peer, old_direct.clone())
+            .unwrap();
+        event_loop.add_identified_address(peer, old_direct).unwrap();
+
+        assert_eq!(event_loop.selected_path_hint(peer), Some(P2pPath::Relayed));
+        assert_eq!(
+            event_loop.retained_peer_addresses(peer),
+            BTreeSet::from([normalize_known_address(peer, current_relay).unwrap()])
         );
     }
 
@@ -23049,6 +23116,7 @@ mod tests {
                 LearnedAddresses {
                     addresses: BTreeSet::new(),
                     expires_at: tokio::time::Instant::now() + DHT_TTL,
+                    signed_record: false,
                 },
             );
         }

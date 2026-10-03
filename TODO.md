@@ -47,6 +47,14 @@
   corrected. The full local Git gate passed again on `1d961d5`; during its
   five-daemon run, logs still showed transient four-of-five coding signatures
   and failed dials to obsolete loopback addresses before recovery completed.
+  Source tracing found that coding and catch-up retries repeatedly add durable
+  roster endpoints to the learned cache, while Identify can add further hints.
+  Those hints could reintroduce an old direct address after a newer signed
+  endpoint set replaced it. The current correction makes signed endpoint sets,
+  including an empty withdrawal, authoritative over roster and Identify hints
+  until expiry. The focused endpoint-cache regression passes; repeat the full
+  topology gate on the corrected committed source before deciding whether this
+  also resolves the missing-signature stall.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

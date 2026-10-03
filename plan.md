@@ -1177,6 +1177,11 @@ firewall rules, and test daemons were cleaned up. Transient four-of-five coding
 signatures and obsolete-loopback dial warnings appeared during the network
 run, so the intermittent topology reliability issue remains open despite this
 pass.
+Source tracing found that older roster and Identify hints could re-add a direct
+address after a signed endpoint update. The endpoint cache now retains signed
+sets, including empty withdrawals, as authoritative until expiry. Its focused
+regression passes; the full topology gate on this correction and the original
+missing-signer diagnosis remain required before closing the reliability issue.
 The provisioned Git acceptance run on `3155689` passed its Git-specific slices
 but failed the five-daemon topology backup after the 5,400-second timeout
 following relay-only storage recovery. Two later isolated smoke runs and the
