@@ -1461,6 +1461,18 @@ exhausted transport tiers and then rejected event 25 as coming from a caller
 other than the configured coordinator before later progress. This correction
 improves post-certification dissemination, but does not explain that
 pre-certification signer failure; keep the reliability gate open.
+`1b3f42a` distinguishes guild-transition membership denial from coordinator
+authorization and logs the recipient's local phase, event sequence, and
+membership error without changing the decision. Its focused refusal and active
+administration tests and strict Clippy pass; the isolated local topology gate
+passed on that source in 1,428.25 seconds. `b3093a1` enables warnings for both
+seed-recovered daemons and includes the recovered member's log in backup
+timeouts. Its isolated topology/seed-recovery gate passed in 1,431.81 seconds
+with complete disposable-resource cleanup. At event 27 the recovered relay
+member had no installed guild or local checkpoint while its restore was still
+underway, so it correctly refused to sign; after adoption it became Active and
+the guild advanced. That transient denial is explained, but it does not prove
+the cause of the earlier 5,400-second stall. Keep the reliability gate open.
 The guarded FUSE view now answers `statfs` from the pinned lower-root
 descriptor, reporting real filesystem capacity and name limits. A privileged
 ordinary-user `statvfs` probe and comparison with the native filesystem pass

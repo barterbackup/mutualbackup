@@ -189,6 +189,20 @@
   caller was not its configured coordinator; the guild later advanced.
   Investigate that pre-certification signer/authorization path separately.
   Bounded dissemination does not close the historical 5,400-second stall.
+  `1b3f42a` adds recipient-side admission context and a distinct guild-member
+  denial while preserving fail-closed authorization. The focused unrecovered
+  signer and active-administration tests and strict workspace Clippy pass. Its
+  isolated local topology/seed-recovery test passed in 1,428.25 seconds.
+  `b3093a1` also captures warnings from both recovered daemons and includes the
+  recovered relay member's log in timeout diagnostics. The revised isolated
+  topology/seed-recovery test passed on exact commit `b3093a1` in 1,431.81
+  seconds; all disposable Btrfs and network resources were removed. At event
+  27, the recovered member logged `local_phase=None`, `local_sequence=None`,
+  and no locally committed checkpoint before its restore adopted the guild.
+  It correctly refused to sign until recovery completed, then became Active
+  and the guild advanced. This explains that transient authorization rejection.
+  The historical 5,400-second missing-signer stall and transport exhaustion
+  remain unresolved; keep this gate open.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
