@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::guarded_view_probe::{GuardedProbeView, GuardedViewMetadataV1};
 use crate::{
-    ControlStore, GuardedRootCapturePlan, NativeFileId, PinnedDirectory, StableAnchorManifest,
-    filesystem_identity,
+    ControlStore, FileAnchorManifest, GuardedRootCapturePlan, NativeFileId, PinnedDirectory,
+    StableAnchorManifest, filesystem_identity,
 };
 
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
@@ -390,6 +390,31 @@ impl GuardedViewMount {
         anchor_id: Uuid,
         control: Arc<Mutex<ControlStore>>,
     ) -> anyhow::Result<GuardedViewMetadataV1> {
+        Self::with_stopped_view(anchor_id, control, |view, _| {
+            view.verified_metadata_snapshot(anchor_id)
+        })
+    }
+
+    /// Capture a visible file from a stopped view into a second guarded
+    /// anchor. Remount replays an interrupted capture and keeps the file's
+    /// visible mode while the new anchor is frozen. This does not publish a
+    /// signed owner revision or release any historical anchor.
+    pub fn capture_stopped_file(
+        anchor_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+        relative_path: impl AsRef<Path>,
+    ) -> anyhow::Result<FileAnchorManifest> {
+        let relative_path = relative_path.as_ref().to_path_buf();
+        Self::with_stopped_view(anchor_id, control, |view, claim| {
+            view.capture_stopped_file(&claim.lower_root, &relative_path)
+        })
+    }
+
+    fn with_stopped_view<T>(
+        anchor_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+        operation: impl FnOnce(&GuardedProbeView, &MountClaim) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         let _lifecycle = MOUNT_LIFECYCLE
             .lock()
             .map_err(|_| io::Error::other("guarded mount lifecycle lock is poisoned"))?;
@@ -422,13 +447,13 @@ impl GuardedViewMount {
         };
         ensure!(
             mounted_filesystem(&claim.mountpoint)?.is_none(),
-            "guarded view must stop before metadata snapshot"
+            "guarded view must stop before inspecting its source"
         );
         let lower = PinnedDirectory::open(&claim.lower_root)?;
         let placeholder = PinnedDirectory::open(&claim.mountpoint)?;
         ensure!(
             lower.identity()? == claim.lower_id && placeholder.identity()? == claim.mountpoint_id,
-            "guarded mount paths changed before metadata snapshot"
+            "guarded mount paths changed before inspecting its source"
         );
         let view = GuardedProbeView::from_guarded_capture(
             &manifest,
@@ -436,7 +461,7 @@ impl GuardedViewMount {
             claim.view_uid,
             claim.view_gid,
         )?;
-        let snapshot = view.verified_metadata_snapshot(anchor_id)?;
+        let value = operation(&view, &claim)?;
         let control = control
             .lock()
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
@@ -446,9 +471,9 @@ impl GuardedViewMount {
                     .get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())?
                     .is_none()
                 && mounted_filesystem(&claim.mountpoint)?.is_none(),
-            "guarded mount claim changed during metadata snapshot"
+            "guarded mount claim changed during stopped-view operation"
         );
-        Ok(snapshot)
+        Ok(value)
     }
 
     pub fn stop(mut self) -> io::Result<()> {
@@ -1593,6 +1618,157 @@ print('DONE', flush=True)
                 .exists()
         );
         assert_eq!(fs::read(lower.join("sample")).unwrap(), edited);
+    }
+
+    #[test]
+    #[ignore = "requires root, CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn stopped_view_file_recapture_detaches_new_anchor_after_rename_and_remount() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-recapture-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        let control_dir = area.path().join("control");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::create_dir(&control_dir).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(lower.join("sample"), b"first revision bytes").unwrap();
+        fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o666)).unwrap();
+        let source_path = CString::new(lower.join("sample").as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(source_path.as_ptr(), 65534, 65534) },
+            0
+        );
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([113; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(control_dir.join("control.db"), &keys).unwrap(),
+        ));
+        let root_plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let original = root_plan
+            .capture_private_file_owners(&control.lock().unwrap(), 65534, 0, 0)
+            .unwrap();
+        root_plan
+            .isolate_lower_directories(&control.lock().unwrap(), &original)
+            .unwrap();
+        let first_mount =
+            GuardedViewMount::start(&original, Arc::clone(&control), &mountpoint, 65534, 65534)
+                .unwrap();
+        let edit = |path: &std::path::Path, bytes: &str| {
+            let output = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.pwrite(fd,sys.argv[2].encode(),0); os.fsync(fd); os.close(fd)")
+                .arg(path)
+                .arg(bytes)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        edit(&mountpoint.join("sample"), "EDIT1");
+        let first_bytes = fs::read(lower.join("sample")).unwrap();
+        first_mount.stop().unwrap();
+        let anchor_bytes = |manifest: &crate::FileAnchorManifest| {
+            let mut file = manifest.open_verified().unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+
+        let first = GuardedViewMount::capture_stopped_file(
+            original.anchor_id,
+            Arc::clone(&control),
+            "sample",
+        )
+        .unwrap();
+        assert_eq!(anchor_bytes(&first), first_bytes);
+        assert_eq!(
+            GuardedViewMount::capture_stopped_file(
+                original.anchor_id,
+                Arc::clone(&control),
+                "sample",
+            )
+            .unwrap(),
+            first
+        );
+        let remounted =
+            GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).unwrap();
+        assert_eq!(
+            fs::metadata(mountpoint.join("sample"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o666
+        );
+        let renamed = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
+            .arg(mountpoint.join("sample"))
+            .arg(mountpoint.join("moved"))
+            .output()
+            .unwrap();
+        assert!(renamed.status.success(), "{renamed:?}");
+        edit(&mountpoint.join("moved"), "EDIT2");
+        assert_eq!(anchor_bytes(&first), first_bytes);
+        let second_bytes = fs::read(lower.join("moved")).unwrap();
+        remounted.stop().unwrap();
+
+        let second = GuardedViewMount::capture_stopped_file(
+            original.anchor_id,
+            Arc::clone(&control),
+            "moved",
+        )
+        .unwrap();
+        assert_ne!(second.anchor_id, first.anchor_id);
+        assert_eq!(anchor_bytes(&second), second_bytes);
+        let remounted =
+            GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).unwrap();
+        edit(&mountpoint.join("moved"), "EDIT3");
+        assert_eq!(anchor_bytes(&second), second_bytes);
+        let create = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o644); os.write(fd,b'new view file'); os.fsync(fd); os.close(fd)")
+            .arg(mountpoint.join("created"))
+            .output()
+            .unwrap();
+        assert!(create.status.success(), "{create:?}");
+        remounted.stop().unwrap();
+        let created_bytes = fs::read(lower.join("created")).unwrap();
+        let created = GuardedViewMount::capture_stopped_file(
+            original.anchor_id,
+            Arc::clone(&control),
+            "created",
+        )
+        .unwrap();
+        assert_eq!(anchor_bytes(&created), created_bytes);
+        let remounted =
+            GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).unwrap();
+        edit(&mountpoint.join("created"), "EDIT4");
+        assert_eq!(anchor_bytes(&created), created_bytes);
+        remounted.stop().unwrap();
+
+        let store = control.lock().unwrap();
+        GuardedViewMount::retire_claim(original.anchor_id, &store).unwrap();
+        for anchor in [&first, &second, &created] {
+            let plan = crate::GuardedFileCapturePlan::load_for_manifest(&store, anchor)
+                .unwrap()
+                .unwrap();
+            plan.discard_unreferenced(&store).unwrap();
+        }
+        root_plan.discard_unreferenced(&store).unwrap();
+        assert!(fs::read(lower.join("moved")).unwrap().starts_with(b"EDIT3"));
     }
 
     #[test]

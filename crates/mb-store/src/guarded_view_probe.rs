@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    CapturedEntry, ControlStore, GuardedRootCapturePlan, NativeFileId, PinnedDirectory,
-    StableAnchorManifest,
+    CapturedEntry, ControlStore, FileAnchorManifest, GuardedFileCapturePlan,
+    GuardedRootCapturePlan, NativeFileId, PinnedDirectory, StableAnchorManifest,
 };
 
 const FILE_INODE: INodeNo = INodeNo(2);
@@ -51,6 +51,7 @@ const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
 const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
 const DIRECTORY_MODE_KIND: &str = "guarded-view-directory-mode-v1";
+const FILE_GUARD_KIND: &str = "guarded-view-file-guard-v1";
 
 /// The mount must be retired before root cleanup. A pending FUSE namespace
 /// operation needs remount replay first; retiring anchors against either side
@@ -960,6 +961,66 @@ impl GuardedNamespace {
             }
         }
         Ok(owned)
+    }
+
+    fn load_file_guards(
+        &self,
+        lower_root: &PinnedDirectory,
+        source_root: &Path,
+    ) -> anyhow::Result<HashMap<u64, VerifiedFileGuard>> {
+        let mut guards = HashMap::new();
+        let mut anchor_ids = BTreeSet::new();
+        let root_id = lower_root.identity()?;
+        for (inode, bytes) in self.owned_records(FILE_GUARD_KIND)? {
+            let mut record: FileGuardRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                record.version == 1
+                    && record.root_anchor_id == self.anchor_id
+                    && record.view_inode == inode
+                    && inode > INodeNo::ROOT.0
+                    && record.source_id.filesystem_id == root_id.filesystem_id
+                    && record.source_id.inode != 0
+                    && record.visible_mode & !0o7777 == 0
+                    && record.plan.source_root() == source_root
+                    && record.plan.source_root_identity() == root_id
+                    && record.plan.source_file_identity() == record.source_id
+                    && anchor_ids.insert(record.plan.anchor_id()),
+                "guarded view file guard differs from its lower source"
+            );
+            let (manifest, frozen) = {
+                let control = self
+                    .control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                if record.phase == FileGuardPhase::Prepared {
+                    record.plan.capture(&control)?;
+                }
+                record.plan.published_manifest(&control)?
+            };
+            ensure!(
+                manifest.anchor_id == record.plan.anchor_id(),
+                "guarded view file guard lost its anchor"
+            );
+            if record.phase == FileGuardPhase::Prepared {
+                record.phase = FileGuardPhase::Published;
+                self.control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+                    .replace_record_if_value(
+                        FILE_GUARD_KIND,
+                        &self.record_id(inode),
+                        &bytes,
+                        &mb_core::canonical_bytes(&record)?,
+                    )?;
+            }
+            ensure!(
+                guards
+                    .insert(inode, VerifiedFileGuard { record, frozen })
+                    .is_none(),
+                "duplicate guarded view file guard"
+            );
+        }
+        Ok(guards)
     }
 
     fn preflight_known_lower_inodes(
@@ -1966,6 +2027,28 @@ struct ProbeLocation {
     relative_path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum FileGuardPhase {
+    Prepared,
+    Published,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct FileGuardRecord {
+    version: u16,
+    root_anchor_id: Uuid,
+    view_inode: u64,
+    source_id: NativeFileId,
+    visible_mode: u16,
+    plan: GuardedFileCapturePlan,
+    phase: FileGuardPhase,
+}
+
+struct VerifiedFileGuard {
+    record: FileGuardRecord,
+    frozen: bool,
+}
+
 #[derive(Clone)]
 struct GuardedProbeDirectory {
     attr: FileAttr,
@@ -2078,17 +2161,23 @@ impl GuardedProbeFile {
         inode: INodeNo,
         location: ProbeLocation,
         lower_root: &Path,
-        view_uid: u32,
-        view_gid: u32,
+        view_owner: (u32, u32),
+        control: Arc<Mutex<ControlStore>>,
+        guard: Option<VerifiedFileGuard>,
     ) -> io::Result<Self> {
-        let mode = (source.metadata()?.permissions().mode() & 0o7777) as u16;
+        let lower_mode = (source.metadata()?.permissions().mode() & 0o7777) as u16;
+        let mode = guard
+            .as_ref()
+            .filter(|guard| guard.frozen)
+            .map_or(lower_mode, |guard| guard.record.visible_mode);
         let expected_inode = source.metadata()?.ino();
         let mut attr = probe_file_attr(&source, inode, mode)?;
-        attr.uid = view_uid;
-        attr.gid = view_gid;
+        attr.uid = view_owner.0;
+        attr.gid = view_owner.1;
         let location = Arc::new(Mutex::new(Some(location)));
         let location_for_open = Arc::clone(&location);
         let lower_root = lower_root.to_path_buf();
+        let guard_plan = guard.map(|guard| guard.record.plan);
         let open_for_write: Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync> =
             Arc::new(move |mode| {
                 let location = location_for_open
@@ -2097,6 +2186,13 @@ impl GuardedProbeFile {
                 let location = location
                     .as_ref()
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                if let Some(plan) = &guard_plan {
+                    let store = control
+                        .lock()
+                        .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                    plan.prepare_edit_at(&store, &location.relative_path)
+                        .map_err(preserve_source_errno)?;
+                }
                 let opened = OpenOptions::new()
                     .read(mode == OpenAccMode::O_RDWR)
                     .write(true)
@@ -2118,6 +2214,134 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    /// Freeze one live file from a stopped view into a new durable hard-link
+    /// anchor. The record is published before capture, so remount completes a
+    /// pending freeze before any FUSE write can reach the inode.
+    pub(crate) fn capture_stopped_file(
+        &self,
+        source_root: &Path,
+        relative_path: &Path,
+    ) -> anyhow::Result<FileAnchorManifest> {
+        self.verify_private_lower_ownership()?;
+        self.verify_lower_namespace()?;
+        let namespace = self
+            .namespace
+            .as_ref()
+            .context("guarded view has no durable namespace")?;
+        let lower_root = self
+            .lower_root
+            .as_ref()
+            .context("guarded view has no private lower root")?;
+        let mut selected = None;
+        for ((parent, name), inode) in self.names.lock().unwrap().iter() {
+            let parent_path = if *parent == INodeNo::ROOT.0 {
+                PathBuf::new()
+            } else {
+                self.directory(*parent)
+                    .context("guarded file has no directory parent")?
+                    .relative_path
+            };
+            if parent_path.join(name) == relative_path {
+                ensure!(
+                    selected.replace(*inode).is_none(),
+                    "duplicate guarded file name"
+                );
+            }
+        }
+        let inode = selected.context("guarded file is not visible in this view")?;
+        let file = self
+            .file(inode)
+            .context("guarded view path is not a file")?;
+        let source_id = NativeFileId {
+            filesystem_id: lower_root.identity()?.filesystem_id,
+            inode: file.source.metadata()?.ino(),
+        };
+        let mode = file.current_attr()?.perm;
+        let id = namespace.record_id(inode);
+        let existing = namespace
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .get_record(FILE_GUARD_KIND, &id)?;
+        if let Some(bytes) = existing.as_ref() {
+            let record: FileGuardRecord = mb_core::decode_canonical(bytes)?;
+            ensure!(
+                record.version == 1
+                    && record.root_anchor_id == namespace.anchor_id
+                    && record.view_inode == inode
+                    && record.source_id == source_id
+                    && record.plan.source_root() == source_root
+                    && record.plan.source_root_identity() == lower_root.identity()?
+                    && record.plan.source_file_identity() == source_id,
+                "guarded file guard differs from its visible source"
+            );
+            if record.phase == FileGuardPhase::Prepared {
+                let control = namespace
+                    .control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                let manifest = record.plan.capture(&control)?;
+                let mut published = record.clone();
+                published.phase = FileGuardPhase::Published;
+                control.replace_record_if_value(
+                    FILE_GUARD_KIND,
+                    &id,
+                    bytes,
+                    &mb_core::canonical_bytes(&published)?,
+                )?;
+                return Ok(manifest);
+            }
+            let (manifest, frozen) = {
+                let store = namespace
+                    .control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                record.plan.published_manifest(&store)?
+            };
+            if frozen {
+                return Ok(manifest);
+            }
+        }
+        let plan = GuardedFileCapturePlan::plan(source_root, relative_path)?;
+        ensure!(
+            plan.source_root_identity() == lower_root.identity()?
+                && plan.source_file_identity() == source_id,
+            "guarded file changed while planning a new anchor"
+        );
+        let record = FileGuardRecord {
+            version: 1,
+            root_anchor_id: namespace.anchor_id,
+            view_inode: inode,
+            source_id,
+            visible_mode: mode,
+            plan,
+            phase: FileGuardPhase::Prepared,
+        };
+        let control = namespace
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        let encoded = mb_core::canonical_bytes(&record)?;
+        if let Some(bytes) = existing {
+            control.replace_record_if_value(FILE_GUARD_KIND, &id, &bytes, &encoded)?;
+        } else {
+            ensure!(
+                control.put_record_if_absent(FILE_GUARD_KIND, &id, &encoded)?,
+                "guarded file guard appeared while planning"
+            );
+        }
+        let manifest = record.plan.capture(&control)?;
+        let mut published = record;
+        published.phase = FileGuardPhase::Published;
+        control.replace_record_if_value(
+            FILE_GUARD_KIND,
+            &id,
+            &encoded,
+            &mb_core::canonical_bytes(&published)?,
+        )?;
+        Ok(manifest)
+    }
+
     /// Caller must stop and fence the FUSE mount before building this value.
     /// The lower namespace check excludes unrecorded paths, while the inode
     /// checks bind each visible name to its reconstructed source object.
@@ -2817,6 +3041,7 @@ impl GuardedProbeView {
             &defaults,
             first_dynamic_inode,
         )?;
+        let mut file_guards = namespace.load_file_guards(&lower_root, plan.source_root())?;
         let mut files = Vec::new();
         for (index, entry) in manifest.entries.iter().enumerate() {
             let (path, mode) = match entry {
@@ -2861,17 +3086,27 @@ impl GuardedProbeView {
                         source.metadata()?.ino() == expected.inode,
                         "guarded view source file changed while opening"
                     );
+                    let guard = file_guards.remove(&inode.0);
+                    ensure!(
+                        guard
+                            .as_ref()
+                            .is_none_or(|guard| guard.record.source_id == expected),
+                        "guarded file guard has another captured source"
+                    );
                     let editable = {
                         let control = control
                             .lock()
                             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
                         plan.file_has_editable_inode(&control, path)?
                     };
-                    let visible_mode = if editable {
-                        (source.metadata()?.permissions().mode() & 0o7777) as u16
-                    } else {
-                        (mode & 0o7777) as u16
-                    };
+                    let visible_mode =
+                        if let Some(guard) = guard.as_ref().filter(|guard| guard.frozen) {
+                            guard.record.visible_mode
+                        } else if editable {
+                            (source.metadata()?.permissions().mode() & 0o7777) as u16
+                        } else {
+                            (mode & 0o7777) as u16
+                        };
                     let mut attr = probe_file_attr(&source, inode, visible_mode)?;
                     attr.uid = view_uid;
                     attr.gid = view_gid;
@@ -2881,6 +3116,7 @@ impl GuardedProbeView {
                     let plan_for_open = plan.clone();
                     let lower_path = plan.source_root().to_path_buf();
                     let captured_path = path.clone();
+                    let guard_plan = guard.map(|guard| guard.record.plan);
                     let open_for_write: Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync> =
                         Arc::new(move |mode| {
                             let location = location_for_open.lock().map_err(|_| {
@@ -2892,6 +3128,11 @@ impl GuardedProbeView {
                             let control = control_for_open.lock().map_err(|_| {
                                 io::Error::other("guarded control lock is poisoned")
                             })?;
+                            if let Some(guard_plan) = &guard_plan {
+                                guard_plan
+                                    .prepare_edit_at(&control, &location.relative_path)
+                                    .map_err(preserve_source_errno)?;
+                            }
                             plan_for_open
                                 .prepare_file_edit_at(
                                     &control,
@@ -2948,14 +3189,35 @@ impl GuardedProbeView {
                 source.metadata()?.ino() == record.expected.inode,
                 "created guarded file changed while opening"
             );
+            let guard = file_guards.remove(&inode);
+            ensure!(
+                guard
+                    .as_ref()
+                    .is_none_or(|guard| guard.record.source_id == record.expected),
+                "guarded file guard has another created source"
+            );
             files.push(GuardedProbeFile::new_editable(
                 source,
                 INodeNo(inode),
                 location,
                 plan.source_root(),
-                view_uid,
-                view_gid,
+                (view_uid, view_gid),
+                Arc::clone(&control),
+                guard,
             )?);
+        }
+        for (inode, guard) in file_guards {
+            ensure!(
+                namespace
+                    .records
+                    .lock()
+                    .unwrap()
+                    .get(&inode)
+                    .is_some_and(|record| {
+                        record.expected == guard.record.source_id && record.current.is_none()
+                    }),
+                "orphaned guarded file guard has no matching removed source"
+            );
         }
         let root_perm = namespace.root_mode((manifest.root_mode & 0o7777) as u16)?;
         let mut view = Self::with_directories(
@@ -4079,8 +4341,9 @@ impl Filesystem for GuardedProbeView {
                     relative_path,
                 },
                 &lower_root.descriptor_path(),
-                self.root_uid,
-                self.root_gid,
+                (self.root_uid, self.root_gid),
+                Arc::clone(&namespace.control),
+                None,
             )
             .inspect_err(|_| self.poisoned.store(true, Ordering::Release))?;
             let attr = file

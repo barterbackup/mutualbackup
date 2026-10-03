@@ -127,6 +127,13 @@ impl GuardedFileCapturePlan {
         self.source_mode
     }
 
+    pub fn source_file_identity(&self) -> NativeFileId {
+        NativeFileId {
+            filesystem_id: self.source_version.filesystem_id,
+            inode: self.source_version.inode,
+        }
+    }
+
     /// Identify a guarded Git blob anchor from its durable local plan. Prune
     /// must route it through this backend's journal rather than generic file
     /// removal. A missing manifest claim is valid only during retirement.
@@ -355,6 +362,23 @@ impl GuardedFileCapturePlan {
             )?);
         }
         Ok(manifest)
+    }
+
+    /// Verify an already published file without consulting its old source
+    /// name. A FUSE rename may move the source after the guarded anchor is
+    /// published, while the anchor and its detach journal remain authoritative.
+    pub fn published_manifest(
+        &self,
+        control: &ControlStore,
+    ) -> anyhow::Result<(FileAnchorManifest, bool)> {
+        let intent = LinkFreezeCaptureIntent::load(control, self.anchor_id)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?;
+        anyhow::ensure!(matches!(
+            intent.phase(),
+            LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
+        ));
+        let (_, manifest) = self.verified_published_edit_anchor(control, &intent)?;
+        Ok((manifest, intent.phase() == LinkFreezeCapturePhase::Frozen))
     }
 
     /// Detach the original source inode before allowing an edit to a captured

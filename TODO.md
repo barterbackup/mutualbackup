@@ -741,6 +741,17 @@
   snapshot's current file bytes into immutable anchors, include its metadata
   in a signed owner revision, prove seed-only recovery, and only then enable
   guarded node enrollment.
+  A stopped claimed view can now capture an edited or newly created visible
+  file into a second guarded hard-link anchor. Its per-inode record is durable
+  before the link is made; remount verifies or resumes the capture and detaches
+  that new anchor before a later write, including after rename. A privileged
+  regression recaptures the same inode twice and captures a view-created file;
+  it passes on local ext4 and disposable Btrfs. All 18 existing guarded FUSE
+  probes, 119 normal store tests, and strict workspace Clippy also pass.
+  The local anchors still need an atomic association with signed owner
+  revisions, seed-only recovery of the mutable view, and coordinated
+  retirement of the per-inode guard records and their anchors before guarded
+  enrollment or Git stage/checkout may select this backend.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
