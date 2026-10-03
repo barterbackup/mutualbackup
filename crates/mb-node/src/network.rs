@@ -733,16 +733,18 @@ fn process_peer_request(
         ) && request
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
-        let guild_transition = matches!(
+        let guild_transition_request = matches!(
             &request,
             PeerRequest::SignGuildEvent { .. }
                 | PeerRequest::InstallGuildEvent { .. }
                 | PeerRequest::SignCodingGroupEvent { .. }
                 | PeerRequest::InstallCodingGroupEvent { .. }
                 | PeerRequest::AttestLegacyCodingAdd { .. }
-        ) && request
-            .guild_scope()
-            .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
+        );
+        let guild_transition = guild_transition_request
+            && request
+                .guild_scope()
+                .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         let delegated_coding = has_delegated_coding_role(&request, caller)
             && request
                 .guild_scope()
@@ -776,6 +778,33 @@ fn process_peer_request(
             && !delegated_coding
             && !historical_coding
         {
+            if guild_transition_request {
+                let guild_id = request.guild_scope();
+                let membership_error = guild_id
+                    .and_then(|guild_id| node_guard.authorize_member(&guild_id, caller).err())
+                    .map(|error| format!("{error:#}"));
+                let local_guild = node_guard.guild_summary().ok().flatten();
+                let requested_sequence = match &request {
+                    PeerRequest::SignGuildEvent { event }
+                    | PeerRequest::SignCodingGroupEvent { event, .. } => Some(event.sequence),
+                    PeerRequest::InstallGuildEvent { certified }
+                    | PeerRequest::InstallCodingGroupEvent { certified, .. } => {
+                        Some(certified.event.sequence)
+                    }
+                    _ => None,
+                };
+                tracing::warn!(
+                    %caller,
+                    operation = mutation_kind.unwrap_or("guild-transition"),
+                    ?guild_id,
+                    ?requested_sequence,
+                    local_sequence = ?local_guild.as_ref().and_then(|guild| guild.event_sequence),
+                    local_phase = ?local_guild.as_ref().map(|guild| &guild.phase),
+                    ?membership_error,
+                    "guild transition caller failed local membership admission"
+                );
+                bail!("caller is not an authorized guild member for this transition");
+            }
             bail!("caller is not the configured guild coordinator");
         }
         #[cfg(test)]
@@ -3011,6 +3040,70 @@ mod tests {
         stale.issued_at_unix_seconds = 1;
         stale.expires_at_unix_seconds = 2;
         assert!(validate_request_envelope(&stale, caller.node_id(), recipient).is_err());
+    }
+
+    #[test]
+    fn unrecovered_peer_refuses_guild_event_signature_without_a_membership_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Arc::new(Mutex::new(
+            Node::open(temp.path(), Seed::from_bytes([151; 32])).unwrap(),
+        ));
+        let (local_id, reader_config) = {
+            let node = node.lock().unwrap();
+            (node.keys().node_id(), node.reader_config())
+        };
+        let service = Arc::new(NodeService {
+            reader_config,
+            writer: Arc::clone(&node),
+            readers: Mutex::new(Vec::new()),
+            max_readers: 2,
+            active_readers: AtomicUsize::new(0),
+            coding_paths: RwLock::new(BTreeMap::new()),
+        });
+        let caller = KeyMaterial::from_seed(&Seed::from_bytes([152; 32]));
+        let event = mb_core::GuildEvent {
+            format_version: 1,
+            guild_id: [153; 32],
+            sequence: 1,
+            parent: [154; 32],
+            kind: mb_core::GuildEventKind::SetQuorum {
+                policy: mb_core::QuorumPolicy {
+                    format_version: 1,
+                    rule: mb_core::QuorumRule::Majority,
+                },
+            },
+        };
+        let request = make_peer_request(
+            &caller,
+            Some(local_id),
+            PeerRequest::SignGuildEvent {
+                event: Box::new(event),
+            },
+        )
+        .unwrap();
+        let config = NodeServerConfig {
+            listen: free_address(),
+            public_endpoint: "tcp://127.0.0.1:1".to_owned(),
+            failure_domain: "recovering-peer".to_owned(),
+            trusted_coordinator: local_id,
+            max_connections: 2,
+        };
+        let response = process_peer_request(service, &config, request).unwrap();
+        assert!(
+            response
+                .value
+                .result
+                .unwrap_err()
+                .to_string()
+                .contains("not an authorized guild member for this transition")
+        );
+        assert!(
+            node.lock()
+                .unwrap()
+                .locked_guild_event_proposal(1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
