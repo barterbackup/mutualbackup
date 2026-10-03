@@ -1164,9 +1164,12 @@ tests pass on ext4 and a fresh local Btrfs image, and the stored anchor remains
 byte-exact. `7f52416` adds a single-file FUSE rename/unlink probe: rename
 preserves the frozen anchor until a later write at the new name
 detaches it; unlink leaves the exact anchor available. All seven privileged
-FUSE probes pass on ext4 and fresh local Btrfs. Whole-worktree dispatch,
-remaining metadata/allocation operations, atomic replacement, concurrent
-handles, mount supervision/recovery, and guarded enrollment remain open.
+FUSE probes pass on ext4 and fresh local Btrfs. `33e8171` adds a guarded
+`fallocate` callback; ordinary-user allocation extends the editable source
+without changing captured bytes, and all eight privileged FUSE probes pass on
+ext4 and fresh local Btrfs. Whole-worktree dispatch, remaining metadata and
+allocation modes, atomic replacement, concurrent handles, mount
+supervision/recovery, and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

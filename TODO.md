@@ -101,8 +101,12 @@
   rename leaves the captured hard-link
   anchor frozen until a later write at the new name detaches it, and unlink
   removes the working name while the exact anchor remains. All seven privileged
-  FUSE probes pass on ext4 and fresh local Btrfs. Extend this to the whole
-  versioned worktree namespace, remaining metadata/allocation operations,
+  FUSE probes pass on ext4 and fresh local Btrfs. `33e8171` adds a guarded
+  `fallocate` callback and an ordinary-user allocation probe: an allocation
+  extending the editable file to 4 KiB leaves the original anchor byte-exact.
+  All eight privileged FUSE probes pass on ext4 and fresh local Btrfs; normal
+  store tests and strict workspace Clippy pass. Extend this to the whole
+  versioned worktree namespace, remaining metadata and allocation modes,
   atomic replacement, concurrent handles, and mount/restart failure before
   enrollment. Whole-worktree rename/unlink dispatch is still open. Keep Git
   staging and checkout gated until the complete privileged probe passes. See
