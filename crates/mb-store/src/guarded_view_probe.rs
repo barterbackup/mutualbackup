@@ -2,17 +2,18 @@
 //!
 //! This proves that this host can mount a view, pass read-only file access to
 //! a lower inode, and finish one captured file's durable detach before a
-//! writable open. It is not a complete long-lived edit guard and must not be
-//! used as an enrollment decision by itself.
+//! writable open or metadata edit. It also probes rename and unlink through
+//! the view. It is not a complete long-lived edit guard and must not be used
+//! as an enrollment decision by itself.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,8 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, ensure};
 use fuser::{
     BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
 };
 
 const FILE_INODE: INodeNo = INodeNo(2);
@@ -35,6 +36,9 @@ const KERNEL_O_LARGEFILE: i32 = 0o100000;
 struct SingleFileProbeView {
     source: File,
     source_attr: Mutex<FileAttr>,
+    name: Arc<Mutex<Option<OsString>>>,
+    lower_dir: Option<PathBuf>,
+    root_perm: u16,
     next_handle: AtomicU64,
     denied_writable: Arc<AtomicU64>,
     backing: Mutex<HashMap<u64, ActiveBacking>>,
@@ -58,7 +62,7 @@ impl SingleFileProbeView {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: self.root_perm,
             nlink: 2,
             uid: source_attr.uid,
             gid: source_attr.gid,
@@ -73,6 +77,7 @@ impl SingleFileProbeView {
         let mut attr = self.source_attr.lock().unwrap();
         attr.size = metadata.len();
         attr.blocks = metadata.blocks();
+        attr.nlink = metadata.nlink() as u32;
         Ok(*attr)
     }
 }
@@ -112,7 +117,8 @@ impl Filesystem for SingleFileProbeView {
     }
 
     fn lookup(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        if parent == INodeNo::ROOT && name == OsStr::new("sample") {
+        let current = self.name.lock().unwrap();
+        if parent == INodeNo::ROOT && current.as_deref() == Some(name) {
             match self.current_file_attr() {
                 Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
                 Err(_) => reply.error(Errno::EIO),
@@ -278,6 +284,77 @@ impl Filesystem for SingleFileProbeView {
         self.backing.lock().unwrap().remove(&handle.0);
         reply.ok();
     }
+
+    fn rename(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let Some(lower_dir) = &self.lower_dir else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        if parent != INodeNo::ROOT || newparent != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        if !flags.is_empty() && flags != RenameFlags::RENAME_NOREPLACE {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let mut current = self.name.lock().unwrap();
+        if current.as_deref() != Some(name) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        if name == newname {
+            reply.ok();
+            return;
+        }
+        let result = (|| -> io::Result<()> {
+            let lower = crate::PinnedDirectory::open(lower_dir).map_err(io::Error::other)?;
+            lower
+                .rename_child_no_replace(name, newname)
+                .map_err(io::Error::other)?;
+            *current = Some(newname.to_os_string());
+            lower.sync_all().map_err(io::Error::other)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+        }
+    }
+
+    fn unlink(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(lower_dir) = &self.lower_dir else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        if parent != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let mut current = self.name.lock().unwrap();
+        if current.as_deref() != Some(name) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let result = (|| -> io::Result<()> {
+            let lower = crate::PinnedDirectory::open(lower_dir).map_err(io::Error::other)?;
+            lower.remove_child_file(name).map_err(io::Error::other)?;
+            *current = None;
+            lower.sync_all().map_err(io::Error::other)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+        }
+    }
 }
 
 /// Verify read-only FUSE passthrough on a disposable view beside `source_root`.
@@ -320,6 +397,9 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
         // Advertise the original editable mode. The lower inode is frozen;
         // the view must still reject writes until detach.
         source_attr: Mutex::new(probe_file_attr(&source, 0o666)?),
+        name: Arc::new(Mutex::new(Some(OsString::from("sample")))),
+        lower_dir: None,
+        root_perm: 0o755,
         source,
         next_handle: AtomicU64::new(1),
         denied_writable: Arc::clone(&denied_writable),
@@ -431,6 +511,7 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -464,6 +545,8 @@ mod tests {
         OwnerChmod,
         PathTruncate,
         OpenTruncate,
+        RenameThenWrite,
+        Unlink,
     }
 
     fn guarded_view_mutation_case(first: FirstMutation) {
@@ -495,24 +578,35 @@ mod tests {
         let control = Arc::new(Mutex::new(control));
         let control_for_open = Arc::clone(&control);
         let plan_for_open = plan.clone();
-        let path_for_open = lower_path.clone();
+        let name = Arc::new(Mutex::new(Some(OsString::from("sample"))));
+        let name_for_open = Arc::clone(&name);
+        let lower_for_open = lower.clone();
         let open_for_write = Arc::new(move |mode: OpenAccMode| -> io::Result<File> {
+            let current = name_for_open
+                .lock()
+                .map_err(|_| io::Error::other("guarded name lock is poisoned"))?;
+            let current = current
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             let control = control_for_open
                 .lock()
                 .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
             plan_for_open
-                .prepare_edit(&control)
+                .prepare_edit_at(&control, current)
                 .map_err(io::Error::other)?;
             OpenOptions::new()
                 .read(mode == OpenAccMode::O_RDWR)
                 .write(true)
-                .open(&path_for_open)
+                .open(lower_for_open.join(current))
         });
         let mut advertised = probe_file_attr(&source, 0o666).unwrap();
         advertised.uid = 65534;
         let view = SingleFileProbeView {
             source_attr: Mutex::new(advertised),
             source,
+            name,
+            lower_dir: Some(lower.clone()),
+            root_perm: 0o777,
             next_handle: AtomicU64::new(1),
             denied_writable: Arc::new(AtomicU64::new(0)),
             backing: Mutex::default(),
@@ -552,6 +646,10 @@ mod tests {
                 FirstMutation::OpenTruncate => {
                     "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_TRUNC); os.write(fd,b'REPLACED'); os.fsync(fd); os.close(fd)"
                 }
+                FirstMutation::RenameThenWrite => {
+                    "import os,sys; os.rename(sys.argv[1],os.path.join(os.path.dirname(sys.argv[1]),'moved'))"
+                }
+                FirstMutation::Unlink => "import os,sys; os.unlink(sys.argv[1])",
             };
             let output = Command::new("python3")
                 .uid(65534)
@@ -604,8 +702,51 @@ mod tests {
                     anyhow::ensure!(fs::read(&lower_path)? == b"REPLACED");
                     anyhow::ensure!(fs::read(mountpoint.join("sample"))? == b"REPLACED");
                 }
+                FirstMutation::RenameThenWrite => {
+                    anyhow::ensure!(!lower_path.exists());
+                    anyhow::ensure!(!mountpoint.join("sample").exists());
+                    anyhow::ensure!(fs::read(lower.join("moved"))? == original);
+                    anyhow::ensure!(fs::read(mountpoint.join("moved"))? == original);
+                    anyhow::ensure!(
+                        LinkFreezeCaptureIntent::load(&control.lock().unwrap(), plan.anchor_id())?
+                            .is_some_and(|intent| intent.phase() == LinkFreezeCapturePhase::Frozen)
+                    );
+                    let renamed_write = Command::new("python3")
+                        .uid(65534)
+                        .gid(65534)
+                        .arg("-c")
+                        .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                        .arg(mountpoint.join("moved"))
+                        .output()?;
+                    anyhow::ensure!(
+                        renamed_write.status.success(),
+                        "ordinary-user write after rename failed: {}",
+                        String::from_utf8_lossy(&renamed_write.stderr)
+                    );
+                    anyhow::ensure!(fs::read(lower.join("moved"))?.starts_with(b"EDIT"));
+                }
+                FirstMutation::Unlink => {
+                    anyhow::ensure!(!lower_path.exists());
+                    anyhow::ensure!(!mountpoint.join("sample").exists());
+                    let mut anchor = manifest.open_verified()?;
+                    anyhow::ensure!(anchor.metadata()?.ino() == original_inode);
+                    anyhow::ensure!(anchor.metadata()?.nlink() == 1);
+                    let mut bytes = Vec::new();
+                    anchor.read_to_end(&mut bytes)?;
+                    anyhow::ensure!(bytes == original);
+                    anyhow::ensure!(
+                        LinkFreezeCaptureIntent::load(&control.lock().unwrap(), plan.anchor_id())?
+                            .is_some_and(|intent| intent.phase() == LinkFreezeCapturePhase::Frozen)
+                    );
+                    return Ok(());
+                }
             }
-            let source_metadata = fs::metadata(&lower_path)?;
+            let current_lower = if matches!(first, FirstMutation::RenameThenWrite) {
+                lower.join("moved")
+            } else {
+                lower_path.clone()
+            };
+            let source_metadata = fs::metadata(current_lower)?;
             anyhow::ensure!(
                 source_metadata.ino() == original_inode && source_metadata.nlink() == 1
             );
@@ -648,5 +789,17 @@ mod tests {
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn truncating_open_detaches_before_changing_source_bytes() {
         guarded_view_mutation_case(FirstMutation::OpenTruncate);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn rename_preserves_anchor_until_later_write_detaches() {
+        guarded_view_mutation_case(FirstMutation::RenameThenWrite);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn unlink_preserves_anchor_without_detach() {
+        guarded_view_mutation_case(FirstMutation::Unlink);
     }
 }
