@@ -11,6 +11,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -25,9 +26,12 @@ use fuser::{
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
     ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
 };
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
-    CapturedEntry, ControlStore, GuardedRootCapturePlan, PinnedDirectory, StableAnchorManifest,
+    CapturedEntry, ControlStore, GuardedRootCapturePlan, NativeFileId, PinnedDirectory,
+    StableAnchorManifest,
 };
 
 const FILE_INODE: INodeNo = INodeNo(2);
@@ -36,6 +40,193 @@ const PROBE_BYTES: &[u8] = b"mutualbackup-guarded-view-probe";
 // The kernel supplies O_LARGEFILE in FUSE_OPEN even when libc defines it as
 // zero for the native 64-bit ABI.
 const KERNEL_O_LARGEFILE: i32 = 0o100000;
+const NAMESPACE_KIND: &str = "guarded-view-namespace-v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NamespaceRecord {
+    version: u16,
+    captured_path: String,
+    expected: NativeFileId,
+    current: Option<Vec<u8>>,
+    // Some(None) is an unlink; Some(Some(path)) is a rename.
+    pending: Option<Option<Vec<u8>>>,
+}
+
+struct GuardedNamespace {
+    control: Arc<Mutex<ControlStore>>,
+    anchor_id: Uuid,
+    records: Mutex<HashMap<u64, NamespaceRecord>>,
+}
+
+impl GuardedNamespace {
+    fn record_id(&self, inode: u64) -> Vec<u8> {
+        let mut id = self.anchor_id.as_bytes().to_vec();
+        id.extend_from_slice(&inode.to_le_bytes());
+        id
+    }
+
+    fn store(&self, inode: u64, record: &NamespaceRecord) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(record).map_err(io::Error::other)?;
+        self.control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record(NAMESPACE_KIND, &self.record_id(inode), &bytes)
+            .map_err(io::Error::other)
+    }
+
+    fn load_or_replay(
+        &self,
+        inode: u64,
+        captured_path: &str,
+        expected: NativeFileId,
+        lower_root: &PinnedDirectory,
+        directories: &HashMap<PathBuf, INodeNo>,
+    ) -> anyhow::Result<Option<ProbeLocation>> {
+        let bytes = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .get_record(NAMESPACE_KIND, &self.record_id(inode))?;
+        let mut record = match bytes {
+            Some(bytes) => mb_core::decode_canonical::<NamespaceRecord>(&bytes)?,
+            None => NamespaceRecord {
+                version: 1,
+                captured_path: captured_path.to_owned(),
+                expected,
+                current: Some(captured_path.as_bytes().to_vec()),
+                pending: None,
+            },
+        };
+        ensure!(
+            record.version == 1
+                && record.captured_path == captured_path
+                && record.expected == expected,
+            "guarded namespace record does not match capture"
+        );
+        if let Some(target) = record.pending.clone() {
+            let old = record
+                .current
+                .as_ref()
+                .context("pending guarded namespace operation has no source")?;
+            let (old_path, _) = namespace_path(old, directories)?;
+            let old_owned = namespace_parent(lower_root, &old_path)?;
+            let old_parent = old_owned.as_ref().unwrap_or(lower_root);
+            let old_name = old_path.file_name().unwrap();
+            let old_identity = old_parent.entry_identity(old_name, false)?;
+            if let Some(target) = &target {
+                let (new_path, _) = namespace_path(target, directories)?;
+                ensure!(new_path != old_path, "guarded rename has identical paths");
+                let new_owned = namespace_parent(lower_root, &new_path)?;
+                let new_parent = new_owned.as_ref().unwrap_or(lower_root);
+                let new_name = new_path.file_name().unwrap();
+                let new_identity = new_parent.entry_identity(new_name, false)?;
+                match (old_identity, new_identity) {
+                    (Some(old_id), None) if old_id == expected => old_parent
+                        .move_child_file_no_replace(old_name, expected, new_parent, new_name)?,
+                    (None, Some(new_id)) if new_id == expected => {}
+                    _ => anyhow::bail!("guarded rename cannot be safely replayed"),
+                }
+            } else {
+                match old_identity {
+                    Some(old_id) if old_id == expected => {
+                        old_parent.remove_child_file_if_identity(old_name, expected)?;
+                    }
+                    None => {}
+                    _ => anyhow::bail!("guarded unlink cannot be safely replayed"),
+                }
+            }
+            record.current = target;
+            record.pending = None;
+            self.store(inode, &record)?;
+        }
+        let location = match &record.current {
+            Some(bytes) => {
+                let (relative_path, parent) = namespace_path(bytes, directories)?;
+                let owned = namespace_parent(lower_root, &relative_path)?;
+                let lower = owned.as_ref().unwrap_or(lower_root);
+                ensure!(
+                    lower.entry_identity(relative_path.file_name().unwrap(), false)?
+                        == Some(expected),
+                    "guarded view file moved or changed after capture"
+                );
+                Some(ProbeLocation {
+                    parent,
+                    relative_path,
+                })
+            }
+            None => None,
+        };
+        ensure!(
+            self.records.lock().unwrap().insert(inode, record).is_none(),
+            "duplicate guarded namespace inode"
+        );
+        Ok(location)
+    }
+
+    fn transition(
+        &self,
+        inode: u64,
+        old: &Path,
+        new: Option<&Path>,
+        mutate: impl FnOnce(NativeFileId) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut records = self.records.lock().unwrap();
+        let record = records
+            .get_mut(&inode)
+            .ok_or_else(|| io::Error::other("missing guarded namespace record"))?;
+        let old_bytes = old.as_os_str().as_bytes();
+        if record.pending.is_some() || record.current.as_deref() != Some(old_bytes) {
+            return Err(io::Error::other("guarded namespace record changed"));
+        }
+        let new_bytes = new.map(|path| path.as_os_str().as_bytes().to_vec());
+        record.pending = Some(new_bytes.clone());
+        if let Err(error) = self.store(inode, record) {
+            record.pending = None;
+            return Err(error);
+        }
+        mutate(record.expected)?;
+        record.current = new_bytes;
+        record.pending = None;
+        self.store(inode, record)
+    }
+}
+
+fn namespace_path(
+    bytes: &[u8],
+    directories: &HashMap<PathBuf, INodeNo>,
+) -> anyhow::Result<(PathBuf, INodeNo)> {
+    let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    ensure!(
+        path.components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "invalid guarded namespace path"
+    );
+    let parent = path
+        .parent()
+        .context("guarded namespace path has no parent")?;
+    let inode = *directories
+        .get(parent)
+        .context("guarded namespace parent is not captured")?;
+    ensure!(
+        path.file_name().is_some(),
+        "guarded namespace name is empty"
+    );
+    Ok((path, inode))
+}
+
+fn namespace_parent(
+    root: &PinnedDirectory,
+    path: &Path,
+) -> anyhow::Result<Option<PinnedDirectory>> {
+    let parent = path
+        .parent()
+        .context("guarded namespace path has no parent")?;
+    if parent.as_os_str().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(root.open_descendant_directory(parent)?))
+    }
+}
 
 struct GuardedProbeFile {
     source: File,
@@ -57,14 +248,15 @@ struct GuardedProbeDirectory {
 }
 
 /// Experimental FUSE view for a published guarded capture. Enrollment and
-/// mount supervision remain gated until namespace replay and mutation coverage
-/// are complete. The caller must keep the lower source directory inaccessible
-/// to ordinary users while this view is mounted.
+/// mount supervision remain gated until directory mutation coverage and the
+/// remaining write paths are complete. The caller must keep the lower source
+/// directory inaccessible to ordinary users while this view is mounted.
 pub struct GuardedProbeView {
     files: HashMap<u64, GuardedProbeFile>,
     directories: HashMap<u64, GuardedProbeDirectory>,
     names: Mutex<HashMap<(u64, OsString), u64>>,
     lower_root: Option<crate::PinnedDirectory>,
+    namespace: Option<GuardedNamespace>,
     root_uid: u32,
     root_gid: u32,
     root_perm: u16,
@@ -92,9 +284,8 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
-    /// Rebuild the initial namespace only while every captured source path is
-    /// still at its recorded identity. A rename or unlink without a durable
-    /// namespace journal fails closed instead of silently losing that change.
+    /// Rebuild the captured namespace and finish any interrupted file rename
+    /// or unlink before serving the view.
     pub fn from_guarded_capture(
         manifest: &StableAnchorManifest,
         control: Arc<Mutex<ControlStore>>,
@@ -112,6 +303,30 @@ impl GuardedProbeView {
             lower_root.identity()? == plan.source_root_identity(),
             "guarded view source root changed after capture"
         );
+        let namespace = GuardedNamespace {
+            control: Arc::clone(&control),
+            anchor_id: manifest.anchor_id,
+            records: Mutex::new(HashMap::new()),
+        };
+        let mut directory_paths = HashMap::new();
+        directory_paths.insert(PathBuf::new(), INodeNo::ROOT);
+        for (index, entry) in manifest.entries.iter().enumerate() {
+            if let CapturedEntry::Directory { path, .. } = entry {
+                let expected = plan
+                    .captured_entry_identity(path)
+                    .context("guarded directory is absent from source plan")?;
+                ensure!(
+                    lower_root.open_descendant_directory(path)?.identity()? == expected,
+                    "guarded view directory changed after capture"
+                );
+                ensure!(
+                    directory_paths
+                        .insert(PathBuf::from(path), INodeNo(u64::try_from(index)? + 2))
+                        .is_none(),
+                    "duplicate guarded view directory"
+                );
+            }
+        }
         let mut paths = HashMap::new();
         paths.insert(PathBuf::new(), INodeNo::ROOT);
         let mut directories = Vec::new();
@@ -161,27 +376,31 @@ impl GuardedProbeView {
                         *native_id == expected,
                         "guarded manifest file identity differs from its plan"
                     );
-                    let lower_parent = if parent_path.as_os_str().is_empty() {
-                        None
-                    } else {
-                        Some(lower_root.open_descendant_directory(parent_path)?)
-                    };
-                    let lower_parent = lower_parent.as_ref().unwrap_or(&lower_root);
-                    ensure!(
-                        lower_parent.entry_identity(name, false)? == Some(expected),
-                        "guarded view file moved or changed after capture"
-                    );
-                    let source = lower_parent
-                        .open_child_file(name)?
-                        .context("guarded view source file disappeared")?;
                     let _anchor = manifest.file_locator(path.clone())?.open()?;
+                    let location = namespace.load_or_replay(
+                        inode.0,
+                        path,
+                        expected,
+                        &lower_root,
+                        &directory_paths,
+                    )?;
+                    let Some(current) = &location else {
+                        paths.insert(relative.to_path_buf(), inode);
+                        continue;
+                    };
+                    let lower_parent = namespace_parent(&lower_root, &current.relative_path)?;
+                    let lower_parent = lower_parent.as_ref().unwrap_or(&lower_root);
+                    let source = lower_parent
+                        .open_child_file(current.relative_path.file_name().unwrap())?
+                        .context("guarded view source file disappeared")?;
+                    ensure!(
+                        source.metadata()?.ino() == expected.inode,
+                        "guarded view source file changed while opening"
+                    );
                     let mut attr = probe_file_attr(&source, inode, (mode & 0o7777) as u16)?;
                     attr.uid = view_uid;
                     attr.gid = view_gid;
-                    let location = Arc::new(Mutex::new(Some(ProbeLocation {
-                        parent,
-                        relative_path: relative.to_path_buf(),
-                    })));
+                    let location = Arc::new(Mutex::new(location));
                     let location_for_open = Arc::clone(&location);
                     let control_for_open = Arc::clone(&control);
                     let plan_for_open = plan.clone();
@@ -224,13 +443,17 @@ impl GuardedProbeView {
                 "duplicate guarded view entry"
             );
         }
-        Ok(Self::with_directories(
+        let mut view = Self::with_directories(
             files,
             directories,
             (manifest.root_mode & 0o7777) as u16,
             Arc::new(AtomicU64::new(0)),
             Some(lower_root),
-        ))
+        );
+        view.root_uid = view_uid;
+        view.root_gid = view_gid;
+        view.namespace = Some(namespace);
+        Ok(view)
     }
 
     fn new(
@@ -301,6 +524,7 @@ impl GuardedProbeView {
             directories: by_directory,
             names: Mutex::new(names),
             lower_root,
+            namespace: None,
             root_uid,
             root_gid,
             root_perm,
@@ -732,14 +956,21 @@ impl Filesystem for GuardedProbeView {
                     .filesystem_id,
                 inode: file.source.metadata()?.ino(),
             };
-            source_parent
-                .move_child_file_no_replace(name, expected, destination_parent, newname)
-                .map_err(|error| {
-                    // The rename may have happened before a directory fsync
-                    // failed. Stop serving this view until it is reconciled.
-                    self.poisoned.store(true, Ordering::Release);
-                    io::Error::other(error)
-                })?;
+            let move_file = |expected| {
+                source_parent
+                    .move_child_file_no_replace(name, expected, destination_parent, newname)
+                    .map_err(io::Error::other)
+            };
+            let moved = if let Some(namespace) = &self.namespace {
+                namespace.transition(inode, &location.relative_path, Some(&new_path), move_file)
+            } else {
+                move_file(expected)
+            };
+            moved.inspect_err(|_| {
+                // A directory fsync or final journal write can fail after
+                // the move. Rebuild and reconcile before serving more calls.
+                self.poisoned.store(true, Ordering::Release);
+            })?;
             *current = Some(ProbeLocation {
                 parent: newparent,
                 relative_path: new_path,
@@ -799,13 +1030,29 @@ impl Filesystem for GuardedProbeView {
                 )
             };
             let lower = lower_owned.as_ref().unwrap_or(lower_root);
-            lower.remove_child_file(name).map_err(io::Error::other)?;
+            let expected = crate::NativeFileId {
+                filesystem_id: lower_root
+                    .identity()
+                    .map_err(io::Error::other)?
+                    .filesystem_id,
+                inode: file.source.metadata()?.ino(),
+            };
+            let remove_file = |expected| {
+                lower
+                    .remove_child_file_if_identity(name, expected)
+                    .map_err(io::Error::other)
+            };
+            let removed = if let Some(namespace) = &self.namespace {
+                namespace.transition(inode, &location.relative_path, None, remove_file)
+            } else {
+                remove_file(expected)
+            };
+            removed.inspect_err(|_| {
+                self.poisoned.store(true, Ordering::Release);
+            })?;
             *current = None;
             names.remove(&key);
-            lower.sync_all().map_err(|error| {
-                self.poisoned.store(true, Ordering::Release);
-                io::Error::other(error)
-            })
+            Ok(())
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -1024,6 +1271,7 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1037,10 +1285,133 @@ mod tests {
 
     use crate::{
         ControlStore, GuardedFileCapturePlan, GuardedRootCapturePlan, LinkFreezeCaptureIntent,
-        LinkFreezeCapturePhase,
+        LinkFreezeCapturePhase, PinnedDirectory,
     };
 
-    use super::{FILE_INODE, GuardedProbeFile, GuardedProbeView, ProbeLocation, probe_file_attr};
+    use super::{
+        FILE_INODE, GuardedNamespace, GuardedProbeFile, GuardedProbeView, NAMESPACE_KIND,
+        NamespaceRecord, ProbeLocation, probe_file_attr,
+    };
+
+    #[test]
+    fn namespace_journal_replays_file_move_and_unlink_on_both_sides_of_mutation() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([89; 32]));
+        let control_path = area.path().join("control.db");
+        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+        for (index, unlink, completed) in [
+            (0, false, false),
+            (1, false, true),
+            (2, true, false),
+            (3, true, true),
+        ] {
+            let old = format!("old-{index}");
+            let new = format!("new-{index}");
+            fs::write(lower.join(&old), b"original bytes").unwrap();
+            let expected = root.entry_identity(&old, false).unwrap().unwrap();
+            let anchor_id = uuid::Uuid::new_v4();
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let target = (!unlink).then(|| new.as_bytes().to_vec());
+            let record = NamespaceRecord {
+                version: 1,
+                captured_path: old.clone(),
+                expected,
+                current: Some(old.as_bytes().to_vec()),
+                pending: Some(target.clone()),
+            };
+            journal.store(2, &record).unwrap();
+            drop(journal);
+            drop(control);
+            if completed {
+                if unlink {
+                    root.remove_child_file_if_identity(&old, expected).unwrap();
+                } else {
+                    root.move_child_file_no_replace(&old, expected, &root, &new)
+                        .unwrap();
+                }
+            }
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let location = journal
+                .load_or_replay(2, &old, expected, &root, &directories)
+                .unwrap();
+            assert!(!lower.join(&old).exists());
+            if unlink {
+                assert!(location.is_none());
+            } else {
+                assert_eq!(location.unwrap().relative_path, PathBuf::from(&new));
+                assert_eq!(fs::read(lower.join(&new)).unwrap(), b"original bytes");
+            }
+            let encoded = control
+                .lock()
+                .unwrap()
+                .get_record(NAMESPACE_KIND, &journal.record_id(2))
+                .unwrap()
+                .unwrap();
+            let settled: NamespaceRecord = mb_core::decode_canonical(&encoded).unwrap();
+            assert!(settled.pending.is_none());
+            assert_eq!(settled.current, target);
+        }
+    }
+
+    #[test]
+    fn namespace_journal_refuses_replacement_identity() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        fs::write(lower.join("old"), b"original").unwrap();
+        let expected = root.entry_identity("old", false).unwrap().unwrap();
+        let original = root.open_child_file("old").unwrap().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([90; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+        ));
+        let journal = GuardedNamespace {
+            control,
+            anchor_id: uuid::Uuid::new_v4(),
+            records: Mutex::new(HashMap::new()),
+        };
+        journal
+            .store(
+                2,
+                &NamespaceRecord {
+                    version: 1,
+                    captured_path: "old".into(),
+                    expected,
+                    current: Some(b"old".to_vec()),
+                    pending: Some(Some(b"new".to_vec())),
+                },
+            )
+            .unwrap();
+        root.remove_child_file_if_identity("old", expected).unwrap();
+        fs::write(lower.join("old"), b"replacement").unwrap();
+        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+        assert!(
+            journal
+                .load_or_replay(2, "old", expected, &root, &directories)
+                .is_err()
+        );
+        assert_eq!(fs::read(lower.join("old")).unwrap(), b"replacement");
+        assert!(!lower.join("new").exists());
+        drop(original);
+    }
 
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN and FUSE passthrough"]
@@ -1444,16 +1815,68 @@ mod tests {
             beta_anchor.read_to_end(&mut beta_bytes)?;
             anyhow::ensure!(beta_bytes == original_beta);
             anyhow::ensure!(fs::read(mountpoint.join("alpha"))?.starts_with(b"EDIT"));
+            let unlink = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.unlink(sys.argv[1])")
+                .arg(mountpoint.join("alpha"))
+                .output()?;
+            anyhow::ensure!(
+                unlink.status.success(),
+                "alpha unlink failed: {}",
+                String::from_utf8_lossy(&unlink.stderr)
+            );
+            anyhow::ensure!(!lower.join("alpha").exists());
+            alpha_bytes.clear();
+            manifest
+                .file_locator("alpha".to_string())?
+                .open()?
+                .read_to_end(&mut alpha_bytes)?;
+            anyhow::ensure!(alpha_bytes == original_alpha);
             Ok(())
         })();
         let unmounted = session.umount_and_join();
         result.unwrap();
         unmounted.unwrap();
-        assert!(
+        let rebuilt =
             GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
-                .is_err(),
-            "a moved file was silently adopted after the view was rebuilt"
+                .unwrap();
+        let names = rebuilt.names.lock().unwrap();
+        assert!(!names.contains_key(&(INodeNo::ROOT.0, "beta".into())));
+        assert!(names.contains_key(&(INodeNo::ROOT.0, "moved".into())));
+        assert!(!names.contains_key(&(INodeNo::ROOT.0, "alpha".into())));
+        drop(names);
+        let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
+        let replayed = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(!mountpoint.join("alpha").exists());
+            anyhow::ensure!(!mountpoint.join("beta").exists());
+            anyhow::ensure!(fs::read(mountpoint.join("moved"))?.starts_with(b"NEXT"));
+            let unlink = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.unlink(sys.argv[1])")
+                .arg(mountpoint.join("moved"))
+                .output()?;
+            anyhow::ensure!(unlink.status.success());
+            Ok(())
+        })();
+        let unmounted = session.umount_and_join();
+        replayed.unwrap();
+        unmounted.unwrap();
+        let empty =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
+        assert!(empty.names.lock().unwrap().is_empty());
+        assert_eq!(
+            (empty.root_attr().uid, empty.root_attr().gid),
+            (65534, 65534)
         );
+        let session = fuser::spawn_mount(empty, &mountpoint, &config).unwrap();
+        let listed = fs::read_dir(&mountpoint).unwrap().count();
+        session.umount_and_join().unwrap();
+        assert_eq!(listed, 0);
     }
 
     #[test]
@@ -1599,6 +2022,19 @@ mod tests {
         })();
         let unmounted = session.umount_and_join();
         result.unwrap();
+        unmounted.unwrap();
+        let rebuilt =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
+        let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
+        let replayed = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(!mountpoint.join("nested/leaf").exists());
+            anyhow::ensure!(fs::read(mountpoint.join("nested/moved"))?.starts_with(b"EDIT"));
+            anyhow::ensure!(fs::read(mountpoint.join("top"))? == top_bytes);
+            Ok(())
+        })();
+        let unmounted = session.umount_and_join();
+        replayed.unwrap();
         unmounted.unwrap();
     }
 }

@@ -124,12 +124,16 @@
   constructs the experimental FUSE view from a published guarded manifest and
   its stored plan, checking the pinned source root, each directory and file
   identity, and anchor availability. The two-file and nested probes use this
-  constructor and pass on ext4 and fresh local Btrfs. Rebuilding after an
-  unjournaled rename refuses the view; a durable namespace journal and replay
-  are required before restart can resume service. Extend this to directory
-  mutations, create and atomic replacement, remaining metadata and allocation
-  modes, concurrent handles, mount supervision/recovery, and whole-worktree
-  enrollment.
+  constructor and pass on ext4 and fresh local Btrfs. The next slice records
+  file rename and unlink intents in the control store before lower-directory
+  mutation. Rebuild replays an interrupted operation against the captured file
+  identity, refuses a replacement identity, and restores renamed and deleted
+  entries across actual FUSE remounts, including nested moves and an empty
+  root. Two nonprivileged interruption tests, 96 normal store tests, all ten
+  privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
+  Clippy pass locally. Directory mutations, create and atomic replacement,
+  remaining metadata and allocation modes, concurrent handles, mount
+  supervision/recovery, and whole-worktree enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
