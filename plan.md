@@ -1460,6 +1460,13 @@ stays frozen and inaccessible through its private lower path, the anchor
 stays exact, and a claimed remount permits the edit after space is freed.
 All 18 guarded-view probes pass on ext4 and fresh local Btrfs, alongside
 115 normal store tests, formatting, and strict workspace Clippy.
+The daemon now recovers active guarded mount claims before it serves requests,
+retains their FUSE sessions, and checks them every five seconds. It finishes
+an interrupted claim retirement rather than remounting it. A privileged node
+probe passes on ext4 and fresh local Btrfs: clean startup recovery, detection
+of an externally detached view, a second restart, ordinary-user edit, and
+claim retirement. This supplies daemon ownership for existing claims; guarded
+root enrollment and seed-only mutable-view recovery remain unimplemented.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

@@ -32,6 +32,8 @@ use mb_git::{
     GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitPruneRoots,
     GitRemoteBranchInfo, GitRepository, GitStatus, GitTagInfo, GitWorktreeInfo,
 };
+#[cfg(target_os = "linux")]
+use mb_store::GuardedViewMount;
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     SourceBackendBinding, SourceBackendKind, VariableParityObject, filesystem_identity,
@@ -771,6 +773,8 @@ pub struct Node {
     data_dir: PathBuf,
     _data_dir_lock: LockedDataDir,
     keys: Arc<KeyMaterial>,
+    #[cfg(target_os = "linux")]
+    guarded_mounts: Vec<GuardedViewMount>,
     control: ControlStore,
     control_database_key: [u8; 32],
     volumes: StorageVolumes,
@@ -1240,10 +1244,20 @@ impl Node {
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
         volumes.reconcile(&control)?;
         let volume_readers = Arc::new(RwLock::new(volumes.reader_configs()));
+        #[cfg(target_os = "linux")]
+        let guarded_mounts = if GuardedViewMount::has_claims(&control)? {
+            GuardedViewMount::recover_all_claimed(Arc::new(Mutex::new(
+                ControlStore::open_with_key(data_dir.join("control.db"), &control_database_key)?,
+            )))?
+        } else {
+            Vec::new()
+        };
         let mut node = Self {
             data_dir,
             _data_dir_lock: locked,
             keys,
+            #[cfg(target_os = "linux")]
+            guarded_mounts,
             control,
             control_database_key,
             volumes,
@@ -1258,6 +1272,16 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// A failed guarded worker or missing mount is fatal for a protected
+    /// worktree: the private lower root must never become its fallback path.
+    pub fn check_guarded_mounts(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        for mount in &self.guarded_mounts {
+            mount.check_health()?;
+        }
+        Ok(())
     }
 
     pub fn keys(&self) -> &KeyMaterial {
@@ -24488,5 +24512,112 @@ pub(crate) mod tests {
         );
         drop(node);
         fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn node_owns_claimed_guarded_mount_across_reopen() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let area = tempfile::Builder::new()
+            .prefix("mb-node-guarded-mount-")
+            .tempdir_in(test_root)
+            .unwrap();
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let view = area.path().join("view");
+        let data_dir = area.path().join("node");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&view).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = b"guarded\r\n\0source\n";
+        fs::write(lower.join("sample"), original).unwrap();
+        fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o666)).unwrap();
+
+        let seed = Seed::from_bytes([241; 32]);
+        let node = Node::open(&data_dir, seed.clone()).unwrap();
+        let database_key = node.control_database_key;
+        let plan = mb_store::GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan.capture(&node.control).unwrap();
+        let guarded_control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
+                .unwrap(),
+        ));
+        let mounted = mb_store::GuardedViewMount::start(
+            &manifest,
+            Arc::clone(&guarded_control),
+            &view,
+            65534,
+            65534,
+        )
+        .unwrap();
+        mounted.stop().unwrap();
+        drop(guarded_control);
+        drop(node);
+
+        let reopened = Node::open(&data_dir, seed.clone()).unwrap();
+        reopened.check_guarded_mounts().unwrap();
+        let visible = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(view.join("sample"))
+            .output()
+            .unwrap();
+        assert!(visible.status.success(), "{visible:?}");
+        assert_eq!(visible.stdout, original);
+        let private = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(lower.join("sample"))
+            .output()
+            .unwrap();
+        assert!(!private.status.success());
+
+        let mount_path = CString::new(view.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the private test mountpoint is NUL-free and this test owns it.
+        assert_eq!(
+            unsafe { libc::umount2(mount_path.as_ptr(), libc::MNT_DETACH) },
+            0
+        );
+        assert!(reopened.check_guarded_mounts().is_err());
+        assert!(fs::read(view.join("sample")).is_err());
+        drop(reopened);
+
+        let recovered = Node::open(&data_dir, seed).unwrap();
+        recovered.check_guarded_mounts().unwrap();
+        let write = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'EDIT',0); os.fsync(fd); os.close(fd)")
+            .arg(view.join("sample"))
+            .output()
+            .unwrap();
+        assert!(write.status.success(), "{write:?}");
+        assert!(fs::read(lower.join("sample")).unwrap().starts_with(b"EDIT"));
+        let mut anchor = manifest
+            .file_locator("sample".to_owned())
+            .unwrap()
+            .open()
+            .unwrap();
+        let mut protected = Vec::new();
+        use std::io::Read;
+        anchor.read_to_end(&mut protected).unwrap();
+        assert_eq!(protected, original);
+        drop(recovered);
+
+        let control =
+            ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap();
+        GuardedViewMount::retire_claim(manifest.anchor_id, &control).unwrap();
+        plan.discard_unreferenced(&control).unwrap();
     }
 }

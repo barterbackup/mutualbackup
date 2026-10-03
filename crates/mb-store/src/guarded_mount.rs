@@ -52,6 +52,48 @@ pub struct GuardedViewMount {
 }
 
 impl GuardedViewMount {
+    pub fn has_claims(control: &ControlStore) -> anyhow::Result<bool> {
+        Ok(!control.records(MOUNT_CLAIM_KIND)?.is_empty())
+    }
+
+    /// Recover every active durable mount claim before the daemon starts
+    /// serving requests. A retirement marker wins over an old claim; finish
+    /// that retirement instead of remounting a view being released.
+    pub fn recover_all_claimed(control: Arc<Mutex<ControlStore>>) -> anyhow::Result<Vec<Self>> {
+        let active = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            let claims = control.records(MOUNT_CLAIM_KIND)?;
+            ensure!(claims.len() <= 256, "too many guarded mount claims");
+            let mut active = Vec::with_capacity(claims.len());
+            for (record_id, bytes) in claims {
+                let anchor_id = Uuid::from_slice(&record_id)?;
+                let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+                ensure!(
+                    claim.version == 1 && claim.anchor_id == anchor_id,
+                    "guarded mount claim record is inconsistent"
+                );
+                if let Some(retired) =
+                    control.get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())?
+                {
+                    ensure!(retired == bytes, "guarded mount retirement marker changed");
+                    Self::retire_claim(anchor_id, &control)?;
+                } else {
+                    active.push(anchor_id);
+                }
+            }
+            active
+        };
+        let mut mounts = Vec::with_capacity(active.len());
+        for anchor_id in active {
+            let mount = Self::recover_claimed(anchor_id, Arc::clone(&control))?;
+            mount.check_health()?;
+            mounts.push(mount);
+        }
+        Ok(mounts)
+    }
+
     /// Retire a stopped view before releasing its captured anchors. The caller
     /// must first prove the protected revision and every Git pin are gone.
     /// The retirement marker fences remount even if deletion of the claim is
@@ -438,7 +480,7 @@ mod tests {
 
     use crate::{ControlStore, GuardedRootCapturePlan};
 
-    use super::{GuardedViewMount, decode_mountinfo_path};
+    use super::{GuardedViewMount, MOUNT_CLAIM_KIND, MOUNT_RETIRE_KIND, decode_mountinfo_path};
 
     #[test]
     fn mountinfo_paths_decode_spaces_and_non_utf8_bytes() {
@@ -572,8 +614,10 @@ mod tests {
             ControlStore::open(&control_path, &keys).unwrap(),
         ));
 
-        let remounted =
-            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        let mut recovered_mounts =
+            GuardedViewMount::recover_all_claimed(Arc::clone(&control)).unwrap();
+        assert_eq!(recovered_mounts.len(), 1);
+        let remounted = recovered_mounts.pop().unwrap();
         remounted.check_health().unwrap();
         assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), edited);
         remounted.stop().unwrap();
@@ -610,8 +654,10 @@ mod tests {
         dead.child.kill().unwrap();
         assert!(!dead.child.wait().unwrap().success());
         assert!(fs::read(mountpoint.join("sample")).is_err());
-        let recovered =
-            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        let mut recovered_mounts =
+            GuardedViewMount::recover_all_claimed(Arc::clone(&control)).unwrap();
+        assert_eq!(recovered_mounts.len(), 1);
+        let recovered = recovered_mounts.pop().unwrap();
         recovered.check_health().unwrap();
         assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), edited);
         recovered.stop().unwrap();
@@ -629,7 +675,29 @@ mod tests {
         {
             let store = control.lock().unwrap();
             assert!(plan.discard_unreferenced(&store).is_err());
-            GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
+            let claim = store
+                .get_record(MOUNT_CLAIM_KIND, manifest.anchor_id.as_bytes())
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .put_record_if_absent(MOUNT_RETIRE_KIND, manifest.anchor_id.as_bytes(), &claim)
+                    .unwrap()
+            );
+        }
+        assert!(
+            GuardedViewMount::recover_all_claimed(Arc::clone(&control))
+                .unwrap()
+                .is_empty()
+        );
+        {
+            let store = control.lock().unwrap();
+            assert!(
+                store
+                    .get_record(MOUNT_CLAIM_KIND, manifest.anchor_id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
             GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
         }
         assert!(

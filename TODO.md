@@ -462,6 +462,14 @@
   freed, a clean stop and claimed remount replay the edit successfully.
   All 18 privileged guarded-view probes pass on ext4 and fresh local Btrfs;
   115 normal store tests, formatting, and strict workspace Clippy pass.
+  The daemon now recovers every active guarded mount claim before serving
+  requests, retains its FUSE session for the process lifetime, and checks
+  mount health every five seconds. Interrupted claim retirement is finished
+  instead of remounted. A privileged node test verifies clean startup
+  recovery, detection of an externally detached view, another restart,
+  ordinary-user edit, and claim retirement on ext4 and fresh local Btrfs.
+  Guarded root enrollment and seed-only recovery of mutable view state still
+  need their own implementation and acceptance gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

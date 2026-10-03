@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
         },
         result = run_relay_membership_sync(node.clone(), p2p_client.clone()) => result,
         result = run_root_watcher(node.clone()) => result,
+        result = supervise_guarded_mounts(node.clone()) => result,
         result = run_automatic_backups(node.clone(), p2p_client.clone()) => result,
         result = run_periodic_audits(
             node.clone(),
@@ -206,6 +207,21 @@ async fn await_optional_task(task: &mut Option<tokio::task::JoinHandle<Result<()
     match task {
         Some(task) => task.await.context("background task panicked")?,
         None => future::pending().await,
+    }
+}
+
+async fn supervise_guarded_mounts(node: Arc<Mutex<Node>>) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        let node = Arc::clone(&node);
+        tokio::task::spawn_blocking(move || {
+            node.lock()
+                .map_err(|_| anyhow::anyhow!("node lock is poisoned"))?
+                .check_guarded_mounts()
+        })
+        .await
+        .context("guarded mount health worker panicked")??;
     }
 }
 
