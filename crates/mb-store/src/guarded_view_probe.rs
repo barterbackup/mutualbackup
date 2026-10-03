@@ -5709,7 +5709,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import ctypes,os,sys; fd=os.open(sys.argv[2],os.O_RDWR); os.rename(sys.argv[1],sys.argv[2]); os.ftruncate(fd,0); c=ctypes.CDLL(None,use_errno=True); result=c.fallocate(fd,0,0,4096); assert result==0,os.strerror(ctypes.get_errno()); os.write(fd,b'OLD'); os.fsync(fd); os.close(fd)")
+                .arg("import ctypes,os,sys; first=os.open(sys.argv[2],os.O_RDWR); second=os.open(sys.argv[2],os.O_RDWR); os.rename(sys.argv[1],sys.argv[2]); os.ftruncate(first,0); c=ctypes.CDLL(None,use_errno=True); result=c.fallocate(second,0,0,4096); assert result==0,os.strerror(ctypes.get_errno()); os.pwrite(first,b'OLD',0); os.fsync(first); os.fsync(second); os.close(second); os.close(first)")
                 .arg(mountpoint.join("delta"))
                 .arg(mountpoint.join("moved"))
                 .output()?;
@@ -5743,7 +5743,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import ctypes,os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.unlink(sys.argv[1]); os.ftruncate(fd,0); c=ctypes.CDLL(None,use_errno=True); result=c.fallocate(fd,0,0,4096); assert result==0,os.strerror(ctypes.get_errno()); os.write(fd,b'HELD'); os.fsync(fd); os.close(fd)")
+                .arg("import ctypes,os,sys; first=os.open(sys.argv[1],os.O_RDWR); second=os.open(sys.argv[1],os.O_RDWR); os.unlink(sys.argv[1]); os.ftruncate(first,0); c=ctypes.CDLL(None,use_errno=True); result=c.fallocate(second,0,0,4096); assert result==0,os.strerror(ctypes.get_errno()); os.pwrite(first,b'HELD',0); os.fsync(first); os.fsync(second); os.close(second); os.close(first)")
                 .arg(mountpoint.join("alpha"))
                 .output()?;
             anyhow::ensure!(
