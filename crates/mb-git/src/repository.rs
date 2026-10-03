@@ -3465,6 +3465,21 @@ mod tests {
                 system_filter.stdout,
                 format!("touch {}\n", run_root.join("filter-executed").display()).as_bytes()
             );
+            for (key, marker) in [
+                ("diff.external", "external-diff-executed"),
+                ("diff.convert.textconv", "textconv-executed"),
+                ("merge.convert.driver", "merge-driver-executed"),
+            ] {
+                let configured = Command::new("git")
+                    .args(["config", "--get", key])
+                    .output()
+                    .unwrap();
+                assert!(configured.status.success(), "{key} is unavailable");
+                assert_eq!(
+                    configured.stdout,
+                    format!("touch {}\n", run_root.join(marker).display()).as_bytes()
+                );
+            }
             let attribute_probe = run_root.join("attribute-probe");
             let initialized = Command::new("git")
                 .args(["init", "-q"])
@@ -3474,7 +3489,7 @@ mod tests {
             assert!(initialized.status.success());
             fs::write(
                 attribute_probe.join(".git/info/attributes"),
-                b"*.txt text eol=crlf filter=convert ident working-tree-encoding=UTF-16\n",
+                b"*.txt text eol=crlf filter=convert diff=convert merge=convert ident working-tree-encoding=UTF-16\n",
             )
             .unwrap();
             let probe_repository = git2::Repository::open(&attribute_probe).unwrap();
@@ -3495,6 +3510,8 @@ mod tests {
                 "text: set",
                 "eol: crlf",
                 "filter: convert",
+                "diff: convert",
+                "merge: convert",
                 "ident: set",
                 "working-tree-encoding: UTF-16",
             ] {
@@ -3643,17 +3660,21 @@ mod tests {
             let remote = git2::Repository::init_bare(&bare_root).unwrap();
             fs::write(
                 bare_root.join("info/attributes"),
-                b"*.txt text eol=crlf filter=convert ident working-tree-encoding=UTF-16\n",
+                b"*.txt text eol=crlf filter=convert diff=convert merge=convert ident working-tree-encoding=UTF-16\n",
             )
             .unwrap();
-            remote
-                .config()
-                .unwrap()
-                .set_str(
-                    "filter.convert.clean",
-                    &format!("touch {}", run_root.join("filter-executed").display()),
-                )
-                .unwrap();
+            for (key, marker) in [
+                ("filter.convert.clean", "filter-executed"),
+                ("diff.external", "external-diff-executed"),
+                ("diff.convert.textconv", "textconv-executed"),
+                ("merge.convert.driver", "merge-driver-executed"),
+            ] {
+                remote
+                    .config()
+                    .unwrap()
+                    .set_str(key, &format!("touch {}", run_root.join(marker).display()))
+                    .unwrap();
+            }
             let remote_attributes = Command::new("git")
                 .arg("--git-dir")
                 .arg(&bare_root)
@@ -3719,7 +3740,14 @@ mod tests {
             drop(pushed_tree);
             drop(pushed);
             drop(remote);
-            assert!(!run_root.join("filter-executed").exists());
+            for marker in [
+                "filter-executed",
+                "external-diff-executed",
+                "textconv-executed",
+                "merge-driver-executed",
+            ] {
+                assert!(!run_root.join(marker).exists(), "{marker} was invoked");
+            }
             let graph = local.export_graph_source().unwrap();
             drop(local);
             for blob in graph.blobs {
@@ -3745,15 +3773,18 @@ mod tests {
         let attributes_path = run_root.join("global-attributes");
         fs::write(
             &attributes_path,
-            b"*.txt text eol=lf filter=convert ident working-tree-encoding=UTF-16\n",
+            b"*.txt text eol=lf filter=convert diff=convert merge=convert ident working-tree-encoding=UTF-16\n",
         )
         .unwrap();
         let config_path = run_root.join("global-config");
         fs::write(
             &config_path,
             format!(
-                "[core]\n\tautocrlf = true\n\tsafecrlf = true\n\tattributesFile = {}\n[merge]\n\trenormalize = true\n[filter \"convert\"]\n\tsmudge = touch {}\n\tprocess = touch {}\n\trequired = true\n",
+                "[core]\n\tautocrlf = true\n\tsafecrlf = true\n\tattributesFile = {}\n[merge]\n\trenormalize = true\n[diff]\n\texternal = touch {}\n[diff \"convert\"]\n\ttextconv = touch {}\n[merge \"convert\"]\n\tdriver = touch {}\n[filter \"convert\"]\n\tsmudge = touch {}\n\tprocess = touch {}\n\trequired = true\n",
                 attributes_path.display(),
+                run_root.join("external-diff-executed").display(),
+                run_root.join("textconv-executed").display(),
+                run_root.join("merge-driver-executed").display(),
                 run_root.join("filter-executed").display(),
                 run_root.join("filter-executed").display(),
             ),
@@ -3780,7 +3811,14 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!run_root.join("filter-executed").exists());
+        for marker in [
+            "filter-executed",
+            "external-diff-executed",
+            "textconv-executed",
+            "merge-driver-executed",
+        ] {
+            assert!(!run_root.join(marker).exists(), "{marker} was invoked");
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 

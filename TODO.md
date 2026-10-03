@@ -31,6 +31,11 @@
   inherited `core.autocrlf`, external attributes, and a configured clean
   filter. It reports a raw-byte edit as dirty without running that filter;
   the focused local Btrfs test and strict workspace Clippy pass.
+  The inherited-config Btrfs regression now also selects configured external
+  diff, `textconv`, and merge drivers through attributes and checks that raw
+  diff and built-in content merge do not invoke them. The ordinary-Git bare
+  peer carries the same hostile rules during push/pull. Its focused local run
+  passes with no driver marker created.
 - [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out

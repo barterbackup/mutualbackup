@@ -28,6 +28,10 @@ Git subprocess used for payloads is `cat-file --batch`, and its output is
 checked against the expected type, length, and object ID. The libgit2 ODB
 writer/reader operates on object bytes. No production path calls libgit2's
 `add_path`, `checkout_*`, worktree diff, or filter APIs.
+`diff` never selects `diff.external` or an attribute's `textconv` driver, and
+the native merge takes raw blobs through its built-in merge path rather than
+running a configured merge driver. These settings remain inert in the native
+repository and at an ordinary-Git object-exchange boundary.
 
 The local Btrfs Git acceptance suite covers mixed line endings, NUL bytes,
 symlinks, linked worktrees, merge, restore/reset, stock-Git exchange, and
