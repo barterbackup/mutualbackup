@@ -2420,8 +2420,8 @@ impl GuardedProbeView {
         }
     }
 
-    fn root_attr(&self) -> FileAttr {
-        FileAttr {
+    fn root_attr(&self) -> io::Result<FileAttr> {
+        let mut attr = FileAttr {
             ino: INodeNo::ROOT,
             size: 0,
             blocks: 0,
@@ -2437,7 +2437,31 @@ impl GuardedProbeView {
             rdev: 0,
             flags: 0,
             blksize: 4096,
+        };
+        if let Some(lower_root) = &self.lower_root {
+            let metadata = lower_root.as_file().metadata()?;
+            attr.atime = metadata.accessed()?;
+            attr.mtime = metadata.modified()?;
         }
+        Ok(attr)
+    }
+
+    fn directory_attr(&self, directory: &GuardedProbeDirectory) -> io::Result<FileAttr> {
+        let Some(lower_root) = &self.lower_root else {
+            return Ok(directory.attr);
+        };
+        let lower = lower_root
+            .open_descendant_directory(&directory.relative_path)
+            .map_err(io::Error::other)?;
+        if lower.identity().map_err(io::Error::other)? != directory.native_id {
+            return Err(io::Error::other("guarded directory identity changed"));
+        }
+        let metadata = lower.as_file().metadata()?;
+        let mut attr = directory.attr;
+        attr.atime = metadata.accessed()?;
+        attr.mtime = metadata.modified()?;
+        attr.perm = (metadata.permissions().mode() & 0o7777) as u16;
+        Ok(attr)
     }
 }
 
@@ -2472,8 +2496,8 @@ fn probe_directory_attr(
         ino: inode,
         size: 0,
         blocks: 0,
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
+        atime: metadata.accessed()?,
+        mtime: metadata.modified()?,
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
         kind: FileType::Directory,
@@ -2485,6 +2509,27 @@ fn probe_directory_attr(
         flags: 0,
         blksize: metadata.blksize() as u32,
     })
+}
+
+fn requested_file_times(atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>) -> Option<FileTimes> {
+    if atime.is_none() && mtime.is_none() {
+        return None;
+    }
+    let now = SystemTime::now();
+    let mut times = FileTimes::new();
+    if let Some(atime) = atime {
+        times = times.set_accessed(match atime {
+            TimeOrNow::SpecificTime(time) => time,
+            TimeOrNow::Now => now,
+        });
+    }
+    if let Some(mtime) = mtime {
+        times = times.set_modified(match mtime {
+            TimeOrNow::SpecificTime(time) => time,
+            TimeOrNow::Now => now,
+        });
+    }
+    Some(times)
 }
 
 impl Filesystem for GuardedProbeView {
@@ -2511,7 +2556,10 @@ impl Filesystem for GuardedProbeView {
             return;
         };
         if let Some(directory) = self.directory(inode) {
-            reply.entry(&ENTRY_TTL, &directory.attr, Generation(0));
+            match self.directory_attr(&directory) {
+                Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
+                Err(_) => reply.error(Errno::EIO),
+            }
         } else if let Some(file) = self.file(inode) {
             match file.current_attr() {
                 Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
@@ -2581,10 +2629,16 @@ impl Filesystem for GuardedProbeView {
             return;
         }
         match inode {
-            INodeNo::ROOT => reply.attr(&ENTRY_TTL, &self.root_attr()),
+            INodeNo::ROOT => match self.root_attr() {
+                Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+                Err(_) => reply.error(Errno::EIO),
+            },
             _ => {
                 if let Some(directory) = self.directory(inode.0) {
-                    reply.attr(&ENTRY_TTL, &directory.attr);
+                    match self.directory_attr(&directory) {
+                        Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+                        Err(_) => reply.error(Errno::EIO),
+                    }
                     return;
                 }
                 match self.file(inode.0) {
@@ -2633,28 +2687,39 @@ impl Filesystem for GuardedProbeView {
             return;
         }
         if inode == INodeNo::ROOT || self.directory(inode.0).is_some() {
-            if mode.is_none()
-                || size.is_some()
-                || atime.is_some()
-                || mtime.is_some()
-                || handle.is_some()
-            {
+            if size.is_some() || handle.is_some() {
                 reply.error(Errno::EINVAL);
                 return;
             }
-            let requested = (mode.unwrap() & 0o7777) as u16;
             if inode == INodeNo::ROOT {
                 let Some(namespace) = &self.namespace else {
                     reply.error(Errno::EACCES);
                     return;
                 };
                 let _names = self.names.lock().unwrap();
-                if namespace.store_root_mode(requested).is_err() {
-                    reply.error(Errno::EIO);
-                    return;
+                let result = (|| -> io::Result<FileAttr> {
+                    let lower_root = self
+                        .lower_root
+                        .as_ref()
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
+                    if let Some(times) = requested_file_times(atime, mtime) {
+                        lower_root.as_file().set_times(times)?;
+                        lower_root.sync_all().map_err(io::Error::other)?;
+                    }
+                    if let Some(mode) = mode {
+                        let requested = (mode & 0o7777) as u16;
+                        namespace.store_root_mode(requested)?;
+                        self.root_perm.store(requested, Ordering::Release);
+                    }
+                    self.root_attr()
+                })();
+                match result {
+                    Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+                    Err(error) => {
+                        self.poisoned.store(true, Ordering::Release);
+                        reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+                    }
                 }
-                self.root_perm.store(requested, Ordering::Release);
-                reply.attr(&ENTRY_TTL, &self.root_attr());
                 return;
             }
             let _names = self.names.lock().unwrap();
@@ -2673,12 +2738,16 @@ impl Filesystem for GuardedProbeView {
                 if lower.identity().map_err(io::Error::other)? != directory.native_id {
                     return Err(io::Error::other("guarded directory identity changed"));
                 }
-                lower
-                    .as_file()
-                    .set_permissions(fs::Permissions::from_mode(u32::from(requested)))?;
+                if let Some(mode) = mode {
+                    lower
+                        .as_file()
+                        .set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
+                }
+                if let Some(times) = requested_file_times(atime, mtime) {
+                    lower.as_file().set_times(times)?;
+                }
                 lower.sync_all().map_err(io::Error::other)?;
-                directory.attr.perm =
-                    (lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
+                directory.attr = self.directory_attr(&directory)?;
                 self.dynamic_directories
                     .lock()
                     .unwrap()
@@ -2744,20 +2813,7 @@ impl Filesystem for GuardedProbeView {
             if let Some(mode) = mode {
                 source.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
             }
-            if atime.is_some() || mtime.is_some() {
-                let mut times = FileTimes::new();
-                if let Some(atime) = atime {
-                    times = times.set_accessed(match atime {
-                        TimeOrNow::SpecificTime(time) => time,
-                        TimeOrNow::Now => SystemTime::now(),
-                    });
-                }
-                if let Some(mtime) = mtime {
-                    times = times.set_modified(match mtime {
-                        TimeOrNow::SpecificTime(time) => time,
-                        TimeOrNow::Now => SystemTime::now(),
-                    });
-                }
+            if let Some(times) = requested_file_times(atime, mtime) {
                 source.set_times(times)?;
             }
             source.sync_all()?;
@@ -5659,7 +5715,10 @@ mod tests {
                 .unwrap();
         assert!(empty.names.lock().unwrap().is_empty());
         assert_eq!(
-            (empty.root_attr().uid, empty.root_attr().gid),
+            (
+                empty.root_attr().unwrap().uid,
+                empty.root_attr().unwrap().gid
+            ),
             (65534, 65534)
         );
         let session = fuser::spawn_mount(empty, &mountpoint, &config).unwrap();
@@ -6120,6 +6179,27 @@ mod tests {
                 .arg(&lower)
                 .output()?;
             anyhow::ensure!(!private_read.status.success());
+            let times = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; base=1600000000123456789\nfor i,path in enumerate(sys.argv[1:]): os.utime(path,ns=(base+i,base+i))")
+                .arg(&mountpoint)
+                .arg(mountpoint.join("nested"))
+                .arg(mountpoint.join("nested/newdir"))
+                .output()?;
+            anyhow::ensure!(
+                times.status.success(),
+                "guarded directory utime failed: {}",
+                String::from_utf8_lossy(&times.stderr)
+            );
+            anyhow::ensure!(
+                fs::metadata(&mountpoint)?
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+                    == 1_600_000_000_123_456_789
+            );
             Ok(())
         })();
         let unmounted = session.umount_and_join();
@@ -6130,6 +6210,27 @@ mod tests {
                 .unwrap();
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
         let replayed = (|| -> anyhow::Result<()> {
+            for (path, expected) in [
+                (&mountpoint, 1_600_000_000_123_456_789_u128),
+                (&mountpoint.join("nested"), 1_600_000_000_123_456_790),
+                (&mountpoint.join("nested/newdir"), 1_600_000_000_123_456_791),
+            ] {
+                let metadata = fs::metadata(path)?;
+                anyhow::ensure!(
+                    metadata
+                        .modified()?
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_nanos()
+                        == expected
+                );
+                anyhow::ensure!(
+                    metadata
+                        .accessed()?
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_nanos()
+                        == expected
+                );
+            }
             anyhow::ensure!(fs::metadata(&mountpoint)?.permissions().mode() & 0o7777 == 0o755);
             anyhow::ensure!(
                 fs::metadata(mountpoint.join("nested"))?
