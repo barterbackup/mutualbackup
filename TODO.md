@@ -26,7 +26,11 @@
   The complete local Git acceptance script passed on exact source `1d961d5`,
   including all 62 Btrfs Git library cases, extent measurements, node recovery,
   stock-Git remote helper, and five-daemon smoke. This does not replace the
-  remaining command-by-command byte-policy audit.
+  remaining command-by-command byte-policy audit. A separate alias-level
+  remote-helper regression now calls `git status` through `mutualgit` under
+  inherited `core.autocrlf`, external attributes, and a configured clean
+  filter. It reports a raw-byte edit as dirty without running that filter;
+  the focused local Btrfs test and strict workspace Clippy pass.
 - [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out

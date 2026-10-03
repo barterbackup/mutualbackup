@@ -89,6 +89,12 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
                     assert_eq!(requested, repository_id);
                     Ok(LocalResponse::GitBranches(repository.branches().unwrap()))
                 }
+                LocalRequest::GitStatus {
+                    repository_id: requested,
+                } => {
+                    assert_eq!(requested, repository_id);
+                    Ok(LocalResponse::GitStatus(repository.status().unwrap()))
+                }
                 LocalRequest::GitTags {
                     repository_id: requested,
                 } => {
@@ -212,6 +218,44 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("main"));
+    let attributes = run_root.join("global-attributes");
+    fs::write(&attributes, b"tracked text eol=lf filter=probe\n").unwrap();
+    let marker = run_root.join("filter-ran");
+    let config = run_root.join("conversion-config");
+    fs::write(
+        &config,
+        format!(
+            "[core]\n\tautocrlf = true\n\tattributesFile = {}\n[filter \"probe\"]\n\tclean = sh -c 'touch \"$MUTUALBACKUP_FILTER_MARKER\"; cat'\n",
+            attributes.display()
+        ),
+    )
+    .unwrap();
+    let status = |expected_dirty: bool| {
+        let output = Command::new(&git_alias)
+            .arg("-C")
+            .arg(&source_root)
+            .arg("--socket")
+            .arg(&socket)
+            .arg("status")
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("MUTUALBACKUP_FILTER_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("Content conversion: disabled (raw file bytes)"));
+        assert_eq!(stdout.contains(" M tracked"), expected_dirty, "{stdout}");
+        assert!(!marker.exists(), "the inherited clean filter ran");
+    };
+    status(false);
+    fs::write(source_root.join("tracked"), b"exact\nbytes\0\xff\n").unwrap();
+    status(true);
+    fs::write(source_root.join("tracked"), payload).unwrap();
     let path = format!(
         "{}:{}",
         helper.parent().unwrap().display(),
