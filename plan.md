@@ -1448,8 +1448,12 @@ and strict workspace Clippy pass. Guarded enrollment still requires protected
 mutable-view recovery and daemon lifecycle supervision.
 The guarded sparse-detach replay test now injects `ENOSPC` after a staging
 write. On ext4 and fresh local Btrfs, it leaves the original inode frozen
-and the anchor byte-exact, then completes on retry. This is a deterministic
-error-path probe; a real disk-full mount and full enrollment gate remain open.
+and the anchor byte-exact, then completes on retry. A separate privileged
+test fills disposable 192 MiB ext4 and 384 MiB Btrfs images until actual
+`ENOSPC`; a 32 MiB detach then leaves a partial staging file, frozen source,
+and exact anchor, and replay succeeds after space is released. It verifies a
+disposable marker, separate mount device, and 512 MiB capacity limit before
+filling. FUSE-level failure behavior and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

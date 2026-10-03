@@ -447,8 +447,14 @@
   The sparse-detach replay test now injects `ENOSPC` after a staging write.
   On ext4 and fresh local Btrfs, the error leaves the edit journal in
   `CopyStaging`, the shared source frozen, and the captured anchor exact;
-  retry removes the incomplete staging file and finishes the detach. A real
-  disk-full mount probe and the full guarded-enrollment gate remain open.
+  retry removes the incomplete staging file and finishes the detach. A separate
+  privileged test now fills disposable 192 MiB ext4 and 384 MiB Btrfs images
+  until real `ENOSPC`, then frees less space than the 32 MiB detach needs. On
+  both, the sparse copy leaves a partial staging file, the source remains
+  frozen, and the anchor stays byte-exact; removing the filler permits replay
+  and a later edit without changing the anchor. The test checks a disposable
+  mount marker, separate device, and 512 MiB capacity bound before filling.
+  FUSE-level failure behavior and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

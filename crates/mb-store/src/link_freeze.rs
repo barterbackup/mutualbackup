@@ -1305,6 +1305,7 @@ fn deny_new_opens(group: &File, stop: &AtomicBool, healthy: &AtomicBool) {
 mod tests {
     use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
+    use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
@@ -1949,6 +1950,173 @@ mod tests {
             fs::write(&source_path, b"edited-after-replay").unwrap();
             assert_eq!(fs::read(&anchor_path).unwrap()[4096..4107], *b"before-edit");
         }
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN and a disposable mounted filesystem of at most 512 MiB"]
+    fn real_enospc_leaves_guarded_source_frozen_and_retries() {
+        let mount = std::env::var_os("MUTUALBACKUP_REAL_ENOSPC_TEST_ROOT")
+            .expect("set MUTUALBACKUP_REAL_ENOSPC_TEST_ROOT to a disposable mount");
+        let mount = std::path::PathBuf::from(mount).canonicalize().unwrap();
+        assert_eq!(
+            fs::read(mount.join(".mutualbackup-disposable-enospc")).unwrap(),
+            b"mutualbackup-disposable-enospc-v1\n"
+        );
+        assert_ne!(
+            fs::metadata(&mount).unwrap().dev(),
+            fs::metadata(mount.parent().unwrap()).unwrap().dev(),
+            "the disposable test root must be a separate mounted filesystem"
+        );
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let mounted = File::open(&mount).unwrap();
+        // SAFETY: the descriptor is open and fstatvfs initializes stats on success.
+        assert_eq!(
+            unsafe { libc::fstatvfs(mounted.as_raw_fd(), stats.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: the preceding fstatvfs call succeeded.
+        let stats = unsafe { stats.assume_init() };
+        assert!(
+            stats.f_blocks > 0
+                && stats.f_frsize > 0
+                && stats.f_blocks.saturating_mul(stats.f_frsize) <= 512 * 1024 * 1024,
+            "the disposable test filesystem exceeds 512 MiB"
+        );
+
+        let root = tempfile::Builder::new()
+            .prefix("mb-real-enospc-")
+            .tempdir_in(&mount)
+            .unwrap();
+        let source_path = root.path().join("source");
+        let anchor_path = root.path().join("anchor");
+        let filler_path = root.path().join("filler");
+        let mut source_writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source_path)
+            .unwrap();
+        let chunk = [0x5a_u8; 1024 * 1024];
+        for _ in 0..32 {
+            source_writer.write_all(&chunk).unwrap();
+        }
+        source_writer.sync_all().unwrap();
+        drop(source_writer);
+        fs::hard_link(&source_path, &anchor_path).unwrap();
+        let source = File::open(&source_path).unwrap();
+        let original_hash = hash_exact(&source, 32 * 1024 * 1024).unwrap();
+        let frozen_content = IndependentSparseCopy {
+            logical_len: 32 * 1024 * 1024,
+            content_hash: original_hash,
+            data_extents: file_data_extents(&source, 32 * 1024 * 1024).unwrap(),
+        };
+        let guard = FileWriteExclusion::acquire(source.try_clone().unwrap()).unwrap();
+        let access = FileAccessSnapshot::capture(&source).unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
+        source.sync_all().unwrap();
+        File::open(root.path()).unwrap().sync_all().unwrap();
+        guard.release().unwrap();
+
+        // Keep journal writes off the filesystem being filled. The anchor and
+        // worktree are on the disposable mount, as they would be in practice.
+        let journal_area = tempfile::tempdir().unwrap();
+        assert_ne!(
+            fs::metadata(journal_area.path()).unwrap().dev(),
+            fs::metadata(root.path()).unwrap().dev()
+        );
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([93; 32]));
+        let store = ControlStore::open(journal_area.path().join("control.db"), &keys).unwrap();
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let anchor_id = Uuid::new_v4();
+        LinkFreezeEditIntent::begin(
+            &store,
+            anchor_id,
+            &parent,
+            "source",
+            &parent,
+            "anchor",
+            FrozenAnchorProof {
+                original_access: access.clone(),
+                content: frozen_content,
+            },
+        )
+        .unwrap();
+
+        let mut filler = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&filler_path)
+            .unwrap();
+        let mut full = false;
+        for _ in 0..512 {
+            let result = filler.write_all(&chunk).and_then(|()| filler.sync_data());
+            if let Err(error) = result {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the disposable filesystem did not become full");
+        let keep = filler
+            .metadata()
+            .unwrap()
+            .len()
+            .saturating_sub(8 * 1024 * 1024);
+        filler.set_len(keep).unwrap();
+        filler.sync_all().unwrap();
+
+        let error = LinkFreezeEditIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap()
+            .resume(&store, &parent, "source", &parent, "anchor")
+            .expect_err("a 32 MiB sparse detach must not fit in the remaining space");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(libc::ENOSPC)
+        }));
+        let pending = LinkFreezeEditIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.phase(), LinkFreezeEditPhase::CopyStaging);
+        let partial = File::open(root.path().join(pending.staging_name())).unwrap();
+        assert_eq!(partial.metadata().unwrap().len(), 32 * 1024 * 1024);
+        assert!(
+            !file_data_extents(&partial, 32 * 1024 * 1024)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().ino(),
+            fs::metadata(&anchor_path).unwrap().ino()
+        );
+        assert_eq!(
+            FileAccessSnapshot::capture(&File::open(&source_path).unwrap())
+                .unwrap()
+                .mode
+                & 0o222,
+            0
+        );
+        assert_eq!(
+            hash_exact(&File::open(&anchor_path).unwrap(), 32 * 1024 * 1024).unwrap(),
+            original_hash
+        );
+
+        drop(filler);
+        fs::remove_file(&filler_path).unwrap();
+        parent.sync_all().unwrap();
+        let resumed = LinkFreezeEditIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap()
+            .resume(&store, &parent, "source", &parent, "anchor")
+            .unwrap();
+        resumed.retire(&store).unwrap();
+        assert!(access.matches(&File::open(&source_path).unwrap()).unwrap());
+        fs::write(&source_path, b"edited after disk pressure").unwrap();
+        assert_eq!(
+            hash_exact(&File::open(&anchor_path).unwrap(), 32 * 1024 * 1024).unwrap(),
+            original_hash
+        );
     }
 
     #[test]
