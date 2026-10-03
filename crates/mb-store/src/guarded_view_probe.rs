@@ -87,6 +87,17 @@ struct DirectoryRemoveIntent {
     expected: NativeFileId,
 }
 
+// Captured directories keep their capture-time identity and mode even after a
+// namespace move. The current path is stored separately in DirectoryRecord.
+type CapturedDirectories = HashMap<u64, (Vec<u8>, NativeFileId, u16)>;
+
+struct GuardedDirectoryIndex {
+    paths: HashMap<PathBuf, INodeNo>,
+    captured: Vec<GuardedProbeDirectory>,
+    dynamic: Vec<GuardedProbeDirectory>,
+    highest_inode: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ReplaceIntent {
     version: u16,
@@ -533,7 +544,7 @@ impl GuardedNamespace {
         lower_root: &PinnedDirectory,
         directories: &HashMap<PathBuf, INodeNo>,
         first_dynamic_inode: u64,
-        captured_directories: &HashMap<u64, (Vec<u8>, NativeFileId)>,
+        captured_directories: &CapturedDirectories,
     ) -> anyhow::Result<()> {
         for (inode, bytes) in self.owned_records(DIRECTORY_REMOVE_KIND)? {
             let intent: DirectoryRemoveIntent = mb_core::decode_canonical(&bytes)?;
@@ -543,9 +554,11 @@ impl GuardedNamespace {
                 "invalid guarded directory removal intent"
             );
             if inode < first_dynamic_inode {
+                let (_, captured_id, _) = captured_directories
+                    .get(&inode)
+                    .context("guarded directory removal aliases captured file")?;
                 ensure!(
-                    captured_directories.get(&inode)
-                        == Some(&(intent.target.clone(), intent.expected)),
+                    *captured_id == intent.expected,
                     "guarded directory removal differs from capture"
                 );
             }
@@ -575,15 +588,15 @@ impl GuardedNamespace {
         Ok(())
     }
 
-    fn load_dynamic_directories(
+    fn load_directories(
         &self,
         lower_root: &PinnedDirectory,
-        directory_paths: &mut HashMap<PathBuf, INodeNo>,
+        captured: &CapturedDirectories,
         first_dynamic_inode: u64,
         view_uid: u32,
         view_gid: u32,
-    ) -> anyhow::Result<(Vec<GuardedProbeDirectory>, u64)> {
-        let mut records = Vec::new();
+    ) -> anyhow::Result<GuardedDirectoryIndex> {
+        let mut stored = HashMap::new();
         let mut highest = first_dynamic_inode - 1;
         let pending_removes: std::collections::HashSet<_> = self
             .owned_records(DIRECTORY_REMOVE_KIND)?
@@ -591,37 +604,73 @@ impl GuardedNamespace {
             .map(|(inode, _)| inode)
             .collect();
         for (inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
-            if inode < first_dynamic_inode {
-                continue;
-            }
-            highest = highest.max(inode);
             let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
             ensure!(
                 record.version == 1
                     && record.expected.filesystem_id == lower_root.identity()?.filesystem_id,
                 "invalid guarded directory record"
             );
-            if let Some(path) = &record.current {
-                if pending_removes.contains(&inode) {
-                    continue;
+            if inode < first_dynamic_inode {
+                ensure!(
+                    captured.contains_key(&inode),
+                    "guarded directory aliases captured file"
+                );
+            } else {
+                highest = highest.max(inode);
+            }
+            ensure!(
+                stored.insert(inode, record).is_none(),
+                "duplicate directory inode"
+            );
+        }
+        let mut entries = Vec::new();
+        for (&inode, (original, expected, mode)) in captured {
+            let current = match stored.remove(&inode) {
+                Some(record) => {
+                    ensure!(
+                        record.expected == *expected,
+                        "captured directory identity changed"
+                    );
+                    record.current
                 }
-                let path = PathBuf::from(OsString::from_vec(path.clone()));
-                records.push((inode, path, record.expected));
+                None => Some(original.clone()),
+            };
+            if let Some(current) = current
+                && !pending_removes.contains(&inode)
+            {
+                entries.push((
+                    inode,
+                    PathBuf::from(OsString::from_vec(current)),
+                    *expected,
+                    Some(*mode),
+                ));
             }
         }
-        records.sort_by_key(|(_, path, _)| path.components().count());
-        let mut directories = Vec::new();
-        for (inode, path, expected) in records {
-            if directory_paths.get(&path) == Some(&INodeNo(inode)) {
-                continue;
+        for (inode, record) in stored {
+            if let Some(current) = record.current
+                && !pending_removes.contains(&inode)
+            {
+                entries.push((
+                    inode,
+                    PathBuf::from(OsString::from_vec(current)),
+                    record.expected,
+                    None,
+                ));
             }
-            let (_, parent) = namespace_path(path.as_os_str().as_bytes(), directory_paths)?;
+        }
+        entries.sort_by_key(|(_, path, _, _)| path.components().count());
+        let mut paths = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+        let mut captured_views = Vec::new();
+        let mut dynamic_views = Vec::new();
+        for (inode, path, expected, captured_mode) in entries {
+            let (_, parent) = namespace_path(path.as_os_str().as_bytes(), &paths)?;
             let lower = lower_root.open_descendant_directory(&path)?;
             ensure!(
                 lower.identity()? == expected,
-                "created guarded directory changed after publication"
+                "guarded directory changed after publication"
             );
-            let mode = (lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
+            let mode = captured_mode
+                .unwrap_or((lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16);
             let mut attr = probe_directory_attr(lower.as_file(), INodeNo(inode), mode)?;
             attr.uid = view_uid;
             attr.gid = view_gid;
@@ -630,20 +679,28 @@ impl GuardedNamespace {
                 .context("created guarded directory has no name")?
                 .to_os_string();
             ensure!(
-                directory_paths
-                    .insert(path.clone(), INodeNo(inode))
-                    .is_none(),
+                paths.insert(path.clone(), INodeNo(inode)).is_none(),
                 "duplicate guarded directory path"
             );
-            directories.push(GuardedProbeDirectory {
+            let view = GuardedProbeDirectory {
                 attr,
                 parent,
                 name,
                 relative_path: path,
                 native_id: expected,
-            });
+            };
+            if captured_mode.is_some() {
+                captured_views.push(view);
+            } else {
+                dynamic_views.push(view);
+            }
         }
-        Ok((directories, highest))
+        Ok(GuardedDirectoryIndex {
+            paths,
+            captured: captured_views,
+            dynamic: dynamic_views,
+            highest_inode: highest,
+        })
     }
 
     fn stored_or_default(
@@ -1186,54 +1243,23 @@ impl GuardedProbeView {
         let first_dynamic_inode = u64::try_from(manifest.entries.len())?
             .checked_add(2)
             .context("guarded view inode overflow")?;
-        let mut directory_paths = HashMap::new();
-        directory_paths.insert(PathBuf::new(), INodeNo::ROOT);
-        let pending_directory_removes: std::collections::HashSet<_> = namespace
-            .owned_records(DIRECTORY_REMOVE_KIND)?
-            .into_iter()
-            .map(|(inode, _)| inode)
-            .collect();
         let mut captured_directories = HashMap::new();
         let mut defaults = HashMap::new();
         for (index, entry) in manifest.entries.iter().enumerate() {
             match entry {
-                CapturedEntry::Directory { path, .. } => {
+                CapturedEntry::Directory { path, mode, .. } => {
                     let inode = u64::try_from(index)? + 2;
                     let expected = plan
                         .captured_entry_identity(path)
                         .context("guarded directory is absent from source plan")?;
                     ensure!(
                         captured_directories
-                            .insert(inode, (path.as_bytes().to_vec(), expected))
+                            .insert(
+                                inode,
+                                (path.as_bytes().to_vec(), expected, (mode & 0o7777) as u16)
+                            )
                             .is_none(),
                         "duplicate captured guarded directory inode"
-                    );
-                    let record = namespace.directory_record_opt(inode)?;
-                    if let Some(record) = &record {
-                        ensure!(
-                            record.version == 1
-                                && record.expected == expected
-                                && record
-                                    .current
-                                    .as_deref()
-                                    .is_none_or(|current| current == path.as_bytes()),
-                            "captured guarded directory record differs from plan"
-                        );
-                    }
-                    if record.is_some_and(|record| record.current.is_none())
-                        || pending_directory_removes.contains(&inode)
-                    {
-                        continue;
-                    }
-                    ensure!(
-                        lower_root.open_descendant_directory(path)?.identity()? == expected,
-                        "guarded view directory changed after capture"
-                    );
-                    ensure!(
-                        directory_paths
-                            .insert(PathBuf::from(path), INodeNo(u64::try_from(index)? + 2))
-                            .is_none(),
-                        "duplicate guarded view directory"
                     );
                 }
                 CapturedEntry::FileV2 {
@@ -1263,46 +1289,43 @@ impl GuardedProbeView {
                 }
             }
         }
-        for (inode, _) in namespace.owned_records(DIRECTORY_KIND)? {
-            if inode < first_dynamic_inode {
-                ensure!(
-                    captured_directories.contains_key(&inode),
-                    "guarded directory record aliases captured file"
-                );
-            }
-        }
         let staging_area = manifest.area.open_guarded_staging_area()?;
         ensure!(
             staging_area.identity()?.filesystem_id == lower_root.identity()?.filesystem_id,
             "guarded staging area is on another filesystem"
         );
-        let (mut dynamic_directories, existing_directory_max) = namespace
-            .load_dynamic_directories(
+        let directory_paths = namespace
+            .load_directories(
                 &lower_root,
-                &mut directory_paths,
+                &captured_directories,
                 first_dynamic_inode,
                 view_uid,
                 view_gid,
-            )?;
+            )?
+            .paths;
         namespace.reconcile_directory_creates(
             &lower_root,
             &staging_area,
             &directory_paths,
             first_dynamic_inode,
         )?;
-        let (replayed_directories, replayed_directory_max) = namespace.load_dynamic_directories(
-            &lower_root,
-            &mut directory_paths,
-            first_dynamic_inode,
-            view_uid,
-            view_gid,
-        )?;
-        dynamic_directories.extend(replayed_directories);
         namespace.reconcile_directory_removes(
             &lower_root,
             &directory_paths,
             first_dynamic_inode,
             &captured_directories,
+        )?;
+        let GuardedDirectoryIndex {
+            paths: directory_paths,
+            captured: directories,
+            dynamic: mut dynamic_directories,
+            mut highest_inode,
+        } = namespace.load_directories(
+            &lower_root,
+            &captured_directories,
+            first_dynamic_inode,
+            view_uid,
+            view_gid,
         )?;
         namespace.reconcile_creates(&lower_root, &directory_paths, first_dynamic_inode)?;
         namespace.reconcile_replaces(
@@ -1311,9 +1334,6 @@ impl GuardedProbeView {
             &defaults,
             first_dynamic_inode,
         )?;
-        let mut paths = HashMap::new();
-        paths.insert(PathBuf::new(), INodeNo::ROOT);
-        let mut directories = Vec::new();
         let mut files = Vec::new();
         for (index, entry) in manifest.entries.iter().enumerate() {
             let (path, mode) = match entry {
@@ -1323,12 +1343,6 @@ impl GuardedProbeView {
                     anyhow::bail!("guarded view needs native file identities")
                 }
             };
-            let relative = Path::new(path);
-            let parent_path = relative.parent().context("guarded entry has no parent")?;
-            let parent = *paths
-                .get(parent_path)
-                .context("guarded view entry has no captured parent directory")?;
-            let name = relative.file_name().context("guarded entry has no name")?;
             let inode = INodeNo(
                 u64::try_from(index)?
                     .checked_add(2)
@@ -1338,29 +1352,7 @@ impl GuardedProbeView {
                 .captured_entry_identity(path)
                 .context("guarded manifest entry is not in its source plan")?;
             match entry {
-                CapturedEntry::Directory { .. } => {
-                    let removed = namespace
-                        .directory_record_opt(inode.0)?
-                        .is_some_and(|record| record.current.is_none());
-                    if !removed {
-                        let lower = lower_root.open_descendant_directory(relative)?;
-                        ensure!(
-                            lower.identity()? == expected,
-                            "guarded view directory changed after capture"
-                        );
-                        let mut attr =
-                            probe_directory_attr(lower.as_file(), inode, (mode & 0o7777) as u16)?;
-                        attr.uid = view_uid;
-                        attr.gid = view_gid;
-                        directories.push(GuardedProbeDirectory {
-                            attr,
-                            parent,
-                            name: name.to_os_string(),
-                            relative_path: relative.to_path_buf(),
-                            native_id: expected,
-                        });
-                    }
-                }
+                CapturedEntry::Directory { .. } => {}
                 CapturedEntry::FileV2 { native_id, .. } => {
                     ensure!(
                         *native_id == expected,
@@ -1375,7 +1367,6 @@ impl GuardedProbeView {
                         &directory_paths,
                     )?;
                     let Some(current) = &location else {
-                        paths.insert(relative.to_path_buf(), inode);
                         continue;
                     };
                     let lower_parent = namespace_parent(&lower_root, &current.relative_path)?;
@@ -1428,12 +1419,7 @@ impl GuardedProbeView {
                 }
                 CapturedEntry::File { .. } => unreachable!(),
             }
-            ensure!(
-                paths.insert(relative.to_path_buf(), inode).is_none(),
-                "duplicate guarded view entry"
-            );
         }
-        let mut highest_inode = existing_directory_max.max(replayed_directory_max);
         for (inode, bytes) in namespace.owned_records(NAMESPACE_KIND)? {
             if inode < first_dynamic_inode {
                 ensure!(
@@ -2749,7 +2735,7 @@ mod tests {
     use std::io::{self, Read};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
@@ -2835,13 +2821,14 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
-            let mut directory_paths = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+            let directory_paths = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
             journal
                 .reconcile_directory_creates(&root, &staging, &directory_paths, 2)
                 .unwrap();
-            let (visible, _) = journal
-                .load_dynamic_directories(&root, &mut directory_paths, 2, 65534, 65534)
-                .unwrap();
+            let visible = journal
+                .load_directories(&root, &HashMap::new(), 2, 65534, 65534)
+                .unwrap()
+                .dynamic;
             assert!(staging.open_child_directory(&stage_name).unwrap().is_none());
             assert!(
                 control
@@ -2975,7 +2962,6 @@ mod tests {
         let root = PinnedDirectory::open(&lower).unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([99; 32]));
         let control_path = area.path().join("control.db");
-        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
         for removed_before_replay in [false, true] {
             let anchor_id = uuid::Uuid::new_v4();
             let name = format!("remove-{removed_before_replay}");
@@ -3027,16 +3013,12 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
-            let mut visible_paths = directories.clone();
-            assert!(
-                journal
-                    .load_dynamic_directories(&root, &mut visible_paths, 2, 65534, 65534)
-                    .unwrap()
-                    .0
-                    .is_empty()
-            );
+            let visible = journal
+                .load_directories(&root, &HashMap::new(), 2, 65534, 65534)
+                .unwrap();
+            assert!(visible.dynamic.is_empty());
             journal
-                .reconcile_directory_removes(&root, &visible_paths, 2, &HashMap::new())
+                .reconcile_directory_removes(&root, &visible.paths, 2, &HashMap::new())
                 .unwrap();
             assert!(!lower.join(&name).exists());
             assert!(
@@ -3109,7 +3091,7 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
-            let captured = HashMap::from([(2, (name.as_bytes().to_vec(), expected))]);
+            let captured = HashMap::from([(2, (name.as_bytes().to_vec(), expected, 0o755))]);
             journal
                 .reconcile_directory_removes(&root, &directories, 3, &captured)
                 .unwrap();
@@ -3124,6 +3106,91 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn rebuilt_directory_index_uses_current_captured_and_dynamic_paths() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(lower.join("original")).unwrap();
+        fs::write(lower.join("original/file"), b"captured-bytes").unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let captured = root.open_child_directory("original").unwrap().unwrap();
+        let captured_id = captured.identity().unwrap();
+        let file_id = captured.entry_identity("file", false).unwrap().unwrap();
+        let dynamic = root.create_child_directory("newparent").unwrap();
+        let dynamic_id = dynamic.identity().unwrap();
+        root.move_child_directory_no_replace("original", captured_id, &dynamic, "relocated")
+            .unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([102; 32]));
+        let control_path = area.path().join("control.db");
+        let anchor_id = uuid::Uuid::new_v4();
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(&control_path, &keys).unwrap(),
+        ));
+        let journal = GuardedNamespace {
+            control: Arc::clone(&control),
+            anchor_id,
+            records: Mutex::new(HashMap::new()),
+        };
+        journal
+            .store_directory_if_absent(
+                2,
+                &DirectoryRecord {
+                    version: 1,
+                    expected: captured_id,
+                    current: Some(b"newparent/relocated".to_vec()),
+                },
+            )
+            .unwrap();
+        journal
+            .store_directory_if_absent(
+                4,
+                &DirectoryRecord {
+                    version: 1,
+                    expected: dynamic_id,
+                    current: Some(b"newparent".to_vec()),
+                },
+            )
+            .unwrap();
+        journal
+            .store(
+                3,
+                &NamespaceRecord {
+                    version: 1,
+                    captured_path: "original/file".to_owned(),
+                    expected: file_id,
+                    current: Some(b"newparent/relocated/file".to_vec()),
+                    pending: None,
+                },
+            )
+            .unwrap();
+        drop(journal);
+        drop(control);
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(&control_path, &keys).unwrap(),
+        ));
+        let journal = GuardedNamespace {
+            control,
+            anchor_id,
+            records: Mutex::new(HashMap::new()),
+        };
+        let captured = HashMap::from([(2, (b"original".to_vec(), captured_id, 0o755))]);
+        let index = journal
+            .load_directories(&root, &captured, 4, 65534, 65534)
+            .unwrap();
+        assert_eq!(index.highest_inode, 4);
+        assert_eq!(index.paths[Path::new("newparent")], INodeNo(4));
+        assert_eq!(index.paths[Path::new("newparent/relocated")], INodeNo(2));
+        assert_eq!(index.captured[0].parent, INodeNo(4));
+        assert_eq!(index.dynamic[0].parent, INodeNo::ROOT);
+        let file = journal
+            .load_or_replay(3, "original/file", file_id, &root, &index.paths)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.parent, INodeNo(2));
+        assert_eq!(file.relative_path, Path::new("newparent/relocated/file"));
     }
 
     #[test]
