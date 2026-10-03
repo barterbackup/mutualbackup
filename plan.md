@@ -1343,6 +1343,15 @@ A separate-process probe now kills the mounted FUSE daemon and confirms new
 view access fails while an ordinary user remains unable to read the private
 lower file. It passes on ext4 and fresh local Btrfs. Mount supervision and
 recovered guarded enrollment remain open.
+The guarded store can now persist a mount claim binding the captured lower
+root, private placeholder inode, mountpoint, and view owner. It refuses a live
+or foreign mount, then remounts a claimed dead FUSE view after daemon loss. A
+privileged ordinary-user test passes clean and killed-process remount, lower
+root denial, and placeholder replacement rejection on ext4 and a fresh local
+Btrfs image. The 114 normal store tests, formatting, and strict workspace
+Clippy pass. This store primitive still needs daemon lifecycle ownership,
+protected mutable-view metadata recovery, and replayable root enrollment
+before guarded capture can be selected.
 `b69ce33` further makes signed endpoint sets authoritative over persistent
 bootstrap and attempt-scoped recovery hints, and prevents a pending dial to a
 withdrawn direct endpoint from holding transport selection on direct. The

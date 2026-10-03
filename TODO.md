@@ -366,6 +366,14 @@
   fresh local ext4; the renamed-directory probe passes on fresh local Btrfs.
   The 113 normal store tests, formatting, and strict workspace Clippy pass.
   Mount supervision and protected view-metadata recovery remain open.
+  A store-level guarded mount now records the lower-root and placeholder inode
+  identities before mounting, refuses a live or foreign mount, and detaches
+  only its claimed dead FUSE mount before rebuilding the captured view. Its
+  privileged test verifies ordinary-user access, private-lower denial, clean
+  remount, killed-daemon remount, and rejection of a replaced placeholder on
+  ext4 and a fresh local Btrfs image. The 114 normal store tests and strict
+  workspace Clippy pass. Daemon ownership/health supervision, protected
+  metadata recovery, and the replayable enrollment transition remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

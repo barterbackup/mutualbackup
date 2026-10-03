@@ -7,6 +7,8 @@
 mod anchor;
 mod database;
 #[cfg(target_os = "linux")]
+mod guarded_mount;
+#[cfg(target_os = "linux")]
 mod guarded_view_probe;
 #[cfg(target_os = "linux")]
 mod link_freeze;
@@ -28,6 +30,8 @@ pub use database::{
     ObjectAttemptState, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
     VariableParityObject,
 };
+#[cfg(target_os = "linux")]
+pub use guarded_mount::GuardedViewMount;
 #[cfg(target_os = "linux")]
 pub use guarded_view_probe::{GuardedProbeView, probe_guarded_view_passthrough};
 #[cfg(target_os = "linux")]
