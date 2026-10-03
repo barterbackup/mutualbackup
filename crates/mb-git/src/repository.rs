@@ -3528,6 +3528,11 @@ mod tests {
                     .windows(b"-one\r\n+one\n".len())
                     .any(|part| part == b"-one\r\n+one\n")
             );
+            assert!(local.remove_tracked("tracked.txt").is_err());
+            assert_eq!(
+                fs::read(source_root.join("tracked.txt")).unwrap(),
+                b"one\ntwo\n"
+            );
             local
                 .restore_worktree(&[PathBuf::from("tracked.txt")])
                 .unwrap();
@@ -3549,6 +3554,16 @@ mod tests {
                 fs::read(source_root.join("tracked.txt")).unwrap(),
                 b"one\r\ntwo\n"
             );
+            fs::write(source_root.join("tracked.txt"), b"one\ntwo\n").unwrap();
+            assert!(local.switch_branch("topic").is_err());
+            assert_eq!(local.selected_branch().unwrap(), "main");
+            assert_eq!(
+                fs::read(source_root.join("tracked.txt")).unwrap(),
+                b"one\ntwo\n"
+            );
+            local
+                .restore_worktree(&[PathBuf::from("tracked.txt")])
+                .unwrap();
             fs::write(source_root.join("merge.txt"), merge_ours).unwrap();
             local.stage_file("merge.txt").unwrap();
             local
@@ -3671,6 +3686,16 @@ mod tests {
             drop(builder);
             drop(base_tree);
             drop(parent);
+            fs::write(source_root.join("tracked.txt"), b"one\ntwo\n").unwrap();
+            assert!(local.pull_bare(&bare_root, "", "").is_err());
+            assert_eq!(local.selected_branch().unwrap(), "main");
+            assert_eq!(
+                fs::read(source_root.join("tracked.txt")).unwrap(),
+                b"one\ntwo\n"
+            );
+            local
+                .restore_worktree(&[PathBuf::from("tracked.txt")])
+                .unwrap();
             local.pull_bare(&bare_root, "", "").unwrap();
             assert_eq!(
                 fs::read(source_root.join("tracked.txt")).unwrap(),

@@ -15,7 +15,10 @@
   a system clean filter, a repository filter setting and `info/attributes` on
   the ordinary-Git side, native content merge, and linked-worktree checkout and
   merge, combined linked restore, and primary hard reset; its raw merged blob
-  and restored bytes match. Complete the remaining cross-command audit required
+  and restored bytes match. The inherited-config regression also checks that a
+  line-ending-only edit blocks tracked `rm`, branch switch, and pull without
+  changing the file or branch; its focused local Btrfs run passes. Complete
+  the remaining cross-command audit required
   by plan.md, especially every supported CLI command. A fresh local Btrfs
   stock-Git round trip confirms that a CRLF worktree normalized by stock Git
   imports as its LF blob, remains clean until edited, restores the exact blob
