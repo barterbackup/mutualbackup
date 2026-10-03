@@ -1,10 +1,10 @@
 //! Disposable Linux FUSE passthrough probe for the future guarded worktree.
 //!
 //! This proves that this host can mount a view, pass read-only file access to
-//! a lower inode, and finish one captured file's durable detach before a
-//! writable open or metadata edit. It also probes rename and unlink through
-//! the view. It is not a complete long-lived edit guard and must not be used
-//! as an enrollment decision by itself.
+//! lower inodes, and finish each captured file's durable detach before a
+//! writable open or metadata edit. It also probes a flat multi-file namespace,
+//! rename, and unlink. It is not a complete long-lived edit guard and must not
+//! be used as an enrollment decision by itself.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -23,7 +23,7 @@ use anyhow::{Context, ensure};
 use fuser::{
     BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
+    ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
 };
 
 const FILE_INODE: INodeNo = INodeNo(2);
@@ -33,26 +33,79 @@ const PROBE_BYTES: &[u8] = b"mutualbackup-guarded-view-probe";
 // zero for the native 64-bit ABI.
 const KERNEL_O_LARGEFILE: i32 = 0o100000;
 
-struct SingleFileProbeView {
+struct GuardedProbeFile {
     source: File,
     source_attr: Mutex<FileAttr>,
     name: Arc<Mutex<Option<OsString>>>,
     lower_dir: Option<PathBuf>,
+    open_for_write: Option<Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync>>,
+}
+
+struct GuardedProbeView {
+    files: HashMap<u64, GuardedProbeFile>,
+    names: Mutex<HashMap<OsString, u64>>,
+    root_uid: u32,
+    root_gid: u32,
     root_perm: u16,
     next_handle: AtomicU64,
     denied_writable: Arc<AtomicU64>,
     backing: Mutex<HashMap<u64, ActiveBacking>>,
-    open_for_write: Option<Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync>>,
 }
 
 struct ActiveBacking {
     id: BackingId,
     mode: OpenAccMode,
+    inode: INodeNo,
 }
 
-impl SingleFileProbeView {
+impl GuardedProbeFile {
+    fn current_attr(&self) -> io::Result<FileAttr> {
+        let metadata = self.source.metadata()?;
+        let mut attr = self.source_attr.lock().unwrap();
+        attr.size = metadata.len();
+        attr.blocks = metadata.blocks();
+        attr.nlink = metadata.nlink() as u32;
+        Ok(*attr)
+    }
+}
+
+impl GuardedProbeView {
+    fn new(files: Vec<GuardedProbeFile>, root_perm: u16, denied_writable: Arc<AtomicU64>) -> Self {
+        let mut by_inode = HashMap::new();
+        let mut names = HashMap::new();
+        let (root_uid, root_gid) = files
+            .first()
+            .map(|file| {
+                let attr = file.source_attr.lock().unwrap();
+                (attr.uid, attr.gid)
+            })
+            .unwrap_or((0, 0));
+        for file in files {
+            let inode = file.source_attr.lock().unwrap().ino.0;
+            if let Some(name) = file.name.lock().unwrap().clone() {
+                assert!(
+                    names.insert(name, inode).is_none(),
+                    "duplicate guarded view name"
+                );
+            }
+            assert!(
+                by_inode.insert(inode, file).is_none(),
+                "duplicate guarded view inode"
+            );
+        }
+        Self {
+            files: by_inode,
+            names: Mutex::new(names),
+            root_uid,
+            root_gid,
+            root_perm,
+            next_handle: AtomicU64::new(1),
+            denied_writable,
+            backing: Mutex::default(),
+        }
+    }
+
     fn root_attr(&self) -> FileAttr {
-        let source_attr = self.source_attr.lock().unwrap();
         FileAttr {
             ino: INodeNo::ROOT,
             size: 0,
@@ -64,28 +117,19 @@ impl SingleFileProbeView {
             kind: FileType::Directory,
             perm: self.root_perm,
             nlink: 2,
-            uid: source_attr.uid,
-            gid: source_attr.gid,
+            uid: self.root_uid,
+            gid: self.root_gid,
             rdev: 0,
             flags: 0,
             blksize: 4096,
         }
     }
-
-    fn current_file_attr(&self) -> io::Result<FileAttr> {
-        let metadata = self.source.metadata()?;
-        let mut attr = self.source_attr.lock().unwrap();
-        attr.size = metadata.len();
-        attr.blocks = metadata.blocks();
-        attr.nlink = metadata.nlink() as u32;
-        Ok(*attr)
-    }
 }
 
-fn probe_file_attr(source: &File, advertised_mode: u16) -> io::Result<FileAttr> {
+fn probe_file_attr(source: &File, inode: INodeNo, advertised_mode: u16) -> io::Result<FileAttr> {
     let metadata = source.metadata()?;
     Ok(FileAttr {
-        ino: FILE_INODE,
+        ino: inode,
         size: metadata.len(),
         blocks: metadata.blocks(),
         atime: UNIX_EPOCH,
@@ -103,7 +147,7 @@ fn probe_file_attr(source: &File, advertised_mode: u16) -> io::Result<FileAttr> 
     })
 }
 
-impl Filesystem for SingleFileProbeView {
+impl Filesystem for GuardedProbeView {
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> io::Result<()> {
         config
             .add_capabilities(InitFlags::FUSE_PASSTHROUGH)
@@ -117,15 +161,53 @@ impl Filesystem for SingleFileProbeView {
     }
 
     fn lookup(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let current = self.name.lock().unwrap();
-        if parent == INodeNo::ROOT && current.as_deref() == Some(name) {
-            match self.current_file_attr() {
+        let names = self.names.lock().unwrap();
+        if parent == INodeNo::ROOT {
+            let Some(inode) = names.get(name) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let file = &self.files[inode];
+            match file.current_attr() {
                 Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
                 Err(_) => reply.error(Errno::EIO),
             }
         } else {
             reply.error(Errno::ENOENT);
         }
+    }
+
+    fn readdir(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _handle: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        if inode != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let names = self.names.lock().unwrap();
+        let mut entries = vec![
+            (INodeNo::ROOT, FileType::Directory, OsString::from(".")),
+            (INodeNo::ROOT, FileType::Directory, OsString::from("..")),
+        ];
+        let mut files: Vec<_> = names.iter().collect();
+        files.sort_by_key(|(name, _)| *name);
+        entries.extend(
+            files
+                .into_iter()
+                .map(|(name, inode)| (INodeNo(*inode), FileType::RegularFile, name.clone())),
+        );
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        for (index, (entry_inode, kind, name)) in entries.iter().enumerate().skip(start) {
+            if reply.add(*entry_inode, index as u64 + 1, *kind, name) {
+                break;
+            }
+        }
+        reply.ok();
     }
 
     fn getattr(
@@ -137,11 +219,13 @@ impl Filesystem for SingleFileProbeView {
     ) {
         match inode {
             INodeNo::ROOT => reply.attr(&ENTRY_TTL, &self.root_attr()),
-            FILE_INODE => match self.current_file_attr() {
-                Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
-                Err(_) => reply.error(Errno::EIO),
+            _ => match self.files.get(&inode.0) {
+                Some(file) => match file.current_attr() {
+                    Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+                    Err(_) => reply.error(Errno::EIO),
+                },
+                None => reply.error(Errno::ENOENT),
             },
-            _ => reply.error(Errno::ENOENT),
         }
     }
 
@@ -163,10 +247,10 @@ impl Filesystem for SingleFileProbeView {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if inode != FILE_INODE {
+        let Some(file) = self.files.get(&inode.0) else {
             reply.error(Errno::ENOENT);
             return;
-        }
+        };
         if (mode.is_none() && size.is_none())
             || uid.is_some()
             || gid.is_some()
@@ -187,12 +271,16 @@ impl Filesystem for SingleFileProbeView {
                 reply.error(Errno::EIO);
                 return;
             };
+            if backing.inode != inode {
+                reply.error(Errno::EIO);
+                return;
+            }
             if size.is_some() && backing.mode == OpenAccMode::O_RDONLY {
                 reply.error(Errno::EACCES);
                 return;
             }
         }
-        let Some(open_for_write) = &self.open_for_write else {
+        let Some(open_for_write) = &file.open_for_write else {
             reply.error(Errno::EACCES);
             return;
         };
@@ -208,9 +296,9 @@ impl Filesystem for SingleFileProbeView {
             }
             source.sync_all()?;
             if let Some(mode) = mode {
-                self.source_attr.lock().unwrap().perm = (mode & 0o7777) as u16;
+                file.source_attr.lock().unwrap().perm = (mode & 0o7777) as u16;
             }
-            self.current_file_attr()
+            file.current_attr()
         })();
         match result {
             Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
@@ -219,22 +307,22 @@ impl Filesystem for SingleFileProbeView {
     }
 
     fn open(&self, _request: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        if inode != FILE_INODE {
+        let Some(file) = self.files.get(&inode.0) else {
             reply.error(Errno::ENOENT);
             return;
-        }
+        };
         if flags.0 & !(libc::O_ACCMODE | KERNEL_O_LARGEFILE) != 0 {
             reply.error(Errno::EACCES);
             return;
         }
         let writable;
         let source = if flags.acc_mode() == OpenAccMode::O_RDONLY {
-            &self.source
+            &file.source
         } else if matches!(
             flags.acc_mode(),
             OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
         ) {
-            let Some(open_for_write) = &self.open_for_write else {
+            let Some(open_for_write) = &file.open_for_write else {
                 self.denied_writable.fetch_add(1, Ordering::Relaxed);
                 reply.error(Errno::EACCES);
                 return;
@@ -266,6 +354,7 @@ impl Filesystem for SingleFileProbeView {
             ActiveBacking {
                 id: backing,
                 mode: flags.acc_mode(),
+                inode,
             },
         );
         reply.opened_passthrough(FileHandle(handle), FopenFlags::empty(), &held[&handle].id);
@@ -295,10 +384,6 @@ impl Filesystem for SingleFileProbeView {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let Some(lower_dir) = &self.lower_dir else {
-            reply.error(Errno::EACCES);
-            return;
-        };
         if parent != INodeNo::ROOT || newparent != INodeNo::ROOT {
             reply.error(Errno::ENOENT);
             return;
@@ -307,21 +392,33 @@ impl Filesystem for SingleFileProbeView {
             reply.error(Errno::EINVAL);
             return;
         }
-        let mut current = self.name.lock().unwrap();
-        if current.as_deref() != Some(name) {
+        let mut names = self.names.lock().unwrap();
+        let Some(&inode) = names.get(name) else {
             reply.error(Errno::ENOENT);
             return;
-        }
+        };
+        let file = &self.files[&inode];
+        let Some(lower_dir) = &file.lower_dir else {
+            reply.error(Errno::EACCES);
+            return;
+        };
         if name == newname {
             reply.ok();
             return;
         }
+        if names.contains_key(newname) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        let mut current = file.name.lock().unwrap();
         let result = (|| -> io::Result<()> {
             let lower = crate::PinnedDirectory::open(lower_dir).map_err(io::Error::other)?;
             lower
                 .rename_child_no_replace(name, newname)
                 .map_err(io::Error::other)?;
             *current = Some(newname.to_os_string());
+            names.remove(name);
+            names.insert(newname.to_os_string(), inode);
             lower.sync_all().map_err(io::Error::other)
         })();
         match result {
@@ -331,23 +428,26 @@ impl Filesystem for SingleFileProbeView {
     }
 
     fn unlink(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let Some(lower_dir) = &self.lower_dir else {
-            reply.error(Errno::EACCES);
-            return;
-        };
         if parent != INodeNo::ROOT {
             reply.error(Errno::ENOENT);
             return;
         }
-        let mut current = self.name.lock().unwrap();
-        if current.as_deref() != Some(name) {
+        let mut names = self.names.lock().unwrap();
+        let Some(&inode) = names.get(name) else {
             reply.error(Errno::ENOENT);
             return;
-        }
+        };
+        let file = &self.files[&inode];
+        let Some(lower_dir) = &file.lower_dir else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        let mut current = file.name.lock().unwrap();
         let result = (|| -> io::Result<()> {
             let lower = crate::PinnedDirectory::open(lower_dir).map_err(io::Error::other)?;
             lower.remove_child_file(name).map_err(io::Error::other)?;
             *current = None;
+            names.remove(name);
             lower.sync_all().map_err(io::Error::other)
         })();
         match result {
@@ -366,21 +466,25 @@ impl Filesystem for SingleFileProbeView {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        if inode != FILE_INODE {
+        let Some(file) = self.files.get(&inode.0) else {
             reply.error(Errno::ENOENT);
             return;
-        }
+        };
         let held = self.backing.lock().unwrap();
         let Some(backing) = held.get(&handle.0) else {
             reply.error(Errno::EIO);
             return;
         };
+        if backing.inode != inode {
+            reply.error(Errno::EIO);
+            return;
+        }
         if backing.mode == OpenAccMode::O_RDONLY {
             reply.error(Errno::EACCES);
             return;
         }
         drop(held);
-        let Some(open_for_write) = &self.open_for_write else {
+        let Some(open_for_write) = &file.open_for_write else {
             reply.error(Errno::EACCES);
             return;
         };
@@ -442,19 +546,16 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
     fs::set_permissions(&lower_path, fs::Permissions::from_mode(0o444))?;
     let source = File::open(&lower_path)?;
     let denied_writable = Arc::new(AtomicU64::new(0));
-    let view = SingleFileProbeView {
+    let file = GuardedProbeFile {
         // Advertise the original editable mode. The lower inode is frozen;
         // the view must still reject writes until detach.
-        source_attr: Mutex::new(probe_file_attr(&source, 0o666)?),
+        source_attr: Mutex::new(probe_file_attr(&source, FILE_INODE, 0o666)?),
         name: Arc::new(Mutex::new(Some(OsString::from("sample")))),
         lower_dir: None,
-        root_perm: 0o755,
         source,
-        next_handle: AtomicU64::new(1),
-        denied_writable: Arc::clone(&denied_writable),
-        backing: Mutex::new(HashMap::new()),
         open_for_write: None,
     };
+    let view = GuardedProbeView::new(vec![file], 0o755, Arc::clone(&denied_writable));
     let mut config = Config::default();
     config.acl = SessionACL::All;
     let session = fuser::spawn_mount(view, &mountpoint, &config)
@@ -566,17 +667,17 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
-    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
 
     use fuser::{Config, OpenAccMode, SessionACL};
     use mb_core::{KeyMaterial, Seed};
 
     use crate::{
-        ControlStore, GuardedFileCapturePlan, LinkFreezeCaptureIntent, LinkFreezeCapturePhase,
+        ControlStore, GuardedFileCapturePlan, GuardedRootCapturePlan, LinkFreezeCaptureIntent,
+        LinkFreezeCapturePhase,
     };
 
-    use super::{SingleFileProbeView, probe_file_attr};
+    use super::{FILE_INODE, GuardedProbeFile, GuardedProbeView, probe_file_attr};
 
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN and FUSE passthrough"]
@@ -649,19 +750,16 @@ mod tests {
                 .write(true)
                 .open(lower_for_open.join(current))
         });
-        let mut advertised = probe_file_attr(&source, 0o666).unwrap();
+        let mut advertised = probe_file_attr(&source, FILE_INODE, 0o666).unwrap();
         advertised.uid = 65534;
-        let view = SingleFileProbeView {
+        let file = GuardedProbeFile {
             source_attr: Mutex::new(advertised),
             source,
             name,
             lower_dir: Some(lower.clone()),
-            root_perm: 0o777,
-            next_handle: AtomicU64::new(1),
-            denied_writable: Arc::new(AtomicU64::new(0)),
-            backing: Mutex::default(),
             open_for_write: Some(open_for_write),
         };
+        let view = GuardedProbeView::new(vec![file], 0o777, Arc::new(Default::default()));
         let mut config = Config::default();
         config.acl = SessionACL::All;
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
@@ -867,5 +965,158 @@ mod tests {
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn unlink_preserves_anchor_without_detach() {
         guarded_view_mutation_case(FirstMutation::Unlink);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn two_file_guarded_root_dispatches_edits_and_renames_by_inode() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-view-root-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        let control_dir = area.path().join("control");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::create_dir(&control_dir).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        let original_alpha = b"alpha\r\n\0";
+        let original_beta = b"beta\nbytes";
+        fs::write(lower.join("alpha"), original_alpha).unwrap();
+        fs::write(lower.join("beta"), original_beta).unwrap();
+        for name in ["alpha", "beta"] {
+            fs::set_permissions(lower.join(name), fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([74; 32]));
+        let control = ControlStore::open(control_dir.join("control.db"), &keys).unwrap();
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan.capture(&control).unwrap();
+        let control = Arc::new(Mutex::new(control));
+        let files = ["alpha", "beta"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, captured_name)| {
+                let name = Arc::new(Mutex::new(Some(OsString::from(captured_name))));
+                let name_for_open = Arc::clone(&name);
+                let control_for_open = Arc::clone(&control);
+                let plan_for_open = plan.clone();
+                let lower_for_open = lower.clone();
+                let open_for_write: Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync> =
+                    Arc::new(move |mode| {
+                        let current = name_for_open
+                            .lock()
+                            .map_err(|_| io::Error::other("guarded name lock is poisoned"))?;
+                        let current = current
+                            .as_ref()
+                            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                        let control = control_for_open
+                            .lock()
+                            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                        plan_for_open
+                            .prepare_file_edit_at(&control, captured_name, current)
+                            .map_err(io::Error::other)?;
+                        OpenOptions::new()
+                            .read(mode == OpenAccMode::O_RDWR)
+                            .write(true)
+                            .open(lower_for_open.join(current))
+                    });
+                let source = File::open(lower.join(captured_name)).unwrap();
+                let mut advertised =
+                    probe_file_attr(&source, fuser::INodeNo(index as u64 + 2), 0o666).unwrap();
+                advertised.uid = 65534;
+                GuardedProbeFile {
+                    source,
+                    source_attr: Mutex::new(advertised),
+                    name,
+                    lower_dir: Some(lower.clone()),
+                    open_for_write: Some(open_for_write),
+                }
+            })
+            .collect();
+        let view = GuardedProbeView::new(files, 0o777, Arc::new(Default::default()));
+        let mut config = Config::default();
+        config.acl = SessionACL::All;
+        let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
+        let result = (|| -> anyhow::Result<()> {
+            let list = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; print(','.join(sorted(os.listdir(sys.argv[1]))))")
+                .arg(&mountpoint)
+                .output()?;
+            anyhow::ensure!(list.status.success());
+            anyhow::ensure!(list.stdout == b"alpha,beta\n");
+            anyhow::ensure!(fs::read(mountpoint.join("alpha"))? == original_alpha);
+            anyhow::ensure!(fs::read(mountpoint.join("beta"))? == original_beta);
+            let beta_inode = fs::metadata(lower.join("beta"))?.ino();
+            let edit = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("alpha"))
+                .output()?;
+            anyhow::ensure!(
+                edit.status.success(),
+                "alpha edit failed: {}",
+                String::from_utf8_lossy(&edit.stderr)
+            );
+            anyhow::ensure!(fs::read(lower.join("alpha"))?.starts_with(b"EDIT"));
+            anyhow::ensure!(fs::read(lower.join("beta"))? == original_beta);
+            let mut alpha_anchor = manifest.file_locator("alpha".to_string())?.open()?;
+            let mut alpha_bytes = Vec::new();
+            alpha_anchor.read_to_end(&mut alpha_bytes)?;
+            anyhow::ensure!(alpha_bytes == original_alpha);
+            let mut beta_anchor = manifest.file_locator("beta".to_string())?.open()?;
+            anyhow::ensure!(beta_anchor.metadata()?.ino() == beta_inode);
+            let mut beta_bytes = Vec::new();
+            beta_anchor.read_to_end(&mut beta_bytes)?;
+            anyhow::ensure!(beta_bytes == original_beta);
+            let rename = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
+                .arg(mountpoint.join("beta"))
+                .arg(mountpoint.join("moved"))
+                .output()?;
+            anyhow::ensure!(
+                rename.status.success(),
+                "beta rename failed: {}",
+                String::from_utf8_lossy(&rename.stderr)
+            );
+            anyhow::ensure!(fs::metadata(lower.join("moved"))?.ino() == beta_inode);
+            let edit_moved = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'NEXT'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("moved"))
+                .output()?;
+            anyhow::ensure!(
+                edit_moved.status.success(),
+                "renamed beta edit failed: {}",
+                String::from_utf8_lossy(&edit_moved.stderr)
+            );
+            anyhow::ensure!(fs::read(lower.join("moved"))?.starts_with(b"NEXT"));
+            anyhow::ensure!(fs::metadata(lower.join("moved"))?.ino() == beta_inode);
+            drop(beta_anchor);
+            let mut beta_anchor = manifest.file_locator("beta".to_string())?.open()?;
+            anyhow::ensure!(beta_anchor.metadata()?.ino() != beta_inode);
+            beta_bytes.clear();
+            beta_anchor.read_to_end(&mut beta_bytes)?;
+            anyhow::ensure!(beta_bytes == original_beta);
+            anyhow::ensure!(fs::read(mountpoint.join("alpha"))?.starts_with(b"EDIT"));
+            Ok(())
+        })();
+        let unmounted = session.umount_and_join();
+        result.unwrap();
+        unmounted.unwrap();
     }
 }
