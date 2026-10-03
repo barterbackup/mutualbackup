@@ -1239,8 +1239,8 @@ captured and dynamic subtrees again across remounts. The 109 normal store tests,
 12 privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
 Clippy pass. Remaining metadata and allocation modes, concurrent handles,
 mount supervision/recovery, and guarded enrollment remain open. Guarded-view
-rebuild now retains a captured file's
-owner `chmod`: while its lower inode is frozen the view advertises its
+rebuild now retains a captured file's owner `chmod`: while its lower inode is
+frozen the view advertises its
 capture-time mode; after the edit journal proves that inode independently
 editable, the lower inode's durable mode is authoritative. A nested-file
 ordinary-user probe checks the initial frozen visible mode and a later `0640`
@@ -1254,6 +1254,13 @@ An ordinary-user FUSE probe checks refusal of a nonempty target, replacement
 of an empty dynamic target with a populated captured subtree, and remount.
 The 112 normal store tests, all 12 privileged probes on ext4 and fresh local
 Btrfs, formatting, and strict workspace Clippy pass on this slice.
+Owner `chmod` of the root, captured directories, and dynamic directories now
+survives guarded-view remount. The root mode is a durable local view record;
+the private lower root remains `0700`. Child directory modes come from their
+unfrozen lower inodes. Ordinary-user probes pass on ext4 and fresh local Btrfs.
+The virtual root-mode record still needs inclusion in encrypted owner revision
+metadata before seed-only recovery and guarded enrollment can claim metadata
+fidelity.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

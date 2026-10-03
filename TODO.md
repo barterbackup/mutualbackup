@@ -174,8 +174,8 @@
   populated captured subtree beneath a dynamic parent, edit its captured file
   without changing the anchor, then rename the captured and dynamic subtrees
   again across remounts. The 109 normal store tests, 12 privileged FUSE probes
-  on ext4 and fresh local Btrfs, and strict workspace Clippy pass. Directory
-  remaining metadata and allocation modes, concurrent handles, mount
+  on ext4 and fresh local Btrfs, and strict workspace Clippy pass. Remaining
+  metadata and allocation modes, concurrent handles, mount
   supervision/recovery, and whole-worktree enrollment remain open.
   Captured-file owner `chmod` now survives guarded-view
   remount: rebuild advertises the original mode while the lower inode is
@@ -193,6 +193,14 @@
   and rebuilds it after remount. The 112 normal store tests, all 12 privileged
   FUSE probes on ext4 and fresh local Btrfs, formatting, and strict workspace
   Clippy pass on this slice.
+  Root, captured-directory, and dynamic-directory owner `chmod` now survive
+  guarded-view remount. The root mode is kept in a durable local view record so
+  the private lower root remains `0700`; child directory modes use their
+  unfrozen lower inodes. Ordinary-user probes check all three modes before and
+  after remount on ext4 and fresh local Btrfs. The virtual root-mode record is
+  not yet carried by protected owner revision metadata for seed-only recovery;
+  guarded enrollment stays gated until that and the remaining metadata,
+  concurrent-handle, and mount-supervision work are complete.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

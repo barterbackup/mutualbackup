@@ -16,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +49,7 @@ const DIRECTORY_CREATE_KIND: &str = "guarded-view-directory-create-v1";
 const DIRECTORY_REMOVE_KIND: &str = "guarded-view-directory-remove-v1";
 const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
 const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
+const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NamespaceRecord {
@@ -105,6 +106,12 @@ struct DirectoryReplaceIntent {
     target_expected: NativeFileId,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RootModeRecord {
+    version: u16,
+    mode: u16,
+}
+
 // Captured directories keep their capture-time identity and mode even after a
 // namespace move. The current path is stored separately in DirectoryRecord.
 type CapturedDirectories = HashMap<u64, (Vec<u8>, NativeFileId, u16)>;
@@ -156,6 +163,35 @@ struct GuardedNamespace {
 }
 
 impl GuardedNamespace {
+    fn root_mode(&self, captured: u16) -> anyhow::Result<u16> {
+        let bytes = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .get_record(ROOT_MODE_KIND, self.anchor_id.as_bytes())?;
+        match bytes {
+            Some(bytes) => {
+                let record: RootModeRecord = mb_core::decode_canonical(&bytes)?;
+                ensure!(
+                    record.version == 1 && record.mode & !0o7777 == 0,
+                    "invalid guarded root mode record"
+                );
+                Ok(record.mode)
+            }
+            None => Ok(captured),
+        }
+    }
+
+    fn store_root_mode(&self, mode: u16) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(&RootModeRecord { version: 1, mode })
+            .map_err(io::Error::other)?;
+        self.control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record(ROOT_MODE_KIND, self.anchor_id.as_bytes(), &bytes)
+            .map_err(io::Error::other)
+    }
+
     fn record_id(&self, inode: u64) -> Vec<u8> {
         let mut id = self.anchor_id.as_bytes().to_vec();
         id.extend_from_slice(&inode.to_le_bytes());
@@ -1175,8 +1211,9 @@ impl GuardedNamespace {
                 lower.identity()? == expected,
                 "guarded directory changed after publication"
             );
-            let mode = captured_mode
-                .unwrap_or((lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16);
+            // Directory inodes are never frozen. Their lower mode is the
+            // user's current mode, including a chmod after capture.
+            let mode = (lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
             let mut attr = probe_directory_attr(lower.as_file(), INodeNo(inode), mode)?;
             attr.uid = view_uid;
             attr.gid = view_gid;
@@ -1557,7 +1594,7 @@ pub struct GuardedProbeView {
     namespace: Option<GuardedNamespace>,
     root_uid: u32,
     root_gid: u32,
-    root_perm: u16,
+    root_perm: AtomicU16,
     poisoned: AtomicBool,
     next_handle: AtomicU64,
     next_inode: AtomicU64,
@@ -2238,10 +2275,11 @@ impl GuardedProbeView {
                 view_gid,
             )?);
         }
+        let root_perm = namespace.root_mode((manifest.root_mode & 0o7777) as u16)?;
         let mut view = Self::with_directories(
             files,
             directories,
-            (manifest.root_mode & 0o7777) as u16,
+            root_perm,
             Arc::new(AtomicU64::new(0)),
             Some(lower_root),
         );
@@ -2370,7 +2408,7 @@ impl GuardedProbeView {
             namespace: None,
             root_uid,
             root_gid,
-            root_perm,
+            root_perm: AtomicU16::new(root_perm),
             poisoned: AtomicBool::new(false),
             next_handle: AtomicU64::new(1),
             next_inode: AtomicU64::new(next_inode),
@@ -2389,7 +2427,7 @@ impl GuardedProbeView {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind: FileType::Directory,
-            perm: self.root_perm,
+            perm: self.root_perm.load(Ordering::Acquire),
             nlink: 2,
             uid: self.root_uid,
             gid: self.root_gid,
@@ -2579,10 +2617,6 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        let Some(file) = self.file(inode.0) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
         if (mode.is_none() && size.is_none())
             || uid.is_some()
             || gid.is_some()
@@ -2597,6 +2631,67 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EINVAL);
             return;
         }
+        if inode == INodeNo::ROOT || self.directory(inode.0).is_some() {
+            if mode.is_none() || size.is_some() || handle.is_some() {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            let requested = (mode.unwrap() & 0o7777) as u16;
+            if inode == INodeNo::ROOT {
+                let Some(namespace) = &self.namespace else {
+                    reply.error(Errno::EACCES);
+                    return;
+                };
+                let _names = self.names.lock().unwrap();
+                if namespace.store_root_mode(requested).is_err() {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                self.root_perm.store(requested, Ordering::Release);
+                reply.attr(&ENTRY_TTL, &self.root_attr());
+                return;
+            }
+            let _names = self.names.lock().unwrap();
+            let Some(mut directory) = self.directory(inode.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let Some(lower_root) = &self.lower_root else {
+                reply.error(Errno::EACCES);
+                return;
+            };
+            let result = (|| -> io::Result<FileAttr> {
+                let lower = lower_root
+                    .open_descendant_directory(&directory.relative_path)
+                    .map_err(io::Error::other)?;
+                if lower.identity().map_err(io::Error::other)? != directory.native_id {
+                    return Err(io::Error::other("guarded directory identity changed"));
+                }
+                lower
+                    .as_file()
+                    .set_permissions(fs::Permissions::from_mode(u32::from(requested)))?;
+                lower.sync_all().map_err(io::Error::other)?;
+                directory.attr.perm =
+                    (lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
+                self.dynamic_directories
+                    .lock()
+                    .unwrap()
+                    .insert(inode.0, directory.clone());
+                Ok(directory.attr)
+            })();
+            match result {
+                Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+                Err(error) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+                }
+            }
+            return;
+        }
+        let Some(file) = self.file(inode.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
         if let Some(handle) = handle {
             let held = self.backing.lock().unwrap();
             let Some(backing) = held.get(&handle.0) else {
@@ -5876,6 +5971,31 @@ mod tests {
                 String::from_utf8_lossy(&mkdir.stderr)
             );
             anyhow::ensure!(fs::read(nested.join("newdir/child/file"))? == b"dynamic-tree");
+            let chmod_directories = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.chmod(sys.argv[1],0o755); os.chmod(sys.argv[2],0o750); os.chmod(sys.argv[3],0o710)")
+                .arg(&mountpoint)
+                .arg(mountpoint.join("nested"))
+                .arg(mountpoint.join("nested/newdir"))
+                .output()?;
+            anyhow::ensure!(
+                chmod_directories.status.success(),
+                "guarded directory chmod failed: {}",
+                String::from_utf8_lossy(&chmod_directories.stderr)
+            );
+            anyhow::ensure!(fs::metadata(&lower)?.permissions().mode() & 0o7777 == 0o700);
+            anyhow::ensure!(fs::metadata(&mountpoint)?.permissions().mode() & 0o7777 == 0o755);
+            anyhow::ensure!(fs::metadata(&nested)?.permissions().mode() & 0o7777 == 0o750);
+            let private_read = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.listdir(sys.argv[1])")
+                .arg(&lower)
+                .output()?;
+            anyhow::ensure!(!private_read.status.success());
             Ok(())
         })();
         let unmounted = session.umount_and_join();
@@ -5886,6 +6006,21 @@ mod tests {
                 .unwrap();
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
         let replayed = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(fs::metadata(&mountpoint)?.permissions().mode() & 0o7777 == 0o755);
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("nested"))?
+                    .permissions()
+                    .mode()
+                    & 0o7777
+                    == 0o750
+            );
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("nested/newdir"))?
+                    .permissions()
+                    .mode()
+                    & 0o7777
+                    == 0o710
+            );
             anyhow::ensure!(!mountpoint.join("nested/leaf").exists());
             anyhow::ensure!(fs::read(mountpoint.join("nested/moved"))?.starts_with(b"EDIT"));
             anyhow::ensure!(
