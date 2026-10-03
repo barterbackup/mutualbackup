@@ -623,12 +623,14 @@ enum PolicyDialKind {
     PreferredProbe,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PolicyDial {
     peer: PeerId,
     tier: u8,
     path: P2pPath,
     kind: PolicyDialKind,
+    addresses: BTreeSet<Multiaddr>,
+    superseded: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1504,7 +1506,7 @@ pub fn build_p2p_with_tor(
             continue;
         }
         let dial = SwarmDialOpts::peer_id(peer)
-            .addresses(addresses)
+            .addresses(addresses.clone())
             .condition(PeerCondition::DisconnectedAndNotDialing)
             .build();
         let connection_id = dial.connection_id();
@@ -1527,6 +1529,8 @@ pub fn build_p2p_with_tor(
                         tier,
                         path,
                         kind: PolicyDialKind::Selected,
+                        addresses: addresses.into_iter().collect(),
+                        superseded: false,
                     },
                 );
             }
@@ -3393,7 +3397,10 @@ impl P2pEventLoop {
                 .connection_paths
                 .values()
                 .any(|(candidate, _)| *candidate == peer)
-            || self.policy_dials.values().any(|dial| dial.peer == peer)
+            || self
+                .policy_dials
+                .values()
+                .any(|dial| dial.peer == peer && !dial.superseded)
             || self.has_outstanding_request(peer)
             || self.transport_promotions.contains_key(&peer)
     }
@@ -4168,6 +4175,19 @@ impl P2pEventLoop {
     fn reconcile_policy_addresses(&mut self, peer: PeerId) {
         let retained = self.retained_peer_addresses(peer);
         let tiers = policy_address_tiers(self.tor_mode, retained);
+        // A signed endpoint replacement can withdraw a pending dial without
+        // changing its transport tier. Let the current address set dial at
+        // once; an obsolete dial must not count as the selected attempt or
+        // trigger fallback when it eventually fails.
+        for dial in self
+            .policy_dials
+            .values_mut()
+            .filter(|dial| dial.peer == peer)
+        {
+            if tiers.get(&dial.tier) != Some(&dial.addresses) {
+                dial.superseded = true;
+            }
+        }
         let requested_tier = self.selected_transport_tier(peer);
         let requested_is_available = tiers.contains_key(&requested_tier)
             || self.healthy_connection_at_tier(peer, requested_tier, None);
@@ -4254,7 +4274,7 @@ impl P2pEventLoop {
     fn policy_dial_exists(&self, peer: PeerId, tier: u8) -> bool {
         self.policy_dials
             .values()
-            .any(|dial| dial.peer == peer && dial.tier == tier)
+            .any(|dial| dial.peer == peer && dial.tier == tier && !dial.superseded)
     }
 
     fn start_policy_dial(
@@ -4267,6 +4287,18 @@ impl P2pEventLoop {
         if addresses.is_empty() || self.policy_dial_exists(peer, tier) {
             return false;
         }
+        let normalized = match addresses
+            .iter()
+            .cloned()
+            .map(|address| normalize_known_address(peer, address))
+            .collect::<Result<BTreeSet<_>>>()
+        {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                tracing::warn!(%peer, %error, "policy dial has an invalid peer address");
+                return false;
+            }
+        };
         let path = address_path(&addresses[0]);
         debug_assert!(
             addresses
@@ -4277,7 +4309,8 @@ impl P2pEventLoop {
             .addresses(addresses)
             // Policy dials must not be suppressed by a retained fallback or
             // an unrelated behaviour-originated dial. The map above bounds us
-            // to one explicit dial per peer/tier.
+            // to one current dial per peer/tier; superseded attempts may still
+            // be finishing while their replacements start.
             .condition(PeerCondition::Always)
             .build();
         let connection_id = dial.connection_id();
@@ -4290,6 +4323,8 @@ impl P2pEventLoop {
                         tier,
                         path,
                         kind,
+                        addresses: normalized,
+                        superseded: false,
                     },
                 );
                 true
@@ -5409,6 +5444,15 @@ impl P2pEventLoop {
             } => {
                 let policy_dial = self.policy_dials.remove(&connection_id);
                 let policy_dial_peer = policy_dial.as_ref().map(|dial| dial.peer);
+                if policy_dial.as_ref().is_some_and(|dial| dial.superseded) {
+                    self.collapsing_connections.insert(connection_id);
+                    if !self.swarm.close_connection(connection_id) {
+                        self.collapsing_connections.remove(&connection_id);
+                    }
+                    tracing::warn!(%peer_id, %connection_id, "closing a superseded policy dial");
+                    self.drain_queued_requests(peer_id);
+                    return;
+                }
                 let path = connected_point_path(&endpoint);
                 let dialer = matches!(&endpoint, ConnectedPoint::Dialer { .. });
                 // DCUtR may report the upgraded connection before or after the
@@ -5535,8 +5579,11 @@ impl P2pEventLoop {
             } => {
                 tracing::warn!(peer = ?peer_id, %error, "libp2p outgoing connection failed");
                 if let Some(dial) = self.policy_dials.remove(&connection_id) {
-                    self.record_dial_failure_path(dial.path);
-                    if dial.kind == PolicyDialKind::Selected
+                    if !dial.superseded {
+                        self.record_dial_failure_path(dial.path);
+                    }
+                    if !dial.superseded
+                        && dial.kind == PolicyDialKind::Selected
                         && self.selected_transport_tier(dial.peer) == dial.tier
                         && !self.healthy_connection_at_tier(dial.peer, dial.tier, None)
                     {
@@ -21933,6 +21980,8 @@ mod tests {
                 tier: 0,
                 path: P2pPath::Direct,
                 kind: PolicyDialKind::Selected,
+                addresses: BTreeSet::new(),
+                superseded: false,
             },
         );
         event_loop.handle_swarm_event(SwarmEvent::OutgoingConnectionError {
@@ -23144,7 +23193,13 @@ mod tests {
         event_loop
             .replace_learned_addresses(peer, vec![current_relay.clone()], unix_seconds() + 300)
             .unwrap();
-        assert!(event_loop.policy_dial_exists(peer, direct_tier));
+        assert!(
+            event_loop
+                .policy_dials
+                .values()
+                .any(|dial| dial.peer == peer && dial.tier == direct_tier && dial.superseded)
+        );
+        assert!(!event_loop.policy_dial_exists(peer, direct_tier));
         assert_eq!(event_loop.selected_transport_tier(peer), relay_tier);
         event_loop.ensure_selected_transport(peer);
         assert!(event_loop.policy_dial_exists(peer, relay_tier));
@@ -23162,6 +23217,53 @@ mod tests {
             .replace_learned_addresses(peer, Vec::new(), unix_seconds() + 300)
             .unwrap();
         assert!(event_loop.retained_peer_addresses(peer).is_empty());
+    }
+
+    #[tokio::test]
+    async fn signed_same_tier_replacement_dials_before_obsolete_attempt_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([79; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([80; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let old: Multiaddr = "/ip4/127.0.0.1/udp/4401/quic-v1".parse().unwrap();
+        let replacement: Multiaddr = "/ip4/127.0.0.1/udp/4402/quic-v1".parse().unwrap();
+        event_loop
+            .replace_learned_addresses(peer, vec![old.clone()], unix_seconds() + 300)
+            .unwrap();
+        let tier = path_preference_rank(event_loop.tor_mode, P2pPath::Direct);
+        assert!(event_loop.start_policy_dial(
+            peer,
+            tier,
+            vec![normalize_known_address(peer, old).unwrap()],
+            PolicyDialKind::Selected,
+        ));
+        let old_dial = *event_loop.policy_dials.keys().next().unwrap();
+        event_loop
+            .replace_learned_addresses(peer, vec![replacement.clone()], unix_seconds() + 300)
+            .unwrap();
+        assert!(event_loop.policy_dials[&old_dial].superseded);
+        assert!(!event_loop.policy_dial_exists(peer, tier));
+        event_loop.ensure_selected_transport(peer);
+        assert!(event_loop.policy_dials.iter().any(|(id, dial)| {
+            *id != old_dial
+                && dial.peer == peer
+                && dial.tier == tier
+                && !dial.superseded
+                && dial.addresses
+                    == BTreeSet::from([normalize_known_address(peer, replacement.clone()).unwrap()])
+        }));
+        event_loop.handle_swarm_event(SwarmEvent::OutgoingConnectionError {
+            connection_id: old_dial,
+            peer_id: Some(peer),
+            error: libp2p::swarm::DialError::Aborted,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), tier);
+        assert!(event_loop.policy_dial_exists(peer, tier));
     }
 
     #[tokio::test]

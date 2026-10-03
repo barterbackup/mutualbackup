@@ -76,8 +76,16 @@
   endpoint or healthy connection, and retries queued requests after replacement.
   A focused regression holds the obsolete direct dial pending while installing
   a signed relay endpoint, then checks relay selection and signed empty-set
-  withdrawal. Also inspect same-tier endpoint replacement: a pending old dial can
-  still delay a new endpoint in that tier until the old attempt terminates.
+  withdrawal. A subsequent same-tier correction binds each policy dial to the
+  address set it started with. Replacing signed addresses supersedes the old
+  attempt, allows a new dial immediately, and prevents a late old-dial failure
+  from advancing transport fallback. A focused test holds the old direct dial
+  pending while replacing it with another direct endpoint. The dial comparison
+  normalizes the optional trailing peer ID, preserving relay-circuit dialing.
+  Both signed-endpoint tests, four fallback tests, three selected-connection
+  tests, and the relay-circuit test pass locally; strict workspace Clippy
+  passes. Two long tests that failed amid broad parallel P2P execution pass
+  individually. The broader missing-signer reliability gate remains open.
   The complete provisioned Git gate passed on exact commit `b69ce33`: all 62
   Btrfs Git cases, extent and node/recovery tests, stock-Git remote helper,
   and the five-daemon test (1,503.94 seconds). Its disposable mount, image,
