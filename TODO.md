@@ -546,6 +546,11 @@
   Clippy. Existing captured lower directories still need a replayable
   ownership/mode isolation transition, and virtual view modes still need
   protected seed-only recovery before guarded enrollment can be enabled.
+  Directory replacement now retires the displaced inode's virtual mode in
+  the same durable commit as its namespace tombstone; source modes survive
+  the move. Replay tests cover every exchange/removal/commit boundary, and
+  directory removal replay also checks mode retirement. All 115 normal store
+  tests and strict workspace Clippy pass.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

@@ -764,11 +764,16 @@ impl GuardedNamespace {
                 changed_files.push((entry_inode, record));
             }
         }
+        let deletions = replaced
+            .map(|(target_inode, _)| (DIRECTORY_MODE_KIND.to_owned(), self.record_id(target_inode)))
+            .into_iter()
+            .collect::<Vec<_>>();
         self.control
             .lock()
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
-            .put_records_and_retire_if_value(
+            .put_records_and_retire_and_delete_if_value(
                 &writes,
+                &deletions,
                 intent_kind,
                 &self.record_id(inode),
                 intent_bytes,
@@ -4190,6 +4195,8 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
+            journal.store_directory_mode(2, 0o750).unwrap();
+            journal.store_directory_mode(3, 0o777).unwrap();
             let intent = DirectoryReplaceIntent {
                 version: 1,
                 move_intent: DirectoryRenameIntent {
@@ -4236,6 +4243,8 @@ mod tests {
             assert_eq!(index.paths[Path::new("target")], INodeNo(2));
             assert!(!index.paths.contains_key(Path::new("source")));
             assert_eq!(journal.directory_record(3).unwrap().current, None);
+            assert_eq!(journal.directory_mode(2).unwrap(), Some(0o750));
+            assert_eq!(journal.directory_mode(3).unwrap(), None);
             assert_eq!(
                 journal
                     .load_or_replay(4, "source/file", file_id, &root, &index.paths)
@@ -4798,6 +4807,7 @@ mod tests {
                     &mb_core::canonical_bytes(&record).unwrap(),
                 )
                 .unwrap();
+            journal.store_directory_mode(2, 0o777).unwrap();
             let intent = DirectoryRemoveIntent {
                 version: 1,
                 target: name.as_bytes().to_vec(),
@@ -4836,6 +4846,7 @@ mod tests {
             let after = journal.directory_record(2).unwrap();
             assert_eq!(after.expected, expected);
             assert!(after.current.is_none());
+            assert_eq!(journal.directory_mode(2).unwrap(), None);
         }
     }
 
