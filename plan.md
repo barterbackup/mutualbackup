@@ -1598,11 +1598,16 @@ to the capture, durable namespace records, or pending intents, and refuses an
 unknown inode before a pending directory rename can mutate the lower tree.
 Normal create/replace/rename crash states and privileged ext4/Btrfs remount
 probes pass, alongside 117 normal store tests and strict workspace Clippy.
-Exact pre-replay path binding across pending intents is still open; the later
-post-replay inventory checks every name before mount publication. Restoration
-after FUSE path changes, detached-file owner recovery, signed mutable-view
-recovery, and the complete privileged mount gate also remain open before
-ordinary user-owned roots can be enrolled.
+The pre-replay descriptor walk now also binds each lower name to its recorded
+inode, allowing only the alternate names and descendants granted by a durable
+pending namespace intent. It refuses a recorded inode moved to an ungranted
+path before replay can mutate the lower tree; the later post-replay inventory
+still checks the exact final namespace before mount publication. Normal
+create/remove/replace/rename crash states, ext4 remount, and fresh local Btrfs
+remount/replace/rename probes pass, alongside 117 normal store tests and strict
+workspace Clippy. Restoration after FUSE path changes, detached-file owner
+recovery, signed mutable-view recovery, and the complete privileged mount gate
+remain open before ordinary user-owned roots can be enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
@@ -3608,6 +3613,10 @@ The Git binary must never opt into Git's automatic CRLF conversion or run a
 configured filter, including during import, checkout, merge, or pull. A stock
 Git peer may already have converted its own worktree; exchange and preserve its
 stored Git blob bytes exactly, without trying to reverse that conversion.
+Repositories with conversion rules remain usable: our binary treats those
+rules as inert for file bytes rather than rejecting the repository or copying
+stock Git's transformed worktree. This rule applies at each Git command gate,
+while the original source-backend and platform gates remain separate.
 
 - First extract and version the source-backend boundary from section 4 without
   changing the existing signed peer format. Prove a custom object-store adapter
