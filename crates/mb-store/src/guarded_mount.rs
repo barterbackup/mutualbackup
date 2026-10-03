@@ -15,7 +15,7 @@ use fuser::{BackgroundSession, Config, MountOption, SessionACL};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::guarded_view_probe::GuardedProbeView;
+use crate::guarded_view_probe::{GuardedProbeView, GuardedViewMetadataV1};
 use crate::{
     ControlStore, GuardedRootCapturePlan, NativeFileId, PinnedDirectory, StableAnchorManifest,
     filesystem_identity,
@@ -24,6 +24,9 @@ use crate::{
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
 const MOUNT_RETIRE_KIND: &str = "guarded-view-mount-retired-v1";
 const MOUNT_SUBTYPE: &str = "mutualbackup_guarded";
+// The daemon is the sole writer for a root. Serialize local mount lifecycle
+// operations so a stopped-view snapshot cannot overlap a remount or stop.
+static MOUNT_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct MountClaim {
@@ -46,7 +49,7 @@ struct MountedFilesystem {
 /// A mounted guarded view. Keep this with the daemon's root registration;
 /// dropping it unmounts the view, while `stop` propagates unmount errors.
 pub struct GuardedViewMount {
-    session: BackgroundSession,
+    session: Option<BackgroundSession>,
     mountpoint: PathBuf,
     source: String,
 }
@@ -183,6 +186,9 @@ impl GuardedViewMount {
         view_uid: u32,
         view_gid: u32,
     ) -> anyhow::Result<Self> {
+        let _lifecycle = MOUNT_LIFECYCLE
+            .lock()
+            .map_err(|_| io::Error::other("guarded mount lifecycle lock is poisoned"))?;
         ensure!(view_uid != 0, "guarded view needs an unprivileged owner");
         let mountpoint = canonical_mountpoint(mountpoint.as_ref())?;
         let plan = {
@@ -352,7 +358,7 @@ impl GuardedViewMount {
             "guarded mount was retired while starting"
         );
         Ok(Self {
-            session,
+            session: Some(session),
             mountpoint,
             source,
         })
@@ -360,7 +366,12 @@ impl GuardedViewMount {
 
     pub fn check_health(&self) -> anyhow::Result<()> {
         ensure!(
-            !self.session.guard.is_finished(),
+            !self
+                .session
+                .as_ref()
+                .context("guarded FUSE worker is stopped")?
+                .guard
+                .is_finished(),
             "guarded FUSE worker exited"
         );
         ensure!(
@@ -372,8 +383,99 @@ impl GuardedViewMount {
         Ok(())
     }
 
-    pub fn stop(self) -> io::Result<()> {
-        self.session.umount_and_join()
+    /// Reconstruct the current visible namespace after the view has stopped.
+    /// This is local, verified input for a future signed owner revision; it
+    /// does not itself make the mutable view seed-recoverable.
+    pub fn snapshot_stopped(
+        anchor_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+    ) -> anyhow::Result<GuardedViewMetadataV1> {
+        let _lifecycle = MOUNT_LIFECYCLE
+            .lock()
+            .map_err(|_| io::Error::other("guarded mount lifecycle lock is poisoned"))?;
+        let (claim_bytes, claim, manifest) = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            let bytes = control
+                .get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())?
+                .context("guarded view has no mount claim")?;
+            let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                claim.version == 1 && claim.anchor_id == anchor_id,
+                "guarded mount claim changed"
+            );
+            ensure!(
+                control
+                    .get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())?
+                    .is_none(),
+                "guarded mount has been retired"
+            );
+            let manifest = GuardedRootCapturePlan::load_published_manifest(&control, anchor_id)?;
+            let plan = GuardedRootCapturePlan::load_active_for_view(&control, &manifest)?;
+            ensure!(
+                claim.lower_root == plan.source_root()
+                    && claim.lower_id == plan.source_root_identity(),
+                "guarded mount claim differs from its source plan"
+            );
+            (bytes, claim, manifest)
+        };
+        ensure!(
+            mounted_filesystem(&claim.mountpoint)?.is_none(),
+            "guarded view must stop before metadata snapshot"
+        );
+        let lower = PinnedDirectory::open(&claim.lower_root)?;
+        let placeholder = PinnedDirectory::open(&claim.mountpoint)?;
+        ensure!(
+            lower.identity()? == claim.lower_id && placeholder.identity()? == claim.mountpoint_id,
+            "guarded mount paths changed before metadata snapshot"
+        );
+        let view = GuardedProbeView::from_guarded_capture(
+            &manifest,
+            Arc::clone(&control),
+            claim.view_uid,
+            claim.view_gid,
+        )?;
+        let snapshot = view.verified_metadata_snapshot(anchor_id)?;
+        let control = control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        ensure!(
+            control.get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())? == Some(claim_bytes)
+                && control
+                    .get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())?
+                    .is_none()
+                && mounted_filesystem(&claim.mountpoint)?.is_none(),
+            "guarded mount claim changed during metadata snapshot"
+        );
+        Ok(snapshot)
+    }
+
+    pub fn stop(mut self) -> io::Result<()> {
+        let lifecycle = MOUNT_LIFECYCLE
+            .lock()
+            .map_err(|_| io::Error::other("guarded mount lifecycle lock is poisoned"))?;
+        let session = self
+            .session
+            .take()
+            .ok_or_else(|| io::Error::other("guarded FUSE worker is already stopped"))?;
+        let result = session.umount_and_join();
+        drop(lifecycle);
+        result
+    }
+}
+
+impl Drop for GuardedViewMount {
+    fn drop(&mut self) {
+        if self.session.is_none() {
+            return;
+        }
+        let _lifecycle = MOUNT_LIFECYCLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Join the worker as well as unmounting, so a later snapshot cannot
+        // observe a lower-tree mutation from an in-flight FUSE request.
+        let _ = self.session.take().unwrap().umount_and_join();
     }
 }
 
@@ -1151,18 +1253,26 @@ print('DONE', flush=True)
         fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
         let exact_bytes = b"guarded\r\n\0source\n";
+        fs::create_dir(lower.join("captured")).unwrap();
+        fs::set_permissions(lower.join("captured"), fs::Permissions::from_mode(0o750)).unwrap();
         fs::write(lower.join("sample"), exact_bytes).unwrap();
         fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o666)).unwrap();
 
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([111; 32]));
         let control = ControlStore::open(&control_path, &keys).unwrap();
         let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
-        let manifest = plan.capture(&control).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&control, 65534, 0, 0)
+            .unwrap();
+        plan.isolate_lower_directories(&control, &manifest).unwrap();
         let control = Arc::new(Mutex::new(control));
         let mount =
             GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
                 .unwrap();
         mount.check_health().unwrap();
+        assert!(
+            GuardedViewMount::snapshot_stopped(manifest.anchor_id, Arc::clone(&control)).is_err()
+        );
         {
             let store = control.lock().unwrap();
             assert!(plan.discard_unreferenced(&store).is_err());
@@ -1240,10 +1350,76 @@ print('DONE', flush=True)
                 & 0o7777,
             0o700
         );
+        let visible_modes = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; os.chmod(sys.argv[1],0o751); os.chmod(sys.argv[2],0o711); os.chmod(sys.argv[3],0o640)")
+            .arg(&mountpoint)
+            .arg(mountpoint.join("captured"))
+            .arg(mountpoint.join("sample"))
+            .output()
+            .unwrap();
+        assert!(visible_modes.status.success(), "{visible_modes:?}");
         mount.stop().unwrap();
+        let snapshot =
+            GuardedViewMount::snapshot_stopped(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        let encoded = mb_core::canonical_bytes(&snapshot).unwrap();
+        assert_eq!(
+            mb_core::decode_canonical::<crate::GuardedViewMetadataV1>(&encoded).unwrap(),
+            snapshot
+        );
+        assert_eq!(snapshot.format_version, 1);
+        assert_eq!(snapshot.anchor_id, manifest.anchor_id);
+        assert_eq!(snapshot.root_mode, 0o751);
+        assert_eq!((snapshot.root_uid, snapshot.root_gid), (65534, 65534));
+        assert_eq!(
+            snapshot.lower_root_id,
+            crate::PinnedDirectory::open(&lower)
+                .unwrap()
+                .identity()
+                .unwrap()
+        );
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.entries[0].path, b"captured");
+        assert_eq!(
+            snapshot.entries[0].kind,
+            crate::GuardedViewEntryKind::Directory
+        );
+        assert_eq!(snapshot.entries[0].mode, 0o711);
+        assert_eq!(
+            (snapshot.entries[0].uid, snapshot.entries[0].gid),
+            (65534, 65534)
+        );
+        assert_eq!(snapshot.entries[1].path, b"public");
+        assert_eq!(
+            snapshot.entries[1].kind,
+            crate::GuardedViewEntryKind::Directory
+        );
+        assert_eq!(snapshot.entries[1].mode, 0o777);
+        assert_eq!(
+            (snapshot.entries[1].uid, snapshot.entries[1].gid),
+            (65534, 65534)
+        );
+        assert_eq!(snapshot.entries[2].path, b"sample");
+        assert_eq!(snapshot.entries[2].kind, crate::GuardedViewEntryKind::File);
+        assert_eq!(snapshot.entries[2].mode, 0o640);
+        assert_eq!(
+            (snapshot.entries[2].uid, snapshot.entries[2].gid),
+            (65534, 65534)
+        );
+        assert_eq!(snapshot.entries[2].logical_len, edited.len() as u64);
+        assert_eq!(
+            snapshot.entries[2].native_id.inode,
+            fs::metadata(lower.join("sample")).unwrap().ino()
+        );
 
         for unexpected in [lower.join("public/unknown"), lower.join("unknown")] {
             fs::write(&unexpected, b"outside the guarded view").unwrap();
+            assert!(
+                GuardedViewMount::snapshot_stopped(manifest.anchor_id, Arc::clone(&control))
+                    .is_err()
+            );
             let error =
                 match GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)) {
                     Ok(mount) => {
@@ -1279,6 +1455,17 @@ print('DONE', flush=True)
         let control = Arc::new(Mutex::new(
             ControlStore::open(&control_path, &keys).unwrap(),
         ));
+        let reopened_snapshot =
+            GuardedViewMount::snapshot_stopped(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        assert_eq!(reopened_snapshot.root_mode, snapshot.root_mode);
+        for (before, after) in snapshot.entries.iter().zip(&reopened_snapshot.entries) {
+            assert_eq!(before.path, after.path);
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.native_id, after.native_id);
+            assert_eq!(before.mode, after.mode);
+            assert_eq!(before.logical_len, after.logical_len);
+        }
+        assert_eq!(reopened_snapshot.entries.len(), snapshot.entries.len());
 
         let mut recovered_mounts =
             GuardedViewMount::recover_all_claimed(Arc::clone(&control)).unwrap();
@@ -1357,6 +1544,9 @@ print('DONE', flush=True)
         fs::rename(&mountpoint, area.path().join("old-view")).unwrap();
         fs::create_dir(&mountpoint).unwrap();
         fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            GuardedViewMount::snapshot_stopped(manifest.anchor_id, Arc::clone(&control)).is_err()
+        );
         assert!(
             GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
                 .is_err()

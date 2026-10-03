@@ -1975,6 +1975,44 @@ struct GuardedProbeDirectory {
     native_id: NativeFileId,
 }
 
+/// The visible namespace and metadata of one quiescent guarded view. Paths
+/// remain raw Unix bytes until the revision format defines their encoding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuardedViewMetadataV1 {
+    pub format_version: u16,
+    pub anchor_id: Uuid,
+    pub lower_root_id: NativeFileId,
+    pub root_mode: u16,
+    pub root_uid: u32,
+    pub root_gid: u32,
+    pub root_atime_secs: i64,
+    pub root_atime_nanos: u32,
+    pub root_modified_secs: i64,
+    pub root_modified_nanos: u32,
+    pub entries: Vec<GuardedViewMetadataEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuardedViewMetadataEntry {
+    pub path: Vec<u8>,
+    pub kind: GuardedViewEntryKind,
+    pub native_id: NativeFileId,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub logical_len: u64,
+    pub atime_secs: i64,
+    pub atime_nanos: u32,
+    pub modified_secs: i64,
+    pub modified_nanos: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GuardedViewEntryKind {
+    File,
+    Directory,
+}
+
 /// FUSE view for a published guarded capture. Only the guarded mount wrapper
 /// may expose this to callers, so its permission and recovery checks cannot
 /// be omitted by accident.
@@ -2080,6 +2118,96 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    /// Caller must stop and fence the FUSE mount before building this value.
+    /// The lower namespace check excludes unrecorded paths, while the inode
+    /// checks bind each visible name to its reconstructed source object.
+    pub(crate) fn verified_metadata_snapshot(
+        &self,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<GuardedViewMetadataV1> {
+        self.verify_private_lower_ownership()?;
+        self.verify_lower_namespace()?;
+        let lower_root = self
+            .lower_root
+            .as_ref()
+            .context("guarded view has no private lower root")?;
+        let root = self.root_attr()?;
+        let (root_atime_secs, root_atime_nanos) = snapshot_time(root.atime)?;
+        let (root_modified_secs, root_modified_nanos) = snapshot_time(root.mtime)?;
+        let names = self.names.lock().unwrap();
+        let dynamic_directories = self.dynamic_directories.lock().unwrap();
+        let dynamic_files = self.dynamic_files.lock().unwrap();
+        let mut entries = Vec::with_capacity(names.len());
+        for ((parent, name), inode) in names.iter() {
+            let parent_path = if *parent == INodeNo::ROOT.0 {
+                PathBuf::new()
+            } else {
+                self.directories
+                    .get(parent)
+                    .or_else(|| dynamic_directories.get(parent))
+                    .context("guarded snapshot name has no parent")?
+                    .relative_path
+                    .clone()
+            };
+            let path = parent_path.join(name);
+            let (kind, native_id, attr) = if let Some(directory) = self
+                .directories
+                .get(inode)
+                .or_else(|| dynamic_directories.get(inode))
+            {
+                (
+                    GuardedViewEntryKind::Directory,
+                    directory.native_id,
+                    self.directory_attr(directory)?,
+                )
+            } else {
+                let file = self
+                    .files
+                    .get(inode)
+                    .or_else(|| dynamic_files.get(inode))
+                    .context("guarded snapshot name has no file")?;
+                let attr = file.current_attr()?;
+                (
+                    GuardedViewEntryKind::File,
+                    NativeFileId {
+                        filesystem_id: lower_root.identity()?.filesystem_id,
+                        inode: file.source.metadata()?.ino(),
+                    },
+                    attr,
+                )
+            };
+            let (atime_secs, atime_nanos) = snapshot_time(attr.atime)?;
+            let (modified_secs, modified_nanos) = snapshot_time(attr.mtime)?;
+            entries.push(GuardedViewMetadataEntry {
+                path: path.as_os_str().as_bytes().to_vec(),
+                kind,
+                native_id,
+                mode: attr.perm,
+                uid: attr.uid,
+                gid: attr.gid,
+                logical_len: attr.size,
+                atime_secs,
+                atime_nanos,
+                modified_secs,
+                modified_nanos,
+            });
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(GuardedViewMetadataV1 {
+            format_version: 1,
+            anchor_id,
+            lower_root_id: lower_root.identity()?,
+            root_mode: root.perm,
+            root_uid: root.uid,
+            root_gid: root.gid,
+            root_atime_secs,
+            root_atime_nanos,
+            root_modified_secs,
+            root_modified_nanos,
+            entries,
+        })
+    }
+
     /// After namespace replay, require the complete private lower tree to
     /// match the visible file and directory identities reconstructed from the
     /// durable view records. This also covers remounts after FUSE mutations.
@@ -3023,6 +3151,26 @@ impl GuardedProbeView {
             .flatten()
             .unwrap_or((metadata.permissions().mode() & 0o7777) as u16);
         Ok(attr)
+    }
+}
+
+fn snapshot_time(time: SystemTime) -> anyhow::Result<(i64, u32)> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Ok((i64::try_from(duration.as_secs())?, duration.subsec_nanos())),
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = i64::try_from(duration.as_secs())?;
+            if duration.subsec_nanos() == 0 {
+                Ok((-seconds, 0))
+            } else {
+                Ok((
+                    -seconds
+                        .checked_add(1)
+                        .context("guarded timestamp overflow")?,
+                    1_000_000_000 - duration.subsec_nanos(),
+                ))
+            }
+        }
     }
 }
 

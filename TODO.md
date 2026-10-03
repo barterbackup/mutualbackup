@@ -725,6 +725,17 @@
   names. The 119 normal store tests, strict workspace Clippy, and all 18
   privileged FUSE probes pass on ext4 and fresh default-atime Btrfs. Signed
   metadata recovery and guarded enrollment remain open.
+  A stopped claimed view can now export a versioned, verified snapshot of its
+  current raw-byte namespace, native inode identities, virtual root/directory
+  modes, visible uid/gid, file modes and lengths, and access/modification
+  timestamps. It refuses a live mount or unrecorded lower entry and rebuilds
+  the same visible names, modes, and inode identities after control-database
+  reopen. The focused privileged probe passes on local ext4 and disposable
+  Btrfs; all 18 guarded FUSE probes on ext4, 119 normal store tests, and
+  strict workspace Clippy pass. This remains local input only: capture the
+  snapshot's current file bytes into immutable anchors, include its metadata
+  in a signed owner revision, prove seed-only recovery, and only then enable
+  guarded node enrollment.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
