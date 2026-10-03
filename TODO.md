@@ -2,7 +2,7 @@
 
 ## Milestone 6 active implementation gates
 
-- [ ] **M6 Git file bytes remain exact under every supported command.**
+- [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
   now treats an LF-only edit as dirty, shows its raw diff, and restores the
@@ -17,16 +17,16 @@
   merge, combined linked restore, and primary hard reset; its raw merged blob
   and restored bytes match. The inherited-config regression also checks that a
   line-ending-only edit blocks tracked `rm`, branch switch, and pull without
-  changing the file or branch; its focused local Btrfs run passes. Complete
-  the remaining cross-command audit required
-  by plan.md, especially every supported CLI command. A fresh local Btrfs
+  changing the file or branch; its focused local Btrfs run passes. The
+  command-by-command source trace in [docs/git-byte-audit.md](docs/git-byte-audit.md)
+  covers every supported CLI command, including metadata-only operations and
+  the stock-Git bridge. A fresh local Btrfs
   stock-Git round trip confirms that a CRLF worktree normalized by stock Git
   imports as its LF blob, remains clean until edited, restores the exact blob
   bytes, and exports the same object ID. The CLI help explains this limit.
   The complete local Git acceptance script passed on exact source `1d961d5`,
   including all 62 Btrfs Git library cases, extent measurements, node recovery,
-  stock-Git remote helper, and five-daemon smoke. This does not replace the
-  remaining command-by-command byte-policy audit. A separate alias-level
+  stock-Git remote helper, and five-daemon smoke. A separate alias-level
   remote-helper regression now calls `git status` through `mutualgit` under
   inherited `core.autocrlf`, external attributes, and a configured clean
   filter. It reports a raw-byte edit as dirty without running that filter;

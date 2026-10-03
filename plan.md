@@ -1167,7 +1167,10 @@ them. That regression now also exercises a system clean filter, repository
 filter settings and `info/attributes` on the ordinary-Git side, raw native
 content merge, linked-worktree checkout and merge, combined linked restore,
 and primary hard reset. The broader
-cross-command audit remains open.
+cross-command source audit is recorded in
+[docs/git-byte-audit.md](docs/git-byte-audit.md), covering each supported CLI
+command and the ordinary-Git bridge. The separate topology, guarded backend,
+and platform gates remain open.
 A separate local Btrfs regression confirms that a stock Git peer's CRLF
 worktree can yield an LF blob and that our import, checkout, restore, and export
 preserve the exchanged LF blob and object ID. The Git-facing help explains that
