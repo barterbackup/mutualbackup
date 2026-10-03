@@ -115,7 +115,7 @@ const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
 const PREFERRED_PATH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGICAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
-const CODING_EVENT_DISSEMINATION_WAIT: Duration = Duration::from_secs(20);
+const GUILD_EVENT_DISSEMINATION_WAIT: Duration = Duration::from_secs(20);
 // A valid empty tail is only evidence that one peer is current. Keep other
 // requests alive for their full bounded logical lifetime so a slow relay or
 // Tor path can still supply the advancing tail.
@@ -8101,7 +8101,7 @@ async fn commit_verified_coding_group(
     // The local certified tail must become available before a slow install
     // request can delay the coordinator. Other members can also pull it from
     // the peer-exchange loop if this bounded eager dissemination expires.
-    let mut installs = FuturesUnordered::new();
+    let installs = FuturesUnordered::new();
     for peer in guild
         .peers
         .iter()
@@ -8118,24 +8118,43 @@ async fn commit_verified_coding_group(
             )
         });
     }
-    let deadline = tokio::time::Instant::now() + CODING_EVENT_DISSEMINATION_WAIT;
+    wait_for_guild_event_dissemination(
+        installs,
+        certified.event.sequence,
+        "coding-group",
+        GUILD_EVENT_DISSEMINATION_WAIT,
+    )
+    .await;
+    Ok(())
+}
+
+async fn wait_for_guild_event_dissemination<F>(
+    mut installs: FuturesUnordered<F>,
+    sequence: u64,
+    kind: &'static str,
+    wait: Duration,
+) where
+    F: Future<Output = (NodeId, Result<()>)>,
+{
+    let deadline = tokio::time::Instant::now() + wait;
     while !installs.is_empty() {
         match tokio::time::timeout_at(deadline, installs.next()).await {
             Ok(Some((peer, Err(error)))) => {
-                tracing::debug!(%peer, %error, "coding-group event dissemination deferred to tail sync");
+                tracing::debug!(%peer, %error, sequence, kind, "guild event dissemination deferred to tail sync");
             }
             Ok(Some((_, Ok(())))) => {}
             Ok(None) => break,
             Err(_) => {
                 tracing::warn!(
                     pending = installs.len(),
-                    "coding-group event dissemination is waiting for peer tail sync"
+                    sequence,
+                    kind,
+                    "guild event dissemination is waiting for peer tail sync"
                 );
                 break;
             }
         }
     }
-    Ok(())
 }
 
 async fn finish_coding_activation(
@@ -9012,19 +9031,26 @@ async fn commit_plain_guild_event(
     }
     let certified = QuorumGuildEvent { event, signatures };
     state.verify_event(&certified)?;
+    let local_certified = certified.clone();
+    node_blocking(node, move |node| node.install_guild_event(local_certified)).await?;
+    let installs = FuturesUnordered::new();
     for peer in guild
         .peers
         .iter()
         .filter(|peer| peer.member.node_id != local_id)
     {
-        if let Err(error) = p2p
-            .install_guild_event(peer.member.node_id, certified.clone())
-            .await
-        {
-            tracing::debug!(peer = %peer.member.node_id, %error, "guild lifecycle event dissemination deferred to tail sync");
-        }
+        let peer_id = peer.member.node_id;
+        let event = certified.clone();
+        installs.push(async move { (peer_id, p2p.install_guild_event(peer_id, event).await) });
     }
-    node_blocking(node, move |node| node.install_guild_event(certified)).await
+    wait_for_guild_event_dissemination(
+        installs,
+        certified.event.sequence,
+        "lifecycle",
+        GUILD_EVENT_DISSEMINATION_WAIT,
+    )
+    .await;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31602,6 +31628,113 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed, restart_locked_rotation);
+    }
+
+    #[tokio::test]
+    async fn certified_lifecycle_event_is_local_before_slow_peer_install_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut nodes = active_test_guild_nodes(temp.path()).await;
+        let coordinator = Arc::new(Mutex::new(nodes.remove(0)));
+        let (state, guild, local_id, event) = prepare_guild_administration(
+            &mut coordinator.lock().unwrap(),
+            GuildAdministration::SetQuorum(QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Majority,
+            }),
+        )
+        .unwrap();
+        {
+            let coordinator = coordinator.lock().unwrap();
+            coordinator.sign_guild_event_proposal(&event).unwrap();
+            for peer in &nodes {
+                let signature = mb_core::sign_guild_event(&event, peer.keys()).unwrap();
+                coordinator
+                    .collect_guild_event_signature(&event, signature)
+                    .unwrap();
+            }
+        }
+
+        let (commands, mut rx) = mpsc::channel(8);
+        let (request_cancellations, _cancel_rx) = mpsc::unbounded_channel();
+        let (_port, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(4)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let (release, hold_slow_response) = oneshot::channel::<()>();
+        let observed = coordinator.clone();
+        let expected = event.clone();
+        let expected_state = state.clone();
+        let worker = tokio::spawn(async move {
+            let mut peers = BTreeSet::new();
+            let mut slow_response = None;
+            while peers.len() < 4 {
+                let Command::Request {
+                    recipient,
+                    request,
+                    response,
+                    ..
+                } = rx
+                    .recv()
+                    .await
+                    .expect("all peer installs must be requested")
+                else {
+                    panic!("unexpected command during lifecycle dissemination");
+                };
+                let PeerRequest::InstallGuildEvent { certified } = *request else {
+                    panic!("expected a certified lifecycle event");
+                };
+                assert_eq!(certified.event, expected);
+                expected_state.verify_event(&certified).unwrap();
+                assert_eq!(
+                    observed
+                        .lock()
+                        .unwrap()
+                        .dynamic_guild_state()
+                        .unwrap()
+                        .unwrap()
+                        .event_sequence,
+                    expected.sequence,
+                    "the local tail must be installed before peer sends"
+                );
+                assert!(peers.insert(recipient));
+                if slow_response.is_none() {
+                    slow_response = Some(response);
+                } else {
+                    response.send(Ok(PeerResponse::Ack)).unwrap();
+                }
+            }
+            hold_slow_response.await.unwrap();
+            drop(slow_response);
+            peers.len()
+        });
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            GUILD_EVENT_DISSEMINATION_WAIT + Duration::from_secs(5),
+            commit_plain_guild_event(coordinator.clone(), &p2p, state, guild, local_id, event),
+        )
+        .await
+        .expect("one slow peer must not hold lifecycle completion indefinitely")
+        .unwrap();
+        assert!(started.elapsed() >= GUILD_EVENT_DISSEMINATION_WAIT);
+        assert_eq!(
+            coordinator
+                .lock()
+                .unwrap()
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .event_sequence,
+            1
+        );
+        release.send(()).unwrap();
+        assert_eq!(worker.await.unwrap(), 4);
     }
 
     #[tokio::test]
