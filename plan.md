@@ -1481,6 +1481,17 @@ five-daemon topology and seed-recovery gate passed with that network code in
 1,569.46 seconds, with complete disposable-resource cleanup. Its unanimous
 guild still had transient short signature sets and transport exhaustion; the
 historical long-stall gate remains open.
+A retiring duplicate was found to queue new requests even with a separate
+healthy selected connection; its retirement may wait for unrelated inbound
+work. Exact-connection dispatch now bypasses that peer-wide hold, while a
+scheduled preferred-tier promotion still waits briefly. The focused regression
+proves the selected path dispatches during duplicate retirement. This may
+explain a stalled signer request but does not by itself close the historical
+five-daemon reliability gate; rerun that gate on committed source.
+The complete P2P unit suite passes (135 tests, 2 provisioned tests ignored)
+after its activation fixture waits for receipt cleanup and the intended pending
+activation. Those waits exposed an existing race on the prior committed tree;
+they do not change production activation decisions.
 The guarded FUSE view now answers `statfs` from the pinned lower-root
 descriptor, reporting real filesystem capacity and name limits. A privileged
 ordinary-user `statvfs` probe and comparison with the native filesystem pass

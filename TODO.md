@@ -212,6 +212,22 @@
   processes, and namespaces were removed. Unanimous short quorums and transport
   exhaustion still appeared before the recovered guild caught up, so this run
   does not close the historical unanimous stall.
+  A source trace found that a retiring duplicate connection prevented dispatch
+  of every new request to that peer even when a separate healthy selected
+  connection existed. Retirement can wait for unrelated inbound work, so this
+  peer-wide hold could repeatedly delay a missing guild signature despite an
+  active relay path. Exact-connection dispatch now proceeds on the healthy
+  selected session while the short preferred-tier promotion wait remains.
+  A focused P2P regression holds a duplicate in retirement and verifies the
+  request uses the healthy session. The historical topology stall is not yet
+  proven to have this cause; repeat the isolated five-daemon gate on committed
+  source and keep the reliability item open until its response path is clear.
+  The P2P suite also exposed an existing activation-fixture race on the prior
+  committed tree: usable coverage can precede cleanup of the losing receipt,
+  and one activation-worker turn need not process the intended pending job.
+  The fixture now waits with bounds for those separate transitions and reports
+  concise pending-job state on timeout. The full P2P suite passes with 135
+  tests and 2 provisioned tests ignored; strict workspace Clippy passes.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

@@ -3650,16 +3650,6 @@ impl P2pEventLoop {
             || self.duplicate_retirement.contains_key(&connection)
     }
 
-    fn peer_has_unsettled_connections(&self, peer: PeerId) -> bool {
-        self.transport_promotions.contains_key(&peer)
-            || self
-                .connection_paths
-                .iter()
-                .any(|(connection, (candidate, _))| {
-                    *candidate == peer && self.connection_is_retiring_or_unhealthy(*connection)
-                })
-    }
-
     fn healthy_connection_at_tier(
         &self,
         peer: PeerId,
@@ -3874,7 +3864,11 @@ impl P2pEventLoop {
         } else {
             self.ensure_selected_transport(peer);
         }
-        if !selected_connection_exists || self.peer_has_unsettled_connections(peer) {
+        // Dispatch is bound to the exact healthy selected connection. A
+        // retiring duplicate or an unrelated inbound request must not hold
+        // every new request for this peer in the queue. A short scheduled
+        // promotion still waits for its preferred connection to become policy.
+        if !selected_connection_exists || self.transport_promotions.contains_key(&peer) {
             self.queued_requests.push_back(pending);
         } else {
             self.dispatch_request(pending);
@@ -21404,6 +21398,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retiring_duplicate_does_not_block_a_healthy_selected_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([84; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([85; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let address: Multiaddr = format!("/ip4/192.0.2.85/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        event_loop.add_learned_address(peer, address).unwrap();
+
+        let selected = ConnectionId::new_unchecked(800);
+        let retiring = ConnectionId::new_unchecked(801);
+        for connection in [selected, retiring] {
+            event_loop
+                .connection_paths
+                .insert(connection, (peer, P2pPath::Direct));
+            register_request_connection(&mut event_loop, peer, connection);
+        }
+        event_loop.duplicate_retirement.insert(
+            retiring,
+            (peer, tokio::time::Instant::now() + Duration::from_secs(60)),
+        );
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert_eq!(next_request_dispatch(&mut event_loop).await, selected);
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        assert!(event_loop.queued_requests.is_empty());
+        assert!(event_loop.duplicate_retirement.contains_key(&retiring));
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn duplicate_collapse_fences_only_the_connection_owning_a_relay_reservation() {
         let temp = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([86; 32]);
@@ -22416,6 +22452,7 @@ mod tests {
         });
         let command = event_loop.commands.recv().await.unwrap();
         event_loop.handle_command(command).unwrap();
+        assert_eq!(next_request_dispatch(&mut event_loop).await, selected);
         let request_id = *event_loop.pending_requests.keys().next().unwrap();
         event_loop.duplicate_retirement.insert(
             survivor,
@@ -22471,8 +22508,9 @@ mod tests {
             error: request_response::OutboundFailure::ConnectionClosed,
         });
         assert_eq!(event_loop.selected_transport_tier(peer), 0);
-        assert!(event_loop.pending_requests.is_empty());
-        assert_eq!(event_loop.queued_requests.len(), 1);
+        assert_eq!(next_request_dispatch(&mut event_loop).await, survivor);
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        assert!(event_loop.queued_requests.is_empty());
 
         event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
             peer_id: peer,
@@ -22484,8 +22522,8 @@ mod tests {
             num_established: 1,
             cause: None,
         });
-        assert!(event_loop.pending_requests.is_empty());
-        assert_eq!(event_loop.queued_requests.len(), 1);
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        assert!(event_loop.queued_requests.is_empty());
 
         event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
             peer_id: peer,
@@ -26978,14 +27016,24 @@ mod tests {
                 .iter()
                 .any(|job| job.transcript.value.plan == initial && job.complete)
         );
-        assert_eq!(
-            nodes[1]
-                .lock()
-                .unwrap()
-                .coding_staged_receipt_count_for_test()
-                .unwrap(),
-            0
-        );
+        // Coverage can become usable before the delegated worker finishes
+        // retiring the losing attempt's staged receipt.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if nodes[1]
+                    .lock()
+                    .unwrap()
+                    .coding_staged_receipt_count_for_test()
+                    .unwrap()
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("losing coding receipt was not retired");
         for task in coding_tasks {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
@@ -27167,15 +27215,39 @@ mod tests {
                 0
             );
         }
-        process_coding_activation_job(nodes[0].clone(), &clients[0])
-            .await
-            .unwrap();
-        let replacement = nodes[0]
-            .lock()
-            .unwrap()
-            .coding_launch_successor_for_test(verified.value.attempt_id)
-            .unwrap()
-            .unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                process_coding_activation_job(nodes[0].clone(), &clients[0])
+                    .await
+                    .unwrap();
+                if let Some(replacement) = nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_launch_successor_for_test(verified.value.attempt_id)
+                    .unwrap()
+                {
+                    break replacement;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let owner = nodes[0].lock().unwrap();
+            let jobs = owner
+                .coding_activation_jobs_for_test()
+                .unwrap()
+                .into_iter()
+                .map(|job| {
+                    (
+                        job.transcript.value.plan.value.attempt_id,
+                        job.complete,
+                        job.error,
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!("retired activation has no successor: jobs={jobs:?}")
+        });
         assert_ne!(
             replacement.value.geometry.parity,
             verified.value.geometry.parity
