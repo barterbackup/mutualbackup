@@ -52,9 +52,15 @@
   Those hints could reintroduce an old direct address after a newer signed
   endpoint set replaced it. The current correction makes signed endpoint sets,
   including an empty withdrawal, authoritative over roster and Identify hints
-  until expiry. The focused endpoint-cache regression passes; repeat the full
-  topology gate on the corrected committed source before deciding whether this
-  also resolves the missing-signature stall.
+  until expiry. The focused endpoint-cache and direct-to-relay regressions,
+  130 other P2P tests, and strict workspace Clippy passed. The complete local
+  Git acceptance script passed on exact commit `d49a0bf`, including all 62
+  Btrfs Git cases and the five-daemon test (1,617.54 seconds); its disposable
+  mount, daemons, namespaces, and firewall rules were cleaned up. Loopback
+  retries and transient short signature quorums still appeared during topology
+  transitions. The gate pass establishes recovery in this run, but not the
+  cause of the original intermittent missing-signer stall; keep this item open
+  until that path is explained and corrected.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
