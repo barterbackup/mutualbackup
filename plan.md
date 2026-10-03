@@ -758,8 +758,11 @@ Proactive background repair comes later.
   pathname truncate, allocation, or owner `chmod`, the view must run and
   durably finish the existing sparse-detach journal, then pass through only
   the independent editable inode. Rename and unlink preserve the immutable
-  anchor without detaching. A mount/daemon failure must make the view fail
-  closed, never expose the private source path or silently resume through it.
+  anchor without detaching. New files are editable independent inodes, and
+  their publication must be replayable across a crash. Atomic replacement must
+  keep the replaced file's immutable anchor intact. A mount/daemon failure
+  must make the view fail closed, never expose the private source path or
+  silently resume through it.
   Probe the mount, passthrough capability, and inaccessible lower path locally
   before guarded enrollment; lack of any required capability is an explicit
   unsupported-backend result. See the [kernel FUSE passthrough design](https://docs.kernel.org/filesystems/fuse/fuse-passthrough.html)
@@ -1190,7 +1193,11 @@ Btrfs through that constructor. The subsequent file-namespace journal writes
 rename/unlink intent before mutating a pinned lower directory and reconciles
 either side of the mutation on rebuild. Renamed and deleted entries survive
 actual FUSE remounts on ext4 and fresh local Btrfs; a replacement identity is
-rejected. Directory mutations, create and atomic replacement, remaining
+rejected. The following slice publishes newly created
+files from anonymous same-filesystem inodes after recording their identities.
+Interrupted publication reconciles across control-database reopen, and
+ordinary-user creation, rename, later writes, and FUSE remount pass on ext4
+and fresh local Btrfs. Directory mutations, atomic replacement, remaining
 metadata and allocation modes, concurrent handles, mount supervision/recovery,
 and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
@@ -3245,8 +3252,9 @@ backend gates. A command being present does not by itself close its slice.
   directory names or removal. Implement the long-lived Linux FUSE view above
   before selecting this backend for any root; include read-only passthrough,
   writable-open and shared-mapping detach, `chmod` and pathname truncate,
-  rename/unlink, and remount recovery. Never expose a raw hard link between an
-  editable worktree and an immutable anchor.
+  rename/unlink, replayable new-file creation, atomic replacement, and remount
+  recovery. Never expose a raw hard link between an editable worktree and an
+  immutable anchor.
 - Then validate the already planned native Windows NTFS capture, including VSS
   where appropriate, macOS cloning, platform watchers, portable metadata/ACL
   policy, and explicit application-consistent capture hooks. Each enrolled root

@@ -24,7 +24,8 @@ use anyhow::{Context, ensure};
 use fuser::{
     BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
+    ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL,
+    TimeOrNow,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,6 +42,7 @@ const PROBE_BYTES: &[u8] = b"mutualbackup-guarded-view-probe";
 // zero for the native 64-bit ABI.
 const KERNEL_O_LARGEFILE: i32 = 0o100000;
 const NAMESPACE_KIND: &str = "guarded-view-namespace-v1";
+const CREATE_KIND: &str = "guarded-view-create-v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NamespaceRecord {
@@ -50,6 +52,13 @@ struct NamespaceRecord {
     current: Option<Vec<u8>>,
     // Some(None) is an unlink; Some(Some(path)) is a rename.
     pending: Option<Option<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CreateIntent {
+    version: u16,
+    target: Vec<u8>,
+    expected: NativeFileId,
 }
 
 struct GuardedNamespace {
@@ -72,6 +81,100 @@ impl GuardedNamespace {
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
             .put_record(NAMESPACE_KIND, &self.record_id(inode), &bytes)
             .map_err(io::Error::other)
+    }
+
+    fn store_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
+        let inserted = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record_if_absent(CREATE_KIND, &self.record_id(inode), &bytes)
+            .map_err(io::Error::other)?;
+        if !inserted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "guarded create inode already recorded",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
+        let record = NamespaceRecord {
+            version: 1,
+            captured_path: String::new(),
+            expected: intent.expected,
+            current: Some(intent.target.clone()),
+            pending: None,
+        };
+        let bytes = mb_core::canonical_bytes(&record).map_err(io::Error::other)?;
+        let id = self.record_id(inode);
+        self.control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_records_and_delete(
+                &[(NAMESPACE_KIND.to_owned(), id.clone(), bytes)],
+                &[(CREATE_KIND.to_owned(), id)],
+            )
+            .map_err(io::Error::other)?;
+        self.records.lock().unwrap().insert(inode, record);
+        Ok(())
+    }
+
+    fn owned_records(&self, kind: &str) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+        let rows = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .records(kind)?;
+        let mut owned = Vec::new();
+        for (id, bytes) in rows {
+            if id.starts_with(self.anchor_id.as_bytes()) {
+                ensure!(id.len() == 24, "malformed guarded namespace record ID");
+                let inode = u64::from_le_bytes(id[16..24].try_into()?);
+                owned.push((inode, bytes));
+            }
+        }
+        Ok(owned)
+    }
+
+    fn reconcile_creates(
+        &self,
+        lower_root: &PinnedDirectory,
+        directories: &HashMap<PathBuf, INodeNo>,
+        first_dynamic_inode: u64,
+    ) -> anyhow::Result<()> {
+        for (inode, bytes) in self.owned_records(CREATE_KIND)? {
+            ensure!(
+                inode >= first_dynamic_inode,
+                "guarded create aliases captured inode"
+            );
+            let intent: CreateIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(intent.version == 1, "unsupported guarded create intent");
+            ensure!(
+                intent.expected.filesystem_id == lower_root.identity()?.filesystem_id,
+                "guarded create belongs to another filesystem"
+            );
+            let (path, _) = namespace_path(&intent.target, directories)?;
+            let owned = namespace_parent(lower_root, &path)?;
+            let parent = owned.as_ref().unwrap_or(lower_root);
+            let id = self.record_id(inode);
+            match parent.entry_identity(path.file_name().unwrap(), false)? {
+                Some(actual) if actual == intent.expected => {
+                    parent.sync_all()?;
+                    self.finish_create(inode, &intent)?;
+                }
+                None => {
+                    self.control
+                        .lock()
+                        .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+                        .delete_record_if_value(CREATE_KIND, &id, &bytes)?;
+                }
+                _ => anyhow::bail!("guarded create target changed before replay"),
+            }
+        }
+        Ok(())
     }
 
     fn load_or_replay(
@@ -123,7 +226,13 @@ impl GuardedNamespace {
                 match (old_identity, new_identity) {
                     (Some(old_id), None) if old_id == expected => old_parent
                         .move_child_file_no_replace(old_name, expected, new_parent, new_name)?,
-                    (None, Some(new_id)) if new_id == expected => {}
+                    (None, Some(new_id)) if new_id == expected => {
+                        // The syscall may have completed before a directory
+                        // fsync failed. Finish both durability barriers before
+                        // publishing the settled journal record.
+                        old_parent.sync_all()?;
+                        new_parent.sync_all()?;
+                    }
                     _ => anyhow::bail!("guarded rename cannot be safely replayed"),
                 }
             } else {
@@ -131,7 +240,7 @@ impl GuardedNamespace {
                     Some(old_id) if old_id == expected => {
                         old_parent.remove_child_file_if_identity(old_name, expected)?;
                     }
-                    None => {}
+                    None => old_parent.sync_all()?,
                     _ => anyhow::bail!("guarded unlink cannot be safely replayed"),
                 }
             }
@@ -252,7 +361,8 @@ struct GuardedProbeDirectory {
 /// remaining write paths are complete. The caller must keep the lower source
 /// directory inaccessible to ordinary users while this view is mounted.
 pub struct GuardedProbeView {
-    files: HashMap<u64, GuardedProbeFile>,
+    files: HashMap<u64, Arc<GuardedProbeFile>>,
+    dynamic_files: Mutex<HashMap<u64, Arc<GuardedProbeFile>>>,
     directories: HashMap<u64, GuardedProbeDirectory>,
     names: Mutex<HashMap<(u64, OsString), u64>>,
     lower_root: Option<crate::PinnedDirectory>,
@@ -262,6 +372,7 @@ pub struct GuardedProbeView {
     root_perm: u16,
     poisoned: AtomicBool,
     next_handle: AtomicU64,
+    next_inode: AtomicU64,
     denied_writable: Arc<AtomicU64>,
     backing: Mutex<HashMap<u64, ActiveBacking>>,
 }
@@ -281,9 +392,59 @@ impl GuardedProbeFile {
         attr.nlink = metadata.nlink() as u32;
         Ok(*attr)
     }
+
+    fn new_editable(
+        source: File,
+        inode: INodeNo,
+        location: ProbeLocation,
+        lower_root: &Path,
+        view_uid: u32,
+        view_gid: u32,
+    ) -> io::Result<Self> {
+        let mode = (source.metadata()?.permissions().mode() & 0o7777) as u16;
+        let expected_inode = source.metadata()?.ino();
+        let mut attr = probe_file_attr(&source, inode, mode)?;
+        attr.uid = view_uid;
+        attr.gid = view_gid;
+        let location = Arc::new(Mutex::new(Some(location)));
+        let location_for_open = Arc::clone(&location);
+        let lower_root = lower_root.to_path_buf();
+        let open_for_write: Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync> =
+            Arc::new(move |mode| {
+                let location = location_for_open
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded location lock is poisoned"))?;
+                let location = location
+                    .as_ref()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                let opened = OpenOptions::new()
+                    .read(mode == OpenAccMode::O_RDWR)
+                    .write(true)
+                    .open(lower_root.join(&location.relative_path))?;
+                if opened.metadata()?.ino() != expected_inode {
+                    return Err(io::Error::other(
+                        "created guarded file changed after opening",
+                    ));
+                }
+                Ok(opened)
+            });
+        Ok(Self {
+            source,
+            source_attr: Mutex::new(attr),
+            location,
+            open_for_write: Some(open_for_write),
+        })
+    }
 }
 
 impl GuardedProbeView {
+    fn file(&self, inode: u64) -> Option<Arc<GuardedProbeFile>> {
+        self.files
+            .get(&inode)
+            .cloned()
+            .or_else(|| self.dynamic_files.lock().unwrap().get(&inode).cloned())
+    }
+
     /// Rebuild the captured namespace and finish any interrupted file rename
     /// or unlink before serving the view.
     pub fn from_guarded_capture(
@@ -443,6 +604,54 @@ impl GuardedProbeView {
                 "duplicate guarded view entry"
             );
         }
+        let first_dynamic_inode = u64::try_from(manifest.entries.len())?
+            .checked_add(2)
+            .context("guarded view inode overflow")?;
+        namespace.reconcile_creates(&lower_root, &directory_paths, first_dynamic_inode)?;
+        let mut highest_inode = first_dynamic_inode - 1;
+        for (inode, bytes) in namespace.owned_records(NAMESPACE_KIND)? {
+            if inode < first_dynamic_inode {
+                ensure!(
+                    namespace.records.lock().unwrap().contains_key(&inode),
+                    "guarded namespace record aliases a directory"
+                );
+                continue;
+            }
+            highest_inode = highest_inode.max(inode);
+            let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                record.captured_path.is_empty()
+                    && record.expected.filesystem_id == lower_root.identity()?.filesystem_id,
+                "invalid dynamically created guarded file"
+            );
+            let location = namespace.load_or_replay(
+                inode,
+                "",
+                record.expected,
+                &lower_root,
+                &directory_paths,
+            )?;
+            let Some(location) = location else {
+                continue;
+            };
+            let owned = namespace_parent(&lower_root, &location.relative_path)?;
+            let parent = owned.as_ref().unwrap_or(&lower_root);
+            let source = parent
+                .open_child_file(location.relative_path.file_name().unwrap())?
+                .context("created guarded file disappeared")?;
+            ensure!(
+                source.metadata()?.ino() == record.expected.inode,
+                "created guarded file changed while opening"
+            );
+            files.push(GuardedProbeFile::new_editable(
+                source,
+                INodeNo(inode),
+                location,
+                plan.source_root(),
+                view_uid,
+                view_gid,
+            )?);
+        }
         let mut view = Self::with_directories(
             files,
             directories,
@@ -452,6 +661,12 @@ impl GuardedProbeView {
         );
         view.root_uid = view_uid;
         view.root_gid = view_gid;
+        view.next_inode.store(
+            highest_inode
+                .checked_add(1)
+                .context("guarded view inode overflow")?,
+            Ordering::Relaxed,
+        );
         view.namespace = Some(namespace);
         Ok(view)
     }
@@ -515,12 +730,21 @@ impl GuardedProbeView {
                 "guarded file aliases a directory inode"
             );
             assert!(
-                by_inode.insert(inode, file).is_none(),
+                by_inode.insert(inode, Arc::new(file)).is_none(),
                 "duplicate guarded view inode"
             );
         }
+        let next_inode = by_inode
+            .keys()
+            .chain(by_directory.keys())
+            .copied()
+            .max()
+            .unwrap_or(INodeNo::ROOT.0)
+            .checked_add(1)
+            .expect("guarded view inode overflow");
         Self {
             files: by_inode,
+            dynamic_files: Mutex::new(HashMap::new()),
             directories: by_directory,
             names: Mutex::new(names),
             lower_root,
@@ -530,6 +754,7 @@ impl GuardedProbeView {
             root_perm,
             poisoned: AtomicBool::new(false),
             next_handle: AtomicU64::new(1),
+            next_inode: AtomicU64::new(next_inode),
             denied_writable,
             backing: Mutex::default(),
         }
@@ -627,7 +852,7 @@ impl Filesystem for GuardedProbeView {
         };
         if let Some(directory) = self.directories.get(&inode) {
             reply.entry(&ENTRY_TTL, &directory.attr, Generation(0));
-        } else if let Some(file) = self.files.get(&inode) {
+        } else if let Some(file) = self.file(inode) {
             match file.current_attr() {
                 Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
                 Err(_) => reply.error(Errno::EIO),
@@ -701,7 +926,7 @@ impl Filesystem for GuardedProbeView {
             _ if self.directories.contains_key(&inode.0) => {
                 reply.attr(&ENTRY_TTL, &self.directories[&inode.0].attr)
             }
-            _ => match self.files.get(&inode.0) {
+            _ => match self.file(inode.0) {
                 Some(file) => match file.current_attr() {
                     Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
                     Err(_) => reply.error(Errno::EIO),
@@ -733,7 +958,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        let Some(file) = self.files.get(&inode.0) else {
+        let Some(file) = self.file(inode.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -797,7 +1022,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        let Some(file) = self.files.get(&inode.0) else {
+        let Some(file) = self.file(inode.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -864,6 +1089,162 @@ impl Filesystem for GuardedProbeView {
         reply.ok();
     }
 
+    fn create(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let Some(lower_root) = &self.lower_root else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        let Some(namespace) = &self.namespace else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        let allowed = libc::O_ACCMODE
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_TRUNC
+            | libc::O_CLOEXEC
+            | libc::O_NOCTTY
+            | KERNEL_O_LARGEFILE;
+        if flags & !allowed != 0
+            || !matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
+            || (mode & libc::S_IFMT != 0 && mode & libc::S_IFMT != libc::S_IFREG)
+        {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let name_path = Path::new(name);
+        if name.as_bytes().contains(&0)
+            || !matches!(
+                name_path.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || name_path.components().count() != 1
+        {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let mut names = self.names.lock().unwrap();
+        let parent_path = if parent == INodeNo::ROOT {
+            PathBuf::new()
+        } else if let Some(directory) = self.directories.get(&parent.0) {
+            directory.relative_path.clone()
+        } else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let key = (parent.0, name.to_os_string());
+        if names.contains_key(&key) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        let result = (|| -> io::Result<(u64, Arc<GuardedProbeFile>, BackingId, FileAttr)> {
+            let owned = if parent_path.as_os_str().is_empty() {
+                None
+            } else {
+                Some(
+                    lower_root
+                        .open_descendant_directory(&parent_path)
+                        .map_err(io::Error::other)?,
+                )
+            };
+            let lower = owned.as_ref().unwrap_or(lower_root);
+            let source = lower
+                .create_unlinked_child_file()
+                .map_err(io::Error::other)?;
+            // The private lower inode is daemon-owned; do not publish
+            // setuid/setgid bits requested through the remapped FUSE owner.
+            source.set_permissions(fs::Permissions::from_mode((mode & !umask) & 0o777))?;
+            source.sync_all()?;
+            let backing = reply.open_backing(&source)?;
+            let inode = self
+                .next_inode
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| io::Error::other("guarded view inode space is exhausted"))?;
+            let relative_path = parent_path.join(name);
+            let expected = NativeFileId {
+                filesystem_id: lower_root
+                    .identity()
+                    .map_err(io::Error::other)?
+                    .filesystem_id,
+                inode: source.metadata()?.ino(),
+            };
+            let intent = CreateIntent {
+                version: 1,
+                target: relative_path.as_os_str().as_bytes().to_vec(),
+                expected,
+            };
+            namespace.store_create(inode, &intent)?;
+            if let Err(error) = lower.publish_unlinked_child_file(&source, name, expected) {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(io::Error::other(error));
+            }
+            if let Err(error) = namespace.finish_create(inode, &intent) {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+            let file = GuardedProbeFile::new_editable(
+                source,
+                INodeNo(inode),
+                ProbeLocation {
+                    parent,
+                    relative_path,
+                },
+                &lower_root.descriptor_path(),
+                self.root_uid,
+                self.root_gid,
+            )
+            .inspect_err(|_| self.poisoned.store(true, Ordering::Release))?;
+            let attr = file
+                .current_attr()
+                .inspect_err(|_| self.poisoned.store(true, Ordering::Release))?;
+            Ok((inode, Arc::new(file), backing, attr))
+        })();
+        match result {
+            Ok((inode, file, backing, attr)) => {
+                names.insert(key, inode);
+                self.dynamic_files.lock().unwrap().insert(inode, file);
+                let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+                self.backing.lock().unwrap().insert(
+                    handle,
+                    ActiveBacking {
+                        id: backing,
+                        mode: if flags & libc::O_ACCMODE == libc::O_RDWR {
+                            OpenAccMode::O_RDWR
+                        } else {
+                            OpenAccMode::O_WRONLY
+                        },
+                        inode: INodeNo(inode),
+                    },
+                );
+                let held = self.backing.lock().unwrap();
+                reply.created_passthrough(
+                    &ENTRY_TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(handle),
+                    FopenFlags::empty(),
+                    &held[&handle].id,
+                );
+            }
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+        }
+    }
+
     fn rename(
         &self,
         _request: &Request,
@@ -895,7 +1276,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::ENOENT);
             return;
         };
-        let Some(file) = self.files.get(&inode) else {
+        let Some(file) = self.file(inode) else {
             reply.error(Errno::EISDIR);
             return;
         };
@@ -1000,7 +1381,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::ENOENT);
             return;
         };
-        let Some(file) = self.files.get(&inode) else {
+        let Some(file) = self.file(inode) else {
             reply.error(Errno::EISDIR);
             return;
         };
@@ -1074,7 +1455,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        let Some(file) = self.files.get(&inode.0) else {
+        let Some(file) = self.file(inode.0) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1289,9 +1670,111 @@ mod tests {
     };
 
     use super::{
-        FILE_INODE, GuardedNamespace, GuardedProbeFile, GuardedProbeView, NAMESPACE_KIND,
-        NamespaceRecord, ProbeLocation, probe_file_attr,
+        CREATE_KIND, CreateIntent, FILE_INODE, GuardedNamespace, GuardedProbeFile,
+        GuardedProbeView, NAMESPACE_KIND, NamespaceRecord, ProbeLocation, probe_file_attr,
     };
+
+    #[test]
+    fn create_intent_reconciles_before_and_after_publication() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([91; 32]));
+        let control_path = area.path().join("control.db");
+        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+        for (index, published) in [(2, false), (3, true)] {
+            let anchor_id = uuid::Uuid::new_v4();
+            let name = format!("new-{index}");
+            let source = root.create_unlinked_child_file().unwrap();
+            source.sync_all().unwrap();
+            let expected = crate::NativeFileId {
+                filesystem_id: root.identity().unwrap().filesystem_id,
+                inode: source.metadata().unwrap().ino(),
+            };
+            let intent = CreateIntent {
+                version: 1,
+                target: name.as_bytes().to_vec(),
+                expected,
+            };
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            journal.store_create(index, &intent).unwrap();
+            if published {
+                root.publish_unlinked_child_file(&source, &name, expected)
+                    .unwrap();
+            }
+            drop(source);
+            drop(journal);
+            drop(control);
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            journal.reconcile_creates(&root, &directories, 2).unwrap();
+            let control = control.lock().unwrap();
+            assert!(
+                control
+                    .get_record(CREATE_KIND, &journal.record_id(index))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                control
+                    .get_record(NAMESPACE_KIND, &journal.record_id(index))
+                    .unwrap()
+                    .is_some(),
+                published
+            );
+            assert_eq!(lower.join(name).exists(), published);
+        }
+    }
+
+    #[test]
+    fn create_intent_refuses_foreign_target() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let source = root.create_unlinked_child_file().unwrap();
+        let expected = crate::NativeFileId {
+            filesystem_id: root.identity().unwrap().filesystem_id,
+            inode: source.metadata().unwrap().ino(),
+        };
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([92; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+        ));
+        let journal = GuardedNamespace {
+            control,
+            anchor_id: uuid::Uuid::new_v4(),
+            records: Mutex::new(HashMap::new()),
+        };
+        journal
+            .store_create(
+                2,
+                &CreateIntent {
+                    version: 1,
+                    target: b"target".to_vec(),
+                    expected,
+                },
+            )
+            .unwrap();
+        fs::write(lower.join("target"), b"foreign").unwrap();
+        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+        assert!(journal.reconcile_creates(&root, &directories, 2).is_err());
+        assert_eq!(fs::read(lower.join("target")).unwrap(), b"foreign");
+    }
 
     #[test]
     fn namespace_journal_replays_file_move_and_unlink_on_both_sides_of_mutation() {
@@ -1334,10 +1817,9 @@ mod tests {
             drop(control);
             if completed {
                 if unlink {
-                    root.remove_child_file_if_identity(&old, expected).unwrap();
+                    fs::remove_file(lower.join(&old)).unwrap();
                 } else {
-                    root.move_child_file_no_replace(&old, expected, &root, &new)
-                        .unwrap();
+                    fs::rename(lower.join(&old), lower.join(&new)).unwrap();
                 }
             }
             let control = Arc::new(Mutex::new(
@@ -1756,6 +2238,20 @@ mod tests {
             anyhow::ensure!(list.stdout == b"alpha,beta\n");
             anyhow::ensure!(fs::read(mountpoint.join("alpha"))? == original_alpha);
             anyhow::ensure!(fs::read(mountpoint.join("beta"))? == original_beta);
+            let create = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_RDWR,0o640); os.write(fd,b'gamma-bytes'); os.fsync(fd); os.close(fd); os.rename(sys.argv[1],sys.argv[2]); fd=os.open(sys.argv[2],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("gamma"))
+                .arg(mountpoint.join("delta"))
+                .output()?;
+            anyhow::ensure!(
+                create.status.success(),
+                "guarded file creation failed: {}",
+                String::from_utf8_lossy(&create.stderr)
+            );
+            anyhow::ensure!(fs::read(lower.join("delta"))?.starts_with(b"EDIT"));
             let beta_inode = fs::metadata(lower.join("beta"))?.ino();
             let edit = Command::new("python3")
                 .uid(65534)
@@ -1845,6 +2341,7 @@ mod tests {
         let names = rebuilt.names.lock().unwrap();
         assert!(!names.contains_key(&(INodeNo::ROOT.0, "beta".into())));
         assert!(names.contains_key(&(INodeNo::ROOT.0, "moved".into())));
+        assert!(names.contains_key(&(INodeNo::ROOT.0, "delta".into())));
         assert!(!names.contains_key(&(INodeNo::ROOT.0, "alpha".into())));
         drop(names);
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
@@ -1852,6 +2349,16 @@ mod tests {
             anyhow::ensure!(!mountpoint.join("alpha").exists());
             anyhow::ensure!(!mountpoint.join("beta").exists());
             anyhow::ensure!(fs::read(mountpoint.join("moved"))?.starts_with(b"NEXT"));
+            anyhow::ensure!(fs::read(mountpoint.join("delta"))?.starts_with(b"EDIT"));
+            let edit_created = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'NEXT'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("delta"))
+                .output()?;
+            anyhow::ensure!(edit_created.status.success());
+            anyhow::ensure!(fs::read(lower.join("delta"))?.starts_with(b"NEXT"));
             let unlink = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
@@ -1860,6 +2367,14 @@ mod tests {
                 .arg(mountpoint.join("moved"))
                 .output()?;
             anyhow::ensure!(unlink.status.success());
+            let unlink_created = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.unlink(sys.argv[1])")
+                .arg(mountpoint.join("delta"))
+                .output()?;
+            anyhow::ensure!(unlink_created.status.success());
             Ok(())
         })();
         let unmounted = session.umount_and_join();
@@ -2018,6 +2533,19 @@ mod tests {
             anyhow::ensure!(fs::read(lower.join("top"))? == top_bytes);
             let top_anchor = manifest.file_locator("top".to_string())?.open()?;
             anyhow::ensure!(top_anchor.metadata()?.ino() == fs::metadata(lower.join("top"))?.ino());
+            let create = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_RDWR,0o600); os.write(fd,b'new-nested'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("nested/new"))
+                .output()?;
+            anyhow::ensure!(
+                create.status.success(),
+                "nested guarded file creation failed: {}",
+                String::from_utf8_lossy(&create.stderr)
+            );
+            anyhow::ensure!(fs::read(nested.join("new"))? == b"new-nested");
             Ok(())
         })();
         let unmounted = session.umount_and_join();
@@ -2030,6 +2558,7 @@ mod tests {
         let replayed = (|| -> anyhow::Result<()> {
             anyhow::ensure!(!mountpoint.join("nested/leaf").exists());
             anyhow::ensure!(fs::read(mountpoint.join("nested/moved"))?.starts_with(b"EDIT"));
+            anyhow::ensure!(fs::read(mountpoint.join("nested/new"))? == b"new-nested");
             anyhow::ensure!(fs::read(mountpoint.join("top"))? == top_bytes);
             Ok(())
         })();

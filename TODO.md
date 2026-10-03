@@ -129,11 +129,16 @@
   mutation. Rebuild replays an interrupted operation against the captured file
   identity, refuses a replacement identity, and restores renamed and deleted
   entries across actual FUSE remounts, including nested moves and an empty
-  root. Two nonprivileged interruption tests, 96 normal store tests, all ten
-  privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
-  Clippy pass locally. Directory mutations, create and atomic replacement,
-  remaining metadata and allocation modes, concurrent handles, mount
-  supervision/recovery, and whole-worktree enrollment remain open.
+  root. The following slice publishes new files from anonymous inodes only
+  after a durable creation intent names their native identity. Reopen either
+  discards an unpublished intent or verifies and finishes its visible file;
+  a foreign target fails closed. Ordinary-user creation in the root and a
+  nested directory, rename, writable reopen, unlink, and FUSE remount pass on
+  ext4 and fresh local Btrfs. Four nonprivileged journal regressions, 98 normal
+  store tests, all ten privileged FUSE probes on ext4 and fresh local Btrfs,
+  and strict workspace Clippy pass locally. Directory mutations and atomic
+  replacement, remaining metadata and allocation modes, concurrent handles,
+  mount supervision/recovery, and whole-worktree enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

@@ -251,6 +251,67 @@ impl PinnedDirectory {
         create_regular_file_at(&self.file, name, name)
     }
 
+    /// Prepare an unnamed, editable regular file in this filesystem. A caller
+    /// can journal its native identity before publishing a visible name.
+    pub fn create_unlinked_child_file(&self) -> Result<File, AnchorError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    /// Link a journaled unnamed file without replacing an existing name, then
+    /// sync the containing directory before acknowledging publication.
+    pub fn publish_unlinked_child_file(
+        &self,
+        file: &File,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 0
+            || native_file_id(self.filesystem_id, &metadata) != expected
+        {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        let encoded =
+            CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+        if unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                self.file.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync_all()?;
+        if self.entry_identity(name, false)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        Ok(())
+    }
+
     /// Publish a small, fully synced regular file under a new name. This is
     /// used for transient Git symlink-target bytes before reflink capture.
     pub fn publish_small_bytes_child(
