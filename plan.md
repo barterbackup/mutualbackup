@@ -1206,9 +1206,13 @@ inodes under one durable intent, publishes both namespace records together,
 and removes the displaced inode only after that publication. Replay covers
 every exchange/publication/cleanup boundary; ordinary-user replacement of a
 still-frozen file and cross-directory replacement preserve the captured
-anchors through remount on ext4 and fresh local Btrfs. Directory mutations,
-remaining metadata and allocation modes, concurrent handles, mount
-supervision/recovery, and guarded enrollment remain open.
+anchors through remount on ext4 and fresh local Btrfs. Directory creation now
+stages a same-filesystem inode in the protected anchor area, records its
+identity before worktree publication, and replays an interrupted creation
+without accepting a foreign target. Ordinary-user nested creation and remount
+pass on ext4 and fresh local Btrfs. Directory rename/removal, remaining
+metadata and allocation modes, concurrent handles, mount supervision/recovery,
+and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

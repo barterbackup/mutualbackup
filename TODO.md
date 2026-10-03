@@ -140,11 +140,16 @@
   exchange, publication, and cleanup boundary, and refuses a foreign target.
   Ordinary-user replacement of a still-frozen captured file and a
   cross-directory replacement preserve exact anchors through remount.
-  Seven nonprivileged journal regressions, 101 normal store tests, all eleven
+  Guarded `mkdir` now stages an empty directory in the protected same-filesystem
+  anchor area, records its native identity before moving it into the worktree,
+  and rebuilds the directory map after restart. Ordinary-user nested directory
+  and file creation survive FUSE remount; interruption tests cover each staging
+  and publication boundary and reject a foreign target without deleting it.
+  Nine nonprivileged journal regressions, 103 normal store tests, all eleven
   privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
-  Clippy pass locally. Directory mutations, remaining metadata and allocation
-  modes, concurrent handles, mount supervision/recovery, and whole-worktree
-  enrollment remain open.
+  Clippy pass locally. Directory rename/removal, remaining metadata and
+  allocation modes, concurrent handles, mount supervision/recovery, and
+  whole-worktree enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

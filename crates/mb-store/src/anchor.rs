@@ -1166,6 +1166,16 @@ impl StableAnchorAreaLocator {
         }
         prepare_stable_anchor_area(&source_root, &metadata)
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_guarded_staging_area(&self) -> Result<PinnedDirectory, AnchorError> {
+        let path = resolve_anchor_area(self)?;
+        let file = open_stable_anchor_area(&path, self)?;
+        Ok(PinnedDirectory {
+            file,
+            filesystem_id: self.filesystem_id,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

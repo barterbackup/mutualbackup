@@ -44,6 +44,8 @@ const KERNEL_O_LARGEFILE: i32 = 0o100000;
 const NAMESPACE_KIND: &str = "guarded-view-namespace-v1";
 const CREATE_KIND: &str = "guarded-view-create-v1";
 const REPLACE_KIND: &str = "guarded-view-replace-v1";
+const DIRECTORY_KIND: &str = "guarded-view-directory-v1";
+const DIRECTORY_CREATE_KIND: &str = "guarded-view-directory-create-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NamespaceRecord {
@@ -60,6 +62,21 @@ struct CreateIntent {
     version: u16,
     target: Vec<u8>,
     expected: NativeFileId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectoryRecord {
+    version: u16,
+    expected: NativeFileId,
+    current: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectoryCreateIntent {
+    version: u16,
+    staging_name: String,
+    target: Vec<u8>,
+    expected: Option<NativeFileId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -216,6 +233,68 @@ impl GuardedNamespace {
         Ok(())
     }
 
+    fn store_directory_create(&self, inode: u64, intent: &DirectoryCreateIntent) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
+        let inserted = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record_if_absent(DIRECTORY_CREATE_KIND, &self.record_id(inode), &bytes)
+            .map_err(io::Error::other)?;
+        if !inserted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "guarded directory inode already recorded",
+            ));
+        }
+        Ok(())
+    }
+
+    fn advance_directory_create(
+        &self,
+        inode: u64,
+        before: &DirectoryCreateIntent,
+        after: &DirectoryCreateIntent,
+    ) -> io::Result<()> {
+        let before = mb_core::canonical_bytes(before).map_err(io::Error::other)?;
+        let after = mb_core::canonical_bytes(after).map_err(io::Error::other)?;
+        self.control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .replace_record_if_value(
+                DIRECTORY_CREATE_KIND,
+                &self.record_id(inode),
+                &before,
+                &after,
+            )
+            .map_err(io::Error::other)
+    }
+
+    fn finish_directory_create(
+        &self,
+        inode: u64,
+        intent: &DirectoryCreateIntent,
+    ) -> io::Result<()> {
+        let expected = intent
+            .expected
+            .ok_or_else(|| io::Error::other("guarded directory identity was not recorded"))?;
+        let record = DirectoryRecord {
+            version: 1,
+            expected,
+            current: Some(intent.target.clone()),
+        };
+        let bytes = mb_core::canonical_bytes(&record).map_err(io::Error::other)?;
+        let id = self.record_id(inode);
+        self.control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_records_and_delete(
+                &[(DIRECTORY_KIND.to_owned(), id.clone(), bytes)],
+                &[(DIRECTORY_CREATE_KIND.to_owned(), id)],
+            )
+            .map_err(io::Error::other)
+    }
+
     fn finish_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
         let record = NamespaceRecord {
             version: 1,
@@ -291,6 +370,144 @@ impl GuardedNamespace {
             }
         }
         Ok(())
+    }
+
+    fn reconcile_directory_creates(
+        &self,
+        lower_root: &PinnedDirectory,
+        staging_area: &PinnedDirectory,
+        directories: &HashMap<PathBuf, INodeNo>,
+        first_dynamic_inode: u64,
+    ) -> anyhow::Result<()> {
+        const PREFIX: &str = ".guarded-mkdir-";
+        for (inode, bytes) in self.owned_records(DIRECTORY_CREATE_KIND)? {
+            ensure!(
+                inode >= first_dynamic_inode,
+                "guarded directory create aliases captured inode"
+            );
+            let intent: DirectoryCreateIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1
+                    && intent.staging_name.starts_with(PREFIX)
+                    && Uuid::parse_str(&intent.staging_name[PREFIX.len()..]).is_ok(),
+                "invalid guarded directory creation intent"
+            );
+            let (target, _) = namespace_path(&intent.target, directories)?;
+            let owned = namespace_parent(lower_root, &target)?;
+            let target_parent = owned.as_ref().unwrap_or(lower_root);
+            let target_name = target.file_name().unwrap();
+            let target_id = target_parent.entry_identity(target_name, true)?;
+            let stage_id = staging_area
+                .open_child_directory(&intent.staging_name)?
+                .map(|directory| directory.identity())
+                .transpose()?;
+            if let Some(expected) = intent.expected {
+                ensure!(
+                    expected.filesystem_id == lower_root.identity()?.filesystem_id,
+                    "guarded directory belongs to another filesystem"
+                );
+                match (stage_id, target_id) {
+                    (Some(actual), None) if actual == expected => {
+                        staging_area.move_child_directory_no_replace(
+                            &intent.staging_name,
+                            expected,
+                            target_parent,
+                            target_name,
+                        )?;
+                    }
+                    (None, Some(actual)) if actual == expected => {
+                        staging_area.sync_all()?;
+                        target_parent.sync_all()?;
+                    }
+                    _ => anyhow::bail!("guarded directory create cannot be safely replayed"),
+                }
+                self.finish_directory_create(inode, &intent)?;
+            } else {
+                ensure!(
+                    target_id.is_none(),
+                    "unidentified guarded directory was already published"
+                );
+                if let Some(stage_id) = stage_id {
+                    ensure!(
+                        staging_area
+                            .remove_empty_child_directory(&intent.staging_name, stage_id)?,
+                        "unidentified guarded staging directory is not empty"
+                    );
+                }
+                self.control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+                    .delete_record_if_value(
+                        DIRECTORY_CREATE_KIND,
+                        &self.record_id(inode),
+                        &bytes,
+                    )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn load_dynamic_directories(
+        &self,
+        lower_root: &PinnedDirectory,
+        directory_paths: &mut HashMap<PathBuf, INodeNo>,
+        first_dynamic_inode: u64,
+        view_uid: u32,
+        view_gid: u32,
+    ) -> anyhow::Result<(Vec<GuardedProbeDirectory>, u64)> {
+        let mut records = Vec::new();
+        let mut highest = first_dynamic_inode - 1;
+        for (inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
+            ensure!(
+                inode >= first_dynamic_inode,
+                "guarded directory aliases capture"
+            );
+            highest = highest.max(inode);
+            let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                record.version == 1
+                    && record.expected.filesystem_id == lower_root.identity()?.filesystem_id,
+                "invalid guarded directory record"
+            );
+            if let Some(path) = &record.current {
+                let path = PathBuf::from(OsString::from_vec(path.clone()));
+                records.push((inode, path, record.expected));
+            }
+        }
+        records.sort_by_key(|(_, path, _)| path.components().count());
+        let mut directories = Vec::new();
+        for (inode, path, expected) in records {
+            if directory_paths.get(&path) == Some(&INodeNo(inode)) {
+                continue;
+            }
+            let (_, parent) = namespace_path(path.as_os_str().as_bytes(), directory_paths)?;
+            let lower = lower_root.open_descendant_directory(&path)?;
+            ensure!(
+                lower.identity()? == expected,
+                "created guarded directory changed after publication"
+            );
+            let mode = (lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
+            let mut attr = probe_directory_attr(lower.as_file(), INodeNo(inode), mode)?;
+            attr.uid = view_uid;
+            attr.gid = view_gid;
+            let name = path
+                .file_name()
+                .context("created guarded directory has no name")?
+                .to_os_string();
+            ensure!(
+                directory_paths
+                    .insert(path.clone(), INodeNo(inode))
+                    .is_none(),
+                "duplicate guarded directory path"
+            );
+            directories.push(GuardedProbeDirectory {
+                attr,
+                parent,
+                name,
+                relative_path: path,
+            });
+        }
+        Ok((directories, highest))
     }
 
     fn stored_or_default(
@@ -604,6 +821,7 @@ struct ProbeLocation {
     relative_path: PathBuf,
 }
 
+#[derive(Clone)]
 struct GuardedProbeDirectory {
     attr: FileAttr,
     parent: INodeNo,
@@ -619,8 +837,10 @@ pub struct GuardedProbeView {
     files: HashMap<u64, Arc<GuardedProbeFile>>,
     dynamic_files: Mutex<HashMap<u64, Arc<GuardedProbeFile>>>,
     directories: HashMap<u64, GuardedProbeDirectory>,
+    dynamic_directories: Mutex<HashMap<u64, GuardedProbeDirectory>>,
     names: Mutex<HashMap<(u64, OsString), u64>>,
     lower_root: Option<crate::PinnedDirectory>,
+    staging_area: Option<crate::PinnedDirectory>,
     namespace: Option<GuardedNamespace>,
     root_uid: u32,
     root_gid: u32,
@@ -698,6 +918,16 @@ impl GuardedProbeView {
             .get(&inode)
             .cloned()
             .or_else(|| self.dynamic_files.lock().unwrap().get(&inode).cloned())
+    }
+
+    fn directory(&self, inode: u64) -> Option<GuardedProbeDirectory> {
+        self.directories.get(&inode).cloned().or_else(|| {
+            self.dynamic_directories
+                .lock()
+                .unwrap()
+                .get(&inode)
+                .cloned()
+        })
     }
 
     fn replace_existing_file(
@@ -862,6 +1092,33 @@ impl GuardedProbeView {
                 }
             }
         }
+        let staging_area = manifest.area.open_guarded_staging_area()?;
+        ensure!(
+            staging_area.identity()?.filesystem_id == lower_root.identity()?.filesystem_id,
+            "guarded staging area is on another filesystem"
+        );
+        let (mut dynamic_directories, existing_directory_max) = namespace
+            .load_dynamic_directories(
+                &lower_root,
+                &mut directory_paths,
+                first_dynamic_inode,
+                view_uid,
+                view_gid,
+            )?;
+        namespace.reconcile_directory_creates(
+            &lower_root,
+            &staging_area,
+            &directory_paths,
+            first_dynamic_inode,
+        )?;
+        let (replayed_directories, replayed_directory_max) = namespace.load_dynamic_directories(
+            &lower_root,
+            &mut directory_paths,
+            first_dynamic_inode,
+            view_uid,
+            view_gid,
+        )?;
+        dynamic_directories.extend(replayed_directories);
         namespace.reconcile_creates(&lower_root, &directory_paths, first_dynamic_inode)?;
         namespace.reconcile_replaces(
             &lower_root,
@@ -985,7 +1242,8 @@ impl GuardedProbeView {
                 "duplicate guarded view entry"
             );
         }
-        let mut highest_inode = first_dynamic_inode - 1;
+        directories.extend(dynamic_directories);
+        let mut highest_inode = existing_directory_max.max(replayed_directory_max);
         for (inode, bytes) in namespace.owned_records(NAMESPACE_KIND)? {
             if inode < first_dynamic_inode {
                 ensure!(
@@ -1045,6 +1303,7 @@ impl GuardedProbeView {
             Ordering::Relaxed,
         );
         view.namespace = Some(namespace);
+        view.staging_area = Some(staging_area);
         Ok(view)
     }
 
@@ -1123,8 +1382,10 @@ impl GuardedProbeView {
             files: by_inode,
             dynamic_files: Mutex::new(HashMap::new()),
             directories: by_directory,
+            dynamic_directories: Mutex::new(HashMap::new()),
             names: Mutex::new(names),
             lower_root,
+            staging_area: None,
             namespace: None,
             root_uid,
             root_gid,
@@ -1227,7 +1488,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::ENOENT);
             return;
         };
-        if let Some(directory) = self.directories.get(&inode) {
+        if let Some(directory) = self.directory(inode) {
             reply.entry(&ENTRY_TTL, &directory.attr, Generation(0));
         } else if let Some(file) = self.file(inode) {
             match file.current_attr() {
@@ -1251,14 +1512,13 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        if inode != INodeNo::ROOT && !self.directories.contains_key(&inode.0) {
+        if inode != INodeNo::ROOT && self.directory(inode.0).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
         let names = self.names.lock().unwrap();
         let parent = self
-            .directories
-            .get(&inode.0)
+            .directory(inode.0)
             .map(|directory| directory.parent)
             .unwrap_or(INodeNo::ROOT);
         let mut entries = vec![
@@ -1271,7 +1531,7 @@ impl Filesystem for GuardedProbeView {
             .collect();
         children.sort_by_key(|((_, name), _)| name);
         entries.extend(children.into_iter().map(|((_, name), child_inode)| {
-            let kind = if self.directories.contains_key(child_inode) {
+            let kind = if self.directory(*child_inode).is_some() {
                 FileType::Directory
             } else {
                 FileType::RegularFile
@@ -1300,16 +1560,19 @@ impl Filesystem for GuardedProbeView {
         }
         match inode {
             INodeNo::ROOT => reply.attr(&ENTRY_TTL, &self.root_attr()),
-            _ if self.directories.contains_key(&inode.0) => {
-                reply.attr(&ENTRY_TTL, &self.directories[&inode.0].attr)
+            _ => {
+                if let Some(directory) = self.directory(inode.0) {
+                    reply.attr(&ENTRY_TTL, &directory.attr);
+                    return;
+                }
+                match self.file(inode.0) {
+                    Some(file) => match file.current_attr() {
+                        Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+                        Err(_) => reply.error(Errno::EIO),
+                    },
+                    None => reply.error(Errno::ENOENT),
+                }
             }
-            _ => match self.file(inode.0) {
-                Some(file) => match file.current_attr() {
-                    Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
-                    Err(_) => reply.error(Errno::EIO),
-                },
-                None => reply.error(Errno::ENOENT),
-            },
         }
     }
 
@@ -1466,6 +1729,131 @@ impl Filesystem for GuardedProbeView {
         reply.ok();
     }
 
+    fn mkdir(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let (Some(lower_root), Some(staging_area), Some(namespace)) =
+            (&self.lower_root, &self.staging_area, &self.namespace)
+        else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        let name_path = Path::new(name);
+        if name.as_bytes().contains(&0)
+            || !matches!(
+                name_path.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || name_path.components().count() != 1
+            || (mode & libc::S_IFMT != 0 && mode & libc::S_IFMT != libc::S_IFDIR)
+        {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let mut names = self.names.lock().unwrap();
+        let parent_path = if parent == INodeNo::ROOT {
+            PathBuf::new()
+        } else if let Some(directory) = self.directory(parent.0) {
+            directory.relative_path
+        } else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let key = (parent.0, name.to_os_string());
+        if names.contains_key(&key) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        let inode =
+            match self
+                .next_inode
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                }) {
+                Ok(inode) => inode,
+                Err(_) => {
+                    reply.error(Errno::EOVERFLOW);
+                    return;
+                }
+            };
+        let target = parent_path.join(name);
+        let mut intent = DirectoryCreateIntent {
+            version: 1,
+            staging_name: format!(".guarded-mkdir-{}", Uuid::new_v4()),
+            target: target.as_os_str().as_bytes().to_vec(),
+            expected: None,
+        };
+        if let Err(error) = namespace.store_directory_create(inode, &intent) {
+            reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+            return;
+        }
+        let result = (|| -> io::Result<GuardedProbeDirectory> {
+            let staged = staging_area
+                .create_child_directory(&intent.staging_name)
+                .map_err(io::Error::other)?;
+            // Staging is daemon-owned, so never install setuid/setgid bits
+            // requested through the view's remapped owner.
+            staged
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode((mode & !umask) & 0o777))?;
+            staged.sync_all().map_err(io::Error::other)?;
+            staging_area.sync_all().map_err(io::Error::other)?;
+            let before = intent.clone();
+            let expected = staged.identity().map_err(io::Error::other)?;
+            intent.expected = Some(expected);
+            namespace.advance_directory_create(inode, &before, &intent)?;
+            let owned = if parent_path.as_os_str().is_empty() {
+                None
+            } else {
+                Some(
+                    lower_root
+                        .open_descendant_directory(&parent_path)
+                        .map_err(io::Error::other)?,
+                )
+            };
+            let lower_parent = owned.as_ref().unwrap_or(lower_root);
+            staging_area
+                .move_child_directory_no_replace(&intent.staging_name, expected, lower_parent, name)
+                .map_err(io::Error::other)?;
+            namespace.finish_directory_create(inode, &intent)?;
+            let actual_mode = (staged.as_file().metadata()?.permissions().mode() & 0o7777) as u16;
+            let mut attr = probe_directory_attr(staged.as_file(), INodeNo(inode), actual_mode)?;
+            attr.uid = self.root_uid;
+            attr.gid = self.root_gid;
+            Ok(GuardedProbeDirectory {
+                attr,
+                parent,
+                name: name.to_os_string(),
+                relative_path: target,
+            })
+        })();
+        match result {
+            Ok(directory) => {
+                let attr = directory.attr;
+                self.dynamic_directories
+                    .lock()
+                    .unwrap()
+                    .insert(inode, directory);
+                names.insert(key, inode);
+                reply.entry(&ENTRY_TTL, &attr, Generation(0));
+            }
+            Err(error) => {
+                self.poisoned.store(true, Ordering::Release);
+                reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+            }
+        }
+    }
+
     fn create(
         &self,
         _request: &Request,
@@ -1516,7 +1904,7 @@ impl Filesystem for GuardedProbeView {
         let mut names = self.names.lock().unwrap();
         let parent_path = if parent == INodeNo::ROOT {
             PathBuf::new()
-        } else if let Some(directory) = self.directories.get(&parent.0) {
+        } else if let Some(directory) = self.directory(parent.0) {
             directory.relative_path.clone()
         } else {
             reply.error(Errno::ENOENT);
@@ -1636,8 +2024,8 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        if (parent != INodeNo::ROOT && !self.directories.contains_key(&parent.0))
-            || (newparent != INodeNo::ROOT && !self.directories.contains_key(&newparent.0))
+        if (parent != INodeNo::ROOT && self.directory(parent.0).is_none())
+            || (newparent != INodeNo::ROOT && self.directory(newparent.0).is_none())
         {
             reply.error(Errno::ENOENT);
             return;
@@ -1693,10 +2081,9 @@ impl Filesystem for GuardedProbeView {
                 .parent()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
             let destination_relative_dir = self
-                .directories
-                .get(&newparent.0)
-                .map(|directory| directory.relative_path.as_path())
-                .unwrap_or(Path::new(""));
+                .directory(newparent.0)
+                .map(|directory| directory.relative_path)
+                .unwrap_or_default();
             let new_path = destination_relative_dir.join(newname);
             let source_owned = if source_relative_dir.as_os_str().is_empty() {
                 None
@@ -1712,7 +2099,7 @@ impl Filesystem for GuardedProbeView {
             } else {
                 Some(
                     lower_root
-                        .open_descendant_directory(destination_relative_dir)
+                        .open_descendant_directory(&destination_relative_dir)
                         .map_err(io::Error::other)?,
                 )
             };
@@ -1759,7 +2146,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        if parent != INodeNo::ROOT && !self.directories.contains_key(&parent.0) {
+        if parent != INodeNo::ROOT && self.directory(parent.0).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
@@ -2054,14 +2441,213 @@ mod tests {
 
     use crate::{
         ControlStore, GuardedFileCapturePlan, GuardedRootCapturePlan, LinkFreezeCaptureIntent,
-        LinkFreezeCapturePhase, PinnedDirectory,
+        LinkFreezeCapturePhase, PinnedDirectory, StableAnchorAreaLocator,
     };
 
     use super::{
-        CREATE_KIND, CreateIntent, FILE_INODE, GuardedNamespace, GuardedProbeFile,
-        GuardedProbeView, NAMESPACE_KIND, NamespaceRecord, ProbeLocation, REPLACE_KIND,
-        probe_file_attr,
+        CREATE_KIND, CreateIntent, DIRECTORY_CREATE_KIND, DIRECTORY_KIND, DirectoryCreateIntent,
+        DirectoryRecord, FILE_INODE, GuardedNamespace, GuardedProbeFile, GuardedProbeView,
+        NAMESPACE_KIND, NamespaceRecord, ProbeLocation, REPLACE_KIND, probe_file_attr,
     };
+
+    #[test]
+    fn directory_creation_replays_each_staging_and_publication_boundary() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let anchor_area = StableAnchorAreaLocator::prepare_for_root(&lower).unwrap();
+        let staging = anchor_area.open_guarded_staging_area().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([97; 32]));
+        let control_path = area.path().join("control.db");
+        for phase in 0..5 {
+            let anchor_id = uuid::Uuid::new_v4();
+            let name = format!("created-{phase}");
+            let stage_name = format!(".guarded-mkdir-{}", uuid::Uuid::new_v4());
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let mut intent = DirectoryCreateIntent {
+                version: 1,
+                staging_name: stage_name.clone(),
+                target: name.as_bytes().to_vec(),
+                expected: None,
+            };
+            journal.store_directory_create(2, &intent).unwrap();
+            let mut staged = None;
+            if phase >= 1 {
+                let directory = staging.create_child_directory(&stage_name).unwrap();
+                directory.sync_all().unwrap();
+                staging.sync_all().unwrap();
+                staged = Some(directory);
+            }
+            if phase >= 2 {
+                let before = intent.clone();
+                intent.expected = Some(staged.as_ref().unwrap().identity().unwrap());
+                journal
+                    .advance_directory_create(2, &before, &intent)
+                    .unwrap();
+            }
+            if phase >= 3 {
+                staging
+                    .move_child_directory_no_replace(
+                        &stage_name,
+                        intent.expected.unwrap(),
+                        &root,
+                        &name,
+                    )
+                    .unwrap();
+            }
+            if phase >= 4 {
+                journal.finish_directory_create(2, &intent).unwrap();
+            }
+            drop(staged);
+            drop(journal);
+            drop(control);
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let mut directory_paths = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+            journal
+                .reconcile_directory_creates(&root, &staging, &directory_paths, 2)
+                .unwrap();
+            let (visible, _) = journal
+                .load_dynamic_directories(&root, &mut directory_paths, 2, 65534, 65534)
+                .unwrap();
+            assert!(staging.open_child_directory(&stage_name).unwrap().is_none());
+            assert!(
+                control
+                    .lock()
+                    .unwrap()
+                    .get_record(DIRECTORY_CREATE_KIND, &journal.record_id(2))
+                    .unwrap()
+                    .is_none()
+            );
+            let published = phase >= 2;
+            assert_eq!(lower.join(&name).is_dir(), published);
+            assert_eq!(visible.len(), usize::from(published));
+            assert_eq!(
+                control
+                    .lock()
+                    .unwrap()
+                    .get_record(DIRECTORY_KIND, &journal.record_id(2))
+                    .unwrap()
+                    .is_some(),
+                published
+            );
+            if published {
+                let record: DirectoryRecord = mb_core::decode_canonical(
+                    &control
+                        .lock()
+                        .unwrap()
+                        .get_record(DIRECTORY_KIND, &journal.record_id(2))
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    record.expected,
+                    root.open_child_directory(&name)
+                        .unwrap()
+                        .unwrap()
+                        .identity()
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_creation_replay_refuses_a_foreign_target() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let anchor_area = StableAnchorAreaLocator::prepare_for_root(&lower).unwrap();
+        let staging = anchor_area.open_guarded_staging_area().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([98; 32]));
+        let control_path = area.path().join("control.db");
+        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+        for identity_recorded in [false, true] {
+            let anchor_id = uuid::Uuid::new_v4();
+            let name = format!("foreign-{identity_recorded}");
+            let stage_name = format!(".guarded-mkdir-{}", uuid::Uuid::new_v4());
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let mut intent = DirectoryCreateIntent {
+                version: 1,
+                staging_name: stage_name.clone(),
+                target: name.as_bytes().to_vec(),
+                expected: None,
+            };
+            journal.store_directory_create(2, &intent).unwrap();
+            let staged = staging.create_child_directory(&stage_name).unwrap();
+            if identity_recorded {
+                let before = intent.clone();
+                intent.expected = Some(staged.identity().unwrap());
+                journal
+                    .advance_directory_create(2, &before, &intent)
+                    .unwrap();
+            }
+            fs::create_dir(lower.join(&name)).unwrap();
+            let foreign_id = root
+                .open_child_directory(&name)
+                .unwrap()
+                .unwrap()
+                .identity()
+                .unwrap();
+            assert_ne!(Some(foreign_id), intent.expected);
+            drop(staged);
+            drop(journal);
+            drop(control);
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            assert!(
+                journal
+                    .reconcile_directory_creates(&root, &staging, &directories, 2)
+                    .is_err()
+            );
+            assert_eq!(
+                root.open_child_directory(&name)
+                    .unwrap()
+                    .unwrap()
+                    .identity()
+                    .unwrap(),
+                foreign_id
+            );
+            assert!(staging.open_child_directory(&stage_name).unwrap().is_some());
+            assert!(
+                control
+                    .lock()
+                    .unwrap()
+                    .get_record(DIRECTORY_CREATE_KIND, &journal.record_id(2))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
 
     #[test]
     fn replacement_replays_each_exchange_publication_and_cleanup_boundary() {
@@ -3272,6 +3858,21 @@ mod tests {
             let mut original_bytes = Vec::new();
             original_top.read_to_end(&mut original_bytes)?;
             anyhow::ensure!(original_bytes == top_bytes);
+            let mkdir = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.mkdir(sys.argv[1],0o755); os.mkdir(sys.argv[2],0o700); fd=os.open(sys.argv[3],os.O_CREAT|os.O_EXCL|os.O_RDWR,0o600); os.write(fd,b'dynamic-tree'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("nested/newdir"))
+                .arg(mountpoint.join("nested/newdir/child"))
+                .arg(mountpoint.join("nested/newdir/child/file"))
+                .output()?;
+            anyhow::ensure!(
+                mkdir.status.success(),
+                "guarded dynamic directory creation failed: {}",
+                String::from_utf8_lossy(&mkdir.stderr)
+            );
+            anyhow::ensure!(fs::read(nested.join("newdir/child/file"))? == b"dynamic-tree");
             Ok(())
         })();
         let unmounted = session.umount_and_join();
@@ -3286,6 +3887,9 @@ mod tests {
             anyhow::ensure!(fs::read(mountpoint.join("nested/moved"))?.starts_with(b"EDIT"));
             anyhow::ensure!(!mountpoint.join("nested/new").exists());
             anyhow::ensure!(fs::read(mountpoint.join("top"))? == b"new-nested");
+            anyhow::ensure!(
+                fs::read(mountpoint.join("nested/newdir/child/file"))? == b"dynamic-tree"
+            );
             Ok(())
         })();
         let unmounted = session.umount_and_join();
