@@ -1680,6 +1680,30 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    /// A process can retain a directory descriptor from before a guarded
+    /// transition. Keep every visible lower directory outside the view
+    /// owner's control, even when the private root path is now inaccessible.
+    pub(crate) fn verify_private_lower_ownership(&self) -> anyhow::Result<()> {
+        let lower_root = self
+            .lower_root
+            .as_ref()
+            .context("guarded view has no private lower root")?;
+        let dynamic = self.dynamic_directories.lock().unwrap();
+        for directory in self.directories.values().chain(dynamic.values()) {
+            let pinned = lower_root.open_descendant_directory(&directory.relative_path)?;
+            ensure!(
+                pinned.identity()? == directory.native_id,
+                "guarded private directory changed before mounting"
+            );
+            let metadata = pinned.as_file().metadata()?;
+            ensure!(
+                metadata.uid() != self.root_uid && metadata.permissions().mode() & 0o022 == 0,
+                "guarded private directory remains writable by the view owner"
+            );
+        }
+        Ok(())
+    }
+
     fn file(&self, inode: u64) -> Option<Arc<GuardedProbeFile>> {
         self.files
             .get(&inode)
@@ -2078,7 +2102,12 @@ impl GuardedProbeView {
                         *native_id == expected,
                         "guarded file identity differs from plan"
                     );
-                    let _anchor = manifest.file_locator(path.clone())?.open()?;
+                    let anchor = manifest.file_locator(path.clone())?.open()?;
+                    let metadata = anchor.metadata()?;
+                    ensure!(
+                        metadata.uid() != view_uid && metadata.permissions().mode() & 0o022 == 0,
+                        "guarded anchor remains writable by the view owner"
+                    );
                     defaults.insert(
                         u64::try_from(index)? + 2,
                         NamespaceRecord {

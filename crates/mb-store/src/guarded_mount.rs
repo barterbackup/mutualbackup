@@ -272,7 +272,19 @@ impl GuardedViewMount {
                 claim.mountpoint_id == placeholder_id,
                 "guarded mountpoint changed after the original mount"
             );
-        } else {
+        }
+        // Build and validate the complete view before publishing a new mount
+        // claim. A user-owned frozen anchor can be changed through a descriptor
+        // retained before the private lower path was hidden: fchmod restores
+        // write permission, then /proc/self/fd reopens the same inode.
+        let view = GuardedProbeView::from_guarded_capture(
+            manifest,
+            Arc::clone(&control),
+            view_uid,
+            view_gid,
+        )?;
+        view.verify_private_lower_ownership()?;
+        if existing.is_none() {
             let claim = MountClaim {
                 version: 1,
                 anchor_id: manifest.anchor_id,
@@ -305,12 +317,6 @@ impl GuardedViewMount {
                 "guarded mount claim changed concurrently"
             );
         }
-        let view = GuardedProbeView::from_guarded_capture(
-            manifest,
-            Arc::clone(&control),
-            view_uid,
-            view_gid,
-        )?;
         let mut config = Config::default();
         config.acl = SessionACL::All;
         config.mount_options = vec![
@@ -489,6 +495,74 @@ mod tests {
         let path = decode_mountinfo_path("/one\\040two/odd\\377").unwrap();
         assert_eq!(path.as_os_str().as_bytes(), b"/one two/odd\xff");
         assert!(decode_mountinfo_path("/broken\\08").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN and fanotify permission events"]
+    fn guarded_mount_refuses_mutable_private_lower_inodes() {
+        for unsafe_case in ["file-owner", "directory-owner", "directory-group-write"] {
+            let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+                Some(root) => tempfile::Builder::new()
+                    .prefix("mb-guarded-owner-")
+                    .tempdir_in(root)
+                    .unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let lower = area.path().join("lower");
+            let mountpoint = area.path().join("view");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(&mountpoint).unwrap();
+            fs::create_dir(lower.join("nested")).unwrap();
+            fs::write(lower.join("sample"), b"frozen bytes").unwrap();
+            fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+            if unsafe_case == "directory-group-write" {
+                fs::set_permissions(lower.join("nested"), fs::Permissions::from_mode(0o775))
+                    .unwrap();
+            } else {
+                let owned = lower.join(if unsafe_case == "file-owner" {
+                    "sample"
+                } else {
+                    "nested"
+                });
+                let path = CString::new(owned.as_os_str().as_bytes()).unwrap();
+                // SAFETY: this test owns the NUL-free disposable lower path.
+                assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, 65534) }, 0);
+            }
+
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([112; 32]));
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+            ));
+            let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+            let manifest = plan.capture(&control.lock().unwrap()).unwrap();
+            let error = match GuardedViewMount::start(
+                &manifest,
+                Arc::clone(&control),
+                &mountpoint,
+                65534,
+                65534,
+            ) {
+                Ok(mount) => {
+                    mount.stop().unwrap();
+                    panic!("mutable private lower {unsafe_case} was mounted")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("guarded") && error.to_string().contains("view owner"),
+                "{error:#}"
+            );
+            assert!(
+                control
+                    .lock()
+                    .unwrap()
+                    .get_record(MOUNT_CLAIM_KIND, manifest.anchor_id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            plan.discard_unreferenced(&control.lock().unwrap()).unwrap();
+        }
     }
 
     #[test]

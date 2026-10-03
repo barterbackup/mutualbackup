@@ -1467,6 +1467,17 @@ probe passes on ext4 and fresh local Btrfs: clean startup recovery, detection
 of an externally detached view, a second restart, ordinary-user edit, and
 claim retirement. This supplies daemon ownership for existing claims; guarded
 root enrollment and seed-only mutable-view recovery remain unimplemented.
+An ordinary-user pre-opened descriptor can still bypass a private lower path
+if a frozen inode remains user-owned: `fchmod` can restore write permission,
+and `/proc/self/fd` can reopen the same hard-link anchor writable. The mount
+wrapper now rejects view-owned frozen anchors and lower child directories that
+remain view-owned or group/other-writable before publishing a new claim.
+The refusal probe, all 18 privileged guarded-view probes, and daemon-owned
+mount restart pass on ext4 and fresh local Btrfs; normal store tests and strict
+workspace Clippy pass.
+Guarded enrollment therefore still needs durable private-inode ownership and
+mode isolation plus virtualized, protected metadata before ordinary user-owned
+source trees are admissible.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
@@ -3567,6 +3578,14 @@ backend gates. A command being present does not by itself close its slice.
   long-lived edit guard, prove that ordinary reads do not trigger eager detach
   while every write path remains blocked until a private anchor is durable,
   including after owner `chmod`, pathname truncate, and a daemon restart.
+  A pre-opened read-only descriptor to a user-owned lower inode can call
+  `fchmod` and reopen `/proc/self/fd` for writing after the short capture guard
+  ends; hiding the lower pathname is insufficient. Before enrollment, make
+  all lower inodes inaccessible to that owner through retained descriptors,
+  including directories and new files, while preserving user-visible modes
+  and ownership in protected virtual metadata. Prove the anchor remains exact
+  through pre-opened file and directory descriptors, permission changes,
+  writable reopen attempts, edit detach, crash, and remount.
   Linux `FAN_PRE_ACCESS` reports both read and write access with a byte range;
   that event alone does not identify an edit. Keep enrollment gated until the
   full access decision and failure behavior pass a privileged local probe.

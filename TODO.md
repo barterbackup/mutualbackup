@@ -470,6 +470,19 @@
   ordinary-user edit, and claim retirement on ext4 and fresh local Btrfs.
   Guarded root enrollment and seed-only recovery of mutable view state still
   need their own implementation and acceptance gate.
+  A disposable local pre-opened-descriptor probe exposed an enrollment
+  escape: a view-owned frozen file can be `fchmod`ed through a retained
+  read-only descriptor, then reopened writable through `/proc/self/fd`,
+  changing its hard-link anchor even when the lower root is private `0700`.
+  The mount wrapper now refuses such frozen anchors and refuses lower child
+  directories owned by the view user or writable by group/others before it
+  records a new claim. A privileged regression covers the refusal. Enrollment
+  still needs durable lower-inode ownership/mode isolation, virtual metadata
+  with signed recovery, and an end-to-end pre-opened-handle probe before it can
+  admit ordinary user-owned trees. The refusal regression, all 18 privileged
+  guarded-view probes, and the node mount-restart probe pass on ext4 and fresh
+  local Btrfs; 115 normal store tests, formatting, and strict workspace Clippy
+  pass.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
