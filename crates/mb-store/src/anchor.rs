@@ -702,6 +702,31 @@ impl PinnedDirectory {
         }
     }
 
+    /// Check an identity-bound child without consuming it. Callers must still
+    /// handle a nonempty result from the later removal if its contents change.
+    pub fn child_directory_is_empty(
+        &self,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+    ) -> Result<bool, AnchorError> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let child = self
+            .open_child_directory(name)?
+            .ok_or(AnchorError::PinnedFileChanged)?;
+        if child.identity()? != expected {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        let empty = fs::read_dir(child.descriptor_path())?
+            .next()
+            .transpose()?
+            .is_none();
+        if self.entry_identity(name, true)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        Ok(empty)
+    }
+
     pub fn rename_child_no_replace(
         &self,
         source: impl AsRef<Path>,
@@ -760,6 +785,33 @@ impl PinnedDirectory {
         }
         self.sync_all()?;
         destination_parent.sync_all()
+    }
+
+    /// Exchange two identity-bound directories. The caller journals both
+    /// identities and removes the displaced empty directory after the swap.
+    pub fn exchange_child_directories(
+        &self,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+        other_parent: &Self,
+        other_name: impl AsRef<Path>,
+        other_expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        let name = name.as_ref();
+        let other_name = other_name.as_ref();
+        if self.entry_identity(name, true)? != Some(expected)
+            || other_parent.entry_identity(other_name, true)? != Some(other_expected)
+        {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        exchange_at(&self.file, name, &other_parent.file, other_name)?;
+        if self.entry_identity(name, true)? != Some(other_expected)
+            || other_parent.entry_identity(other_name, true)? != Some(expected)
+        {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        self.sync_all()?;
+        other_parent.sync_all()
     }
 
     /// Atomically exchange two verified regular-file names. This keeps the
@@ -905,6 +957,14 @@ impl PinnedDirectory {
         Err(unsupported_pinned_directory())
     }
 
+    pub fn child_directory_is_empty(
+        &self,
+        _name: impl AsRef<Path>,
+        _expected: NativeFileId,
+    ) -> Result<bool, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
     pub fn create_child_file(&self, _name: impl AsRef<Path>) -> Result<File, AnchorError> {
         Err(unsupported_pinned_directory())
     }
@@ -1032,6 +1092,17 @@ impl PinnedDirectory {
     }
 
     pub fn exchange_child_files(
+        &self,
+        _name: impl AsRef<Path>,
+        _expected: NativeFileId,
+        _other_parent: &Self,
+        _other_name: impl AsRef<Path>,
+        _other_expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn exchange_child_directories(
         &self,
         _name: impl AsRef<Path>,
         _expected: NativeFileId,
@@ -4887,6 +4958,58 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_directory_exchange_preserves_identities_and_requires_empty_target() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("source")).unwrap();
+        fs::create_dir(temp.path().join("target")).unwrap();
+        fs::write(temp.path().join("source/file"), b"payload").unwrap();
+        let root = PinnedDirectory::open(temp.path()).unwrap();
+        let source_id = root
+            .open_child_directory("source")
+            .unwrap()
+            .unwrap()
+            .identity()
+            .unwrap();
+        let target_id = root
+            .open_child_directory("target")
+            .unwrap()
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert!(!root.child_directory_is_empty("source", source_id).unwrap());
+        assert!(root.child_directory_is_empty("target", target_id).unwrap());
+        assert!(
+            root.exchange_child_directories("source", target_id, &root, "target", source_id)
+                .is_err()
+        );
+        assert_eq!(
+            root.entry_identity("source", true).unwrap(),
+            Some(source_id)
+        );
+        root.exchange_child_directories("source", source_id, &root, "target", target_id)
+            .unwrap();
+        assert_eq!(
+            root.entry_identity("source", true).unwrap(),
+            Some(target_id)
+        );
+        assert_eq!(
+            root.entry_identity("target", true).unwrap(),
+            Some(source_id)
+        );
+        assert_eq!(
+            fs::read(temp.path().join("target/file")).unwrap(),
+            b"payload"
+        );
+        assert!(root.child_directory_is_empty("source", target_id).unwrap());
+        assert!(
+            root.remove_empty_child_directory("source", target_id)
+                .unwrap()
+        );
+        assert_eq!(root.entry_identity("source", true).unwrap(), None);
     }
 
     #[cfg(target_os = "linux")]

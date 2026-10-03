@@ -1237,15 +1237,23 @@ rejects a foreign target. Ordinary-user FUSE probes move a populated captured
 subtree beneath a dynamic parent, edit without changing its anchor, then move
 captured and dynamic subtrees again across remounts. The 109 normal store tests,
 12 privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
-Clippy pass. Replacement of an occupied directory, remaining metadata and
-allocation modes, concurrent handles, mount supervision/recovery, and guarded
-enrollment remain open. Guarded-view rebuild now retains a captured file's
+Clippy pass. Remaining metadata and allocation modes, concurrent handles,
+mount supervision/recovery, and guarded enrollment remain open. Guarded-view
+rebuild now retains a captured file's
 owner `chmod`: while its lower inode is frozen the view advertises its
 capture-time mode; after the edit journal proves that inode independently
 editable, the lower inode's durable mode is authoritative. A nested-file
 ordinary-user probe checks the initial frozen visible mode and a later `0640`
 mode after remount on ext4 and fresh local Btrfs. Formatting, 109 normal store
 tests, all 12 privileged probes, and strict workspace Clippy pass.
+Replacing an existing empty directory now records both native identities,
+atomically exchanges their names, removes the displaced empty inode, and
+publishes descendant paths and the target tombstone together. Replay handles
+every exchange and cleanup boundary and rejects nonempty or foreign targets.
+An ordinary-user FUSE probe checks refusal of a nonempty target, replacement
+of an empty dynamic target with a populated captured subtree, and remount.
+The 112 normal store tests, all 12 privileged probes on ext4 and fresh local
+Btrfs, formatting, and strict workspace Clippy pass on this slice.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

@@ -175,15 +175,24 @@
   without changing the anchor, then rename the captured and dynamic subtrees
   again across remounts. The 109 normal store tests, 12 privileged FUSE probes
   on ext4 and fresh local Btrfs, and strict workspace Clippy pass. Directory
-  replacement onto an occupied target, remaining metadata and allocation
-  modes, concurrent handles, mount supervision/recovery, and whole-worktree
-  enrollment remain open. Captured-file owner `chmod` now survives guarded-view
+  remaining metadata and allocation modes, concurrent handles, mount
+  supervision/recovery, and whole-worktree enrollment remain open.
+  Captured-file owner `chmod` now survives guarded-view
   remount: rebuild advertises the original mode while the lower inode is
   guard-frozen, then uses the lower mode only after the durable edit journal
   proves that inode independently editable. A nested-file probe checks the
   frozen visible mode and the later `0640` mode across remount on ext4 and
   fresh local Btrfs. The 109 normal store tests, all 12 privileged probes,
   formatting, and strict workspace Clippy pass on this correction.
+  Empty-target directory replacement now journals both native identities,
+  exchanges the directory names, removes the displaced empty target, and
+  atomically publishes descendant paths with a target tombstone. Replay
+  covers intent, exchange, cleanup, and publication boundaries; nonempty or
+  foreign targets fail closed. An ordinary-user FUSE probe rejects a nonempty
+  target, replaces an empty dynamic directory with a populated captured tree,
+  and rebuilds it after remount. The 112 normal store tests, all 12 privileged
+  FUSE probes on ext4 and fresh local Btrfs, formatting, and strict workspace
+  Clippy pass on this slice.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

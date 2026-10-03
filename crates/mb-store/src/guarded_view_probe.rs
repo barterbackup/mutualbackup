@@ -48,6 +48,7 @@ const DIRECTORY_KIND: &str = "guarded-view-directory-v1";
 const DIRECTORY_CREATE_KIND: &str = "guarded-view-directory-create-v1";
 const DIRECTORY_REMOVE_KIND: &str = "guarded-view-directory-remove-v1";
 const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
+const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NamespaceRecord {
@@ -96,9 +97,24 @@ struct DirectoryRenameIntent {
     expected: NativeFileId,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectoryReplaceIntent {
+    version: u16,
+    move_intent: DirectoryRenameIntent,
+    target_inode: u64,
+    target_expected: NativeFileId,
+}
+
 // Captured directories keep their capture-time identity and mode even after a
 // namespace move. The current path is stored separately in DirectoryRecord.
 type CapturedDirectories = HashMap<u64, (Vec<u8>, NativeFileId, u16)>;
+
+struct DirectoryMoveContext<'a> {
+    lower_root: &'a PinnedDirectory,
+    captured: &'a CapturedDirectories,
+    defaults: &'a HashMap<u64, NamespaceRecord>,
+    first_dynamic_inode: u64,
+}
 
 struct GuardedDirectoryIndex {
     paths: HashMap<PathBuf, INodeNo>,
@@ -413,6 +429,27 @@ impl GuardedNamespace {
         Ok(())
     }
 
+    fn store_directory_replace(
+        &self,
+        inode: u64,
+        intent: &DirectoryReplaceIntent,
+    ) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
+        let inserted = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record_if_absent(DIRECTORY_REPLACE_KIND, &self.record_id(inode), &bytes)
+            .map_err(io::Error::other)?;
+        if !inserted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "guarded directory replacement is already pending",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_directory_rename_source(
         &self,
         inode: u64,
@@ -450,15 +487,21 @@ impl GuardedNamespace {
         Ok(())
     }
 
-    fn finish_directory_rename(
+    fn finish_directory_move(
         &self,
-        lower_root: &PinnedDirectory,
-        captured: &CapturedDirectories,
-        defaults: &HashMap<u64, NamespaceRecord>,
-        first_dynamic_inode: u64,
+        context: DirectoryMoveContext<'_>,
         inode: u64,
         intent: &DirectoryRenameIntent,
+        replaced: Option<(u64, NativeFileId)>,
+        intent_kind: &str,
+        intent_bytes: &[u8],
     ) -> anyhow::Result<Vec<(u64, NamespaceRecord)>> {
+        let DirectoryMoveContext {
+            lower_root,
+            captured,
+            defaults,
+            first_dynamic_inode,
+        } = context;
         ensure!(
             intent.version == 1,
             "unsupported guarded directory rename intent"
@@ -469,9 +512,27 @@ impl GuardedNamespace {
             source != target && !target.starts_with(&source),
             "invalid guarded directory rename paths"
         );
+        if replaced.is_some() {
+            ensure!(
+                !source.starts_with(&target),
+                "guarded directory replacement target contains its source"
+            );
+        }
         ensure!(
             intent.expected.filesystem_id == lower_root.identity()?.filesystem_id,
             "guarded directory rename belongs to another filesystem"
+        );
+        let old_owned = namespace_parent(lower_root, &source)?;
+        let new_owned = namespace_parent(lower_root, &target)?;
+        let old_parent = old_owned.as_ref().unwrap_or(lower_root);
+        let new_parent = new_owned.as_ref().unwrap_or(lower_root);
+        ensure!(
+            old_parent
+                .entry_identity(source.file_name().unwrap(), true)?
+                .is_none()
+                && new_parent.entry_identity(target.file_name().unwrap(), true)?
+                    == Some(intent.expected),
+            "guarded directory move has not finished in the lower namespace"
         );
         let mut directories = HashMap::new();
         for (&captured_inode, (path, expected, _)) in captured {
@@ -505,6 +566,17 @@ impl GuardedNamespace {
                 && root_record.expected == intent.expected,
             "guarded directory rename differs from source record"
         );
+        if let Some((target_inode, target_expected)) = replaced {
+            ensure!(target_inode != inode, "guarded directory replaces itself");
+            let record = directories
+                .get(&target_inode)
+                .context("guarded directory replacement has no target record")?;
+            ensure!(
+                record.current.as_deref() == Some(intent.target.as_slice())
+                    && record.expected == target_expected,
+                "guarded directory replacement differs from target record"
+            );
+        }
 
         let mut files = defaults.clone();
         for (stored_inode, bytes) in self.owned_records(NAMESPACE_KIND)? {
@@ -535,6 +607,15 @@ impl GuardedNamespace {
             let Some(current) = &record.current else {
                 continue;
             };
+            if replaced.is_some_and(|(target_inode, _)| target_inode == entry_inode) {
+                record.current = None;
+                writes.push((
+                    DIRECTORY_KIND.to_owned(),
+                    self.record_id(entry_inode),
+                    mb_core::canonical_bytes(&record)?,
+                ));
+                continue;
+            }
             let before = checked_namespace_relative_path(current)?;
             let after = rebased_namespace_path(&before, &source, &target);
             ensure!(
@@ -586,17 +667,66 @@ impl GuardedNamespace {
                 changed_files.push((entry_inode, record));
             }
         }
-        let bytes = mb_core::canonical_bytes(intent)?;
         self.control
             .lock()
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
             .put_records_and_retire_if_value(
                 &writes,
-                DIRECTORY_RENAME_KIND,
+                intent_kind,
                 &self.record_id(inode),
-                &bytes,
+                intent_bytes,
             )?;
         Ok(changed_files)
+    }
+
+    fn finish_directory_rename(
+        &self,
+        lower_root: &PinnedDirectory,
+        captured: &CapturedDirectories,
+        defaults: &HashMap<u64, NamespaceRecord>,
+        first_dynamic_inode: u64,
+        inode: u64,
+        intent: &DirectoryRenameIntent,
+    ) -> anyhow::Result<Vec<(u64, NamespaceRecord)>> {
+        let bytes = mb_core::canonical_bytes(intent)?;
+        self.finish_directory_move(
+            DirectoryMoveContext {
+                lower_root,
+                captured,
+                defaults,
+                first_dynamic_inode,
+            },
+            inode,
+            intent,
+            None,
+            DIRECTORY_RENAME_KIND,
+            &bytes,
+        )
+    }
+
+    fn finish_directory_replace(
+        &self,
+        lower_root: &PinnedDirectory,
+        captured: &CapturedDirectories,
+        defaults: &HashMap<u64, NamespaceRecord>,
+        first_dynamic_inode: u64,
+        source_inode: u64,
+        intent: &DirectoryReplaceIntent,
+    ) -> anyhow::Result<Vec<(u64, NamespaceRecord)>> {
+        let bytes = mb_core::canonical_bytes(intent)?;
+        self.finish_directory_move(
+            DirectoryMoveContext {
+                lower_root,
+                captured,
+                defaults,
+                first_dynamic_inode,
+            },
+            source_inode,
+            &intent.move_intent,
+            Some((intent.target_inode, intent.target_expected)),
+            DIRECTORY_REPLACE_KIND,
+            &bytes,
+        )
     }
 
     fn finish_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
@@ -854,6 +984,110 @@ impl GuardedNamespace {
                 defaults,
                 first_dynamic_inode,
                 inode,
+                &intent,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_directory_replaces(
+        &self,
+        lower_root: &PinnedDirectory,
+        captured: &CapturedDirectories,
+        defaults: &HashMap<u64, NamespaceRecord>,
+        first_dynamic_inode: u64,
+    ) -> anyhow::Result<()> {
+        let pending = self.owned_records(DIRECTORY_REPLACE_KIND)?;
+        ensure!(
+            pending.len() <= 1,
+            "multiple guarded directory replacements are pending"
+        );
+        ensure!(
+            pending.is_empty() || self.owned_records(DIRECTORY_RENAME_KIND)?.is_empty(),
+            "guarded directory moves overlap"
+        );
+        for (source_inode, bytes) in pending {
+            let intent: DirectoryReplaceIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1
+                    && intent.move_intent.version == 1
+                    && source_inode != intent.target_inode
+                    && intent.move_intent.expected != intent.target_expected
+                    && intent.target_expected.filesystem_id == lower_root.identity()?.filesystem_id,
+                "invalid guarded directory replacement intent"
+            );
+            self.validate_directory_rename_source(
+                source_inode,
+                &intent.move_intent,
+                captured,
+                first_dynamic_inode,
+            )?;
+            let target_record = DirectoryRenameIntent {
+                version: 1,
+                source: intent.move_intent.target.clone(),
+                target: intent.move_intent.source.clone(),
+                expected: intent.target_expected,
+            };
+            self.validate_directory_rename_source(
+                intent.target_inode,
+                &target_record,
+                captured,
+                first_dynamic_inode,
+            )?;
+            let source = checked_namespace_relative_path(&intent.move_intent.source)?;
+            let target = checked_namespace_relative_path(&intent.move_intent.target)?;
+            ensure!(
+                source != target && !source.starts_with(&target) && !target.starts_with(&source),
+                "invalid guarded directory replacement paths"
+            );
+            let old_owned = namespace_parent(lower_root, &source)?;
+            let new_owned = namespace_parent(lower_root, &target)?;
+            let old_parent = old_owned.as_ref().unwrap_or(lower_root);
+            let new_parent = new_owned.as_ref().unwrap_or(lower_root);
+            let old_name = source.file_name().unwrap();
+            let new_name = target.file_name().unwrap();
+            let old_id = old_parent.entry_identity(old_name, true)?;
+            let new_id = new_parent.entry_identity(new_name, true)?;
+            match (old_id, new_id) {
+                (Some(old), Some(new))
+                    if old == intent.move_intent.expected && new == intent.target_expected =>
+                {
+                    ensure!(
+                        new_parent.child_directory_is_empty(new_name, intent.target_expected)?,
+                        "guarded directory replacement target is not empty"
+                    );
+                    old_parent.exchange_child_directories(
+                        old_name,
+                        intent.move_intent.expected,
+                        new_parent,
+                        new_name,
+                        intent.target_expected,
+                    )?;
+                }
+                (Some(old), Some(new))
+                    if old == intent.target_expected && new == intent.move_intent.expected =>
+                {
+                    old_parent.sync_all()?;
+                    new_parent.sync_all()?;
+                }
+                (None, Some(new)) if new == intent.move_intent.expected => {
+                    old_parent.sync_all()?;
+                    new_parent.sync_all()?;
+                }
+                _ => anyhow::bail!("guarded directory replacement cannot be safely replayed"),
+            }
+            if old_parent.entry_identity(old_name, true)? == Some(intent.target_expected) {
+                ensure!(
+                    old_parent.remove_empty_child_directory(old_name, intent.target_expected)?,
+                    "displaced guarded directory is not empty"
+                );
+            }
+            self.finish_directory_replace(
+                lower_root,
+                captured,
+                defaults,
+                first_dynamic_inode,
+                source_inode,
                 &intent,
             )?;
         }
@@ -1416,6 +1650,7 @@ impl GuardedProbeView {
         inode: u64,
         old_key: &(u64, OsString),
         new_key: &(u64, OsString),
+        replaced: Option<(u64, GuardedProbeDirectory)>,
         names: &mut HashMap<(u64, OsString), u64>,
     ) -> io::Result<()> {
         let lower_root = self
@@ -1451,7 +1686,7 @@ impl GuardedProbeView {
         };
         let target = new_parent_path.join(&new_key.1);
         let source = directory.relative_path.clone();
-        if target.starts_with(&source) {
+        if target.starts_with(&source) || replaced.is_some() && source.starts_with(&target) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         checked_namespace_relative_path(target.as_os_str().as_bytes()).map_err(io::Error::other)?;
@@ -1469,6 +1704,31 @@ impl GuardedProbeView {
                 self.first_dynamic_inode,
             )
             .map_err(io::Error::other)?;
+        if let Some((target_inode, target_directory)) = &replaced {
+            if *target_inode == inode
+                || target_directory.parent.0 != new_key.0
+                || target_directory.name != new_key.1
+                || target_directory.relative_path != target
+                || target_directory.native_id == directory.native_id
+                || names.keys().any(|(parent, _)| *parent == *target_inode)
+            {
+                return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+            }
+            let target_record = DirectoryRenameIntent {
+                version: 1,
+                source: intent.target.clone(),
+                target: intent.source.clone(),
+                expected: target_directory.native_id,
+            };
+            namespace
+                .validate_directory_rename_source(
+                    *target_inode,
+                    &target_record,
+                    &self.captured_directories,
+                    self.first_dynamic_inode,
+                )
+                .map_err(io::Error::other)?;
+        }
         // Keep writable opens from observing a moved lower path before its
         // durable namespace records and in-memory locations are updated.
         let mut files: Vec<_> = self
@@ -1511,26 +1771,73 @@ impl GuardedProbeView {
         let new_owned = namespace_parent(lower_root, &target).map_err(io::Error::other)?;
         let old_parent = old_owned.as_ref().unwrap_or(lower_root);
         let new_parent = new_owned.as_ref().unwrap_or(lower_root);
-        namespace.store_directory_rename(inode, &intent)?;
+        let replace_intent =
+            replaced
+                .as_ref()
+                .map(|(target_inode, entry)| DirectoryReplaceIntent {
+                    version: 1,
+                    move_intent: intent.clone(),
+                    target_inode: *target_inode,
+                    target_expected: entry.native_id,
+                });
+        if let Some(replace) = &replace_intent {
+            if !new_parent
+                .child_directory_is_empty(&new_key.1, replace.target_expected)
+                .map_err(io::Error::other)?
+            {
+                return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+            }
+            namespace.store_directory_replace(inode, replace)?;
+        } else {
+            namespace.store_directory_rename(inode, &intent)?;
+        }
         let result = (|| -> io::Result<()> {
-            old_parent
-                .move_child_directory_no_replace(
-                    &old_key.1,
-                    directory.native_id,
-                    new_parent,
-                    &new_key.1,
-                )
-                .map_err(io::Error::other)?;
-            let changed_files = namespace
-                .finish_directory_rename(
-                    lower_root,
-                    &self.captured_directories,
-                    &self.file_defaults,
-                    self.first_dynamic_inode,
-                    inode,
-                    &intent,
-                )
-                .map_err(io::Error::other)?;
+            let changed_files = if let Some(replace) = &replace_intent {
+                old_parent
+                    .exchange_child_directories(
+                        &old_key.1,
+                        directory.native_id,
+                        new_parent,
+                        &new_key.1,
+                        replace.target_expected,
+                    )
+                    .map_err(io::Error::other)?;
+                if !old_parent
+                    .remove_empty_child_directory(&old_key.1, replace.target_expected)
+                    .map_err(io::Error::other)?
+                {
+                    return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+                }
+                namespace
+                    .finish_directory_replace(
+                        lower_root,
+                        &self.captured_directories,
+                        &self.file_defaults,
+                        self.first_dynamic_inode,
+                        inode,
+                        replace,
+                    )
+                    .map_err(io::Error::other)?
+            } else {
+                old_parent
+                    .move_child_directory_no_replace(
+                        &old_key.1,
+                        directory.native_id,
+                        new_parent,
+                        &new_key.1,
+                    )
+                    .map_err(io::Error::other)?;
+                namespace
+                    .finish_directory_rename(
+                        lower_root,
+                        &self.captured_directories,
+                        &self.file_defaults,
+                        self.first_dynamic_inode,
+                        inode,
+                        &intent,
+                    )
+                    .map_err(io::Error::other)?
+            };
             for (file_inode, record) in &changed_files {
                 let (_, location) = locations
                     .iter_mut()
@@ -1541,6 +1848,16 @@ impl GuardedProbeView {
                     .ok_or_else(|| io::Error::other("renamed guarded file has no location"))?;
                 current.relative_path =
                     PathBuf::from(OsString::from_vec(record.current.clone().unwrap()));
+            }
+            if let Some((target_inode, _)) = &replaced {
+                self.removed_directories
+                    .lock()
+                    .unwrap()
+                    .insert(*target_inode);
+                self.dynamic_directories
+                    .lock()
+                    .unwrap()
+                    .remove(target_inode);
             }
             self.dynamic_directories
                 .lock()
@@ -1729,6 +2046,12 @@ impl GuardedProbeView {
             staging_area.identity()?.filesystem_id == lower_root.identity()?.filesystem_id,
             "guarded staging area is on another filesystem"
         );
+        namespace.reconcile_directory_replaces(
+            &lower_root,
+            &captured_directories,
+            &defaults,
+            first_dynamic_inode,
+        )?;
         namespace.reconcile_directory_renames(
             &lower_root,
             &captured_directories,
@@ -2711,11 +3034,19 @@ impl Filesystem for GuardedProbeView {
             return;
         }
         if self.directory(inode).is_some() {
-            if names.contains_key(&new_key) {
+            let replaced = names.get(&new_key).and_then(|&target_inode| {
+                self.directory(target_inode)
+                    .map(|directory| (target_inode, directory))
+            });
+            if names.contains_key(&new_key) && flags == RenameFlags::RENAME_NOREPLACE {
                 reply.error(Errno::EEXIST);
                 return;
             }
-            let result = self.rename_directory(inode, &old_key, &new_key, &mut names);
+            if names.contains_key(&new_key) && replaced.is_none() {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+            let result = self.rename_directory(inode, &old_key, &new_key, replaced, &mut names);
             match result {
                 Ok(()) => reply.ok(),
                 Err(error) => {
@@ -3227,10 +3558,214 @@ mod tests {
 
     use super::{
         CREATE_KIND, CreateIntent, DIRECTORY_CREATE_KIND, DIRECTORY_KIND, DIRECTORY_REMOVE_KIND,
-        DIRECTORY_RENAME_KIND, DirectoryCreateIntent, DirectoryRecord, DirectoryRemoveIntent,
-        DirectoryRenameIntent, FILE_INODE, GuardedNamespace, GuardedProbeFile, GuardedProbeView,
-        NAMESPACE_KIND, NamespaceRecord, ProbeLocation, REPLACE_KIND, probe_file_attr,
+        DIRECTORY_RENAME_KIND, DIRECTORY_REPLACE_KIND, DirectoryCreateIntent, DirectoryRecord,
+        DirectoryRemoveIntent, DirectoryRenameIntent, DirectoryReplaceIntent, FILE_INODE,
+        GuardedNamespace, GuardedProbeFile, GuardedProbeView, NAMESPACE_KIND, NamespaceRecord,
+        ProbeLocation, REPLACE_KIND, probe_file_attr,
     };
+
+    #[test]
+    fn populated_directory_replacement_replays_each_boundary() {
+        for phase in 0..4 {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(lower.join("source")).unwrap();
+            fs::create_dir(lower.join("target")).unwrap();
+            fs::write(lower.join("source/file"), b"captured bytes").unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let source_id = root
+                .open_child_directory("source")
+                .unwrap()
+                .unwrap()
+                .identity()
+                .unwrap();
+            let target_id = root
+                .open_child_directory("target")
+                .unwrap()
+                .unwrap()
+                .identity()
+                .unwrap();
+            let file_id = root
+                .open_child_directory("source")
+                .unwrap()
+                .unwrap()
+                .entry_identity("file", false)
+                .unwrap()
+                .unwrap();
+            let captured = HashMap::from([
+                (2, (b"source".to_vec(), source_id, 0o755)),
+                (3, (b"target".to_vec(), target_id, 0o755)),
+            ]);
+            let defaults = HashMap::from([(
+                4,
+                NamespaceRecord {
+                    version: 1,
+                    captured_path: "source/file".to_owned(),
+                    expected: file_id,
+                    current: Some(b"source/file".to_vec()),
+                    pending: None,
+                },
+            )]);
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([108; 32]));
+            let control_path = area.path().join("control.db");
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let anchor_id = uuid::Uuid::new_v4();
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let intent = DirectoryReplaceIntent {
+                version: 1,
+                move_intent: DirectoryRenameIntent {
+                    version: 1,
+                    source: b"source".to_vec(),
+                    target: b"target".to_vec(),
+                    expected: source_id,
+                },
+                target_inode: 3,
+                target_expected: target_id,
+            };
+            journal.store_directory_replace(2, &intent).unwrap();
+            if phase >= 1 {
+                root.exchange_child_directories("source", source_id, &root, "target", target_id)
+                    .unwrap();
+            }
+            if phase >= 2 {
+                assert!(
+                    root.remove_empty_child_directory("source", target_id)
+                        .unwrap()
+                );
+            }
+            if phase >= 3 {
+                journal
+                    .finish_directory_replace(&root, &captured, &defaults, 5, 2, &intent)
+                    .unwrap();
+            }
+            drop(journal);
+            drop(control);
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            journal
+                .reconcile_directory_replaces(&root, &captured, &defaults, 5)
+                .unwrap();
+            let index = journal
+                .load_directories(&root, &captured, 5, 65534, 65534)
+                .unwrap();
+            assert_eq!(index.paths[Path::new("target")], INodeNo(2));
+            assert!(!index.paths.contains_key(Path::new("source")));
+            assert_eq!(journal.directory_record(3).unwrap().current, None);
+            assert_eq!(
+                journal
+                    .load_or_replay(4, "source/file", file_id, &root, &index.paths)
+                    .unwrap()
+                    .unwrap()
+                    .relative_path,
+                Path::new("target/file")
+            );
+            assert_eq!(
+                fs::read(lower.join("target/file")).unwrap(),
+                b"captured bytes"
+            );
+            assert!(
+                control
+                    .lock()
+                    .unwrap()
+                    .get_record(DIRECTORY_REPLACE_KIND, &journal.record_id(2))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn directory_replacement_replay_refuses_nonempty_or_foreign_target() {
+        for foreign in [false, true] {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(lower.join("source")).unwrap();
+            fs::create_dir(lower.join("target")).unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let source_id = root
+                .open_child_directory("source")
+                .unwrap()
+                .unwrap()
+                .identity()
+                .unwrap();
+            let target_id = root
+                .open_child_directory("target")
+                .unwrap()
+                .unwrap()
+                .identity()
+                .unwrap();
+            let captured = HashMap::from([
+                (2, (b"source".to_vec(), source_id, 0o755)),
+                (3, (b"target".to_vec(), target_id, 0o755)),
+            ]);
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([109; 32]));
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control,
+                anchor_id: uuid::Uuid::new_v4(),
+                records: Mutex::new(HashMap::new()),
+            };
+            journal
+                .store_directory_replace(
+                    2,
+                    &DirectoryReplaceIntent {
+                        version: 1,
+                        move_intent: DirectoryRenameIntent {
+                            version: 1,
+                            source: b"source".to_vec(),
+                            target: b"target".to_vec(),
+                            expected: source_id,
+                        },
+                        target_inode: 3,
+                        target_expected: target_id,
+                    },
+                )
+                .unwrap();
+            if foreign {
+                root.move_child_directory_no_replace("target", target_id, &root, "saved")
+                    .unwrap();
+                fs::create_dir(lower.join("target")).unwrap();
+            } else {
+                fs::write(lower.join("target/untracked"), b"cannot discard").unwrap();
+            }
+            let actual_target = root.entry_identity("target", true).unwrap().unwrap();
+            assert!(
+                journal
+                    .reconcile_directory_replaces(&root, &captured, &HashMap::new(), 4)
+                    .is_err()
+            );
+            assert_eq!(
+                root.entry_identity("source", true).unwrap(),
+                Some(source_id)
+            );
+            assert_eq!(
+                root.entry_identity("target", true).unwrap(),
+                Some(actual_target)
+            );
+            if !foreign {
+                assert_eq!(
+                    fs::read(lower.join("target/untracked")).unwrap(),
+                    b"cannot discard"
+                );
+            }
+        }
+    }
 
     #[test]
     fn populated_directory_rename_replays_each_boundary() {
@@ -5088,6 +5623,33 @@ mod tests {
                 String::from_utf8_lossy(&rename_again.stderr)
             );
             anyhow::ensure!(fs::read(mountpoint.join("dynamic-moved/new"))? == b"dynamic");
+            let nonempty = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import errno,os,sys\nroot=sys.argv[1]\nos.mkdir(root+'/nonempty')\nfd=os.open(root+'/nonempty/file',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\nos.close(fd)\ntry:\n os.rename(root+'/final',root+'/nonempty')\nexcept OSError as error:\n assert error.errno in (errno.ENOTEMPTY,errno.EEXIST)\nelse:\n raise AssertionError('replaced nonempty directory')")
+                .arg(&mountpoint)
+                .output()?;
+            anyhow::ensure!(
+                nonempty.status.success(),
+                "nonempty directory replacement was not refused: {}",
+                String::from_utf8_lossy(&nonempty.stderr)
+            );
+            anyhow::ensure!(fs::read(mountpoint.join("final/leaf"))?.starts_with(b"EDIT"));
+            let replace = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.mkdir(sys.argv[2]); os.rename(sys.argv[1],sys.argv[2])")
+                .arg(mountpoint.join("final"))
+                .arg(mountpoint.join("occupied"))
+                .output()?;
+            anyhow::ensure!(
+                replace.status.success(),
+                "empty directory replacement failed: {}",
+                String::from_utf8_lossy(&replace.stderr)
+            );
+            anyhow::ensure!(fs::read(mountpoint.join("occupied/leaf"))?.starts_with(b"EDIT"));
             Ok(())
         })();
         let unmounted = session.umount_and_join();
@@ -5098,7 +5660,7 @@ mod tests {
                 .unwrap();
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
         assert!(
-            fs::read(mountpoint.join("final/leaf"))
+            fs::read(mountpoint.join("occupied/leaf"))
                 .unwrap()
                 .starts_with(b"EDIT")
         );
