@@ -149,11 +149,15 @@
   Removal writes a durable intent before the lower `rmdir`, and remount either
   finishes the removal or rejects a foreign replacement. Nested removal after
   file unlink and a second FUSE remount pass on ext4 and fresh local Btrfs.
-  Eleven nonprivileged journal regressions, 105 normal store tests, all eleven
-  privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
-  Clippy pass locally. Captured-directory removal, directory rename, remaining
-  metadata and allocation modes, concurrent handles, mount supervision/recovery,
-  and whole-worktree enrollment remain open.
+  Captured empty directories now use their manifest-bound native identity and
+  the same removal journal; a tombstone survives remount without requiring
+  the original worktree path to exist. The nested captured-directory probe
+  removes its last file, removes the directory, and remounts successfully on
+  both filesystems. Twelve nonprivileged journal regressions and 106 normal
+  store tests pass, as do all eleven privileged FUSE probes on ext4 and fresh
+  local Btrfs and strict workspace Clippy. Directory rename, remaining metadata
+  and allocation modes, concurrent handles, mount supervision/recovery, and whole-worktree
+  enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

@@ -303,15 +303,38 @@ impl GuardedNamespace {
             .map_err(io::Error::other)
     }
 
-    fn directory_record(&self, inode: u64) -> io::Result<DirectoryRecord> {
+    fn directory_record_opt(&self, inode: u64) -> io::Result<Option<DirectoryRecord>> {
         let bytes = self
             .control
             .lock()
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
             .get_record(DIRECTORY_KIND, &self.record_id(inode))
-            .map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        mb_core::decode_canonical(&bytes).map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        bytes
+            .map(|bytes| mb_core::decode_canonical(&bytes).map_err(io::Error::other))
+            .transpose()
+    }
+
+    fn directory_record(&self, inode: u64) -> io::Result<DirectoryRecord> {
+        self.directory_record_opt(inode)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    fn store_directory_if_absent(&self, inode: u64, record: &DirectoryRecord) -> io::Result<()> {
+        let bytes = mb_core::canonical_bytes(record).map_err(io::Error::other)?;
+        let inserted = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .put_record_if_absent(DIRECTORY_KIND, &self.record_id(inode), &bytes)
+            .map_err(io::Error::other)?;
+        if !inserted {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "guarded directory record already exists",
+            ));
+        }
+        Ok(())
     }
 
     fn store_directory_remove(&self, inode: u64, intent: &DirectoryRemoveIntent) -> io::Result<()> {
@@ -510,18 +533,22 @@ impl GuardedNamespace {
         lower_root: &PinnedDirectory,
         directories: &HashMap<PathBuf, INodeNo>,
         first_dynamic_inode: u64,
+        captured_directories: &HashMap<u64, (Vec<u8>, NativeFileId)>,
     ) -> anyhow::Result<()> {
         for (inode, bytes) in self.owned_records(DIRECTORY_REMOVE_KIND)? {
-            ensure!(
-                inode >= first_dynamic_inode,
-                "guarded directory removal aliases capture"
-            );
             let intent: DirectoryRemoveIntent = mb_core::decode_canonical(&bytes)?;
             ensure!(
                 intent.version == 1
                     && intent.expected.filesystem_id == lower_root.identity()?.filesystem_id,
                 "invalid guarded directory removal intent"
             );
+            if inode < first_dynamic_inode {
+                ensure!(
+                    captured_directories.get(&inode)
+                        == Some(&(intent.target.clone(), intent.expected)),
+                    "guarded directory removal differs from capture"
+                );
+            }
             let record = self.directory_record(inode)?;
             ensure!(
                 record.version == 1
@@ -564,10 +591,9 @@ impl GuardedNamespace {
             .map(|(inode, _)| inode)
             .collect();
         for (inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
-            ensure!(
-                inode >= first_dynamic_inode,
-                "guarded directory aliases capture"
-            );
+            if inode < first_dynamic_inode {
+                continue;
+            }
             highest = highest.max(inode);
             let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
             ensure!(
@@ -614,6 +640,7 @@ impl GuardedNamespace {
                 parent,
                 name,
                 relative_path: path,
+                native_id: expected,
             });
         }
         Ok((directories, highest))
@@ -936,6 +963,7 @@ struct GuardedProbeDirectory {
     parent: INodeNo,
     name: OsString,
     relative_path: PathBuf,
+    native_id: NativeFileId,
 }
 
 /// Experimental FUSE view for a published guarded capture. Enrollment and
@@ -947,6 +975,7 @@ pub struct GuardedProbeView {
     dynamic_files: Mutex<HashMap<u64, Arc<GuardedProbeFile>>>,
     directories: HashMap<u64, GuardedProbeDirectory>,
     dynamic_directories: Mutex<HashMap<u64, GuardedProbeDirectory>>,
+    removed_directories: Mutex<std::collections::HashSet<u64>>,
     names: Mutex<HashMap<(u64, OsString), u64>>,
     lower_root: Option<crate::PinnedDirectory>,
     staging_area: Option<crate::PinnedDirectory>,
@@ -1030,6 +1059,9 @@ impl GuardedProbeView {
     }
 
     fn directory(&self, inode: u64) -> Option<GuardedProbeDirectory> {
+        if self.removed_directories.lock().unwrap().contains(&inode) {
+            return None;
+        }
         self.directories.get(&inode).cloned().or_else(|| {
             self.dynamic_directories
                 .lock()
@@ -1156,13 +1188,43 @@ impl GuardedProbeView {
             .context("guarded view inode overflow")?;
         let mut directory_paths = HashMap::new();
         directory_paths.insert(PathBuf::new(), INodeNo::ROOT);
+        let pending_directory_removes: std::collections::HashSet<_> = namespace
+            .owned_records(DIRECTORY_REMOVE_KIND)?
+            .into_iter()
+            .map(|(inode, _)| inode)
+            .collect();
+        let mut captured_directories = HashMap::new();
         let mut defaults = HashMap::new();
         for (index, entry) in manifest.entries.iter().enumerate() {
             match entry {
                 CapturedEntry::Directory { path, .. } => {
+                    let inode = u64::try_from(index)? + 2;
                     let expected = plan
                         .captured_entry_identity(path)
                         .context("guarded directory is absent from source plan")?;
+                    ensure!(
+                        captured_directories
+                            .insert(inode, (path.as_bytes().to_vec(), expected))
+                            .is_none(),
+                        "duplicate captured guarded directory inode"
+                    );
+                    let record = namespace.directory_record_opt(inode)?;
+                    if let Some(record) = &record {
+                        ensure!(
+                            record.version == 1
+                                && record.expected == expected
+                                && record
+                                    .current
+                                    .as_deref()
+                                    .is_none_or(|current| current == path.as_bytes()),
+                            "captured guarded directory record differs from plan"
+                        );
+                    }
+                    if record.is_some_and(|record| record.current.is_none())
+                        || pending_directory_removes.contains(&inode)
+                    {
+                        continue;
+                    }
                     ensure!(
                         lower_root.open_descendant_directory(path)?.identity()? == expected,
                         "guarded view directory changed after capture"
@@ -1201,6 +1263,14 @@ impl GuardedProbeView {
                 }
             }
         }
+        for (inode, _) in namespace.owned_records(DIRECTORY_KIND)? {
+            if inode < first_dynamic_inode {
+                ensure!(
+                    captured_directories.contains_key(&inode),
+                    "guarded directory record aliases captured file"
+                );
+            }
+        }
         let staging_area = manifest.area.open_guarded_staging_area()?;
         ensure!(
             staging_area.identity()?.filesystem_id == lower_root.identity()?.filesystem_id,
@@ -1232,6 +1302,7 @@ impl GuardedProbeView {
             &lower_root,
             &directory_paths,
             first_dynamic_inode,
+            &captured_directories,
         )?;
         namespace.reconcile_creates(&lower_root, &directory_paths, first_dynamic_inode)?;
         namespace.reconcile_replaces(
@@ -1268,21 +1339,27 @@ impl GuardedProbeView {
                 .context("guarded manifest entry is not in its source plan")?;
             match entry {
                 CapturedEntry::Directory { .. } => {
-                    let lower = lower_root.open_descendant_directory(relative)?;
-                    ensure!(
-                        lower.identity()? == expected,
-                        "guarded view directory changed after capture"
-                    );
-                    let mut attr =
-                        probe_directory_attr(lower.as_file(), inode, (mode & 0o7777) as u16)?;
-                    attr.uid = view_uid;
-                    attr.gid = view_gid;
-                    directories.push(GuardedProbeDirectory {
-                        attr,
-                        parent,
-                        name: name.to_os_string(),
-                        relative_path: relative.to_path_buf(),
-                    });
+                    let removed = namespace
+                        .directory_record_opt(inode.0)?
+                        .is_some_and(|record| record.current.is_none());
+                    if !removed {
+                        let lower = lower_root.open_descendant_directory(relative)?;
+                        ensure!(
+                            lower.identity()? == expected,
+                            "guarded view directory changed after capture"
+                        );
+                        let mut attr =
+                            probe_directory_attr(lower.as_file(), inode, (mode & 0o7777) as u16)?;
+                        attr.uid = view_uid;
+                        attr.gid = view_gid;
+                        directories.push(GuardedProbeDirectory {
+                            attr,
+                            parent,
+                            name: name.to_os_string(),
+                            relative_path: relative.to_path_buf(),
+                            native_id: expected,
+                        });
+                    }
                 }
                 CapturedEntry::FileV2 { native_id, .. } => {
                     ensure!(
@@ -1519,6 +1596,7 @@ impl GuardedProbeView {
             dynamic_files: Mutex::new(HashMap::new()),
             directories: by_directory,
             dynamic_directories: Mutex::new(HashMap::new()),
+            removed_directories: Mutex::new(std::collections::HashSet::new()),
             names: Mutex::new(names),
             lower_root,
             staging_area: None,
@@ -1971,6 +2049,7 @@ impl Filesystem for GuardedProbeView {
                 parent,
                 name: name.to_os_string(),
                 relative_path: target,
+                native_id: expected,
             })
         })();
         match result {
@@ -2367,20 +2446,15 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::ENOENT);
             return;
         };
-        let Some(directory) = self
-            .dynamic_directories
-            .lock()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-        else {
+        let Some(directory) = self.directory(inode) else {
             reply.error(if self.file(inode).is_some() {
                 Errno::ENOTDIR
             } else {
-                Errno::EOPNOTSUPP
+                Errno::ENOENT
             });
             return;
         };
+        let captured = self.directories.contains_key(&inode);
         if names.keys().any(|(child_parent, _)| *child_parent == inode) {
             reply.error(Errno::ENOTEMPTY);
             return;
@@ -2390,8 +2464,18 @@ impl Filesystem for GuardedProbeView {
             return;
         };
         let result = (|| -> io::Result<()> {
-            let record = namespace.directory_record(inode)?;
+            let stored = namespace.directory_record_opt(inode)?;
+            let record = match &stored {
+                Some(record) => record.clone(),
+                None if captured => DirectoryRecord {
+                    version: 1,
+                    expected: directory.native_id,
+                    current: Some(directory.relative_path.as_os_str().as_bytes().to_vec()),
+                },
+                None => return Err(io::Error::from(io::ErrorKind::NotFound)),
+            };
             if record.version != 1
+                || record.expected != directory.native_id
                 || record.current.as_deref() != Some(directory.relative_path.as_os_str().as_bytes())
             {
                 return Err(io::Error::other("guarded directory record changed"));
@@ -2417,6 +2501,9 @@ impl Filesystem for GuardedProbeView {
             {
                 return Err(io::Error::other("guarded directory identity changed"));
             }
+            if stored.is_none() {
+                namespace.store_directory_if_absent(inode, &record)?;
+            }
             let intent = DirectoryRemoveIntent {
                 version: 1,
                 target: directory.relative_path.as_os_str().as_bytes().to_vec(),
@@ -2434,6 +2521,7 @@ impl Filesystem for GuardedProbeView {
         })();
         match result {
             Ok(()) => {
+                self.removed_directories.lock().unwrap().insert(inode);
                 self.dynamic_directories.lock().unwrap().remove(&inode);
                 names.remove(&key);
                 reply.ok();
@@ -2948,7 +3036,7 @@ mod tests {
                     .is_empty()
             );
             journal
-                .reconcile_directory_removes(&root, &visible_paths, 2)
+                .reconcile_directory_removes(&root, &visible_paths, 2, &HashMap::new())
                 .unwrap();
             assert!(!lower.join(&name).exists());
             assert!(
@@ -2962,6 +3050,79 @@ mod tests {
             let after = journal.directory_record(2).unwrap();
             assert_eq!(after.expected, expected);
             assert!(after.current.is_none());
+        }
+    }
+
+    #[test]
+    fn captured_directory_removal_replays_across_control_reopen() {
+        let area = tempfile::tempdir().unwrap();
+        let lower = area.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let root = PinnedDirectory::open(&lower).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([101; 32]));
+        let control_path = area.path().join("control.db");
+        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+        for removed_before_replay in [false, true] {
+            let name = format!("captured-{removed_before_replay}");
+            fs::create_dir(lower.join(&name)).unwrap();
+            let expected = root
+                .open_child_directory(&name)
+                .unwrap()
+                .unwrap()
+                .identity()
+                .unwrap();
+            let anchor_id = uuid::Uuid::new_v4();
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let intent = DirectoryRemoveIntent {
+                version: 1,
+                target: name.as_bytes().to_vec(),
+                expected,
+            };
+            journal
+                .store_directory_if_absent(
+                    2,
+                    &DirectoryRecord {
+                        version: 1,
+                        expected,
+                        current: Some(intent.target.clone()),
+                    },
+                )
+                .unwrap();
+            journal.store_directory_remove(2, &intent).unwrap();
+            if removed_before_replay {
+                assert!(root.remove_empty_child_directory(&name, expected).unwrap());
+            }
+            drop(journal);
+            drop(control);
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(&control_path, &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control: Arc::clone(&control),
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let captured = HashMap::from([(2, (name.as_bytes().to_vec(), expected))]);
+            journal
+                .reconcile_directory_removes(&root, &directories, 3, &captured)
+                .unwrap();
+            assert!(!lower.join(&name).exists());
+            assert!(journal.directory_record(2).unwrap().current.is_none());
+            assert!(
+                control
+                    .lock()
+                    .unwrap()
+                    .get_record(DIRECTORY_REMOVE_KIND, &journal.record_id(2))
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -3025,7 +3186,7 @@ mod tests {
         let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
         assert!(
             journal
-                .reconcile_directory_removes(&root, &directories, 2)
+                .reconcile_directory_removes(&root, &directories, 2, &HashMap::new())
                 .is_err()
         );
         assert_eq!(
@@ -4315,7 +4476,40 @@ mod tests {
             GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
                 .unwrap();
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
-        assert!(!mountpoint.join("nested/newdir").exists());
+        let remove_captured = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(!mountpoint.join("nested/newdir").exists());
+            let nonempty = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.rmdir(sys.argv[1])")
+                .arg(mountpoint.join("nested"))
+                .output()?;
+            anyhow::ensure!(!nonempty.status.success());
+            let remove = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.unlink(sys.argv[1]); os.rmdir(sys.argv[2])")
+                .arg(mountpoint.join("nested/moved"))
+                .arg(mountpoint.join("nested"))
+                .output()?;
+            anyhow::ensure!(
+                remove.status.success(),
+                "captured directory removal failed: {}",
+                String::from_utf8_lossy(&remove.stderr)
+            );
+            anyhow::ensure!(!nested.exists());
+            Ok(())
+        })();
+        session.umount_and_join().unwrap();
+        remove_captured.unwrap();
+        let rebuilt =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
+        let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
+        assert!(!mountpoint.join("nested").exists());
+        assert_eq!(fs::read(mountpoint.join("top")).unwrap(), b"new-nested");
         session.umount_and_join().unwrap();
     }
 }
