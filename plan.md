@@ -3489,6 +3489,30 @@ strictly byte-for-byte even when stock Git would apply attributes or filters.
 Keep those three conditions together as Git work proceeds, and retain the
 original guarded-source and platform gates in this milestone's closure test.
 
+Track Milestone 6 against these separate closure gates when iterating over this
+plan; passing a Git command gate does not close a source-backend or platform gate:
+
+- Version and validate the native source-backend boundary, with byte-exact
+  capture/restore and no change to signed peer formats.
+- Complete the supported Git command set over native anchors, including
+  branches, linked worktrees, protected history, recovery, and two-way ordinary-
+  Git object exchange. For each file-touching command, verify that line-ending
+  settings and all clean/smudge/process, encoding, and ident rules are inert:
+  the captured file, staged blob, exported blob, and restored file have the
+  same bytes unless the user or merge operation explicitly changes content.
+- Make Git-facing prune release unreachable native anchors and backed-up
+  sectors while respecting every live ref, index entry, worktree, protection
+  pin, retained signed revision, and in-flight operation.
+- Complete guarded link-freeze with its long-lived Linux edit guard and
+  privileged capture/edit/restore and crash-recovery probes.
+- Complete Windows and macOS source backends, portable metadata, watchers,
+  and application-consistent capture hooks with their platform-specific gates.
+
+The Git binary must never opt into Git's automatic CRLF conversion or run a
+configured filter, including during import, checkout, merge, or pull. A stock
+Git peer may already have converted its own worktree; exchange and preserve its
+stored Git blob bytes exactly, without trying to reverse that conversion.
+
 - First extract and version the source-backend boundary from section 4 without
   changing the existing signed peer format. Prove a custom object-store adapter
   over native anchors with a maintained Git library, initially targeting
