@@ -1819,7 +1819,18 @@ impl GuardedProbeView {
                         source.metadata()?.ino() == expected.inode,
                         "guarded view source file changed while opening"
                     );
-                    let mut attr = probe_file_attr(&source, inode, (mode & 0o7777) as u16)?;
+                    let editable = {
+                        let control = control
+                            .lock()
+                            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                        plan.file_has_editable_inode(&control, path)?
+                    };
+                    let visible_mode = if editable {
+                        (source.metadata()?.permissions().mode() & 0o7777) as u16
+                    } else {
+                        (mode & 0o7777) as u16
+                    };
+                    let mut attr = probe_file_attr(&source, inode, visible_mode)?;
                     attr.uid = view_uid;
                     attr.gid = view_gid;
                     let location = Arc::new(Mutex::new(location));
@@ -5138,6 +5149,14 @@ mod tests {
         config.acl = SessionACL::All;
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
         let result = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("nested/leaf"))?
+                    .permissions()
+                    .mode()
+                    & 0o7777
+                    == 0o666
+            );
+            anyhow::ensure!(fs::metadata(nested.join("leaf"))?.permissions().mode() & 0o222 == 0);
             let listing = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
@@ -5229,6 +5248,17 @@ mod tests {
             );
             anyhow::ensure!(fs::read(nested.join("moved"))?.starts_with(b"EDIT"));
             anyhow::ensure!(fs::metadata(nested.join("moved"))?.ino() == leaf_inode);
+            let chmod = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.chmod(sys.argv[1],0o640)")
+                .arg(mountpoint.join("nested/moved"))
+                .output()?;
+            anyhow::ensure!(chmod.status.success());
+            anyhow::ensure!(
+                fs::metadata(nested.join("moved"))?.permissions().mode() & 0o7777 == 0o640
+            );
             let mut anchor_after = manifest.file_locator("nested/leaf".to_string())?.open()?;
             anyhow::ensure!(anchor_after.metadata()?.ino() != leaf_inode);
             let mut bytes = Vec::new();
@@ -5296,6 +5326,13 @@ mod tests {
         let replayed = (|| -> anyhow::Result<()> {
             anyhow::ensure!(!mountpoint.join("nested/leaf").exists());
             anyhow::ensure!(fs::read(mountpoint.join("nested/moved"))?.starts_with(b"EDIT"));
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("nested/moved"))?
+                    .permissions()
+                    .mode()
+                    & 0o7777
+                    == 0o640
+            );
             anyhow::ensure!(!mountpoint.join("nested/new").exists());
             anyhow::ensure!(fs::read(mountpoint.join("top"))? == b"new-nested");
             anyhow::ensure!(

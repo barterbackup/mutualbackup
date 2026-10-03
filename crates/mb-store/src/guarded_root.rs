@@ -295,6 +295,39 @@ impl GuardedRootCapturePlan {
             })
     }
 
+    /// A frozen inode has guard-restricted lower permissions, so its captured
+    /// mode is the visible one. Once the edit journal made that inode
+    /// independent, the lower inode's mode includes later owner chmods and is
+    /// authoritative even after a view remount.
+    pub(crate) fn file_has_editable_inode(
+        &self,
+        control: &ControlStore,
+        captured_path: &str,
+    ) -> anyhow::Result<bool> {
+        let capture_id = match self
+            .entries
+            .iter()
+            .find(|entry| entry.path() == captured_path)
+        {
+            Some(GuardedRootEntry::File { capture_id, .. }) => *capture_id,
+            _ => anyhow::bail!("guarded file mode has no captured file"),
+        };
+        let capture = LinkFreezeCaptureIntent::load(control, capture_id)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?;
+        anyhow::ensure!(
+            matches!(
+                capture.phase(),
+                LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
+            ),
+            "guarded file capture is not published"
+        );
+        if capture.phase() == LinkFreezeCapturePhase::Detached {
+            return Ok(true);
+        }
+        Ok(LinkFreezeEditIntent::load(control, capture_id)?
+            .is_some_and(|edit| edit.phase() == LinkFreezeEditPhase::Editable))
+    }
+
     pub(crate) fn load_active_for_view(
         control: &ControlStore,
         manifest: &StableAnchorManifest,

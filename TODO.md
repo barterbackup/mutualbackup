@@ -177,7 +177,13 @@
   on ext4 and fresh local Btrfs, and strict workspace Clippy pass. Directory
   replacement onto an occupied target, remaining metadata and allocation
   modes, concurrent handles, mount supervision/recovery, and whole-worktree
-  enrollment remain open.
+  enrollment remain open. Captured-file owner `chmod` now survives guarded-view
+  remount: rebuild advertises the original mode while the lower inode is
+  guard-frozen, then uses the lower mode only after the durable edit journal
+  proves that inode independently editable. A nested-file probe checks the
+  frozen visible mode and the later `0640` mode across remount on ext4 and
+  fresh local Btrfs. The 109 normal store tests, all 12 privileged probes,
+  formatting, and strict workspace Clippy pass on this correction.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
