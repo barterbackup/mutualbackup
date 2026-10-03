@@ -201,6 +201,14 @@
   not yet carried by protected owner revision metadata for seed-only recovery;
   guarded enrollment stays gated until that and the remaining metadata,
   concurrent-handle, and mount-supervision work are complete.
+  Writable FUSE handles now retain the detached source descriptor. Handle-based
+  truncate and allocation continue to address that inode after unlink or
+  atomic replacement instead of reopening the old pathname. The ordinary-user
+  two-file probe exercises both cases, checks the replacement and captured
+  anchors remain byte-exact, and passes with 112 normal store tests and all 12
+  privileged probes on ext4 and fresh local Btrfs; formatting and strict
+  workspace Clippy pass. Broader concurrent-handle interleavings and mount
+  supervision remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

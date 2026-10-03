@@ -1261,6 +1261,13 @@ unfrozen lower inodes. Ordinary-user probes pass on ext4 and fresh local Btrfs.
 The virtual root-mode record still needs inclusion in encrypted owner revision
 metadata before seed-only recovery and guarded enrollment can claim metadata
 fidelity.
+Writable FUSE handles now keep a descriptor for the inode detached before
+open. Handle-based truncate and allocation use that descriptor after unlink or
+atomic replacement, so they cannot reopen a changed pathname. The ordinary-
+user two-file probe covers both cases, with 112 normal store tests, all 12
+privileged FUSE probes on ext4 and fresh local Btrfs, formatting, and strict
+workspace Clippy passing. Broader concurrent-handle schedules, mount
+supervision, and protected recovery of the virtual root mode remain gated.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

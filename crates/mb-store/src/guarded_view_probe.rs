@@ -1606,6 +1606,7 @@ struct ActiveBacking {
     id: BackingId,
     mode: OpenAccMode,
     inode: INodeNo,
+    source: File,
 }
 
 impl GuardedProbeFile {
@@ -2692,7 +2693,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::ENOENT);
             return;
         };
-        if let Some(handle) = handle {
+        let held_source = if let Some(handle) = handle {
             let held = self.backing.lock().unwrap();
             let Some(backing) = held.get(&handle.0) else {
                 reply.error(Errno::EIO);
@@ -2706,15 +2707,32 @@ impl Filesystem for GuardedProbeView {
                 reply.error(Errno::EACCES);
                 return;
             }
-        }
+            if backing.mode == OpenAccMode::O_RDONLY {
+                None
+            } else {
+                match backing.source.try_clone() {
+                    Ok(source) => Some(source),
+                    Err(_) => {
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let Some(open_for_write) = &file.open_for_write else {
             reply.error(Errno::EACCES);
             return;
         };
         let result = (|| -> io::Result<FileAttr> {
-            // The callback completes the durable sparse detach before this
-            // operation can change the inode shared with an anchor.
-            let source = open_for_write(OpenAccMode::O_RDWR)?;
+            // A writable handle was detached before open returned. Retain its
+            // inode across rename, replacement and unlink. Without a writable
+            // handle, detach the file currently named by this path first.
+            let source = match held_source {
+                Some(source) => source,
+                None => open_for_write(OpenAccMode::O_RDWR)?,
+            };
             if let Some(size) = size {
                 source.set_len(size)?;
             }
@@ -2771,6 +2789,13 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EACCES);
             return;
         };
+        let retained = match source.try_clone() {
+            Ok(retained) => retained,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         let backing = match reply.open_backing(source) {
             Ok(backing) => backing,
             Err(_) => {
@@ -2786,6 +2811,7 @@ impl Filesystem for GuardedProbeView {
                 id: backing,
                 mode: flags.acc_mode(),
                 inode,
+                source: retained,
             },
         );
         reply.opened_passthrough(FileHandle(handle), FopenFlags::empty(), &held[&handle].id);
@@ -2992,7 +3018,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EEXIST);
             return;
         }
-        let result = (|| -> io::Result<(u64, Arc<GuardedProbeFile>, BackingId, FileAttr)> {
+        let result = (|| -> io::Result<(u64, Arc<GuardedProbeFile>, BackingId, File, FileAttr)> {
             let owned = if parent_path.as_os_str().is_empty() {
                 None
             } else {
@@ -3010,6 +3036,7 @@ impl Filesystem for GuardedProbeView {
             // setuid/setgid bits requested through the remapped FUSE owner.
             source.set_permissions(fs::Permissions::from_mode((mode & !umask) & 0o777))?;
             source.sync_all()?;
+            let retained = source.try_clone()?;
             let backing = reply.open_backing(&source)?;
             let inode = self
                 .next_inode
@@ -3054,10 +3081,10 @@ impl Filesystem for GuardedProbeView {
             let attr = file
                 .current_attr()
                 .inspect_err(|_| self.poisoned.store(true, Ordering::Release))?;
-            Ok((inode, Arc::new(file), backing, attr))
+            Ok((inode, Arc::new(file), backing, retained, attr))
         })();
         match result {
-            Ok((inode, file, backing, attr)) => {
+            Ok((inode, file, backing, retained, attr)) => {
                 names.insert(key, inode);
                 self.dynamic_files.lock().unwrap().insert(inode, file);
                 let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -3071,6 +3098,7 @@ impl Filesystem for GuardedProbeView {
                             OpenAccMode::O_WRONLY
                         },
                         inode: INodeNo(inode),
+                        source: retained,
                     },
                 );
                 let held = self.backing.lock().unwrap();
@@ -3437,10 +3465,6 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EIO);
             return;
         }
-        let Some(file) = self.file(inode.0) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
         let held = self.backing.lock().unwrap();
         let Some(backing) = held.get(&handle.0) else {
             reply.error(Errno::EIO);
@@ -3454,19 +3478,21 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EACCES);
             return;
         }
-        drop(held);
-        let Some(open_for_write) = &file.open_for_write else {
-            reply.error(Errno::EACCES);
-            return;
+        let source = match backing.source.try_clone() {
+            Ok(source) => source,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         };
+        drop(held);
         let result = (|| -> io::Result<()> {
             let offset =
                 i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
             let length =
                 i64::try_from(length).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            // The callback completes or verifies the durable detach before an
-            // allocation or hole punch can reach the private source inode.
-            let source = open_for_write(OpenAccMode::O_RDWR)?;
+            // The writable handle's inode was detached before open returned.
+            // Allocation continues to target it after rename or unlink.
             // SAFETY: `source` owns a valid descriptor, and the offset and
             // length were checked for the syscall's signed argument width.
             if unsafe { libc::fallocate(source.as_raw_fd(), mode, offset, length) } < 0 {
@@ -5451,7 +5477,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
+                .arg("import ctypes,os,sys; fd=os.open(sys.argv[2],os.O_RDWR); os.rename(sys.argv[1],sys.argv[2]); os.ftruncate(fd,0); c=ctypes.CDLL(None,use_errno=True); result=c.fallocate(fd,0,0,4096); assert result==0,os.strerror(ctypes.get_errno()); os.write(fd,b'OLD'); os.fsync(fd); os.close(fd)")
                 .arg(mountpoint.join("delta"))
                 .arg(mountpoint.join("moved"))
                 .output()?;
@@ -5473,7 +5499,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import os,sys; os.unlink(sys.argv[1])")
+                .arg("import ctypes,os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.unlink(sys.argv[1]); os.ftruncate(fd,0); c=ctypes.CDLL(None,use_errno=True); result=c.fallocate(fd,0,0,4096); assert result==0,os.strerror(ctypes.get_errno()); os.write(fd,b'HELD'); os.fsync(fd); os.close(fd)")
                 .arg(mountpoint.join("alpha"))
                 .output()?;
             anyhow::ensure!(
