@@ -361,6 +361,71 @@ impl GuardedRootCapturePlan {
             })
     }
 
+    /// Before the first mount, every lower path still has its captured name.
+    /// Compare each pinned directory with the complete plan before any view
+    /// namespace journal can replay. The marked Git catalog is app metadata,
+    /// excluded by the same rule used during inventory planning.
+    pub(crate) fn verify_initial_lower_namespace(
+        &self,
+        lower_root: &PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            lower_root.identity()? == self.source_root_identity(),
+            "guarded lower root changed after capture"
+        );
+        let mut expected = BTreeMap::<String, BTreeSet<Vec<u8>>>::new();
+        expected.insert(String::new(), BTreeSet::new());
+        for entry in &self.entries {
+            let relative = Path::new(entry.path());
+            let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent = parent.to_str().ok_or(AnchorError::InvalidGuardedPlan)?;
+            let name = relative
+                .file_name()
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            expected
+                .get_mut(parent)
+                .ok_or(AnchorError::InvalidGuardedPlan)?
+                .insert(name.as_bytes().to_vec());
+            if entry.is_directory() {
+                expected.insert(entry.path().to_owned(), BTreeSet::new());
+            }
+            let native_id = NativeFileId {
+                filesystem_id: entry.version().filesystem_id,
+                inode: entry.version().inode,
+            };
+            anyhow::ensure!(
+                lower_root.entry_identity(relative, entry.is_directory())? == Some(native_id),
+                "guarded lower entry identity changed before first mount: {}",
+                entry.path()
+            );
+        }
+        let marked_catalog = git_catalog_marker_from_root(lower_root.as_file())?.is_some();
+        for (parent, names) in expected {
+            let directory = if parent.is_empty() {
+                lower_root.try_clone()?
+            } else {
+                lower_root.open_descendant_directory(&parent)?
+            };
+            let mut actual = BTreeSet::new();
+            let mut stream = DirectoryStream::open(directory.as_file())?;
+            while let Some(name) = stream.next_name()? {
+                if parent.is_empty()
+                    && marked_catalog
+                    && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes()
+                {
+                    continue;
+                }
+                actual.insert(name.as_bytes().to_vec());
+            }
+            anyhow::ensure!(
+                actual == names,
+                "guarded lower directory has an unexpected or missing entry: {parent}"
+            );
+        }
+        Ok(())
+    }
+
     /// Before the first view mount, captured paths have not yet been renamed
     /// through FUSE. Check their private lower directories before rebuilding
     /// namespace journals, since replay itself can mutate that lower tree.
@@ -767,6 +832,7 @@ impl GuardedRootCapturePlan {
             "guarded directory isolation parameters changed"
         );
         self.verify_lower_directories_for_retirement(&snapshot, &lower, prior.as_ref())?;
+        self.verify_initial_lower_namespace(&lower)?;
         for entry in self.lower_directory_entries(&snapshot) {
             let directory = Self::open_lower_directory(&lower, entry)?;
             Self::check_directory_isolation_metadata(directory.as_file())?;
@@ -816,6 +882,7 @@ impl GuardedRootCapturePlan {
             );
         }
         self.verify_lower_directories_for_retirement(&snapshot, &lower, Some(&expected))?;
+        self.verify_initial_lower_namespace(&lower)?;
         let root_metadata = lower.as_file().metadata()?;
         anyhow::ensure!(
             (root_metadata.uid(), root_metadata.gid())
@@ -3060,6 +3127,44 @@ mod tests {
     }
 
     #[test]
+    fn initial_lower_namespace_rejects_unplanned_names_and_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/file"), b"captured").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let lower = PinnedDirectory::open(&root).unwrap();
+        plan.verify_initial_lower_namespace(&lower).unwrap();
+
+        let extra = root.join("nested/extra");
+        fs::write(&extra, b"not captured").unwrap();
+        assert!(
+            plan.verify_initial_lower_namespace(&lower)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected or missing entry")
+        );
+        fs::remove_file(extra).unwrap();
+        let extra = root.join("extra");
+        fs::create_dir(&extra).unwrap();
+        assert!(
+            plan.verify_initial_lower_namespace(&lower)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected or missing entry")
+        );
+        fs::remove_dir(extra).unwrap();
+        fs::rename(root.join("nested/file"), root.join("nested/old")).unwrap();
+        fs::write(root.join("nested/file"), b"replacement").unwrap();
+        assert!(
+            plan.verify_initial_lower_namespace(&lower)
+                .unwrap_err()
+                .to_string()
+                .contains("identity changed")
+        );
+    }
+
+    #[test]
     fn inventory_rejects_symlinks_and_hard_link_aliases() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -3090,6 +3195,11 @@ mod tests {
         )
         .unwrap();
         assert!(inventory(&root).unwrap().is_empty());
+        let plan = planned_without_privileged_probe(&root);
+        let lower = PinnedDirectory::open(&root).unwrap();
+        plan.verify_initial_lower_namespace(&lower).unwrap();
+        fs::remove_file(catalog.join(super::super::GIT_CATALOG_MARKER_FILE)).unwrap();
+        assert!(plan.verify_initial_lower_namespace(&lower).is_err());
     }
 
     #[test]
@@ -4245,6 +4355,22 @@ mod tests {
                 .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
                 .unwrap()
                 .unwrap();
+            if interruption == 0 {
+                let extra = nested.join("uncaptured");
+                fs::write(&extra, b"unplanned bytes").unwrap();
+                assert!(plan.isolate_lower_directories(&store, &manifest).is_err());
+                assert!(
+                    store
+                        .get_record(DIRECTORY_ISOLATION_KIND, plan.anchor_id.as_bytes())
+                        .unwrap()
+                        .is_none()
+                );
+                for directory in [&root, &nested] {
+                    let metadata = fs::metadata(directory).unwrap();
+                    assert_eq!((metadata.uid(), metadata.gid()), (65534, 65534));
+                }
+                fs::remove_file(extra).unwrap();
+            }
             if interruption == 1 || interruption == 2 {
                 let marker = plan.private_file_capture(&store).unwrap().unwrap();
                 let record = DirectoryIsolation {

@@ -1583,10 +1583,17 @@ UID/GID before any chmod/chown, then replays partial lower-directory changes.
 Root retirement restores directory ownership and mode after frozen anchors
 retire. Ext4 and fresh local Btrfs probes cover interrupted transitions,
 retained ordinary-user directory descriptors, and default-ACL refusal; 116
-normal store tests and strict workspace Clippy pass. Exact lower-namespace
-admission, restoration after FUSE path changes, detached-file owner recovery,
-signed mutable-view recovery, and the complete privileged mount gate remain
-open before ordinary user-owned roots can be enrolled.
+normal store tests and strict workspace Clippy pass. First-mount admission now
+compares every planned lower entry identity and each complete directory entry
+set before FUSE namespace replay, excluding only the marked Git catalog. The
+isolation pass checks the same inventory before and after ownership changes.
+Normal unknown-entry and replacement cases pass locally, and privileged
+first-mount/isolator refusal passes on ext4 and fresh local Btrfs, alongside
+117 normal store tests and strict workspace Clippy. Exact remount
+admission against the mutable FUSE namespace, restoration after FUSE path
+changes, detached-file owner recovery, signed mutable-view recovery, and the
+complete privileged mount gate remain open before ordinary user-owned roots
+can be enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

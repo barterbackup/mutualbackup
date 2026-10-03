@@ -276,6 +276,7 @@ impl GuardedViewMount {
             // No FUSE operation has yet changed captured paths. Refuse an
             // accessible child before view reconstruction can replay a
             // pending namespace operation against that lower directory.
+            plan.verify_initial_lower_namespace(&lower_root)?;
             plan.verify_initial_private_directories(&lower_root, view_uid)?;
         }
         // Build and validate the complete view before publishing a new mount
@@ -516,6 +517,7 @@ mod tests {
             "directory-owner",
             "directory-group-write",
             "directory-world-search",
+            "unknown-lower-entry",
         ] {
             let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
                 Some(root) => tempfile::Builder::new()
@@ -539,7 +541,7 @@ mod tests {
             } else if unsafe_case == "directory-world-search" {
                 fs::set_permissions(lower.join("nested"), fs::Permissions::from_mode(0o711))
                     .unwrap();
-            } else {
+            } else if unsafe_case != "unknown-lower-entry" {
                 let owned = lower.join(if unsafe_case == "file-owner" {
                     "sample"
                 } else {
@@ -556,18 +558,23 @@ mod tests {
             ));
             let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
             let manifest = plan.capture(&control.lock().unwrap()).unwrap();
+            if unsafe_case == "unknown-lower-entry" {
+                fs::write(lower.join("nested/unknown"), b"outside the capture plan").unwrap();
+            }
             // A first-mount preflight must reject the unsafe nested directory
             // before it tries to decode or replay any view namespace intent.
-            let pending_rename = (unsafe_case == "directory-world-search").then(|| {
-                let mut id = manifest.anchor_id.as_bytes().to_vec();
-                id.extend_from_slice(&2_u64.to_le_bytes());
-                control
-                    .lock()
-                    .unwrap()
-                    .put_record("guarded-view-directory-rename-v1", &id, &[0xff])
-                    .unwrap();
-                id
-            });
+            let pending_rename = (unsafe_case == "directory-world-search"
+                || unsafe_case == "unknown-lower-entry")
+                .then(|| {
+                    let mut id = manifest.anchor_id.as_bytes().to_vec();
+                    id.extend_from_slice(&2_u64.to_le_bytes());
+                    control
+                        .lock()
+                        .unwrap()
+                        .put_record("guarded-view-directory-rename-v1", &id, &[0xff])
+                        .unwrap();
+                    id
+                });
             let error = match GuardedViewMount::start(
                 &manifest,
                 Arc::clone(&control),
@@ -581,10 +588,12 @@ mod tests {
                 }
                 Err(error) => error,
             };
-            assert!(
-                error.to_string().contains("guarded") && error.to_string().contains("view owner"),
-                "{error:#}"
-            );
+            let expected = if unsafe_case == "unknown-lower-entry" {
+                "unexpected or missing entry"
+            } else {
+                "view owner"
+            };
+            assert!(error.to_string().contains(expected), "{error:#}");
             assert!(
                 control
                     .lock()
@@ -618,6 +627,9 @@ mod tests {
                         .delete_record("guarded-view-directory-rename-v1", &id)
                         .unwrap()
                 );
+            }
+            if unsafe_case == "unknown-lower-entry" {
+                fs::remove_file(lower.join("nested/unknown")).unwrap();
             }
             plan.discard_unreferenced(&control.lock().unwrap()).unwrap();
         }

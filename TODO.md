@@ -650,10 +650,19 @@
   directories fail closed before isolation. Three privileged probes cover
   interrupted isolation/retirement, retained ordinary-user directory
   descriptors, and default-ACL refusal on ext4 and fresh local Btrfs; 116
-  normal store tests and strict workspace Clippy pass. Guarded enrollment still
-  needs exact lower-namespace admission, restoration after FUSE path changes,
-  owner restoration after file detach, protected mutable-view metadata, and
-  the complete privileged mount gate.
+  normal store tests and strict workspace Clippy pass. First-mount admission
+  now checks every captured lower path's identity and compares each directory's
+  complete entry set with the plan before namespace replay; directory isolation
+  checks the same inventory before and after changing ownership. Only a marked
+  app-owned Git catalog is excluded. An unplanned entry fails before an
+  isolation record or mount claim is created. Normal replacement/unknown-entry
+  cases pass locally; privileged first-mount and isolator refusal pass on ext4
+  and fresh local Btrfs, alongside 117 normal store tests and strict workspace
+  Clippy.
+  Guarded enrollment still needs exact remount admission against the mutable
+  FUSE namespace, restoration after FUSE path changes, owner restoration after
+  file detach, protected mutable-view metadata, and the complete privileged
+  mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
