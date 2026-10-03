@@ -151,6 +151,14 @@
   committed, and seed recovery passed. The test removed its Btrfs image,
   mount, daemons, namespaces, and firewall chains. This run confirms eventual
   progress but does not explain or exclude the earlier 5,400-second stall.
+  Source tracing found another diagnostic gap: the coordinator can wait for
+  variable coding coverage while pending durable coding work exists, and that
+  loop exposed the missing coverage only at debug level. A 60-second progress
+  warning now names the checkpoint, guild event sequence, and coverage error;
+  the coordinator's fetch, writer-key, packing, and lane-queue stages and the
+  coding worker's four sequential steps also warn if any one stays pending for
+  60 seconds. The warnings do not cancel work or change quorum decisions.
+  Use the next local topology run to identify the stage behind a long pause.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

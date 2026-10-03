@@ -6176,17 +6176,37 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
     loop {
         // Every queue gets a turn, including when a retry or cleanup is blocked.
         // The retry cursor also prevents one failed retry from hiding later retries.
-        process_delegated_coding_job(node.clone(), &p2p).await?;
+        observe_slow_network_stage(
+            "delegated-coding-job",
+            None,
+            process_delegated_coding_job(node.clone(), &p2p),
+        )
+        .await?;
         if let Some(job) = node_blocking(node.clone(), move |node| {
             node.claim_coding_retry(retry_cursor)
         })
         .await?
         {
             retry_cursor = Some(job.failure.value.plan.value.attempt_id);
-            process_coding_retry_job(node.clone(), &p2p, &job).await?;
+            observe_slow_network_stage(
+                "coding-retry-job",
+                None,
+                process_coding_retry_job(node.clone(), &p2p, &job),
+            )
+            .await?;
         }
-        dispatch_next_coding_launch_after(node.clone(), &p2p, &mut launch_cursor).await?;
-        process_coding_activation_job(node.clone(), &p2p).await?;
+        observe_slow_network_stage(
+            "coding-launch-job",
+            None,
+            dispatch_next_coding_launch_after(node.clone(), &p2p, &mut launch_cursor),
+        )
+        .await?;
+        observe_slow_network_stage(
+            "coding-activation-job",
+            None,
+            process_coding_activation_job(node.clone(), &p2p),
+        )
+        .await?;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -8173,6 +8193,28 @@ pub async fn run_coordinator_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Res
                     .await?;
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+            }
+        }
+    }
+}
+
+async fn observe_slow_network_stage<T>(
+    stage: &'static str,
+    revision_id: Option<Uuid>,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = tokio::time::Instant::now();
+    tokio::pin!(future);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(60), &mut future).await {
+            Ok(result) => return result,
+            Err(_) => {
+                tracing::warn!(
+                    ?revision_id,
+                    stage,
+                    elapsed_seconds = started.elapsed().as_secs(),
+                    "network workflow is still waiting in this stage"
+                );
             }
         }
     }
@@ -13984,16 +14026,18 @@ async fn wait_for_variable_coding_groups(
     checkpoint: GuildCheckpoint,
 ) -> Result<()> {
     let checkpoint_hash = checkpoint.hash()?;
+    let started = tokio::time::Instant::now();
+    let mut next_report = started + Duration::from_secs(60);
     let expected_membership_epoch = checkpoint
         .authority
         .context("variable checkpoint has no dynamic authority")?
         .membership_epoch;
     loop {
-        let current_membership_epoch = node_blocking(node.clone(), |node| {
-            Ok(node
+        let (current_membership_epoch, event_sequence) = node_blocking(node.clone(), |node| {
+            let state = node
                 .dynamic_guild_state()?
-                .context("backup coordinator has no dynamic guild state")?
-                .membership_epoch)
+                .context("backup coordinator has no dynamic guild state")?;
+            Ok((state.membership_epoch, state.event_sequence))
         })
         .await?;
         if current_membership_epoch != expected_membership_epoch {
@@ -14014,10 +14058,22 @@ async fn wait_for_variable_coding_groups(
         {
             bail!("variable coding has no pending owner for uncovered checkpoint");
         }
-        tracing::debug!(
-            error = %coverage.unwrap_err(),
-            "backup is waiting for verified variable coding groups"
-        );
+        let coverage_error = coverage.unwrap_err();
+        if tokio::time::Instant::now() >= next_report {
+            tracing::warn!(
+                checkpoint = %hex::encode(checkpoint_hash),
+                event_sequence,
+                elapsed_seconds = started.elapsed().as_secs(),
+                error = %coverage_error,
+                "backup is still waiting for verified variable coding groups"
+            );
+            next_report = tokio::time::Instant::now() + Duration::from_secs(60);
+        } else {
+            tracing::debug!(
+                error = %coverage_error,
+                "backup is waiting for verified variable coding groups"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -15033,7 +15089,12 @@ async fn commit_backup_job(
         }
     }
 
-    let revision = fetch_p2p_revision(node.clone(), p2p, local_id, &job.descriptor).await?;
+    let revision = observe_slow_network_stage(
+        "fetch-revision",
+        Some(job.descriptor.revision_id),
+        fetch_p2p_revision(node.clone(), p2p, local_id, &job.descriptor),
+    )
+    .await?;
     revision.verify(mb_core::USER_REVISION_DOMAIN)?;
     revision.value.verify_writer()?;
     if revision.signer != job.descriptor.owner
@@ -15076,7 +15137,12 @@ async fn commit_backup_job(
         None => (1, None, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     include_writer_fence(&mut writer_fences, &revision.value)?;
-    ensure_writer_key_epochs(node.clone(), p2p, writer_fences.clone()).await?;
+    observe_slow_network_stage(
+        "writer-key-epochs",
+        Some(job.descriptor.revision_id),
+        ensure_writer_key_epochs(node.clone(), p2p, writer_fences.clone()),
+    )
+    .await?;
     revisions.push(revision);
     revisions.sort_by_key(|revision| {
         (
@@ -15095,15 +15161,19 @@ async fn commit_backup_job(
         &mut coding_groups,
     )?;
     coding_groups.clear();
-    let packing = build_production_packing(
-        node.clone(),
-        p2p,
-        local_id,
-        guild_id,
-        &revisions,
-        previous_packing_catalog.as_ref(),
-        &checkpoint_members,
-        checkpoint_authority,
+    let packing = observe_slow_network_stage(
+        "pack-source-sectors",
+        Some(job.descriptor.revision_id),
+        build_production_packing(
+            node.clone(),
+            p2p,
+            local_id,
+            guild_id,
+            &revisions,
+            previous_packing_catalog.as_ref(),
+            &checkpoint_members,
+            checkpoint_authority,
+        ),
     )
     .await?;
     let checkpoint = GuildCheckpoint {
@@ -15161,14 +15231,18 @@ async fn commit_backup_job(
                 placement_capacity: &mut placement_capacity,
             },
         )?;
-        queue_variable_coding_lanes(
-            node.clone(),
-            p2p,
-            local_id,
-            checkpoint_hash,
-            checkpoint_authority.membership_epoch,
-            &coding_peers,
-            variable_lanes,
+        observe_slow_network_stage(
+            "queue-coding-lanes",
+            Some(job.descriptor.revision_id),
+            queue_variable_coding_lanes(
+                node.clone(),
+                p2p,
+                local_id,
+                checkpoint_hash,
+                checkpoint_authority.membership_epoch,
+                &coding_peers,
+                variable_lanes,
+            ),
         )
         .await?;
     }
