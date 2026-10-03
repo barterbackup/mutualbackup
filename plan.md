@@ -1193,13 +1193,18 @@ Btrfs through that constructor. The subsequent file-namespace journal writes
 rename/unlink intent before mutating a pinned lower directory and reconciles
 either side of the mutation on rebuild. Renamed and deleted entries survive
 actual FUSE remounts on ext4 and fresh local Btrfs; a replacement identity is
-rejected. The following slice publishes newly created
-files from anonymous same-filesystem inodes after recording their identities.
+rejected. The following slice publishes newly created files from anonymous
+same-filesystem inodes after recording their identities.
 Interrupted publication reconciles across control-database reopen, and
 ordinary-user creation, rename, later writes, and FUSE remount pass on ext4
-and fresh local Btrfs. Directory mutations, atomic replacement, remaining
-metadata and allocation modes, concurrent handles, mount supervision/recovery,
-and guarded enrollment remain open.
+and fresh local Btrfs. Atomic replacement now exchanges the source and target
+inodes under one durable intent, publishes both namespace records together,
+and removes the displaced inode only after that publication. Replay covers
+every exchange/publication/cleanup boundary; ordinary-user replacement of a
+still-frozen file and cross-directory replacement preserve the captured
+anchors through remount on ext4 and fresh local Btrfs. Directory mutations,
+remaining metadata and allocation modes, concurrent handles, mount
+supervision/recovery, and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

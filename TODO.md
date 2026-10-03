@@ -134,11 +134,17 @@
   discards an unpublished intent or verifies and finishes its visible file;
   a foreign target fails closed. Ordinary-user creation in the root and a
   nested directory, rename, writable reopen, unlink, and FUSE remount pass on
-  ext4 and fresh local Btrfs. Four nonprivileged journal regressions, 98 normal
-  store tests, all ten privileged FUSE probes on ext4 and fresh local Btrfs,
-  and strict workspace Clippy pass locally. Directory mutations and atomic
-  replacement, remaining metadata and allocation modes, concurrent handles,
-  mount supervision/recovery, and whole-worktree enrollment remain open.
+  ext4 and fresh local Btrfs. Atomic replacement now journals one two-inode
+  exchange, publishes both namespace records together, and conditionally
+  removes the displaced inode. Restart finishes the operation at each
+  exchange, publication, and cleanup boundary, and refuses a foreign target.
+  Ordinary-user replacement of a still-frozen captured file and a
+  cross-directory replacement preserve exact anchors through remount.
+  Seven nonprivileged journal regressions, 101 normal store tests, all eleven
+  privileged FUSE probes on ext4 and fresh local Btrfs, and strict workspace
+  Clippy pass locally. Directory mutations, remaining metadata and allocation
+  modes, concurrent handles, mount supervision/recovery, and whole-worktree
+  enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
