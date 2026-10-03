@@ -3357,6 +3357,11 @@ backend gates. A command being present does not by itself close its slice.
   overwritten by checkout, restore, switch, or pull.
   Treat raw-byte behavior as a gate for each supported command, including
   interoperation commands, rather than deferring it to final milestone testing.
+  For each file- or blob-touching command, trace the bytes read, the bytes
+  hashed/stored, and any bytes written to a worktree or transport. A command
+  passes only if its own path preserves those bytes and never invokes a
+  Git-library conversion or an external filter; metadata-only commands must
+  not introduce a converted payload indirectly.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
   content, not just the currently checked-out tree. A signed MutualBackup
   revision/checkpoint is the protection boundary; seed-only recovery must
@@ -3409,11 +3414,13 @@ backend gates. A command being present does not by itself close its slice.
   `core.autocrlf`, `core.eol`, `core.safecrlf`, `merge.renormalize`, and
   `filter.<driver>.*` settings and rules from
   `.gitattributes`, `core.attributesFile`, and `.git/info/attributes` for
-  `text=auto`, `eol`, `filter`, `ident`, and `working-tree-encoding` across add,
-  merge, reset/restore, pull, worktree checkout, import, and export; verify a configured
-  filter is never executed; verify renormalization/filter-enabling command
-  options are rejected without changing index, refs, anchors, or worktree;
-  transforming rules remain present but inert while raw-byte commands succeed;
+  `text=auto`, `eol`, `filter`, `ident`, and `working-tree-encoding` across every
+  supported byte-touching path: add, rm, commit, status/diff, switch/checkout,
+  reset/restore, merge, worktree creation, fetch/pull/push, import/export, and
+  prune/GC. Verify a configured filter is never executed, and reject command
+  options that enable renormalization or filters without changing index, refs,
+  anchors, or worktree. Verify that transforming rules remain present but inert
+  while raw-byte commands succeed;
   verify `status` and `diff` report a line-ending-only edit as dirty and
   destructive worktree operations protect that edit;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
