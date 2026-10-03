@@ -278,6 +278,41 @@ impl GuardedRootCapturePlan {
         self.entries.len()
     }
 
+    pub(crate) fn source_root_identity(&self) -> NativeFileId {
+        NativeFileId {
+            filesystem_id: self.root_version.filesystem_id,
+            inode: self.root_version.inode,
+        }
+    }
+
+    pub(crate) fn captured_entry_identity(&self, path: &str) -> Option<NativeFileId> {
+        self.entries
+            .iter()
+            .find(|entry| entry.path() == path)
+            .map(|entry| NativeFileId {
+                filesystem_id: entry.version().filesystem_id,
+                inode: entry.version().inode,
+            })
+    }
+
+    pub(crate) fn load_active_for_view(
+        control: &ControlStore,
+        manifest: &StableAnchorManifest,
+    ) -> anyhow::Result<Self> {
+        let plan = Self::load_for_manifest(control, manifest)?
+            .ok_or_else(|| anyhow::anyhow!("guarded view has no durable capture plan"))?;
+        anyhow::ensure!(
+            control
+                .get_record(RETIRE_KIND, plan.anchor_id.as_bytes())?
+                .is_none()
+                && control
+                    .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())?
+                    .is_some(),
+            "guarded view capture is not published or is retiring"
+        );
+        Ok(plan)
+    }
+
     /// Decode a pending guarded plan without requiring its source volume to
     /// be online. Capture itself performs the descriptor and journal checks.
     pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {

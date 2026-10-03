@@ -26,6 +26,10 @@ use fuser::{
     ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
 };
 
+use crate::{
+    CapturedEntry, ControlStore, GuardedRootCapturePlan, PinnedDirectory, StableAnchorManifest,
+};
+
 const FILE_INODE: INodeNo = INodeNo(2);
 const ENTRY_TTL: Duration = Duration::ZERO;
 const PROBE_BYTES: &[u8] = b"mutualbackup-guarded-view-probe";
@@ -52,7 +56,11 @@ struct GuardedProbeDirectory {
     relative_path: PathBuf,
 }
 
-struct GuardedProbeView {
+/// Experimental FUSE view for a published guarded capture. Enrollment and
+/// mount supervision remain gated until namespace replay and mutation coverage
+/// are complete. The caller must keep the lower source directory inaccessible
+/// to ordinary users while this view is mounted.
+pub struct GuardedProbeView {
     files: HashMap<u64, GuardedProbeFile>,
     directories: HashMap<u64, GuardedProbeDirectory>,
     names: Mutex<HashMap<(u64, OsString), u64>>,
@@ -84,6 +92,147 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    /// Rebuild the initial namespace only while every captured source path is
+    /// still at its recorded identity. A rename or unlink without a durable
+    /// namespace journal fails closed instead of silently losing that change.
+    pub fn from_guarded_capture(
+        manifest: &StableAnchorManifest,
+        control: Arc<Mutex<ControlStore>>,
+        view_uid: u32,
+        view_gid: u32,
+    ) -> anyhow::Result<Self> {
+        let plan = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            GuardedRootCapturePlan::load_active_for_view(&control, manifest)?
+        };
+        let lower_root = PinnedDirectory::open(plan.source_root())?;
+        ensure!(
+            lower_root.identity()? == plan.source_root_identity(),
+            "guarded view source root changed after capture"
+        );
+        let mut paths = HashMap::new();
+        paths.insert(PathBuf::new(), INodeNo::ROOT);
+        let mut directories = Vec::new();
+        let mut files = Vec::new();
+        for (index, entry) in manifest.entries.iter().enumerate() {
+            let (path, mode) = match entry {
+                CapturedEntry::Directory { path, mode, .. }
+                | CapturedEntry::FileV2 { path, mode, .. } => (path, *mode),
+                CapturedEntry::File { .. } => {
+                    anyhow::bail!("guarded view needs native file identities")
+                }
+            };
+            let relative = Path::new(path);
+            let parent_path = relative.parent().context("guarded entry has no parent")?;
+            let parent = *paths
+                .get(parent_path)
+                .context("guarded view entry has no captured parent directory")?;
+            let name = relative.file_name().context("guarded entry has no name")?;
+            let inode = INodeNo(
+                u64::try_from(index)?
+                    .checked_add(2)
+                    .context("view inode overflow")?,
+            );
+            let expected = plan
+                .captured_entry_identity(path)
+                .context("guarded manifest entry is not in its source plan")?;
+            match entry {
+                CapturedEntry::Directory { .. } => {
+                    let lower = lower_root.open_descendant_directory(relative)?;
+                    ensure!(
+                        lower.identity()? == expected,
+                        "guarded view directory changed after capture"
+                    );
+                    let mut attr =
+                        probe_directory_attr(lower.as_file(), inode, (mode & 0o7777) as u16)?;
+                    attr.uid = view_uid;
+                    attr.gid = view_gid;
+                    directories.push(GuardedProbeDirectory {
+                        attr,
+                        parent,
+                        name: name.to_os_string(),
+                        relative_path: relative.to_path_buf(),
+                    });
+                }
+                CapturedEntry::FileV2 { native_id, .. } => {
+                    ensure!(
+                        *native_id == expected,
+                        "guarded manifest file identity differs from its plan"
+                    );
+                    let lower_parent = if parent_path.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(lower_root.open_descendant_directory(parent_path)?)
+                    };
+                    let lower_parent = lower_parent.as_ref().unwrap_or(&lower_root);
+                    ensure!(
+                        lower_parent.entry_identity(name, false)? == Some(expected),
+                        "guarded view file moved or changed after capture"
+                    );
+                    let source = lower_parent
+                        .open_child_file(name)?
+                        .context("guarded view source file disappeared")?;
+                    let _anchor = manifest.file_locator(path.clone())?.open()?;
+                    let mut attr = probe_file_attr(&source, inode, (mode & 0o7777) as u16)?;
+                    attr.uid = view_uid;
+                    attr.gid = view_gid;
+                    let location = Arc::new(Mutex::new(Some(ProbeLocation {
+                        parent,
+                        relative_path: relative.to_path_buf(),
+                    })));
+                    let location_for_open = Arc::clone(&location);
+                    let control_for_open = Arc::clone(&control);
+                    let plan_for_open = plan.clone();
+                    let lower_path = plan.source_root().to_path_buf();
+                    let captured_path = path.clone();
+                    let open_for_write: Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync> =
+                        Arc::new(move |mode| {
+                            let location = location_for_open.lock().map_err(|_| {
+                                io::Error::other("guarded location lock is poisoned")
+                            })?;
+                            let location = location
+                                .as_ref()
+                                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                            let control = control_for_open.lock().map_err(|_| {
+                                io::Error::other("guarded control lock is poisoned")
+                            })?;
+                            plan_for_open
+                                .prepare_file_edit_at(
+                                    &control,
+                                    &captured_path,
+                                    &location.relative_path,
+                                )
+                                .map_err(io::Error::other)?;
+                            OpenOptions::new()
+                                .read(mode == OpenAccMode::O_RDWR)
+                                .write(true)
+                                .open(lower_path.join(&location.relative_path))
+                        });
+                    files.push(GuardedProbeFile {
+                        source,
+                        source_attr: Mutex::new(attr),
+                        location,
+                        open_for_write: Some(open_for_write),
+                    });
+                }
+                CapturedEntry::File { .. } => unreachable!(),
+            }
+            ensure!(
+                paths.insert(relative.to_path_buf(), inode).is_none(),
+                "duplicate guarded view entry"
+            );
+        }
+        Ok(Self::with_directories(
+            files,
+            directories,
+            (manifest.root_mode & 0o7777) as u16,
+            Arc::new(AtomicU64::new(0)),
+            Some(lower_root),
+        ))
+    }
+
     fn new(
         files: Vec<GuardedProbeFile>,
         root_perm: u16,
@@ -204,7 +353,6 @@ fn probe_file_attr(source: &File, inode: INodeNo, advertised_mode: u16) -> io::R
     })
 }
 
-#[cfg(test)]
 fn probe_directory_attr(
     source: &File,
     inode: INodeNo,
@@ -880,7 +1028,7 @@ mod tests {
     use std::io::{self, Read};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
@@ -892,10 +1040,7 @@ mod tests {
         LinkFreezeCapturePhase,
     };
 
-    use super::{
-        FILE_INODE, GuardedProbeDirectory, GuardedProbeFile, GuardedProbeView, ProbeLocation,
-        probe_directory_attr, probe_file_attr,
-    };
+    use super::{FILE_INODE, GuardedProbeFile, GuardedProbeView, ProbeLocation, probe_file_attr};
 
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN and FUSE passthrough"]
@@ -1192,53 +1337,6 @@ mod tests {
         guarded_view_mutation_case(FirstMutation::Unlink);
     }
 
-    fn root_captured_probe_file(
-        lower: &Path,
-        captured_name: &str,
-        inode: INodeNo,
-        parent: INodeNo,
-        plan: &GuardedRootCapturePlan,
-        control: &Arc<Mutex<ControlStore>>,
-    ) -> GuardedProbeFile {
-        let location = Arc::new(Mutex::new(Some(ProbeLocation {
-            parent,
-            relative_path: PathBuf::from(captured_name),
-        })));
-        let location_for_open = Arc::clone(&location);
-        let control_for_open = Arc::clone(control);
-        let plan_for_open = plan.clone();
-        let lower_for_open = lower.to_path_buf();
-        let captured = captured_name.to_owned();
-        let open_for_write: Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync> =
-            Arc::new(move |mode| {
-                let current = location_for_open
-                    .lock()
-                    .map_err(|_| io::Error::other("guarded path lock is poisoned"))?;
-                let current = current
-                    .as_ref()
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-                let control = control_for_open
-                    .lock()
-                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
-                plan_for_open
-                    .prepare_file_edit_at(&control, &captured, &current.relative_path)
-                    .map_err(io::Error::other)?;
-                OpenOptions::new()
-                    .read(mode == OpenAccMode::O_RDWR)
-                    .write(true)
-                    .open(lower_for_open.join(&current.relative_path))
-            });
-        let source = File::open(lower.join(captured_name)).unwrap();
-        let mut advertised = probe_file_attr(&source, inode, 0o666).unwrap();
-        advertised.uid = 65534;
-        GuardedProbeFile {
-            source,
-            source_attr: Mutex::new(advertised),
-            location,
-            open_for_write: Some(open_for_write),
-        }
-    }
-
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn two_file_guarded_root_dispatches_edits_and_renames_by_inode() {
@@ -1269,26 +1367,9 @@ mod tests {
         let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
         let manifest = plan.capture(&control).unwrap();
         let control = Arc::new(Mutex::new(control));
-        let files = ["alpha", "beta"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, captured_name)| {
-                root_captured_probe_file(
-                    &lower,
-                    captured_name,
-                    INodeNo(index as u64 + 2),
-                    INodeNo::ROOT,
-                    &plan,
-                    &control,
-                )
-            })
-            .collect();
-        let view = GuardedProbeView::new(
-            files,
-            0o777,
-            Arc::new(Default::default()),
-            Some(crate::PinnedDirectory::open(&lower).unwrap()),
-        );
+        let view =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
         let mut config = Config::default();
         config.acl = SessionACL::All;
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
@@ -1368,6 +1449,11 @@ mod tests {
         let unmounted = session.umount_and_join();
         result.unwrap();
         unmounted.unwrap();
+        assert!(
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .is_err(),
+            "a moved file was silently adopted after the view was rebuilt"
+        );
     }
 
     #[test]
@@ -1403,33 +1489,9 @@ mod tests {
         let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
         let manifest = plan.capture(&control).unwrap();
         let control = Arc::new(Mutex::new(control));
-        let mut nested_attr =
-            probe_directory_attr(&File::open(&nested).unwrap(), INodeNo(2), 0o777).unwrap();
-        nested_attr.uid = 65534;
-        let files = vec![
-            root_captured_probe_file(&lower, "top", INodeNo(3), INodeNo::ROOT, &plan, &control),
-            root_captured_probe_file(
-                &lower,
-                "nested/leaf",
-                INodeNo(4),
-                INodeNo(2),
-                &plan,
-                &control,
-            ),
-        ];
-        let directory = GuardedProbeDirectory {
-            attr: nested_attr,
-            parent: INodeNo::ROOT,
-            name: "nested".into(),
-            relative_path: PathBuf::from("nested"),
-        };
-        let view = GuardedProbeView::with_directories(
-            files,
-            vec![directory],
-            0o777,
-            Arc::new(Default::default()),
-            Some(crate::PinnedDirectory::open(&lower).unwrap()),
-        );
+        let view =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
         let mut config = Config::default();
         config.acl = SessionACL::All;
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
