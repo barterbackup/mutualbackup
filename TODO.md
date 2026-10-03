@@ -178,6 +178,17 @@
   signature quorums, transport exhaustion, and stale-address dials. No coding
   dissemination timeout was observed, so this run does not verify that branch
   or explain the historical 5,400-second missing-signer stall. Keep open.
+  `2b8c248` installs certified plain lifecycle events locally before concurrent
+  peer dissemination with the same 20-second eager bound. A focused test holds
+  one install response open, checks that the local tail is already installed,
+  and exercises the bound; administration and coding activation tests and
+  strict workspace Clippy pass. The isolated five-daemon topology and seed-only
+  recovery test passed on this source in 1,490.34 seconds on fresh local Btrfs;
+  its image, mount, and network namespaces were removed. During the run, a
+  signer exhausted transport tiers and then rejected event 25 because the
+  caller was not its configured coordinator; the guild later advanced.
+  Investigate that pre-certification signer/authorization path separately.
+  Bounded dissemination does not close the historical 5,400-second stall.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

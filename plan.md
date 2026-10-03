@@ -1450,6 +1450,17 @@ The topology reached event 43 but again showed transient short lifecycle
 signature quorums and stale-address dials. The timeout branch was not observed,
 and the historical missing-signer stall remains unexplained; keep the
 reliability gate open.
+`2b8c248` also installs a certified plain lifecycle event locally before
+concurrent, 20-second-bounded peer dissemination. A focused test holds one peer
+response open, verifies the local tail is available before peer sends, and
+exercises the timeout; administration and coding activation regressions and
+strict workspace Clippy pass. The isolated five-daemon topology and seed-only
+recovery test passed on the same source in 1,490.34 seconds on fresh local
+Btrfs, with complete temporary-resource cleanup. A signer still temporarily
+exhausted transport tiers and then rejected event 25 as coming from a caller
+other than the configured coordinator before later progress. This correction
+improves post-certification dissemination, but does not explain that
+pre-certification signer failure; keep the reliability gate open.
 The guarded FUSE view now answers `statfs` from the pinned lower-root
 descriptor, reporting real filesystem capacity and name limits. A privileged
 ordinary-user `statvfs` probe and comparison with the native filesystem pass
