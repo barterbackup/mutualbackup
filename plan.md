@@ -1562,11 +1562,15 @@ held-descriptor and partial-replay probes pass on ext4 and fresh local Btrfs;
 ACL and file-capability cases fail before mutation. Frozen-file retirement
 now replays UID/GID and access restoration after anchor unlink; interruption
 after unlink and after `fchown` passes on ext4 and fresh local Btrfs. The
-root-level lower-ownership snapshot still blocks root retirement, and
-detached owner-isolated files remain fenced. The initial freeze and ownership
-change still have a guard-release gap, so this is not yet an enrollment-safe
-transition; directory isolation and signed mutable-view recovery also remain
-open.
+root-level retirement now preflights unchanged directory metadata and binds
+changed file owners to their isolation records, then clears the lower-owner
+snapshot after all file retirements. Restart after one file completed and a
+changed-directory refusal pass on ext4 and fresh local Btrfs. The held file
+guard also checks an unjournaled owner before unlink. This path does
+not yet cover private or user-modified directories; detached owner-isolated
+files remain fenced. The initial freeze and ownership change still have a
+guard-release gap, so this is not yet an enrollment-safe transition;
+directory isolation and signed mutable-view recovery also remain open.
 Guarded enrollment therefore still needs durable private-inode ownership and
 mode isolation plus virtualized, protected metadata before ordinary user-owned
 source trees are admissible.

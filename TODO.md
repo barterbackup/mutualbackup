@@ -614,11 +614,21 @@
   probes cover interruption after unlink and after `fchown`; the held-descriptor
   probe also verifies final restoration. These pass on ext4 and fresh local
   Btrfs, alongside 115 normal store tests and strict workspace Clippy.
-  Root retirement still refuses the surviving lower-ownership snapshot, and
-  detached owner-isolated files remain fenced. Enrollment still needs the
-  initial freeze and owner change joined under one guard, directory isolation
-  and recovery, owner restoration after detach/root retirement, and signed
-  mutable-view state.
+  Root retirement now consumes the lower-ownership snapshot after all captured
+  file journals finish: it preflights unchanged root/directory metadata and
+  matches any changed file owner to its isolation journal, then clears the
+  snapshot before removing the anchor namespace. Preflight refuses a changed
+  directory or an unjournaled file-owner change before retirement starts;
+  the file's held write guard rechecks an unjournaled owner before unlink.
+  Restart after one file retired and ordinary two-file retirement pass on ext4
+  and fresh local Btrfs, alongside 115 normal store tests and strict workspace
+  Clippy.
+  This path currently requires the recorded root and directories to remain
+  unchanged; directory isolation and user-visible metadata changes need their
+  own replayable restoration. Detached owner-isolated files remain fenced.
+  Enrollment still needs the initial freeze and owner change joined under one
+  guard, directory isolation and recovery, owner restoration after detach,
+  and signed mutable-view state.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

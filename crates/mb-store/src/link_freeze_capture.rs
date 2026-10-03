@@ -153,6 +153,40 @@ impl RetireIntent {
 }
 
 impl LinkFreezeCaptureIntent {
+    pub(crate) fn verify_lower_owner_before_retirement(
+        &self,
+        control: &ControlStore,
+        original: FileOwner,
+        current: Option<FileOwner>,
+    ) -> anyhow::Result<()> {
+        let isolated = OwnerIsolation::load(control, self.anchor_id)?;
+        if let Some(record) = &isolated {
+            anyhow::ensure!(
+                self.phase == LinkFreezeCapturePhase::Frozen
+                    && record.source_id == self.source_id
+                    && (record.original_uid, record.original_gid) == (original.uid, original.gid),
+                "frozen owner isolation differs from lower ownership snapshot"
+            );
+        }
+        if let Some(current) = current {
+            let expected_private = isolated
+                .as_ref()
+                .map(|record| (record.private_uid, record.private_gid));
+            anyhow::ensure!(
+                current == original || expected_private == Some((current.uid, current.gid)),
+                "guarded lower owner changed without its isolation journal"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owner_isolation_pending(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        Ok(OwnerIsolation::load(control, anchor_id)?.is_some())
+    }
+
     /// Record original access metadata and exact sparse bytes before adding a
     /// hard link or changing permissions. A held kernel guard excludes both
     /// already-open writers and new opens during this initial proof.
@@ -506,7 +540,33 @@ impl LinkFreezeCaptureIntent {
         source_parent: &PinnedDirectory,
         anchor_parent: &PinnedDirectory,
     ) -> anyhow::Result<()> {
+        self.retire_unreferenced_inner(control, source_parent, anchor_parent, None)
+    }
+
+    pub(crate) fn retire_unreferenced_with_original_owner(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+        original: FileOwner,
+    ) -> anyhow::Result<()> {
+        self.retire_unreferenced_inner(control, source_parent, anchor_parent, Some(original))
+    }
+
+    fn retire_unreferenced_inner(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+        original: Option<FileOwner>,
+    ) -> anyhow::Result<()> {
         let owner = OwnerIsolation::load(control, self.anchor_id)?;
+        if let (Some(record), Some(original)) = (&owner, original) {
+            anyhow::ensure!(
+                (record.original_uid, record.original_gid) == (original.uid, original.gid),
+                "frozen owner isolation differs from lower ownership snapshot"
+            );
+        }
         anyhow::ensure!(
             owner.is_none() || self.phase == LinkFreezeCapturePhase::Frozen,
             "detached owner-isolated anchor needs separate owner recovery"
@@ -585,6 +645,11 @@ impl LinkFreezeCaptureIntent {
                                 FileAccessSnapshot::capture(&guard.file)? == owner.frozen_access,
                                 "shared anchor access changed before retirement"
                             );
+                        } else if let Some(original) = original {
+                            anyhow::ensure!(
+                                (metadata.uid(), metadata.gid()) == (original.uid, original.gid),
+                                "shared anchor owner changed without an isolation journal"
+                            );
                         }
                         anchor_parent
                             .remove_child_file_if_identity(&self.anchor_name, self.source_id)?;
@@ -593,14 +658,18 @@ impl LinkFreezeCaptureIntent {
                         guard.release()?;
                     }
                     (Some(source_id), None) if source_id == self.source_id => {
+                        let metadata = source_parent
+                            .open_child_file(&self.source_name)?
+                            .ok_or_else(|| anyhow::anyhow!("retiring source disappeared"))?
+                            .metadata()?;
                         anyhow::ensure!(
-                            source_parent
-                                .open_child_file(&self.source_name)?
-                                .ok_or_else(|| anyhow::anyhow!("retiring source disappeared"))?
-                                .metadata()?
-                                .nlink()
-                                == 1,
-                            "retiring source kept another hard-link alias"
+                            metadata.nlink() == 1
+                                && (owner.is_some()
+                                    || original.is_none_or(|original| {
+                                        (metadata.uid(), metadata.gid())
+                                            == (original.uid, original.gid)
+                                    })),
+                            "retiring source has another alias or an unjournaled owner"
                         );
                         retire.advance(control, RetirePhase::AnchorRemoved)?;
                     }
@@ -1629,6 +1698,60 @@ print('DONE', flush=True)
             assert!(OwnerIsolation::load(&store, anchor_id).unwrap().is_none());
             assert!(!LinkFreezeCaptureIntent::retirement_pending(&store, anchor_id).unwrap());
         }
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for held-descriptor write exclusion"]
+    fn root_retirement_rejects_unjournaled_owner_before_unlink() {
+        let root = test_directory();
+        let source_path = root.path().join("source");
+        let anchor_path = root.path().join("anchor");
+        fs::write(&source_path, b"frozen exact bytes").unwrap();
+        let name = std::ffi::CString::new(source_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 65534, 65534) }, 0);
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([121; 32]));
+        let store =
+            crate::database::ControlStore::open(root.path().join("control.db"), &keys).unwrap();
+        let anchor_id = uuid::Uuid::new_v4();
+        let frozen =
+            LinkFreezeCaptureIntent::begin(&store, anchor_id, &parent, "source", &parent, "anchor")
+                .unwrap()
+                .resume(&store, &parent, &parent)
+                .unwrap()
+                .unwrap();
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 0, 0) }, 0);
+        assert!(
+            frozen
+                .clone()
+                .retire_unreferenced_with_original_owner(
+                    &store,
+                    &parent,
+                    &parent,
+                    FileOwner {
+                        uid: 65534,
+                        gid: 65534,
+                    },
+                )
+                .is_err()
+        );
+        assert!(anchor_path.exists());
+        assert_eq!(fs::read(&anchor_path).unwrap(), b"frozen exact bytes");
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 65534, 65534) }, 0);
+        frozen
+            .retire_unreferenced_with_original_owner(
+                &store,
+                &parent,
+                &parent,
+                FileOwner {
+                    uid: 65534,
+                    gid: 65534,
+                },
+            )
+            .unwrap();
+        assert!(LinkFreezeCaptureIntent::finish_completed_retirement(&store, anchor_id).unwrap());
+        assert!(!anchor_path.exists());
+        assert_eq!(fs::metadata(&source_path).unwrap().uid(), 65534);
     }
 
     #[test]

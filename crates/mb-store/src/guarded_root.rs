@@ -651,6 +651,123 @@ impl GuardedRootCapturePlan {
         Ok(())
     }
 
+    fn verify_lower_directories_for_retirement(
+        &self,
+        snapshot: &LowerOwnershipSnapshot,
+        lower: &PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        let root_entry = snapshot
+            .entries
+            .first()
+            .ok_or(AnchorError::InvalidGuardedPlan)?;
+        let directories = std::iter::once(root_entry).chain(
+            self.entries
+                .iter()
+                .zip(snapshot.entries.iter().skip(1))
+                .filter_map(|(planned, recorded)| planned.is_directory().then_some(recorded)),
+        );
+        for entry in directories {
+            let directory = if entry.path.is_empty() {
+                lower.try_clone()?
+            } else {
+                lower.open_descendant_directory(&entry.path)?
+            };
+            let metadata = directory.as_file().metadata()?;
+            anyhow::ensure!(
+                directory.identity()? == entry.native_id
+                    && metadata.uid() == entry.uid
+                    && metadata.gid() == entry.gid
+                    && unix_mode(&metadata) & 0o7777 == entry.mode
+                    && read_access_acl(directory.as_file())? == entry.access_acl,
+                "guarded lower directory changed during retirement: {}",
+                entry.path
+            );
+        }
+        Ok(())
+    }
+
+    fn source_file_at_recorded_identity(
+        lower: &PinnedDirectory,
+        entry: &LowerOwnershipEntry,
+    ) -> anyhow::Result<Option<File>> {
+        let path = Path::new(&entry.path);
+        if lower.entry_identity(path, false)? != Some(entry.native_id) {
+            return Ok(None);
+        }
+        let parent = path.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+        let directory = if parent.as_os_str().is_empty() {
+            lower.try_clone()?
+        } else {
+            lower.open_descendant_directory(parent)?
+        };
+        let name = path.file_name().ok_or(AnchorError::InvalidGuardedPlan)?;
+        let file = directory
+            .open_child_file(name)?
+            .ok_or_else(|| anyhow::anyhow!("guarded lower file disappeared: {}", entry.path))?;
+        anyhow::ensure!(
+            directory.identity()?.filesystem_id == entry.native_id.filesystem_id
+                && file.metadata()?.ino() == entry.native_id.inode
+                && directory.entry_identity(name, false)? == Some(entry.native_id),
+            "guarded lower file changed during retirement: {}",
+            entry.path
+        );
+        Ok(Some(file))
+    }
+
+    fn verify_lower_ownership_before_retirement(
+        &self,
+        control: &ControlStore,
+        snapshot: &LowerOwnershipSnapshot,
+    ) -> anyhow::Result<()> {
+        let lower = PinnedDirectory::open(&self.source_root)?;
+        self.verify_lower_directories_for_retirement(snapshot, &lower)?;
+        for (planned, recorded) in self.entries.iter().zip(snapshot.entries.iter().skip(1)) {
+            let GuardedRootEntry::File { capture_id, .. } = planned else {
+                continue;
+            };
+            let Some(capture) = LinkFreezeCaptureIntent::load(control, *capture_id)? else {
+                continue;
+            };
+            let current = Self::source_file_at_recorded_identity(&lower, recorded)?
+                .map(|file| file.metadata())
+                .transpose()?;
+            capture.verify_lower_owner_before_retirement(
+                control,
+                FileOwner {
+                    uid: recorded.uid,
+                    gid: recorded.gid,
+                },
+                current.map(|metadata| FileOwner {
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn finish_lower_ownership_retirement(
+        &self,
+        control: &ControlStore,
+        snapshot: &LowerOwnershipSnapshot,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let lower = PinnedDirectory::open(&self.source_root)?;
+        self.verify_lower_directories_for_retirement(snapshot, &lower)?;
+        for planned in &self.entries {
+            let GuardedRootEntry::File { capture_id, .. } = planned else {
+                continue;
+            };
+            anyhow::ensure!(
+                LinkFreezeCaptureIntent::load(control, *capture_id)?.is_none()
+                    && !LinkFreezeCaptureIntent::owner_isolation_pending(control, *capture_id)?,
+                "guarded lower file still has an owner restoration obligation"
+            );
+        }
+        control.delete_record_if_value(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes(), bytes)?;
+        Ok(())
+    }
+
     /// A frozen inode has guard-restricted lower permissions, so its captured
     /// mode is the visible one. Once the edit journal made that inode
     /// independent, the lower inode's mode includes later owner chmods and is
@@ -1512,12 +1629,6 @@ impl GuardedRootCapturePlan {
     /// interrupted retirement.
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
-        anyhow::ensure!(
-            control
-                .get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
-                .is_none(),
-            "guarded lower ownership must be restored or canceled before retirement"
-        );
         crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
         let plan_bytes = mb_core::canonical_bytes(self)?;
         let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
@@ -1528,6 +1639,21 @@ impl GuardedRootCapturePlan {
                 .is_none_or(|bytes| bytes == &plan_bytes),
             "guarded root plan changed before retirement"
         );
+        let lower_ownership = control
+            .get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
+            .map(|bytes| {
+                let snapshot: LowerOwnershipSnapshot = mb_core::decode_canonical(&bytes)?;
+                Ok::<_, anyhow::Error>((bytes, snapshot))
+            })
+            .transpose()?;
+        if let Some((_, snapshot)) = &lower_ownership {
+            anyhow::ensure!(
+                recorded_plan.is_some(),
+                "guarded lower owner lost its root plan"
+            );
+            self.reconcile(control)?;
+            self.verify_lower_ownership_before_retirement(control, snapshot)?;
+        }
         let retirement = RootRetirement {
             format_version: 1,
             anchor_id: self.anchor_id,
@@ -1553,6 +1679,10 @@ impl GuardedRootCapturePlan {
             .map(mb_core::decode_canonical::<RootClaim>)
             .transpose()?;
         let anchor_root = area.open_child_directory(self.anchor_id.to_string())?;
+        anyhow::ensure!(
+            lower_ownership.is_none() || anchor_root.is_some(),
+            "guarded lower owner lost its anchor root"
+        );
         if recorded_plan.is_none() || anchor_root.is_none() {
             anyhow::ensure!(
                 existing_retirement.is_some() || recorded_plan.is_none(),
@@ -1621,7 +1751,7 @@ impl GuardedRootCapturePlan {
                 );
             }
         }
-        for entry in &self.entries {
+        for (index, entry) in self.entries.iter().enumerate() {
             let GuardedRootEntry::File {
                 path,
                 capture_id,
@@ -1685,9 +1815,25 @@ impl GuardedRootCapturePlan {
                 Some(capture)
             };
             if let Some(capture) = capture {
-                capture.retire_unreferenced(control, &source_parent, &anchor_parent)?;
+                if let Some((_, snapshot)) = &lower_ownership {
+                    let original = &snapshot.entries[index + 1];
+                    capture.retire_unreferenced_with_original_owner(
+                        control,
+                        &source_parent,
+                        &anchor_parent,
+                        FileOwner {
+                            uid: original.uid,
+                            gid: original.gid,
+                        },
+                    )?;
+                } else {
+                    capture.retire_unreferenced(control, &source_parent, &anchor_parent)?;
+                }
             }
             LinkFreezeCaptureIntent::finish_completed_retirement(control, *capture_id)?;
+        }
+        if let Some((bytes, snapshot)) = &lower_ownership {
+            self.finish_lower_ownership_retirement(control, snapshot, bytes)?;
         }
         self.remove_claimed_manifest(control, &anchor_root, plan_hash)?;
         self.discard_empty_anchor_root(control)?;
@@ -3059,7 +3205,111 @@ mod tests {
             anchor.read_to_end(&mut bytes).unwrap();
             assert_eq!(bytes, b"raw\r\n\0file");
         }
+        let nested = root.join("nested");
+        let original_mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o7777;
+        fs::set_permissions(&nested, fs::Permissions::from_mode(original_mode ^ 0o001)).unwrap();
         assert!(plan.discard_unreferenced(&store).is_err());
+        assert_eq!(fs::metadata(root.join("a")).unwrap().uid(), 0);
+        assert!(
+            store
+                .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        fs::set_permissions(&nested, fs::Permissions::from_mode(original_mode)).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(
+            store
+                .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        for path in ["a", "nested/b"] {
+            let file = root.join(path);
+            assert_eq!(fs::metadata(&file).unwrap().uid(), 65534);
+            assert_eq!(fs::metadata(&file).unwrap().gid(), 65534);
+            assert_eq!(fs::read(file).unwrap(), b"raw\r\n\0file");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded owner isolation"]
+    fn root_owner_retirement_replays_after_one_file_completed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-owner-retire-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        for name in ["a", "b"] {
+            let path = root.join(name);
+            fs::write(&path, b"exact\r\n\0bytes").unwrap();
+            let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        }
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([120; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan.capture(&store).unwrap();
+        plan.prepare_private_lower_ownership(&store, &manifest)
+            .unwrap();
+        plan.isolate_frozen_file_owners(&store, &manifest, 65534, 0, 0)
+            .unwrap();
+        let retirement = RootRetirement {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes(),
+        };
+        assert!(
+            store
+                .put_record_if_absent(
+                    RETIRE_KIND,
+                    plan.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&retirement).unwrap(),
+                )
+                .unwrap()
+        );
+        let GuardedRootEntry::File { capture_id, .. } = &plan.entries[0] else {
+            panic!("expected first file");
+        };
+        let source_root = PinnedDirectory::open(&root).unwrap();
+        let anchor_area = PinnedDirectory::open(&plan.area.path_hint).unwrap();
+        let anchor_root = anchor_area
+            .open_child_directory(plan.anchor_id.to_string())
+            .unwrap()
+            .unwrap();
+        LinkFreezeCaptureIntent::load(&store, *capture_id)
+            .unwrap()
+            .unwrap()
+            .retire_unreferenced(&store, &source_root, &anchor_root)
+            .unwrap();
+        assert!(LinkFreezeCaptureIntent::retirement_pending(&store, *capture_id).unwrap());
+        assert_eq!(fs::metadata(root.join("a")).unwrap().uid(), 65534);
+        assert_eq!(fs::metadata(root.join("b")).unwrap().uid(), 0);
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(
+            store
+                .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!LinkFreezeCaptureIntent::retirement_pending(&store, *capture_id).unwrap());
+        for name in ["a", "b"] {
+            let path = root.join(name);
+            assert_eq!(fs::metadata(&path).unwrap().uid(), 65534);
+            assert_eq!(fs::metadata(&path).unwrap().gid(), 65534);
+            assert_eq!(fs::read(path).unwrap(), b"exact\r\n\0bytes");
+        }
     }
 
     #[test]
