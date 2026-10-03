@@ -25,6 +25,7 @@ use crate::database::ControlStore;
 
 #[path = "link_freeze_capture.rs"]
 mod capture;
+pub(crate) use capture::FileOwner;
 pub use capture::{LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
 
 // Linux UAPI asm-generic/fcntl.h. The libc crate does not expose F_SETSIG.

@@ -600,6 +600,18 @@
   workspace Clippy pass. The actual guarded ownership/mode transition, its
   replay and restoration, and signed recovery of mutable view metadata remain
   open; this snapshot alone does not make the lower tree private.
+  A per-file owner-isolation record now precedes `fchown` of a verified frozen
+  hard-link inode while its write-exclusion guard is held. The root pass reads
+  original UID/GID from the durable lower snapshot and resumes after a partial
+  file pass. A privileged ordinary-user probe holds a read-only descriptor
+  across capture and isolation, then confirms `fchmod` and writable
+  `/proc/self/fd` reopen fail; exact anchor bytes and replay pass on ext4 and
+  fresh local Btrfs. Files with access ACLs or file capabilities are refused
+  before the ownership change until those metadata rules are implemented.
+  Owner-isolated anchors cannot yet retire. Enrollment still needs the initial
+  freeze and owner change joined under one guard, directory isolation and
+  recovery, owner restoration after detach/retirement, and signed view state.
+  The 115 normal store tests and strict workspace Clippy pass.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

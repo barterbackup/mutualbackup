@@ -2,6 +2,7 @@
 //! backend owns discovery of these records and publication of source manifests.
 
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -9,14 +10,16 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof, IndependentSparseCopy,
-    LinkFreezeEditIntent, LinkFreezeEditPhase, file_data_extents, hash_exact,
+    AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof,
+    IndependentSparseCopy, LinkFreezeEditIntent, LinkFreezeEditPhase, file_data_extents,
+    hash_exact,
 };
 use crate::anchor::{CaptureVersion, NativeFileId, PinnedDirectory, capture_version};
 use crate::database::ControlStore;
 
 const CAPTURE_INTENT_KIND: &str = "link-freeze-capture-v1";
 const RETIRE_INTENT_KIND: &str = "link-freeze-retire-v1";
+const OWNER_ISOLATION_KIND: &str = "link-freeze-owner-isolation-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinkFreezeCapturePhase {
@@ -65,6 +68,62 @@ struct RetireIntent {
     format_version: u16,
     capture: LinkFreezeCaptureIntent,
     phase: RetirePhase,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct OwnerIsolation {
+    format_version: u16,
+    anchor_id: Uuid,
+    source_id: NativeFileId,
+    original_uid: u32,
+    original_gid: u32,
+    private_uid: u32,
+    private_gid: u32,
+    frozen_access: FileAccessSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileOwner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl OwnerIsolation {
+    fn load(control: &ControlStore, anchor_id: Uuid) -> anyhow::Result<Option<Self>> {
+        let Some(bytes) = control.get_record(OWNER_ISOLATION_KIND, anchor_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let record: Self = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            record.format_version == 1 && record.anchor_id == anchor_id,
+            "invalid frozen-owner isolation record"
+        );
+        Ok(Some(record))
+    }
+}
+
+fn reject_file_capability(file: &File) -> std::io::Result<()> {
+    // Linux clears file capabilities on ownership change. Keep this backend
+    // fail-closed until capability metadata is captured and restored.
+    let length = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if length >= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded owner isolation does not preserve file capabilities",
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA | libc::EOPNOTSUPP) => Ok(()),
+        _ => Err(error),
+    }
 }
 
 impl RetireIntent {
@@ -268,11 +327,124 @@ impl LinkFreezeCaptureIntent {
                 },
             "invalid frozen capture intent"
         );
+        if let Some(owner) = OwnerIsolation::load(control, anchor_id)? {
+            anyhow::ensure!(
+                owner.source_id == intent.source_id
+                    && owner.original_uid != owner.private_uid
+                    && matches!(owner.frozen_access.access_acl, AccessAclSnapshot::Absent),
+                "frozen owner isolation differs from its capture"
+            );
+        }
         Ok(Some(intent))
     }
 
     pub fn phase(&self) -> LinkFreezeCapturePhase {
         self.phase
+    }
+
+    /// Move a verified frozen hard-link inode to an owner that cannot be the
+    /// ordinary view user. The original owner is supplied from the root's
+    /// durable pre-isolation snapshot. The record precedes `fchown`, so a
+    /// crash after the syscall can replay against the same pinned inode.
+    pub(crate) fn isolate_owner(
+        &self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+        original: FileOwner,
+        private: FileOwner,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.phase == LinkFreezeCapturePhase::Frozen
+                && original.uid != private.uid
+                && source_parent.identity()? == self.source_parent_id
+                && anchor_parent.identity()? == self.anchor_parent_id
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id)
+                && anchor_parent.entry_identity(&self.anchor_name, false)? == Some(self.source_id)
+                && control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                    == Some(mb_core::canonical_bytes(self)?)
+                && LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none()
+                && !Self::retirement_pending(control, self.anchor_id)?,
+            "frozen owner isolation needs its unedited captured inode"
+        );
+        let anchor = anchor_parent
+            .open_child_file(&self.anchor_name)?
+            .ok_or_else(|| anyhow::anyhow!("frozen anchor disappeared"))?;
+        let guard = FileWriteExclusion::acquire(anchor)?;
+        let before = guard.file.metadata()?;
+        let frozen_access = FileAccessSnapshot::capture(&guard.file)?;
+        anyhow::ensure!(
+            before.ino() == self.source_id.inode
+                && before.nlink() == 2
+                && frozen_access.mode & (0o222 | 0o6000) == 0
+                && self.content_matches(&guard.file)?
+                && guard.is_held()?
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id),
+            "frozen anchor changed before owner isolation"
+        );
+        anyhow::ensure!(
+            matches!(&frozen_access.access_acl, AccessAclSnapshot::Absent),
+            "guarded owner isolation cannot yet preserve a file access ACL"
+        );
+        reject_file_capability(&guard.file)?;
+        let expected = OwnerIsolation {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            source_id: self.source_id,
+            original_uid: original.uid,
+            original_gid: original.gid,
+            private_uid: private.uid,
+            private_gid: private.gid,
+            frozen_access,
+        };
+        match OwnerIsolation::load(control, self.anchor_id)? {
+            Some(record) => {
+                anyhow::ensure!(record == expected, "frozen owner isolation record changed")
+            }
+            None => {
+                anyhow::ensure!(
+                    before.uid() == original.uid && before.gid() == original.gid,
+                    "frozen owner changed before isolation was journaled"
+                );
+                anyhow::ensure!(control.put_record_if_absent(
+                    OWNER_ISOLATION_KIND,
+                    self.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&expected)?,
+                )?);
+            }
+        }
+        anyhow::ensure!(
+            (before.uid(), before.gid()) == (original.uid, original.gid)
+                || (before.uid(), before.gid()) == (private.uid, private.gid),
+            "frozen owner is neither original nor private"
+        );
+        if (before.uid(), before.gid()) != (private.uid, private.gid) {
+            let result = unsafe {
+                libc::fchown(
+                    guard.file.as_raw_fd(),
+                    private.uid as libc::uid_t,
+                    private.gid as libc::gid_t,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            guard.file.sync_all()?;
+        }
+        let after = guard.file.metadata()?;
+        anyhow::ensure!(
+            (after.uid(), after.gid()) == (private.uid, private.gid)
+                && after.ino() == self.source_id.inode
+                && after.nlink() == 2
+                && FileAccessSnapshot::capture(&guard.file)? == expected.frozen_access
+                && self.content_matches(&guard.file)?
+                && guard.is_held()?
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id)
+                && anchor_parent.entry_identity(&self.anchor_name, false)? == Some(self.source_id),
+            "frozen owner isolation did not preserve its anchor"
+        );
+        guard.release()?;
+        Ok(())
     }
 
     pub(crate) fn retirement_pending(
@@ -322,6 +494,10 @@ impl LinkFreezeCaptureIntent {
         source_parent: &PinnedDirectory,
         anchor_parent: &PinnedDirectory,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            OwnerIsolation::load(control, self.anchor_id)?.is_none(),
+            "owner-isolated anchor needs owner restoration before retirement"
+        );
         anyhow::ensure!(
             matches!(
                 self.phase,
@@ -1080,13 +1256,18 @@ fn same_source_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> 
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File, OpenOptions};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
 
     use mb_core::{KeyMaterial, Seed};
 
     use super::{
-        CAPTURE_INTENT_KIND, LegacyCaptureIntentV1, LinkFreezeCaptureIntent,
-        LinkFreezeCapturePhase, RETIRE_INTENT_KIND, RetireIntent, RetirePhase,
+        CAPTURE_INTENT_KIND, FileOwner, LegacyCaptureIntentV1, LinkFreezeCaptureIntent,
+        LinkFreezeCapturePhase, OWNER_ISOLATION_KIND, RETIRE_INTENT_KIND, RetireIntent,
+        RetirePhase,
     };
     use crate::anchor::{NativeFileId, PinnedDirectory};
     use crate::link_freeze::{
@@ -1170,6 +1351,178 @@ mod tests {
             .unwrap();
         assert!(LinkFreezeCaptureIntent::finish_completed_retirement(&store, anchor_id).unwrap());
         assert!(!LinkFreezeCaptureIntent::retirement_pending(&store, anchor_id).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for held-descriptor write exclusion"]
+    fn frozen_owner_isolation_replays_and_blocks_preopened_writes() {
+        let root = test_directory();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let source_path = root.path().join("source");
+        fs::write(&source_path, b"exact\r\n\0bytes").unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let source_name = std::ffi::CString::new(source_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(source_name.as_ptr(), 65534, 65534) },
+            0
+        );
+        let mut child = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-u")
+            .arg("-c")
+            .arg(
+                r#"import errno, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+print('READY', flush=True)
+assert sys.stdin.readline() == 'continue\n'
+for operation in (
+    lambda: os.fchmod(fd, 0o600),
+    lambda: os.open('/proc/self/fd/%d' % fd, os.O_WRONLY),
+):
+    try:
+        operation()
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM), error
+    else:
+        raise AssertionError('frozen inode remained writable through a retained descriptor')
+os.close(fd)
+print('DONE', flush=True)
+"#,
+            )
+            .arg(&source_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "READY\n");
+
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([116; 32]));
+        let database_path = root.path().join("control.db");
+        let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+        let anchor_id = uuid::Uuid::new_v4();
+        let prepared =
+            LinkFreezeCaptureIntent::begin(&store, anchor_id, &parent, "source", &parent, "anchor")
+                .unwrap();
+        let frozen = prepared.resume(&store, &parent, &parent).unwrap().unwrap();
+        frozen
+            .isolate_owner(
+                &store,
+                &parent,
+                &parent,
+                FileOwner {
+                    uid: 65534,
+                    gid: 65534,
+                },
+                FileOwner { uid: 0, gid: 0 },
+            )
+            .unwrap();
+        assert_eq!(fs::metadata(&source_path).unwrap().uid(), 0);
+        assert_eq!(fs::read(&source_path).unwrap(), b"exact\r\n\0bytes");
+        drop(store);
+
+        let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+        let frozen = LinkFreezeCaptureIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap();
+        frozen
+            .isolate_owner(
+                &store,
+                &parent,
+                &parent,
+                FileOwner {
+                    uid: 65534,
+                    gid: 65534,
+                },
+                FileOwner { uid: 0, gid: 0 },
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_record(OWNER_ISOLATION_KIND, anchor_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            frozen
+                .retire_unreferenced(&store, &parent, &parent)
+                .is_err()
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"continue\n")
+            .unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(status.success(), "held-descriptor check failed: {stderr}");
+        assert_eq!(line, "DONE\n");
+    }
+
+    #[test]
+    #[ignore = "requires root, POSIX ACLs, and CAP_SYS_ADMIN"]
+    fn owner_isolation_rejects_acl_before_chown_or_journal() {
+        let root = test_directory();
+        let source_path = root.path().join("source");
+        let source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&source_path)
+            .unwrap();
+        source.write_at(b"acl bytes", 0).unwrap();
+        if !install_probe_acl(&source).unwrap() {
+            return;
+        }
+        let encoded = std::ffi::CString::new(source_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        drop(source);
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([118; 32]));
+        let store =
+            crate::database::ControlStore::open(root.path().join("control.db"), &keys).unwrap();
+        let anchor_id = uuid::Uuid::new_v4();
+        let prepared =
+            LinkFreezeCaptureIntent::begin(&store, anchor_id, &parent, "source", &parent, "anchor")
+                .unwrap();
+        let frozen = prepared.resume(&store, &parent, &parent).unwrap().unwrap();
+        assert!(
+            frozen
+                .isolate_owner(
+                    &store,
+                    &parent,
+                    &parent,
+                    FileOwner {
+                        uid: 65534,
+                        gid: 65534
+                    },
+                    FileOwner { uid: 0, gid: 0 },
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("access ACL")
+        );
+        assert_eq!(fs::metadata(&source_path).unwrap().uid(), 65534);
+        assert!(
+            store
+                .get_record(OWNER_ISOLATION_KIND, anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

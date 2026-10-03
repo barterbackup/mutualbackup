@@ -1555,6 +1555,14 @@ anchor retirement until restored. The privileged reopen/retirement probe passes 
 ext4 and fresh local Btrfs, as do 115 normal store tests and strict Clippy.
 The record preserves rollback evidence, but the ownership transition and
 signed recovery of mutable view metadata are still required for enrollment.
+Frozen-file owner isolation now has a separate durable record before `fchown`
+under the held write-exclusion guard. A root pass uses the original owner from
+the lower snapshot and replays a partially isolated file set. Privileged
+held-descriptor and partial-replay probes pass on ext4 and fresh local Btrfs;
+ACL and file-capability cases fail before mutation. Retirement stays fenced
+until owner restoration exists. The initial freeze and ownership change still
+have a guard-release gap, so this is not yet an enrollment-safe transition;
+directory isolation and signed mutable-view recovery also remain open.
 Guarded enrollment therefore still needs durable private-inode ownership and
 mode isolation plus virtualized, protected metadata before ordinary user-owned
 source trees are admissible.

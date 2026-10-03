@@ -23,7 +23,7 @@ use super::{
     open_source_root, open_stable_anchor_area, probe_guarded_link_freeze, reopen_pinned_file,
     resolve_anchor_area, unix_mode, validate_relative,
 };
-use crate::link_freeze::{AccessAclSnapshot, read_access_acl};
+use crate::link_freeze::{AccessAclSnapshot, FileOwner, read_access_acl};
 use crate::{
     ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase, LinkFreezeEditIntent,
     LinkFreezeEditPhase,
@@ -508,6 +508,121 @@ impl GuardedRootCapturePlan {
                 "guarded lower ownership changed after its durable snapshot"
             );
         }
+        Ok(())
+    }
+
+    /// Isolate every frozen file owner using the durable root snapshot. Each
+    /// file has its own write exclusion and owner journal; a failed pass can
+    /// resume without changing the identity or bytes of an earlier anchor.
+    /// Directory isolation and enrollment remain separate gated transitions.
+    pub fn isolate_frozen_file_owners(
+        &self,
+        control: &ControlStore,
+        manifest: &StableAnchorManifest,
+        view_uid: u32,
+        private_uid: u32,
+        private_gid: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(private_uid != view_uid, "private owner is the view owner");
+        anyhow::ensure!(
+            !crate::guarded_mount::mount_claim_exists(control, self.anchor_id)?,
+            "guarded view is already claimed"
+        );
+        anyhow::ensure!(
+            Self::load_active_for_view(control, manifest)? == *self,
+            "guarded file isolation has another capture plan"
+        );
+        let bytes = control
+            .get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("guarded lower ownership snapshot is missing"))?;
+        self.reconcile(control)?;
+        let snapshot: LowerOwnershipSnapshot = mb_core::decode_canonical(&bytes)?;
+        let source_root = PinnedDirectory::open(&self.source_root)?;
+        anyhow::ensure!(source_root.identity()? == self.source_root_identity());
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let anchor_root = area
+            .open_child_directory(self.anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("guarded anchor root disappeared"))?;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let GuardedRootEntry::File {
+                path,
+                capture_id,
+                version,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            let original = &snapshot.entries[index + 1];
+            let relative = Path::new(path);
+            let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+            let source_parent = if parent.as_os_str().is_empty() {
+                source_root.try_clone()?
+            } else {
+                source_root.open_descendant_directory(parent)?
+            };
+            let anchor_parent = if parent.as_os_str().is_empty() {
+                anchor_root.try_clone()?
+            } else {
+                anchor_root.open_descendant_directory(parent)?
+            };
+            let name = relative
+                .file_name()
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let intent = LinkFreezeCaptureIntent::load(control, *capture_id)?
+                .ok_or_else(|| anyhow::anyhow!("guarded file capture disappeared: {path}"))?;
+            anyhow::ensure!(
+                source_parent.entry_identity(name, false)? == Some(original.native_id)
+                    && anchor_parent.entry_identity(name, false)? == Some(original.native_id),
+                "guarded lower file changed before owner isolation: {path}"
+            );
+            anyhow::ensure!(intent.matches_root_file_plan(
+                *capture_id,
+                source_parent.identity()?,
+                NativeFileId {
+                    filesystem_id: version.filesystem_id,
+                    inode: version.inode,
+                },
+                &anchor_parent,
+                Path::new(name),
+            )?);
+            if original.uid == private_uid {
+                let metadata = anchor_parent
+                    .open_child_file(name)?
+                    .ok_or_else(|| anyhow::anyhow!("guarded anchor disappeared: {path}"))?
+                    .metadata()?;
+                anyhow::ensure!(
+                    metadata.uid() == private_uid
+                        && metadata.gid() == original.gid
+                        && metadata.nlink() == 2
+                        && unix_mode(&metadata) & 0o022 == 0,
+                    "guarded file is no longer private: {path}"
+                );
+                continue;
+            }
+            intent.isolate_owner(
+                control,
+                &source_parent,
+                &anchor_parent,
+                FileOwner {
+                    uid: original.uid,
+                    gid: original.gid,
+                },
+                FileOwner {
+                    uid: private_uid,
+                    gid: private_gid,
+                },
+            )?;
+        }
+        anyhow::ensure!(
+            self.capture(control)? == *manifest,
+            "guarded frozen bytes changed during owner isolation"
+        );
         Ok(())
     }
 
@@ -2871,6 +2986,80 @@ mod tests {
             .unwrap();
         plan.discard_unreferenced(&store).unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"original\r\n\0bytes");
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded owner isolation"]
+    fn root_file_owner_isolation_replays_after_one_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-file-owners-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        for path in [root.join("a"), root.join("nested/b")] {
+            fs::write(&path, b"raw\r\n\0file").unwrap();
+            let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        }
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([117; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan.capture(&store).unwrap();
+        plan.prepare_private_lower_ownership(&store, &manifest)
+            .unwrap();
+        let GuardedRootEntry::File { capture_id, .. } = &plan.entries[0] else {
+            panic!("expected first captured file");
+        };
+        let first = LinkFreezeCaptureIntent::load(&store, *capture_id)
+            .unwrap()
+            .unwrap();
+        let source_root = PinnedDirectory::open(&root).unwrap();
+        let area = PinnedDirectory::open(&plan.area.path_hint).unwrap();
+        let anchor_root = area
+            .open_child_directory(plan.anchor_id.to_string())
+            .unwrap()
+            .unwrap();
+        first
+            .isolate_owner(
+                &store,
+                &source_root,
+                &anchor_root,
+                FileOwner {
+                    uid: 65534,
+                    gid: 65534,
+                },
+                FileOwner { uid: 0, gid: 0 },
+            )
+            .unwrap();
+        assert_eq!(fs::metadata(root.join("a")).unwrap().uid(), 0);
+        assert_eq!(fs::metadata(root.join("nested/b")).unwrap().uid(), 65534);
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        plan.isolate_frozen_file_owners(&store, &manifest, 65534, 0, 0)
+            .unwrap();
+        plan.isolate_frozen_file_owners(&store, &manifest, 65534, 0, 0)
+            .unwrap();
+        for path in ["a", "nested/b"] {
+            assert_eq!(fs::metadata(root.join(path)).unwrap().uid(), 0);
+            assert_eq!(fs::read(root.join(path)).unwrap(), b"raw\r\n\0file");
+            let mut anchor = manifest
+                .file_locator(path.to_owned())
+                .unwrap()
+                .open()
+                .unwrap();
+            let mut bytes = Vec::new();
+            anchor.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"raw\r\n\0file");
+        }
+        assert!(plan.discard_unreferenced(&store).is_err());
     }
 
     #[test]
