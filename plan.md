@@ -1373,6 +1373,19 @@ transport tiers at event 39. The coordinator advanced and the backup committed.
 Disposable Btrfs and network resources were removed. Keep the intermittent
 5,400-second reliability case open pending stronger repeated topology evidence
 or a correction for any signer that remains unavailable indefinitely.
+The Git raw-byte command audit is complete in
+[docs/git-byte-audit.md](docs/git-byte-audit.md). `702fe63` also supersedes
+pending policy dials when a signed endpoint set changes within the same
+transport tier, so an old attempt cannot delay the replacement or trigger
+fallback after its eventual failure. The exact-source provisioned Git stages
+passed: strict Clippy, 62 Btrfs Git cases, extent measurement, node recovery,
+and the stock-Git bridge. The network script's first invocation stopped before
+namespace creation because `/usr/sbin` was absent from PATH; a separate
+invocation with the installed `iptables` on PATH passed the five-daemon
+topology/recovery test in 1,536.31 seconds. Disposable local Btrfs and network
+resources were cleaned. Partial signature quorums and old direct-address dials
+still appeared before the backup completed; the intermittent reliability gate
+remains open alongside guarded enrollment and platform backends.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

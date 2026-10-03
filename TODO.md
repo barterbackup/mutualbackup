@@ -120,6 +120,17 @@
   excluded by stronger repeated topology evidence or its remaining response
   path is corrected; this one passing gate does not prove that every missing
   signer will eventually become reachable.
+  The same-tier dial correction passed its exact-source local provisioned Git
+  gate on `702fe63`. Clippy, 62 Btrfs Git cases, extent measurement, node Git
+  and seed-recovery checks, and the stock-Git bridge passed first. The network
+  script initially stopped before namespace setup because this shell omitted
+  `/usr/sbin` from PATH; rerunning that final stage with the installed
+  `iptables` on PATH passed the five-daemon topology/recovery test in 1,536.31
+  seconds. The coordinator advanced past transient event-41 missing signatures
+  and the recovered-topology backup committed. Old direct-address failures
+  still occurred. Both disposable Btrfs mounts, images, daemon processes,
+  namespaces, and firewall chains were removed. One more successful run does
+  not exclude the intermittent long stall, so this reliability gate stays open.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
