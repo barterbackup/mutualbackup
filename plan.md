@@ -1165,6 +1165,10 @@ filter settings and `info/attributes` on the ordinary-Git side, raw native
 content merge, linked-worktree checkout and merge, combined linked restore,
 and primary hard reset. The broader
 cross-command audit remains open.
+A separate local Btrfs regression confirms that a stock Git peer's CRLF
+worktree can yield an LF blob and that our import, checkout, restore, and export
+preserve the exchanged LF blob and object ID. The Git-facing help explains that
+we do not reverse conversions already performed by a stock peer.
 The provisioned Git acceptance run on `3155689` passed its Git-specific slices
 but failed the five-daemon topology backup after the 5,400-second timeout
 following relay-only storage recovery. Two later isolated smoke runs and the

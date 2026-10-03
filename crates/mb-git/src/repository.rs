@@ -3827,6 +3827,118 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn stock_git_normalized_blob_imports_without_reversing_peer_conversion() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-stock-normalized-{}", Uuid::new_v4()));
+        let stock_root = run_root.join("stock");
+        let bare_root = run_root.join("remote.git");
+        let source_root = run_root.join("native");
+        let export_root = run_root.join("export.git");
+        fs::create_dir_all(&run_root).unwrap();
+        fs::create_dir(&source_root).unwrap();
+        let git = crate::stock_git::executable().unwrap();
+        let run_git = |args: &[&str]| {
+            let output = Command::new(&git)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stock Git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        let stock = stock_root.to_str().unwrap();
+        let bare = bare_root.to_str().unwrap();
+        run_git(&["init", "-q", "-b", "main", stock]);
+        fs::write(stock_root.join(".gitattributes"), b"*.txt text eol=crlf\n").unwrap();
+        let worktree_bytes = b"one\r\ntwo\r\n";
+        let blob_bytes = b"one\ntwo\n";
+        fs::write(stock_root.join("payload.txt"), worktree_bytes).unwrap();
+        run_git(&["-C", stock, "add", ".gitattributes", "payload.txt"]);
+        run_git(&[
+            "-C",
+            stock,
+            "-c",
+            "user.name=Stock",
+            "-c",
+            "user.email=stock@example.test",
+            "commit",
+            "-qm",
+            "normalized by stock Git",
+        ]);
+        assert_eq!(
+            fs::read(stock_root.join("payload.txt")).unwrap(),
+            worktree_bytes
+        );
+        assert_eq!(
+            run_git(&["-C", stock, "show", "main:payload.txt"]),
+            blob_bytes
+        );
+        let remote_blob = Oid::from_str(
+            String::from_utf8(run_git(&["-C", stock, "rev-parse", "main:payload.txt"]))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_blob,
+            Oid::hash_object(git2::ObjectType::Blob, blob_bytes).unwrap()
+        );
+        assert_ne!(
+            remote_blob,
+            Oid::hash_object(git2::ObjectType::Blob, worktree_bytes).unwrap()
+        );
+        run_git(&["clone", "-q", "--bare", stock, bare]);
+
+        let repository_id = Uuid::new_v4();
+        let local = GitRepository::init(&source_root, repository_id, &[104; 32]).unwrap();
+        local.pull_bare(&bare_root, "", "").unwrap();
+        assert_eq!(
+            fs::read(source_root.join("payload.txt")).unwrap(),
+            blob_bytes
+        );
+        assert_eq!(
+            local.staged_entry("payload.txt").unwrap().unwrap().oid,
+            remote_blob.as_bytes()
+        );
+        assert!(local.status().unwrap().changes.is_empty());
+        fs::write(source_root.join("payload.txt"), worktree_bytes).unwrap();
+        assert!(local.status().unwrap().changes.iter().any(|change| {
+            change.path == b"payload.txt" && change.worktree == Some(crate::GitChange::Modified)
+        }));
+        local
+            .restore_worktree(&[PathBuf::from("payload.txt")])
+            .unwrap();
+        assert_eq!(
+            fs::read(source_root.join("payload.txt")).unwrap(),
+            blob_bytes
+        );
+        git2::Repository::init_bare(&export_root).unwrap();
+        local.push_current_branch_to_bare(&export_root).unwrap();
+        let exported = git2::Repository::open_bare(&export_root).unwrap();
+        assert_eq!(
+            exported.find_blob(remote_blob).unwrap().content(),
+            blob_bytes
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(exported);
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn deleted_file_can_resolve_a_modify_delete_merge_conflict() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")

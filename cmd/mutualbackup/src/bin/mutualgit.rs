@@ -15,7 +15,7 @@ use uuid::Uuid;
     name = "mutualgit",
     version,
     about = "Git-compatible MutualBackup history",
-    long_about = "Git-compatible MutualBackup history over native anchors. File bytes are preserved exactly: automatic line-ending conversion, clean/smudge filters, ident expansion, and working-tree encoding conversion are disabled, regardless of Git config or attributes."
+    long_about = "Git-compatible MutualBackup history over native anchors. File bytes are preserved exactly: automatic line-ending conversion, clean/smudge filters, ident expansion, and working-tree encoding conversion are disabled, regardless of Git config or attributes. When a stock Git peer has already converted its worktree before committing, MutualBackup imports and checks out that peer's stored blob bytes exactly; it does not reverse the peer's conversion."
 )]
 struct Cli {
     /// Run as if started in this directory.

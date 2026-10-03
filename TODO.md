@@ -16,8 +16,10 @@
   the ordinary-Git side, native content merge, and linked-worktree checkout and
   merge, combined linked restore, and primary hard reset; its raw merged blob
   and restored bytes match. Complete the remaining cross-command audit required
-  by plan.md, especially every supported CLI command and importing ordinary-Git
-  histories whose blobs have already been transformed by that Git client.
+  by plan.md, especially every supported CLI command. A fresh local Btrfs
+  stock-Git round trip confirms that a CRLF worktree normalized by stock Git
+  imports as its LF blob, remains clean until edited, restores the exact blob
+  bytes, and exports the same object ID. The CLI help explains this limit.
 - [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out
