@@ -438,6 +438,12 @@
   the claim and frees the guarded anchor after stop; it passes on ext4 and a
   fresh local Btrfs image. Node GC still needs to call this transition only
   after all signed revisions and Git pins release the anchor.
+  The guarded FUSE view now reports filesystem capacity and name limits from
+  its pinned lower-root descriptor instead of the default zero-capacity reply.
+  An ordinary-user `statvfs` probe and native-geometry comparison pass on
+  ext4 and fresh local Btrfs; 115 normal store tests, formatting, and strict
+  workspace Clippy pass. This does not close protected mutable-view recovery,
+  daemon supervision, or guarded enrollment.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

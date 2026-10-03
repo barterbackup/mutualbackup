@@ -1440,6 +1440,12 @@ and complete disposable-resource cleanup. Coverage warnings showed event
 sequences advancing through both recovered-topology backups; no worker step
 crossed the one-minute threshold. The earlier 5,400-second stall remains
 unexplained, so the reliability gate stays open.
+The guarded FUSE view now answers `statfs` from the pinned lower-root
+descriptor, reporting real filesystem capacity and name limits. A privileged
+ordinary-user `statvfs` probe and comparison with the native filesystem pass
+on ext4 and a fresh local Btrfs image. The 115 normal store tests, formatting,
+and strict workspace Clippy pass. Guarded enrollment still requires protected
+mutable-view recovery and daemon lifecycle supervision.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

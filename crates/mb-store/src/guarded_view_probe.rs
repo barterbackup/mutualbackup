@@ -24,8 +24,8 @@ use anyhow::{Context, ensure};
 use fuser::{
     BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL,
-    TimeOrNow,
+    ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    Request, SessionACL, TimeOrNow,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -2564,6 +2564,17 @@ fn unix_system_time(seconds: i64, nanoseconds: i64) -> io::Result<SystemTime> {
     .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
 }
 
+fn pinned_statvfs(file: &File) -> io::Result<libc::statvfs> {
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the descriptor is open and fstatvfs initializes the output on
+    // success. The uninitialized value is never read on failure.
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), stats.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatvfs returned success and initialized every field.
+    Ok(unsafe { stats.assume_init() })
+}
+
 impl Filesystem for GuardedProbeView {
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> io::Result<()> {
         config
@@ -2599,6 +2610,37 @@ impl Filesystem for GuardedProbeView {
             }
         } else {
             reply.error(Errno::EIO);
+        }
+    }
+
+    fn statfs(&self, _request: &Request, inode: INodeNo, reply: ReplyStatfs) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if inode != INodeNo::ROOT
+            && self.directory(inode.0).is_none()
+            && self.file(inode.0).is_none()
+        {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let Some(lower_root) = &self.lower_root else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        match pinned_statvfs(lower_root.as_file()) {
+            Ok(stats) => reply.statfs(
+                stats.f_blocks,
+                stats.f_bfree,
+                stats.f_bavail,
+                stats.f_files,
+                stats.f_ffree,
+                u32::try_from(stats.f_bsize).unwrap_or(u32::MAX),
+                u32::try_from(stats.f_namemax).unwrap_or(u32::MAX),
+                u32::try_from(stats.f_frsize).unwrap_or(u32::MAX),
+            ),
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
         }
     }
 
@@ -3956,7 +3998,7 @@ mod tests {
         DIRECTORY_RENAME_KIND, DIRECTORY_REPLACE_KIND, DirectoryCreateIntent, DirectoryRecord,
         DirectoryRemoveIntent, DirectoryRenameIntent, DirectoryReplaceIntent, FILE_INODE,
         GuardedNamespace, GuardedProbeFile, GuardedProbeView, NAMESPACE_KIND, NamespaceRecord,
-        ProbeLocation, REPLACE_KIND, probe_file_attr, unix_system_time,
+        ProbeLocation, REPLACE_KIND, pinned_statvfs, probe_file_attr, unix_system_time,
     };
 
     #[test]
@@ -5895,6 +5937,24 @@ mod tests {
                 .output()?;
             anyhow::ensure!(list.status.success());
             anyhow::ensure!(list.stdout == b"alpha,beta\n");
+            let native_capacity = pinned_statvfs(&File::open(&lower)?)?;
+            let visible_capacity = pinned_statvfs(&File::open(&mountpoint)?)?;
+            anyhow::ensure!(visible_capacity.f_blocks == native_capacity.f_blocks);
+            anyhow::ensure!(visible_capacity.f_bsize == native_capacity.f_bsize);
+            anyhow::ensure!(visible_capacity.f_frsize == native_capacity.f_frsize);
+            anyhow::ensure!(visible_capacity.f_namemax == native_capacity.f_namemax);
+            let ordinary_capacity = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; s=os.statvfs(sys.argv[1]); assert s.f_blocks>0 and s.f_bavail>0")
+                .arg(&mountpoint)
+                .output()?;
+            anyhow::ensure!(
+                ordinary_capacity.status.success(),
+                "ordinary-user statvfs failed: {}",
+                String::from_utf8_lossy(&ordinary_capacity.stderr)
+            );
             anyhow::ensure!(fs::read(mountpoint.join("alpha"))? == original_alpha);
             anyhow::ensure!(fs::read(mountpoint.join("beta"))? == original_beta);
             let read_only_mode = Command::new("python3")
