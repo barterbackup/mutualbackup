@@ -1473,6 +1473,14 @@ member had no installed guild or local checkpoint while its restore was still
 underway, so it correctly refused to sign; after adoption it became Active and
 the guild advanced. That transient denial is explained, but it does not prove
 the cause of the earlier 5,400-second stall. Keep the reliability gate open.
+`0d5af1d` lets majority-policy guild events proceed once `verify_event`
+accepts their collected certificate and drops pending minority requests before
+peer installation. Focused majority, administration, coding activation, and
+slow-install tests and strict workspace Clippy pass. The isolated local
+five-daemon topology and seed-recovery gate passed with that network code in
+1,569.46 seconds, with complete disposable-resource cleanup. Its unanimous
+guild still had transient short signature sets and transport exhaustion; the
+historical long-stall gate remains open.
 The guarded FUSE view now answers `statfs` from the pinned lower-root
 descriptor, reporting real filesystem capacity and name limits. A privileged
 ordinary-user `statvfs` probe and comparison with the native filesystem pass
@@ -1508,6 +1516,13 @@ remain view-owned or group/other-writable before publishing a new claim.
 The refusal probe, all 18 privileged guarded-view probes, and daemon-owned
 mount restart pass on ext4 and fresh local Btrfs; normal store tests and strict
 workspace Clippy pass.
+The privileged held-descriptor probe now confirms that manually moving a
+captured file and lower directory into owner-inaccessible state prevents
+`fchmod`, writable `/proc/self/fd` reopen, and lookup through a retained
+directory handle. An ordinary-user FUSE edit leaves the anchor exact. It passes
+on ext4 and fresh local Btrfs, with 115 normal store tests and strict workspace
+Clippy. A replayable ownership transition and signed recovery of mutable view
+metadata are still required before enrollment.
 Guarded enrollment therefore still needs durable private-inode ownership and
 mode isolation plus virtualized, protected metadata before ordinary user-owned
 source trees are admissible.

@@ -203,6 +203,15 @@
   and the guild advanced. This explains that transient authorization rejection.
   The historical 5,400-second missing-signer stall and transport exhaustion
   remain unresolved; keep this gate open.
+  `0d5af1d` stops majority-policy lifecycle and coding events as soon as their
+  actual guild certificate verifies, releasing pending minority requests and
+  outbound permits before installation. Its focused five-member majority,
+  administration, coding activation, and slow-install tests pass, with strict
+  workspace Clippy. The isolated five-daemon topology/seed-recovery gate using
+  that network code passed in 1,569.46 seconds; its Btrfs image, mount, daemon
+  processes, and namespaces were removed. Unanimous short quorums and transport
+  exhaustion still appeared before the recovered guild caught up, so this run
+  does not close the historical unanimous stall.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
