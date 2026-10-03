@@ -1424,6 +1424,14 @@ topology/recovery test in 1,536.31 seconds. Disposable local Btrfs and network
 resources were cleaned. Partial signature quorums and old direct-address dials
 still appeared before the backup completed; the intermittent reliability gate
 remains open alongside guarded enrollment and platform backends.
+`b25ae06` lets signed endpoint exchange continue independently while a guild
+tail request waits for a slow peer; state-changing lifecycle reconciliation
+still follows tail catch-up. Its local provisioned five-node QUIC/recovery
+test and exact-commit isolated topology/recovery test passed, the latter in
+1,637.58 seconds with complete resource cleanup. The topology again paused at
+event 36 for over five minutes with a recovered peer reachable over
+RelayFallback, then advanced and committed. This does not close the
+intermittent missing-signer reliability gate.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

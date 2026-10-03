@@ -141,6 +141,16 @@
   strict workspace Clippy, the focused tail-selection test, and the provisioned
   five-node multi-owner QUIC/recovery test pass; the latter completed in 535.02
   seconds on a disposable local Btrfs image, which was unmounted and removed.
+  The exact-commit `b25ae06` isolated five-daemon topology/recovery test passed
+  in 1,637.58 seconds. Its relay-only transition again showed one signer
+  exhausting transport tiers and then returning the generic guild-transition
+  authorization rejection for event 28; a later event-29 request also exhausted
+  tiers. During the final `backup --wait`, all active guild views reached event
+  36 and the owner remained dirty for over five minutes despite an active
+  RelayFallback path to the recovered storage peer. The job later advanced,
+  committed, and seed recovery passed. The test removed its Btrfs image,
+  mount, daemons, namespaces, and firewall chains. This run confirms eventual
+  progress but does not explain or exclude the earlier 5,400-second stall.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
