@@ -3349,17 +3349,38 @@ mod tests {
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join(".gitattributes"), b"*.txt text=auto\n").unwrap();
         fs::write(source_root.join("payload.txt"), b"base\r\nbytes\0").unwrap();
+        fs::write(source_root.join("line.txt"), b"one\r\ntwo\n").unwrap();
         let repository_id = Uuid::new_v4();
         let key = [97_u8; 32];
         let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
         local.stage_file(".gitattributes").unwrap();
         local.stage_file("payload.txt").unwrap();
+        local.stage_file("line.txt").unwrap();
         let expected = git2::Oid::hash_object(git2::ObjectType::Blob, b"base\r\nbytes\0").unwrap();
         assert_eq!(
             local.staged_entry("payload.txt").unwrap().unwrap().oid,
             expected.as_bytes()
         );
         local.commit("Author", "a@example.test", "base").unwrap();
+        fs::write(source_root.join("line.txt"), b"one\ntwo\n").unwrap();
+        assert!(local.status().unwrap().changes.iter().any(|change| {
+            change.path == b"line.txt"
+                && change.staged.is_none()
+                && change.worktree == Some(crate::GitChange::Modified)
+        }));
+        let patch = local.diff(false).unwrap().patch;
+        assert!(
+            patch
+                .windows(b"-one\r\n+one\n".len())
+                .any(|bytes| bytes == b"-one\r\n+one\n")
+        );
+        local
+            .restore_worktree(&[PathBuf::from("line.txt")])
+            .unwrap();
+        assert_eq!(
+            fs::read(source_root.join("line.txt")).unwrap(),
+            b"one\r\ntwo\n"
+        );
         local.create_branch("topic").unwrap();
         local.switch_branch("topic").unwrap();
         fs::write(source_root.join("payload.txt"), b"topic\nraw\r\n").unwrap();
