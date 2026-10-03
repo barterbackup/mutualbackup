@@ -115,9 +115,15 @@
   captured nested file preserve its anchor and leave another file frozen.
   An unsupported directory rename fails closed. All ten privileged probes
   pass on ext4 and fresh local Btrfs; store tests and strict locked workspace
-  Clippy pass. Extend this to cross-directory moves, directory mutations,
-  create and atomic replacement, remaining metadata/allocation modes,
-  concurrent handles, mount/restart recovery, and whole-worktree enrollment.
+  Clippy pass. `4d5c804` moves a frozen file out of a nested directory and
+  back using pinned source directories; the later edit detaches the correct
+  anchor. A move onto an existing tracked name fails without changing either
+  file. An uncertain move failure poisons the probe view so later requests
+  fail closed. The ten privileged probes pass on ext4 and fresh local Btrfs,
+  along with normal store tests and strict workspace Clippy. Extend this to
+  directory mutations, create and atomic replacement, remaining metadata and
+  allocation modes, concurrent handles, mount/restart recovery, and
+  whole-worktree enrollment.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
