@@ -22,6 +22,7 @@ use crate::{
 };
 
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
+const MOUNT_RETIRE_KIND: &str = "guarded-view-mount-retired-v1";
 const MOUNT_SUBTYPE: &str = "mutualbackup_guarded";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,6 +52,54 @@ pub struct GuardedViewMount {
 }
 
 impl GuardedViewMount {
+    /// Retire a stopped view before releasing its captured anchors. The caller
+    /// must first prove the protected revision and every Git pin are gone.
+    /// The retirement marker fences remount even if deletion of the claim is
+    /// interrupted; retrying this method finishes that deletion.
+    pub fn retire_claim(anchor_id: Uuid, control: &ControlStore) -> anyhow::Result<()> {
+        let id = anchor_id.as_bytes();
+        let claim_bytes = control.get_record(MOUNT_CLAIM_KIND, id)?;
+        let retired = control.get_record(MOUNT_RETIRE_KIND, id)?;
+        let Some(claim_bytes) = claim_bytes else {
+            let bytes =
+                retired.ok_or_else(|| anyhow::anyhow!("guarded mount has no claim to retire"))?;
+            let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                claim.version == 1 && claim.anchor_id == anchor_id,
+                "guarded mount retirement marker changed"
+            );
+            ensure!(
+                mounted_filesystem(&claim.mountpoint)?.is_none(),
+                "guarded view remains mounted during retirement"
+            );
+            return Ok(());
+        };
+        let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
+        ensure!(
+            claim.version == 1 && claim.anchor_id == anchor_id,
+            "guarded mount claim changed before retirement"
+        );
+        ensure!(
+            retired.as_ref().is_none_or(|bytes| bytes == &claim_bytes),
+            "guarded mount retirement belongs to another claim"
+        );
+        ensure!(
+            mounted_filesystem(&claim.mountpoint)?.is_none(),
+            "guarded view remains mounted during retirement"
+        );
+        let lower = PinnedDirectory::open(&claim.lower_root)?;
+        let placeholder = PinnedDirectory::open(&claim.mountpoint)?;
+        ensure!(
+            lower.identity()? == claim.lower_id && placeholder.identity()? == claim.mountpoint_id,
+            "guarded mount paths changed before retirement"
+        );
+        if retired.is_none() {
+            ensure!(control.put_record_if_absent(MOUNT_RETIRE_KIND, id, &claim_bytes)?);
+        }
+        control.delete_record_if_value(MOUNT_CLAIM_KIND, id, &claim_bytes)?;
+        Ok(())
+    }
+
     /// Reopen a claimed view after process loss using only its durable local
     /// claim, capture plan, and sealed manifest. No caller-held manifest is
     /// needed; `start` still verifies the lower and placeholder identities.
@@ -98,6 +147,12 @@ impl GuardedViewMount {
             let control = control
                 .lock()
                 .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            ensure!(
+                control
+                    .get_record(MOUNT_RETIRE_KIND, manifest.anchor_id.as_bytes())?
+                    .is_none(),
+                "guarded mount has been retired"
+            );
             GuardedRootCapturePlan::load_active_for_view(&control, manifest)?
         };
         let lower_root = PinnedDirectory::open(plan.source_root())?;
@@ -233,6 +288,14 @@ impl GuardedViewMount {
                 .is_some_and(|mounted| mounted.matches_guarded(&source)),
             "guarded mount did not appear with its claimed identity: {mounted:?}"
         );
+        ensure!(
+            control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+                .get_record(MOUNT_RETIRE_KIND, manifest.anchor_id.as_bytes())?
+                .is_none(),
+            "guarded mount was retired while starting"
+        );
         Ok(Self {
             session,
             mountpoint,
@@ -257,6 +320,30 @@ impl GuardedViewMount {
     pub fn stop(self) -> io::Result<()> {
         self.session.umount_and_join()
     }
+}
+
+pub(crate) fn require_mount_claim_retired(
+    control: &ControlStore,
+    anchor_id: Uuid,
+) -> anyhow::Result<()> {
+    ensure!(
+        control
+            .get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())?
+            .is_none(),
+        "guarded mount claim must be retired before its anchors"
+    );
+    if let Some(bytes) = control.get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())? {
+        let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+        ensure!(
+            claim.version == 1 && claim.anchor_id == anchor_id,
+            "guarded mount retirement marker changed"
+        );
+        ensure!(
+            mounted_filesystem(&claim.mountpoint)?.is_none(),
+            "guarded view remains mounted during anchor retirement"
+        );
+    }
+    Ok(())
 }
 
 fn mount_source(anchor_id: Uuid) -> String {
@@ -419,15 +506,18 @@ mod tests {
 
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([111; 32]));
         let control = ControlStore::open(&control_path, &keys).unwrap();
-        let manifest = GuardedRootCapturePlan::plan(&lower)
-            .unwrap()
-            .capture(&control)
-            .unwrap();
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan.capture(&control).unwrap();
         let control = Arc::new(Mutex::new(control));
         let mount =
             GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
                 .unwrap();
         mount.check_health().unwrap();
+        {
+            let store = control.lock().unwrap();
+            assert!(plan.discard_unreferenced(&store).is_err());
+            assert!(GuardedViewMount::retire_claim(manifest.anchor_id, &store).is_err());
+        }
         assert!(
             GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534,)
                 .is_err()
@@ -529,6 +619,29 @@ mod tests {
         fs::rename(&mountpoint, area.path().join("old-view")).unwrap();
         fs::create_dir(&mountpoint).unwrap();
         fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(GuardedViewMount::start(&manifest, control, &mountpoint, 65534, 65534).is_err());
+        assert!(
+            GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
+                .is_err()
+        );
+        fs::remove_dir(&mountpoint).unwrap();
+        fs::rename(area.path().join("old-view"), &mountpoint).unwrap();
+        {
+            let store = control.lock().unwrap();
+            assert!(plan.discard_unreferenced(&store).is_err());
+            GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
+            GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
+        }
+        assert!(
+            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).is_err()
+        );
+        plan.discard_unreferenced(&control.lock().unwrap()).unwrap();
+        assert!(
+            !manifest
+                .area
+                .path_hint
+                .join(manifest.anchor_id.to_string())
+                .exists()
+        );
+        assert_eq!(fs::read(lower.join("sample")).unwrap(), edited);
     }
 }

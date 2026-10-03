@@ -393,6 +393,13 @@
   A normal test rejects altered sealed catalog bytes. The 115 normal store
   tests, formatting, and strict workspace Clippy pass. Seed-only recovery of
   mutable view metadata and node enrollment remain open.
+  Guarded root retirement now refuses any live mount claim. An explicit,
+  identity-checked claim retirement requires the view to be unmounted, writes
+  a durable remount fence, and removes the claim before anchor GC may proceed.
+  The privileged lifecycle test rejects retirement while mounted, then retires
+  the claim and frees the guarded anchor after stop; it passes on ext4 and a
+  fresh local Btrfs image. Node GC still needs to call this transition only
+  after all signed revisions and Git pins release the anchor.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

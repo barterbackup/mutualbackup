@@ -1114,6 +1114,7 @@ impl GuardedRootCapturePlan {
     /// interrupted retirement.
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
+        crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
         let plan_bytes = mb_core::canonical_bytes(self)?;
         let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
         let recorded_plan = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())?;
@@ -1469,6 +1470,7 @@ impl GuardedRootCapturePlan {
     /// capture intent or child entry rather than unlinking a frozen source.
     pub fn discard_empty_anchor_root(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
+        crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
         anyhow::ensure!(
             control
                 .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?

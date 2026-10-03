@@ -1372,6 +1372,13 @@ supplies the old process's manifest. An unprivileged store test rejects changed
 sealed catalog bytes. All 115 normal store tests and strict workspace Clippy
 pass. This covers local restart metadata, while seed-only recovery of mutable
 view state and safe node enrollment remain open.
+Guarded anchor retirement now checks that its mount claim has been retired.
+The explicit claim transition verifies an unmounted, identity-matched lower
+root and placeholder, persists a remount fence, and removes the claim before
+the anchor can be freed. A privileged lifecycle test rejects retirement while
+mounted, then stops and retires the view and its anchor on ext4 and fresh local
+Btrfs. Node GC must still invoke this only after retained revisions and Git
+pins release the source.
 `b69ce33` further makes signed endpoint sets authoritative over persistent
 bootstrap and attempt-scoped recovery hints, and prevents a pending dial to a
 withdrawn direct endpoint from holding transport selection on direct. The
