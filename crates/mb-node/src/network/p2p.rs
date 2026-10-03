@@ -8084,12 +8084,23 @@ async fn commit_verified_coding_group(
                     node.collect_guild_event_signature(&proposal, signature)
                 })
                 .await?;
+                if state
+                    .verify_event(&QuorumGuildEvent {
+                        event: event.clone(),
+                        signatures: signatures.clone(),
+                    })
+                    .is_ok()
+                {
+                    break;
+                }
             }
             Err(error) => {
                 tracing::warn!(%signer, %error, "guild member did not sign coding-group event");
             }
         }
     }
+    // Release minority requests and their outbound permits before installing.
+    drop(requests);
     let certified = QuorumGuildEvent { event, signatures };
     state.verify_event(&certified)?;
     let local_certified = certified.clone();
@@ -9023,12 +9034,23 @@ async fn commit_plain_guild_event(
                     node.collect_guild_event_signature(&proposal, signature)
                 })
                 .await?;
+                if state
+                    .verify_event(&QuorumGuildEvent {
+                        event: event.clone(),
+                        signatures: signatures.clone(),
+                    })
+                    .is_ok()
+                {
+                    break;
+                }
             }
             Err(error) => {
                 tracing::warn!(%signer, sequence = event.sequence, %error, "guild member did not sign lifecycle event");
             }
         }
     }
+    // Release minority requests and their outbound permits before installing.
+    drop(requests);
     let certified = QuorumGuildEvent { event, signatures };
     state.verify_event(&certified)?;
     let local_certified = certified.clone();
@@ -31735,6 +31757,153 @@ mod tests {
         );
         release.send(()).unwrap();
         assert_eq!(worker.await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn majority_lifecycle_event_does_not_wait_for_minority_signers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut nodes = active_test_guild_nodes(temp.path()).await;
+        let (unanimous_state, _, _, quorum_event) = prepare_guild_administration(
+            &mut nodes[0],
+            GuildAdministration::SetQuorum(QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Majority,
+            }),
+        )
+        .unwrap();
+        let mut quorum_signatures = nodes
+            .iter()
+            .map(|node| node.sign_guild_event_proposal(&quorum_event).unwrap())
+            .collect::<Vec<_>>();
+        quorum_signatures.sort_by_key(|signature| signature.signer);
+        let quorum_certificate = QuorumGuildEvent {
+            event: quorum_event,
+            signatures: quorum_signatures,
+        };
+        unanimous_state.verify_event(&quorum_certificate).unwrap();
+        for node in &mut nodes {
+            node.install_guild_event(quorum_certificate.clone())
+                .unwrap();
+        }
+
+        let coordinator = Arc::new(Mutex::new(nodes.remove(0)));
+        let relabeled = nodes[3].keys().node_id();
+        let (state, mut guild, local_id, event) = prepare_guild_administration(
+            &mut coordinator.lock().unwrap(),
+            GuildAdministration::RelabelMember {
+                node_id: relabeled,
+                failure_domain: "new-domain".to_owned(),
+            },
+        )
+        .unwrap();
+        for peer in &mut guild.peers {
+            peer.endpoints.clear();
+        }
+        let signatures_by_peer = nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.keys().node_id(),
+                    mb_core::sign_guild_event(&event, node.keys()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (commands, mut rx) = mpsc::channel(8);
+        let (request_cancellations, _cancel_rx) = mpsc::unbounded_channel();
+        let (_port, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(4)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let observed = coordinator.clone();
+        let expected = event.clone();
+        let expected_state = state.clone();
+        let worker = tokio::spawn(async move {
+            let mut signatures_by_peer = signatures_by_peer;
+            let mut sign_responses = Vec::new();
+            for _ in 0..4 {
+                let Command::Request {
+                    recipient,
+                    request,
+                    response,
+                    ..
+                } = rx.recv().await.expect("all signatures must be requested")
+                else {
+                    panic!("unexpected command during signature collection");
+                };
+                let PeerRequest::SignGuildEvent { event } = *request else {
+                    panic!("expected a lifecycle signature request");
+                };
+                assert_eq!(*event, expected);
+                sign_responses.push((recipient, response));
+            }
+            let held_minority = sign_responses.split_off(2);
+            for (recipient, response) in sign_responses {
+                let signature = signatures_by_peer.remove(&recipient).unwrap();
+                response
+                    .send(Ok(PeerResponse::GuildEventSignature(signature)))
+                    .unwrap();
+            }
+            let mut installed = BTreeSet::new();
+            for _ in 0..4 {
+                let Command::Request {
+                    recipient,
+                    request,
+                    response,
+                    ..
+                } = rx.recv().await.expect("all installs must be requested")
+                else {
+                    panic!("unexpected command during lifecycle installation");
+                };
+                let PeerRequest::InstallGuildEvent { certified } = *request else {
+                    panic!("expected a certified lifecycle event");
+                };
+                assert_eq!(certified.event, expected);
+                assert_eq!(certified.signatures.len(), 3);
+                expected_state.verify_event(&certified).unwrap();
+                assert_eq!(
+                    observed
+                        .lock()
+                        .unwrap()
+                        .dynamic_guild_state()
+                        .unwrap()
+                        .unwrap()
+                        .event_sequence,
+                    expected.sequence,
+                );
+                assert!(installed.insert(recipient));
+                response.send(Ok(PeerResponse::Ack)).unwrap();
+            }
+            assert!(
+                held_minority
+                    .iter()
+                    .all(|(_, response)| response.is_closed())
+            );
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            commit_plain_guild_event(coordinator.clone(), &p2p, state, guild, local_id, event),
+        )
+        .await
+        .expect("a certified majority must not wait for slow minority signers")
+        .unwrap();
+        worker.await.unwrap();
+        assert_eq!(
+            coordinator
+                .lock()
+                .unwrap()
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .event_sequence,
+            2
+        );
     }
 
     #[tokio::test]
