@@ -400,26 +400,17 @@ impl GuardedRootCapturePlan {
                 entry.path()
             );
         }
-        let marked_catalog = git_catalog_marker_from_root(lower_root.as_file())?.is_some();
+        let marked_catalog = lower_root.has_marked_git_catalog()?;
         for (parent, names) in expected {
             let directory = if parent.is_empty() {
                 lower_root.try_clone()?
             } else {
                 lower_root.open_descendant_directory(&parent)?
             };
-            let mut actual = BTreeSet::new();
-            let mut stream = DirectoryStream::open(directory.as_file())?;
-            while let Some(name) = stream.next_name()? {
-                if parent.is_empty()
-                    && marked_catalog
-                    && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes()
-                {
-                    continue;
-                }
-                actual.insert(name.as_bytes().to_vec());
-            }
+            let ignored =
+                (parent.is_empty() && marked_catalog).then_some(GIT_CATALOG_DIRECTORY.as_bytes());
             anyhow::ensure!(
-                actual == names,
+                directory.child_names_match(&names, ignored)?,
                 "guarded lower directory has an unexpected or missing entry: {parent}"
             );
         }

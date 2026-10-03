@@ -1589,11 +1589,14 @@ set before FUSE namespace replay, excluding only the marked Git catalog. The
 isolation pass checks the same inventory before and after ownership changes.
 Normal unknown-entry and replacement cases pass locally, and privileged
 first-mount/isolator refusal passes on ext4 and fresh local Btrfs, alongside
-117 normal store tests and strict workspace Clippy. Exact remount
-admission against the mutable FUSE namespace, restoration after FUSE path
-changes, detached-file owner recovery, signed mutable-view recovery, and the
-complete privileged mount gate remain open before ordinary user-owned roots
-can be enrolled.
+117 normal store tests and strict workspace Clippy. Remount now checks the
+reconstructed visible name/inode map against every complete lower-directory
+entry set after namespace replay and before mount publication. Privileged
+extra-entry refusal and legitimate replace/rename recovery pass on ext4 and
+fresh local Btrfs. Pre-replay admission around pending remount intents,
+restoration after FUSE path changes, detached-file owner recovery, signed
+mutable-view recovery, and the complete privileged mount gate remain open
+before ordinary user-owned roots can be enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

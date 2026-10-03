@@ -6,7 +6,7 @@
 //! creation, rename, unlink, and atomic replacement. It is not a complete
 //! long-lived edit guard and must not be used as an enrollment decision by itself.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io;
@@ -1757,6 +1757,112 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    /// After namespace replay, require the complete private lower tree to
+    /// match the visible file and directory identities reconstructed from the
+    /// durable view records. This also covers remounts after FUSE mutations.
+    pub(crate) fn verify_lower_namespace(&self) -> anyhow::Result<()> {
+        let lower_root = self
+            .lower_root
+            .as_ref()
+            .context("guarded view has no private lower root")?;
+        let root_id = lower_root.identity()?;
+        let dynamic_directories = self.dynamic_directories.lock().unwrap();
+        let mut directories = HashMap::from([(INodeNo::ROOT.0, PathBuf::new())]);
+        let mut expected = BTreeMap::from([(INodeNo::ROOT.0, BTreeSet::<Vec<u8>>::new())]);
+        for directory in self
+            .directories
+            .values()
+            .chain(dynamic_directories.values())
+        {
+            let inode = directory.attr.ino.0;
+            ensure!(
+                directories
+                    .insert(inode, directory.relative_path.clone())
+                    .is_none()
+                    && expected.insert(inode, BTreeSet::new()).is_none(),
+                "guarded view has duplicate directory identities"
+            );
+        }
+        let names = self.names.lock().unwrap().clone();
+        let dynamic_files = self.dynamic_files.lock().unwrap();
+        for ((parent, name), inode) in names {
+            let parent_path = directories
+                .get(&parent)
+                .context("guarded view name has no directory parent")?;
+            ensure!(
+                !name.is_empty()
+                    && name.as_bytes() != b"."
+                    && name.as_bytes() != b".."
+                    && !name.as_bytes().contains(&b'/')
+                    && !name.as_bytes().contains(&0),
+                "guarded view contains an unsafe name"
+            );
+            let path = parent_path.join(&name);
+            let (native_id, is_directory) = if let Some(directory) = self
+                .directories
+                .get(&inode)
+                .or_else(|| dynamic_directories.get(&inode))
+            {
+                ensure!(
+                    directory.parent.0 == parent
+                        && directory.name == name
+                        && directory.relative_path == path,
+                    "guarded directory name differs from its reconstructed path"
+                );
+                (directory.native_id, true)
+            } else {
+                let file = self
+                    .files
+                    .get(&inode)
+                    .or_else(|| dynamic_files.get(&inode))
+                    .context("guarded view name has no file or directory")?;
+                let location = file.location.lock().unwrap();
+                let location = location
+                    .as_ref()
+                    .context("guarded view names an unlinked file")?;
+                ensure!(
+                    location.parent.0 == parent && location.relative_path == path,
+                    "guarded file name differs from its reconstructed path"
+                );
+                (
+                    NativeFileId {
+                        filesystem_id: root_id.filesystem_id,
+                        inode: file.source.metadata()?.ino(),
+                    },
+                    false,
+                )
+            };
+            ensure!(
+                lower_root.entry_identity(&path, is_directory)? == Some(native_id),
+                "guarded lower entry differs from its reconstructed view: {}",
+                path.display()
+            );
+            expected
+                .get_mut(&parent)
+                .context("guarded view name has no expected parent")?
+                .insert(name.as_bytes().to_vec());
+        }
+        let marked_catalog = lower_root.has_marked_git_catalog()?;
+        for (inode, names) in expected {
+            let path = directories
+                .get(&inode)
+                .context("guarded view lost a directory path")?;
+            let directory = if inode == INodeNo::ROOT.0 {
+                lower_root.try_clone()?
+            } else {
+                lower_root.open_descendant_directory(path)?
+            };
+            let ignored = (inode == INodeNo::ROOT.0 && marked_catalog)
+                .then_some(crate::anchor::GIT_CATALOG_DIRECTORY.as_bytes());
+            ensure!(
+                directory.child_names_match(&names, ignored)?,
+                "guarded lower directory has an unrecorded or missing view entry: {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     /// A process can retain a directory descriptor from before a guarded
     /// transition. Keep every visible lower directory outside the view
     /// owner's reach, even when the private root path is now inaccessible.
@@ -6387,6 +6493,7 @@ mod tests {
         let rebuilt =
             GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
                 .unwrap();
+        rebuilt.verify_lower_namespace().unwrap();
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
         let replayed = (|| -> anyhow::Result<()> {
             anyhow::ensure!(!mountpoint.join("temporary").exists());
@@ -6475,6 +6582,7 @@ mod tests {
         let rebuilt =
             GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
                 .unwrap();
+        rebuilt.verify_lower_namespace().unwrap();
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
         let replayed = (|| -> anyhow::Result<()> {
             anyhow::ensure!(!mountpoint.join("source").exists());

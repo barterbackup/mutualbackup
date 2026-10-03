@@ -659,10 +659,16 @@
   cases pass locally; privileged first-mount and isolator refusal pass on ext4
   and fresh local Btrfs, alongside 117 normal store tests and strict workspace
   Clippy.
-  Guarded enrollment still needs exact remount admission against the mutable
-  FUSE namespace, restoration after FUSE path changes, owner restoration after
-  file detach, protected mutable-view metadata, and the complete privileged
-  mount gate.
+  Remount now reconstructs the visible name and inode map from durable FUSE
+  records, then compares every lower directory's complete entry set and every
+  named inode with that map before publishing the mount. An unrecorded root or
+  dynamic-directory file refuses recovery; legitimate replacement and
+  populated-directory rename with new descendants still recover. These
+  privileged remount probes pass on ext4 and fresh local Btrfs, alongside 117
+  normal store tests and strict workspace Clippy. Guarded enrollment still
+  needs pre-replay remount admission for pending namespace intents, restoration
+  after FUSE path changes, owner restoration after file detach, protected
+  mutable-view metadata, and the complete privileged mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

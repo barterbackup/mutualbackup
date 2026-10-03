@@ -595,6 +595,30 @@ impl PinnedDirectory {
         Ok(Some(native_file_id(self.filesystem_id, &metadata)))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn child_names_match(
+        &self,
+        expected: &BTreeSet<Vec<u8>>,
+        ignored: Option<&[u8]>,
+    ) -> Result<bool, AnchorError> {
+        let mut missing = expected.clone();
+        let mut stream = DirectoryStream::open(&self.file)?;
+        while let Some(name) = stream.next_name()? {
+            if ignored.is_some_and(|ignored| name.as_bytes() == ignored) {
+                continue;
+            }
+            if !missing.remove(name.as_bytes()) {
+                return Ok(false);
+            }
+        }
+        Ok(missing.is_empty())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_marked_git_catalog(&self) -> Result<bool, AnchorError> {
+        Ok(git_catalog_marker_from_root(&self.file)?.is_some())
+    }
+
     pub fn open_descendant_directory(
         &self,
         relative: impl AsRef<Path>,

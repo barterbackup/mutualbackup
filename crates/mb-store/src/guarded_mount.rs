@@ -290,6 +290,7 @@ impl GuardedViewMount {
             view_gid,
         )?;
         view.verify_private_lower_ownership()?;
+        view.verify_lower_namespace()?;
         if existing.is_none() {
             let claim = MountClaim {
                 version: 1,
@@ -929,6 +930,26 @@ print('DONE', flush=True)
             0o700
         );
         mount.stop().unwrap();
+
+        for unexpected in [lower.join("public/unknown"), lower.join("unknown")] {
+            fs::write(&unexpected, b"outside the guarded view").unwrap();
+            let error =
+                match GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)) {
+                    Ok(mount) => {
+                        mount.stop().unwrap();
+                        panic!("remount admitted an unrecorded lower entry")
+                    }
+                    Err(error) => error,
+                };
+            assert!(
+                error
+                    .to_string()
+                    .contains("unrecorded or missing view entry"),
+                "{error:#}"
+            );
+            assert!(fs::read_dir(&mountpoint).unwrap().next().is_none());
+            fs::remove_file(unexpected).unwrap();
+        }
 
         drop(control);
         let control = Arc::new(Mutex::new(
