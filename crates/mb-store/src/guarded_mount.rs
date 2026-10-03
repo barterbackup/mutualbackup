@@ -948,6 +948,21 @@ print('DONE', flush=True)
             assert!(fs::read_dir(&mountpoint).unwrap().next().is_none());
             fs::remove_file(unexpected).unwrap();
         }
+        fs::rename(lower.join("sample"), lower.join("wrong-recorded-inode")).unwrap();
+        let error =
+            match GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)) {
+                Ok(mount) => {
+                    mount.stop().unwrap();
+                    panic!("remount admitted a recorded inode at an unrecorded path")
+                }
+                Err(error) => error,
+            };
+        assert!(
+            error.to_string().contains("ungranted path before replay"),
+            "{error:#}"
+        );
+        assert!(fs::read_dir(&mountpoint).unwrap().next().is_none());
+        fs::rename(lower.join("wrong-recorded-inode"), lower.join("sample")).unwrap();
 
         drop(control);
         let control = Arc::new(Mutex::new(

@@ -674,12 +674,16 @@
   crash states. Pending create and replacement states also pass. The guarded
   remount probe and 117 normal store tests pass on ext4; remount, replace, and
   populated rename probes pass on fresh local Btrfs; strict Clippy passes.
-  Exact pre-replay path binding during pending intents still needs proof: the
-  inode scan admits any recorded inode at this stage, while the post-replay
-  inventory enforces exact names before mount publication. Guarded enrollment
-  also needs restoration after FUSE path changes, owner restoration after file
-  detach, protected mutable-view metadata, and the complete privileged mount
-  gate.
+  Pre-replay now also checks each lower path against its recorded native inode,
+  permitting alternate paths and rebased descendants only when granted by a
+  durable pending namespace intent. Moving a recorded inode to an ungranted
+  path refuses recovery before replay can mutate the lower tree; post-replay
+  inventory still enforces the exact final namespace before mount publication.
+  Normal create/remove/replace/rename crash states, ext4 remount, and fresh
+  local Btrfs remount/replace/rename probes pass, alongside 117 normal store
+  tests and strict workspace Clippy. Guarded enrollment still needs
+  restoration after FUSE path changes, owner restoration after file detach,
+  protected mutable-view metadata, and the complete privileged mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

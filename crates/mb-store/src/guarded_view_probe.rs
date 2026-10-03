@@ -967,6 +967,127 @@ impl GuardedNamespace {
             lower_root.all_descendants_known(&allowed)?,
             "guarded lower tree contains an unrecorded inode before replay"
         );
+        self.preflight_granted_lower_paths(lower_root, captured_directories, captured_files)?;
+        Ok(())
+    }
+
+    fn preflight_granted_lower_paths(
+        &self,
+        lower_root: &PinnedDirectory,
+        captured_directories: &CapturedDirectories,
+        captured_files: &HashMap<u64, NamespaceRecord>,
+    ) -> anyhow::Result<()> {
+        let mut directories = captured_directories
+            .iter()
+            .map(|(&inode, (path, id, _))| {
+                (
+                    inode,
+                    DirectoryRecord {
+                        version: 1,
+                        expected: *id,
+                        current: Some(path.clone()),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for (inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
+            let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
+            directories.insert(inode, record);
+        }
+        let mut files = captured_files.clone();
+        for (inode, bytes) in self.owned_records(NAMESPACE_KIND)? {
+            let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
+            files.insert(inode, record);
+        }
+        let mut grants = BTreeMap::<PathBuf, BTreeSet<NativeFileId>>::new();
+        for record in directories.values() {
+            if let Some(path) = &record.current {
+                grant_lower_path(&mut grants, path, record.expected)?;
+            }
+        }
+        for record in files.values() {
+            if let Some(path) = &record.current {
+                grant_lower_path(&mut grants, path, record.expected)?;
+            }
+            if let Some(Some(path)) = &record.pending {
+                grant_lower_path(&mut grants, path, record.expected)?;
+            }
+        }
+        for (_, bytes) in self.owned_records(CREATE_KIND)? {
+            let intent: CreateIntent = mb_core::decode_canonical(&bytes)?;
+            grant_lower_path(&mut grants, &intent.target, intent.expected)?;
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_CREATE_KIND)? {
+            let intent: DirectoryCreateIntent = mb_core::decode_canonical(&bytes)?;
+            if let Some(id) = intent.expected {
+                grant_lower_path(&mut grants, &intent.target, id)?;
+            }
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_REMOVE_KIND)? {
+            let intent: DirectoryRemoveIntent = mb_core::decode_canonical(&bytes)?;
+            grant_lower_path(&mut grants, &intent.target, intent.expected)?;
+        }
+        let mut directory_moves = Vec::new();
+        for (_, bytes) in self.owned_records(DIRECTORY_RENAME_KIND)? {
+            let intent: DirectoryRenameIntent = mb_core::decode_canonical(&bytes)?;
+            grant_lower_path(&mut grants, &intent.source, intent.expected)?;
+            grant_lower_path(&mut grants, &intent.target, intent.expected)?;
+            directory_moves.push((
+                checked_namespace_relative_path(&intent.source)?,
+                checked_namespace_relative_path(&intent.target)?,
+            ));
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_REPLACE_KIND)? {
+            let intent: DirectoryReplaceIntent = mb_core::decode_canonical(&bytes)?;
+            let move_intent = &intent.move_intent;
+            grant_lower_path(&mut grants, &move_intent.source, move_intent.expected)?;
+            grant_lower_path(&mut grants, &move_intent.target, move_intent.expected)?;
+            grant_lower_path(&mut grants, &move_intent.target, intent.target_expected)?;
+            grant_lower_path(&mut grants, &move_intent.source, intent.target_expected)?;
+            directory_moves.push((
+                checked_namespace_relative_path(&move_intent.source)?,
+                checked_namespace_relative_path(&move_intent.target)?,
+            ));
+        }
+        let rows = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .records(REPLACE_KIND)?;
+        for (id, bytes) in rows {
+            if !id.starts_with(self.anchor_id.as_bytes()) {
+                continue;
+            }
+            ensure!(id.len() == 32, "invalid guarded file replace ID");
+            let intent: ReplaceIntent = mb_core::decode_canonical(&bytes)?;
+            let source = intent
+                .source_before
+                .current
+                .as_ref()
+                .context("guarded replace intent has no source path")?;
+            let target = intent
+                .target_before
+                .current
+                .as_ref()
+                .context("guarded replace intent has no target path")?;
+            for path in [source, target] {
+                grant_lower_path(&mut grants, path, intent.source_before.expected)?;
+                grant_lower_path(&mut grants, path, intent.target_before.expected)?;
+            }
+        }
+        for (source, target) in directory_moves {
+            let current = grants.clone();
+            for (path, ids) in current {
+                if path.starts_with(&source) {
+                    let rebased = rebased_namespace_path(&path, &source, &target);
+                    grants.entry(rebased).or_default().extend(ids);
+                }
+            }
+        }
+        ensure!(
+            lower_root.all_descendant_paths_granted(&grants)?,
+            "guarded lower tree has an ungranted path before replay"
+        );
         Ok(())
     }
 
@@ -1701,6 +1822,16 @@ fn rebased_namespace_path(path: &Path, source: &Path, target: &Path) -> PathBuf 
         Ok(suffix) => target.join(suffix),
         Err(_) => path.to_path_buf(),
     }
+}
+
+fn grant_lower_path(
+    grants: &mut BTreeMap<PathBuf, BTreeSet<NativeFileId>>,
+    bytes: &[u8],
+    id: NativeFileId,
+) -> anyhow::Result<()> {
+    let path = checked_namespace_relative_path(bytes)?;
+    grants.entry(path).or_default().insert(id);
+    Ok(())
 }
 
 fn namespace_path(
@@ -4686,6 +4817,21 @@ mod tests {
                         .is_some()
                 );
                 fs::remove_file(unknown).unwrap();
+                let wrong = lower.join("wrong-known-path");
+                fs::rename(lower.join("parent/sub/new"), &wrong).unwrap();
+                assert!(
+                    journal
+                        .preflight_known_lower_inodes(&root, &captured, &defaults)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ungranted path before replay")
+                );
+                assert_eq!(
+                    root.entry_identity("parent", true).unwrap(),
+                    Some(parent_id)
+                );
+                assert!(root.entry_identity("relocated", true).unwrap().is_none());
+                fs::rename(wrong, lower.join("parent/sub/new")).unwrap();
             }
             journal
                 .preflight_known_lower_inodes(&root, &captured, &defaults)
@@ -4799,15 +4945,15 @@ mod tests {
 
     #[test]
     fn directory_creation_replays_each_staging_and_publication_boundary() {
-        let area = tempfile::tempdir().unwrap();
-        let lower = area.path().join("lower");
-        fs::create_dir(&lower).unwrap();
-        let root = PinnedDirectory::open(&lower).unwrap();
-        let anchor_area = StableAnchorAreaLocator::prepare_for_root(&lower).unwrap();
-        let staging = anchor_area.open_guarded_staging_area().unwrap();
-        let keys = KeyMaterial::from_seed(&Seed::from_bytes([97; 32]));
-        let control_path = area.path().join("control.db");
         for phase in 0..5 {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let anchor_area = StableAnchorAreaLocator::prepare_for_root(&lower).unwrap();
+            let staging = anchor_area.open_guarded_staging_area().unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([97; 32]));
+            let control_path = area.path().join("control.db");
             let anchor_id = uuid::Uuid::new_v4();
             let name = format!("created-{phase}");
             let stage_name = format!(".guarded-mkdir-{}", uuid::Uuid::new_v4());
@@ -4866,6 +5012,9 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
+            journal
+                .preflight_known_lower_inodes(&root, &HashMap::new(), &HashMap::new())
+                .unwrap();
             let directory_paths = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
             journal
                 .reconcile_directory_creates(&root, &staging, &directory_paths, 2)
@@ -5066,6 +5215,9 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
+            journal
+                .preflight_known_lower_inodes(&root, &HashMap::new(), &HashMap::new())
+                .unwrap();
             let visible = journal
                 .load_directories(&root, &HashMap::new(), 2, 65534, 65534)
                 .unwrap();
@@ -5146,6 +5298,9 @@ mod tests {
                 records: Mutex::new(HashMap::new()),
             };
             let captured = HashMap::from([(2, (name.as_bytes().to_vec(), expected, 0o755))]);
+            journal
+                .preflight_known_lower_inodes(&root, &captured, &HashMap::new())
+                .unwrap();
             journal
                 .reconcile_directory_removes(&root, &directories, 3, &captured)
                 .unwrap();
@@ -5323,14 +5478,14 @@ mod tests {
 
     #[test]
     fn replacement_replays_each_exchange_publication_and_cleanup_boundary() {
-        let area = tempfile::tempdir().unwrap();
-        let lower = area.path().join("lower");
-        fs::create_dir(&lower).unwrap();
-        let root = PinnedDirectory::open(&lower).unwrap();
-        let keys = KeyMaterial::from_seed(&Seed::from_bytes([93; 32]));
-        let control_path = area.path().join("control.db");
-        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
         for phase in 0..4 {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([93; 32]));
+            let control_path = area.path().join("control.db");
+            let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
             let source_name = format!("temp-{phase}");
             let target_name = format!("target-{phase}");
             let anchor_name = format!("anchor-{phase}");
@@ -5389,6 +5544,9 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
+            journal
+                .preflight_known_lower_inodes(&root, &HashMap::new(), &defaults)
+                .unwrap();
             journal
                 .reconcile_replaces(&root, &directories, &defaults, 3)
                 .unwrap();
@@ -5654,19 +5812,19 @@ mod tests {
 
     #[test]
     fn namespace_journal_replays_file_move_and_unlink_on_both_sides_of_mutation() {
-        let area = tempfile::tempdir().unwrap();
-        let lower = area.path().join("lower");
-        fs::create_dir(&lower).unwrap();
-        let root = PinnedDirectory::open(&lower).unwrap();
-        let keys = KeyMaterial::from_seed(&Seed::from_bytes([89; 32]));
-        let control_path = area.path().join("control.db");
-        let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
         for (index, unlink, completed) in [
             (0, false, false),
             (1, false, true),
             (2, true, false),
             (3, true, true),
         ] {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([89; 32]));
+            let control_path = area.path().join("control.db");
+            let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
             let old = format!("old-{index}");
             let new = format!("new-{index}");
             fs::write(lower.join(&old), b"original bytes").unwrap();
@@ -5706,6 +5864,15 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
+            let mut default = record.clone();
+            default.pending = None;
+            journal
+                .preflight_known_lower_inodes(
+                    &root,
+                    &HashMap::new(),
+                    &HashMap::from([(2, default)]),
+                )
+                .unwrap();
             let location = journal
                 .load_or_replay(2, &old, expected, &root, &directories)
                 .unwrap();

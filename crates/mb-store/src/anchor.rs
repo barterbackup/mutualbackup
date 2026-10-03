@@ -672,6 +672,64 @@ impl PinnedDirectory {
         scan(self, allowed, &mut seen, 0, self.has_marked_git_catalog()?)
     }
 
+    /// Every pre-replay lower name must map to an inode permitted by a durable
+    /// namespace record or one of its replayable pending transitions.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn all_descendant_paths_granted(
+        &self,
+        grants: &BTreeMap<PathBuf, BTreeSet<NativeFileId>>,
+    ) -> Result<bool, AnchorError> {
+        fn scan(
+            directory: &PinnedDirectory,
+            parent: &Path,
+            grants: &BTreeMap<PathBuf, BTreeSet<NativeFileId>>,
+            depth: usize,
+            skip_catalog: bool,
+        ) -> Result<bool, AnchorError> {
+            if depth > MAX_CAPTURE_DEPTH {
+                return Ok(false);
+            }
+            let mut stream = DirectoryStream::open(directory.as_file())?;
+            while let Some(name) = stream.next_name()? {
+                if skip_catalog && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes() {
+                    continue;
+                }
+                let component = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
+                let relative = parent.join(component);
+                let pinned = open_path_no_xdev_beneath(directory.as_file(), component)?;
+                let metadata = pinned.metadata()?;
+                if !metadata.is_dir() && !metadata.is_file() {
+                    return Ok(false);
+                }
+                let id = native_file_id(directory.filesystem_id, &metadata);
+                if !grants.get(&relative).is_some_and(|ids| ids.contains(&id)) {
+                    return Ok(false);
+                }
+                if metadata.is_dir() {
+                    let file = reopen_pinned_file(&pinned, true, component)?;
+                    let child = PinnedDirectory {
+                        file,
+                        filesystem_id: directory.filesystem_id,
+                    };
+                    if child.identity()? != id
+                        || !scan(&child, &relative, grants, depth + 1, false)?
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+
+        scan(
+            self,
+            Path::new(""),
+            grants,
+            0,
+            self.has_marked_git_catalog()?,
+        )
+    }
+
     pub fn open_descendant_directory(
         &self,
         relative: impl AsRef<Path>,
