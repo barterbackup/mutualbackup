@@ -187,6 +187,10 @@ impl GuardedViewMount {
         config.mount_options = vec![
             MountOption::FSName(source.clone()),
             MountOption::Subtype(MOUNT_SUBTYPE.to_owned()),
+            // The view advertises the owner's original modes while the
+            // private lower inodes remain frozen. Kernel permission checks
+            // must enforce those advertised modes for other local users.
+            MountOption::DefaultPermissions,
         ];
         let session = fuser::spawn_mount(view, &mountpoint, &config)
             .context("mount guarded worktree view")?;
@@ -301,6 +305,7 @@ fn decode_mountinfo_path(encoded: &str) -> anyhow::Result<PathBuf> {
 mod tests {
     use std::ffi::CString;
     use std::fs;
+    use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -403,6 +408,13 @@ mod tests {
             .unwrap();
         assert!(user_read.status.success(), "{user_read:?}");
         assert_eq!(user_read.stdout, exact_bytes);
+        let unrelated_read = Command::new("cat")
+            .uid(65533)
+            .gid(65533)
+            .arg(mountpoint.join("sample"))
+            .output()
+            .unwrap();
+        assert!(!unrelated_read.status.success());
         let private_read = Command::new("cat")
             .uid(65534)
             .gid(65534)
@@ -410,13 +422,33 @@ mod tests {
             .output()
             .unwrap();
         assert!(!private_read.status.success());
+        let owner_write = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.pwrite(fd,b'EDIT',0); os.fsync(fd); os.close(fd)")
+            .arg(mountpoint.join("sample"))
+            .output()
+            .unwrap();
+        assert!(owner_write.status.success(), "{owner_write:?}");
+        let mut edited = exact_bytes.to_vec();
+        edited[..4].copy_from_slice(b"EDIT");
+        assert_eq!(fs::read(lower.join("sample")).unwrap(), edited);
+        let mut anchor = manifest
+            .file_locator("sample".to_owned())
+            .unwrap()
+            .open()
+            .unwrap();
+        let mut frozen = Vec::new();
+        anchor.read_to_end(&mut frozen).unwrap();
+        assert_eq!(frozen, exact_bytes);
         mount.stop().unwrap();
 
         let remounted =
             GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
                 .unwrap();
         remounted.check_health().unwrap();
-        assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), exact_bytes);
+        assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), edited);
         remounted.stop().unwrap();
 
         fs::write(
@@ -455,7 +487,7 @@ mod tests {
             GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
                 .unwrap();
         recovered.check_health().unwrap();
-        assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), exact_bytes);
+        assert_eq!(fs::read(mountpoint.join("sample")).unwrap(), edited);
         recovered.stop().unwrap();
         drop(dead);
 

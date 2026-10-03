@@ -374,6 +374,12 @@
   ext4 and a fresh local Btrfs image. The 114 normal store tests and strict
   workspace Clippy pass. Daemon ownership/health supervision, protected
   metadata recovery, and the replayable enrollment transition remain open.
+  The production mount now enables kernel default permission checks for its
+  advertised view modes. A privileged probe proves that without this option
+  an unrelated user can read a `0700` view; with it, that user is denied and
+  the intended owner can still edit after durable detach without changing the
+  frozen anchor. The edit survives clean and killed-daemon remount on ext4 and
+  fresh local Btrfs. Daemon supervision and enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
