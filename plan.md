@@ -550,8 +550,11 @@ formats. A tracked regular file's Git blob is exactly the bytes captured at
 checkout, restore/reset, switch, merge, worktree creation, import, or export.
 For a tracked file that the user has not edited, require byte identity across
 the captured source, staged blob, committed blob, and every restored worktree
-file. A merge result intentionally written by the user or merge engine becomes
-a new raw-byte blob; the frontend does not apply an additional conversion.
+file. `status` and `diff` compare the working bytes with the raw staged and
+committed blobs: changing only LF to CRLF (or back) is a real modification, not
+an automatically corrected or ignored formatting difference. A merge result
+intentionally written by the user or merge engine becomes a new raw-byte blob;
+the frontend does not apply an additional conversion.
 Incoming Git blobs become identical local file bytes; outgoing blobs retain
 their original bytes and object IDs. Do not use `core.autocrlf`, `core.eol`,
 `core.safecrlf`, or `text`, `eol`, `filter`, `ident`, and
@@ -3201,6 +3204,9 @@ backend gates. A command being present does not by itself close its slice.
   behavior visible in help and status when such rules exist. Never run a
   configured filter command. Define safe support for Git file
   modes, symlinks, and path names rather than silently dropping them.
+  Check `status`, `diff`, and dirty-worktree preflight against raw blob bytes,
+  so a line-ending-only edit cannot disappear from the index or be silently
+  overwritten by checkout, restore, switch, or pull.
   Treat raw-byte behavior as a gate for each supported command, including
   interoperation commands, rather than deferring it to final milestone testing.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
@@ -3258,6 +3264,8 @@ backend gates. A command being present does not by itself close its slice.
   filter is never executed; verify renormalization/filter-enabling command
   options are rejected without changing index, refs, anchors, or worktree;
   transforming rules remain present but inert while raw-byte commands succeed;
+  verify `status` and `diff` report a line-ending-only edit as dirty and
+  destructive worktree operations protect that edit;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
   dirty and untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
   ref, checkout, switch, merge, worktree HEAD/index, import, prune, and backup
