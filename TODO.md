@@ -691,10 +691,16 @@
   It refuses unfinished or malformed namespace state before retirement begins.
   An ordinary-user same-directory rename, remount, and final owner/access
   restoration pass on ext4 and fresh local Btrfs; the retained anchor remains
-  byte-exact through refused retirements. Guarded enrollment still needs
-  retirement after captured directory moves and replacements, recovery of
-  detached owner obligations for removed or replaced names, protected mutable-
-  view metadata, and the complete privileged mount gate.
+  byte-exact through refused retirements. Captured-directory retirement now
+  resolves completed FUSE move records for every planned directory and restores
+  their original owner and mode at the verified current inode. A root-level
+  directory move with a nested frozen file survives remount and retirement on
+  ext4 and fresh local Btrfs; malformed records, a replaced lower directory,
+  and an interrupted owner-before-mode restoration fail or replay as expected.
+  Guarded enrollment still needs retirement after captured directory removals
+  and replacements, recovery of detached owner obligations for removed or
+  replaced names, protected mutable-view metadata, and the complete privileged
+  mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

@@ -1612,10 +1612,14 @@ local Btrfs. Retirement now follows a captured frozen file's completed FUSE
 rename record, rebinding the file capture to its verified current inode and
 name before anchor removal. A same-directory ordinary-user rename, remount,
 and retirement pass on ext4 and fresh local Btrfs; malformed or unfinished
-namespace state refuses retirement. Captured directory moves and replacements,
-removed or replaced detached-file owner obligations, signed mutable-view
-recovery, and the complete privileged mount gate remain open before ordinary
-user-owned roots can be enrolled.
+namespace state refuses retirement. Captured-directory retirement now follows
+completed move records and restores each planned inode at its verified current
+path. A moved directory containing a frozen file survives remount and final
+owner/mode restoration on ext4 and fresh local Btrfs, including a partial
+owner-before-mode restore; malformed or replaced directories refuse retirement.
+Captured directory removal/replacement, removed or replaced detached-file owner
+obligations, signed mutable-view recovery, and the complete privileged mount
+gate remain open before ordinary user-owned roots can be enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

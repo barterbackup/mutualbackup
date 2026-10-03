@@ -753,21 +753,58 @@ impl GuardedRootCapturePlan {
         entries
     }
 
+    fn retirement_directory_paths(
+        &self,
+        control: &ControlStore,
+    ) -> anyhow::Result<BTreeMap<String, PathBuf>> {
+        let mut paths = BTreeMap::from([(String::new(), PathBuf::new())]);
+        let mut occupied = std::collections::BTreeSet::from([PathBuf::new()]);
+        for (index, entry) in self.entries.iter().enumerate() {
+            let GuardedRootEntry::Directory { path, version, .. } = entry else {
+                continue;
+            };
+            let expected = NativeFileId {
+                filesystem_id: version.filesystem_id,
+                inode: version.inode,
+            };
+            let current = crate::guarded_view_probe::captured_directory_path_for_retirement(
+                control,
+                self.anchor_id,
+                u64::try_from(index)? + 2,
+                path,
+                expected,
+            )?;
+            anyhow::ensure!(
+                occupied.insert(current.clone()) && paths.insert(path.clone(), current).is_none(),
+                "captured directories alias a retirement path"
+            );
+        }
+        Ok(paths)
+    }
+
     fn open_lower_directory(
         lower: &PinnedDirectory,
         entry: &LowerOwnershipEntry,
     ) -> anyhow::Result<PinnedDirectory> {
-        let directory = if entry.path.is_empty() {
+        Self::open_lower_directory_at_path(lower, entry, Path::new(&entry.path))
+    }
+
+    fn open_lower_directory_at_path(
+        lower: &PinnedDirectory,
+        entry: &LowerOwnershipEntry,
+        path: &Path,
+    ) -> anyhow::Result<PinnedDirectory> {
+        let directory = if path.as_os_str().is_empty() {
             lower.try_clone()?
         } else {
-            lower.open_descendant_directory(&entry.path)?
+            lower.open_descendant_directory(path)?
         };
         anyhow::ensure!(
             directory.identity()? == entry.native_id
-                && (entry.path.is_empty()
-                    || lower.entry_identity(&entry.path, true)? == Some(entry.native_id)),
+                && (path.as_os_str().is_empty()
+                    || lower.entry_identity(path, true)? == Some(entry.native_id)),
             "guarded lower directory identity changed: {}",
-            entry.path
+            path.display()
         );
         Ok(directory)
     }
@@ -822,7 +859,7 @@ impl GuardedRootCapturePlan {
             prior.as_ref().is_none_or(|record| record == &expected),
             "guarded directory isolation parameters changed"
         );
-        self.verify_lower_directories_for_retirement(&snapshot, &lower, prior.as_ref())?;
+        self.verify_lower_directories_for_retirement(&snapshot, &lower, prior.as_ref(), None)?;
         self.verify_initial_lower_namespace(&lower)?;
         for entry in self.lower_directory_entries(&snapshot) {
             let directory = Self::open_lower_directory(&lower, entry)?;
@@ -872,7 +909,7 @@ impl GuardedRootCapturePlan {
                 entry.path
             );
         }
-        self.verify_lower_directories_for_retirement(&snapshot, &lower, Some(&expected))?;
+        self.verify_lower_directories_for_retirement(&snapshot, &lower, Some(&expected), None)?;
         self.verify_initial_lower_namespace(&lower)?;
         let root_metadata = lower.as_file().metadata()?;
         anyhow::ensure!(
@@ -1048,9 +1085,17 @@ impl GuardedRootCapturePlan {
         snapshot: &LowerOwnershipSnapshot,
         lower: &PinnedDirectory,
         isolation: Option<&DirectoryIsolation>,
+        paths: Option<&BTreeMap<String, PathBuf>>,
     ) -> anyhow::Result<()> {
         for entry in self.lower_directory_entries(snapshot) {
-            let directory = Self::open_lower_directory(lower, entry)?;
+            let current = match paths {
+                Some(paths) => paths
+                    .get(&entry.path)
+                    .ok_or_else(|| anyhow::anyhow!("captured directory lost its retirement path"))?
+                    .as_path(),
+                None => Path::new(&entry.path),
+            };
+            let directory = Self::open_lower_directory_at_path(lower, entry, current)?;
             if isolation.is_some() {
                 Self::check_directory_isolation_metadata(directory.as_file())?;
             }
@@ -1116,9 +1161,15 @@ impl GuardedRootCapturePlan {
         control: &ControlStore,
         snapshot: &LowerOwnershipSnapshot,
         isolation: Option<&DirectoryIsolation>,
+        directory_paths: &BTreeMap<String, PathBuf>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
-        self.verify_lower_directories_for_retirement(snapshot, &lower, isolation)?;
+        self.verify_lower_directories_for_retirement(
+            snapshot,
+            &lower,
+            isolation,
+            Some(directory_paths),
+        )?;
         for (planned, recorded) in self.entries.iter().zip(snapshot.entries.iter().skip(1)) {
             let GuardedRootEntry::File { capture_id, .. } = planned else {
                 continue;
@@ -1150,9 +1201,15 @@ impl GuardedRootCapturePlan {
         snapshot: &LowerOwnershipSnapshot,
         bytes: &[u8],
         isolation: Option<&DirectoryIsolation>,
+        directory_paths: &BTreeMap<String, PathBuf>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
-        self.verify_lower_directories_for_retirement(snapshot, &lower, isolation)?;
+        self.verify_lower_directories_for_retirement(
+            snapshot,
+            &lower,
+            isolation,
+            Some(directory_paths),
+        )?;
         for planned in &self.entries {
             let GuardedRootEntry::File { capture_id, .. } = planned else {
                 continue;
@@ -1164,8 +1221,13 @@ impl GuardedRootCapturePlan {
             );
         }
         if let Some(record) = isolation {
-            for entry in self.lower_directory_entries(snapshot).into_iter().rev() {
-                let directory = Self::open_lower_directory(&lower, entry)?;
+            let mut entries = self.lower_directory_entries(snapshot);
+            entries.sort_by_key(|entry| {
+                std::cmp::Reverse(directory_paths[&entry.path].components().count())
+            });
+            for entry in entries {
+                let current = &directory_paths[&entry.path];
+                let directory = Self::open_lower_directory_at_path(&lower, entry, current)?;
                 Self::check_directory_isolation_metadata(directory.as_file())?;
                 let before = directory.as_file().metadata()?;
                 if (before.uid(), before.gid()) != (entry.uid, entry.gid) {
@@ -1192,13 +1254,19 @@ impl GuardedRootCapturePlan {
                     (after.uid(), after.gid()) == (entry.uid, entry.gid)
                         && unix_mode(&after) & 0o7777 == entry.mode
                         && read_access_acl(directory.as_file())? == entry.access_acl
-                        && Self::open_lower_directory(&lower, entry)?.identity()?
+                        && Self::open_lower_directory_at_path(&lower, entry, current)?
+                            .identity()?
                             == entry.native_id,
                     "guarded lower directory was not restored: {}",
                     entry.path
                 );
             }
-            self.verify_lower_directories_for_retirement(snapshot, &lower, None)?;
+            self.verify_lower_directories_for_retirement(
+                snapshot,
+                &lower,
+                None,
+                Some(directory_paths),
+            )?;
             control.delete_record_if_value(
                 DIRECTORY_ISOLATION_KIND,
                 self.anchor_id.as_bytes(),
@@ -2178,17 +2246,21 @@ impl GuardedRootCapturePlan {
             )?;
             return Ok(());
         }
+        let mut retirement_directory_paths = None;
         if let Some((_, snapshot)) = &lower_ownership {
             anyhow::ensure!(
                 recorded_plan.is_some(),
                 "guarded lower owner lost its root plan"
             );
             self.reconcile(control)?;
+            let paths = self.retirement_directory_paths(control)?;
             self.verify_lower_ownership_before_retirement(
                 control,
                 snapshot,
                 directory_isolation.as_ref(),
+                &paths,
             )?;
+            retirement_directory_paths = Some(paths);
         }
         let retirement = RootRetirement {
             format_version: 1,
@@ -2432,6 +2504,9 @@ impl GuardedRootCapturePlan {
                 snapshot,
                 bytes,
                 directory_isolation.as_ref(),
+                retirement_directory_paths
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("guarded retirement lost directory paths"))?,
             )?;
         }
         if let Some(private) = &private_capture {
