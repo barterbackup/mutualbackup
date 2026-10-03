@@ -2643,6 +2643,50 @@ impl Filesystem for GuardedProbeView {
         reply.ok();
     }
 
+    fn fsyncdir(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _handle: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let _names = self.names.lock().unwrap();
+        let result = (|| -> io::Result<()> {
+            let lower_root = self
+                .lower_root
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
+            let directory = if inode == INodeNo::ROOT {
+                lower_root.try_clone().map_err(io::Error::other)?
+            } else {
+                let visible = self
+                    .directory(inode.0)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                let directory = lower_root
+                    .open_descendant_directory(&visible.relative_path)
+                    .map_err(io::Error::other)?;
+                if directory.identity().map_err(io::Error::other)? != visible.native_id {
+                    return Err(io::Error::other("guarded directory changed during fsync"));
+                }
+                directory
+            };
+            if datasync {
+                directory.as_file().sync_data()
+            } else {
+                directory.as_file().sync_all()
+            }
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+        }
+    }
+
     fn getattr(
         &self,
         _request: &Request,
@@ -2941,6 +2985,38 @@ impl Filesystem for GuardedProbeView {
         // released passthrough for this FUSE inode.
         self.backing.lock().unwrap().remove(&handle.0);
         reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let source = {
+            let held = self.backing.lock().unwrap();
+            held.get(&handle.0)
+                .filter(|backing| backing.inode == inode)
+                .map(|backing| backing.source.try_clone())
+        };
+        let result = match source {
+            Some(Ok(source)) if datasync => source.sync_data(),
+            Some(Ok(source)) => source.sync_all(),
+            _ => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+        }
     }
 
     fn mkdir(
@@ -6081,7 +6157,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import os,sys; root=sys.argv[1]; os.mkdir(root+'/destination'); os.mkdir(root+'/source/created'); fd=os.open(root+'/source/created/new',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.write(fd,b'dynamic'); os.close(fd); os.rename(root+'/source',root+'/destination/moved'); fd=os.open(root+'/destination/moved/leaf',os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                .arg("import os,sys; root=sys.argv[1]; rootfd=os.open(root,os.O_RDONLY|os.O_DIRECTORY); os.mkdir(root+'/destination'); os.mkdir(root+'/source/created'); fd=os.open(root+'/source/created/new',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.write(fd,b'dynamic'); os.fsync(fd); os.close(fd); dirfd=os.open(root+'/source',os.O_RDONLY|os.O_DIRECTORY); os.rename(root+'/source',root+'/destination/moved'); os.fsync(dirfd); os.close(dirfd); os.fsync(rootfd); os.close(rootfd); fd=os.open(root+'/destination/moved/leaf',os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
                 .arg(&mountpoint)
                 .output()?;
             anyhow::ensure!(

@@ -770,7 +770,10 @@ Proactive background repair comes later.
   handle-based truncate and allocation. Rename and unlink preserve the immutable
   anchor without detaching. New files are editable independent inodes, and
   their publication must be replayable across a crash. Atomic replacement must
-  keep the replaced file's immutable anchor intact. A mount/daemon failure
+  keep the replaced file's immutable anchor intact. File `fsync`/`fdatasync`
+  must sync the retained inode even after rename, unlink, or replacement;
+  directory sync must use an identity-checked current directory, including
+  after rename, and propagate storage errors. A mount/daemon failure
   must make the view fail closed, never expose the private source path or
   silently resume through it.
   Probe the mount, passthrough capability, and inaccessible lower path locally
