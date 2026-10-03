@@ -1603,10 +1603,18 @@ pub struct GuardedProbeView {
 }
 
 struct ActiveBacking {
-    id: BackingId,
+    id: Arc<BackingId>,
     mode: OpenAccMode,
     inode: INodeNo,
     source: File,
+}
+
+struct CreatedGuardedFile {
+    inode: u64,
+    file: Arc<GuardedProbeFile>,
+    backing: Arc<BackingId>,
+    retained: File,
+    attr: FileAttr,
 }
 
 impl GuardedProbeFile {
@@ -2891,15 +2899,22 @@ impl Filesystem for GuardedProbeView {
                 return;
             }
         };
-        let backing = match reply.open_backing(source) {
-            Ok(backing) => backing,
-            Err(_) => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut held = self.backing.lock().unwrap();
+        // The kernel permits only one backing registration per FUSE inode
+        // while passthrough handles overlap. Each handle still retains its
+        // own descriptor for ftruncate and fallocate after namespace changes.
+        let backing = if let Some(existing) = held.values().find(|open| open.inode == inode) {
+            Arc::clone(&existing.id)
+        } else {
+            match reply.open_backing(source) {
+                Ok(backing) => Arc::new(backing),
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+        };
         held.insert(
             handle,
             ActiveBacking {
@@ -2922,6 +2937,8 @@ impl Filesystem for GuardedProbeView {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // The last handle drops the shared registration after the kernel has
+        // released passthrough for this FUSE inode.
         self.backing.lock().unwrap().remove(&handle.0);
         reply.ok();
     }
@@ -3113,7 +3130,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EEXIST);
             return;
         }
-        let result = (|| -> io::Result<(u64, Arc<GuardedProbeFile>, BackingId, File, FileAttr)> {
+        let result = (|| -> io::Result<CreatedGuardedFile> {
             let owned = if parent_path.as_os_str().is_empty() {
                 None
             } else {
@@ -3132,7 +3149,7 @@ impl Filesystem for GuardedProbeView {
             source.set_permissions(fs::Permissions::from_mode((mode & !umask) & 0o777))?;
             source.sync_all()?;
             let retained = source.try_clone()?;
-            let backing = reply.open_backing(&source)?;
+            let backing = Arc::new(reply.open_backing(&source)?);
             let inode = self
                 .next_inode
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -3176,10 +3193,22 @@ impl Filesystem for GuardedProbeView {
             let attr = file
                 .current_attr()
                 .inspect_err(|_| self.poisoned.store(true, Ordering::Release))?;
-            Ok((inode, Arc::new(file), backing, retained, attr))
+            Ok(CreatedGuardedFile {
+                inode,
+                file: Arc::new(file),
+                backing,
+                retained,
+                attr,
+            })
         })();
         match result {
-            Ok((inode, file, backing, retained, attr)) => {
+            Ok(CreatedGuardedFile {
+                inode,
+                file,
+                backing,
+                retained,
+                attr,
+            }) => {
                 names.insert(key, inode);
                 self.dynamic_files.lock().unwrap().insert(inode, file);
                 let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -5178,6 +5207,9 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FirstMutation {
         WritableOpen,
+        SharedMapping,
+        ConcurrentOpens,
+        MixedOpenModes,
         OwnerChmod,
         OwnerTimes,
         PathTruncate,
@@ -5283,6 +5315,15 @@ mod tests {
                 FirstMutation::WritableOpen => {
                     "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)"
                 }
+                FirstMutation::SharedMapping => {
+                    "import mmap,os,sys; fd=os.open(sys.argv[1],os.O_RDWR); mapped=mmap.mmap(fd,0,flags=mmap.MAP_SHARED,prot=mmap.PROT_READ|mmap.PROT_WRITE); mapped[:4]=b'MMAP'; mapped.flush(); mapped.close(); os.fsync(fd); os.close(fd)"
+                }
+                FirstMutation::ConcurrentOpens => {
+                    "import os,sys,threading\nbarrier=threading.Barrier(8)\nerrors=[]\ndef worker(offset):\n stage='barrier'\n try:\n  barrier.wait()\n  stage='open'; fd=os.open(sys.argv[1],os.O_RDWR)\n  stage='write'; os.pwrite(fd,bytes([65+offset]),offset)\n  stage='fsync'; os.fsync(fd)\n  stage='close'; os.close(fd)\n except Exception as error: errors.append((offset,stage,str(error)))\nthreads=[threading.Thread(target=worker,args=(offset,)) for offset in range(8)]\nfor thread in threads: thread.start()\nfor thread in threads: thread.join()\nassert not errors,errors"
+                }
+                FirstMutation::MixedOpenModes => {
+                    "import os,sys; reader=os.open(sys.argv[1],os.O_RDONLY); assert os.pread(reader,4,0)==b'raw\\r'; writer=os.open(sys.argv[1],os.O_RDWR); second_reader=os.open(sys.argv[1],os.O_RDONLY); os.pwrite(writer,b'EDIT',0); os.fsync(writer); assert os.pread(reader,4,0)==b'EDIT'; assert os.pread(second_reader,4,0)==b'EDIT'; os.close(second_reader); os.close(writer); os.close(reader)"
+                }
                 FirstMutation::OwnerChmod => "import os,sys; os.chmod(sys.argv[1],0o600)",
                 FirstMutation::OwnerTimes => {
                     "import os,sys; os.utime(sys.argv[1],ns=(1600000001987654321,1600000000123456789))"
@@ -5328,6 +5369,18 @@ mod tests {
                         String::from_utf8_lossy(&second_open.stderr)
                     );
                     anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT\nNEXT"));
+                }
+                FirstMutation::SharedMapping => {
+                    anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"MMAP"));
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))?.starts_with(b"MMAP"));
+                }
+                FirstMutation::ConcurrentOpens => {
+                    anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"ABCDEFGH"));
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))?.starts_with(b"ABCDEFGH"));
+                }
+                FirstMutation::MixedOpenModes => {
+                    anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT"));
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))?.starts_with(b"EDIT"));
                 }
                 FirstMutation::OwnerChmod => {
                     anyhow::ensure!(fs::read(&lower_path)? == original);
@@ -5450,6 +5503,24 @@ mod tests {
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn writable_open_finishes_durable_detach_before_passthrough() {
         guarded_view_mutation_case(FirstMutation::WritableOpen);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn shared_writable_mapping_detaches_before_mapped_write() {
+        guarded_view_mutation_case(FirstMutation::SharedMapping);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn concurrent_writable_opens_share_one_detached_source() {
+        guarded_view_mutation_case(FirstMutation::ConcurrentOpens);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn mixed_read_only_and_writable_handles_share_one_backing() {
+        guarded_view_mutation_case(FirstMutation::MixedOpenModes);
     }
 
     #[test]

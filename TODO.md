@@ -237,6 +237,16 @@
   normal store tests, all 13 privileged probes on both filesystems, formatting,
   and strict workspace Clippy pass. Protected recovery of the full metadata
   set and the remaining guarded enrollment gates are still open.
+  Shared writable mapping now has an ordinary-user first-mutation probe: the
+  mapping writes the detached source and leaves captured bytes exact. A new
+  eight-thread probe exposed overlapping writable opens failing with `EIO`:
+  the kernel requires all live passthrough handles for one FUSE inode to reuse
+  one backing registration. The view now shares that registration while each
+  handle retains its own descriptor. Eight simultaneous writable opens and
+  mixed read-only/writable handles pass on ext4 and fresh local Btrfs, as do
+  113 normal store tests, all 16 privileged guarded probes on both filesystems,
+  formatting, and strict workspace Clippy. Broader rename/unlink interleavings,
+  mount supervision, and guarded enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

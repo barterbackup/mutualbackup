@@ -764,7 +764,10 @@ Proactive background repair comes later.
   writable handle, accepting a shared writable mapping, or applying a
   pathname truncate, allocation, or owner `chmod`, the view must run and
   durably finish the existing sparse-detach journal, then pass through only
-  the independent editable inode. Rename and unlink preserve the immutable
+  the independent editable inode. All simultaneous passthrough handles for a
+  FUSE inode must share one live kernel backing registration, including when a
+  read-only handle predates detach; keep each handle's source descriptor for
+  handle-based truncate and allocation. Rename and unlink preserve the immutable
   anchor without detaching. New files are editable independent inodes, and
   their publication must be replayable across a crash. Atomic replacement must
   keep the replaced file's immutable anchor intact. A mount/daemon failure
@@ -1291,6 +1294,14 @@ negative Unix timestamps; ordinary-user probes compare it with the lower
 inodes on ext4 and fresh local Btrfs across remount. The 113 normal store tests,
 all 13 privileged probes, formatting, and strict workspace Clippy pass. This
 does not yet establish seed-only recovery of every mutable metadata field.
+An ordinary-user shared writable mapping now proves first-write detach. Eight
+simultaneous writable opens exposed the kernel's one-backing-registration-per-
+FUSE-inode rule; the view now shares a backing ID across overlapping handles
+and retains each handle's own descriptor. Mixed read-only/writable handles also
+pass, including a read-only handle opened before detach. The 113 normal store
+tests, all 16 privileged guarded probes on ext4 and fresh local Btrfs,
+formatting, and strict workspace Clippy pass. Broader namespace interleavings,
+mount supervision, and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
