@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -617,6 +619,57 @@ impl PinnedDirectory {
     #[cfg(target_os = "linux")]
     pub(crate) fn has_marked_git_catalog(&self) -> Result<bool, AnchorError> {
         Ok(git_catalog_marker_from_root(&self.file)?.is_some())
+    }
+
+    /// Read-only admission before guarded namespace replay. Every inode in the
+    /// lower tree must already belong to the capture or a durable view record.
+    /// The caller checks exact names after replay has settled pending moves.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn all_descendants_known(
+        &self,
+        allowed: &BTreeSet<NativeFileId>,
+    ) -> Result<bool, AnchorError> {
+        fn scan(
+            directory: &PinnedDirectory,
+            allowed: &BTreeSet<NativeFileId>,
+            seen: &mut BTreeSet<NativeFileId>,
+            depth: usize,
+            skip_catalog: bool,
+        ) -> Result<bool, AnchorError> {
+            if depth > MAX_CAPTURE_DEPTH {
+                return Ok(false);
+            }
+            let mut stream = DirectoryStream::open(directory.as_file())?;
+            while let Some(name) = stream.next_name()? {
+                if skip_catalog && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes() {
+                    continue;
+                }
+                let relative = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
+                let pinned = open_path_no_xdev_beneath(directory.as_file(), relative)?;
+                let metadata = pinned.metadata()?;
+                if !metadata.is_dir() && !metadata.is_file() {
+                    return Ok(false);
+                }
+                let id = native_file_id(directory.filesystem_id, &metadata);
+                if !allowed.contains(&id) || !seen.insert(id) {
+                    return Ok(false);
+                }
+                if metadata.is_dir() {
+                    let file = reopen_pinned_file(&pinned, true, relative)?;
+                    let child = PinnedDirectory {
+                        file,
+                        filesystem_id: directory.filesystem_id,
+                    };
+                    if child.identity()? != id || !scan(&child, allowed, seen, depth + 1, false)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+
+        let mut seen = BTreeSet::from([self.identity()?]);
+        scan(self, allowed, &mut seen, 0, self.has_marked_git_catalog()?)
     }
 
     pub fn open_descendant_directory(

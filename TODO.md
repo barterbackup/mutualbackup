@@ -665,10 +665,21 @@
   dynamic-directory file refuses recovery; legitimate replacement and
   populated-directory rename with new descendants still recover. These
   privileged remount probes pass on ext4 and fresh local Btrfs, alongside 117
-  normal store tests and strict workspace Clippy. Guarded enrollment still
-  needs pre-replay remount admission for pending namespace intents, restoration
-  after FUSE path changes, owner restoration after file detach, protected
-  mutable-view metadata, and the complete privileged mount gate.
+  normal store tests and strict workspace Clippy. Before any remount replay,
+  a bounded descriptor walk now rejects lower inodes absent from the captured
+  plan, durable file/directory records, and pending create/move/replace/remove
+  intents; it also rejects extra hard-link aliases. A normal pending populated-
+  directory rename probe proves an unknown file is refused while the intent
+  and lower source remain unchanged, then accepts all three legitimate rename
+  crash states. Pending create and replacement states also pass. The guarded
+  remount probe and 117 normal store tests pass on ext4; remount, replace, and
+  populated rename probes pass on fresh local Btrfs; strict Clippy passes.
+  Exact pre-replay path binding during pending intents still needs proof: the
+  inode scan admits any recorded inode at this stage, while the post-replay
+  inventory enforces exact names before mount publication. Guarded enrollment
+  also needs restoration after FUSE path changes, owner restoration after file
+  detach, protected mutable-view metadata, and the complete privileged mount
+  gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

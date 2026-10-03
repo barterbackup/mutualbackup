@@ -942,9 +942,7 @@ print('DONE', flush=True)
                     Err(error) => error,
                 };
             assert!(
-                error
-                    .to_string()
-                    .contains("unrecorded or missing view entry"),
+                error.to_string().contains("unrecorded inode before replay"),
                 "{error:#}"
             );
             assert!(fs::read_dir(&mountpoint).unwrap().next().is_none());

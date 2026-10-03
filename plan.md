@@ -1593,10 +1593,16 @@ first-mount/isolator refusal passes on ext4 and fresh local Btrfs, alongside
 reconstructed visible name/inode map against every complete lower-directory
 entry set after namespace replay and before mount publication. Privileged
 extra-entry refusal and legitimate replace/rename recovery pass on ext4 and
-fresh local Btrfs. Pre-replay admission around pending remount intents,
-restoration after FUSE path changes, detached-file owner recovery, signed
-mutable-view recovery, and the complete privileged mount gate remain open
-before ordinary user-owned roots can be enrolled.
+fresh local Btrfs. A pre-replay descriptor walk now admits only inodes bound
+to the capture, durable namespace records, or pending intents, and refuses an
+unknown inode before a pending directory rename can mutate the lower tree.
+Normal create/replace/rename crash states and privileged ext4/Btrfs remount
+probes pass, alongside 117 normal store tests and strict workspace Clippy.
+Exact pre-replay path binding across pending intents is still open; the later
+post-replay inventory checks every name before mount publication. Restoration
+after FUSE path changes, detached-file owner recovery, signed mutable-view
+recovery, and the complete privileged mount gate also remain open before
+ordinary user-owned roots can be enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

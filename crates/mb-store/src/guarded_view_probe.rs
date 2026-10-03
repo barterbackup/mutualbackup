@@ -870,6 +870,106 @@ impl GuardedNamespace {
         Ok(owned)
     }
 
+    fn preflight_known_lower_inodes(
+        &self,
+        lower_root: &PinnedDirectory,
+        captured_directories: &CapturedDirectories,
+        captured_files: &HashMap<u64, NamespaceRecord>,
+    ) -> anyhow::Result<()> {
+        let root_id = lower_root.identity()?;
+        let mut allowed = BTreeSet::new();
+        let mut add = |id: NativeFileId| -> anyhow::Result<()> {
+            ensure!(
+                id.filesystem_id == root_id.filesystem_id && id.inode != 0,
+                "guarded namespace record names another filesystem"
+            );
+            allowed.insert(id);
+            Ok(())
+        };
+        add(root_id)?;
+        for (_, id, _) in captured_directories.values() {
+            add(*id)?;
+        }
+        for record in captured_files.values() {
+            add(record.expected)?;
+        }
+        for (_, bytes) in self.owned_records(NAMESPACE_KIND)? {
+            let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(record.version == 1, "invalid guarded file namespace record");
+            add(record.expected)?;
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_KIND)? {
+            let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(record.version == 1, "invalid guarded directory record");
+            add(record.expected)?;
+        }
+        for (_, bytes) in self.owned_records(CREATE_KIND)? {
+            let intent: CreateIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(intent.version == 1, "invalid guarded file create intent");
+            add(intent.expected)?;
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_CREATE_KIND)? {
+            let intent: DirectoryCreateIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1,
+                "invalid guarded directory create intent"
+            );
+            if let Some(id) = intent.expected {
+                add(id)?;
+            }
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_REMOVE_KIND)? {
+            let intent: DirectoryRemoveIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1,
+                "invalid guarded directory remove intent"
+            );
+            add(intent.expected)?;
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_RENAME_KIND)? {
+            let intent: DirectoryRenameIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1,
+                "invalid guarded directory rename intent"
+            );
+            add(intent.expected)?;
+        }
+        for (_, bytes) in self.owned_records(DIRECTORY_REPLACE_KIND)? {
+            let intent: DirectoryReplaceIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1 && intent.move_intent.version == 1,
+                "invalid guarded directory replace intent"
+            );
+            add(intent.move_intent.expected)?;
+            add(intent.target_expected)?;
+        }
+        let rows = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
+            .records(REPLACE_KIND)?;
+        for (id, bytes) in rows {
+            if !id.starts_with(self.anchor_id.as_bytes()) {
+                continue;
+            }
+            ensure!(id.len() == 32, "invalid guarded file replace ID");
+            let intent: ReplaceIntent = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                intent.version == 1
+                    && intent.source_before.version == 1
+                    && intent.target_before.version == 1,
+                "invalid guarded file replace intent"
+            );
+            add(intent.source_before.expected)?;
+            add(intent.target_before.expected)?;
+        }
+        ensure!(
+            lower_root.all_descendants_known(&allowed)?,
+            "guarded lower tree contains an unrecorded inode before replay"
+        );
+        Ok(())
+    }
+
     fn reconcile_creates(
         &self,
         lower_root: &PinnedDirectory,
@@ -2308,6 +2408,7 @@ impl GuardedProbeView {
                 }
             }
         }
+        namespace.preflight_known_lower_inodes(&lower_root, &captured_directories, &defaults)?;
         let staging_area = manifest.area.open_guarded_staging_area()?;
         ensure!(
             staging_area.identity()?.filesystem_id == lower_root.identity()?.filesystem_id,
@@ -4342,6 +4443,9 @@ mod tests {
                 records: Mutex::new(HashMap::new()),
             };
             journal
+                .preflight_known_lower_inodes(&root, &captured, &defaults)
+                .unwrap();
+            journal
                 .reconcile_directory_replaces(&root, &captured, &defaults, 5)
                 .unwrap();
             let index = journal
@@ -4558,6 +4662,34 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
+            if phase == 0 {
+                let unknown = lower.join("unknown-before-replay");
+                fs::write(&unknown, b"not in any durable namespace record").unwrap();
+                assert!(
+                    journal
+                        .preflight_known_lower_inodes(&root, &captured, &defaults)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unrecorded inode before replay")
+                );
+                assert_eq!(
+                    root.entry_identity("parent", true).unwrap(),
+                    Some(parent_id)
+                );
+                assert!(root.entry_identity("relocated", true).unwrap().is_none());
+                assert!(
+                    control
+                        .lock()
+                        .unwrap()
+                        .get_record(DIRECTORY_RENAME_KIND, &journal.record_id(2))
+                        .unwrap()
+                        .is_some()
+                );
+                fs::remove_file(unknown).unwrap();
+            }
+            journal
+                .preflight_known_lower_inodes(&root, &captured, &defaults)
+                .unwrap();
             journal
                 .reconcile_directory_renames(&root, &captured, &defaults, 4)
                 .unwrap();
@@ -5462,6 +5594,9 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
+            journal
+                .preflight_known_lower_inodes(&root, &HashMap::new(), &HashMap::new())
+                .unwrap();
             journal.reconcile_creates(&root, &directories, 2).unwrap();
             let control = control.lock().unwrap();
             assert!(
