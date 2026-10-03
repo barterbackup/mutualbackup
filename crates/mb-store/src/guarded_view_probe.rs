@@ -3786,13 +3786,16 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Child, Command};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use fuser::{Config, INodeNo, OpenAccMode, SessionACL};
     use mb_core::{KeyMaterial, Seed};
@@ -5203,6 +5206,116 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| disposable.path().to_path_buf());
         super::probe_guarded_view_passthrough(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN and FUSE passthrough"]
+    fn daemon_loss_leaves_private_source_inaccessible() {
+        const CHILD_ROOT: &str = "MUTUALBACKUP_FUSE_CRASH_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let lower = root.join("lower");
+            let source = File::open(lower.join("sample")).unwrap();
+            let file = GuardedProbeFile {
+                source_attr: Mutex::new(probe_file_attr(&source, FILE_INODE, 0o666).unwrap()),
+                location: Arc::new(Mutex::new(Some(ProbeLocation {
+                    parent: INodeNo::ROOT,
+                    relative_path: PathBuf::from("sample"),
+                }))),
+                source,
+                open_for_write: None,
+            };
+            let view = GuardedProbeView::new(
+                vec![file],
+                0o755,
+                Arc::new(Default::default()),
+                Some(PinnedDirectory::open(&lower).unwrap()),
+            );
+            let mut config = Config::default();
+            config.acl = SessionACL::All;
+            let _session = fuser::spawn_mount(view, root.join("view"), &config).unwrap();
+            assert_eq!(
+                fs::read(root.join("view/sample")).unwrap(),
+                super::PROBE_BYTES
+            );
+            fs::write(root.join("ready"), b"mounted").unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+
+        struct DeadMount {
+            child: Child,
+            mountpoint: PathBuf,
+        }
+        impl Drop for DeadMount {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let path = CString::new(self.mountpoint.as_os_str().as_bytes()).unwrap();
+                // SAFETY: the path is NUL-free and names this test's private mount.
+                let _ = unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-fuse-dead-daemon-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(lower.join("sample"), super::PROBE_BYTES).unwrap();
+        fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o444)).unwrap();
+        let mut mounted = DeadMount {
+            child: Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "guarded_view_probe::tests::daemon_loss_leaves_private_source_inaccessible",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, area.path())
+                .spawn()
+                .unwrap(),
+            mountpoint,
+        };
+        for _ in 0..200 {
+            if area.path().join("ready").exists() {
+                break;
+            }
+            assert!(mounted.child.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            area.path().join("ready").exists(),
+            "child mount did not become ready"
+        );
+        let ordinary_read = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(area.path().join("view/sample"))
+            .output()
+            .unwrap();
+        assert_eq!(ordinary_read.stdout, super::PROBE_BYTES);
+        assert!(ordinary_read.status.success());
+        mounted.child.kill().unwrap();
+        assert!(!mounted.child.wait().unwrap().success());
+        assert!(fs::read(area.path().join("view/sample")).is_err());
+        let ordinary_private = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(lower.join("sample"))
+            .output()
+            .unwrap();
+        assert!(!ordinary_private.status.success());
+        assert_eq!(fs::read(lower.join("sample")).unwrap(), super::PROBE_BYTES);
     }
 
     #[derive(Clone, Copy)]

@@ -259,6 +259,12 @@
   append probe seeks back to the start before writing and still appends after
   durable detach; a newly created file also appends through its first handle.
   All 17 privileged FUSE probes pass on ext4 and fresh local Btrfs.
+  A separate-process crash probe now kills the FUSE daemon after a successful
+  ordinary-user read, then verifies new view access fails and the same user
+  still cannot open the private lower file. All 18 privileged FUSE probes pass
+  on fresh local Btrfs; the crash probe also passes on ext4. This proves the
+  observed fail-closed kernel behavior, while supervised remount, recovered
+  metadata, and guarded enrollment remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

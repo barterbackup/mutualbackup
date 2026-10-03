@@ -1312,6 +1312,10 @@ without changing the replacement or captured anchors on ext4 and Btrfs.
 Guarded passthrough open and create now allow `O_APPEND`. Ordinary-user probes
 verify that seeking to offset zero still appends after detach and on a newly
 created file; all 17 privileged FUSE probes pass on ext4 and fresh local Btrfs.
+A separate-process probe now kills the mounted FUSE daemon and confirms new
+view access fails while an ordinary user remains unable to read the private
+lower file. It passes on ext4 and fresh local Btrfs. Mount supervision and
+recovered guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
