@@ -110,10 +110,16 @@
   capture: editing one file leaves the other frozen, and rename plus later edit
   dispatches to the correct file's detach journal. All nine privileged probes
   pass on ext4 and fresh local Btrfs, with normal store tests and strict locked
-  workspace Clippy passing. Extend this to nested directories, create and
-  atomic replacement, remaining metadata and allocation modes, concurrent
-  handles, mount/restart recovery, and whole-worktree enrollment. Keep Git
-  staging and checkout gated until the complete privileged probe passes. See
+  workspace Clippy passing. `712a62f` adds a nested directory to the view:
+  ordinary-user listing, read, same-directory rename, and later edit of a
+  captured nested file preserve its anchor and leave another file frozen.
+  An unsupported directory rename fails closed. All ten privileged probes
+  pass on ext4 and fresh local Btrfs; store tests and strict locked workspace
+  Clippy pass. Extend this to cross-directory moves, directory mutations,
+  create and atomic replacement, remaining metadata/allocation modes,
+  concurrent handles, mount/restart recovery, and whole-worktree enrollment.
+  Keep Git staging and checkout gated until the complete privileged probe
+  passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
 

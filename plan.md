@@ -1171,7 +1171,11 @@ ext4 and fresh local Btrfs. `7110990` adds inode/name dispatch and directory
 listing for a flat two-file guarded-root capture. One file can be edited while
 the other stays frozen, then renamed and edited through its own durable detach.
 All nine privileged probes pass on ext4 and fresh local Btrfs; normal store
-tests and strict locked workspace Clippy pass. Nested directories, create and
+tests and strict locked workspace Clippy pass. `712a62f` adds nested-directory
+lookup/listing and same-directory file rename through the guarded-root view;
+ordinary-user read and later edit of a nested captured file preserve its exact
+anchor and leave another file frozen. All ten privileged probes pass on ext4
+and fresh local Btrfs. Cross-directory moves, directory mutations, create and
 atomic replacement, remaining metadata/allocation modes, concurrent handles,
 mount supervision/recovery, and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
