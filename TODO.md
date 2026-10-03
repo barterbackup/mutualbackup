@@ -105,10 +105,14 @@
   `fallocate` callback and an ordinary-user allocation probe: an allocation
   extending the editable file to 4 KiB leaves the original anchor byte-exact.
   All eight privileged FUSE probes pass on ext4 and fresh local Btrfs; normal
-  store tests and strict workspace Clippy pass. Extend this to the whole
-  versioned worktree namespace, remaining metadata and allocation modes,
-  atomic replacement, concurrent handles, and mount/restart failure before
-  enrollment. Whole-worktree rename/unlink dispatch is still open. Keep Git
+  store tests and strict workspace Clippy pass. `7110990` indexes a flat FUSE
+  namespace by inode and name. Its two-file probe uses a real guarded-root
+  capture: editing one file leaves the other frozen, and rename plus later edit
+  dispatches to the correct file's detach journal. All nine privileged probes
+  pass on ext4 and fresh local Btrfs, with normal store tests and strict locked
+  workspace Clippy passing. Extend this to nested directories, create and
+  atomic replacement, remaining metadata and allocation modes, concurrent
+  handles, mount/restart recovery, and whole-worktree enrollment. Keep Git
   staging and checkout gated until the complete privileged probe passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
