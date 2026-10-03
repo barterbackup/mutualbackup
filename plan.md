@@ -3534,6 +3534,8 @@ plan; passing a Git command gate does not close a source-backend or platform gat
   privileged capture/edit/restore and crash-recovery probes.
 - Complete Windows and macOS source backends, portable metadata, watchers,
   and application-consistent capture hooks with their platform-specific gates.
+  On both platforms, stage and restore mixed-line-ending files byte-for-byte
+  through the Git frontend regardless of the host's line-ending defaults.
 
 The Git binary must never opt into Git's automatic CRLF conversion or run a
 configured filter, including during import, checkout, merge, or pull. A stock
@@ -3681,7 +3683,8 @@ stored Git blob bytes exactly, without trying to reverse that conversion.
   that event alone does not identify an edit. Keep enrollment gated until the
   full access decision and failure behavior pass a privileged local probe.
 - Close each listed platform backend only after its own capture/edit/restore,
-  metadata fidelity, application-consistency, and source-loss recovery gate.
+  metadata fidelity, application-consistency, source-loss recovery, and raw Git
+  add/checkout/interoperability gate under conversion-inducing host settings.
   Milestone 6 closes only after the Git, guarded-link-freeze, and listed
   platform gates.
 
