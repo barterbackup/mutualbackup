@@ -1512,14 +1512,15 @@ An ordinary-user pre-opened descriptor can still bypass a private lower path
 if a frozen inode remains user-owned: `fchmod` can restore write permission,
 and `/proc/self/fd` can reopen the same hard-link anchor writable. The mount
 wrapper now rejects view-owned frozen anchors and lower child directories that
-remain view-owned or group/other-writable before publishing a new claim.
+remain view-owned or group/other-accessible before publishing a new claim.
 The refusal probe, all 18 privileged guarded-view probes, and daemon-owned
 mount restart pass on ext4 and fresh local Btrfs; normal store tests and strict
 workspace Clippy pass.
 The privileged held-descriptor probe now confirms that manually moving a
 captured file and lower directory into owner-inaccessible state prevents
-`fchmod`, writable `/proc/self/fd` reopen, and lookup through a retained
-directory handle. An ordinary-user FUSE edit leaves the anchor exact. It passes
+`fchmod`, writable `/proc/self/fd` reopen, and lookup through retained root
+and nested-directory handles. Search-only access through a nested handle also
+blocks mount admission. An ordinary-user FUSE edit leaves the anchor exact. It passes
 on ext4 and fresh local Btrfs, with 115 normal store tests and strict workspace
 Clippy. A replayable ownership transition and signed recovery of mutable view
 metadata are still required before enrollment.

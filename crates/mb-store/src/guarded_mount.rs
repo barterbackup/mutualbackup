@@ -500,7 +500,12 @@ mod tests {
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN and fanotify permission events"]
     fn guarded_mount_refuses_mutable_private_lower_inodes() {
-        for unsafe_case in ["file-owner", "directory-owner", "directory-group-write"] {
+        for unsafe_case in [
+            "file-owner",
+            "directory-owner",
+            "directory-group-write",
+            "directory-world-search",
+        ] {
             let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
                 Some(root) => tempfile::Builder::new()
                     .prefix("mb-guarded-owner-")
@@ -515,9 +520,13 @@ mod tests {
             fs::create_dir(lower.join("nested")).unwrap();
             fs::write(lower.join("sample"), b"frozen bytes").unwrap();
             fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(lower.join("nested"), fs::Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
             if unsafe_case == "directory-group-write" {
                 fs::set_permissions(lower.join("nested"), fs::Permissions::from_mode(0o775))
+                    .unwrap();
+            } else if unsafe_case == "directory-world-search" {
+                fs::set_permissions(lower.join("nested"), fs::Permissions::from_mode(0o711))
                     .unwrap();
             } else {
                 let owned = lower.join(if unsafe_case == "file-owner" {
@@ -580,6 +589,9 @@ mod tests {
         let mountpoint = area.path().join("view");
         let control_dir = area.path().join("control");
         fs::create_dir(&lower).unwrap();
+        let nested = lower.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("known"), b"nested bytes").unwrap();
         fs::create_dir(&mountpoint).unwrap();
         fs::create_dir(&control_dir).unwrap();
         fs::set_permissions(&lower, fs::Permissions::from_mode(0o755)).unwrap();
@@ -622,6 +634,7 @@ mod tests {
                 r#"import errno, os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY)
 dirfd = os.open(os.path.dirname(sys.argv[1]), os.O_RDONLY | os.O_DIRECTORY)
+nested_fd = os.open(sys.argv[3], os.O_RDONLY | os.O_DIRECTORY)
 print('READY', flush=True)
 assert sys.stdin.readline() == 'continue\n'
 for operation in (
@@ -630,6 +643,7 @@ for operation in (
     lambda: os.open(sys.argv[1], os.O_RDONLY),
     lambda: os.fchmod(dirfd, 0o777),
     lambda: os.open('sample', os.O_RDONLY, dir_fd=dirfd),
+    lambda: os.open('known', os.O_RDONLY, dir_fd=nested_fd),
 ):
     try:
         operation()
@@ -643,11 +657,13 @@ os.fsync(view)
 os.close(view)
 os.close(fd)
 os.close(dirfd)
+os.close(nested_fd)
 print('DONE', flush=True)
 "#,
             )
             .arg(&source)
             .arg(mountpoint.join("sample"))
+            .arg(&nested)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -670,6 +686,7 @@ print('DONE', flush=True)
         // across that transition; enrollment itself remains gated.
         assert_eq!(unsafe { libc::chown(source_path.as_ptr(), 0, 0) }, 0);
         fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
         let mount =
             GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
                 .unwrap();

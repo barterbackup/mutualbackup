@@ -551,6 +551,11 @@
   the move. Replay tests cover every exchange/removal/commit boundary, and
   directory removal replay also checks mode retirement. All 115 normal store
   tests and strict workspace Clippy pass.
+  Mount admission now rejects lower child directories with any group/other
+  access, including search-only `0711`: a retained descriptor to that child
+  would bypass the private root path. The privileged refusal probe and an
+  extended held-descriptor probe, which includes a nested child, pass on ext4
+  and fresh local Btrfs. The actual enrollment transition remains gated.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

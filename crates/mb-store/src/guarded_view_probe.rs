@@ -1759,7 +1759,8 @@ impl GuardedProbeFile {
 impl GuardedProbeView {
     /// A process can retain a directory descriptor from before a guarded
     /// transition. Keep every visible lower directory outside the view
-    /// owner's control, even when the private root path is now inaccessible.
+    /// owner's reach, even when the private root path is now inaccessible.
+    /// A retained descriptor to a searchable child bypasses the root path.
     pub(crate) fn verify_private_lower_ownership(&self) -> anyhow::Result<()> {
         let lower_root = self
             .lower_root
@@ -1774,8 +1775,8 @@ impl GuardedProbeView {
             );
             let metadata = pinned.as_file().metadata()?;
             ensure!(
-                metadata.uid() != self.root_uid && metadata.permissions().mode() & 0o022 == 0,
-                "guarded private directory remains writable by the view owner"
+                metadata.uid() != self.root_uid && metadata.permissions().mode() & 0o077 == 0,
+                "guarded private directory remains accessible to the view owner"
             );
         }
         Ok(())
