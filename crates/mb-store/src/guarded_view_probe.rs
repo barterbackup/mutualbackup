@@ -52,6 +52,72 @@ const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
 const DIRECTORY_MODE_KIND: &str = "guarded-view-directory-mode-v1";
 
+/// The mount must be retired before root cleanup. A pending FUSE namespace
+/// operation needs remount replay first; retiring anchors against either side
+/// of an unfinished move could restore access to the wrong lower name.
+pub(crate) fn verify_retired_namespace_quiescent(
+    control: &ControlStore,
+    anchor_id: Uuid,
+) -> anyhow::Result<()> {
+    for kind in [
+        CREATE_KIND,
+        REPLACE_KIND,
+        DIRECTORY_CREATE_KIND,
+        DIRECTORY_REMOVE_KIND,
+        DIRECTORY_RENAME_KIND,
+        DIRECTORY_REPLACE_KIND,
+    ] {
+        ensure!(
+            !control
+                .records(kind)?
+                .iter()
+                .any(|(id, _)| id.starts_with(anchor_id.as_bytes())),
+            "guarded namespace has an unfinished operation during retirement"
+        );
+    }
+    for (id, bytes) in control.records(NAMESPACE_KIND)? {
+        if id.starts_with(anchor_id.as_bytes()) {
+            ensure!(id.len() == 24, "invalid guarded namespace record ID");
+            let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                record.version == 1 && record.pending.is_none(),
+                "guarded namespace has an unfinished file move during retirement"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a captured file's final FUSE name without replaying or modifying
+/// the lower tree. The caller also checks the name against the captured native
+/// inode before using it for anchor retirement.
+pub(crate) fn captured_file_path_for_retirement(
+    control: &ControlStore,
+    anchor_id: Uuid,
+    view_inode: u64,
+    captured_path: &str,
+    expected: NativeFileId,
+) -> anyhow::Result<Option<PathBuf>> {
+    let mut id = anchor_id.as_bytes().to_vec();
+    id.extend_from_slice(&view_inode.to_le_bytes());
+    let Some(bytes) = control.get_record(NAMESPACE_KIND, &id)? else {
+        return Ok(Some(PathBuf::from(captured_path)));
+    };
+    let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
+    ensure!(
+        record.version == 1
+            && record.captured_path == captured_path
+            && record.expected == expected
+            && record.pending.is_none(),
+        "captured file has an unfinished or mismatched namespace record"
+    );
+    record
+        .current
+        .as_deref()
+        .map(checked_namespace_relative_path)
+        .transpose()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NamespaceRecord {
     version: u16,

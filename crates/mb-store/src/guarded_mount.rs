@@ -788,6 +788,104 @@ print('DONE', flush=True)
     }
 
     #[test]
+    #[ignore = "requires root, CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn frozen_file_renamed_through_view_retires_at_its_recorded_path() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-renamed-retire-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let public = tempfile::Builder::new()
+            .prefix("mb-guarded-renamed-view-")
+            .tempdir_in(area.path().parent().unwrap())
+            .unwrap();
+        fs::set_permissions(public.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = public.path().join("view");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+        let source = lower.join("sample");
+        let original = b"frozen\r\n\0bytes";
+        fs::write(&source, original).unwrap();
+        let source_path = CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(source_path.as_ptr(), 65534, 65534) },
+            0
+        );
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([126; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+        ));
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&control.lock().unwrap(), 65534, 0, 0)
+            .unwrap();
+        plan.isolate_lower_directories(&control.lock().unwrap(), &manifest)
+            .unwrap();
+        let mount =
+            GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
+                .unwrap();
+        let rename = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
+            .arg(mountpoint.join("sample"))
+            .arg(mountpoint.join("renamed"))
+            .output()
+            .unwrap();
+        assert!(rename.status.success(), "{rename:?}");
+        assert_eq!(fs::read(lower.join("renamed")).unwrap(), original);
+        assert_eq!(fs::metadata(lower.join("renamed")).unwrap().uid(), 0);
+        mount.stop().unwrap();
+        let remounted =
+            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        assert_eq!(fs::read(mountpoint.join("renamed")).unwrap(), original);
+        assert!(!mountpoint.join("sample").exists());
+        remounted.stop().unwrap();
+        let store = control.lock().unwrap();
+        GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
+        let mut namespace_id = manifest.anchor_id.as_bytes().to_vec();
+        namespace_id.extend_from_slice(&2_u64.to_le_bytes());
+        let namespace = store
+            .get_record("guarded-view-namespace-v1", &namespace_id)
+            .unwrap()
+            .unwrap();
+        store
+            .put_record("guarded-view-namespace-v1", &namespace_id, &[0xff])
+            .unwrap();
+        assert!(plan.discard_unreferenced(&store).is_err());
+        store
+            .put_record("guarded-view-namespace-v1", &namespace_id, &namespace)
+            .unwrap();
+        store
+            .put_record("guarded-view-create-v1", &namespace_id, &[0xff])
+            .unwrap();
+        assert!(plan.discard_unreferenced(&store).is_err());
+        store
+            .delete_record("guarded-view-create-v1", &namespace_id)
+            .unwrap();
+        let mut anchor = manifest
+            .file_locator("sample".to_owned())
+            .unwrap()
+            .open()
+            .unwrap();
+        let mut retained = Vec::new();
+        anchor.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, original);
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::read(lower.join("renamed")).unwrap(), original);
+        let restored = fs::metadata(lower.join("renamed")).unwrap();
+        assert_eq!((restored.uid(), restored.gid()), (65534, 65534));
+        assert_eq!(restored.permissions().mode() & 0o7777, 0o644);
+        assert!(!source.exists());
+    }
+
+    #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn guarded_mount_claim_survives_remount_and_rejects_replaced_placeholder() {
         const CHILD_ROOT: &str = "MUTUALBACKUP_GUARDED_MOUNT_CHILD_ROOT";

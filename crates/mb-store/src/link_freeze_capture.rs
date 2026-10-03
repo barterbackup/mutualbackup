@@ -1066,6 +1066,14 @@ impl LinkFreezeCaptureIntent {
             && self.anchor_name == anchor_name)
     }
 
+    pub(crate) fn matches_source_binding(
+        &self,
+        source_parent: &PinnedDirectory,
+        source_name: &Path,
+    ) -> anyhow::Result<bool> {
+        Ok(self.source_parent_id == source_parent.identity()? && self.source_name == source_name)
+    }
+
     pub(crate) fn matches_root_file_plan(
         &self,
         anchor_id: Uuid,

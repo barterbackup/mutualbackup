@@ -685,10 +685,16 @@
   original UID/GID from the durable owner journal before a writable view handle
   returns; replay also handles a crash after detach and before owner restore.
   The focused privileged root test passes on ext4 and fresh local Btrfs, and
-  117 normal store tests plus strict workspace Clippy pass. Guarded enrollment
-  still needs retirement after FUSE path changes, recovery of detached owner
-  obligations for removed or replaced names, protected mutable-view metadata,
-  and the complete privileged mount gate.
+  117 normal store tests plus strict workspace Clippy pass. Retirement now
+  resolves a frozen captured file's current name from its completed FUSE
+  namespace record and rebinds its capture journal before unlinking the anchor.
+  It refuses unfinished or malformed namespace state before retirement begins.
+  An ordinary-user same-directory rename, remount, and final owner/access
+  restoration pass on ext4 and fresh local Btrfs; the retained anchor remains
+  byte-exact through refused retirements. Guarded enrollment still needs
+  retirement after captured directory moves and replacements, recovery of
+  detached owner obligations for removed or replaced names, protected mutable-
+  view metadata, and the complete privileged mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

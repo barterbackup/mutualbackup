@@ -2115,6 +2115,7 @@ impl GuardedRootCapturePlan {
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
         crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
+        crate::guarded_view_probe::verify_retired_namespace_quiescent(control, self.anchor_id)?;
         let private_capture = self.private_file_capture(control)?;
         let plan_bytes = mb_core::canonical_bytes(self)?;
         let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
@@ -2325,9 +2326,19 @@ impl GuardedRootCapturePlan {
                 filesystem_id: version.filesystem_id,
                 inode: version.inode,
             };
+            let current_path = crate::guarded_view_probe::captured_file_path_for_retirement(
+                control,
+                self.anchor_id,
+                u64::try_from(index)? + 2,
+                path,
+                expected_source,
+            )?;
+            let moved = current_path
+                .as_deref()
+                .is_some_and(|current| current != relative);
             // Retirement no longer needs the old source pathname after the
             // anchor became a verified private inode.
-            let matches_plan = if capture.phase() == LinkFreezeCapturePhase::Detached {
+            let matches_plan = if capture.phase() == LinkFreezeCapturePhase::Detached || moved {
                 capture.matches_file_plan(*capture_id, expected_source, &anchor_parent, name)?
             } else {
                 capture.matches_root_file_plan(
@@ -2339,11 +2350,41 @@ impl GuardedRootCapturePlan {
                 )?
             };
             anyhow::ensure!(matches_plan);
-            let source_parent =
-                match self.open_source_parent_for_retirement(parent_path, expected_parent) {
-                    Ok(parent) => parent,
-                    Err(_) => anchor_parent.try_clone()?,
+            let (source_parent, capture) = if moved {
+                anyhow::ensure!(
+                    capture.phase() != LinkFreezeCapturePhase::Prepared,
+                    "unpublished guarded file has a moved view path"
+                );
+                let current = current_path.as_deref().unwrap();
+                let source_parent = self.open_source_parent_at_retirement_path(current)?;
+                let current_name = current.file_name().ok_or(AnchorError::UnsafePath)?;
+                anyhow::ensure!(
+                    source_parent.entry_identity(current_name, false)? == Some(expected_source),
+                    "moved guarded source differs from its namespace record"
+                );
+                let capture = if capture.phase() == LinkFreezeCapturePhase::Frozen {
+                    if capture.matches_source_binding(&source_parent, Path::new(current_name))? {
+                        capture
+                    } else {
+                        capture.rebind_frozen_source(
+                            control,
+                            &source_parent,
+                            Path::new(current_name),
+                            &anchor_parent,
+                        )?
+                    }
+                } else {
+                    capture
                 };
+                (source_parent, capture)
+            } else {
+                let parent =
+                    match self.open_source_parent_for_retirement(parent_path, expected_parent) {
+                        Ok(parent) => parent,
+                        Err(_) => anchor_parent.try_clone()?,
+                    };
+                (parent, capture)
+            };
             if let Some(private) = &private_capture
                 && capture.phase() == LinkFreezeCapturePhase::Prepared
             {
@@ -2429,6 +2470,24 @@ impl GuardedRootCapturePlan {
             return Err(AnchorError::SourceChanged(PathBuf::from(parent_path)));
         }
         Ok(parent)
+    }
+
+    fn open_source_parent_at_retirement_path(
+        &self,
+        current: &Path,
+    ) -> anyhow::Result<PinnedDirectory> {
+        validate_relative(current)?;
+        let root = PinnedDirectory::open(&self.source_root)?;
+        anyhow::ensure!(
+            root.identity()? == self.source_root_identity(),
+            "guarded lower root changed before retirement"
+        );
+        let parent = current.parent().ok_or(AnchorError::UnsafePath)?;
+        if parent.as_os_str().is_empty() {
+            Ok(root)
+        } else {
+            Ok(root.open_descendant_directory(parent)?)
+        }
     }
 
     fn finish_file_retirement_records(&self, control: &ControlStore) -> anyhow::Result<()> {
