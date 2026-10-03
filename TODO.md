@@ -454,7 +454,15 @@
   frozen, and the anchor stays byte-exact; removing the filler permits replay
   and a later edit without changing the anchor. The test checks a disposable
   mount marker, separate device, and 512 MiB capacity bound before filling.
-  FUSE-level failure behavior and the full guarded-enrollment gate remain open.
+  The checked FUSE view now preserves the underlying `ENOSPC` through guarded
+  writable-open and pathname-truncate replies instead of reporting `EIO`.
+  An ordinary-user test on fresh disposable ext4 and Btrfs images confirms
+  both operations return `ENOSPC`; the shared source stays frozen, its private
+  lower path remains inaccessible, and the anchor stays exact. After space is
+  freed, a clean stop and claimed remount replay the edit successfully.
+  All 18 privileged guarded-view probes pass on ext4 and fresh local Btrfs;
+  115 normal store tests, formatting, and strict workspace Clippy pass.
+  Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

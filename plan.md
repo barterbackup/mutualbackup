@@ -1453,7 +1453,14 @@ test fills disposable 192 MiB ext4 and 384 MiB Btrfs images until actual
 `ENOSPC`; a 32 MiB detach then leaves a partial staging file, frozen source,
 and exact anchor, and replay succeeds after space is released. It verifies a
 disposable marker, separate mount device, and 512 MiB capacity limit before
-filling. FUSE-level failure behavior and guarded enrollment remain open.
+filling. A checked guarded FUSE mount now returns the underlying `ENOSPC` for
+ordinary-user writable open and pathname truncate, rather than `EIO`. The
+privileged test passes on fresh disposable ext4 and Btrfs images: the source
+stays frozen and inaccessible through its private lower path, the anchor
+stays exact, and a claimed remount permits the edit after space is freed.
+All 18 guarded-view probes pass on ext4 and fresh local Btrfs, alongside
+115 normal store tests, formatting, and strict workspace Clippy.
+Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

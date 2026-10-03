@@ -2233,7 +2233,7 @@ impl GuardedProbeView {
                                     &captured_path,
                                     &location.relative_path,
                                 )
-                                .map_err(io::Error::other)?;
+                                .map_err(preserve_source_errno)?;
                             OpenOptions::new()
                                 .read(mode == OpenAccMode::O_RDWR)
                                 .write(true)
@@ -2573,6 +2573,18 @@ fn pinned_statvfs(file: &File) -> io::Result<libc::statvfs> {
     }
     // SAFETY: fstatvfs returned success and initialized every field.
     Ok(unsafe { stats.assume_init() })
+}
+
+fn preserve_source_errno(error: anyhow::Error) -> io::Error {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+        })
+        .map(io::Error::from_raw_os_error)
+        .unwrap_or_else(|| io::Error::other(error))
 }
 
 impl Filesystem for GuardedProbeView {
@@ -3003,7 +3015,7 @@ impl Filesystem for GuardedProbeView {
         })();
         match result {
             Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
-            Err(_) => reply.error(Errno::EIO),
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
         }
     }
 
@@ -3034,8 +3046,8 @@ impl Filesystem for GuardedProbeView {
             };
             writable = match open_for_write(flags.acc_mode()) {
                 Ok(file) => file,
-                Err(_) => {
-                    reply.error(Errno::EIO);
+                Err(error) => {
+                    reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
                     return;
                 }
             };

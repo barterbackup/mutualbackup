@@ -423,10 +423,11 @@ fn decode_mountinfo_path(encoded: &str) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
-    use std::fs;
-    use std::io::Read;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Child, Command};
@@ -643,5 +644,184 @@ mod tests {
                 .exists()
         );
         assert_eq!(fs::read(lower.join("sample")).unwrap(), edited);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN and a disposable mounted filesystem of at most 512 MiB"]
+    fn real_enospc_writable_open_keeps_guarded_mount_recoverable() {
+        let mounted_root = std::env::var_os("MUTUALBACKUP_REAL_ENOSPC_TEST_ROOT")
+            .expect("set MUTUALBACKUP_REAL_ENOSPC_TEST_ROOT to a disposable mount");
+        let mounted_root = PathBuf::from(mounted_root).canonicalize().unwrap();
+        assert_eq!(
+            fs::read(mounted_root.join(".mutualbackup-disposable-enospc")).unwrap(),
+            b"mutualbackup-disposable-enospc-v1\n"
+        );
+        assert_ne!(
+            fs::metadata(&mounted_root).unwrap().dev(),
+            fs::metadata(mounted_root.parent().unwrap()).unwrap().dev()
+        );
+        let mounted = File::open(&mounted_root).unwrap();
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the mounted descriptor is open and fstatvfs fills stats on success.
+        assert_eq!(
+            unsafe { libc::fstatvfs(mounted.as_raw_fd(), stats.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: the preceding fstatvfs call succeeded.
+        let stats = unsafe { stats.assume_init() };
+        assert!(
+            stats.f_blocks > 0
+                && stats.f_frsize > 0
+                && stats.f_blocks.saturating_mul(stats.f_frsize) <= 512 * 1024 * 1024
+        );
+
+        let area = tempfile::Builder::new()
+            .prefix("mb-guarded-full-view-")
+            .tempdir_in(&mounted_root)
+            .unwrap();
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        let filler_path = area.path().join("filler");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+        let chunk = [0x5a_u8; 1024 * 1024];
+        let source_path = lower.join("source");
+        let mut source = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source_path)
+            .unwrap();
+        for _ in 0..32 {
+            source.write_all(&chunk).unwrap();
+        }
+        source.sync_all().unwrap();
+        source
+            .set_permissions(fs::Permissions::from_mode(0o666))
+            .unwrap();
+        drop(source);
+        let original_hash = blake3::hash(&fs::read(&source_path).unwrap());
+
+        let journal_area = tempfile::tempdir().unwrap();
+        assert_ne!(
+            fs::metadata(journal_area.path()).unwrap().dev(),
+            fs::metadata(area.path()).unwrap().dev()
+        );
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([112; 32]));
+        let control = ControlStore::open(journal_area.path().join("control.db"), &keys).unwrap();
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan.capture(&control).unwrap();
+        let control = Arc::new(Mutex::new(control));
+        let mount =
+            GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
+                .unwrap();
+        mount.check_health().unwrap();
+
+        let mut filler = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&filler_path)
+            .unwrap();
+        let mut full = false;
+        for _ in 0..512 {
+            let result = filler.write_all(&chunk).and_then(|()| filler.sync_data());
+            if let Err(error) = result {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the disposable filesystem did not become full");
+        filler
+            .set_len(
+                filler
+                    .metadata()
+                    .unwrap()
+                    .len()
+                    .saturating_sub(8 * 1024 * 1024),
+            )
+            .unwrap();
+        filler.sync_all().unwrap();
+
+        let attempted_open = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import errno,os,sys\ntry:\n fd=os.open(sys.argv[1],os.O_WRONLY)\n os.close(fd)\n raise AssertionError('writable open unexpectedly succeeded')\nexcept OSError as error:\n assert error.errno==errno.ENOSPC,error")
+            .arg(mountpoint.join("source"))
+            .output()
+            .unwrap();
+        assert!(
+            attempted_open.status.success(),
+            "ordinary-user disk-full open: {}",
+            String::from_utf8_lossy(&attempted_open.stderr)
+        );
+        let attempted_truncate = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import errno,os,sys\ntry:\n os.truncate(sys.argv[1],1)\n raise AssertionError('pathname truncate unexpectedly succeeded')\nexcept OSError as error:\n assert error.errno==errno.ENOSPC,error")
+            .arg(mountpoint.join("source"))
+            .output()
+            .unwrap();
+        assert!(
+            attempted_truncate.status.success(),
+            "ordinary-user disk-full truncate: {}",
+            String::from_utf8_lossy(&attempted_truncate.stderr)
+        );
+        mount.check_health().unwrap();
+        let private_read = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(!private_read.status.success());
+        let anchor_path = manifest.file_locator("source".to_owned()).unwrap();
+        let anchor = anchor_path.open().unwrap();
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().ino(),
+            anchor.metadata().unwrap().ino()
+        );
+        assert_eq!(
+            blake3::hash(&fs::read(&source_path).unwrap()),
+            original_hash
+        );
+        drop(anchor);
+
+        drop(filler);
+        fs::remove_file(&filler_path).unwrap();
+        mount.stop().unwrap();
+        let recovered =
+            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        recovered.check_health().unwrap();
+        let edited = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'EDIT',0); os.fsync(fd); os.close(fd)")
+            .arg(mountpoint.join("source"))
+            .output()
+            .unwrap();
+        assert!(
+            edited.status.success(),
+            "ordinary-user retry: {}",
+            String::from_utf8_lossy(&edited.stderr)
+        );
+        assert!(fs::read(&source_path).unwrap().starts_with(b"EDIT"));
+        let mut protected = anchor_path.open().unwrap();
+        assert_ne!(
+            fs::metadata(&source_path).unwrap().ino(),
+            protected.metadata().unwrap().ino()
+        );
+        let mut anchor_bytes = Vec::new();
+        protected.read_to_end(&mut anchor_bytes).unwrap();
+        assert_eq!(blake3::hash(&anchor_bytes), original_hash);
+        recovered.stop().unwrap();
+        let control = control.lock().unwrap();
+        GuardedViewMount::retire_claim(manifest.anchor_id, &control).unwrap();
+        plan.discard_unreferenced(&control).unwrap();
     }
 }
