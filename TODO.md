@@ -91,6 +91,18 @@
   missing response in this run. Identify the failing signer/request path and
   distinguish transport loss from signature collection or lock handling;
   plain lifecycle signer failures are currently logged only at debug level.
+  The next source correction retains individually verified guild signatures in
+  a versioned local record bound to the coordinator's durable proposal lock,
+  guild, and event sequence. Plain lifecycle and bound coding Add retries reuse
+  those signatures, contact only missing signers, and atomically retire the
+  partial record when the event installs. A focused test proves accumulation
+  across reopen and rejection of an invalid signature or changed proposal;
+  existing guild administration and coding lifecycle tests, core guild tests,
+  the locked all-target workspace suite (313 passing `mb-node` tests), and
+  strict workspace Clippy pass. Plain lifecycle signer failures now name
+  the member and sequence at warning level. This addresses the observed
+  same-event partial-quorum loss; the full provisioned topology gate still
+  needs to pass on the final committed source before closing this blocker.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

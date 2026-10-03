@@ -40,7 +40,8 @@ pub use guild::{
     MAX_GUILD_EVENT_TAIL, QuorumGuildEvent, QuorumLegacyCodingAddBinding, QuorumPolicy, QuorumRule,
     RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch, RetainedCodingGroup,
     WriterKeyEpoch, create_recovery_key_envelope, open_recovery_key_envelope, sign_guild_event,
-    sign_legacy_coding_add_binding, verify_legacy_coding_add_signature,
+    sign_legacy_coding_add_binding, verify_guild_event_signature,
+    verify_legacy_coding_add_signature,
 };
 pub use keys::{
     DatabaseKeyError, KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed,

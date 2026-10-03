@@ -1354,6 +1354,17 @@ prefixes for event 37 on all five members. The guild advanced to event 42 and
 the backup committed. Keep the intermittent signature-response issue open;
 obsolete loopback retries continued but did not prevent relay traffic in this
 run.
+The next Milestone 6 correction durably accumulates individually verified
+signatures for the coordinator's exact locked proposal across retry passes and
+reopen. Plain guild lifecycle events and verifier-bound coding Adds request
+only missing signers, then atomically remove partial signatures when the event
+installs; they do not require all unanimous responses in one pass. A focused
+reopen/invalid-signature regression, existing guild administration and coding
+lifecycle tests, core guild tests, the locked all-target workspace suite
+(313 passing `mb-node` tests), and strict workspace Clippy pass. The full
+provisioned topology gate remains required on the final committed source, and
+the remaining signer-response path is not yet classified as transport or
+application failure.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

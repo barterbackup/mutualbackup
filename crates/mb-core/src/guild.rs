@@ -436,7 +436,6 @@ impl DynamicGuildState {
         {
             return Err(GuildStateError::InvalidEvent);
         }
-        let encoded = canonical_bytes(event)?;
         let active = self
             .active_members()
             .map(|member| member.node_id)
@@ -449,14 +448,7 @@ impl DynamicGuildState {
             {
                 return Err(GuildStateError::InvalidEvent);
             }
-            let key = VerifyingKey::from_bytes(&signature.signer.0)?;
-            if key.is_weak() {
-                return Err(GuildStateError::InvalidEvent);
-            }
-            key.verify_strict(
-                &signing_payload(GUILD_EVENT_DOMAIN, &encoded),
-                &Signature::from_slice(&signature.signature)?,
-            )?;
+            verify_guild_event_signature(event, signature)?;
             valid += 1;
             previous = Some(signature.signer);
         }
@@ -833,6 +825,21 @@ pub fn sign_guild_event(
             .sign(GUILD_EVENT_DOMAIN, &canonical_bytes(event)?)
             .to_vec(),
     })
+}
+
+pub fn verify_guild_event_signature(
+    event: &GuildEvent,
+    signature: &MemberSignature,
+) -> Result<(), GuildStateError> {
+    let key = VerifyingKey::from_bytes(&signature.signer.0)?;
+    if key.is_weak() {
+        return Err(GuildStateError::InvalidEvent);
+    }
+    key.verify_strict(
+        &signing_payload(GUILD_EVENT_DOMAIN, &canonical_bytes(event)?),
+        &Signature::from_slice(&signature.signature)?,
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]

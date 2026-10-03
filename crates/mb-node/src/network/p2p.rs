@@ -7967,19 +7967,30 @@ async fn commit_verified_coding_group(
         },
     };
     state.validate_event_proposal(&event)?;
-    let mut signatures = Vec::new();
+    let local_event = event.clone();
+    let local_transcript = transcript.clone();
+    let local_signature = node_blocking(node.clone(), move |node| {
+        node.sign_coding_group_event_proposal(&local_event, &local_transcript)
+    })
+    .await?;
+    let local_event = event.clone();
+    let mut signatures = node_blocking(node.clone(), move |node| {
+        node.collect_guild_event_signature(&local_event, local_signature)
+    })
+    .await?;
+    let already_certified = state
+        .verify_event(&QuorumGuildEvent {
+            event: event.clone(),
+            signatures: signatures.clone(),
+        })
+        .is_ok();
     let mut requests = FuturesUnordered::new();
     for peer in &guild.peers {
         let signer = peer.member.node_id;
-        if signer == local_id {
-            let local_event = event.clone();
-            let local_transcript = transcript.clone();
-            signatures.push(
-                node_blocking(node.clone(), move |node| {
-                    node.sign_coding_group_event_proposal(&local_event, &local_transcript)
-                })
-                .await?,
-            );
+        if already_certified
+            || signer == local_id
+            || signatures.iter().any(|saved| saved.signer == signer)
+        {
             continue;
         }
         for endpoint in &peer.endpoints {
@@ -7999,13 +8010,18 @@ async fn commit_verified_coding_group(
     }
     while let Some((signer, result)) = requests.next().await {
         match result {
-            Ok(signature) => signatures.push(signature),
+            Ok(signature) => {
+                let proposal = event.clone();
+                signatures = node_blocking(node.clone(), move |node| {
+                    node.collect_guild_event_signature(&proposal, signature)
+                })
+                .await?;
+            }
             Err(error) => {
                 tracing::warn!(%signer, %error, "guild member did not sign coding-group event");
             }
         }
     }
-    signatures.sort_by_key(|signature| signature.signer);
     let certified = QuorumGuildEvent { event, signatures };
     state.verify_event(&certified)?;
     for peer in guild
@@ -8814,18 +8830,29 @@ async fn commit_plain_guild_event(
     local_id: NodeId,
     event: GuildEvent,
 ) -> Result<()> {
-    let mut signatures = Vec::new();
+    let local_event = event.clone();
+    let local_signature = node_blocking(node.clone(), move |node| {
+        node.sign_guild_event_proposal(&local_event)
+    })
+    .await?;
+    let local_event = event.clone();
+    let mut signatures = node_blocking(node.clone(), move |node| {
+        node.collect_guild_event_signature(&local_event, local_signature)
+    })
+    .await?;
+    let already_certified = state
+        .verify_event(&QuorumGuildEvent {
+            event: event.clone(),
+            signatures: signatures.clone(),
+        })
+        .is_ok();
     let mut requests = FuturesUnordered::new();
     for peer in &guild.peers {
         let signer = peer.member.node_id;
-        if signer == local_id {
-            let event = event.clone();
-            signatures.push(
-                node_blocking(node.clone(), move |node| {
-                    node.sign_guild_event_proposal(&event)
-                })
-                .await?,
-            );
+        if already_certified
+            || signer == local_id
+            || signatures.iter().any(|saved| saved.signer == signer)
+        {
             continue;
         }
         for endpoint in &peer.endpoints {
@@ -8838,13 +8865,18 @@ async fn commit_plain_guild_event(
     }
     while let Some((signer, result)) = requests.next().await {
         match result {
-            Ok(signature) => signatures.push(signature),
+            Ok(signature) => {
+                let proposal = event.clone();
+                signatures = node_blocking(node.clone(), move |node| {
+                    node.collect_guild_event_signature(&proposal, signature)
+                })
+                .await?;
+            }
             Err(error) => {
-                tracing::debug!(%signer, %error, "guild member did not sign lifecycle event");
+                tracing::warn!(%signer, sequence = event.sequence, %error, "guild member did not sign lifecycle event");
             }
         }
     }
-    signatures.sort_by_key(|signature| signature.signer);
     let certified = QuorumGuildEvent { event, signatures };
     state.verify_event(&certified)?;
     for peer in guild

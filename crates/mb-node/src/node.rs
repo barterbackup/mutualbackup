@@ -26,6 +26,7 @@ use mb_core::{
     merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope,
     open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
+    verify_guild_event_signature,
 };
 use mb_git::{
     GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitPruneRoots,
@@ -558,6 +559,20 @@ struct GuildEventSignatureLock {
     event_hash: [u8; 32],
     event: GuildEvent,
     signature: MemberSignature,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PendingGuildEventSignatures {
+    format_version: u16,
+    event: GuildEvent,
+    signatures: Vec<MemberSignature>,
+}
+
+fn pending_guild_event_signatures_id(event: &GuildEvent) -> [u8; 40] {
+    let mut id = [0_u8; 40];
+    id[..32].copy_from_slice(&event.guild_id);
+    id[32..].copy_from_slice(&event.sequence.to_be_bytes());
+    id
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -3971,6 +3986,70 @@ impl Node {
         Ok(signature)
     }
 
+    /// Retain exact, individually verified signatures across coordinator retry
+    /// passes. A unanimous event need not reach every signer in one pass.
+    pub(crate) fn collect_guild_event_signature(
+        &self,
+        event: &GuildEvent,
+        candidate: MemberSignature,
+    ) -> Result<Vec<MemberSignature>> {
+        let state = self
+            .dynamic_guild_state()?
+            .context("node has no dynamic guild state")?;
+        state.validate_event_proposal(event)?;
+        if self.locked_guild_event_proposal(event.sequence)?.as_ref() != Some(event) {
+            anyhow::bail!("local guild proposal lock does not match the event");
+        }
+        let id = pending_guild_event_signatures_id(event);
+        let mut pending = self
+            .control
+            .get_record("guild-event-partial-signatures", &id)?
+            .map(|bytes| decode_canonical::<PendingGuildEventSignatures>(&bytes))
+            .transpose()?
+            .unwrap_or(PendingGuildEventSignatures {
+                format_version: 1,
+                event: event.clone(),
+                signatures: Vec::new(),
+            });
+        if pending.format_version != 1 || pending.event != *event {
+            anyhow::bail!("pending guild signatures name another proposal");
+        }
+        let active = state
+            .active_members()
+            .map(|member| member.node_id)
+            .collect::<BTreeSet<_>>();
+        let mut previous = None;
+        for signature in &pending.signatures {
+            if !active.contains(&signature.signer)
+                || previous.is_some_and(|signer| signer >= signature.signer)
+            {
+                anyhow::bail!("pending guild signatures contain an invalid signer");
+            }
+            verify_guild_event_signature(event, signature)?;
+            previous = Some(signature.signer);
+        }
+        if !active.contains(&candidate.signer) {
+            anyhow::bail!("guild signature came from a nonmember");
+        }
+        verify_guild_event_signature(event, &candidate)?;
+        match pending
+            .signatures
+            .binary_search_by_key(&candidate.signer, |signature| signature.signer)
+        {
+            Ok(index) if pending.signatures[index] != candidate => {
+                anyhow::bail!("guild member returned a conflicting signature");
+            }
+            Ok(_) => return Ok(pending.signatures),
+            Err(index) => pending.signatures.insert(index, candidate),
+        }
+        self.control.put_record(
+            "guild-event-partial-signatures",
+            &id,
+            &canonical_bytes(&pending)?,
+        )?;
+        Ok(pending.signatures)
+    }
+
     pub fn install_guild_event(&mut self, certified: QuorumGuildEvent) -> Result<()> {
         if certified.event.kind.coding_group_add().is_some() {
             anyhow::bail!("coding-group events require replayable verifier evidence");
@@ -4208,6 +4287,10 @@ impl Node {
             ) {
                 self.reconcile_garbage_collection()?;
             }
+            self.control.delete_record(
+                "guild-event-partial-signatures",
+                &pending_guild_event_signatures_id(&certified.event),
+            )?;
             return Ok(());
         }
         if let Some(existing) = self.control.get_record("guild-event", &record_id)?
@@ -4367,9 +4450,13 @@ impl Node {
                 bytes,
             ));
         }
-        let deletions = attempt_id
+        let mut deletions = attempt_id
             .map(|attempt_id| vec![("coding-pending-activation".to_owned(), attempt_id.to_vec())])
             .unwrap_or_default();
+        deletions.push((
+            "guild-event-partial-signatures".to_owned(),
+            pending_guild_event_signatures_id(&certified.event).to_vec(),
+        ));
         self.control.put_records_and_delete(&records, &deletions)?;
         if let Some(attempt_id) = attempt_id {
             self.volumes.finalize_attempt(&self.control, &attempt_id)?;
@@ -18376,6 +18463,104 @@ pub(crate) mod tests {
                 .endpoints
                 .as_slice(),
             std::slice::from_ref(&changed_endpoint)
+        );
+    }
+
+    #[test]
+    fn guild_signatures_accumulate_across_reopen_without_mixing_proposals() {
+        let temp = tempfile::tempdir().unwrap();
+        let (local_seed, certificate, peers) = recovery_guild_fixture();
+        let mut signers = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 120; 32])))
+            .collect::<Vec<_>>();
+        signers.sort_by_key(KeyMaterial::node_id);
+        let mut node = Node::open(temp.path(), local_seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RelabelMember {
+                node_id: certificate.genesis.coordinator,
+                failure_domain: "signature-retry-domain".to_owned(),
+            },
+        };
+        let local = node.sign_guild_event_proposal(&event).unwrap();
+        let remote = signers
+            .iter()
+            .filter(|keys| keys.node_id() != local.signer)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            node.collect_guild_event_signature(&event, local.clone())
+                .unwrap()
+                .len(),
+            1
+        );
+        let second = sign_guild_event(&event, remote[0]).unwrap();
+        assert_eq!(
+            node.collect_guild_event_signature(&event, second.clone())
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut invalid = sign_guild_event(&event, remote[1]).unwrap();
+        invalid.signature[0] ^= 1;
+        assert!(node.collect_guild_event_signature(&event, invalid).is_err());
+        let conflicting = GuildEvent {
+            kind: mb_core::GuildEventKind::RelabelMember {
+                node_id: certificate.genesis.coordinator,
+                failure_domain: "another-domain".to_owned(),
+            },
+            ..event.clone()
+        };
+        assert!(
+            node.collect_guild_event_signature(
+                &conflicting,
+                sign_guild_event(&conflicting, remote[1]).unwrap()
+            )
+            .is_err()
+        );
+        drop(node);
+
+        let mut reopened = Node::open(temp.path(), local_seed).unwrap();
+        assert_eq!(
+            reopened
+                .collect_guild_event_signature(&event, local)
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut collected = Vec::new();
+        for keys in remote.iter().skip(1) {
+            collected = reopened
+                .collect_guild_event_signature(&event, sign_guild_event(&event, keys).unwrap())
+                .unwrap();
+        }
+        assert_eq!(collected.len(), 5);
+        state
+            .verify_event(&QuorumGuildEvent {
+                event: event.clone(),
+                signatures: collected.clone(),
+            })
+            .unwrap();
+        reopened
+            .install_guild_event(QuorumGuildEvent {
+                event: event.clone(),
+                signatures: collected,
+            })
+            .unwrap();
+        assert!(
+            reopened
+                .control
+                .get_record(
+                    "guild-event-partial-signatures",
+                    &pending_guild_event_signatures_id(&event)
+                )
+                .unwrap()
+                .is_none()
         );
     }
 
