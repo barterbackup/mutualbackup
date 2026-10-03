@@ -169,6 +169,15 @@
   firewall chains were removed. This run distinguishes slow serial group
   completion from a fixed sequence stall but does not explain the historical
   5,400-second timeout, so this gate remains open.
+  `e65580f` installs a verified coding Add locally before concurrent peer
+  dissemination and bounds its eager wait to 20 seconds. The focused activation
+  test and strict workspace Clippy pass. The complete local Git acceptance gate
+  passed on this exact commit, including 62 Btrfs Git cases, extent measurement,
+  node/Git recovery, stock-Git exchange, and five-daemon topology/seed recovery
+  in 1,618.57 seconds. Event 43 was reached after transient short lifecycle
+  signature quorums, transport exhaustion, and stale-address dials. No coding
+  dissemination timeout was observed, so this run does not verify that branch
+  or explain the historical 5,400-second missing-signer stall. Keep open.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

@@ -1440,6 +1440,16 @@ and complete disposable-resource cleanup. Coverage warnings showed event
 sequences advancing through both recovered-topology backups; no worker step
 crossed the one-minute threshold. The earlier 5,400-second stall remains
 unexplained, so the reliability gate stays open.
+`e65580f` installs a verified coding Add locally before peer dissemination,
+starts peer installs concurrently, and bounds their eager wait to 20 seconds;
+lagging peers can use event-tail catch-up. The focused five-domain activation
+test and strict workspace Clippy pass. The complete local Git acceptance gate
+passed on that exact commit, including 62 Btrfs Git cases, extent measurement,
+node/Git recovery, stock-Git exchange, and five-daemon topology/seed recovery.
+The topology reached event 43 but again showed transient short lifecycle
+signature quorums and stale-address dials. The timeout branch was not observed,
+and the historical missing-signer stall remains unexplained; keep the
+reliability gate open.
 The guarded FUSE view now answers `statfs` from the pinned lower-root
 descriptor, reporting real filesystem capacity and name limits. A privileged
 ordinary-user `statvfs` probe and comparison with the native filesystem pass
@@ -3448,6 +3458,13 @@ completed Git command against the byte-exact policy and crash/recovery gates
 below, then continue through graph protection, two-way ordinary-Git exchange,
 and physical reclamation before closing the guarded link-freeze and platform
 backend gates. A command being present does not by itself close its slice.
+The native `.mutualbackup` catalog, not a `.git` directory, owns local history;
+the same immutable captured bytes serve backup and Git blobs without a second
+persistent payload copy. Git compatibility applies to the supported command
+syntax and object/pack exchange, while this binary's file-content rule is
+strictly byte-for-byte even when stock Git would apply attributes or filters.
+Keep those three conditions together as Git work proceeds, and retain the
+original guarded-source and platform gates in this milestone's closure test.
 
 - First extract and version the source-backend boundary from section 4 without
   changing the existing signed peer format. Prove a custom object-store adapter
