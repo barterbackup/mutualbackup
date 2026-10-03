@@ -355,6 +355,55 @@ impl Filesystem for SingleFileProbeView {
             Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
         }
     }
+
+    fn fallocate(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        if inode != FILE_INODE {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let held = self.backing.lock().unwrap();
+        let Some(backing) = held.get(&handle.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        if backing.mode == OpenAccMode::O_RDONLY {
+            reply.error(Errno::EACCES);
+            return;
+        }
+        drop(held);
+        let Some(open_for_write) = &self.open_for_write else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        let result = (|| -> io::Result<()> {
+            let offset =
+                i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let length =
+                i64::try_from(length).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // The callback completes or verifies the durable detach before an
+            // allocation or hole punch can reach the private source inode.
+            let source = open_for_write(OpenAccMode::O_RDWR)?;
+            // SAFETY: `source` owns a valid descriptor, and the offset and
+            // length were checked for the syscall's signed argument width.
+            if unsafe { libc::fallocate(source.as_raw_fd(), mode, offset, length) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            source.sync_all()
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO))),
+        }
+    }
 }
 
 /// Verify read-only FUSE passthrough on a disposable view beside `source_root`.
@@ -545,6 +594,7 @@ mod tests {
         OwnerChmod,
         PathTruncate,
         OpenTruncate,
+        Allocate,
         RenameThenWrite,
         Unlink,
     }
@@ -646,6 +696,9 @@ mod tests {
                 FirstMutation::OpenTruncate => {
                     "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_TRUNC); os.write(fd,b'REPLACED'); os.fsync(fd); os.close(fd)"
                 }
+                FirstMutation::Allocate => {
+                    "import ctypes,os,sys; fd=os.open(sys.argv[1],os.O_RDWR); libc=ctypes.CDLL(None,use_errno=True); result=libc.fallocate(fd,0,0,4096); assert result==0,os.strerror(ctypes.get_errno()); os.fsync(fd); os.close(fd)"
+                }
                 FirstMutation::RenameThenWrite => {
                     "import os,sys; os.rename(sys.argv[1],os.path.join(os.path.dirname(sys.argv[1]),'moved'))"
                 }
@@ -701,6 +754,13 @@ mod tests {
                 FirstMutation::OpenTruncate => {
                     anyhow::ensure!(fs::read(&lower_path)? == b"REPLACED");
                     anyhow::ensure!(fs::read(mountpoint.join("sample"))? == b"REPLACED");
+                }
+                FirstMutation::Allocate => {
+                    let bytes = fs::read(&lower_path)?;
+                    anyhow::ensure!(bytes.len() == 4096);
+                    anyhow::ensure!(bytes.starts_with(original));
+                    anyhow::ensure!(bytes[original.len()..].iter().all(|byte| *byte == 0));
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))? == bytes);
                 }
                 FirstMutation::RenameThenWrite => {
                     anyhow::ensure!(!lower_path.exists());
@@ -789,6 +849,12 @@ mod tests {
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn truncating_open_detaches_before_changing_source_bytes() {
         guarded_view_mutation_case(FirstMutation::OpenTruncate);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn allocation_keeps_captured_anchor_immutable() {
+        guarded_view_mutation_case(FirstMutation::Allocate);
     }
 
     #[test]
