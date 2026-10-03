@@ -15,7 +15,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,25 +36,31 @@ const KERNEL_O_LARGEFILE: i32 = 0o100000;
 struct GuardedProbeFile {
     source: File,
     source_attr: Mutex<FileAttr>,
-    parent: INodeNo,
-    relative_path: Arc<Mutex<Option<PathBuf>>>,
-    lower_dir: Option<PathBuf>,
+    location: Arc<Mutex<Option<ProbeLocation>>>,
     open_for_write: Option<Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync>>,
+}
+
+struct ProbeLocation {
+    parent: INodeNo,
+    relative_path: PathBuf,
 }
 
 struct GuardedProbeDirectory {
     attr: FileAttr,
     parent: INodeNo,
     name: OsString,
+    relative_path: PathBuf,
 }
 
 struct GuardedProbeView {
     files: HashMap<u64, GuardedProbeFile>,
     directories: HashMap<u64, GuardedProbeDirectory>,
     names: Mutex<HashMap<(u64, OsString), u64>>,
+    lower_root: Option<crate::PinnedDirectory>,
     root_uid: u32,
     root_gid: u32,
     root_perm: u16,
+    poisoned: AtomicBool,
     next_handle: AtomicU64,
     denied_writable: Arc<AtomicU64>,
     backing: Mutex<HashMap<u64, ActiveBacking>>,
@@ -78,8 +84,13 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
-    fn new(files: Vec<GuardedProbeFile>, root_perm: u16, denied_writable: Arc<AtomicU64>) -> Self {
-        Self::with_directories(files, Vec::new(), root_perm, denied_writable)
+    fn new(
+        files: Vec<GuardedProbeFile>,
+        root_perm: u16,
+        denied_writable: Arc<AtomicU64>,
+        lower_root: Option<crate::PinnedDirectory>,
+    ) -> Self {
+        Self::with_directories(files, Vec::new(), root_perm, denied_writable, lower_root)
     }
 
     fn with_directories(
@@ -87,6 +98,7 @@ impl GuardedProbeView {
         directories: Vec<GuardedProbeDirectory>,
         root_perm: u16,
         denied_writable: Arc<AtomicU64>,
+        lower_root: Option<crate::PinnedDirectory>,
     ) -> Self {
         let mut by_inode = HashMap::new();
         let mut names = HashMap::new();
@@ -114,11 +126,14 @@ impl GuardedProbeView {
         }
         for file in files {
             let inode = file.source_attr.lock().unwrap().ino.0;
-            if let Some(path) = file.relative_path.lock().unwrap().clone() {
-                let name = path.file_name().expect("guarded file needs a name");
+            if let Some(location) = file.location.lock().unwrap().as_ref() {
+                let name = location
+                    .relative_path
+                    .file_name()
+                    .expect("guarded file needs a name");
                 assert!(
                     names
-                        .insert((file.parent.0, name.to_os_string()), inode)
+                        .insert((location.parent.0, name.to_os_string()), inode)
                         .is_none(),
                     "duplicate guarded view name"
                 );
@@ -136,9 +151,11 @@ impl GuardedProbeView {
             files: by_inode,
             directories: by_directory,
             names: Mutex::new(names),
+            lower_root,
             root_uid,
             root_gid,
             root_perm,
+            poisoned: AtomicBool::new(false),
             next_handle: AtomicU64::new(1),
             denied_writable,
             backing: Mutex::default(),
@@ -227,6 +244,10 @@ impl Filesystem for GuardedProbeView {
     }
 
     fn lookup(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
         let names = self.names.lock().unwrap();
         let Some(&inode) = names.get(&(parent.0, name.to_os_string())) else {
             reply.error(Errno::ENOENT);
@@ -252,6 +273,10 @@ impl Filesystem for GuardedProbeView {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
         if inode != INodeNo::ROOT && !self.directories.contains_key(&inode.0) {
             reply.error(Errno::ENOENT);
             return;
@@ -295,6 +320,10 @@ impl Filesystem for GuardedProbeView {
         _handle: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
         match inode {
             INodeNo::ROOT => reply.attr(&ENTRY_TTL, &self.root_attr()),
             _ if self.directories.contains_key(&inode.0) => {
@@ -328,6 +357,10 @@ impl Filesystem for GuardedProbeView {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
         let Some(file) = self.files.get(&inode.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -388,6 +421,10 @@ impl Filesystem for GuardedProbeView {
     }
 
     fn open(&self, _request: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
         let Some(file) = self.files.get(&inode.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -465,11 +502,13 @@ impl Filesystem for GuardedProbeView {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if parent != newparent {
-            reply.error(Errno::EXDEV);
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
             return;
         }
-        if parent != INodeNo::ROOT && !self.directories.contains_key(&parent.0) {
+        if (parent != INodeNo::ROOT && !self.directories.contains_key(&parent.0))
+            || (newparent != INodeNo::ROOT && !self.directories.contains_key(&newparent.0))
+        {
             reply.error(Errno::ENOENT);
             return;
         }
@@ -479,7 +518,7 @@ impl Filesystem for GuardedProbeView {
         }
         let mut names = self.names.lock().unwrap();
         let old_key = (parent.0, name.to_os_string());
-        let new_key = (parent.0, newname.to_os_string());
+        let new_key = (newparent.0, newname.to_os_string());
         let Some(&inode) = names.get(&old_key) else {
             reply.error(Errno::ENOENT);
             return;
@@ -488,11 +527,11 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EISDIR);
             return;
         };
-        let Some(lower_dir) = &file.lower_dir else {
+        let Some(lower_root) = &self.lower_root else {
             reply.error(Errno::EACCES);
             return;
         };
-        if name == newname {
+        if parent == newparent && name == newname {
             reply.ok();
             return;
         }
@@ -500,20 +539,66 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EEXIST);
             return;
         }
-        let mut current = file.relative_path.lock().unwrap();
+        let mut current = file.location.lock().unwrap();
         let result = (|| -> io::Result<()> {
-            let new_path = current
+            let location = current
                 .as_ref()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
-                .with_file_name(newname);
-            let lower = crate::PinnedDirectory::open(lower_dir).map_err(io::Error::other)?;
-            lower
-                .rename_child_no_replace(name, newname)
-                .map_err(io::Error::other)?;
-            *current = Some(new_path);
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            if location.parent != parent {
+                return Err(io::Error::other("guarded namespace parent changed"));
+            }
+            let source_relative_dir = location
+                .relative_path
+                .parent()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let destination_relative_dir = self
+                .directories
+                .get(&newparent.0)
+                .map(|directory| directory.relative_path.as_path())
+                .unwrap_or(Path::new(""));
+            let new_path = destination_relative_dir.join(newname);
+            let source_owned = if source_relative_dir.as_os_str().is_empty() {
+                None
+            } else {
+                Some(
+                    lower_root
+                        .open_descendant_directory(source_relative_dir)
+                        .map_err(io::Error::other)?,
+                )
+            };
+            let destination_owned = if destination_relative_dir.as_os_str().is_empty() {
+                None
+            } else {
+                Some(
+                    lower_root
+                        .open_descendant_directory(destination_relative_dir)
+                        .map_err(io::Error::other)?,
+                )
+            };
+            let source_parent = source_owned.as_ref().unwrap_or(lower_root);
+            let destination_parent = destination_owned.as_ref().unwrap_or(lower_root);
+            let expected = crate::NativeFileId {
+                filesystem_id: lower_root
+                    .identity()
+                    .map_err(io::Error::other)?
+                    .filesystem_id,
+                inode: file.source.metadata()?.ino(),
+            };
+            source_parent
+                .move_child_file_no_replace(name, expected, destination_parent, newname)
+                .map_err(|error| {
+                    // The rename may have happened before a directory fsync
+                    // failed. Stop serving this view until it is reconciled.
+                    self.poisoned.store(true, Ordering::Release);
+                    io::Error::other(error)
+                })?;
+            *current = Some(ProbeLocation {
+                parent: newparent,
+                relative_path: new_path,
+            });
             names.remove(&old_key);
             names.insert(new_key, inode);
-            lower.sync_all().map_err(io::Error::other)
+            Ok(())
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -522,6 +607,10 @@ impl Filesystem for GuardedProbeView {
     }
 
     fn unlink(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
         if parent != INodeNo::ROOT && !self.directories.contains_key(&parent.0) {
             reply.error(Errno::ENOENT);
             return;
@@ -536,17 +625,39 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EISDIR);
             return;
         };
-        let Some(lower_dir) = &file.lower_dir else {
+        let Some(lower_root) = &self.lower_root else {
             reply.error(Errno::EACCES);
             return;
         };
-        let mut current = file.relative_path.lock().unwrap();
+        let mut current = file.location.lock().unwrap();
         let result = (|| -> io::Result<()> {
-            let lower = crate::PinnedDirectory::open(lower_dir).map_err(io::Error::other)?;
+            let location = current
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            if location.parent != parent {
+                return Err(io::Error::other("guarded namespace parent changed"));
+            }
+            let source_relative_dir = location
+                .relative_path
+                .parent()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let lower_owned = if source_relative_dir.as_os_str().is_empty() {
+                None
+            } else {
+                Some(
+                    lower_root
+                        .open_descendant_directory(source_relative_dir)
+                        .map_err(io::Error::other)?,
+                )
+            };
+            let lower = lower_owned.as_ref().unwrap_or(lower_root);
             lower.remove_child_file(name).map_err(io::Error::other)?;
             *current = None;
             names.remove(&key);
-            lower.sync_all().map_err(io::Error::other)
+            lower.sync_all().map_err(|error| {
+                self.poisoned.store(true, Ordering::Release);
+                io::Error::other(error)
+            })
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -564,6 +675,10 @@ impl Filesystem for GuardedProbeView {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        if self.poisoned.load(Ordering::Acquire) {
+            reply.error(Errno::EIO);
+            return;
+        }
         let Some(file) = self.files.get(&inode.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -648,13 +763,14 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
         // Advertise the original editable mode. The lower inode is frozen;
         // the view must still reject writes until detach.
         source_attr: Mutex::new(probe_file_attr(&source, FILE_INODE, 0o666)?),
-        parent: INodeNo::ROOT,
-        relative_path: Arc::new(Mutex::new(Some(PathBuf::from("sample")))),
-        lower_dir: None,
+        location: Arc::new(Mutex::new(Some(ProbeLocation {
+            parent: INodeNo::ROOT,
+            relative_path: PathBuf::from("sample"),
+        }))),
         source,
         open_for_write: None,
     };
-    let view = GuardedProbeView::new(vec![file], 0o755, Arc::clone(&denied_writable));
+    let view = GuardedProbeView::new(vec![file], 0o755, Arc::clone(&denied_writable), None);
     let mut config = Config::default();
     config.acl = SessionACL::All;
     let session = fuser::spawn_mount(view, &mountpoint, &config)
@@ -777,7 +893,7 @@ mod tests {
     };
 
     use super::{
-        FILE_INODE, GuardedProbeDirectory, GuardedProbeFile, GuardedProbeView,
+        FILE_INODE, GuardedProbeDirectory, GuardedProbeFile, GuardedProbeView, ProbeLocation,
         probe_directory_attr, probe_file_attr,
     };
 
@@ -831,11 +947,14 @@ mod tests {
         let control = Arc::new(Mutex::new(control));
         let control_for_open = Arc::clone(&control);
         let plan_for_open = plan.clone();
-        let relative_path = Arc::new(Mutex::new(Some(PathBuf::from("sample"))));
-        let path_for_open = Arc::clone(&relative_path);
+        let location = Arc::new(Mutex::new(Some(ProbeLocation {
+            parent: INodeNo::ROOT,
+            relative_path: PathBuf::from("sample"),
+        })));
+        let location_for_open = Arc::clone(&location);
         let lower_for_open = lower.clone();
         let open_for_write = Arc::new(move |mode: OpenAccMode| -> io::Result<File> {
-            let current = path_for_open
+            let current = location_for_open
                 .lock()
                 .map_err(|_| io::Error::other("guarded name lock is poisoned"))?;
             let current = current
@@ -845,24 +964,27 @@ mod tests {
                 .lock()
                 .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
             plan_for_open
-                .prepare_edit_at(&control, current)
+                .prepare_edit_at(&control, &current.relative_path)
                 .map_err(io::Error::other)?;
             OpenOptions::new()
                 .read(mode == OpenAccMode::O_RDWR)
                 .write(true)
-                .open(lower_for_open.join(current))
+                .open(lower_for_open.join(&current.relative_path))
         });
         let mut advertised = probe_file_attr(&source, FILE_INODE, 0o666).unwrap();
         advertised.uid = 65534;
         let file = GuardedProbeFile {
             source_attr: Mutex::new(advertised),
             source,
-            parent: INodeNo::ROOT,
-            relative_path,
-            lower_dir: Some(lower.clone()),
+            location,
             open_for_write: Some(open_for_write),
         };
-        let view = GuardedProbeView::new(vec![file], 0o777, Arc::new(Default::default()));
+        let view = GuardedProbeView::new(
+            vec![file],
+            0o777,
+            Arc::new(Default::default()),
+            Some(crate::PinnedDirectory::open(&lower).unwrap()),
+        );
         let mut config = Config::default();
         config.acl = SessionACL::All;
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
@@ -1078,15 +1200,18 @@ mod tests {
         plan: &GuardedRootCapturePlan,
         control: &Arc<Mutex<ControlStore>>,
     ) -> GuardedProbeFile {
-        let relative_path = Arc::new(Mutex::new(Some(PathBuf::from(captured_name))));
-        let path_for_open = Arc::clone(&relative_path);
+        let location = Arc::new(Mutex::new(Some(ProbeLocation {
+            parent,
+            relative_path: PathBuf::from(captured_name),
+        })));
+        let location_for_open = Arc::clone(&location);
         let control_for_open = Arc::clone(control);
         let plan_for_open = plan.clone();
         let lower_for_open = lower.to_path_buf();
         let captured = captured_name.to_owned();
         let open_for_write: Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync> =
             Arc::new(move |mode| {
-                let current = path_for_open
+                let current = location_for_open
                     .lock()
                     .map_err(|_| io::Error::other("guarded path lock is poisoned"))?;
                 let current = current
@@ -1096,12 +1221,12 @@ mod tests {
                     .lock()
                     .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
                 plan_for_open
-                    .prepare_file_edit_at(&control, &captured, current)
+                    .prepare_file_edit_at(&control, &captured, &current.relative_path)
                     .map_err(io::Error::other)?;
                 OpenOptions::new()
                     .read(mode == OpenAccMode::O_RDWR)
                     .write(true)
-                    .open(lower_for_open.join(current))
+                    .open(lower_for_open.join(&current.relative_path))
             });
         let source = File::open(lower.join(captured_name)).unwrap();
         let mut advertised = probe_file_attr(&source, inode, 0o666).unwrap();
@@ -1109,9 +1234,7 @@ mod tests {
         GuardedProbeFile {
             source,
             source_attr: Mutex::new(advertised),
-            parent,
-            relative_path,
-            lower_dir: Some(lower.join(Path::new(captured_name).parent().unwrap_or(Path::new("")))),
+            location,
             open_for_write: Some(open_for_write),
         }
     }
@@ -1160,7 +1283,12 @@ mod tests {
                 )
             })
             .collect();
-        let view = GuardedProbeView::new(files, 0o777, Arc::new(Default::default()));
+        let view = GuardedProbeView::new(
+            files,
+            0o777,
+            Arc::new(Default::default()),
+            Some(crate::PinnedDirectory::open(&lower).unwrap()),
+        );
         let mut config = Config::default();
         config.acl = SessionACL::All;
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
@@ -1293,12 +1421,14 @@ mod tests {
             attr: nested_attr,
             parent: INodeNo::ROOT,
             name: "nested".into(),
+            relative_path: PathBuf::from("nested"),
         };
         let view = GuardedProbeView::with_directories(
             files,
             vec![directory],
             0o777,
             Arc::new(Default::default()),
+            Some(crate::PinnedDirectory::open(&lower).unwrap()),
         );
         let mut config = Config::default();
         config.acl = SessionACL::All;
@@ -1335,21 +1465,48 @@ mod tests {
                 .output()?;
             anyhow::ensure!(!unsupported_directory_rename.status.success());
             anyhow::ensure!(fs::read(mountpoint.join("nested/leaf"))? == leaf_bytes);
-            let leaf_inode = fs::metadata(nested.join("leaf"))?.ino();
-            let rename = Command::new("python3")
+            let unsupported_replacement = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
                 .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
                 .arg(mountpoint.join("nested/leaf"))
+                .arg(mountpoint.join("top"))
+                .output()?;
+            anyhow::ensure!(!unsupported_replacement.status.success());
+            anyhow::ensure!(fs::read(lower.join("top"))? == top_bytes);
+            anyhow::ensure!(fs::read(nested.join("leaf"))? == leaf_bytes);
+            let leaf_inode = fs::metadata(nested.join("leaf"))?.ino();
+            let move_to_root = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
+                .arg(mountpoint.join("nested/leaf"))
+                .arg(mountpoint.join("relocated"))
+                .output()?;
+            anyhow::ensure!(
+                move_to_root.status.success(),
+                "move from nested directory failed: {}",
+                String::from_utf8_lossy(&move_to_root.stderr)
+            );
+            anyhow::ensure!(!nested.join("leaf").exists());
+            anyhow::ensure!(fs::metadata(lower.join("relocated"))?.ino() == leaf_inode);
+            anyhow::ensure!(fs::read(mountpoint.join("relocated"))? == leaf_bytes);
+            let move_back = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.rename(sys.argv[1],sys.argv[2])")
+                .arg(mountpoint.join("relocated"))
                 .arg(mountpoint.join("nested/moved"))
                 .output()?;
             anyhow::ensure!(
-                rename.status.success(),
-                "nested rename failed: {}",
-                String::from_utf8_lossy(&rename.stderr)
+                move_back.status.success(),
+                "move into nested directory failed: {}",
+                String::from_utf8_lossy(&move_back.stderr)
             );
-            anyhow::ensure!(!nested.join("leaf").exists());
+            anyhow::ensure!(!lower.join("relocated").exists());
             anyhow::ensure!(fs::metadata(nested.join("moved"))?.ino() == leaf_inode);
             let anchor_before = manifest.file_locator("nested/leaf".to_string())?.open()?;
             anyhow::ensure!(anchor_before.metadata()?.ino() == leaf_inode);
