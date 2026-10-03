@@ -4618,10 +4618,23 @@ fn validate_relative(path: &Path) -> Result<(), AnchorError> {
 #[cfg(target_os = "linux")]
 fn open_source_root(path: &Path) -> Result<File, AnchorError> {
     use std::os::unix::fs::OpenOptionsExt;
-    Ok(OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?)
+    let open = |flags| OpenOptions::new().read(true).custom_flags(flags).open(path);
+    let flags = libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    // Guarded remount scans must not turn a user-set directory atime into the
+    // time of an internal inventory read. Other source backends may run
+    // without permission to suppress atime, so retain their normal open path.
+    match open(flags | libc::O_NOATIME) {
+        Ok(file) => Ok(file),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EINVAL | libc::EOPNOTSUPP)
+            ) =>
+        {
+            Ok(open(flags)?)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4702,7 +4715,15 @@ fn reopen_pinned_file(
         flags |= libc::O_DIRECTORY;
         flags &= !libc::O_NONBLOCK;
     }
-    let descriptor = unsafe { libc::open(path.as_ptr(), flags) };
+    let mut descriptor = unsafe { libc::open(path.as_ptr(), flags | libc::O_NOATIME) };
+    if descriptor < 0
+        && matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM | libc::EINVAL | libc::EOPNOTSUPP)
+        )
+    {
+        descriptor = unsafe { libc::open(path.as_ptr(), flags) };
+    }
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error().into());
     }

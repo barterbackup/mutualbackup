@@ -1628,6 +1628,12 @@ remount, and retirement pass on ext4 and fresh local Btrfs, alongside 118
 normal store tests and strict workspace Clippy. Signed mutable-view recovery
 and the complete privileged mount gate remain open before ordinary user-owned
 roots can be enrolled.
+The complete 18-probe guarded FUSE suite now passes on ext4 and fresh
+default-atime Btrfs. A Btrfs failure showed that internal directory inventory
+reads advanced a user-set atime during remount; pinned reads now request
+`O_NOATIME` where permitted. The passthrough probe also places its temporary
+parent on the provisioned filesystem. These local corrections preserve view
+atime but do not provide signed recovery or finish guarded enrollment.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

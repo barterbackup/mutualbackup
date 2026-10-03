@@ -6037,7 +6037,11 @@ mod tests {
         let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| disposable.path().to_path_buf());
-        super::probe_guarded_view_passthrough(root).unwrap();
+        let probe_root = tempfile::Builder::new()
+            .prefix("mb-guarded-passthrough-")
+            .tempdir_in(root)
+            .unwrap();
+        super::probe_guarded_view_passthrough(probe_root.path()).unwrap();
     }
 
     #[test]

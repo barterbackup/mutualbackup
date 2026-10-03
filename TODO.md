@@ -711,6 +711,14 @@
   Btrfs; 118 normal store tests and strict workspace Clippy pass. Guarded
   enrollment still needs protected mutable-view metadata and the complete
   privileged mount gate.
+  A fresh default-atime Btrfs run of all 18 privileged FUSE probes exposed
+  internal remount inventory reads advancing a user-set directory atime.
+  Pinned source reads now request `O_NOATIME` where permitted, leaving the
+  visible timestamp intact; the passthrough probe also keeps its disposable
+  parent on the provisioned filesystem. All 18 guarded-view probes pass on
+  ext4 and fresh default-atime Btrfs after these corrections, alongside 118
+  normal store tests and strict workspace Clippy. Signed view-metadata
+  recovery and guarded enrollment remain open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
