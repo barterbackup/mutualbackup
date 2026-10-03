@@ -1268,6 +1268,9 @@ user two-file probe covers both cases, with 112 normal store tests, all 12
 privileged FUSE probes on ext4 and fresh local Btrfs, formatting, and strict
 workspace Clippy passing. Broader concurrent-handle schedules, mount
 supervision, and protected recovery of the virtual root mode remain gated.
+The ordinary-user two-file probe also verifies that `fchmod` through a
+read-only descriptor detaches the source before changing its mode and leaves
+the private anchor intact on ext4 and fresh local Btrfs.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

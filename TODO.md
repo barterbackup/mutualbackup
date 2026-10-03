@@ -209,6 +209,10 @@
   privileged probes on ext4 and fresh local Btrfs; formatting and strict
   workspace Clippy pass. Broader concurrent-handle interleavings and mount
   supervision remain open.
+  An additional ordinary-user probe confirms `fchmod` on a read-only handle
+  first detaches the source and changes its visible mode while the private
+  anchor remains byte-exact at its protected mode; it passes on ext4 and fresh
+  local Btrfs.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

@@ -5401,6 +5401,26 @@ mod tests {
             anyhow::ensure!(list.stdout == b"alpha,beta\n");
             anyhow::ensure!(fs::read(mountpoint.join("alpha"))? == original_alpha);
             anyhow::ensure!(fs::read(mountpoint.join("beta"))? == original_beta);
+            let read_only_mode = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_RDONLY); os.fchmod(fd,0o600); os.close(fd)")
+                .arg(mountpoint.join("alpha"))
+                .output()?;
+            anyhow::ensure!(
+                read_only_mode.status.success(),
+                "read-only handle chmod failed: {}",
+                String::from_utf8_lossy(&read_only_mode.stderr)
+            );
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("alpha"))?.permissions().mode() & 0o7777 == 0o600
+            );
+            let mut anchor_after_mode = manifest.file_locator("alpha".to_string())?.open()?;
+            anyhow::ensure!(anchor_after_mode.metadata()?.permissions().mode() & 0o7777 == 0o400);
+            let mut anchor_bytes = Vec::new();
+            anchor_after_mode.read_to_end(&mut anchor_bytes)?;
+            anyhow::ensure!(anchor_bytes == original_alpha);
             let create = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
