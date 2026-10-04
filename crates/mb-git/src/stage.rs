@@ -1181,7 +1181,7 @@ pub(crate) fn indexed_anchor_manifest(
         .get_record(&object_kind(repository_id, oid), entry.anchor_id.as_bytes())?
         .ok_or(StageError::IncompatibleRecord)?;
     let manifest: FileAnchorManifest = decode_canonical(&encoded)?;
-    if manifest.format_version != 1 || manifest.anchor_id != entry.anchor_id {
+    if !matches!(manifest.format_version, 1 | 2) || manifest.anchor_id != entry.anchor_id {
         return Err(StageError::IncompatibleRecord);
     }
     Ok(manifest)
@@ -1287,7 +1287,7 @@ pub fn anchors_for_oid(
     let mut anchors = Vec::new();
     for (key, encoded) in control.records(&object_kind(repository_id, oid))? {
         let manifest: FileAnchorManifest = decode_canonical(&encoded)?;
-        if key != manifest.anchor_id.as_bytes() || manifest.format_version != 1 {
+        if key != manifest.anchor_id.as_bytes() || !matches!(manifest.format_version, 1 | 2) {
             return Err(StageError::IncompatibleRecord);
         }
         match blob_oid_from_anchor(&manifest) {

@@ -750,6 +750,12 @@ Proactive background repair comes later.
   prove that the staged anchor initially shares physical extents with the
   source file and that a later source edit changes neither the anchor's bytes
   nor its Git blob ID. Equal logical sizes alone do not establish sharing.
+  For an unchanged guarded file already frozen by a root anchor, map the Git
+  stage to that verified root file with a distinct local object-map ID. Do not
+  add a third hard link: the guarded edit journal must retain its exact
+  two-link invariant until it detaches the working inode. Keep the root pinned
+  for as long as any such Git mapping needs its bytes, and rebind the mapping
+  only through a verified backend transition after source-loss recovery.
   A failed conversion-requesting command must leave the captured anchor,
   index, and working file unchanged; an inert repository attribute or config
   setting alone is not a reason to reject raw staging.

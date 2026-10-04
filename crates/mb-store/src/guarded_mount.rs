@@ -251,7 +251,7 @@ fn git_anchor_pin(
         matches!(pin.format_version, 1 | 2)
             && !pin.repository_id.is_nil()
             && !pin.root_anchor_id.is_nil()
-            && pin.manifest.format_version == 1
+            && matches!(pin.manifest.format_version, 1 | 2)
             && pin.manifest.anchor_id == anchor_id
             && match (&pin.stage, pin.format_version) {
                 (None, 1) => true,
@@ -309,7 +309,7 @@ impl StoppedFileCaptureIntent {
                 && self.entry.atime_nanos < 1_000_000_000
                 && self.entry.modified_nanos < 1_000_000_000
                 && self.published.as_ref().is_none_or(|manifest| {
-                    manifest.format_version == 1
+                    matches!(manifest.format_version, 1 | 2)
                         && !manifest.anchor_id.is_nil()
                         && manifest.source_file_identity() == self.entry.native_id
                         && manifest.logical_len == self.entry.logical_len
@@ -329,16 +329,42 @@ fn verify_published_file_capture_binding(
         .get_record(MOUNT_CLAIM_KIND, intent.root_anchor_id.as_bytes())?
         .context("guarded file attempt lost its mount claim")?;
     let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
-    let plan = GuardedFileCapturePlan::load_for_manifest(control, manifest)?
-        .context("guarded file attempt lost its source plan")?;
     ensure!(
-        claim.version == 1
-            && claim.anchor_id == intent.root_anchor_id
-            && plan.source_root() == claim.lower_root
-            && plan.source_root_identity() == claim.lower_id
-            && plan.source_file_identity() == intent.entry.native_id,
-        "guarded file attempt differs from its claimed source"
+        claim.version == 1 && claim.anchor_id == intent.root_anchor_id,
+        "guarded file attempt lost its mount claim"
     );
+    if let Some(backing) = &manifest.guarded_root_file {
+        let original =
+            GuardedRootCapturePlan::load_published_manifest(control, intent.root_anchor_id)?;
+        let root_plan = GuardedRootCapturePlan::load_active_for_view(control, &original)?;
+        let entry = original.entries.iter().find(|entry| {
+            matches!(entry, CapturedEntry::FileV2 { path, native_id, .. }
+                if path == &backing.captured_relative_path && *native_id == backing.native_id)
+        });
+        let proof =
+            root_plan.captured_file_content_proof(control, &backing.captured_relative_path)?;
+        ensure!(
+            manifest.format_version == 2
+                && entry.is_some()
+                && backing.root_anchor_id == intent.root_anchor_id
+                && backing.native_id == intent.entry.native_id
+                && manifest.area == original.area
+                && manifest.source_root_hint == claim.lower_root
+                && manifest.source_relative_path.as_os_str().as_bytes() == intent.entry.path
+                && manifest.logical_len == proof.logical_len
+                && manifest.content_hash == proof.content_hash,
+            "guarded root-file Git stage differs from its sealed root proof"
+        );
+    } else {
+        let plan = GuardedFileCapturePlan::load_for_manifest(control, manifest)?
+            .context("guarded file attempt lost its source plan")?;
+        ensure!(
+            plan.source_root() == claim.lower_root
+                && plan.source_root_identity() == claim.lower_id
+                && plan.source_file_identity() == intent.entry.native_id,
+            "guarded file attempt differs from its claimed source"
+        );
+    }
     manifest.open_verified()?;
     Ok(())
 }
@@ -1653,7 +1679,50 @@ impl GuardedViewMount {
                 "guarded file changed after its stage attempt was prepared"
             );
             let path = PathBuf::from(OsString::from_vec(intent.entry.path.clone()));
-            let manifest = view.capture_stopped_file(&claim.lower_root, &path)?;
+            let original_file = {
+                let store = control_for_finish
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                let original = GuardedRootCapturePlan::load_published_manifest(&store, anchor_id)?;
+                let root_plan = GuardedRootCapturePlan::load_active_for_view(&store, &original)?;
+                let captured = original.entries.iter().find_map(|entry| match entry {
+                    CapturedEntry::FileV2 {
+                        path,
+                        native_id,
+                        logical_len,
+                        ..
+                    } if *native_id == intent.entry.native_id => Some((path, *logical_len)),
+                    _ => None,
+                });
+                if let Some((captured_path, captured_len)) = captured {
+                    if root_plan.file_has_editable_inode(&store, captured_path)? {
+                        None
+                    } else {
+                        let proof = root_plan.captured_file_content_proof(&store, captured_path)?;
+                        ensure!(
+                            captured_len == intent.entry.logical_len
+                                && proof.logical_len == intent.entry.logical_len,
+                            "original guarded file length changed before Git stage"
+                        );
+                        Some(FileAnchorManifest::from_guarded_root_file(
+                            attempt_id,
+                            &original,
+                            &claim.lower_root,
+                            &path,
+                            captured_path,
+                            intent.entry.native_id,
+                            &proof,
+                        )?)
+                    }
+                } else {
+                    None
+                }
+            };
+            let manifest = if let Some(manifest) = original_file {
+                manifest
+            } else {
+                view.capture_stopped_file(&claim.lower_root, &path)?
+            };
             let mut published = intent;
             published.published = Some(manifest.clone());
             published.validate(attempt_id.as_bytes())?;

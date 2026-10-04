@@ -57,7 +57,14 @@
   stopped-view capture, pin transfer, crash/reopen replay, raw blob ID, and
   idempotent reconciliation. Production guarded Git enrollment and stage are
   still gated on the live edit guard; guarded checkout, signed graph protection,
-  and cross-catalog prune remain open.
+  and cross-catalog prune remain open. An untouched original file now stages
+  through a version-2 virtual file manifest over its verified root anchor,
+  without adding a hard link or copying payload bytes. The ext4 and disposable
+  Btrfs node probe stages untouched and already edited files, replays both
+  catalog entries after reopen, then edits the untouched file without changing
+  its staged bytes. Guarded prune must eventually retire virtual mappings and
+  their root pins together, and seed-only recovery must rebind their root
+  locators to the recovered anchor before guarded Git protection is enabled.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

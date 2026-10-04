@@ -27076,6 +27076,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn guarded_git_pin_replays_into_catalog_after_node_reopen() {
+        use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
 
@@ -27096,7 +27097,9 @@ pub(crate) mod tests {
         fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
         let original = b"guarded Git\r\n\0exact";
         fs::write(lower.join("sample"), original).unwrap();
+        fs::write(lower.join("edited"), original).unwrap();
         fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(lower.join("edited"), fs::Permissions::from_mode(0o644)).unwrap();
 
         let seed = Seed::from_bytes([119; 32]);
         let mut node = Node::open(&data_dir, seed.clone()).unwrap();
@@ -27134,11 +27137,11 @@ pub(crate) mod tests {
             .gid(65534)
             .arg("-c")
             .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'g',0); os.fsync(fd); os.close(fd)")
-            .arg(view.join("sample"))
+            .arg(view.join("edited"))
             .output()
             .unwrap();
         assert!(detach.status.success(), "{detach:?}");
-        assert_eq!(fs::read(view.join("sample")).unwrap(), original);
+        assert_eq!(fs::read(view.join("edited")).unwrap(), original);
         node.guarded_mounts.pop().unwrap().stop().unwrap();
         let control = Arc::new(Mutex::new(
             ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
@@ -27158,8 +27161,33 @@ pub(crate) mod tests {
             Arc::clone(&control),
         )
         .unwrap();
+        assert_eq!(manifest.format_version, 2);
+        assert_eq!(manifest.file_locator().anchor_id, binding.anchor_id);
+        assert_eq!(fs::metadata(lower.join("sample")).unwrap().nlink(), 2);
         GuardedViewMount::transfer_stopped_file_capture_to_git(
             attempt_id,
+            repository_id,
+            repository_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        let edited_attempt = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            edited_attempt,
+            Arc::clone(&control),
+            "edited",
+        )
+        .unwrap();
+        let edited_manifest = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            edited_attempt,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        assert_eq!(edited_manifest.format_version, 1);
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            edited_attempt,
             repository_id,
             repository_id,
             &control.lock().unwrap(),
@@ -27180,11 +27208,34 @@ pub(crate) mod tests {
         .unwrap();
         let staged = repository.staged_entry("sample").unwrap().unwrap();
         assert_eq!(staged.anchor_id, manifest.anchor_id);
+        let edited_stage = repository.staged_entry("edited").unwrap().unwrap();
+        assert_eq!(edited_stage.anchor_id, edited_manifest.anchor_id);
         assert!(fs::symlink_metadata(view.join(".mutualbackup")).is_err());
         assert_eq!(
             staged.oid.as_slice(),
             mb_git::blob_oid_from_anchor(&manifest).unwrap().as_bytes()
         );
+        let detach_after_stage = std::process::Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'G',0); os.fsync(fd); os.close(fd)")
+            .arg(view.join("sample"))
+            .output()
+            .unwrap();
+        assert!(
+            detach_after_stage.status.success(),
+            "{detach_after_stage:?}"
+        );
+        assert_eq!(fs::metadata(lower.join("sample")).unwrap().nlink(), 1);
+        assert_eq!(fs::read(view.join("sample")).unwrap()[0], b'G');
+        let mut anchored = Vec::new();
+        manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut anchored)
+            .unwrap();
+        assert_eq!(anchored, original);
         drop(repository);
         reopened.guarded_mounts.pop().unwrap().stop().unwrap();
     }

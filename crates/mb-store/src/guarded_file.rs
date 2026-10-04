@@ -580,6 +580,7 @@ impl GuardedFileCapturePlan {
             logical_len: content.logical_len,
             content_hash: content.content_hash,
             source_version: self.source_version.clone(),
+            guarded_root_file: None,
         }
     }
 
@@ -1074,6 +1075,7 @@ mod tests {
             logical_len: 9,
             content_hash: [42; 32],
             source_version: plan.source_version.clone(),
+            guarded_root_file: None,
         }
     }
 

@@ -2474,7 +2474,7 @@ fn reanchor_recovered_guarded_revision(
         let anchor = planned.plan.capture_with_control(control)?;
         files.push(GuardedRecoveredFileV1 {
             path: planned.path.clone(),
-            anchor: RawFileAnchorManifestV2::from_file_anchor(anchor),
+            anchor: RawFileAnchorManifestV2::from_file_anchor(anchor)?,
         });
     }
     #[cfg(test)]

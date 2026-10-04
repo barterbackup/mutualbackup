@@ -1828,6 +1828,7 @@ impl ImportedBlobCapturePlan {
                 logical_len: self.logical_len,
                 content_hash: *hasher.finalize().as_bytes(),
                 source_version: self.synthetic_source_version(),
+                guarded_root_file: None,
             };
             let manifest_name = capture_manifest_name(self.anchor_id());
             let mut file = create_regular_file_at(
@@ -1955,6 +1956,15 @@ impl ReflinkFileCapturePlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuardedRootFileBacking {
+    pub root_anchor_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+    pub captured_relative_path: PathBuf,
+    pub native_id: NativeFileId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(into = "FileAnchorManifestWire")]
 pub struct FileAnchorManifest {
     pub format_version: u16,
     pub anchor_id: Uuid,
@@ -1968,6 +1978,176 @@ pub struct FileAnchorManifest {
     pub logical_len: u64,
     pub content_hash: [u8; 32],
     source_version: CaptureVersion,
+    /// Format 2 locates the already frozen file inside a guarded root anchor.
+    /// Its own anchor ID is a virtual Git mapping, so no third hard link is
+    /// added to the inode guarded by the root edit journal.
+    pub guarded_root_file: Option<GuardedRootFileBacking>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct FileAnchorManifestV1 {
+    format_version: u16,
+    anchor_id: Uuid,
+    area: StableAnchorAreaLocator,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+    source_root_hint: PathBuf,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+    source_relative_path: PathBuf,
+    logical_len: u64,
+    content_hash: [u8; 32],
+    source_version: CaptureVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct FileAnchorManifestV2 {
+    format_version: u16,
+    anchor_id: Uuid,
+    area: StableAnchorAreaLocator,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+    source_root_hint: PathBuf,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+    source_relative_path: PathBuf,
+    logical_len: u64,
+    content_hash: [u8; 32],
+    source_version: CaptureVersion,
+    guarded_root_file: GuardedRootFileBacking,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+enum FileAnchorManifestWire {
+    V2(FileAnchorManifestV2),
+    V1(FileAnchorManifestV1),
+}
+
+impl<'de> Deserialize<'de> for FileAnchorManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ManifestVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ManifestVisitor {
+            type Value = FileAnchorManifest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a versioned file anchor manifest")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                fn next<'de, A, T>(
+                    seq: &mut A,
+                    index: usize,
+                    visitor: &ManifestVisitor,
+                ) -> Result<T, A::Error>
+                where
+                    A: serde::de::SeqAccess<'de>,
+                    T: Deserialize<'de>,
+                {
+                    seq.next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, visitor))
+                }
+
+                #[cfg(target_os = "linux")]
+                #[derive(Deserialize)]
+                struct WirePath(#[serde(with = "raw_path_bytes")] PathBuf);
+                #[cfg(not(target_os = "linux"))]
+                #[derive(Deserialize)]
+                struct WirePath(PathBuf);
+
+                let format_version = next(&mut seq, 0, &self)?;
+                let anchor_id = next(&mut seq, 1, &self)?;
+                let area = next(&mut seq, 2, &self)?;
+                let source_root_hint: WirePath = next(&mut seq, 3, &self)?;
+                let source_relative_path: WirePath = next(&mut seq, 4, &self)?;
+                let logical_len = next(&mut seq, 5, &self)?;
+                let content_hash = next(&mut seq, 6, &self)?;
+                let source_version = next(&mut seq, 7, &self)?;
+                let guarded_root_file = match format_version {
+                    1 => None,
+                    2 => Some(next(&mut seq, 8, &self)?),
+                    _ => return Err(serde::de::Error::custom("unknown file anchor format")),
+                };
+                Ok(FileAnchorManifest {
+                    format_version,
+                    anchor_id,
+                    area,
+                    source_root_hint: source_root_hint.0,
+                    source_relative_path: source_relative_path.0,
+                    logical_len,
+                    content_hash,
+                    source_version,
+                    guarded_root_file,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(9, ManifestVisitor)
+    }
+}
+
+impl From<FileAnchorManifestWire> for FileAnchorManifest {
+    fn from(wire: FileAnchorManifestWire) -> Self {
+        let (old, guarded_root_file) = match wire {
+            FileAnchorManifestWire::V1(old) => (old, None),
+            FileAnchorManifestWire::V2(new) => (
+                FileAnchorManifestV1 {
+                    format_version: new.format_version,
+                    anchor_id: new.anchor_id,
+                    area: new.area,
+                    source_root_hint: new.source_root_hint,
+                    source_relative_path: new.source_relative_path,
+                    logical_len: new.logical_len,
+                    content_hash: new.content_hash,
+                    source_version: new.source_version,
+                },
+                Some(new.guarded_root_file),
+            ),
+        };
+        Self {
+            format_version: old.format_version,
+            anchor_id: old.anchor_id,
+            area: old.area,
+            source_root_hint: old.source_root_hint,
+            source_relative_path: old.source_relative_path,
+            logical_len: old.logical_len,
+            content_hash: old.content_hash,
+            source_version: old.source_version,
+            guarded_root_file,
+        }
+    }
+}
+
+impl From<FileAnchorManifest> for FileAnchorManifestWire {
+    fn from(manifest: FileAnchorManifest) -> Self {
+        let old = FileAnchorManifestV1 {
+            format_version: manifest.format_version,
+            anchor_id: manifest.anchor_id,
+            area: manifest.area,
+            source_root_hint: manifest.source_root_hint,
+            source_relative_path: manifest.source_relative_path,
+            logical_len: manifest.logical_len,
+            content_hash: manifest.content_hash,
+            source_version: manifest.source_version,
+        };
+        match manifest.guarded_root_file {
+            None => Self::V1(old),
+            Some(guarded_root_file) => Self::V2(FileAnchorManifestV2 {
+                format_version: old.format_version,
+                anchor_id: old.anchor_id,
+                area: old.area,
+                source_root_hint: old.source_root_hint,
+                source_relative_path: old.source_relative_path,
+                logical_len: old.logical_len,
+                content_hash: old.content_hash,
+                source_version: old.source_version,
+                guarded_root_file,
+            }),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1987,8 +2167,11 @@ pub struct RawFileAnchorManifestV2 {
 
 #[cfg(target_os = "linux")]
 impl RawFileAnchorManifestV2 {
-    pub fn from_file_anchor(anchor: FileAnchorManifest) -> Self {
-        Self {
+    pub fn from_file_anchor(anchor: FileAnchorManifest) -> Result<Self, AnchorError> {
+        if anchor.format_version != 1 || anchor.guarded_root_file.is_some() {
+            return Err(AnchorError::InvalidRoot);
+        }
+        Ok(Self {
             format_version: 2,
             anchor_id: anchor.anchor_id,
             area: anchor.area,
@@ -1997,7 +2180,7 @@ impl RawFileAnchorManifestV2 {
             logical_len: anchor.logical_len,
             content_hash: anchor.content_hash,
             source_version: anchor.source_version,
-        }
+        })
     }
 
     fn as_file_anchor(&self) -> Result<FileAnchorManifest, AnchorError> {
@@ -2013,6 +2196,7 @@ impl RawFileAnchorManifestV2 {
             logical_len: self.logical_len,
             content_hash: self.content_hash,
             source_version: self.source_version.clone(),
+            guarded_root_file: None,
         })
     }
 
@@ -2034,6 +2218,58 @@ impl RawFileAnchorManifestV2 {
 }
 
 impl FileAnchorManifest {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_guarded_root_file(
+        virtual_anchor_id: Uuid,
+        original: &StableAnchorManifest,
+        source_root: &Path,
+        stage_path: &Path,
+        captured_path: &Path,
+        native_id: NativeFileId,
+        proof: &crate::IndependentSparseCopy,
+    ) -> Result<Self, AnchorError> {
+        use std::os::unix::fs::MetadataExt;
+
+        if virtual_anchor_id.is_nil()
+            || virtual_anchor_id == original.anchor_id
+            || !source_root.is_absolute()
+            || native_id.filesystem_id != original.area.filesystem_id
+            || native_id.inode == 0
+        {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_relative(stage_path)?;
+        validate_relative(captured_path)?;
+        let locator = original.file_locator_path(captured_path)?;
+        let file = locator.open()?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || native_file_id(original.area.filesystem_id, &metadata) != native_id
+            || metadata.len() != proof.logical_len
+            || metadata.nlink() != 2
+            || file_data_extents(&file, proof.logical_len)? != proof.data_extents
+        {
+            return Err(AnchorError::SourceChanged(stage_path.to_path_buf()));
+        }
+        let manifest = Self {
+            format_version: 2,
+            anchor_id: virtual_anchor_id,
+            area: original.area.clone(),
+            source_root_hint: source_root.to_path_buf(),
+            source_relative_path: stage_path.to_path_buf(),
+            logical_len: proof.logical_len,
+            content_hash: proof.content_hash,
+            source_version: capture_version(original.area.filesystem_id, &metadata),
+            guarded_root_file: Some(GuardedRootFileBacking {
+                root_anchor_id: original.anchor_id,
+                captured_relative_path: captured_path.to_path_buf(),
+                native_id,
+            }),
+        };
+        manifest.open_verified()?;
+        Ok(manifest)
+    }
+
     pub(crate) fn source_file_identity(&self) -> NativeFileId {
         NativeFileId {
             filesystem_id: self.source_version.filesystem_id,
@@ -2042,6 +2278,13 @@ impl FileAnchorManifest {
     }
 
     pub fn file_locator(&self) -> StableAnchorFileLocator {
+        if let Some(backing) = &self.guarded_root_file {
+            return StableAnchorFileLocator {
+                area: self.area.clone(),
+                anchor_id: backing.root_anchor_id,
+                relative_path: backing.captured_relative_path.clone(),
+            };
+        }
         StableAnchorFileLocator {
             area: self.area.clone(),
             anchor_id: self.anchor_id,
@@ -2051,12 +2294,26 @@ impl FileAnchorManifest {
 
     /// Verify the immutable anchor before giving its bytes to another format.
     pub fn open_verified(&self) -> Result<File, AnchorError> {
-        if self.format_version != 1 {
+        if !matches!(self.format_version, 1 | 2)
+            || (self.format_version == 1) != self.guarded_root_file.is_none()
+        {
             return Err(AnchorError::InvalidRoot);
         }
         validate_relative(&self.source_relative_path)?;
+        if let Some(backing) = &self.guarded_root_file {
+            validate_relative(&backing.captured_relative_path)?;
+            if backing.root_anchor_id.is_nil()
+                || backing.root_anchor_id == self.anchor_id
+                || backing.native_id.filesystem_id != self.area.filesystem_id
+                || backing.native_id.inode == 0
+                || self.source_file_identity() != backing.native_id
+            {
+                return Err(AnchorError::InvalidRoot);
+            }
+        }
         let mut file = self.file_locator().open()?;
-        if file.metadata()?.len() != self.logical_len {
+        let metadata = file.metadata()?;
+        if metadata.len() != self.logical_len {
             return Err(AnchorError::SourceChanged(
                 self.source_relative_path.clone(),
             ));
@@ -2080,6 +2337,9 @@ impl FileAnchorManifest {
     }
 
     pub fn remove(&self) -> Result<(), AnchorError> {
+        if self.guarded_root_file.is_some() {
+            return Err(AnchorError::InvalidRoot);
+        }
         let area = resolve_anchor_area(&self.area)?;
         let area_file = open_stable_anchor_area(&area, &self.area)?;
         remove_directory_at(
@@ -2653,6 +2913,7 @@ impl ReflinkAnchor {
                 logical_len: before.len(),
                 content_hash: *hasher.finalize().as_bytes(),
                 source_version: plan.file_version.clone(),
+                guarded_root_file: None,
             };
             let manifest_name = capture_manifest_name(plan.root.anchor_id);
             let mut manifest_file = create_regular_file_at(
@@ -2664,7 +2925,8 @@ impl ReflinkAnchor {
                 FileManifestEncoding::Utf8V1 => canonical_bytes(&manifest),
                 #[cfg(target_os = "linux")]
                 FileManifestEncoding::RawV2 => {
-                    canonical_bytes(&RawFileAnchorManifestV2::from_file_anchor(manifest.clone()))
+                    let raw = RawFileAnchorManifestV2::from_file_anchor(manifest.clone())?;
+                    canonical_bytes(&raw)
                 }
             }
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -5294,6 +5556,134 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn file_manifest_v2_keeps_old_wire_bytes_and_round_trips_root_locator() {
+        #[cfg(target_os = "linux")]
+        use std::ffi::OsString;
+        #[cfg(target_os = "linux")]
+        use std::os::unix::ffi::OsStringExt;
+
+        #[cfg(target_os = "linux")]
+        let raw_path = PathBuf::from(OsString::from_vec(vec![b'f', 0x80]));
+        #[cfg(not(target_os = "linux"))]
+        let raw_path = PathBuf::from("file");
+        let old = FileAnchorManifestV1 {
+            format_version: 1,
+            anchor_id: Uuid::from_u128(1),
+            area: StableAnchorAreaLocator {
+                area_id: Uuid::from_u128(2),
+                path_hint: PathBuf::from("/anchor"),
+                filesystem_id: 3,
+                volume_root_hint: PathBuf::from("/"),
+            },
+            source_root_hint: PathBuf::from("/source"),
+            source_relative_path: raw_path,
+            logical_len: 4,
+            content_hash: [5; 32],
+            source_version: CaptureVersion {
+                filesystem_id: 3,
+                inode: 6,
+                logical_len: 4,
+                modified_secs: 7,
+                modified_nanos: 8,
+                changed_secs: 9,
+                changed_nanos: 10,
+            },
+        };
+        let historical = mb_core::canonical_bytes(&old).unwrap();
+        let manifest: FileAnchorManifest = FileAnchorManifestWire::V1(old).into();
+        assert_eq!(mb_core::canonical_bytes(&manifest).unwrap(), historical);
+        assert_eq!(
+            mb_core::decode_canonical::<FileAnchorManifest>(&historical).unwrap(),
+            manifest
+        );
+
+        let mut root_backed = manifest;
+        root_backed.format_version = 2;
+        root_backed.guarded_root_file = Some(GuardedRootFileBacking {
+            root_anchor_id: Uuid::from_u128(11),
+            captured_relative_path: PathBuf::from("old/file"),
+            native_id: NativeFileId {
+                filesystem_id: 3,
+                inode: 6,
+            },
+        });
+        let encoded = mb_core::canonical_bytes(&root_backed).unwrap();
+        assert_eq!(
+            mb_core::decode_canonical::<FileAnchorManifest>(&encoded).unwrap(),
+            root_backed
+        );
+        assert_eq!(root_backed.file_locator().anchor_id, Uuid::from_u128(11));
+        assert_eq!(
+            root_backed.file_locator().relative_path,
+            PathBuf::from("old/file")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_root_file_manifest_adds_no_link_and_survives_root_detach() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("lower");
+        fs::create_dir(&lower).unwrap();
+        let source = lower.join("file");
+        let bytes = b"CRLF\r\nraw\0bytes";
+        fs::write(&source, bytes).unwrap();
+        let area = StableAnchorAreaLocator::prepare_for_root(&lower).unwrap();
+        let root_id = Uuid::from_u128(100);
+        let root_dir = area.path_hint.join(root_id.to_string());
+        fs::create_dir(&root_dir).unwrap();
+        let captured = root_dir.join("file");
+        fs::hard_link(&source, &captured).unwrap();
+        let original = StableAnchorManifest {
+            format_version: 3,
+            anchor_id: root_id,
+            source_root_hint: lower.clone(),
+            area: area.clone(),
+            root_mode: 0o700,
+            root_modified_secs: 0,
+            root_modified_nanos: 0,
+            entries: Vec::new(),
+        };
+        let metadata = fs::metadata(&source).unwrap();
+        let native_id = NativeFileId {
+            filesystem_id: area.filesystem_id,
+            inode: metadata.ino(),
+        };
+        let proof = crate::IndependentSparseCopy {
+            logical_len: bytes.len() as u64,
+            content_hash: *blake3::hash(bytes).as_bytes(),
+            data_extents: file_data_extents(&File::open(&captured).unwrap(), bytes.len() as u64)
+                .unwrap(),
+        };
+        let manifest = FileAnchorManifest::from_guarded_root_file(
+            Uuid::from_u128(101),
+            &original,
+            &lower,
+            Path::new("file"),
+            Path::new("file"),
+            native_id,
+            &proof,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().nlink(), 2);
+        assert_eq!(manifest.file_locator().anchor_id, root_id);
+
+        let private = root_dir.join("private");
+        fs::write(&private, bytes).unwrap();
+        fs::rename(&private, &captured).unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
+        let mut anchored = Vec::new();
+        manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut anchored)
+            .unwrap();
+        assert_eq!(anchored, bytes);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn raw_path_codec_preserves_historical_utf8_record_bytes() {
@@ -5477,6 +5867,7 @@ mod tests {
                     changed_secs: 0,
                     changed_nanos: 0,
                 },
+                guarded_root_file: None,
             };
             assert!(matches!(
                 manifest.remove(),
