@@ -50,8 +50,8 @@ use crate::merge::{
 };
 use crate::prune::{
     GitGuardedPrunePreview, GitPruneError, GitPruneReport, GitPruneRoots,
-    complete_guarded_prune_catalog, has_pending_prune, preview_guarded_prune, prune_unreachable,
-    resume_pending_prune, retire_guarded_prune_catalog,
+    complete_guarded_prune_catalog, has_pending_guarded_prune, has_pending_prune,
+    preview_guarded_prune, prune_unreachable, resume_pending_prune, retire_guarded_prune_catalog,
 };
 use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
 use crate::stage::{
@@ -1482,6 +1482,16 @@ impl GitRepository {
             return Err(RepositoryError::Conflict);
         }
         Ok(complete_guarded_prune_catalog(&self.catalog, batch)?)
+    }
+
+    pub fn has_pending_guarded_prune_catalog(&self) -> Result<bool, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(has_pending_guarded_prune(
+            &self.catalog,
+            self.repository_id,
+        )?)
     }
 
     pub fn push_current_branch_to_bare(

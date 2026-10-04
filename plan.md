@@ -3814,8 +3814,13 @@ an unconditional repository invariant, not a configurable compatibility mode.
   release its node-owned file/root pin only after the catalog retirement is
   durable, and finish physical cleanup idempotently. A version-2 virtual
   mapping releases its root pin but never unlinks the root file as if it owned
-  a separate payload. A catalog receipt with no node pin must still fail
-  closed unless it belongs to an authenticated retirement fence.
+  a separate payload. A live guarded mount claim still owns a per-file anchor:
+  remove its Git mapping and pin, retain a durable deferred-cleanup obligation,
+  and delete the physical anchor only after the claim is retired. Provide an
+  explicit safe repository-retirement operation that removes an empty private
+  Git catalog before guarded-root release; test that handoff and physical
+  deletion across interruption and reopen. A catalog receipt with no node pin
+  must still fail closed unless it belongs to an authenticated retirement fence.
   Prune is a real data-deletion operation: once no such protection remains,
   it must release unreachable native anchors, retire their backed-up sectors
   through the existing remote cleanup path, and make the removed history

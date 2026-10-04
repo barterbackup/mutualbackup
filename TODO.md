@@ -20,10 +20,10 @@
   The platform and complete backend gates remain open.
 - [ ] **M6 integrate guarded Git anchors and worktrees.** The guarded FUSE view
   can recapture a stopped file and detach it on edit, but `SourceBackendKind`
-  still rejects guarded Git stage/checkout and the node rejects operations on
-  a guarded protected root. Bind each Git index/object pin to its guarded
-  per-inode capture with a replayable handoff, and prove prune/root release
-  cannot retire that anchor while Git retains it. Publish checkout files only
+  still rejects ordinary guarded Git add/checkout on a protected root. Bind
+  each Git index/object pin to its guarded per-inode capture with a replayable
+  handoff, and prove prune/root release cannot retire that anchor while Git
+  retains it. Publish checkout files only
   through a guarded editable view, with byte-exact, no-copy and crash/reopen
   probes on ext4 and Btrfs. Keep the current guard until those proofs pass.
   The store now has a versioned per-file stopped-view attempt: preparation
@@ -41,15 +41,16 @@
   covers two pinned files, wrong-repository retirement, and last-pin release.
   The pin now records the exact attempt, worktree, raw path, and Git mode so a
   reopened node can enumerate and verify the pending stage without guessing;
-  legacy pins missing that context fail closed. The node must still bind the
-  repository to its protected root, reconcile pins after crashes, and publish
+  legacy pins missing that context fail closed. The node binds the
+  repository to its protected root, reconciles pins after crashes, and publishes
   the corresponding Git catalog entry. The Git catalog now has a guarded-pin
   publication primitive: it atomically records the exact object mapping,
   worktree index entry, and attempt receipt, and replay leaves a newer index
   untouched. Its normal catalog tests cover reopen, retry, and wrong backend
-  or root. Guarded repository prune is fenced, including a pending prune intent
-  on reopen, because that catalog cannot yet see node-owned pins. The node
-  now verifies guarded root, backend, and repository registration at startup,
+  or root. The generic repository prune remains fenced for guarded roots; its
+  old intent cannot safely see node-owned pins. The dedicated guarded path now
+  uses a node-owned retirement fence. The node verifies guarded root, backend,
+  and repository registration at startup,
   checks exact catalog receipts, rejects two unpublished stages for one path,
   and publishes missing receipts. The catalog is pinned in the private lower
   root and hidden from the FUSE worktree, whose mount lacks a stable native
@@ -57,32 +58,41 @@
   stopped-view capture, pin transfer, crash/reopen replay, raw blob ID, and
   idempotent reconciliation. Production guarded Git enrollment and stage are
   still gated on the live edit guard; guarded checkout, signed graph protection,
-  and cross-catalog prune remain open. An untouched original file now stages
+  and seed-only recovery remain open. An untouched original file now stages
   through a version-2 virtual file manifest over its verified root anchor,
   without adding a hard link or copying payload bytes. The ext4 and disposable
   Btrfs node probe stages untouched and already edited files, replays both
   catalog entries after reopen, then edits the untouched file without changing
-  its staged bytes. Guarded prune must eventually retire virtual mappings and
-  their root pins together, and seed-only recovery must rebind their root
-  locators to the recovered anchor before guarded Git protection is enabled.
+  its staged bytes. Guarded prune now retires virtual mappings and their root
+  pins together; seed-only recovery must rebind their root locators to the
+  recovered anchor before guarded Git protection is enabled.
   Startup now also enumerates every guarded catalog receipt, checks it against
   node-owned pins, and rejects a root-backed virtual object map with no
   receipt; the node probe removes a pin after publication and confirms that
-  reconciliation fails closed. Guarded prune still needs a cross-catalog
-  retirement intent so legitimate pin removal cannot be mistaken for loss.
+  reconciliation fails closed.
   The guarded catalog now exposes a read-only, versioned prune preview using
   the ordinary reachability calculation. It validates receipts and names
   candidate object IDs, exact manifests, and attempt IDs, including untouched
   files backed by version-2 virtual mappings. The preview leaves catalog
-  mappings and node pins intact; deletion stays fenced until the node records
-  and replays a cross-catalog retirement intent. The catalog-side batch
-  transition is now implemented separately: with a node-fenced batch and
-  current signed roots, it atomically deletes exact object mappings and
+  mappings and node pins intact. Given a node-fenced batch and current signed
+  roots, the catalog transition atomically deletes exact object mappings and
   receipts under a replayable catalog intent, rejects a stale candidate or
   changed protection root, and completes idempotently after reopen. The node
-  still must durably fence the batch first, retire pins with crash progress,
-  clean up physical anchors, and replay this sequence before normal receipt
-  reconciliation; guarded production prune remains disabled.
+  now durably fences each batch before catalog retirement, records pin removal
+  with an atomic progress marker, and replays the handoff before normal receipt
+  reconciliation. A live guarded view still owns a per-file anchor through its
+  mount claim: Git prune removes its mapping and pin but defers physical cleanup
+  under a durable record until guarded-root release retires that claim. The
+  privileged ext4 and disposable Btrfs probe covers root-backed virtual prune,
+  per-file deferred cleanup, daemon reopen after catalog deletion, and an
+  unrelated lost-pin failure. A second privileged ext4/Btrfs probe retires
+  the mount claim and confirms that deferred cleanup then deletes the physical
+  file anchor while preserving edited worktree bytes. A full root-release
+  interruption probe is still required. An explicit safe way to retire an empty
+  Git repository and its private catalog is also needed before guarded-root
+  release, which currently rejects every registered Git repository. Guarded Git
+  enrollment, checkout, signed graph protection, and seed-only virtual-locator
+  rebind remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

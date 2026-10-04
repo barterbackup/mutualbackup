@@ -389,6 +389,7 @@ impl Node {
         let visible = intent
             .visible(&self.control)?
             .context("retired separate guarded view lost its snapshot")?;
+        self.reconcile_guarded_git_file_gc(intent.anchor_id)?;
         if let Some(plan) =
             GuardedRootCapturePlan::load_for_retirement(&self.control, intent.anchor_id)?
         {

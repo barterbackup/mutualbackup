@@ -1906,6 +1906,40 @@ impl GuardedViewMount {
         anchor_id: Uuid,
         control: &ControlStore,
     ) -> anyhow::Result<()> {
+        Self::retire_git_anchor_pin_with_progress(repository_id, anchor_id, control, None)
+    }
+
+    /// Atomically retire a Git pin and publish the node's prune progress
+    /// marker. A restart can then distinguish this removal from a lost pin.
+    pub fn retire_git_anchor_pin_with_prune_progress(
+        repository_id: Uuid,
+        anchor_id: Uuid,
+        control: &ControlStore,
+        marker_kind: &str,
+        marker_value: &[u8],
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !marker_kind.is_empty()
+                && !marker_value.is_empty()
+                && control
+                    .get_record(marker_kind, anchor_id.as_bytes())?
+                    .is_none(),
+            "guarded Git prune progress already exists"
+        );
+        Self::retire_git_anchor_pin_with_progress(
+            repository_id,
+            anchor_id,
+            control,
+            Some((marker_kind, marker_value)),
+        )
+    }
+
+    fn retire_git_anchor_pin_with_progress(
+        repository_id: Uuid,
+        anchor_id: Uuid,
+        control: &ControlStore,
+        progress: Option<(&str, &[u8])>,
+    ) -> anyhow::Result<()> {
         let (bytes, pin) = git_anchor_pin(control, anchor_id)?
             .context("guarded Git anchor has no node-owned pin")?;
         ensure!(
@@ -1941,8 +1975,18 @@ impl GuardedViewMount {
                 pin.root_anchor_id.as_bytes().to_vec(),
             )]
         };
+        let records = progress
+            .into_iter()
+            .map(|(kind, value)| {
+                (
+                    kind.to_owned(),
+                    anchor_id.as_bytes().to_vec(),
+                    value.to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
         control.put_records_and_retire_and_delete_if_value(
-            &[],
+            &records,
             &deletions,
             GIT_ANCHOR_PIN_KIND,
             anchor_id.as_bytes(),

@@ -136,6 +136,15 @@ fn guarded_intent_kind(repository_id: Uuid) -> String {
     format!("{GUARDED_INTENT_PREFIX}{repository_id}")
 }
 
+pub(crate) fn has_pending_guarded_prune(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<bool, GitPruneError> {
+    Ok(control
+        .get_record(&guarded_intent_kind(repository_id), ACTIVE)?
+        .is_some())
+}
+
 fn validate_guarded_batch(batch: &GitGuardedPrunePreview) -> Result<(), GitPruneError> {
     if batch.format_version != 1
         || batch.repository_id.is_nil()
@@ -442,9 +451,7 @@ pub(crate) fn preview_guarded_prune(
     protected: &GitPruneRoots,
 ) -> Result<GitGuardedPrunePreview, GitPruneError> {
     if has_pending_prune(control, repository_id)?
-        || control
-            .get_record(&guarded_intent_kind(repository_id), ACTIVE)?
-            .is_some()
+        || has_pending_guarded_prune(control, repository_id)?
     {
         return Err(GitPruneError::IncompatibleRecord);
     }

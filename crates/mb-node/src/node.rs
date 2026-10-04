@@ -29,8 +29,8 @@ use mb_core::{
     verify_guild_event_signature,
 };
 use mb_git::{
-    GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitPruneRoots,
-    GitRemoteBranchInfo, GitRepository, GitStatus, GitTagInfo, GitWorktreeInfo,
+    GitBranchInfo, GitCommitInfo, GitDiff, GitGuardedPrunePreview, GitLogEntry, GitPruneReport,
+    GitPruneRoots, GitRemoteBranchInfo, GitRepository, GitStatus, GitTagInfo, GitWorktreeInfo,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -38,8 +38,8 @@ use mb_store::{
 };
 #[cfg(target_os = "linux")]
 use mb_store::{
-    GuardedRecoveryHandoff, GuardedRootCapturePlan, GuardedStoppedCaptureV1, GuardedViewMetadataV1,
-    GuardedViewMount,
+    GuardedFileCapturePlan, GuardedRecoveryHandoff, GuardedRootCapturePlan,
+    GuardedStoppedCaptureV1, GuardedViewMetadataV1, GuardedViewMount,
 };
 use rand::RngCore;
 use uuid::Uuid;
@@ -134,6 +134,70 @@ const GUARDED_IN_PLACE_KIND: &str = "guarded-in-place-enrollment-v1";
 
 #[cfg(target_os = "linux")]
 const GUARDED_RELEASE_KIND: &str = "guarded-protected-root-release-v1";
+
+#[cfg(target_os = "linux")]
+const GUARDED_GIT_PRUNE_KIND: &str = "guarded-git-prune-v1";
+
+#[cfg(target_os = "linux")]
+const GUARDED_GIT_PRUNE_READY_KIND: &str = "guarded-git-prune-catalog-ready-v1";
+
+#[cfg(target_os = "linux")]
+const GUARDED_GIT_FILE_GC_KIND: &str = "guarded-git-deferred-file-gc-v1";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedGitDeferredFileGcV1 {
+    format_version: u16,
+    repository_id: Uuid,
+    root_anchor_id: Uuid,
+    manifest: mb_store::FileAnchorManifest,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedGitDeferredFileGcV1 {
+    fn validate(&self, record_id: &[u8], bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            self.format_version == 1
+                && !self.repository_id.is_nil()
+                && !self.root_anchor_id.is_nil()
+                && self.manifest.format_version == 1
+                && self.manifest.guarded_root_file.is_none()
+                && self.manifest.anchor_id.as_bytes() == record_id
+                && canonical_bytes(self)? == bytes,
+            "guarded Git file cleanup record is invalid"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn guarded_git_prune_progress_kind(repository_id: Uuid) -> String {
+    format!("guarded-git-prune-pin-retired-v1/{repository_id}")
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedGitPruneIntentV1 {
+    format_version: u16,
+    repository_id: Uuid,
+    batch: GitGuardedPrunePreview,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedGitPruneIntentV1 {
+    fn validate(&self, record_id: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            self.format_version == 1
+                && !self.repository_id.is_nil()
+                && record_id == self.repository_id.as_bytes()
+                && self.batch.format_version == 1
+                && self.batch.repository_id == self.repository_id
+                && self.batch.first_batch().as_ref() == Some(&self.batch),
+            "guarded Git prune intent is invalid"
+        );
+        Ok(())
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1496,6 +1560,10 @@ impl Node {
         #[cfg(target_os = "linux")]
         node.reconcile_guarded_enrollments()?;
         #[cfg(target_os = "linux")]
+        node.reconcile_guarded_git_prunes()?;
+        #[cfg(target_os = "linux")]
+        node.audit_guarded_git_file_gc()?;
+        #[cfg(target_os = "linux")]
         node.reconcile_guarded_git_stages()?;
         node.reconcile_garbage_collection()?;
         Ok(node)
@@ -2072,6 +2140,7 @@ impl Node {
         if !handoff.has_prepared_release(&self.control, intent.anchor_id)? {
             anyhow::bail!("retired guarded view lost its release metadata");
         }
+        self.reconcile_guarded_git_file_gc(intent.anchor_id)?;
         if let Some(plan) =
             GuardedRootCapturePlan::load_for_retirement(&self.control, intent.anchor_id)?
         {
@@ -2757,6 +2826,9 @@ impl Node {
                 &self.git_catalog_key(repository_id),
                 SourceBackendKind::GuardedLinkFreezeV1,
             )?;
+            if repository.has_pending_guarded_prune_catalog()? {
+                anyhow::bail!("guarded Git catalog prune lost its node retirement fence");
+            }
             let pinned_by_attempt = pins
                 .iter()
                 .map(|pin| (pin.attempt_id, pin))
@@ -2837,6 +2909,43 @@ impl Node {
 
     fn open_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
         self.open_git_repository_with_policy(repository_id, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_guarded_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
+        let registration = self
+            .control
+            .get_record("git-repository", repository_id.as_bytes())?
+            .context("guarded Git repository is not registered")?;
+        let info: GitRepositoryInfo = decode_canonical(&registration)?;
+        let root = self.protected_root_by_id(repository_id)?;
+        anyhow::ensure!(
+            root.format_version == 4
+                && info.format_version == 1
+                && info.repository_id == repository_id
+                && info.path == root.path
+                && canonical_bytes(&info)? == registration,
+            "guarded Git repository registration is invalid"
+        );
+        let binding = self.guarded_root_mount_binding(&root)?;
+        let backend = self.verified_source_backend_for_root(&root)?;
+        anyhow::ensure!(
+            backend.backend == SourceBackendKind::GuardedLinkFreezeV1
+                && backend.is_supported_guarded_for(
+                    repository_id,
+                    root.filesystem_id,
+                    root.root_inode,
+                ),
+            "guarded Git repository backend differs from its root"
+        );
+        GitRepository::open_with_catalog_root(
+            &root.path,
+            &binding.lower_root,
+            repository_id,
+            &self.git_catalog_key(repository_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .map_err(Into::into)
     }
 
     fn open_git_repository_with_policy(
@@ -3383,6 +3492,17 @@ impl Node {
                 anyhow::bail!("a Git backup job is unfinished; prune must wait");
             }
         }
+        let protected = self.git_prune_protected_roots(repository_id)?;
+        #[cfg(target_os = "linux")]
+        if root.format_version == 4 {
+            return self.git_prune_guarded(repository_id, &protected);
+        }
+        self.open_git_repository(repository_id)?
+            .prune_unreachable(&protected)
+            .map_err(Into::into)
+    }
+
+    fn git_prune_protected_roots(&self, repository_id: Uuid) -> Result<GitPruneRoots> {
         let mut protected = GitPruneRoots::default();
         let mut include_revision = |revision: &SignedRecord<UserRevision>| -> Result<()> {
             if revision.value.protected_root_id != repository_id
@@ -3434,9 +3554,311 @@ impl Node {
         protected
             .anchor_ids
             .extend(git_prune_recipe_anchor_ids(&self.control)?);
-        self.open_git_repository(repository_id)?
-            .prune_unreachable(&protected)
-            .map_err(Into::into)
+        Ok(protected)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn git_prune_guarded(
+        &mut self,
+        repository_id: Uuid,
+        protected: &GitPruneRoots,
+    ) -> Result<GitPruneReport> {
+        self.reconcile_guarded_git_prunes()?;
+        self.reconcile_guarded_git_stages()?;
+        let repository = self.open_guarded_git_repository(repository_id)?;
+        let mut report = GitPruneReport {
+            format_version: 1,
+            repository_id,
+            ..GitPruneReport::default()
+        };
+        while let Some(batch) = repository.preview_guarded_prune(protected)?.first_batch() {
+            let intent = GuardedGitPruneIntentV1 {
+                format_version: 1,
+                repository_id,
+                batch,
+            };
+            let bytes = canonical_bytes(&intent)?;
+            anyhow::ensure!(
+                self.control.put_record_if_absent(
+                    GUARDED_GIT_PRUNE_KIND,
+                    repository_id.as_bytes(),
+                    &bytes,
+                )?,
+                "another guarded Git prune batch is pending"
+            );
+            self.resume_guarded_git_prune_intent(&intent, &bytes)?;
+            report.metadata_objects_removed += intent.batch.metadata_oids.len() as u64;
+            for candidate in &intent.batch.anchors {
+                if candidate.manifest.format_version == 1
+                    && self
+                        .control
+                        .get_record(
+                            GUARDED_GIT_FILE_GC_KIND,
+                            candidate.manifest.anchor_id.as_bytes(),
+                        )?
+                        .is_none()
+                {
+                    report.native_anchors_removed += 1;
+                    report.logical_anchor_bytes_removed = report
+                        .logical_anchor_bytes_removed
+                        .checked_add(candidate.manifest.logical_len)
+                        .context("guarded Git prune logical byte count overflowed")?;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_guarded_git_prunes(&mut self) -> Result<()> {
+        for (id, bytes) in self.control.records(GUARDED_GIT_PRUNE_KIND)? {
+            let intent: GuardedGitPruneIntentV1 = decode_canonical(&bytes)?;
+            intent.validate(&id)?;
+            anyhow::ensure!(
+                canonical_bytes(&intent)? == bytes,
+                "guarded Git prune intent is not canonical"
+            );
+            self.resume_guarded_git_prune_intent(&intent, &bytes)?;
+        }
+        anyhow::ensure!(
+            self.control
+                .records_with_kind_prefix("guarded-git-prune-pin-retired-v1/")?
+                .is_empty(),
+            "guarded Git prune progress lost its node retirement fence"
+        );
+        anyhow::ensure!(
+            self.control
+                .records(GUARDED_GIT_PRUNE_READY_KIND)?
+                .is_empty(),
+            "guarded Git prune completion lost its node retirement fence"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_guarded_git_file_gc(&self, root_anchor_id: Uuid) -> Result<()> {
+        anyhow::ensure!(
+            !GuardedViewMount::claimed_anchor_ids(&self.control)?.contains(&root_anchor_id),
+            "guarded Git file cleanup waits for mount retirement"
+        );
+        let recipe_pins = git_prune_recipe_anchor_ids(&self.control)?;
+        let git_pins = GuardedViewMount::all_git_stage_pins(&self.control)?;
+        for (id, bytes) in self.control.records(GUARDED_GIT_FILE_GC_KIND)? {
+            let cleanup: GuardedGitDeferredFileGcV1 = decode_canonical(&bytes)?;
+            cleanup.validate(&id, &bytes)?;
+            if cleanup.root_anchor_id != root_anchor_id {
+                continue;
+            }
+            anyhow::ensure!(
+                !recipe_pins.contains(&cleanup.manifest.anchor_id)
+                    && !git_pins
+                        .iter()
+                        .any(|pin| pin.manifest.anchor_id == cleanup.manifest.anchor_id),
+                "guarded Git file cleanup still has a live owner"
+            );
+            if let Some(plan) =
+                GuardedFileCapturePlan::load_for_manifest(&self.control, &cleanup.manifest)?
+            {
+                plan.discard_unreferenced(&self.control)?;
+            } else {
+                cleanup.manifest.remove()?;
+            }
+            self.control
+                .delete_record_if_value(GUARDED_GIT_FILE_GC_KIND, &id, &bytes)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn audit_guarded_git_file_gc(&self) -> Result<()> {
+        let pins = GuardedViewMount::all_git_stage_pins(&self.control)?;
+        let claims = GuardedViewMount::claimed_anchor_ids(&self.control)?;
+        for (id, bytes) in self.control.records(GUARDED_GIT_FILE_GC_KIND)? {
+            let cleanup: GuardedGitDeferredFileGcV1 = decode_canonical(&bytes)?;
+            cleanup.validate(&id, &bytes)?;
+            anyhow::ensure!(
+                !pins
+                    .iter()
+                    .any(|pin| pin.manifest.anchor_id == cleanup.manifest.anchor_id),
+                "guarded Git deferred cleanup still has a catalog pin"
+            );
+            if claims.contains(&cleanup.root_anchor_id) {
+                anyhow::ensure!(
+                    GuardedFileCapturePlan::load_for_manifest(&self.control, &cleanup.manifest)?
+                        .is_some(),
+                    "live guarded mount lost its deferred file plan"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resume_guarded_git_prune_intent(
+        &mut self,
+        intent: &GuardedGitPruneIntentV1,
+        bytes: &[u8],
+    ) -> Result<()> {
+        intent.validate(intent.repository_id.as_bytes())?;
+        anyhow::ensure!(
+            self.control
+                .get_record(GUARDED_GIT_PRUNE_KIND, intent.repository_id.as_bytes())?
+                == Some(bytes.to_vec()),
+            "guarded Git prune lost its exact node fence"
+        );
+        let protected = self.git_prune_protected_roots(intent.repository_id)?;
+        let repository = self.open_guarded_git_repository(intent.repository_id)?;
+        let root = self.protected_root_by_id(intent.repository_id)?;
+        let root_anchor_id = self.guarded_root_mount_binding(&root)?.anchor_id;
+        let mount_claimed =
+            GuardedViewMount::claimed_anchor_ids(&self.control)?.contains(&root_anchor_id);
+        let progress_kind = guarded_git_prune_progress_kind(intent.repository_id);
+        let marker = blake3::hash(bytes);
+        let ready = self.control.get_record(
+            GUARDED_GIT_PRUNE_READY_KIND,
+            intent.repository_id.as_bytes(),
+        )?;
+        anyhow::ensure!(
+            ready
+                .as_deref()
+                .is_none_or(|value| value == marker.as_bytes()),
+            "guarded Git prune completion belongs to another batch"
+        );
+        let pins = GuardedViewMount::all_git_stage_pins(&self.control)?;
+        for candidate in &intent.batch.anchors {
+            let existing = self
+                .control
+                .get_record(&progress_kind, candidate.manifest.anchor_id.as_bytes())?;
+            let pin = pins
+                .iter()
+                .find(|pin| pin.manifest.anchor_id == candidate.manifest.anchor_id);
+            if let Some(attempt_id) = candidate.attempt_id {
+                if let Some(existing) = existing {
+                    anyhow::ensure!(
+                        existing == marker.as_bytes() && pin.is_none(),
+                        "guarded Git prune pin progress conflicts with a live pin"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        ready.is_none(),
+                        "guarded Git prune completion precedes pin retirement"
+                    );
+                    anyhow::ensure!(
+                        pin.is_some_and(|pin| {
+                            pin.repository_id == intent.repository_id
+                                && pin.attempt_id == attempt_id
+                                && pin.manifest == candidate.manifest
+                        }),
+                        "guarded Git prune candidate lost its node-owned pin"
+                    );
+                }
+            } else {
+                anyhow::ensure!(
+                    existing.is_none() && pin.is_none(),
+                    "unguarded Git prune candidate has a node-owned pin"
+                );
+            }
+        }
+        let catalog_pending = repository.retire_guarded_prune_catalog(&intent.batch, &protected)?;
+        if !catalog_pending {
+            anyhow::ensure!(
+                ready.is_some(),
+                "guarded Git catalog completed without node cleanup proof"
+            );
+        }
+        for candidate in &intent.batch.anchors {
+            let deferred = if candidate.manifest.format_version == 1 {
+                let cleanup = GuardedGitDeferredFileGcV1 {
+                    format_version: 1,
+                    repository_id: intent.repository_id,
+                    root_anchor_id,
+                    manifest: candidate.manifest.clone(),
+                };
+                let encoded = canonical_bytes(&cleanup)?;
+                let existing = self.control.get_record(
+                    GUARDED_GIT_FILE_GC_KIND,
+                    candidate.manifest.anchor_id.as_bytes(),
+                )?;
+                anyhow::ensure!(
+                    existing.as_ref().is_none_or(|bytes| bytes == &encoded),
+                    "guarded Git deferred file cleanup belongs to another anchor"
+                );
+                let plan =
+                    GuardedFileCapturePlan::load_for_manifest(&self.control, &candidate.manifest)?;
+                anyhow::ensure!(
+                    !mount_claimed || existing.is_none() || plan.is_some(),
+                    "guarded Git file cleanup lost its plan under a live mount"
+                );
+                if plan.is_some() && existing.is_none() {
+                    anyhow::ensure!(
+                        self.control.put_record_if_absent(
+                            GUARDED_GIT_FILE_GC_KIND,
+                            candidate.manifest.anchor_id.as_bytes(),
+                            &encoded,
+                        )?,
+                        "guarded Git deferred file cleanup was replaced"
+                    );
+                }
+                plan.is_some() || existing.is_some()
+            } else {
+                false
+            };
+            if candidate.attempt_id.is_some()
+                && self
+                    .control
+                    .get_record(&progress_kind, candidate.manifest.anchor_id.as_bytes())?
+                    .is_none()
+            {
+                GuardedViewMount::retire_git_anchor_pin_with_prune_progress(
+                    intent.repository_id,
+                    candidate.manifest.anchor_id,
+                    &self.control,
+                    &progress_kind,
+                    marker.as_bytes(),
+                )?;
+            }
+            if candidate.manifest.format_version == 1 && !deferred {
+                candidate.manifest.remove()?;
+            }
+        }
+        if !mount_claimed {
+            self.reconcile_guarded_git_file_gc(root_anchor_id)?;
+        }
+        if ready.is_none() {
+            anyhow::ensure!(
+                self.control.put_record_if_absent(
+                    GUARDED_GIT_PRUNE_READY_KIND,
+                    intent.repository_id.as_bytes(),
+                    marker.as_bytes(),
+                )?,
+                "guarded Git prune completion was replaced"
+            );
+        }
+        repository.complete_guarded_prune_catalog(&intent.batch)?;
+        let mut deletions = intent
+            .batch
+            .anchors
+            .iter()
+            .filter(|candidate| candidate.attempt_id.is_some())
+            .map(|candidate| {
+                (
+                    progress_kind.clone(),
+                    candidate.manifest.anchor_id.as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        deletions.push((
+            GUARDED_GIT_PRUNE_READY_KIND.to_owned(),
+            intent.repository_id.as_bytes().to_vec(),
+        ));
+        self.control.put_records_and_retire_and_delete_if_value(
+            &[],
+            &deletions,
+            GUARDED_GIT_PRUNE_KIND,
+            intent.repository_id.as_bytes(),
+            bytes,
+        )?;
+        Ok(())
     }
 
     pub fn git_create_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
@@ -27122,8 +27544,12 @@ pub(crate) mod tests {
         let original = b"guarded Git\r\n\0exact";
         fs::write(lower.join("sample"), original).unwrap();
         fs::write(lower.join("edited"), original).unwrap();
+        fs::write(lower.join("corrupt"), original).unwrap();
+        fs::write(lower.join("replay"), original).unwrap();
         fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(lower.join("edited"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(lower.join("corrupt"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(lower.join("replay"), fs::Permissions::from_mode(0o644)).unwrap();
 
         let seed = Seed::from_bytes([119; 32]);
         let mut node = Node::open(&data_dir, seed.clone()).unwrap();
@@ -27217,6 +27643,48 @@ pub(crate) mod tests {
             &control.lock().unwrap(),
         )
         .unwrap();
+        let corrupt_attempt = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            corrupt_attempt,
+            Arc::clone(&control),
+            "corrupt",
+        )
+        .unwrap();
+        let corrupt_manifest = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            corrupt_attempt,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            corrupt_attempt,
+            repository_id,
+            repository_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        let replay_attempt = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            replay_attempt,
+            Arc::clone(&control),
+            "replay",
+        )
+        .unwrap();
+        let replay_manifest = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            replay_attempt,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            replay_attempt,
+            repository_id,
+            repository_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
         drop(control);
         drop(node);
 
@@ -27234,6 +27702,22 @@ pub(crate) mod tests {
         assert_eq!(staged.anchor_id, manifest.anchor_id);
         let edited_stage = repository.staged_entry("edited").unwrap().unwrap();
         assert_eq!(edited_stage.anchor_id, edited_manifest.anchor_id);
+        assert_eq!(
+            repository
+                .staged_entry("corrupt")
+                .unwrap()
+                .unwrap()
+                .anchor_id,
+            corrupt_manifest.anchor_id
+        );
+        assert_eq!(
+            repository
+                .staged_entry("replay")
+                .unwrap()
+                .unwrap()
+                .anchor_id,
+            replay_manifest.anchor_id
+        );
         assert!(fs::symlink_metadata(view.join(".mutualbackup")).is_err());
         assert_eq!(
             staged.oid.as_slice(),
@@ -27276,38 +27760,269 @@ pub(crate) mod tests {
         assert_eq!(preview.anchors.len(), 1);
         assert_eq!(preview.anchors[0].manifest, manifest);
         assert_eq!(preview.anchors[0].attempt_id, Some(attempt_id));
+        let pruned = reopened.git_prune(repository_id).unwrap();
+        assert_eq!(pruned.native_anchors_removed, 0);
+        assert_eq!(repository.guarded_catalog_stage_pins().unwrap().len(), 3);
+        assert_eq!(
+            GuardedViewMount::all_git_stage_pins(&reopened.control)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(fs::read(view.join("sample")).unwrap()[0], b'G');
+        let mut rooted = Vec::new();
+        manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut rooted)
+            .unwrap();
+        assert_eq!(rooted, original);
         assert!(mb_git::remove_cached(&catalog, repository_id, "edited").unwrap());
         let protected = GitPruneRoots {
-            anchor_ids: std::iter::once(manifest.anchor_id).collect(),
+            anchor_ids: std::iter::once(edited_manifest.anchor_id).collect(),
             ..GitPruneRoots::default()
         };
         let preview = repository.preview_guarded_prune(&protected).unwrap();
-        assert_eq!(preview.anchors.len(), 1);
-        assert_eq!(preview.anchors[0].manifest, edited_manifest);
+        assert!(preview.anchors.is_empty());
         let preview = repository
             .preview_guarded_prune(&GitPruneRoots::default())
             .unwrap();
-        assert_eq!(preview.anchors.len(), 2);
-        assert!(preview.anchors.iter().any(|candidate| {
-            candidate.manifest == manifest && candidate.attempt_id == Some(attempt_id)
-        }));
-        assert!(preview.anchors.iter().any(|candidate| {
-            candidate.manifest == edited_manifest && candidate.attempt_id == Some(edited_attempt)
-        }));
+        assert_eq!(preview.anchors.len(), 1);
+        assert_eq!(preview.anchors[0].manifest, edited_manifest);
+        assert_eq!(preview.anchors[0].attempt_id, Some(edited_attempt));
+        let pruned = reopened.git_prune(repository_id).unwrap();
+        assert_eq!(pruned.native_anchors_removed, 0);
+        assert_eq!(pruned.logical_anchor_bytes_removed, 0);
+        assert!(edited_manifest.open_verified().is_ok());
+        assert!(
+            reopened
+                .control
+                .get_record(
+                    GUARDED_GIT_FILE_GC_KIND,
+                    edited_manifest.anchor_id.as_bytes()
+                )
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(repository.guarded_catalog_stage_pins().unwrap().len(), 2);
+        assert!(mb_git::remove_cached(&catalog, repository_id, "replay").unwrap());
+        let replay_batch = repository
+            .preview_guarded_prune(&GitPruneRoots::default())
+            .unwrap()
+            .first_batch()
+            .unwrap();
+        assert_eq!(replay_batch.anchors.len(), 1);
+        assert_eq!(replay_batch.anchors[0].manifest, replay_manifest);
+        let replay_intent = GuardedGitPruneIntentV1 {
+            format_version: 1,
+            repository_id,
+            batch: replay_batch.clone(),
+        };
+        let replay_bytes = canonical_bytes(&replay_intent).unwrap();
+        assert!(
+            reopened
+                .control
+                .put_record_if_absent(
+                    GUARDED_GIT_PRUNE_KIND,
+                    repository_id.as_bytes(),
+                    &replay_bytes,
+                )
+                .unwrap()
+        );
+        assert!(
+            repository
+                .retire_guarded_prune_catalog(&replay_batch, &GitPruneRoots::default())
+                .unwrap()
+        );
+        drop(catalog);
+        drop(repository);
+        reopened.guarded_mounts.pop().unwrap().stop().unwrap();
+        drop(reopened);
+        let mut reopened = Node::open(&data_dir, seed.clone()).unwrap();
+        let repository = GitRepository::open_with_catalog_root(
+            &view,
+            &binding.lower_root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        assert_eq!(repository.guarded_catalog_stage_pins().unwrap().len(), 1);
+        assert_eq!(
+            GuardedViewMount::all_git_stage_pins(&reopened.control)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            reopened
+                .control
+                .get_record(GUARDED_GIT_PRUNE_KIND, repository_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!repository.has_pending_guarded_prune_catalog().unwrap());
         assert_eq!(
             mb_git::blob_oid_from_anchor(&manifest).unwrap().as_bytes(),
             staged.oid
         );
         reopened
             .control
-            .delete_record("guarded-git-anchor-pin-v1", manifest.anchor_id.as_bytes())
+            .delete_record(
+                "guarded-git-anchor-pin-v1",
+                corrupt_manifest.anchor_id.as_bytes(),
+            )
             .unwrap();
         assert!(reopened.reconcile_guarded_git_stages().is_err());
         drop(repository);
         reopened.guarded_mounts.pop().unwrap().stop().unwrap();
         drop(reopened);
         assert!(Node::open(&data_dir, seed).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_git_deferred_file_gc_waits_for_mount_retirement() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let area = tempfile::Builder::new()
+            .prefix("mb-node-guarded-git-gc-")
+            .tempdir_in(test_root)
+            .unwrap();
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let view = area.path().join("view");
+        let data_dir = area.path().join("node");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&view).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = b"deferred\r\nanchor\0";
+        fs::write(lower.join("tracked"), original).unwrap();
+        fs::set_permissions(lower.join("tracked"), fs::Permissions::from_mode(0o644)).unwrap();
+        let seed = Seed::from_bytes([118; 32]);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let root = node
+            .enroll_test_guarded_root(&lower, &view, 65534, 65534)
+            .unwrap();
+        let binding = node.guarded_root_mount_binding(&root).unwrap();
+        let repository_id = root.root_id;
+        let key = node.git_catalog_key(repository_id);
+        GitRepository::init_with_catalog_root(
+            &view,
+            &binding.lower_root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        node.control
+            .put_record(
+                "git-repository",
+                repository_id.as_bytes(),
+                &canonical_bytes(&GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id,
+                    path: view.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let edit = std::process::Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'D',0); os.fsync(fd); os.close(fd)")
+            .arg(view.join("tracked"))
+            .output()
+            .unwrap();
+        assert!(edit.status.success(), "{edit:?}");
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
+        let control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
+                .unwrap(),
+        ));
+        let attempt_id = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+            "tracked",
+        )
+        .unwrap();
+        let manifest = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        assert_eq!(manifest.format_version, 1);
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            attempt_id,
+            repository_id,
+            repository_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        drop(control);
+        drop(node);
+
+        let mut reopened = Node::open(&data_dir, seed).unwrap();
+        let catalog = ControlStore::open_existing_with_key(
+            binding.lower_root.join(".mutualbackup/catalog.db"),
+            &key,
+        )
+        .unwrap();
+        assert!(mb_git::remove_cached(&catalog, repository_id, "tracked").unwrap());
+        assert_eq!(
+            reopened
+                .git_prune(repository_id)
+                .unwrap()
+                .native_anchors_removed,
+            0
+        );
+        assert!(manifest.open_verified().is_ok());
+        assert!(
+            reopened
+                .reconcile_guarded_git_file_gc(binding.anchor_id)
+                .is_err()
+        );
+        assert!(
+            reopened
+                .control
+                .get_record(GUARDED_GIT_FILE_GC_KIND, manifest.anchor_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        reopened.guarded_mounts.pop().unwrap().stop().unwrap();
+        let control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(
+                data_dir.join("control.db"),
+                &reopened.control_database_key,
+            )
+            .unwrap(),
+        ));
+        GuardedViewMount::detach_stopped_files_for_release(binding.anchor_id, Arc::clone(&control))
+            .unwrap();
+        GuardedViewMount::snapshot_stopped(binding.anchor_id, control).unwrap();
+        GuardedViewMount::retire_claim(binding.anchor_id, &reopened.control).unwrap();
+        reopened
+            .reconcile_guarded_git_file_gc(binding.anchor_id)
+            .unwrap();
+        assert!(manifest.open_verified().is_err());
+        assert!(
+            reopened
+                .control
+                .get_record(GUARDED_GIT_FILE_GC_KIND, manifest.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(lower.join("tracked")).unwrap()[0], b'D');
     }
 
     #[cfg(target_os = "linux")]
