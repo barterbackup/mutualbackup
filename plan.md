@@ -3800,7 +3800,10 @@ an unconditional repository invariant, not a configurable compatibility mode.
   recovery. Make enrollment a durable, restartable transition from a private
   lower tree to a supervised view. A separate lower/view path is an initial
   operational slice; finish original-path migration and data-preserving root
-  removal before closing the guarded backend gate. Never expose a raw hard
+  removal before closing the guarded backend gate. Before removal restores
+  ordinary ownership, detach every live lower file from immutable anchors
+  under a stopped-view fence, then durably hand its current namespace and
+  visible metadata back to the user. Never expose a raw hard
   link between an editable worktree and an immutable anchor.
 - Then validate the already planned native Windows NTFS capture, including VSS
   where appropriate, macOS cloning, platform watchers, portable metadata/ACL

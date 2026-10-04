@@ -1,10 +1,10 @@
-//! Disposable Linux FUSE passthrough probe for the future guarded worktree.
+//! Linux FUSE guarded worktree and its disposable passthrough probes.
 //!
 //! This proves that this host can mount a view, pass read-only file access to
 //! lower inodes, and finish each captured file's durable detach before a
 //! writable open or metadata edit. It also probes a nested file namespace,
-//! creation, rename, unlink, and atomic replacement. It is not a complete
-//! long-lived edit guard and must not be used as an enrollment decision by itself.
+//! creation, rename, unlink, and atomic replacement. The guarded backend now
+//! uses this view; its full failure and removal gates remain separate.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -2467,6 +2467,42 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    /// Materialize every live file while the view is stopped. Each writable
+    /// opener uses the same durable detach journal as FUSE `open`, but no user
+    /// process can change the namespace between files. A later unmount/removal
+    /// can restore ownership only after no visible lower inode still aliases
+    /// an immutable anchor. A failed pass is safe to retry from its journals.
+    pub(crate) fn detach_live_files_for_release(&self) -> anyhow::Result<()> {
+        self.verify_private_lower_ownership()?;
+        self.verify_lower_namespace()?;
+        let inodes = self
+            .names
+            .lock()
+            .map_err(|_| io::Error::other("guarded names lock is poisoned"))?
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for inode in inodes {
+            if self.directory(inode).is_some() {
+                continue;
+            }
+            let file = self
+                .file(inode)
+                .context("guarded view file disappeared during release")?;
+            let open = file
+                .open_for_write
+                .as_ref()
+                .context("guarded file has no durable writable-detach path")?;
+            let source = open(OpenAccMode::O_RDWR)?;
+            ensure!(
+                source.metadata()?.nlink() == 1,
+                "guarded release file still has a hard-link alias"
+            );
+            source.sync_all()?;
+        }
+        Ok(())
+    }
+
     fn mark_virtual_directory_size_dirty(&self, inode: INodeNo) -> io::Result<()> {
         if inode == INodeNo::ROOT {
             return Ok(());

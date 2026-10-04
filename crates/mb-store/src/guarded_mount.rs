@@ -1208,6 +1208,19 @@ impl GuardedViewMount {
         })
     }
 
+    /// Detach all currently visible lower files from immutable hard-link
+    /// anchors while the FUSE view is stopped. This is a replayable prerequisite
+    /// for returning the lower tree to ordinary ownership during root removal.
+    /// The claim remains active and the caller must still complete removal.
+    pub fn detach_stopped_files_for_release(
+        anchor_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+    ) -> anyhow::Result<()> {
+        Self::with_stopped_view(anchor_id, control, |view, _, _| {
+            view.detach_live_files_for_release()
+        })
+    }
+
     /// Capture a visible file from a stopped view into a second guarded
     /// anchor. Remount replays an interrupted capture and keeps the file's
     /// visible mode while the new anchor is frozen. This does not publish a
@@ -1830,6 +1843,76 @@ mod tests {
         GuardedStoppedCaptureV1, GuardedViewMount, MOUNT_CLAIM_KIND, MOUNT_RETIRE_KIND,
         decode_mountinfo_path, mounted_filesystem_from_bytes,
     };
+
+    #[test]
+    #[ignore = "requires root, CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn stopped_release_detaches_renamed_live_files_before_owner_restore() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-release-detach-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = b"release\r\nretained\0";
+        fs::write(lower.join("sample"), original).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([214; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+        ));
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&control.lock().unwrap(), 65534, 0, 0)
+            .unwrap();
+        plan.isolate_lower_directories(&control.lock().unwrap(), &manifest)
+            .unwrap();
+        let mount =
+            GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
+                .unwrap();
+        fs::rename(mountpoint.join("sample"), mountpoint.join("renamed")).unwrap();
+        fs::write(mountpoint.join("created"), b"new\nbytes").unwrap();
+        mount.stop().unwrap();
+
+        let anchor = manifest.file_locator("sample".to_owned()).unwrap();
+        let anchor_file = anchor.open().unwrap();
+        assert_eq!(
+            fs::metadata(lower.join("renamed")).unwrap().ino(),
+            anchor_file.metadata().unwrap().ino()
+        );
+        drop(anchor_file);
+        GuardedViewMount::detach_stopped_files_for_release(
+            manifest.anchor_id,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        // Detach replay is idempotent before any mount claim or anchor is retired.
+        GuardedViewMount::detach_stopped_files_for_release(
+            manifest.anchor_id,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        let visible =
+            GuardedViewMount::snapshot_stopped(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        assert!(visible.entries.iter().any(|entry| entry.path == b"renamed"));
+        assert!(visible.entries.iter().any(|entry| entry.path == b"created"));
+        assert_ne!(
+            fs::metadata(lower.join("renamed")).unwrap().ino(),
+            anchor.open().unwrap().metadata().unwrap().ino()
+        );
+        assert_eq!(fs::read(lower.join("renamed")).unwrap(), original);
+        fs::write(lower.join("renamed"), b"changed after detach").unwrap();
+        let mut retained = Vec::new();
+        anchor.open().unwrap().read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, original);
+        GuardedViewMount::retire_claim(manifest.anchor_id, &control.lock().unwrap()).unwrap();
+        plan.discard_unreferenced(&control.lock().unwrap()).unwrap();
+    }
 
     #[test]
     fn mountinfo_paths_decode_spaces_and_non_utf8_bytes() {

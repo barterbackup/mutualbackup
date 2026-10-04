@@ -978,6 +978,15 @@
   enables the separate lower/view path. Original-path migration,
   data-preserving removal and claim retirement, Git operations through the
   guarded backend, and the complete guarded failure gate remain open.
+  A stopped-view release primitive now walks every live file through its
+  replayable writable-open detach journal and requires a single lower hard
+  link before returning. A privileged ext4 and disposable-Btrfs regression
+  renames a frozen file, creates a second file, retries release preparation,
+  and proves that editing the lower working inode leaves the relocated anchor
+  byte-exact; ordinary anchor retirement then succeeds. Root removal still
+  needs a durable name handoff, visible metadata restoration, revision/Git pin
+  checks, and protected-root record retirement before this primitive can be
+  exposed as a command.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
