@@ -18,8 +18,8 @@ use crate::fetch::{FetchError, has_pending_fetch};
 use crate::history::{HistoryError, export_graph_source, metadata_kind, verified_metadata_ids};
 use crate::merge::{MergeBlobError, has_merge_session, has_pending_merge_blob};
 use crate::stage::{
-    StageError, has_pending_stages, has_pending_stages_for_scope, object_kind_prefix,
-    staged_entries, staged_entries_for_scope, worktree_scopes_with_stage_state,
+    StageError, guarded_catalog_stage_pins, has_pending_stages, has_pending_stages_for_scope,
+    object_kind_prefix, staged_entries, staged_entries_for_scope, worktree_scopes_with_stage_state,
 };
 
 const INTENT_PREFIX: &str = "git-prune-intent-v1/";
@@ -74,6 +74,25 @@ pub struct GitPruneReport {
     pub logical_anchor_bytes_removed: u64,
     /// Shared COW extents make logical bytes an invalid physical-space claim.
     pub physical_bytes_reclaimed: Option<u64>,
+}
+
+/// Read-only candidate set for a guarded repository. The node must bind this
+/// exact set to a durable cross-catalog retirement before deleting any mapping
+/// or releasing any node-owned pin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitGuardedPrunePreview {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub metadata_oids: Vec<[u8; 20]>,
+    pub anchors: Vec<GitGuardedPruneAnchorCandidate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitGuardedPruneAnchorCandidate {
+    pub oid: [u8; 20],
+    pub manifest: FileAnchorManifest,
+    /// The receipt and its node-owned pin must be retired with this mapping.
+    pub attempt_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -188,6 +207,98 @@ pub(crate) fn prune_unreachable(
     protected: &GitPruneRoots,
 ) -> Result<GitPruneReport, GitPruneError> {
     resume_pending_prune(control, repository_id)?;
+    let candidates = collect_candidates(control, repository_id, protected, false)?;
+
+    let mut report = GitPruneReport {
+        format_version: 1,
+        repository_id,
+        ..GitPruneReport::default()
+    };
+    for batch in candidates.chunks(MAX_BATCH_RECORDS) {
+        let mut anchors = Vec::new();
+        let mut deletions = Vec::with_capacity(batch.len());
+        for candidate in batch {
+            deletions.push((candidate.kind.clone(), candidate.key.clone()));
+            if let Some(anchor) = &candidate.anchor {
+                anchors.push(anchor.clone());
+                report.native_anchors_removed += 1;
+                report.logical_anchor_bytes_removed = report
+                    .logical_anchor_bytes_removed
+                    .checked_add(anchor.logical_len)
+                    .ok_or(GitPruneError::TooManyObjects)?;
+            } else {
+                report.metadata_objects_removed += 1;
+            }
+        }
+        let intent = PruneIntent {
+            format_version: 1,
+            repository_id,
+            anchors,
+        };
+        control.put_records_and_delete(
+            &[(
+                intent_kind(repository_id),
+                ACTIVE.to_vec(),
+                canonical_bytes(&intent)?,
+            )],
+            &deletions,
+        )?;
+        run_after_catalog_delete_hook();
+        resume_pending_prune(control, repository_id)?;
+    }
+    Ok(report)
+}
+
+pub(crate) fn preview_guarded_prune(
+    control: &ControlStore,
+    repository_id: Uuid,
+    protected: &GitPruneRoots,
+) -> Result<GitGuardedPrunePreview, GitPruneError> {
+    if has_pending_prune(control, repository_id)? {
+        return Err(GitPruneError::IncompatibleRecord);
+    }
+    let receipts = guarded_catalog_stage_pins(control, repository_id)?;
+    let by_anchor = receipts
+        .iter()
+        .map(|pin| (pin.manifest.anchor_id, pin.attempt_id))
+        .collect::<HashMap<_, _>>();
+    let mut preview = GitGuardedPrunePreview {
+        format_version: 1,
+        repository_id,
+        metadata_oids: Vec::new(),
+        anchors: Vec::new(),
+    };
+    for candidate in collect_candidates(control, repository_id, protected, true)? {
+        if let Some(manifest) = candidate.anchor {
+            let oid = candidate
+                .kind
+                .strip_prefix(&object_kind_prefix(repository_id))
+                .ok_or(GitPruneError::IncompatibleRecord)?;
+            let oid = Oid::from_str(oid).map_err(|_| GitPruneError::IncompatibleRecord)?;
+            preview.anchors.push(GitGuardedPruneAnchorCandidate {
+                oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+                attempt_id: by_anchor.get(&manifest.anchor_id).copied(),
+                manifest,
+            });
+        } else {
+            preview.metadata_oids.push(
+                candidate
+                    .key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| GitPruneError::IncompatibleRecord)?,
+            );
+        }
+    }
+    Ok(preview)
+}
+
+fn collect_candidates(
+    control: &ControlStore,
+    repository_id: Uuid,
+    protected: &GitPruneRoots,
+    allow_guarded_root_files: bool,
+) -> Result<Vec<Candidate>, GitPruneError> {
     let linked_scopes = worktree_scopes_with_stage_state(control, repository_id)?;
     if has_pending_stages(control, repository_id)?
         || linked_scopes.iter().try_fold(false, |pending, scope| {
@@ -260,7 +371,10 @@ pub(crate) fn prune_unreachable(
             return Err(GitPruneError::IncompatibleRecord);
         }
         let anchor: FileAnchorManifest = decode_canonical(&encoded)?;
-        if anchor.format_version != 1
+        if !(anchor.format_version == 1 && anchor.guarded_root_file.is_none()
+            || allow_guarded_root_files
+                && anchor.format_version == 2
+                && anchor.guarded_root_file.is_some())
             || key != anchor.anchor_id.as_bytes()
             || blob_oid_from_anchor(&anchor).map_err(StageError::from)? != oid
             || mapped_anchors.insert(anchor.anchor_id, oid).is_some()
@@ -305,50 +419,72 @@ pub(crate) fn prune_unreachable(
         return Err(GitPruneError::TooManyObjects);
     }
     candidates.sort_by(|left, right| (&left.kind, &left.key).cmp(&(&right.kind, &right.key)));
-
-    let mut report = GitPruneReport {
-        format_version: 1,
-        repository_id,
-        ..GitPruneReport::default()
-    };
-    for batch in candidates.chunks(MAX_BATCH_RECORDS) {
-        let mut anchors = Vec::new();
-        let mut deletions = Vec::with_capacity(batch.len());
-        for candidate in batch {
-            deletions.push((candidate.kind.clone(), candidate.key.clone()));
-            if let Some(anchor) = &candidate.anchor {
-                anchors.push(anchor.clone());
-                report.native_anchors_removed += 1;
-                report.logical_anchor_bytes_removed = report
-                    .logical_anchor_bytes_removed
-                    .checked_add(anchor.logical_len)
-                    .ok_or(GitPruneError::TooManyObjects)?;
-            } else {
-                report.metadata_objects_removed += 1;
-            }
-        }
-        let intent = PruneIntent {
-            format_version: 1,
-            repository_id,
-            anchors,
-        };
-        control.put_records_and_delete(
-            &[(
-                intent_kind(repository_id),
-                ACTIVE.to_vec(),
-                canonical_bytes(&intent)?,
-            )],
-            &deletions,
-        )?;
-        run_after_catalog_delete_hook();
-        resume_pending_prune(control, repository_id)?;
-    }
-    Ok(report)
+    Ok(candidates)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GitWorktreeScope;
+    use crate::stage::{publish_guarded_stage_for_scope, remove_cached};
+    use mb_store::{GuardedGitStagePin, SourceBlobImportPlan};
+
+    #[test]
+    fn guarded_preview_names_receipt_and_preserves_catalog_until_retirement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(temporary.path().join("catalog.db"), &[41; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let manifest = SourceBlobImportPlan::plan_direct(temporary.path(), 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"bytes"))
+            .unwrap();
+        let pin = GuardedGitStagePin {
+            repository_id,
+            root_anchor_id: Uuid::new_v4(),
+            manifest: manifest.clone(),
+            attempt_id: Uuid::new_v4(),
+            worktree_id: repository_id,
+            relative_path: b"tracked".to_vec(),
+            git_mode: 0o100644,
+        };
+        let entry = publish_guarded_stage_for_scope(
+            &control,
+            GitWorktreeScope::primary(repository_id),
+            &pin,
+        )
+        .unwrap();
+        assert!(
+            preview_guarded_prune(&control, repository_id, &GitPruneRoots::default())
+                .unwrap()
+                .anchors
+                .is_empty()
+        );
+        assert!(remove_cached(&control, repository_id, "tracked").unwrap());
+        let preview =
+            preview_guarded_prune(&control, repository_id, &GitPruneRoots::default()).unwrap();
+        assert_eq!(preview.format_version, 1);
+        assert!(preview.metadata_oids.is_empty());
+        assert_eq!(preview.anchors.len(), 1);
+        assert_eq!(preview.anchors[0].oid, entry.oid);
+        assert_eq!(preview.anchors[0].manifest, manifest);
+        assert_eq!(preview.anchors[0].attempt_id, Some(pin.attempt_id));
+        assert_eq!(
+            guarded_catalog_stage_pins(&control, repository_id).unwrap(),
+            vec![pin]
+        );
+        let protected = GitPruneRoots {
+            anchor_ids: std::iter::once(manifest.anchor_id).collect(),
+            ..GitPruneRoots::default()
+        };
+        assert!(
+            preview_guarded_prune(&control, repository_id, &protected)
+                .unwrap()
+                .anchors
+                .is_empty()
+        );
+        manifest.remove().unwrap();
+    }
 
     #[test]
     fn physical_prune_pins_recipes_and_index_and_keeps_one_source_per_filesystem() {

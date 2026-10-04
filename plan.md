@@ -3807,6 +3807,15 @@ an unconditional repository invariant, not a configurable compatibility mode.
   or config may transform its external working tree outside our control.
 - Define Git-facing history expiry and prune/GC over refs, index, worktrees,
   retained signed revisions, explicit protection pins, and in-flight work.
+  For a guarded repository, enumerate catalog candidates and their stage
+  receipts without mutation, then durably fence the exact candidate set in
+  node control before deleting any catalog mapping. Replay that fence before
+  normal pin/catalog reconciliation; retire each receipt with its mapping,
+  release its node-owned file/root pin only after the catalog retirement is
+  durable, and finish physical cleanup idempotently. A version-2 virtual
+  mapping releases its root pin but never unlinks the root file as if it owned
+  a separate payload. A catalog receipt with no node pin must still fail
+  closed unless it belongs to an authenticated retirement fence.
   Prune is a real data-deletion operation: once no such protection remains,
   it must release unreachable native anchors, retire their backed-up sectors
   through the existing remote cleanup path, and make the removed history

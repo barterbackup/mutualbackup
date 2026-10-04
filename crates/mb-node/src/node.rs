@@ -27260,6 +27260,45 @@ pub(crate) mod tests {
             .read_to_end(&mut anchored)
             .unwrap();
         assert_eq!(anchored, original);
+        let preview = repository
+            .preview_guarded_prune(&GitPruneRoots::default())
+            .unwrap();
+        assert!(preview.anchors.is_empty());
+        let catalog = ControlStore::open_existing_with_key(
+            binding.lower_root.join(".mutualbackup/catalog.db"),
+            &key,
+        )
+        .unwrap();
+        assert!(mb_git::remove_cached(&catalog, repository_id, "sample").unwrap());
+        let preview = repository
+            .preview_guarded_prune(&GitPruneRoots::default())
+            .unwrap();
+        assert_eq!(preview.anchors.len(), 1);
+        assert_eq!(preview.anchors[0].manifest, manifest);
+        assert_eq!(preview.anchors[0].attempt_id, Some(attempt_id));
+        assert!(mb_git::remove_cached(&catalog, repository_id, "edited").unwrap());
+        let protected = GitPruneRoots {
+            anchor_ids: std::iter::once(manifest.anchor_id).collect(),
+            ..GitPruneRoots::default()
+        };
+        let preview = repository.preview_guarded_prune(&protected).unwrap();
+        assert_eq!(preview.anchors.len(), 1);
+        assert_eq!(preview.anchors[0].manifest, edited_manifest);
+        let preview = repository
+            .preview_guarded_prune(&GitPruneRoots::default())
+            .unwrap();
+        assert_eq!(preview.anchors.len(), 2);
+        assert!(preview.anchors.iter().any(|candidate| {
+            candidate.manifest == manifest && candidate.attempt_id == Some(attempt_id)
+        }));
+        assert!(preview.anchors.iter().any(|candidate| {
+            candidate.manifest == edited_manifest && candidate.attempt_id == Some(edited_attempt)
+        }));
+        assert_eq!(repository.guarded_catalog_stage_pins().unwrap().len(), 2);
+        assert_eq!(
+            mb_git::blob_oid_from_anchor(&manifest).unwrap().as_bytes(),
+            staged.oid
+        );
         reopened
             .control
             .delete_record("guarded-git-anchor-pin-v1", manifest.anchor_id.as_bytes())

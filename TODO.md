@@ -70,6 +70,12 @@
   receipt; the node probe removes a pin after publication and confirms that
   reconciliation fails closed. Guarded prune still needs a cross-catalog
   retirement intent so legitimate pin removal cannot be mistaken for loss.
+  The guarded catalog now exposes a read-only, versioned prune preview using
+  the ordinary reachability calculation. It validates receipts and names
+  candidate object IDs, exact manifests, and attempt IDs, including untouched
+  files backed by version-2 virtual mappings. The preview leaves catalog
+  mappings and node pins intact; deletion stays fenced until the node records
+  and replays a cross-catalog retirement intent.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

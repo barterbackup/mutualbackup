@@ -65,7 +65,10 @@ pub use interop::GitInteropError;
 pub use merge::{GitMergeState, MergeBlobError};
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
-pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};
+pub use prune::{
+    GitGuardedPruneAnchorCandidate, GitGuardedPrunePreview, GitPruneError, GitPruneReport,
+    GitPruneRoots,
+};
 #[cfg(target_os = "linux")]
 pub use repository::{GitRepository, RepositoryError};
 #[cfg(target_os = "linux")]

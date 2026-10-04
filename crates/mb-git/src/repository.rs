@@ -49,8 +49,8 @@ use crate::merge::{
     session_key, session_kind, session_kind_for_scope,
 };
 use crate::prune::{
-    GitPruneError, GitPruneReport, GitPruneRoots, has_pending_prune, prune_unreachable,
-    resume_pending_prune,
+    GitGuardedPrunePreview, GitPruneError, GitPruneReport, GitPruneRoots, has_pending_prune,
+    preview_guarded_prune, prune_unreachable, resume_pending_prune,
 };
 use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
 use crate::stage::{
@@ -1427,6 +1427,23 @@ impl GitRepository {
         }
         self.resume_checkout()?;
         Ok(prune_unreachable(
+            &self.catalog,
+            self.repository_id,
+            protected,
+        )?)
+    }
+
+    /// Enumerate guarded prune candidates without changing either catalog.
+    /// Only the node can use this result to start cross-catalog retirement.
+    pub fn preview_guarded_prune(
+        &self,
+        protected: &GitPruneRoots,
+    ) -> Result<GitGuardedPrunePreview, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
+        self.require_guarded_stage_ready()?;
+        Ok(preview_guarded_prune(
             &self.catalog,
             self.repository_id,
             protected,
