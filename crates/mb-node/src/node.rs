@@ -3681,12 +3681,6 @@ impl Node {
         protected: &GitPruneRoots,
     ) -> Result<GitPruneReport> {
         self.reconcile_guarded_git_prunes()?;
-        anyhow::ensure!(
-            !GuardedViewMount::all_git_recovery_pins(&self.control)?
-                .iter()
-                .any(|pin| pin.repository_id == repository_id),
-            "guarded Git prune waits for recovered root-pin retirement support"
-        );
         self.reconcile_guarded_git_stages()?;
         let repository = self.open_guarded_git_repository(repository_id)?;
         let mut report = GitPruneReport {
@@ -3823,17 +3817,6 @@ impl Node {
         bytes: &[u8],
     ) -> Result<()> {
         let recovery_pins = GuardedViewMount::all_git_recovery_pins(&self.control)?;
-        anyhow::ensure!(
-            !intent
-                .batch
-                .anchors
-                .iter()
-                .any(|candidate| recovery_pins.iter().any(|pin| {
-                    pin.repository_id == intent.repository_id
-                        && pin.root_file.anchor_id == candidate.manifest.anchor_id
-                })),
-            "guarded Git prune cannot retire a recovered root-backed mapping"
-        );
         intent.validate(intent.repository_id.as_bytes())?;
         anyhow::ensure!(
             self.control
@@ -3867,7 +3850,14 @@ impl Node {
             let pin = pins
                 .iter()
                 .find(|pin| pin.manifest.anchor_id == candidate.manifest.anchor_id);
+            let recovered_pin = recovery_pins
+                .iter()
+                .find(|pin| pin.root_file.anchor_id == candidate.manifest.anchor_id);
             if let Some(attempt_id) = candidate.attempt_id {
+                anyhow::ensure!(
+                    recovered_pin.is_none(),
+                    "guarded Git stage prune conflicts with a recovered root pin"
+                );
                 if let Some(existing) = existing {
                     anyhow::ensure!(
                         existing == marker.as_bytes() && pin.is_none(),
@@ -3887,9 +3877,31 @@ impl Node {
                         "guarded Git prune candidate lost its node-owned pin"
                     );
                 }
+            } else if candidate.manifest.format_version == 2 {
+                anyhow::ensure!(
+                    pin.is_none(),
+                    "recovered Git prune candidate has a stage pin"
+                );
+                if let Some(existing) = existing {
+                    anyhow::ensure!(
+                        existing == marker.as_bytes() && recovered_pin.is_none(),
+                        "recovered Git prune progress conflicts with a live pin"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        ready.is_none()
+                            && recovered_pin.is_some_and(|pin| {
+                                pin.repository_id == intent.repository_id
+                                    && pin.oid == candidate.oid
+                                    && pin.root_file == candidate.manifest
+                                    && pin.root_anchor_id().ok() == Some(root_anchor_id)
+                            }),
+                        "recovered Git prune candidate lost its node-owned pin"
+                    );
+                }
             } else {
                 anyhow::ensure!(
-                    existing.is_none() && pin.is_none(),
+                    existing.is_none() && pin.is_none() && recovered_pin.is_none(),
                     "unguarded Git prune candidate has a node-owned pin"
                 );
             }
@@ -3951,6 +3963,19 @@ impl Node {
                     &progress_kind,
                     marker.as_bytes(),
                 )?;
+            } else if candidate.manifest.format_version == 2
+                && self
+                    .control
+                    .get_record(&progress_kind, candidate.manifest.anchor_id.as_bytes())?
+                    .is_none()
+            {
+                GuardedViewMount::retire_git_recovery_pin_with_prune_progress(
+                    intent.repository_id,
+                    candidate.manifest.anchor_id,
+                    &self.control,
+                    &progress_kind,
+                    marker.as_bytes(),
+                )?;
             }
             if candidate.manifest.format_version == 1 && !deferred {
                 candidate.manifest.remove()?;
@@ -3974,7 +3999,9 @@ impl Node {
             .batch
             .anchors
             .iter()
-            .filter(|candidate| candidate.attempt_id.is_some())
+            .filter(|candidate| {
+                candidate.attempt_id.is_some() || candidate.manifest.format_version == 2
+            })
             .map(|candidate| {
                 (
                     progress_kind.clone(),
@@ -29196,12 +29223,12 @@ pub(crate) mod tests {
             git_catalog.guarded_catalog_recovery_rebinds().unwrap(),
             GuardedViewMount::all_git_recovery_pins(&git_node.control).unwrap()
         );
-        assert!(
+        assert_eq!(
             git_node
                 .git_prune(protected_root_id)
-                .unwrap_err()
-                .to_string()
-                .contains("recovered root-pin retirement")
+                .unwrap()
+                .native_anchors_removed,
+            0
         );
         let virtual_blob = mb_store::GuardedRootCapturePlan::verified_git_file_manifest(
             &git_node.control,
@@ -29297,6 +29324,101 @@ pub(crate) mod tests {
                 .unwrap()
         );
         git_node.reconcile_guarded_git_stages().unwrap();
+        let catalog_key = git_node.git_catalog_key(protected_root_id);
+        let catalog_db = ControlStore::open_existing_with_key(
+            git_binding.lower_root.join(".mutualbackup/catalog.db"),
+            &catalog_key,
+        )
+        .unwrap();
+        assert!(mb_git::remove_cached(&catalog_db, protected_root_id, "sample").unwrap());
+        catalog_db
+            .delete_record(
+                &format!("git-ref-v1/{protected_root_id}"),
+                b"refs/heads/main",
+            )
+            .unwrap();
+        drop(catalog_db);
+        let repository = GitRepository::open_with_catalog_root(
+            &git_target,
+            &git_binding.lower_root,
+            protected_root_id,
+            &catalog_key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let protected = git_node
+            .git_prune_protected_roots(protected_root_id)
+            .unwrap();
+        let batch = repository
+            .preview_guarded_prune(&protected)
+            .unwrap()
+            .first_batch()
+            .unwrap();
+        assert!(batch.anchors.iter().any(|candidate| {
+            candidate.manifest.anchor_id == recovered_pin.root_file.anchor_id
+                && candidate.manifest.format_version == 2
+                && candidate.attempt_id.is_none()
+        }));
+        let prune_intent = GuardedGitPruneIntentV1 {
+            format_version: 1,
+            repository_id: protected_root_id,
+            batch: batch.clone(),
+        };
+        let prune_bytes = canonical_bytes(&prune_intent).unwrap();
+        assert!(
+            git_node
+                .control
+                .put_record_if_absent(
+                    GUARDED_GIT_PRUNE_KIND,
+                    protected_root_id.as_bytes(),
+                    &prune_bytes,
+                )
+                .unwrap()
+        );
+        assert!(
+            repository
+                .retire_guarded_prune_catalog(&batch, &protected)
+                .unwrap()
+        );
+        drop(repository);
+        drop(git_node);
+        let git_node = Node::open(&git_data_dir, Seed::from_bytes([241; 32])).unwrap();
+        assert!(
+            GuardedViewMount::all_git_recovery_pins(&git_node.control)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            git_node
+                .control
+                .get_record(
+                    "guarded-git-root-pin-v1",
+                    signed_root_manifest.anchor_id.as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
+        let repository = GitRepository::open_with_catalog_root(
+            &git_target,
+            &git_binding.lower_root,
+            protected_root_id,
+            &catalog_key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        assert!(
+            repository
+                .guarded_catalog_recovery_rebinds()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repository.export_graph_source().unwrap().refs.is_empty());
+        assert!(
+            fs::read(git_target.join("sample"))
+                .unwrap()
+                .starts_with(b"GIT!")
+        );
+        drop(repository);
         drop(git_node);
         recovered.check_guarded_mounts().unwrap();
         assert!(fs::read(view.join("sample")).unwrap().starts_with(b"EDIT"));

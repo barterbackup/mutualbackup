@@ -123,7 +123,7 @@
   the FUSE view, interrupts after recipe installation, reopens to finish the
   mount, then edits the visible file without changing its signed blob or
   sector recipes and reopens the completed recovery. Finish production graph
-  capture and pinning, recovered-root prune/retirement, and broader no-duplicate
+  capture and pinning, broader recovered-blob prune and no-duplicate
   payload proof before lifting the production signing guard. A provisioned
   five-member seed-only network recovery gate for format 7 also remains open.
   Linux Git blob recovery streams verified sectors into a sparse native anchor
@@ -140,9 +140,16 @@
   ext4 and Btrfs recovery probes confirm the imported anchor is gone, the
   signed blob remains readable after a visible edit and daemon reopen, and a
   new virtual mapping is rejected once the file becomes editable. Guarded
-  prune currently refuses repositories with recovered root pins; add their
-  receipt and root-pin retirement to the fenced prune protocol before closing
-  the physical-deletion gate.
+  prune now treats a recovered virtual mapping as a distinct candidate: its
+  catalog transition removes the object map and recovery receipt together,
+  and the node retires the matching recovery pin and last Git root pin with a
+  durable progress marker. An interrupted catalog deletion replays before
+  normal pin reconciliation. The ext4 and Btrfs probes retain the live graph,
+  then remove local ref/index reachability in the synthetic fixture, interrupt
+  after catalog retirement, and confirm replay releases only Git ownership
+  while the edited visible file and signed root recipe survive. Production
+  signed graph capture, broader multi-blob/source-loss cases, and the
+  five-member seed-only gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

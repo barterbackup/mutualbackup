@@ -2022,6 +2022,66 @@ impl GuardedViewMount {
         Ok(pins)
     }
 
+    /// Retire a recovered virtual mapping after the node-fenced catalog batch
+    /// has removed its object map and recovery receipt. Keep the root pin while
+    /// any other staged or recovered Git mapping still needs that root.
+    pub fn retire_git_recovery_pin_with_prune_progress(
+        repository_id: Uuid,
+        anchor_id: Uuid,
+        control: &ControlStore,
+        marker_kind: &str,
+        marker_value: &[u8],
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !marker_kind.is_empty()
+                && !marker_value.is_empty()
+                && control
+                    .get_record(marker_kind, anchor_id.as_bytes())?
+                    .is_none(),
+            "recovered Git prune progress already exists"
+        );
+        let bytes = control
+            .get_record(GIT_RECOVERY_PIN_KIND, anchor_id.as_bytes())?
+            .context("recovered Git anchor has no node-owned pin")?;
+        let pin: GuardedGitRecoveryPin = mb_core::decode_canonical(&bytes)?;
+        let root_anchor_id = pin.root_anchor_id()?;
+        ensure!(
+            pin.repository_id == repository_id
+                && pin.imported.anchor_id == anchor_id
+                && mb_core::canonical_bytes(&pin)? == bytes
+                && git_root_pin(control, root_anchor_id)?
+                    .is_some_and(|(_, root)| root.repository_id == repository_id),
+            "recovered Git prune pin differs from its root owner"
+        );
+        let other_recovery = Self::all_git_recovery_pins(control)?.iter().any(|other| {
+            other.imported.anchor_id != anchor_id
+                && other.root_anchor_id().ok() == Some(root_anchor_id)
+        });
+        let other_stage = Self::all_git_stage_pins(control)?
+            .iter()
+            .any(|other| other.root_anchor_id == root_anchor_id);
+        let deletions = if other_recovery || other_stage {
+            Vec::new()
+        } else {
+            vec![(
+                GIT_ROOT_PIN_KIND.to_owned(),
+                root_anchor_id.as_bytes().to_vec(),
+            )]
+        };
+        control.put_records_and_retire_and_delete_if_value(
+            &[(
+                marker_kind.to_owned(),
+                anchor_id.as_bytes().to_vec(),
+                marker_value.to_vec(),
+            )],
+            &deletions,
+            GIT_RECOVERY_PIN_KIND,
+            anchor_id.as_bytes(),
+            &bytes,
+        )?;
+        Ok(())
+    }
+
     /// Retire a node-owned Git pin only after the caller proves that the Git
     /// catalog no longer maps this anchor and no signed revision or recipe
     /// needs it. The root pin leaves with the last file pin for that root.

@@ -57,7 +57,7 @@ const GUARDED_STAGE_RECEIPT_PREFIX: &str = "git-guarded-stage-receipt-v1/";
 const GUARDED_RECOVERY_REBIND_PREFIX: &str = "git-guarded-recovery-rebind-v1/";
 
 #[cfg(target_os = "linux")]
-fn guarded_recovery_rebind_kind(repository_id: Uuid) -> String {
+pub(crate) fn guarded_recovery_rebind_kind(repository_id: Uuid) -> String {
     format!("{GUARDED_RECOVERY_REBIND_PREFIX}{repository_id}")
 }
 

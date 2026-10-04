@@ -19,8 +19,9 @@ use crate::history::{HistoryError, export_graph_source, metadata_kind, verified_
 use crate::merge::{MergeBlobError, has_merge_session, has_pending_merge_blob};
 use crate::stage::{
     StageError, guarded_catalog_recovery_rebinds, guarded_catalog_stage_pins,
-    guarded_stage_receipt_kind, has_pending_stages, has_pending_stages_for_scope, object_kind,
-    object_kind_prefix, staged_entries, staged_entries_for_scope, worktree_scopes_with_stage_state,
+    guarded_recovery_rebind_kind, guarded_stage_receipt_kind, has_pending_stages,
+    has_pending_stages_for_scope, object_kind, object_kind_prefix, staged_entries,
+    staged_entries_for_scope, worktree_scopes_with_stage_state,
 };
 
 const INTENT_PREFIX: &str = "git-prune-intent-v1/";
@@ -167,7 +168,6 @@ fn validate_guarded_batch(batch: &GitGuardedPrunePreview) -> Result<(), GitPrune
                 && candidate.manifest.guarded_root_file.is_none()
             || candidate.manifest.format_version == 1
                 && candidate.manifest.guarded_root_file.is_some()
-            || candidate.manifest.format_version == 2 && candidate.attempt_id.is_none()
             || !anchors.insert(candidate.manifest.anchor_id)
             || candidate
                 .attempt_id
@@ -202,6 +202,13 @@ fn guarded_batch_records_absent(
                 .get_record(
                     &guarded_stage_receipt_kind(batch.repository_id),
                     attempt.as_bytes(),
+                )?
+                .is_none();
+        } else if candidate.manifest.format_version == 2 {
+            absent &= control
+                .get_record(
+                    &guarded_recovery_rebind_kind(batch.repository_id),
+                    candidate.manifest.anchor_id.as_bytes(),
                 )?
                 .is_none();
         }
@@ -239,13 +246,10 @@ pub(crate) fn retire_guarded_prune_catalog(
 
     let receipts = guarded_catalog_stage_pins(control, batch.repository_id)?;
     let recovered = guarded_catalog_recovery_rebinds(control, batch.repository_id)?;
-    if batch.anchors.iter().any(|candidate| {
-        recovered
-            .iter()
-            .any(|pin| pin.root_file.anchor_id == candidate.manifest.anchor_id)
-    }) {
-        return Err(GitPruneError::PendingOperation);
-    }
+    let recovered_by_anchor = recovered
+        .iter()
+        .map(|pin| (pin.root_file.anchor_id, pin))
+        .collect::<HashMap<_, _>>();
     let by_attempt = receipts
         .iter()
         .map(|pin| (pin.attempt_id, pin))
@@ -282,6 +286,25 @@ pub(crate) fn retire_guarded_prune_catalog(
             let kind = guarded_stage_receipt_kind(batch.repository_id);
             present += usize::from(control.get_record(&kind, attempt.as_bytes())?.is_some());
             deletions.push((kind, attempt.as_bytes().to_vec()));
+        } else if candidate.manifest.format_version == 2 {
+            let recovered = recovered_by_anchor
+                .get(&candidate.manifest.anchor_id)
+                .ok_or(GitPruneError::IncompatibleRecord)?;
+            if recovered.root_file != candidate.manifest
+                || recovered.oid != candidate.oid
+                || receipts
+                    .iter()
+                    .any(|pin| pin.manifest.anchor_id == candidate.manifest.anchor_id)
+            {
+                return Err(GitPruneError::IncompatibleRecord);
+            }
+            let kind = guarded_recovery_rebind_kind(batch.repository_id);
+            present += usize::from(
+                control
+                    .get_record(&kind, candidate.manifest.anchor_id.as_bytes())?
+                    .is_some(),
+            );
+            deletions.push((kind, candidate.manifest.anchor_id.as_bytes().to_vec()));
         } else if receipts
             .iter()
             .any(|pin| pin.manifest.anchor_id == candidate.manifest.anchor_id)
