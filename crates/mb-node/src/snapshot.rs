@@ -3025,10 +3025,15 @@ pub(crate) fn install_guarded_recovery_root_recipes(
                     .is_none_or(|previous| previous == locator.area.path_hint),
                 "recovered Git anchors disagree about their area location"
             );
+            // A visible guarded file already owns a verified root-anchor
+            // recipe for this sector. Keep that source when Git names the
+            // same signed bytes, so retiring the imported Git anchor later
+            // cannot strand the revision's sector recipe.
+            let retained = recipes
+                .entry(recipe.reference.id)
+                .or_insert_with(|| recipe.clone());
             ensure!(
-                recipes
-                    .insert(recipe.reference.id, recipe.clone())
-                    .is_none_or(|previous| previous.reference == recipe.reference),
+                retained.reference == recipe.reference,
                 "guarded recovery Git sector conflicts with signed file sector"
             );
         }

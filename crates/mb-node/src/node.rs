@@ -29024,6 +29024,17 @@ pub(crate) mod tests {
                 .as_bytes(),
             git_blob_oid.as_bytes()
         );
+        let signed_root_manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &git_node
+                .control
+                .get_record("anchor-manifest", git_signed.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let recipe_anchors = git_prune_recipe_anchor_ids(&git_node.control).unwrap();
+        assert!(recipe_anchors.contains(&signed_root_manifest.anchor_id));
+        assert!(!recipe_anchors.contains(&recovered_graph.blobs[0].anchor.anchor_id));
         let git_edit = Command::new("python3")
             .uid(65534)
             .gid(65534)

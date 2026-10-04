@@ -128,8 +128,14 @@
   production signing guard. A provisioned five-member seed-only network
   recovery gate for format 7 also remains open. Linux Git blob recovery streams
   verified sectors into a sparse native anchor without a temporary worktree
-  payload or reflink; reusing a recovered root
-  file anchor for an identical Git blob remains open.
+  payload or reflink; moving an identical Git blob's catalog mapping onto the
+  recovered root file anchor remains open. When a signed Git sector
+  is also a visible guarded-file sector, recovery now retains the root-anchor
+  recipe instead of replacing it with the imported Git anchor. The privileged
+  ext4 and Btrfs probe confirms that the imported anchor no longer owns those
+  sector recipes after the mount. A durable catalog mapping and pin handoff
+  must still move the Git blob to the recovered root anchor and retire the
+  imported payload before this storage gate closes.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
