@@ -704,6 +704,13 @@ Proactive background repair comes later.
   immutable source bytes, metadata, source filesystem capabilities, restore
   behavior, and reachability pins. Every backend must capture and restore file
   content byte-for-byte; a backend that cannot do so rejects the operation.
+  For a staged file with source bytes `B`, its immutable anchor, Git blob
+  payload, exported Git blob, and an unedited checkout must all contain `B`.
+  A Git blob imported from an ordinary repository becomes the authoritative
+  `B` for our checkout, regardless of that repository's attributes or the
+  other client's worktree presentation. Reflinks or guarded hard links may
+  share physical extents, but no Git index, object database, pack cache, or
+  worktree may retain a second permanent copy merely for compatibility.
   Verify the captured bytes before publishing an index entry or revision and
   the restored bytes before replacing a worktree file. A mismatch is an
   operation failure, never a reason to normalize line endings or run a Git
@@ -3798,9 +3805,10 @@ an unconditional repository invariant, not a configurable compatibility mode.
   writable-open and shared-mapping detach, `chmod` and pathname truncate,
   rename/unlink, replayable new-file creation, atomic replacement, and remount
   recovery. Make enrollment a durable, restartable transition from a private
-  lower tree to a supervised view. A separate lower/view path is an initial
-  operational slice; finish original-path migration and data-preserving root
-  removal before closing the guarded backend gate. Before removal restores
+  lower tree to a supervised view. Separate lower/view and original-path
+  handoffs are operational slices; complete the original-path metadata and
+  failure gate and data-preserving root removal before closing the guarded
+  backend gate. Before removal restores
   ordinary ownership, detach every live lower file from immutable anchors
   under a stopped-view fence, then durably hand its current namespace and
   visible metadata back to the user. Never expose a raw hard
