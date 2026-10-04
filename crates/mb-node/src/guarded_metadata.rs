@@ -11,9 +11,10 @@ use anyhow::{Context, Result, bail, ensure};
 use mb_core::{V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_bytes, decode_canonical};
 use mb_store::{
     FileExtent, GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewEntryKind,
-    GuardedViewMetadataEntry, NativeFileId, PinnedDirectory,
+    GuardedViewMetadataEntry, GuardedViewMetadataV1, NativeFileId, PinnedDirectory,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::snapshot::{PrivateDataExtent, validate_file_extents};
 
@@ -397,6 +398,31 @@ impl GuardedPrivateMetadataV6 {
             "guarded restored tree has an unrecorded or replaced name"
         );
         Ok((root_id, bound))
+    }
+
+    /// Construct a guarded view's local presentation metadata from the
+    /// authenticated portable form and a freshly restored tree. The new
+    /// anchor ID is local; all visible attributes remain the signed values.
+    pub fn bind_restored_view(
+        &self,
+        root: &PinnedDirectory,
+        anchor_id: Uuid,
+    ) -> Result<GuardedViewMetadataV1> {
+        ensure!(!anchor_id.is_nil(), "guarded recovered anchor ID is nil");
+        let (lower_root_id, entries) = self.bind_restored_entries(root)?;
+        Ok(GuardedViewMetadataV1 {
+            format_version: 1,
+            anchor_id,
+            lower_root_id,
+            root_mode: self.root.mode,
+            root_uid: self.root.uid,
+            root_gid: self.root.gid,
+            root_atime_secs: self.root.atime_secs,
+            root_atime_nanos: self.root.atime_nanos,
+            root_modified_secs: self.root.modified_secs,
+            root_modified_nanos: self.root.modified_nanos,
+            entries,
+        })
     }
 }
 

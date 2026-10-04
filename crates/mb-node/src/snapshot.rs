@@ -2458,7 +2458,7 @@ fn load_private_metadata_with_git(
     )?)
 }
 
-fn load_private_metadata_bytes(
+pub(crate) fn load_private_metadata_bytes(
     control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],

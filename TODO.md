@@ -899,10 +899,14 @@
   every entry against its sealed capture, and persist root/entry ownership,
   root/directory modes, and directory lengths across remount; a local
   disposable-Btrfs FUSE test covers rejection before publication, exact file
-  bytes, chmod precedence, remount, and retirement cleanup. The node recovery
-  job still needs to create and register that guarded view from the signed
-  format-6 data, especially on non-reflink filesystems, before guarded
-  enrollment can be enabled.
+  bytes, chmod precedence, remount, and retirement cleanup. The privileged
+  node fixture now decodes the actual signed format-6 sectors, binds them to
+  newly restored local inodes, and mounts the resulting guarded view with its
+  raw names and virtual directory length. That path passes locally on ext4
+  and disposable Btrfs, including remount. The production recovery job still
+  needs a replayable transition from its published restored directory to a
+  private lower tree, guarded root registration/backend selection, and a
+  non-reflink recovery path before guarded enrollment can be enabled.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

@@ -24829,6 +24829,83 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(fs::read(restored.join("sample")).unwrap(), captured_bytes);
         assert_eq!(fs::read(restored.join(&raw_path)).unwrap(), raw_edited);
+        // Bind the actual signed private metadata to a newly restored local
+        // tree, then prove that the guarded view can present it on ext4 as
+        // well as Btrfs. The production recovery job still needs the
+        // replayable path transition from target directory to private lower.
+        let signed_private = crate::GuardedPrivateMetadataV6::decode(
+            &crate::snapshot::load_private_metadata_bytes(
+                &recovered.control,
+                &keys,
+                guild_id,
+                &signed,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let restored_plan = mb_store::GuardedRootCapturePlan::plan(&restored).unwrap();
+        let virtual_metadata = signed_private
+            .bind_restored_view(
+                &PinnedDirectory::open(&restored).unwrap(),
+                restored_plan.anchor_id(),
+            )
+            .unwrap();
+        assert_eq!(virtual_metadata.root_uid, signed_private.root.uid);
+        assert!(
+            virtual_metadata
+                .entries
+                .iter()
+                .any(|entry| entry.path == raw_path.as_os_str().as_bytes())
+        );
+        let restored_manifest = restored_plan
+            .capture_private_file_owners(&recovered.control, 65534, 0, 0)
+            .unwrap();
+        restored_plan
+            .isolate_lower_directories(&recovered.control, &restored_manifest)
+            .unwrap();
+        let restored_view = area.path().join("restored-view");
+        fs::create_dir(&restored_view).unwrap();
+        let restored_control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap(),
+        ));
+        let restored_mount = GuardedViewMount::start_with_virtual_metadata(
+            &restored_manifest,
+            Arc::clone(&restored_control),
+            &restored_view,
+            65534,
+            65534,
+            virtual_metadata.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(restored_view.join(&raw_directory))
+                .unwrap()
+                .len(),
+            virtual_metadata
+                .entries
+                .iter()
+                .find(|entry| entry.path == raw_directory.as_bytes())
+                .unwrap()
+                .logical_len
+        );
+        assert_eq!(
+            fs::read(restored_view.join("sample")).unwrap(),
+            captured_bytes
+        );
+        assert_eq!(fs::read(restored_view.join(&raw_path)).unwrap(), raw_edited);
+        restored_mount.stop().unwrap();
+        let remounted = GuardedViewMount::recover_claimed(
+            restored_manifest.anchor_id,
+            Arc::clone(&restored_control),
+        )
+        .unwrap();
+        assert_eq!(fs::read(restored_view.join(&raw_path)).unwrap(), raw_edited);
+        remounted.stop().unwrap();
+        let store = restored_control.lock().unwrap();
+        GuardedViewMount::retire_claim(restored_manifest.anchor_id, &store).unwrap();
+        restored_plan.discard_unreferenced(&store).unwrap();
+        drop(store);
+        drop(restored_control);
         if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
             let ciphertexts = signed
                 .value
