@@ -16,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -51,7 +51,44 @@ const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
 const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
 const DIRECTORY_MODE_KIND: &str = "guarded-view-directory-mode-v1";
+const VIRTUAL_TIME_DIRTY_KIND: &str = "guarded-view-virtual-time-dirty-v1";
 pub(crate) const FILE_GUARD_KIND: &str = "guarded-view-file-guard-v1";
+
+pub(crate) fn virtual_time_dirty_masks(
+    control: &ControlStore,
+    anchor_id: Uuid,
+    max_inode: u64,
+) -> anyhow::Result<HashMap<u64, u8>> {
+    let mut dirty = HashMap::new();
+    for (id, value) in control.records(VIRTUAL_TIME_DIRTY_KIND)? {
+        if !id.starts_with(anchor_id.as_bytes()) {
+            continue;
+        }
+        ensure!(
+            id.len() == 24 && value.len() == 1 && (1..=3).contains(&value[0]),
+            "invalid guarded virtual time dirty record"
+        );
+        let inode = u64::from_le_bytes(id[16..24].try_into()?);
+        ensure!(
+            (1..max_inode).contains(&inode) && dirty.insert(inode, value[0]).is_none(),
+            "guarded virtual time dirty record has another inode"
+        );
+    }
+    Ok(dirty)
+}
+
+pub(crate) fn retire_virtual_time_dirty(
+    control: &ControlStore,
+    anchor_id: Uuid,
+) -> anyhow::Result<()> {
+    for (id, value) in control.records(VIRTUAL_TIME_DIRTY_KIND)? {
+        if id.starts_with(anchor_id.as_bytes()) {
+            ensure!(id.len() == 24, "invalid guarded virtual time dirty key");
+            control.delete_record_if_value(VIRTUAL_TIME_DIRTY_KIND, &id, &value)?;
+        }
+    }
+    Ok(())
+}
 
 /// The mount must be retired before root cleanup. A pending FUSE namespace
 /// operation needs remount replay first; retiring anchors against either side
@@ -303,6 +340,32 @@ struct GuardedNamespace {
 }
 
 impl GuardedNamespace {
+    fn mark_virtual_time_dirty(&self, inode: u64, mask: u8) -> io::Result<()> {
+        if !(1..=3).contains(&mask) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let control = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        let id = self.record_id(inode);
+        let previous = control
+            .get_record(VIRTUAL_TIME_DIRTY_KIND, &id)
+            .map_err(io::Error::other)?;
+        let previous = match previous {
+            Some(bytes) if bytes.len() == 1 && (1..=3).contains(&bytes[0]) => bytes[0],
+            Some(_) => {
+                return Err(io::Error::other(
+                    "invalid guarded virtual time dirty record",
+                ));
+            }
+            None => 0,
+        };
+        control
+            .put_record(VIRTUAL_TIME_DIRTY_KIND, &id, &[previous | mask])
+            .map_err(io::Error::other)
+    }
+
     fn root_mode(&self, captured: u16) -> anyhow::Result<u16> {
         let bytes = self
             .control
@@ -2135,10 +2198,11 @@ pub(crate) struct GuardedViewTimeBaselineV1 {
     pub entries: Vec<GuardedTimePair>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GuardedVirtualTime {
     signed: GuardedTimePair,
     baseline: GuardedTimePair,
+    dirty: Arc<AtomicU8>,
 }
 
 impl GuardedTimePair {
@@ -2159,21 +2223,24 @@ impl GuardedTimePair {
 }
 
 impl GuardedVirtualTime {
-    fn apply(self, attr: &mut FileAttr) -> io::Result<()> {
-        if attr.atime
-            == unix_system_time(
-                self.baseline.atime_secs,
-                i64::from(self.baseline.atime_nanos),
-            )?
+    fn apply(&self, attr: &mut FileAttr) -> io::Result<()> {
+        let dirty = self.dirty.load(Ordering::Acquire);
+        if dirty & 1 == 0
+            && attr.atime
+                == unix_system_time(
+                    self.baseline.atime_secs,
+                    i64::from(self.baseline.atime_nanos),
+                )?
         {
             attr.atime =
                 unix_system_time(self.signed.atime_secs, i64::from(self.signed.atime_nanos))?;
         }
-        if attr.mtime
-            == unix_system_time(
-                self.baseline.modified_secs,
-                i64::from(self.baseline.modified_nanos),
-            )?
+        if dirty & 2 == 0
+            && attr.mtime
+                == unix_system_time(
+                    self.baseline.modified_secs,
+                    i64::from(self.baseline.modified_nanos),
+                )?
         {
             attr.mtime = unix_system_time(
                 self.signed.modified_secs,
@@ -2264,7 +2331,7 @@ impl GuardedProbeFile {
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
         attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
-        if let Some(virtual_time) = *self.virtual_time.lock().unwrap() {
+        if let Some(virtual_time) = self.virtual_time.lock().unwrap().as_ref() {
             virtual_time.apply(&mut attr)?;
         }
         Ok(*attr)
@@ -2329,6 +2396,25 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    fn mark_virtual_time_dirty(&self, inode: INodeNo, mask: u8) -> io::Result<()> {
+        let virtual_time = if inode == INodeNo::ROOT {
+            self.root_virtual_time.clone()
+        } else if let Some(directory) = self.directory(inode.0) {
+            directory.virtual_time
+        } else {
+            self.file(inode.0)
+                .and_then(|file| file.virtual_time.lock().unwrap().clone())
+        };
+        if let Some(virtual_time) = virtual_time {
+            self.namespace
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?
+                .mark_virtual_time_dirty(inode.0, mask)?;
+            virtual_time.dirty.fetch_or(mask, Ordering::Release);
+        }
+        Ok(())
+    }
+
     pub(crate) fn capture_time_baseline(
         &self,
         metadata: &GuardedViewMetadataV1,
@@ -2382,6 +2468,7 @@ impl GuardedProbeView {
         &mut self,
         metadata: &GuardedViewMetadataV1,
         baseline: Option<&GuardedViewTimeBaselineV1>,
+        dirty_times: &HashMap<u64, u8>,
         initial_mount: bool,
     ) -> anyhow::Result<()> {
         self.root_uid = metadata.root_uid;
@@ -2401,6 +2488,7 @@ impl GuardedProbeView {
                     modified_nanos: metadata.root_modified_nanos,
                 },
                 baseline: baseline.root,
+                dirty: Arc::new(AtomicU8::new(dirty_times.get(&1).copied().unwrap_or(0))),
             });
         }
         for (index, entry) in metadata.entries.iter().enumerate() {
@@ -2416,6 +2504,7 @@ impl GuardedProbeView {
                     modified_nanos: entry.modified_nanos,
                 },
                 baseline: baseline.entries[index],
+                dirty: Arc::new(AtomicU8::new(dirty_times.get(&inode).copied().unwrap_or(0))),
             });
             match entry.kind {
                 GuardedViewEntryKind::Directory => {
@@ -2423,7 +2512,7 @@ impl GuardedProbeView {
                         directory.attr.size = entry.logical_len;
                         directory.attr.uid = entry.uid;
                         directory.attr.gid = entry.gid;
-                        directory.virtual_time = virtual_time;
+                        directory.virtual_time = virtual_time.clone();
                         present = true;
                     }
                     if let Some(directory) =
@@ -2432,7 +2521,7 @@ impl GuardedProbeView {
                         directory.attr.size = entry.logical_len;
                         directory.attr.uid = entry.uid;
                         directory.attr.gid = entry.gid;
-                        directory.virtual_time = virtual_time;
+                        directory.virtual_time = virtual_time.clone();
                         present = true;
                     }
                     if present {
@@ -2444,14 +2533,14 @@ impl GuardedProbeView {
                         let mut attr = file.source_attr.lock().unwrap();
                         attr.uid = entry.uid;
                         attr.gid = entry.gid;
-                        *file.virtual_time.lock().unwrap() = virtual_time;
+                        *file.virtual_time.lock().unwrap() = virtual_time.clone();
                         present = true;
                     }
                     if let Some(file) = self.dynamic_files.get_mut().unwrap().get(&inode) {
                         let mut attr = file.source_attr.lock().unwrap();
                         attr.uid = entry.uid;
                         attr.gid = entry.gid;
-                        *file.virtual_time.lock().unwrap() = virtual_time;
+                        *file.virtual_time.lock().unwrap() = virtual_time.clone();
                         present = true;
                     }
                 }
@@ -3654,7 +3743,7 @@ impl GuardedProbeView {
             attr.mtime = metadata.modified()?;
             attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
         }
-        if let Some(virtual_time) = self.root_virtual_time {
+        if let Some(virtual_time) = &self.root_virtual_time {
             virtual_time.apply(&mut attr)?;
         }
         Ok(attr)
@@ -3675,7 +3764,7 @@ impl GuardedProbeView {
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
         attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
-        if let Some(virtual_time) = directory.virtual_time {
+        if let Some(virtual_time) = &directory.virtual_time {
             virtual_time.apply(&mut attr)?;
         }
         attr.perm = self
@@ -4110,6 +4199,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EINVAL);
             return;
         }
+        let time_mask = u8::from(atime.is_some()) | (u8::from(mtime.is_some()) << 1);
         if inode == INodeNo::ROOT || self.directory(inode.0).is_some() {
             if size.is_some() || handle.is_some() {
                 reply.error(Errno::EINVAL);
@@ -4127,6 +4217,7 @@ impl Filesystem for GuardedProbeView {
                         .as_ref()
                         .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
                     if let Some(times) = requested_file_times(atime, mtime) {
+                        self.mark_virtual_time_dirty(inode, time_mask)?;
                         lower_root.as_file().set_times(times)?;
                         lower_root.sync_all().map_err(io::Error::other)?;
                     }
@@ -4170,6 +4261,7 @@ impl Filesystem for GuardedProbeView {
                     namespace.store_directory_mode(inode.0, (mode & 0o7777) as u16)?;
                 }
                 if let Some(times) = requested_file_times(atime, mtime) {
+                    self.mark_virtual_time_dirty(inode, time_mask)?;
                     lower.as_file().set_times(times)?;
                 }
                 lower.sync_all().map_err(io::Error::other)?;
@@ -4240,6 +4332,7 @@ impl Filesystem for GuardedProbeView {
                 source.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
             }
             if let Some(times) = requested_file_times(atime, mtime) {
+                self.mark_virtual_time_dirty(inode, time_mask)?;
                 source.set_times(times)?;
             }
             source.sync_all()?;

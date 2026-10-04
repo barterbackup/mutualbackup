@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::guarded_view_probe::{
     GuardedProbeView, GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
-    GuardedViewTimeBaselineV1,
+    GuardedViewTimeBaselineV1, retire_virtual_time_dirty, virtual_time_dirty_masks,
 };
 use crate::{
     CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedRootCapturePlan,
@@ -648,6 +648,7 @@ impl GuardedViewMount {
             );
             control.delete_record(VIRTUAL_METADATA_KIND, id)?;
             control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
+            retire_virtual_time_dirty(control, anchor_id)?;
             return Ok(());
         };
         let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
@@ -675,6 +676,7 @@ impl GuardedViewMount {
         control.delete_record_if_value(MOUNT_CLAIM_KIND, id, &claim_bytes)?;
         control.delete_record(VIRTUAL_METADATA_KIND, id)?;
         control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
+        retire_virtual_time_dirty(control, anchor_id)?;
         Ok(())
     }
 
@@ -834,6 +836,18 @@ impl GuardedViewMount {
                 })
                 .transpose()?
         };
+        let dirty_times = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            virtual_time_dirty_masks(
+                &control,
+                manifest.anchor_id,
+                u64::try_from(manifest.entries.len())?
+                    .checked_add(2)
+                    .context("guarded virtual inode overflow")?,
+            )?
+        };
         if let Some(metadata) = &virtual_metadata {
             validate_virtual_metadata_binding(metadata, manifest, &plan)?;
             ensure!(
@@ -862,6 +876,11 @@ impl GuardedViewMount {
                     && baseline.root.valid()
                     && baseline.entries.iter().all(|entry| entry.valid()),
                 "guarded virtual time baseline differs from signed metadata"
+            );
+        } else {
+            ensure!(
+                dirty_times.is_empty(),
+                "guarded virtual time change lacks its baseline"
             );
         }
         if let Some(claim) = &existing {
@@ -951,6 +970,7 @@ impl GuardedViewMount {
             view.apply_virtual_metadata(
                 metadata,
                 time_baseline.as_ref().or(new_time_baseline.as_ref()),
+                &dirty_times,
                 existing.is_none(),
             )?;
         }
@@ -2543,6 +2563,8 @@ print('DONE', flush=True)
             b"raw\r\nbytes\0"
         );
         fs::set_permissions(mountpoint.join("nested"), fs::Permissions::from_mode(0o711)).unwrap();
+        let lower_nested = fs::metadata(lower.join("nested")).unwrap();
+        let baseline_mtime = (lower_nested.mtime(), lower_nested.mtime_nsec());
         let nested_path = CString::new(mountpoint.join("nested").as_os_str().as_bytes()).unwrap();
         let times = [
             libc::timespec {
@@ -2578,6 +2600,39 @@ print('DONE', flush=True)
             fs::metadata(mountpoint.join("nested/file")).unwrap().uid(),
             65533
         );
+        let reset_times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: baseline_mtime.0,
+                tv_nsec: baseline_mtime.1,
+            },
+        ];
+        // SAFETY: the path remains NUL-free and both timespec values are valid.
+        assert_eq!(
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    nested_path.as_ptr(),
+                    reset_times.as_ptr(),
+                    0,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().mtime(),
+            baseline_mtime.0
+        );
+        remounted.stop().unwrap();
+        let remounted =
+            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().mtime(),
+            baseline_mtime.0
+        );
         remounted.stop().unwrap();
         let store = control.lock().unwrap();
         GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
@@ -2595,6 +2650,15 @@ print('DONE', flush=True)
                 )
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            super::virtual_time_dirty_masks(
+                &store,
+                manifest.anchor_id,
+                u64::try_from(manifest.entries.len()).unwrap() + 2,
+            )
+            .unwrap()
+            .is_empty()
         );
         plan.discard_unreferenced(&store).unwrap();
     }

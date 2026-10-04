@@ -908,7 +908,11 @@
   time baseline and presents signed atime/mtime until the lower time changes;
   a changed directory mtime remains visible after remount. Focused privileged
   ext4/Btrfs probes cover signed times, a changed directory mtime, and
-  baseline cleanup on retirement. The production recovery job still
+  baseline cleanup on retirement. Explicit FUSE timestamp setters now record
+  durable per-inode dirty bits before changing the lower inode, so setting a
+  time back to its original lower value cannot resurrect the signed time after
+  remount; the ext4/Btrfs probes cover that sequence and dirty-record cleanup.
+  The production recovery job still
   needs a replayable transition from its published restored directory to a
   private lower tree, guarded root registration/backend selection, and a
   non-reflink recovery path before guarded enrollment can be enabled.
