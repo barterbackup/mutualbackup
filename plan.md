@@ -735,6 +735,13 @@ Proactive background repair comes later.
   its verified private lower root and hide it from the editable view; the FUSE
   mount does not provide the remount-stable filesystem identity required by
   native catalog and anchor operations.
+  Treat a pre-existing `.git` directory as a separate stock-Git repository,
+  never as native history or a file tree to stage recursively. Any takeover of
+  that worktree must be an explicit import with one catalog writer: import the
+  Git graph by its stored object bytes, and capture current working files as
+  their raw bytes. If stock Git filters made a worktree file differ from its
+  stored blob, show that difference and require an explicit choice to stage it;
+  do not quietly normalize the file or claim the two byte strings are one blob.
 - Stage a regular file by first creating and durably recording an immutable same-
   filesystem reflink of the user's bytes. Hash that captured file through the
   Git library, record its blob ID, source locator, and index entry atomically
@@ -3805,6 +3812,9 @@ an unconditional repository invariant, not a configurable compatibility mode.
   pack space and memory for large and sparse files. The bridge preserves the
   exchanged Git blob bytes and object IDs; a stock Git client's own attributes
   or config may transform its external working tree outside our control.
+  Include an explicit existing-repository takeover path in this interop gate:
+  preserve imported refs and object IDs, keep `.git` outside native protection,
+  and make any raw worktree-versus-Git-blob difference visible before staging.
 - Define Git-facing history expiry and prune/GC over refs, index, worktrees,
   retained signed revisions, explicit protection pins, and in-flight work.
   For a guarded repository, enumerate catalog candidates and their stage
@@ -3890,6 +3900,10 @@ an unconditional repository invariant, not a configurable compatibility mode.
   extent-sharing assertions for stage and each same-filesystem checkout, COW
   isolation after worktree edits, and physical-deletion measurements; and
   bidirectional stock-Git round trips without a persistent payload mirror.
+  Include takeover of a stock-Git worktree whose CRLF file differs from its LF
+  blob: the imported blob and object ID remain LF, the worktree remains CRLF
+  until an explicit user operation, and no `.git` payload is copied into native
+  anchors or backed-up as user files.
 - Close guarded link-freeze separately with its full atomic edit/failure and
   anchor-recovery probe, including `ENOSPC`, unknown hard-link aliases, and
   restart at each permission and sparse-detach transition. Before enabling a
