@@ -132,6 +132,17 @@ impl GuardedGitPrivateMetadataV7 {
         self.guarded.validate()?;
         self.git.validate()?;
         ensure!(
+            self.guarded.entries.iter().all(|entry| {
+                PathBuf::from(OsString::from_vec(entry.path().to_vec()))
+                    .components()
+                    .next()
+                    .is_none_or(|component| {
+                        component.as_os_str() != mb_store::GIT_CATALOG_DIRECTORY
+                    })
+            }),
+            "guarded Git namespace includes its private catalog"
+        );
+        ensure!(
             canonical_bytes(self)?.len() <= V1_MAX_CATALOG_BYTES,
             "guarded Git private metadata exceeds the catalog bound"
         );
@@ -331,6 +342,23 @@ impl GuardedPrivateMetadataV6 {
         &self,
         root: &PinnedDirectory,
     ) -> Result<(NativeFileId, Vec<GuardedViewMetadataEntry>)> {
+        self.bind_restored_entries_with_catalog_policy(root, None)
+    }
+
+    pub(crate) fn bind_restored_entries_with_git_catalog(
+        &self,
+        root: &PinnedDirectory,
+        repository_id: Uuid,
+        catalog_id: NativeFileId,
+    ) -> Result<(NativeFileId, Vec<GuardedViewMetadataEntry>)> {
+        self.bind_restored_entries_with_catalog_policy(root, Some((repository_id, catalog_id)))
+    }
+
+    fn bind_restored_entries_with_catalog_policy(
+        &self,
+        root: &PinnedDirectory,
+        catalog: Option<(Uuid, NativeFileId)>,
+    ) -> Result<(NativeFileId, Vec<GuardedViewMetadataEntry>)> {
         self.validate()?;
         let root_id = root.identity()?;
         let mut expected = BTreeMap::new();
@@ -431,8 +459,13 @@ impl GuardedPrivateMetadataV6 {
             groups.values().all(|(_, links, bound)| links == bound),
             "guarded restored inode has an unrecorded hard-link alias"
         );
+        let exact = if let Some((repository_id, catalog_id)) = catalog {
+            root.exact_descendant_paths_with_git_catalog(&expected, repository_id, catalog_id)?
+        } else {
+            root.exact_descendant_paths(&expected)?
+        };
         ensure!(
-            root.exact_descendant_paths(&expected)?,
+            exact,
             "guarded restored tree has an unrecorded or replaced name"
         );
         Ok((root_id, bound))
@@ -562,6 +595,16 @@ mod tests {
             metadata
         );
         assert!(GuardedGitPrivateMetadataV7::decode(&encoded, Uuid::new_v4()).is_err());
+        let mut colliding = metadata.clone();
+        colliding
+            .guarded
+            .entries
+            .push(GuardedPrivateEntryV6::Directory {
+                path: b".mutualbackup".to_vec(),
+                stat: colliding.guarded.root.clone(),
+                logical_len: 4096,
+            });
+        assert!(colliding.validate(root_id).is_err());
         let mut malformed = metadata;
         malformed.guarded.root.atime_nanos = 1_000_000_000;
         assert!(malformed.validate(root_id).is_err());

@@ -1543,22 +1543,7 @@ impl GitRepository {
             return Err(RepositoryError::Conflict);
         }
         require_empty_guarded_catalog_records(&self.catalog, self.repository_id)?;
-        for entry in fs::read_dir(self.directory.descriptor_path())? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if !matches!(
-                name.to_str(),
-                Some(
-                    CATALOG_DATABASE
-                        | "catalog.db-wal"
-                        | "catalog.db-shm"
-                        | GIT_CATALOG_MARKER_FILE
-                )
-            ) || !entry.file_type()?.is_file()
-            {
-                return Err(RepositoryError::Conflict);
-            }
-        }
+        require_expected_private_catalog_files(&self.directory)?;
         let fence = GitGuardedCatalogRetirementV1 {
             format_version: 1,
             repository_id: self.repository_id,
@@ -1936,6 +1921,36 @@ impl GitRepository {
     pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {
         Ok(self.directory.identity()?)
     }
+
+    /// Recovery may exclude this directory from the signed visible namespace
+    /// only when it contains the expected private catalog files.
+    pub fn verify_guarded_catalog_files(&self) -> Result<(), RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1
+            || read_marker(&self.directory, GIT_CATALOG_MARKER_FILE)?
+                != Some(git_catalog_marker_bytes(self.repository_id))
+            || self.directory.open_child_file(CATALOG_DATABASE)?.is_none()
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        require_expected_private_catalog_files(&self.directory)
+    }
+}
+
+fn require_expected_private_catalog_files(
+    directory: &PinnedDirectory,
+) -> Result<(), RepositoryError> {
+    for entry in fs::read_dir(directory.descriptor_path())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !matches!(
+            name.to_str(),
+            Some(CATALOG_DATABASE | "catalog.db-wal" | "catalog.db-shm" | GIT_CATALOG_MARKER_FILE)
+        ) || !entry.file_type()?.is_file()
+        {
+            return Err(RepositoryError::Conflict);
+        }
+    }
+    Ok(())
 }
 
 fn require_private_catalog(directory: &PinnedDirectory) -> Result<(), RepositoryError> {

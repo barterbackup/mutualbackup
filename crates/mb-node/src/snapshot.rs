@@ -2623,58 +2623,221 @@ pub(crate) fn verify_guarded_recovered_namespace(
     }
     let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
     if private_metadata_format(&bytes)? == 7 {
-        bail!("guarded Git catalog namespace verification is not yet supported");
+        let metadata =
+            GuardedGitPrivateMetadataV7::decode(&bytes, revision.value.protected_root_id)?;
+        let root_path = root.descriptor_path();
+        let repository = GitRepository::open_with_backend(
+            &root_path,
+            metadata.git.repository_id,
+            &mb_git::catalog_key(keys, metadata.git.repository_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )?;
+        let catalog_id = repository.catalog_directory_identity()?;
+        repository.verify_guarded_catalog_files()?;
+        let (root_id, bound) = metadata.guarded.bind_restored_entries_with_git_catalog(
+            root,
+            metadata.git.repository_id,
+            catalog_id,
+        )?;
+        let encryption_key = keys.guild_data_key(&guild_id);
+        let mut sectors = BTreeMap::new();
+        verify_guarded_restored_files(
+            root,
+            &metadata.guarded,
+            root_id,
+            &bound,
+            &encryption_key,
+            |reference| record_verified_sector(&mut sectors, reference),
+        )?;
+        verify_recovered_git_graph(&repository, &metadata.git, &encryption_key, &mut sectors)?;
+        let signed = revision
+            .value
+            .data_sectors
+            .iter()
+            .map(|reference| (reference.id, reference))
+            .collect::<BTreeMap<_, _>>();
+        ensure!(
+            signed.len() == revision.value.data_sectors.len()
+                && signed.len() == sectors.len()
+                && signed
+                    .iter()
+                    .all(|(id, reference)| sectors.get(id) == Some(*reference)),
+            "guarded Git data sectors differ from signed revision"
+        );
+        metadata.guarded.bind_restored_entries_with_git_catalog(
+            root,
+            metadata.git.repository_id,
+            catalog_id,
+        )?;
+        ensure!(
+            repository.catalog_directory_identity()? == catalog_id,
+            "guarded Git catalog changed during verification"
+        );
+        repository.verify_guarded_catalog_files()?;
+        return Ok(());
     }
     if private_metadata_format(&bytes)? == 6 {
         let metadata = GuardedPrivateMetadataV6::decode(&bytes)?;
         let (root_id, bound) = metadata.bind_restored_entries(root)?;
         let encryption_key = keys.guild_data_key(&guild_id);
-        for (entry, bound_entry) in metadata.entries.iter().zip(&bound) {
-            let GuardedPrivateEntryV6::File {
-                path,
-                logical_len,
-                data_extents,
-                ..
-            } = entry
-            else {
-                continue;
-            };
-            let path = PathBuf::from(OsString::from_vec(path.clone()));
-            let parent = path
-                .parent()
-                .context("guarded restored file has no parent")?;
-            let directory = if parent.as_os_str().is_empty() {
-                None
-            } else {
-                Some(root.open_descendant_directory(parent)?)
-            };
-            let directory = directory.as_ref().unwrap_or(root);
-            let name = path
-                .file_name()
-                .context("guarded restored file has no name")?;
-            let mut file = directory
-                .open_child_file(name)?
-                .context("guarded restored file disappeared before publication")?;
-            let stat = file.metadata()?;
-            ensure!(
-                stat.len() == *logical_len
-                    && bound_entry.native_id
-                        == (NativeFileId {
-                            filesystem_id: root_id.filesystem_id,
-                            inode: stat.ino(),
-                        })
-                    && directory.entry_identity(name, false)? == Some(bound_entry.native_id),
-                "guarded restored file changed before publication"
-            );
-            verify_guarded_file_content(
-                &mut file,
-                *logical_len,
-                data_extents,
-                &encryption_key,
-                |_, _| Ok(()),
-            )?;
-        }
+        verify_guarded_restored_files(root, &metadata, root_id, &bound, &encryption_key, |_| {
+            Ok(())
+        })?;
         metadata.bind_restored_entries(root)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn record_verified_sector(
+    sectors: &mut BTreeMap<SectorId, SectorRef>,
+    reference: &SectorRef,
+) -> Result<()> {
+    ensure!(
+        sectors
+            .insert(reference.id, reference.clone())
+            .is_none_or(|previous| previous == *reference),
+        "guarded Git sector ID has conflicting signed references"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_guarded_restored_files(
+    root: &PinnedDirectory,
+    metadata: &GuardedPrivateMetadataV6,
+    root_id: NativeFileId,
+    bound: &[mb_store::GuardedViewMetadataEntry],
+    encryption_key: &[u8; 32],
+    mut verified_sector: impl FnMut(&SectorRef) -> Result<()>,
+) -> Result<()> {
+    for (entry, bound_entry) in metadata.entries.iter().zip(bound) {
+        let GuardedPrivateEntryV6::File {
+            path,
+            logical_len,
+            data_extents,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let path = PathBuf::from(OsString::from_vec(path.clone()));
+        let parent = path
+            .parent()
+            .context("guarded restored file has no parent")?;
+        let directory = if parent.as_os_str().is_empty() {
+            None
+        } else {
+            Some(root.open_descendant_directory(parent)?)
+        };
+        let directory = directory.as_ref().unwrap_or(root);
+        let name = path
+            .file_name()
+            .context("guarded restored file has no name")?;
+        let mut file = directory
+            .open_child_file(name)?
+            .context("guarded restored file disappeared before publication")?;
+        let stat = file.metadata()?;
+        ensure!(
+            stat.len() == *logical_len
+                && bound_entry.native_id
+                    == (NativeFileId {
+                        filesystem_id: root_id.filesystem_id,
+                        inode: stat.ino(),
+                    })
+                && directory.entry_identity(name, false)? == Some(bound_entry.native_id),
+            "guarded restored file changed before publication"
+        );
+        verify_guarded_file_content(
+            &mut file,
+            *logical_len,
+            data_extents,
+            encryption_key,
+            |reference, _| verified_sector(reference),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_recovered_git_graph(
+    repository: &GitRepository,
+    descriptor: &GitBackupDescriptor,
+    encryption_key: &[u8; 32],
+    sectors: &mut BTreeMap<SectorId, SectorRef>,
+) -> Result<()> {
+    descriptor.validate()?;
+    ensure!(
+        repository.selected_branch()? == descriptor.head_branch,
+        "recovered Git HEAD differs from signed graph"
+    );
+    let source = repository.export_graph_source()?;
+    let source_refs = source
+        .refs
+        .into_iter()
+        .map(|reference| (reference.name, reference.oid))
+        .collect::<BTreeMap<_, _>>();
+    let signed_refs = descriptor
+        .refs
+        .iter()
+        .map(|reference| (reference.name.clone(), reference.oid))
+        .collect::<BTreeMap<_, _>>();
+    let source_objects = source
+        .objects
+        .into_iter()
+        .map(|object| (object.oid, (object.kind, object.bytes)))
+        .collect::<BTreeMap<_, _>>();
+    let signed_objects = descriptor
+        .objects
+        .iter()
+        .map(|object| (object.oid, (object.kind, object.bytes.clone())))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        source.repository_id == descriptor.repository_id
+            && source_refs == signed_refs
+            && source_objects == signed_objects,
+        "recovered Git refs or objects differ from signed graph"
+    );
+    let mut source_blobs = source
+        .blobs
+        .into_iter()
+        .map(|blob| (blob.oid, blob.anchor))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        source_blobs.len() == descriptor.blobs.len(),
+        "recovered Git blob set differs from signed graph"
+    );
+    for blob in &descriptor.blobs {
+        let anchor = source_blobs
+            .remove(&blob.oid)
+            .context("signed Git blob missing from recovered graph")?;
+        ensure!(
+            anchor.logical_len == blob.logical_len
+                && mb_git::blob_oid_from_anchor(&anchor)?.as_bytes() == blob.oid,
+            "recovered Git blob has another length or object ID"
+        );
+        let mut file = anchor.open_verified()?;
+        let mut position = 0_u64;
+        for extent in &blob.data_extents {
+            verify_zero_gap(&mut file, position, extent.offset)?;
+            let mut offset = extent.offset;
+            for reference in &extent.sectors {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut plaintext = vec![0_u8; reference.logical_len as usize];
+                file.read_exact(&mut plaintext)?;
+                let (actual, _) = encrypted_sector(encryption_key, reference.id, &plaintext)?;
+                ensure!(
+                    actual == *reference,
+                    "recovered Git blob differs from a signed data sector"
+                );
+                record_verified_sector(sectors, reference)?;
+                offset = offset
+                    .checked_add(reference.logical_len as u64)
+                    .context("recovered Git blob sector range overflow")?;
+            }
+            position = offset;
+        }
+        verify_zero_gap(&mut file, position, blob.logical_len)?;
     }
     Ok(())
 }
@@ -5181,6 +5344,35 @@ mod metadata_compatibility_tests {
         )
         .unwrap();
         assert_eq!(repository.export_graph_source().unwrap().refs.len(), 0);
+        verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging).unwrap();
+        fs::write(staging_path.join("extra"), b"not signed").unwrap();
+        assert!(
+            verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging)
+                .unwrap_err()
+                .to_string()
+                .contains("unrecorded or replaced name")
+        );
+        fs::remove_file(staging_path.join("extra")).unwrap();
+        let private_extra = staging_path
+            .join(mb_store::GIT_CATALOG_DIRECTORY)
+            .join("unexpected");
+        fs::write(&private_extra, b"unrecognized state").unwrap();
+        assert!(
+            verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging)
+                .is_err()
+        );
+        fs::remove_file(private_extra).unwrap();
+        fs::write(
+            staging_path
+                .join(mb_store::GIT_CATALOG_DIRECTORY)
+                .join(mb_store::GIT_CATALOG_MARKER_FILE),
+            mb_store::git_catalog_marker_bytes(Uuid::new_v4()),
+        )
+        .unwrap();
+        assert!(
+            verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging)
+                .is_err()
+        );
         assert!(
             guarded_private_metadata_for_revision(&control, &keys, guild_id, &revision)
                 .unwrap_err()
@@ -5343,6 +5535,89 @@ mod metadata_compatibility_tests {
                 .unwrap()
                 .as_bytes(),
             blob_oid.as_bytes()
+        );
+        let private = GuardedGitPrivateMetadataV7 {
+            format_version: 7,
+            guarded: GuardedPrivateMetadataV6 {
+                format_version: 6,
+                root: GuardedPrivateStatV6 {
+                    mode: 0o700,
+                    uid: 1000,
+                    gid: 1000,
+                    atime_secs: 1,
+                    atime_nanos: 0,
+                    modified_secs: 1,
+                    modified_nanos: 0,
+                },
+                entries: Vec::new(),
+            },
+            git: descriptor.clone(),
+        };
+        let metadata_bytes = canonical_bytes(&private).unwrap();
+        let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
+        let (metadata_ref, metadata_ciphertext) = encrypted_sector(
+            &keys.guild_data_key(&guild_id),
+            metadata_id,
+            &metadata_bytes,
+        )
+        .unwrap();
+        let writer = SigningKey::from_bytes(&[227; 32]);
+        let mut revision = UserRevision {
+            format_version: 5,
+            guild_id,
+            protected_root_id: repository_id,
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id,
+            owner: keys.node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![metadata_ref.clone()],
+            data_sectors: sectors.clone(),
+            sector_commitments: Some(
+                std::iter::once(&metadata_ciphertext)
+                    .chain(sectors.iter().map(|sector| &ciphertexts[&sector.id]))
+                    .map(|ciphertext| merkle_commit(ciphertext).unwrap())
+                    .collect(),
+            ),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
+        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
+        install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
+        verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &guarded_staging)
+            .unwrap();
+        let mut incomplete = revision.value.clone();
+        incomplete.data_sectors.clear();
+        incomplete.sector_commitments = Some(vec![merkle_commit(&metadata_ciphertext).unwrap()]);
+        incomplete.sign_writer(&writer).unwrap();
+        let incomplete = SignedRecord::sign(USER_REVISION_DOMAIN, incomplete, &keys).unwrap();
+        assert!(
+            verify_guarded_recovered_namespace(
+                &control,
+                &keys,
+                guild_id,
+                &incomplete,
+                &guarded_staging,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("guarded Git data sectors differ")
+        );
+        guarded_repository.create_branch("other").unwrap();
+        assert!(
+            verify_guarded_recovered_namespace(
+                &control,
+                &keys,
+                guild_id,
+                &revision,
+                &guarded_staging,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("recovered Git refs or objects differ")
         );
         let mut damaged = ciphertexts;
         damaged.get_mut(&sectors[0].id).unwrap()[0] ^= 1;

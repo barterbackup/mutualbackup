@@ -700,6 +700,34 @@ impl PinnedDirectory {
         self.all_descendant_paths_granted_with_catalog_policy(&grants, false)
     }
 
+    /// A signed Git revision may exclude one app-owned root catalog after its
+    /// marker and exact directory inode have been verified by the caller.
+    /// Every other lower-tree name remains part of the signed namespace check.
+    #[cfg(target_os = "linux")]
+    pub fn exact_descendant_paths_with_git_catalog(
+        &self,
+        expected: &BTreeMap<PathBuf, NativeFileId>,
+        repository_id: Uuid,
+        catalog_id: NativeFileId,
+    ) -> Result<bool, AnchorError> {
+        if repository_id.is_nil()
+            || git_catalog_marker_from_root(self.as_file())? != Some(repository_id)
+            || self.entry_identity(GIT_CATALOG_DIRECTORY, true)? != Some(catalog_id)
+            || expected.keys().any(|path| {
+                path.components()
+                    .next()
+                    .is_some_and(|component| component.as_os_str() == GIT_CATALOG_DIRECTORY)
+            })
+        {
+            return Ok(false);
+        }
+        let grants = expected
+            .iter()
+            .map(|(path, id)| (path.clone(), BTreeSet::from([*id])))
+            .collect();
+        self.all_descendant_paths_granted_with_catalog_policy(&grants, true)
+    }
+
     #[cfg(target_os = "linux")]
     fn all_descendant_paths_granted_with_catalog_policy(
         &self,
@@ -5562,6 +5590,60 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_guarded_namespace_excludes_only_its_bound_git_catalog() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let repository_id = Uuid::new_v4();
+        fs::write(root.join("tracked"), b"signed bytes").unwrap();
+        let catalog = root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir(&catalog).unwrap();
+        fs::write(
+            catalog.join(GIT_CATALOG_MARKER_FILE),
+            git_catalog_marker_bytes(repository_id),
+        )
+        .unwrap();
+        fs::write(catalog.join("catalog.db"), b"private catalog").unwrap();
+        let pinned = PinnedDirectory::open(root).unwrap();
+        let catalog_id = pinned
+            .entry_identity(GIT_CATALOG_DIRECTORY, true)
+            .unwrap()
+            .unwrap();
+        let expected = BTreeMap::from([(
+            PathBuf::from("tracked"),
+            pinned.entry_identity("tracked", false).unwrap().unwrap(),
+        )]);
+        assert!(!pinned.exact_descendant_paths(&expected).unwrap());
+        assert!(
+            pinned
+                .exact_descendant_paths_with_git_catalog(&expected, repository_id, catalog_id)
+                .unwrap()
+        );
+        assert!(
+            !pinned
+                .exact_descendant_paths_with_git_catalog(&expected, Uuid::new_v4(), catalog_id)
+                .unwrap()
+        );
+        fs::write(root.join("extra"), b"not signed").unwrap();
+        assert!(
+            !pinned
+                .exact_descendant_paths_with_git_catalog(&expected, repository_id, catalog_id)
+                .unwrap()
+        );
+        fs::remove_file(root.join("extra")).unwrap();
+        fs::write(
+            catalog.join(GIT_CATALOG_MARKER_FILE),
+            git_catalog_marker_bytes(Uuid::new_v4()),
+        )
+        .unwrap();
+        assert!(
+            !pinned
+                .exact_descendant_paths_with_git_catalog(&expected, repository_id, catalog_id)
+                .unwrap()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

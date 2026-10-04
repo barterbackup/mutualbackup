@@ -109,8 +109,12 @@
   format-7 private metadata type now validates a raw guarded namespace and
   root-bound Git graph; revision inspection can read it, and format-7 restore
   stages its guarded namespace and Git catalog with a guarded backend binding.
-  Publication still refuses format 7 until catalog-aware namespace verification,
-  graph-sector recipe rebind, and supervised mount replay are complete. Finish
+  Format-7 staging now verifies the catalog marker and exact private filenames,
+  compares reachable refs, objects, HEAD, blob IDs and signed blob sectors,
+  and binds the visible lower tree to its signed raw namespace while excluding
+  only that bound catalog. An unexpected lower-tree name or catalog file fails
+  verification. Publication still refuses format 7 until graph-sector recipe
+  rebind and supervised mount replay are complete. Finish
   graph capture and native-anchor pinning before lifting the production signing
   gate. Linux Git blob recovery now streams verified sectors into one sparse native
   anchor without a temporary worktree payload or reflink; the guarded catalog

@@ -624,6 +624,12 @@ Retain MutualBackup's independent content roots and signed revision authority.
   of its graph pass together. Restore format 7 into a private staging tree
   with a guarded-bound Git catalog, then verify that catalog and the signed
   namespace before supervised mount publication and sector-recipe rebind.
+  The staging verifier must bind the exact marked catalog directory, permit
+  only its known private files, compare its reachable refs, objects, HEAD,
+  and native blob bytes against the signed graph and data-sector catalog, and
+  reject every visible path outside the signed guarded namespace. Keep this
+  verification separate from publication until recovered sector recipes and
+  the guarded mount claim are durably replayable together.
 - **UserRevision:** guild, owner, protected-root ID, root-scoped monotonic
   revision, optional parent in that root's chain, explicit metadata/data
   `SectorRef` lists, suite versions, and owner signature. Milestone 5 keeps
