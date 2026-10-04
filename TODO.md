@@ -951,8 +951,13 @@
   sector recipes. Both runs edit the recovered FUSE view, reopen the node, and
   confirm that the signed sector recipes still reproduce the pre-edit bytes;
   the Btrfs run also migrates an older reflink-backed capture into durable
-  retirement. Full network seed-only guarded recovery, guarded
-  removal/GC, and broader FUSE failure paths remain open before enrollment.
+  retirement. A five-member local memory-guild test now loses the guarded
+  owner's data directory and source tree, reconstructs its signed format-6
+  sectors from the remaining members, and restores an ordinary-user-readable
+  guarded view from the seed on ext4 and disposable Btrfs. This closes the
+  reconstructed-shard integration check; a provisioned P2P network gate,
+  guarded removal/GC, and broader FUSE failure paths remain open before
+  enrollment.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

@@ -1727,6 +1727,27 @@ impl Node {
         Ok(root)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn enroll_test_guarded_root(
+        &mut self,
+        lower: &Path,
+        view: &Path,
+        view_uid: u32,
+        view_gid: u32,
+    ) -> Result<ProtectedRoot> {
+        let plan = GuardedRootCapturePlan::plan(lower)?;
+        let manifest = plan.capture_private_file_owners(&self.control, view_uid, 0, 0)?;
+        plan.isolate_lower_directories(&self.control, &manifest)?;
+        let mount_control = Arc::new(Mutex::new(ControlStore::open_with_key(
+            self.data_dir.join("control.db"),
+            &self.control_database_key,
+        )?));
+        let mount = GuardedViewMount::start(&manifest, mount_control, view, view_uid, view_gid)?;
+        mount.check_health()?;
+        self.guarded_mounts.push(mount);
+        self.register_guarded_protected_root(Uuid::new_v4(), manifest.anchor_id)
+    }
+
     fn git_catalog_key(&self, repository_id: Uuid) -> [u8; 32] {
         mb_git::catalog_key(&self.keys, repository_id)
     }

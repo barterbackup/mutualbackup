@@ -1210,7 +1210,11 @@ sector recipes from that guarded capture without a preliminary reflink; local
 ext4 and Btrfs interruption/reopen runs exercise handoff and mount-intent
 replay, and the Btrfs run migrates an older reflink capture. Full network
 seed-only guarded recovery, guarded removal/GC, and the platform gates remain
-open.
+open. A five-member memory-guild check now reconstructs signed guarded sectors
+from the remaining peers after deleting the old owner's data directory and
+source tree; ext4 and Btrfs runs restore the view from the seed and serve its
+exact bytes to the ordinary owner. A provisioned P2P recovery gate is still
+required.
 A separate local Btrfs regression confirms that a stock Git peer's CRLF
 worktree can yield an LF blob and that our import, checkout, restore, and export
 preserve the exchanged LF blob and object ID. The Git-facing help explains that
