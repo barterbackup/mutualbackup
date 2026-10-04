@@ -629,6 +629,30 @@ impl GuardedViewMount {
         control: Arc<Mutex<ControlStore>>,
     ) -> anyhow::Result<GuardedViewMetadataV1> {
         ensure!(!attempt_id.is_nil(), "guarded capture attempt ID is nil");
+        // A completed attempt is immutable. Revision retries may arrive after
+        // the view has remounted and changed, so do not inspect today's view
+        // before returning the metadata reserved by that attempt.
+        {
+            let store = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            if let Some(bytes) = store.get_record(STOPPED_CAPTURE_KIND, attempt_id.as_bytes())? {
+                ensure!(
+                    bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                    "guarded stopped-capture intent exceeds its local bound"
+                );
+                let intent: StoppedCaptureIntent = mb_core::decode_canonical(&bytes)?;
+                intent.validate(attempt_id.as_bytes())?;
+                ensure!(
+                    intent.root_anchor_id == anchor_id,
+                    "guarded capture attempt belongs to another root"
+                );
+                if let Some(capture) = intent.published {
+                    capture.verify()?;
+                    return Ok(intent.metadata);
+                }
+            }
+        }
         let control_for_prepare = Arc::clone(&control);
         Self::with_stopped_view(anchor_id, control, |view, _, _| {
             let metadata = view.verified_metadata_snapshot(anchor_id)?;
@@ -636,6 +660,10 @@ impl GuardedViewMount {
                 .lock()
                 .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
             if let Some(bytes) = store.get_record(STOPPED_CAPTURE_KIND, attempt_id.as_bytes())? {
+                ensure!(
+                    bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                    "guarded stopped-capture intent exceeds its local bound"
+                );
                 let intent: StoppedCaptureIntent = mb_core::decode_canonical(&bytes)?;
                 intent.validate(attempt_id.as_bytes())?;
                 ensure!(
@@ -684,6 +712,10 @@ impl GuardedViewMount {
             let bytes = store
                 .get_record(STOPPED_CAPTURE_KIND, attempt_id.as_bytes())?
                 .context("guarded capture attempt was not prepared")?;
+            ensure!(
+                bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                "guarded stopped-capture intent exceeds its local bound"
+            );
             let intent: StoppedCaptureIntent = mb_core::decode_canonical(&bytes)?;
             intent.validate(attempt_id.as_bytes())?;
             ensure!(
@@ -751,6 +783,10 @@ impl GuardedViewMount {
         let bytes = control
             .get_record(STOPPED_CAPTURE_KIND, attempt_id.as_bytes())?
             .context("guarded stopped capture has no durable intent")?;
+        ensure!(
+            bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+            "guarded stopped-capture intent exceeds its local bound"
+        );
         let intent: StoppedCaptureIntent = mb_core::decode_canonical(&bytes)?;
         intent.validate(attempt_id.as_bytes())?;
         ensure!(
@@ -2335,6 +2371,15 @@ print('DONE', flush=True)
         assert!(renamed.status.success(), "{renamed:?}");
         edit(&mountpoint.join("moved"), "EDIT2");
         assert_eq!(anchor_bytes(&first), first_bytes);
+        assert_eq!(
+            GuardedViewMount::prepare_stopped_capture(
+                original.anchor_id,
+                attempt_id,
+                Arc::clone(&control),
+            )
+            .unwrap(),
+            prepared
+        );
         assert_eq!(
             GuardedViewMount::finish_stopped_capture(
                 original.anchor_id,
