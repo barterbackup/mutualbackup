@@ -2788,6 +2788,77 @@ impl Node {
         self.register_guarded_protected_root(Uuid::new_v4(), manifest.anchor_id)
     }
 
+    /// Bind a guarded Git catalog to an already supervised protected root.
+    /// Catalog initialization has its own replayable marker; if the node stops
+    /// before recording registration, retrying this operation completes that
+    /// same catalog. Public guarded Git init remains gated on the full backend
+    /// and provisioned recovery checks.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn init_registered_guarded_git(&mut self, repository_id: Uuid) -> Result<GitRepositoryInfo> {
+        let root = self.protected_root_by_id(repository_id)?;
+        let binding = self.guarded_root_mount_binding(&root)?;
+        let backend = self.verified_source_backend_for_root(&root)?;
+        anyhow::ensure!(
+            backend.backend == SourceBackendKind::GuardedLinkFreezeV1
+                && backend.is_supported_guarded_for(
+                    repository_id,
+                    root.filesystem_id,
+                    root.root_inode,
+                ),
+            "guarded Git init backend differs from its protected root"
+        );
+        match fs::symlink_metadata(root.path.join(".git")) {
+            Ok(_) => {
+                anyhow::bail!("ordinary .git storage already exists; use an explicit import path")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect guarded Git root"),
+        }
+        let info = GitRepositoryInfo {
+            format_version: 1,
+            repository_id,
+            path: root.path.clone(),
+        };
+        let encoded = canonical_bytes(&info)?;
+        if let Some(existing) = self
+            .control
+            .get_record("git-repository", repository_id.as_bytes())?
+        {
+            anyhow::ensure!(
+                existing == encoded,
+                "Git repository registration conflicts with its guarded root"
+            );
+        }
+        let repository = GitRepository::init_with_catalog_root(
+            &root.path,
+            &binding.lower_root,
+            repository_id,
+            &self.git_catalog_key(repository_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )?;
+        anyhow::ensure!(
+            repository.id() == repository_id,
+            "guarded Git catalog does not match its protected root"
+        );
+        if self
+            .control
+            .get_record("git-repository", repository_id.as_bytes())?
+            .is_none()
+        {
+            anyhow::ensure!(
+                self.control.put_record_if_absent(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &encoded,
+                )?,
+                "guarded Git repository registration changed"
+            );
+        }
+        self.reconcile_guarded_git_stages()?;
+        Ok(info)
+    }
+
     /// Capture one registered guarded Git file under a stopped-view fence and
     /// transfer its immutable bytes to the node-owned Git pin before remount.
     /// A failure after stopping the view leaves it unsupervised; startup must
@@ -2874,24 +2945,7 @@ impl Node {
         root_id: Uuid,
         paths: &[(&str, u16)],
     ) -> Result<mb_git::GitGraphSource> {
-        let root = self.protected_root_by_id(root_id)?;
-        let binding = self.guarded_root_mount_binding(&root)?;
-        GitRepository::init_with_catalog_root(
-            &root.path,
-            &binding.lower_root,
-            root_id,
-            &self.git_catalog_key(root_id),
-            SourceBackendKind::GuardedLinkFreezeV1,
-        )?;
-        self.control.put_record(
-            "git-repository",
-            root_id.as_bytes(),
-            &canonical_bytes(&GitRepositoryInfo {
-                format_version: 1,
-                repository_id: root_id,
-                path: root.path,
-            })?,
-        )?;
+        self.init_registered_guarded_git(root_id)?;
         for &(path, expected_format) in paths {
             let (_, anchor) = self.stage_registered_guarded_git_file(root_id, Path::new(path))?;
             anyhow::ensure!(
@@ -28367,13 +28421,29 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none()
         );
-        node.control
-            .put_record(
-                "git-repository",
-                repository_id.as_bytes(),
-                &canonical_bytes(&registration).unwrap(),
-            )
-            .unwrap();
+        drop(node);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        node.check_guarded_mounts().unwrap();
+        assert!(
+            node.control
+                .get_record("git-repository", repository_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            node.init_registered_guarded_git(repository_id).unwrap(),
+            registration
+        );
+        assert_eq!(
+            node.init_registered_guarded_git(repository_id).unwrap(),
+            registration
+        );
+        assert_eq!(
+            node.control
+                .get_record("git-repository", repository_id.as_bytes())
+                .unwrap(),
+            Some(canonical_bytes(&registration).unwrap())
+        );
         let detach = std::process::Command::new("python3")
             .uid(65534)
             .gid(65534)

@@ -192,8 +192,12 @@
   mixed three-file format-7 QUIC recovery fixture uses this routine, checks
   the edited file's format-1 stage anchor and its recovered root-backed
   virtual blob, and passes on ext4 and disposable local Btrfs; strict workspace
-  Clippy passes. Public guarded
-  enrollment, add/checkout, and the provisioned daemon gate remain open.
+  Clippy passes. Guarded Git catalog initialization and node registration now
+  share a checked node routine: a private catalog created before registration
+  can be registered after node restart, and repeated init preserves the same
+  identity. The privileged registration replay probe passes on ext4 and disposable
+  Btrfs; the format-7 QUIC fixture passes with this init path on ext4. Public
+  guarded enrollment, add/checkout, and the provisioned daemon gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
