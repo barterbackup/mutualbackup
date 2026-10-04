@@ -894,8 +894,15 @@
   restored tree's local inodes before retaining new anchors. It rejects extra
   names, changed lengths, and hard-link aliases outside the signed namespace;
   a directory-only revision is bound even with no data sectors. The binding
-  carries signed directory lengths for later FUSE reconstruction, which is
-  still required before non-reflink guarded recovery can be enabled.
+  carries signed directory lengths for later FUSE reconstruction. A guarded
+  mount can now accept those locally rebound virtual attributes, validate
+  every entry against its sealed capture, and persist root/entry ownership,
+  root/directory modes, and directory lengths across remount; a local
+  disposable-Btrfs FUSE test covers rejection before publication, exact file
+  bytes, chmod precedence, remount, and retirement cleanup. The node recovery
+  job still needs to create and register that guarded view from the signed
+  format-6 data, especially on non-reflink filesystems, before guarded
+  enrollment can be enabled.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

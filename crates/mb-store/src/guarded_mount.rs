@@ -27,6 +27,7 @@ use crate::{
 
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
 const MOUNT_RETIRE_KIND: &str = "guarded-view-mount-retired-v1";
+const VIRTUAL_METADATA_KIND: &str = "guarded-view-virtual-metadata-v1";
 const STOPPED_CAPTURE_KIND: &str = "guarded-view-stopped-capture-v1";
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
 const GUARDED_REVISION_RETIREMENT_KIND: &str = "guarded-view-revision-retirement-v1";
@@ -171,6 +172,7 @@ impl GuardedViewMetadataV1 {
                 && !self.anchor_id.is_nil()
                 && self.lower_root_id.filesystem_id != 0
                 && self.lower_root_id.inode != 0
+                && self.root_mode & !0o7777 == 0
                 && self.root_atime_nanos < 1_000_000_000
                 && self.root_modified_nanos < 1_000_000_000,
             "invalid guarded view root metadata"
@@ -198,6 +200,7 @@ impl GuardedViewMetadataV1 {
                 entry.native_id.filesystem_id == self.lower_root_id.filesystem_id
                     && entry.native_id.inode != 0
                     && entry.native_id != self.lower_root_id
+                    && entry.mode & !0o7777 == 0
                     && entry.atime_nanos < 1_000_000_000
                     && entry.modified_nanos < 1_000_000_000,
                 "invalid guarded view entry metadata"
@@ -228,6 +231,56 @@ impl GuardedViewMetadataV1 {
         }
         Ok(())
     }
+}
+
+fn validate_virtual_metadata_binding(
+    metadata: &GuardedViewMetadataV1,
+    manifest: &StableAnchorManifest,
+    plan: &GuardedRootCapturePlan,
+) -> anyhow::Result<()> {
+    metadata.validate_shape()?;
+    ensure!(
+        metadata.anchor_id == manifest.anchor_id
+            && metadata.lower_root_id == plan.source_root_identity()
+            && metadata.entries.len() == manifest.entries.len(),
+        "guarded virtual metadata differs from its captured root"
+    );
+    for (signed, captured) in metadata.entries.iter().zip(&manifest.entries) {
+        let (path, kind, mode, logical_len, native_id) = match captured {
+            CapturedEntry::Directory { path, mode, .. } => (
+                path,
+                GuardedViewEntryKind::Directory,
+                *mode,
+                None,
+                plan.captured_entry_identity(path),
+            ),
+            CapturedEntry::FileV2 {
+                path,
+                mode,
+                logical_len,
+                native_id,
+                ..
+            } => (
+                path,
+                GuardedViewEntryKind::File,
+                *mode,
+                Some(*logical_len),
+                Some(*native_id),
+            ),
+            CapturedEntry::File { .. } => {
+                anyhow::bail!("guarded virtual metadata needs native file identities")
+            }
+        };
+        ensure!(
+            signed.path == path.as_os_str().as_bytes()
+                && signed.kind == kind
+                && signed.native_id == native_id.context("guarded source plan lacks entry")?
+                && signed.mode == (mode & 0o7777) as u16
+                && logical_len.is_none_or(|len| signed.logical_len == len),
+            "guarded virtual metadata entry differs from captured source"
+        );
+    }
+    Ok(())
 }
 
 fn stopped_capture_intents(control: &ControlStore) -> anyhow::Result<Vec<StoppedCaptureRecord>> {
@@ -591,6 +644,7 @@ impl GuardedViewMount {
                 mounted_filesystem(&claim.mountpoint)?.is_none(),
                 "guarded view remains mounted during retirement"
             );
+            control.delete_record(VIRTUAL_METADATA_KIND, id)?;
             return Ok(());
         };
         let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
@@ -616,6 +670,7 @@ impl GuardedViewMount {
             ensure!(control.put_record_if_absent(MOUNT_RETIRE_KIND, id, &claim_bytes)?);
         }
         control.delete_record_if_value(MOUNT_CLAIM_KIND, id, &claim_bytes)?;
+        control.delete_record(VIRTUAL_METADATA_KIND, id)?;
         Ok(())
     }
 
@@ -660,11 +715,50 @@ impl GuardedViewMount {
         view_uid: u32,
         view_gid: u32,
     ) -> anyhow::Result<Self> {
+        Self::start_inner(
+            manifest,
+            control,
+            mountpoint.as_ref(),
+            view_uid,
+            view_gid,
+            None,
+        )
+    }
+
+    /// Mount a restored guarded capture with signed presentation metadata.
+    /// The metadata is bound to the captured source and retained separately
+    /// from the original mount claim so a later remount presents it again.
+    pub fn start_with_virtual_metadata(
+        manifest: &StableAnchorManifest,
+        control: Arc<Mutex<ControlStore>>,
+        mountpoint: impl AsRef<Path>,
+        view_uid: u32,
+        view_gid: u32,
+        metadata: GuardedViewMetadataV1,
+    ) -> anyhow::Result<Self> {
+        Self::start_inner(
+            manifest,
+            control,
+            mountpoint.as_ref(),
+            view_uid,
+            view_gid,
+            Some(metadata),
+        )
+    }
+
+    fn start_inner(
+        manifest: &StableAnchorManifest,
+        control: Arc<Mutex<ControlStore>>,
+        mountpoint: &Path,
+        view_uid: u32,
+        view_gid: u32,
+        requested_metadata: Option<GuardedViewMetadataV1>,
+    ) -> anyhow::Result<Self> {
         let _lifecycle = MOUNT_LIFECYCLE
             .lock()
             .map_err(|_| io::Error::other("guarded mount lifecycle lock is poisoned"))?;
         ensure!(view_uid != 0, "guarded view needs an unprivileged owner");
-        let mountpoint = canonical_mountpoint(mountpoint.as_ref())?;
+        let mountpoint = canonical_mountpoint(mountpoint)?;
         let plan = {
             let control = control
                 .lock()
@@ -681,6 +775,9 @@ impl GuardedViewMount {
             );
             GuardedRootCapturePlan::load_active_for_view(&control, manifest)?
         };
+        if let Some(metadata) = &requested_metadata {
+            validate_virtual_metadata_binding(metadata, manifest, &plan)?;
+        }
         let lower_root = PinnedDirectory::open(plan.source_root())?;
         ensure!(
             lower_root.identity()? == plan.source_root_identity(),
@@ -701,6 +798,35 @@ impl GuardedViewMount {
                 .map(|bytes| mb_core::decode_canonical::<MountClaim>(&bytes))
                 .transpose()?
         };
+        let virtual_metadata = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            control
+                .get_record(VIRTUAL_METADATA_KIND, manifest.anchor_id.as_bytes())?
+                .map(|bytes| {
+                    ensure!(
+                        bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                        "guarded virtual metadata exceeds its local bound"
+                    );
+                    Ok(mb_core::decode_canonical::<GuardedViewMetadataV1>(&bytes)?)
+                })
+                .transpose()?
+        };
+        if let Some(metadata) = &virtual_metadata {
+            validate_virtual_metadata_binding(metadata, manifest, &plan)?;
+            ensure!(
+                requested_metadata
+                    .as_ref()
+                    .is_none_or(|requested| requested == metadata),
+                "guarded virtual metadata differs from the durable record"
+            );
+        } else {
+            ensure!(
+                requested_metadata.is_none() || existing.is_none(),
+                "cannot add guarded virtual metadata to an existing mount claim"
+            );
+        }
         if let Some(claim) = &existing {
             ensure!(
                 claim.version == 1
@@ -767,12 +893,15 @@ impl GuardedViewMount {
         // claim. A user-owned frozen anchor can be changed through a descriptor
         // retained before the private lower path was hidden: fchmod restores
         // write permission, then /proc/self/fd reopens the same inode.
-        let view = GuardedProbeView::from_guarded_capture(
+        let mut view = GuardedProbeView::from_guarded_capture(
             manifest,
             Arc::clone(&control),
             view_uid,
             view_gid,
         )?;
+        if let Some(metadata) = virtual_metadata.as_ref().or(requested_metadata.as_ref()) {
+            view.apply_virtual_metadata(metadata, existing.is_none())?;
+        }
         view.verify_private_lower_ownership()?;
         view.verify_lower_namespace()?;
         if existing.is_none() {
@@ -798,6 +927,23 @@ impl GuardedViewMount {
                             || other_id == manifest.anchor_id.as_bytes()),
                     "another guarded capture claims this mountpoint"
                 );
+            }
+            if let Some(metadata) = &requested_metadata {
+                let encoded_metadata = mb_core::canonical_bytes(metadata)?;
+                ensure!(
+                    encoded_metadata.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                    "guarded virtual metadata exceeds its local bound"
+                );
+                if virtual_metadata.is_none() {
+                    ensure!(
+                        control.put_record_if_absent(
+                            VIRTUAL_METADATA_KIND,
+                            manifest.anchor_id.as_bytes(),
+                            &encoded_metadata,
+                        )?,
+                        "guarded virtual metadata changed concurrently"
+                    );
+                }
             }
             ensure!(
                 control.put_record_if_absent(
@@ -1542,6 +1688,7 @@ mod tests {
 
     use mb_core::{KeyMaterial, Seed};
 
+    use crate::guarded_view_probe::GuardedProbeView;
     use crate::{ControlStore, GuardedRootCapturePlan};
 
     use super::{
@@ -2225,6 +2372,125 @@ print('DONE', flush=True)
             assert_eq!(fs::read(&kept).unwrap(), original);
             assert_eq!(fs::metadata(&kept).unwrap().uid(), 65534);
         }
+    }
+
+    #[test]
+    #[ignore = "requires root, CAP_SYS_ADMIN, FUSE passthrough, and reflink capture"]
+    fn guarded_virtual_metadata_survives_remount_and_retires_with_claim() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-virtual-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(lower.join("nested")).unwrap();
+        fs::write(lower.join("nested/file"), b"raw\r\nbytes\0").unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([219; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+        ));
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&control.lock().unwrap(), 65534, 0, 0)
+            .unwrap();
+        plan.isolate_lower_directories(&control.lock().unwrap(), &manifest)
+            .unwrap();
+        let view =
+            GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
+                .unwrap();
+        let mut metadata = view.verified_metadata_snapshot(manifest.anchor_id).unwrap();
+        metadata.root_mode = 0o750;
+        metadata.root_uid = 65533;
+        metadata.root_gid = 65533;
+        for (entry, captured) in metadata.entries.iter_mut().zip(&manifest.entries) {
+            entry.mode = match captured {
+                crate::CapturedEntry::Directory { mode, .. }
+                | crate::CapturedEntry::FileV2 { mode, .. } => (mode & 0o7777) as u16,
+                crate::CapturedEntry::File { .. } => unreachable!(),
+            };
+            entry.uid = 65533;
+            entry.gid = 65533;
+            if entry.path == b"nested" {
+                entry.logical_len = 8192;
+            }
+        }
+        let mut invalid = metadata.clone();
+        invalid.entries[0].path = b"different".to_vec();
+        assert!(
+            GuardedViewMount::start_with_virtual_metadata(
+                &manifest,
+                Arc::clone(&control),
+                &mountpoint,
+                65534,
+                65534,
+                invalid,
+            )
+            .is_err()
+        );
+        assert!(
+            control
+                .lock()
+                .unwrap()
+                .get_record(super::VIRTUAL_METADATA_KIND, manifest.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        let mount = GuardedViewMount::start_with_virtual_metadata(
+            &manifest,
+            Arc::clone(&control),
+            &mountpoint,
+            65534,
+            65534,
+            metadata,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&mountpoint).unwrap().uid(), 65533);
+        assert_eq!(fs::metadata(&mountpoint).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(fs::metadata(mountpoint.join("nested")).unwrap().len(), 8192);
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested/file")).unwrap().uid(),
+            65533
+        );
+        assert_eq!(
+            fs::read(mountpoint.join("nested/file")).unwrap(),
+            b"raw\r\nbytes\0"
+        );
+        fs::set_permissions(mountpoint.join("nested"), fs::Permissions::from_mode(0o711)).unwrap();
+        mount.stop().unwrap();
+        let remounted =
+            GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
+        assert_eq!(fs::metadata(&mountpoint).unwrap().uid(), 65533);
+        assert_eq!(fs::metadata(&mountpoint).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(fs::metadata(mountpoint.join("nested")).unwrap().len(), 8192);
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().mode() & 0o7777,
+            0o711
+        );
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested/file")).unwrap().uid(),
+            65533
+        );
+        remounted.stop().unwrap();
+        let store = control.lock().unwrap();
+        GuardedViewMount::retire_claim(manifest.anchor_id, &store).unwrap();
+        assert!(
+            store
+                .get_record(super::VIRTUAL_METADATA_KIND, manifest.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        plan.discard_unreferenced(&store).unwrap();
     }
 
     #[test]

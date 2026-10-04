@@ -2155,6 +2155,7 @@ pub(crate) struct GuardedProbeView {
     root_uid: u32,
     root_gid: u32,
     root_perm: AtomicU16,
+    virtual_directory_modes: HashMap<u64, u16>,
     poisoned: AtomicBool,
     next_handle: AtomicU64,
     next_inode: AtomicU64,
@@ -2254,6 +2255,71 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    /// Apply signed, locally rebound presentation metadata to a freshly
+    /// reconstructed view. The mount wrapper first proves that every entry
+    /// still belongs to the captured plan. Native file bytes and edit guards
+    /// remain governed by the existing source and namespace journals.
+    pub(crate) fn apply_virtual_metadata(
+        &mut self,
+        metadata: &GuardedViewMetadataV1,
+        initial_mount: bool,
+    ) -> anyhow::Result<()> {
+        self.root_uid = metadata.root_uid;
+        self.root_gid = metadata.root_gid;
+        let root_mode = self
+            .namespace
+            .as_ref()
+            .context("guarded virtual view has no namespace")?
+            .root_mode(metadata.root_mode)?;
+        self.root_perm.store(root_mode, Ordering::Release);
+        for (index, entry) in metadata.entries.iter().enumerate() {
+            let inode = u64::try_from(index)?
+                .checked_add(2)
+                .context("guarded virtual inode overflow")?;
+            let mut present = false;
+            match entry.kind {
+                GuardedViewEntryKind::Directory => {
+                    if let Some(directory) = self.directories.get_mut(&inode) {
+                        directory.attr.size = entry.logical_len;
+                        directory.attr.uid = entry.uid;
+                        directory.attr.gid = entry.gid;
+                        present = true;
+                    }
+                    if let Some(directory) =
+                        self.dynamic_directories.get_mut().unwrap().get_mut(&inode)
+                    {
+                        directory.attr.size = entry.logical_len;
+                        directory.attr.uid = entry.uid;
+                        directory.attr.gid = entry.gid;
+                        present = true;
+                    }
+                    if present {
+                        self.virtual_directory_modes.insert(inode, entry.mode);
+                    }
+                }
+                GuardedViewEntryKind::File => {
+                    if let Some(file) = self.files.get(&inode) {
+                        let mut attr = file.source_attr.lock().unwrap();
+                        attr.uid = entry.uid;
+                        attr.gid = entry.gid;
+                        present = true;
+                    }
+                    if let Some(file) = self.dynamic_files.get_mut().unwrap().get(&inode) {
+                        let mut attr = file.source_attr.lock().unwrap();
+                        attr.uid = entry.uid;
+                        attr.gid = entry.gid;
+                        present = true;
+                    }
+                }
+            }
+            ensure!(
+                present || !initial_mount,
+                "new guarded virtual view is missing a signed entry"
+            );
+        }
+        Ok(())
+    }
+
     /// Freeze one live file from a stopped view into a new durable hard-link
     /// anchor. The record is published before capture, so remount completes a
     /// pending freeze before any FUSE write can reach the inode.
@@ -3408,6 +3474,7 @@ impl GuardedProbeView {
             root_uid,
             root_gid,
             root_perm: AtomicU16::new(root_perm),
+            virtual_directory_modes: HashMap::new(),
             poisoned: AtomicBool::new(false),
             next_handle: AtomicU64::new(1),
             next_inode: AtomicU64::new(next_inode),
@@ -3466,7 +3533,12 @@ impl GuardedProbeView {
             .transpose()
             .map_err(io::Error::other)?
             .flatten()
-            .unwrap_or((metadata.permissions().mode() & 0o7777) as u16);
+            .unwrap_or_else(|| {
+                self.virtual_directory_modes
+                    .get(&directory.attr.ino.0)
+                    .copied()
+                    .unwrap_or((metadata.permissions().mode() & 0o7777) as u16)
+            });
         Ok(attr)
     }
 }
