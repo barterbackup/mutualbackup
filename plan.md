@@ -3645,6 +3645,12 @@ syntax and object/pack exchange, while this binary's file-content rule is
 strictly byte-for-byte even when stock Git would apply attributes or filters.
 Keep those three conditions together as Git work proceeds, and retain the
 original guarded-source and platform gates in this milestone's closure test.
+On each iteration, choose from all open Milestone 6 gates in `TODO.md`, including
+the original source-backend and platform work. For any command or backend that
+reads or writes file content, check byte identity from the user's file through
+the immutable anchor, Git blob, exported object, and restored worktree. A
+line-ending-only change is a real content change; no default, configuration,
+attribute, filter, or compatibility option may silently convert it.
 
 Track Milestone 6 against these separate closure gates when iterating over this
 plan; passing a Git command gate does not close a source-backend or platform gate:
