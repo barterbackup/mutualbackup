@@ -158,9 +158,12 @@
   metadata recipes. A normal catalog-intent test and privileged ext4 and
   disposable Btrfs probes cover a reachable commit/blob, intent retention
   through startup reconciliation,
-  sector-recipe sharing, signing, and retry. Production node selection still
-  refuses guarded Git until the complete graph-pinning, source-loss and
-  five-member seed-only gate proves this path end to end.
+  sector-recipe sharing, signing, and retry. A further ext4/Btrfs node probe
+  stages an untouched root file with a node-owned pin, reopens to publish its
+  catalog receipt, creates a real guarded Git commit without checkout replay,
+  then reopens again with a stopped graph capture and signs its reachable blob.
+  Production node selection still refuses guarded Git until the source-loss
+  and five-member seed-only gate proves this path end to end.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

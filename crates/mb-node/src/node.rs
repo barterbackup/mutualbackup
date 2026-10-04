@@ -27701,7 +27701,7 @@ pub(crate) mod tests {
         node.guarded_mounts.pop().unwrap().stop().unwrap();
         drop(node);
 
-        let mut node = Node::open(&data_dir, seed).unwrap();
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
         assert_eq!(node.protected_root_by_id(root_id).unwrap(), root);
         assert_eq!(
             node.verified_source_backend_for_root(&root)
@@ -27775,10 +27775,137 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(restored.join("sample")).unwrap(), original);
+        let binding = node.guarded_root_mount_binding(&root).unwrap();
+        let git_key = node.git_catalog_key(root_id);
+        GitRepository::init_with_catalog_root(
+            &view,
+            &binding.lower_root,
+            root_id,
+            &git_key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        node.control
+            .put_record(
+                "git-repository",
+                root_id.as_bytes(),
+                &canonical_bytes(&GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id: root_id,
+                    path: view.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
+        let stage_control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
+                .unwrap(),
+        ));
+        let stage_id = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            stage_id,
+            Arc::clone(&stage_control),
+            "sample",
+        )
+        .unwrap();
+        let stage_anchor = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            stage_id,
+            Arc::clone(&stage_control),
+        )
+        .unwrap();
+        assert_eq!(stage_anchor.format_version, 2);
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            stage_id,
+            root_id,
+            root_id,
+            &stage_control.lock().unwrap(),
+        )
+        .unwrap();
+        drop(stage_control);
+        drop(node);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let repository = node.open_guarded_git_repository(root_id).unwrap();
+        let commit = repository
+            .commit("Guarded", "guarded@example.test", "exact bytes")
+            .unwrap();
+        let captured_graph = repository.export_graph_source().unwrap();
+        assert_eq!(captured_graph.refs.len(), 1);
+        assert_eq!(captured_graph.blobs.len(), 1);
+        assert_eq!(captured_graph.blobs[0].anchor, stage_anchor);
+        drop(repository);
+        let git_revision_id = Uuid::new_v4();
+        assert!(
+            crate::snapshot::prepare_guarded_git_graph_intent(
+                &node.control,
+                &node.keys,
+                guild_id,
+                git_revision_id,
+                root_id,
+                &view,
+                &binding.lower_root,
+            )
+            .unwrap()
+        );
+        node.capture_claimed_guarded_view_for_revision(binding.anchor_id, git_revision_id)
+            .unwrap();
         for mount in node.guarded_mounts.drain(..) {
             mount.stop().unwrap();
         }
         drop(node);
+        let mut reopened = Node::open(&data_dir, seed).unwrap();
+        reopened.check_guarded_mounts().unwrap();
+        assert!(
+            reopened
+                .control
+                .get_record("git-graph-intent-v1", git_revision_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        let writer = reopened.writer_incarnation(guild_id).unwrap();
+        let git_revision = crate::snapshot::prepare_guarded_git_revision(
+            &mut reopened.control,
+            &reopened.keys,
+            guild_id,
+            root_id,
+            binding.anchor_id,
+            2,
+            git_revision_id,
+            WriterCredentials {
+                epoch: writer.epoch,
+                secret: &writer.secret_key,
+                captured_change_sequence: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            git_revision.value.parent,
+            Some(revision.value.hash().unwrap())
+        );
+        let signed_graph = crate::snapshot::revision_git_backup(
+            &reopened.control,
+            &reopened.keys,
+            guild_id,
+            &git_revision,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(signed_graph.repository_id, root_id);
+        assert_eq!(signed_graph.refs[0].oid, commit.oid);
+        assert_eq!(signed_graph.blobs.len(), 1);
+        assert_eq!(signed_graph.blobs[0].oid, captured_graph.blobs[0].oid);
+        assert!(
+            reopened
+                .control
+                .get_record("git-graph-intent-v1", git_revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        for mount in reopened.guarded_mounts.drain(..) {
+            mount.stop().unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]

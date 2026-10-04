@@ -1153,7 +1153,7 @@ impl GitRepository {
         author_email: &str,
         message: &str,
     ) -> Result<GitCommitInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         self.ensure_no_merge_session()?;
         Ok(commit_index(
             &self.catalog,
@@ -1165,12 +1165,12 @@ impl GitRepository {
     }
 
     pub fn log(&self, limit: usize) -> Result<Vec<GitLogEntry>, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(log_history(&self.catalog, self.repository_id, limit)?)
     }
 
     pub fn branches(&self) -> Result<Vec<GitBranchInfo>, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(list_branches(&self.catalog, self.repository_id)?)
     }
 
@@ -2444,6 +2444,15 @@ mod tests {
         assert!(guarded.publish_guarded_stage(&pin, Uuid::new_v4()).is_err());
         let staged = guarded.publish_guarded_stage(&pin, root_anchor_id).unwrap();
         assert_eq!(guarded.staged_entry("tracked").unwrap(), Some(staged));
+        let commit = guarded
+            .commit("Guarded", "guarded@example.test", "pinned bytes")
+            .unwrap();
+        assert_eq!(guarded.log(1).unwrap()[0].oid, commit.oid);
+        assert_eq!(guarded.branches().unwrap()[0].oid, commit.oid);
+        let graph = guarded.export_graph_source().unwrap();
+        assert_eq!(graph.refs.len(), 1);
+        assert_eq!(graph.blobs.len(), 1);
+        assert_eq!(graph.blobs[0].anchor.anchor_id, pin.manifest.anchor_id);
         assert!(
             guarded
                 .prune_unreachable(&GitPruneRoots::default())
