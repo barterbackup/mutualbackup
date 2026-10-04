@@ -75,7 +75,14 @@
   candidate object IDs, exact manifests, and attempt IDs, including untouched
   files backed by version-2 virtual mappings. The preview leaves catalog
   mappings and node pins intact; deletion stays fenced until the node records
-  and replays a cross-catalog retirement intent.
+  and replays a cross-catalog retirement intent. The catalog-side batch
+  transition is now implemented separately: with a node-fenced batch and
+  current signed roots, it atomically deletes exact object mappings and
+  receipts under a replayable catalog intent, rejects a stale candidate or
+  changed protection root, and completes idempotently after reopen. The node
+  still must durably fence the batch first, retire pins with crash progress,
+  clean up physical anchors, and replay this sequence before normal receipt
+  reconciliation; guarded production prune remains disabled.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

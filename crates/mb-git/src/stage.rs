@@ -55,6 +55,11 @@ const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
 const GUARDED_STAGE_RECEIPT_PREFIX: &str = "git-guarded-stage-receipt-v1/";
 
 #[cfg(target_os = "linux")]
+pub(crate) fn guarded_stage_receipt_kind(repository_id: Uuid) -> String {
+    format!("{GUARDED_STAGE_RECEIPT_PREFIX}{repository_id}")
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn guarded_stage_receipt_matches(
     control: &ControlStore,
     pin: &GuardedGitStagePin,
@@ -76,7 +81,7 @@ pub(crate) fn guarded_stage_receipt_matches(
     if stage_path_key(&path)? != pin.relative_path {
         return Err(StageError::IncompatibleRecord);
     }
-    let kind = format!("{GUARDED_STAGE_RECEIPT_PREFIX}{}", pin.repository_id);
+    let kind = guarded_stage_receipt_kind(pin.repository_id);
     let Some(bytes) = control.get_record(&kind, pin.attempt_id.as_bytes())? else {
         return Ok(false);
     };
@@ -121,7 +126,7 @@ pub(crate) fn guarded_catalog_stage_pins(
     }
     let mut pins = Vec::new();
     let mut by_anchor = std::collections::HashMap::new();
-    let kind = format!("{GUARDED_STAGE_RECEIPT_PREFIX}{repository_id}");
+    let kind = guarded_stage_receipt_kind(repository_id);
     for (key, bytes) in control.records(&kind)? {
         let receipt: GuardedStageReceipt = decode_canonical(&bytes)?;
         if receipt.format_version != 1
@@ -861,7 +866,7 @@ pub(crate) fn publish_guarded_stage_for_scope(
         manifest: pin.manifest.clone(),
         entry: entry.clone(),
     };
-    let receipt_kind = format!("{GUARDED_STAGE_RECEIPT_PREFIX}{}", scope.repository_id());
+    let receipt_kind = guarded_stage_receipt_kind(scope.repository_id());
     let receipt_bytes = canonical_bytes(&receipt)?;
     if let Some(existing) = control.get_record(&receipt_kind, pin.attempt_id.as_bytes())? {
         let recorded: GuardedStageReceipt = decode_canonical(&existing)?;

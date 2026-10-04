@@ -18,11 +18,13 @@ use crate::fetch::{FetchError, has_pending_fetch};
 use crate::history::{HistoryError, export_graph_source, metadata_kind, verified_metadata_ids};
 use crate::merge::{MergeBlobError, has_merge_session, has_pending_merge_blob};
 use crate::stage::{
-    StageError, guarded_catalog_stage_pins, has_pending_stages, has_pending_stages_for_scope,
-    object_kind_prefix, staged_entries, staged_entries_for_scope, worktree_scopes_with_stage_state,
+    StageError, guarded_catalog_stage_pins, guarded_stage_receipt_kind, has_pending_stages,
+    has_pending_stages_for_scope, object_kind, object_kind_prefix, staged_entries,
+    staged_entries_for_scope, worktree_scopes_with_stage_state,
 };
 
 const INTENT_PREFIX: &str = "git-prune-intent-v1/";
+const GUARDED_INTENT_PREFIX: &str = "git-guarded-prune-intent-v1/";
 const ACTIVE: &[u8] = b"active";
 const MAX_BATCH_RECORDS: usize = 1024;
 
@@ -95,6 +97,24 @@ pub struct GitGuardedPruneAnchorCandidate {
     pub attempt_id: Option<Uuid>,
 }
 
+impl GitGuardedPrunePreview {
+    /// One bounded deterministic batch, with metadata before anchor mappings.
+    /// The node fences only this batch, then replans after it completes.
+    pub fn first_batch(&self) -> Option<Self> {
+        if self.metadata_oids.is_empty() && self.anchors.is_empty() {
+            return None;
+        }
+        let metadata_count = self.metadata_oids.len().min(MAX_BATCH_RECORDS);
+        let anchor_count = self.anchors.len().min(MAX_BATCH_RECORDS - metadata_count);
+        Some(Self {
+            format_version: self.format_version,
+            repository_id: self.repository_id,
+            metadata_oids: self.metadata_oids[..metadata_count].to_vec(),
+            anchors: self.anchors[..anchor_count].to_vec(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PruneIntent {
     format_version: u16,
@@ -110,6 +130,173 @@ struct Candidate {
 
 fn intent_kind(repository_id: Uuid) -> String {
     format!("{INTENT_PREFIX}{repository_id}")
+}
+
+fn guarded_intent_kind(repository_id: Uuid) -> String {
+    format!("{GUARDED_INTENT_PREFIX}{repository_id}")
+}
+
+fn validate_guarded_batch(batch: &GitGuardedPrunePreview) -> Result<(), GitPruneError> {
+    if batch.format_version != 1
+        || batch.repository_id.is_nil()
+        || batch.metadata_oids.len() + batch.anchors.len() == 0
+        || batch.metadata_oids.len() + batch.anchors.len() > MAX_BATCH_RECORDS
+    {
+        return Err(GitPruneError::IncompatibleRecord);
+    }
+    let mut metadata = HashSet::new();
+    let mut anchors = HashSet::new();
+    let mut attempts = HashSet::new();
+    for oid in &batch.metadata_oids {
+        if !metadata.insert(*oid) {
+            return Err(GitPruneError::IncompatibleRecord);
+        }
+    }
+    for candidate in &batch.anchors {
+        if !matches!(candidate.manifest.format_version, 1 | 2)
+            || candidate.manifest.format_version == 2
+                && candidate.manifest.guarded_root_file.is_none()
+            || candidate.manifest.format_version == 1
+                && candidate.manifest.guarded_root_file.is_some()
+            || candidate.manifest.format_version == 2 && candidate.attempt_id.is_none()
+            || !anchors.insert(candidate.manifest.anchor_id)
+            || candidate
+                .attempt_id
+                .is_some_and(|attempt| !attempts.insert(attempt))
+        {
+            return Err(GitPruneError::IncompatibleRecord);
+        }
+    }
+    Ok(())
+}
+
+fn guarded_batch_records_absent(
+    control: &ControlStore,
+    batch: &GitGuardedPrunePreview,
+) -> Result<bool, GitPruneError> {
+    let mut absent = true;
+    for oid in &batch.metadata_oids {
+        absent &= control
+            .get_record(&metadata_kind(batch.repository_id), oid)?
+            .is_none();
+    }
+    for candidate in &batch.anchors {
+        let oid = Oid::from_bytes(&candidate.oid)?;
+        absent &= control
+            .get_record(
+                &object_kind(batch.repository_id, oid),
+                candidate.manifest.anchor_id.as_bytes(),
+            )?
+            .is_none();
+        if let Some(attempt) = candidate.attempt_id {
+            absent &= control
+                .get_record(
+                    &guarded_stage_receipt_kind(batch.repository_id),
+                    attempt.as_bytes(),
+                )?
+                .is_none();
+        }
+    }
+    Ok(absent)
+}
+
+/// Atomically retire one node-fenced guarded batch from the Git catalog. The
+/// returned `true` means its catalog intent still needs physical cleanup and
+/// completion; `false` means a prior completion already removed every record.
+/// No caller may invoke this before durably fencing the same batch in node
+/// control, because a receipt disappears alongside its object mapping.
+pub(crate) fn retire_guarded_prune_catalog(
+    control: &ControlStore,
+    batch: &GitGuardedPrunePreview,
+    protected: &GitPruneRoots,
+) -> Result<bool, GitPruneError> {
+    validate_guarded_batch(batch)?;
+    let intent_kind = guarded_intent_kind(batch.repository_id);
+    let encoded = canonical_bytes(batch)?;
+    if let Some(existing) = control.get_record(&intent_kind, ACTIVE)? {
+        if existing != encoded || !guarded_batch_records_absent(control, batch)? {
+            return Err(GitPruneError::IncompatibleRecord);
+        }
+        return Ok(true);
+    }
+
+    if guarded_batch_records_absent(control, batch)? {
+        return Ok(false);
+    }
+    let current = preview_guarded_prune(control, batch.repository_id, protected)?;
+    if current.first_batch().as_ref() != Some(batch) {
+        return Err(GitPruneError::IncompatibleRecord);
+    }
+
+    let receipts = guarded_catalog_stage_pins(control, batch.repository_id)?;
+    let by_attempt = receipts
+        .iter()
+        .map(|pin| (pin.attempt_id, pin))
+        .collect::<HashMap<_, _>>();
+    let mut deletions = Vec::with_capacity(batch.metadata_oids.len() + batch.anchors.len() * 2);
+    let mut present = 0usize;
+    for oid in &batch.metadata_oids {
+        let kind = metadata_kind(batch.repository_id);
+        present += usize::from(control.get_record(&kind, oid)?.is_some());
+        deletions.push((kind, oid.to_vec()));
+    }
+    for candidate in &batch.anchors {
+        let oid = Oid::from_bytes(&candidate.oid)?;
+        let kind = object_kind(batch.repository_id, oid);
+        let mapped = control.get_record(&kind, candidate.manifest.anchor_id.as_bytes())?;
+        let expected = canonical_bytes(&candidate.manifest)?;
+        if mapped
+            .as_deref()
+            .is_some_and(|bytes| bytes != expected.as_slice())
+        {
+            return Err(GitPruneError::IncompatibleRecord);
+        }
+        present += usize::from(mapped.is_some());
+        deletions.push((kind, candidate.manifest.anchor_id.as_bytes().to_vec()));
+        if let Some(attempt) = candidate.attempt_id {
+            if by_attempt
+                .get(&attempt)
+                .copied()
+                .is_some_and(|pin| pin.manifest != candidate.manifest)
+                || mapped.is_some() && !by_attempt.contains_key(&attempt)
+            {
+                return Err(GitPruneError::IncompatibleRecord);
+            }
+            let kind = guarded_stage_receipt_kind(batch.repository_id);
+            present += usize::from(control.get_record(&kind, attempt.as_bytes())?.is_some());
+            deletions.push((kind, attempt.as_bytes().to_vec()));
+        } else if receipts
+            .iter()
+            .any(|pin| pin.manifest.anchor_id == candidate.manifest.anchor_id)
+        {
+            return Err(GitPruneError::IncompatibleRecord);
+        }
+    }
+    if present != deletions.len() {
+        return Err(GitPruneError::IncompatibleRecord);
+    }
+    control.put_records_and_delete(&[(intent_kind, ACTIVE.to_vec(), encoded)], &deletions)?;
+    Ok(true)
+}
+
+pub(crate) fn complete_guarded_prune_catalog(
+    control: &ControlStore,
+    batch: &GitGuardedPrunePreview,
+) -> Result<(), GitPruneError> {
+    validate_guarded_batch(batch)?;
+    if !guarded_batch_records_absent(control, batch)? {
+        return Err(GitPruneError::IncompatibleRecord);
+    }
+    let kind = guarded_intent_kind(batch.repository_id);
+    let Some(existing) = control.get_record(&kind, ACTIVE)? else {
+        return Ok(());
+    };
+    let encoded = canonical_bytes(batch)?;
+    if existing != encoded {
+        return Err(GitPruneError::IncompatibleRecord);
+    }
+    control.delete_record_if_value(&kind, ACTIVE, &encoded)?;
+    Ok(())
 }
 
 pub(crate) fn has_pending_prune(
@@ -254,7 +441,11 @@ pub(crate) fn preview_guarded_prune(
     repository_id: Uuid,
     protected: &GitPruneRoots,
 ) -> Result<GitGuardedPrunePreview, GitPruneError> {
-    if has_pending_prune(control, repository_id)? {
+    if has_pending_prune(control, repository_id)?
+        || control
+            .get_record(&guarded_intent_kind(repository_id), ACTIVE)?
+            .is_some()
+    {
         return Err(GitPruneError::IncompatibleRecord);
     }
     let receipts = guarded_catalog_stage_pins(control, repository_id)?;
@@ -471,7 +662,7 @@ mod tests {
         assert_eq!(preview.anchors[0].attempt_id, Some(pin.attempt_id));
         assert_eq!(
             guarded_catalog_stage_pins(&control, repository_id).unwrap(),
-            vec![pin]
+            vec![pin.clone()]
         );
         let protected = GitPruneRoots {
             anchor_ids: std::iter::once(manifest.anchor_id).collect(),
@@ -483,6 +674,68 @@ mod tests {
                 .anchors
                 .is_empty()
         );
+        assert!(matches!(
+            retire_guarded_prune_catalog(&control, &preview, &protected),
+            Err(GitPruneError::IncompatibleRecord)
+        ));
+        let mut wrong = preview.clone();
+        wrong.anchors[0].attempt_id = Some(Uuid::new_v4());
+        assert!(matches!(
+            retire_guarded_prune_catalog(&control, &wrong, &GitPruneRoots::default()),
+            Err(GitPruneError::IncompatibleRecord)
+        ));
+        assert_eq!(
+            guarded_catalog_stage_pins(&control, repository_id).unwrap(),
+            vec![pin]
+        );
+
+        assert!(
+            retire_guarded_prune_catalog(&control, &preview, &GitPruneRoots::default()).unwrap()
+        );
+        assert!(matches!(
+            preview_guarded_prune(&control, repository_id, &GitPruneRoots::default()),
+            Err(GitPruneError::IncompatibleRecord)
+        ));
+        assert!(matches!(
+            retire_guarded_prune_catalog(&control, &wrong, &GitPruneRoots::default()),
+            Err(GitPruneError::IncompatibleRecord)
+        ));
+        assert!(matches!(
+            complete_guarded_prune_catalog(&control, &wrong),
+            Err(GitPruneError::IncompatibleRecord)
+        ));
+        assert!(
+            control
+                .get_record(&guarded_intent_kind(repository_id), ACTIVE)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            guarded_catalog_stage_pins(&control, repository_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            control
+                .get_record(
+                    &object_kind(repository_id, Oid::from_bytes(&entry.oid).unwrap()),
+                    manifest.anchor_id.as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(control);
+        let reopened =
+            ControlStore::open_existing_with_key(temporary.path().join("catalog.db"), &[41; 32])
+                .unwrap();
+        assert!(
+            retire_guarded_prune_catalog(&reopened, &preview, &GitPruneRoots::default()).unwrap()
+        );
+        complete_guarded_prune_catalog(&reopened, &preview).unwrap();
+        assert!(
+            !retire_guarded_prune_catalog(&reopened, &preview, &GitPruneRoots::default()).unwrap()
+        );
+        complete_guarded_prune_catalog(&reopened, &preview).unwrap();
         manifest.remove().unwrap();
     }
 

@@ -49,8 +49,9 @@ use crate::merge::{
     session_key, session_kind, session_kind_for_scope,
 };
 use crate::prune::{
-    GitGuardedPrunePreview, GitPruneError, GitPruneReport, GitPruneRoots, has_pending_prune,
-    preview_guarded_prune, prune_unreachable, resume_pending_prune,
+    GitGuardedPrunePreview, GitPruneError, GitPruneReport, GitPruneRoots,
+    complete_guarded_prune_catalog, has_pending_prune, preview_guarded_prune, prune_unreachable,
+    resume_pending_prune, retire_guarded_prune_catalog,
 };
 use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
 use crate::stage::{
@@ -1448,6 +1449,39 @@ impl GitRepository {
             self.repository_id,
             protected,
         )?)
+    }
+
+    /// The node must first persist an exact retirement fence in its own
+    /// control database. This atomically removes the fenced catalog records
+    /// and leaves a replayable catalog intent until node cleanup completes.
+    pub fn retire_guarded_prune_catalog(
+        &self,
+        batch: &GitGuardedPrunePreview,
+        protected: &GitPruneRoots,
+    ) -> Result<bool, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1
+            || batch.repository_id != self.repository_id
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        self.require_guarded_stage_ready()?;
+        Ok(retire_guarded_prune_catalog(
+            &self.catalog,
+            batch,
+            protected,
+        )?)
+    }
+
+    pub fn complete_guarded_prune_catalog(
+        &self,
+        batch: &GitGuardedPrunePreview,
+    ) -> Result<(), RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1
+            || batch.repository_id != self.repository_id
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(complete_guarded_prune_catalog(&self.catalog, batch)?)
     }
 
     pub fn push_current_branch_to_bare(
