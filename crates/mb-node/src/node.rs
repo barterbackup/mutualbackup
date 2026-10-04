@@ -49,11 +49,11 @@ use crate::control::{GitRepositoryInfo, GitStagedFile, NodeStatus, ProtectedRoot
 use crate::snapshot::{
     WriterCredentials, abandon_recovered_anchor_capture, build_revision_restore,
     git_prune_capture_pending, git_prune_recipe_anchor_ids, install_inline_recipe,
-    install_recovered_sector_recipe, make_restore_root_private_at, prepare_revision,
-    publish_owned_restore, reanchor_recovered_revision, reconcile_pending_captures,
-    recovered_recipe_is_stable, render_sector, restore_revision_from_source,
-    restore_signed_root_metadata_at, resume_restore_publication, retire_revision_anchor,
-    revision_git_backup, revision_head_id,
+    install_recovered_sector_recipe, make_restore_root_private_at,
+    prepare_recovered_revision_publication, prepare_revision, publish_owned_restore,
+    reanchor_recovered_revision, reconcile_pending_captures, recovered_recipe_is_stable,
+    render_sector, restore_revision_from_source, restore_signed_root_metadata_at,
+    resume_restore_publication, retire_revision_anchor, revision_git_backup, revision_head_id,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -320,6 +320,9 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     #[cfg(target_os = "linux")]
     static INTERRUPT_AFTER_GUARDED_RECOVERY_INTENT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -13595,12 +13598,12 @@ impl Node {
 
         if job.state == RecoveryJobState::Anchoring {
             let staging = open_expected_recovery_directory(&parent, &staging_name, expected)?;
-            reanchor_recovered_revision(
+            prepare_recovered_revision_publication(
                 &mut self.control,
                 &self.keys,
                 guild_id,
                 revision,
-                &staging.descriptor_path(),
+                &staging,
             )?;
             if parent.entry_identity(&staging_name, true)? != expected {
                 anyhow::bail!("recovery staging directory changed while it was anchored");
@@ -13685,12 +13688,12 @@ impl Node {
         job.state = RecoveryJobState::Anchoring;
         self.control
             .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
-        reanchor_recovered_revision(
+        prepare_recovered_revision_publication(
             &mut self.control,
             &self.keys,
             guild_id,
             revision,
-            &staging.descriptor_path(),
+            &staging,
         )?;
         if parent.entry_identity(&staging_name, true)? != Some(staged_identity) {
             anyhow::bail!("recovery staging directory changed while it was anchored");
@@ -13987,12 +13990,18 @@ impl Node {
                 intent
                     .plan
                     .capture_private_file_owners(&self.control, metadata.root.uid, 0, 0)?;
-            crate::snapshot::verify_guarded_recovery_capture(
+            crate::snapshot::install_guarded_recovery_root_recipes(
+                &mut self.control,
                 &self.keys,
                 job.guild_id,
+                revision,
                 metadata,
                 &manifest,
             )?;
+            #[cfg(test)]
+            if INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.replace(false)) {
+                anyhow::bail!("injected interruption after guarded recovery capture");
+            }
             intent
                 .plan
                 .isolate_lower_directories(&self.control, &manifest)?;
@@ -25753,7 +25762,7 @@ pub(crate) mod tests {
         restored_plan.discard_unreferenced(&store).unwrap();
         drop(store);
         drop(restored_control);
-        if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
+        {
             let ciphertexts = signed
                 .value
                 .metadata_sectors
@@ -25808,6 +25817,29 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(published.state, RecoveryJobState::Published);
+            if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
+                // A job published by an older binary may already have
+                // reflink-backed guarded recipes. The mounted-root capture
+                // replaces them and retires that old local capture.
+                crate::snapshot::reanchor_recovered_revision(
+                    &mut seed_only.control,
+                    &keys,
+                    guild_id,
+                    &signed,
+                    &seed_target,
+                )
+                .unwrap();
+                assert!(
+                    seed_only
+                        .control
+                        .get_record(
+                            "guarded-recovery-reflink-capture-v1",
+                            signed.value.revision_id.as_bytes()
+                        )
+                        .unwrap()
+                        .is_some()
+                );
+            }
             fs::write(seed_target.join("unexpected"), b"extra name").unwrap();
             assert!(
                 seed_only
@@ -25867,6 +25899,26 @@ pub(crate) mod tests {
                 Seed::from_bytes([241; 32]),
             )
             .unwrap();
+            INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.set(true));
+            assert!(
+                seed_only
+                    .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                    .is_err()
+            );
+            assert!(
+                seed_only
+                    .control
+                    .get_record("anchor-manifest", signed.value.revision_id.as_bytes())
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(seed_only.protected_root_by_id(protected_root_id).is_err());
+            drop(seed_only);
+            let mut seed_only = Node::open(
+                area.path().join("seed-only-node"),
+                Seed::from_bytes([241; 32]),
+            )
+            .unwrap();
             seed_only
                 .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
                 .unwrap();
@@ -25889,6 +25941,31 @@ pub(crate) mod tests {
             let restored_root = seed_only.protected_root_by_id(protected_root_id).unwrap();
             assert_eq!(restored_root.path, seed_target);
             assert_eq!(restored_root.format_version, 4);
+            let protected_manifest: mb_store::StableAnchorManifest = decode_canonical(
+                &seed_only
+                    .control
+                    .get_record("anchor-manifest", signed.value.revision_id.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                protected_manifest.anchor_id,
+                seed_only
+                    .guarded_root_mount_binding(&restored_root)
+                    .unwrap()
+                    .anchor_id
+            );
+            assert!(
+                seed_only
+                    .control
+                    .get_record(
+                        "guarded-recovery-reflink-capture-v1",
+                        signed.value.revision_id.as_bytes()
+                    )
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(
                 seed_only
                     .verified_source_backend_for_root(&restored_root)
@@ -25910,6 +25987,32 @@ pub(crate) mod tests {
                     .unwrap()
                     .is_some()
             );
+            let recovered_edit = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'LIVE',0); os.fsync(fd); os.close(fd)")
+                .arg(seed_target.join("sample"))
+                .output()
+                .unwrap();
+            assert!(recovered_edit.status.success(), "{recovered_edit:?}");
+            let mut edited_recovered = captured_bytes.clone();
+            edited_recovered[..4].copy_from_slice(b"LIVE");
+            assert_eq!(
+                fs::read(seed_target.join("sample")).unwrap(),
+                edited_recovered
+            );
+            for reference in &signed.value.data_sectors {
+                assert!(
+                    crate::snapshot::recovered_recipe_is_stable(
+                        &seed_only.control,
+                        &keys,
+                        guild_id,
+                        reference,
+                    )
+                    .unwrap()
+                );
+            }
             drop(seed_only);
             let mut seed_only = Node::open(
                 area.path().join("seed-only-node"),
@@ -25936,7 +26039,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(
                 fs::read(seed_target.join("sample")).unwrap(),
-                captured_bytes
+                edited_recovered
             );
         }
         recovered.check_guarded_mounts().unwrap();

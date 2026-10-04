@@ -873,8 +873,8 @@
   The privileged node fixture now feeds signed format-6 sectors to a fresh
   same-seed node on disposable Btrfs and runs the production recovery job
   through restore, reanchor, root registration, and reopen/retry. That local
-  path passes; a full network seed-only recovery and non-reflink guarded-view
-  reconstruction remain open.
+  path passes; at that stage it did not cover full network seed-only recovery
+  or guarded-view reconstruction without reflinks.
   Production protected-root removal must retire the claimed view, and guarded
   Git pins must join this proof before guarded enrollment or Git operations
   can select the backend.
@@ -888,8 +888,8 @@
   nested raw filename, edits it through FUSE while preserving its original
   anchor, signs its guarded stopped capture, restores its exact bytes on ext4
   and Btrfs, and exercises same-seed recovery/reanchor on Btrfs.
-  Reconstructing a guarded FUSE view from signed recovery on a non-reflink
-  filesystem remains open.
+  That initial Btrfs-only recovery fixture did not cover a non-reflink
+  filesystem.
   Recovery now binds signed format-6 raw paths and virtual attributes to the
   restored tree's local inodes before retaining new anchors. It rejects extra
   names, changed lengths, and hard-link aliases outside the signed namespace;
@@ -943,7 +943,15 @@
   cannot discard an unfinished private-lower handoff. A privileged disposable-
   Btrfs fixture exercises publication tampering, interruption and node reopen
   after the handoff and mount intent, completed mount reopen, and exact file
-  bytes. Non-reflink reanchoring, full network seed-only recovery, guarded
+  bytes. Production format-6 jobs now verify the restored staging tree before
+  publication, then install signed data-sector recipes from the sealed guarded
+  root capture rather than a preliminary reflink. Privileged ext4 and Btrfs
+  runs pass the same seed-only restore, handoff, mount, restart, and exact-byte
+  checks, including restarts after the durable mount intent and captured
+  sector recipes. Both runs edit the recovered FUSE view, reopen the node, and
+  confirm that the signed sector recipes still reproduce the pre-edit bytes;
+  the Btrfs run also migrates an older reflink-backed capture into durable
+  retirement. Full network seed-only guarded recovery, guarded
   removal/GC, and broader FUSE failure paths remain open before enrollment.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe

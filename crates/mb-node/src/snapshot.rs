@@ -2059,6 +2059,37 @@ pub(crate) fn reanchor_recovered_revision(
     Ok(())
 }
 
+/// A guarded restore is verified before publication, but its durable sector
+/// recipes are installed only after the private lower tree has been captured.
+/// That capture works on filesystems without reflinks.
+pub(crate) fn prepare_recovered_revision_publication(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    restored: &PinnedDirectory,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if guarded_private_metadata_for_revision(control, keys, guild_id, revision)?.is_some() {
+        revision.verify(USER_REVISION_DOMAIN)?;
+        revision.value.verify_writer()?;
+        ensure!(
+            revision.signer == keys.node_id()
+                && revision.value.owner == keys.node_id()
+                && revision.value.guild_id == guild_id,
+            "recovered guarded revision does not belong to the local seed and guild"
+        );
+        return verify_guarded_recovered_namespace(control, keys, guild_id, revision, restored);
+    }
+    reanchor_recovered_revision(
+        control,
+        keys,
+        guild_id,
+        revision,
+        &restored.descriptor_path(),
+    )
+}
+
 fn recovered_anchor_records(
     keys: &KeyMaterial,
     guild_id: [u8; 32],
@@ -2648,6 +2679,135 @@ pub(crate) fn verify_guarded_recovery_capture(
             &encryption_key,
             |_, _| Ok(()),
         )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_guarded_recovery_root_recipes(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    metadata: &GuardedPrivateMetadataV6,
+    manifest: &mb_store::StableAnchorManifest,
+) -> Result<()> {
+    ensure!(
+        matches!(manifest.format_version, 2 | 3),
+        "unsupported guarded recovery root capture"
+    );
+    verify_guarded_recovery_capture(keys, guild_id, metadata, manifest)?;
+    let revision_key = revision.value.revision_id.as_bytes();
+    let manifest_bytes = canonical_bytes(manifest)?;
+    ensure!(
+        control
+            .get_record("anchor-manifest", revision_key)?
+            .is_none_or(|existing| existing == manifest_bytes),
+        "guarded recovery root capture conflicts with an existing revision anchor"
+    );
+    let encryption_key = keys.guild_data_key(&guild_id);
+    let mut recipes = BTreeMap::<SectorId, LocalSectorRecipe>::new();
+    for entry in &metadata.entries {
+        let GuardedPrivateEntryV6::File {
+            path,
+            logical_len,
+            data_extents,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let path = PathBuf::from(OsString::from_vec(path.clone()));
+        let locator = manifest.file_locator_path(&path)?;
+        let mut file = locator.open()?;
+        verify_guarded_file_content(
+            &mut file,
+            *logical_len,
+            data_extents,
+            &encryption_key,
+            |reference, offset| {
+                let recipe = LocalSectorRecipe {
+                    guild_id,
+                    reference: reference.clone(),
+                    source: LocalPlaintextSource::StableAnchorFile {
+                        locator: locator.clone(),
+                        offset,
+                    },
+                };
+                ensure!(
+                    recipes
+                        .insert(reference.id, recipe.clone())
+                        .is_none_or(|previous| previous.reference == recipe.reference),
+                    "guarded recovery sector has conflicting signed references"
+                );
+                Ok(())
+            },
+        )?;
+    }
+    ensure!(
+        recipes.len() == revision.value.data_sectors.len()
+            && revision.value.data_sectors.iter().all(|reference| {
+                recipes.get(&reference.id).map(|recipe| &recipe.reference) == Some(reference)
+            }),
+        "guarded recovery root capture differs from signed data catalog"
+    );
+    let mut records = Vec::with_capacity(recipes.len() + 2);
+    for recipe in recipes.into_values() {
+        records.push((
+            "local-sector".to_owned(),
+            recipe.reference.id.to_vec(),
+            canonical_bytes(&recipe)?,
+        ));
+    }
+    records.push((
+        ANCHOR_AREA_LOCATION_KIND.to_owned(),
+        manifest.area.area_id.as_bytes().to_vec(),
+        canonical_bytes(&RawLocalPath(manifest.area.path_hint.clone()))?,
+    ));
+    records.push((
+        "anchor-manifest".to_owned(),
+        revision_key.to_vec(),
+        manifest_bytes,
+    ));
+    control.put_records(&records)?;
+    let old_capture_bytes = control.get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_key)?;
+    let old_capture = old_capture_bytes
+        .as_deref()
+        .map(decode_canonical::<GuardedRecoveredCaptureV1>)
+        .transpose()?;
+    if let Some(capture) = &old_capture {
+        let metadata_bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+        capture.validate(revision.value.revision_id, &metadata_bytes, metadata)?;
+    }
+    if let Some(bytes) = control.get_record(GUARDED_RECOVERY_INTENT_KIND, revision_key)? {
+        let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
+        let metadata_bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+        intent.validate(
+            revision,
+            guild_id,
+            &metadata_bytes,
+            metadata,
+            &intent.source_root,
+            old_capture.as_ref(),
+        )?;
+        discard_guarded_recovery_intent(control, &intent, &bytes)?;
+    }
+    if let Some(bytes) = old_capture_bytes {
+        let retirement_id = blake3::hash(&bytes);
+        ensure!(
+            control
+                .get_record(GUARDED_RECOVERY_RETIRE_KIND, retirement_id.as_bytes())?
+                .is_none_or(|existing| existing == bytes),
+            "guarded recovery reflink retirement conflicts with its capture"
+        );
+        control.move_protocol_record(
+            GUARDED_RECOVERY_CAPTURE_KIND,
+            revision_key,
+            &bytes,
+            GUARDED_RECOVERY_RETIRE_KIND,
+            retirement_id.as_bytes(),
+        )?;
+        reconcile_guarded_recovered_retirements(control)?;
     }
     Ok(())
 }

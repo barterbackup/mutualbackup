@@ -1205,10 +1205,12 @@ and platform gates remain open.
 The guarded format-6 production recovery path now journals the restored-tree
 handoff, binds signed virtual metadata to a durable mount intent, verifies the
 captured anchors against signed sectors, and registers the recovered root only
-through a supervised FUSE claim. Local Btrfs interruption/reopen coverage
-exercises both handoff and mount-intent replay. Non-reflink reanchoring, full
-network seed-only guarded recovery, guarded removal/GC, and the platform gates
-remain open.
+through a supervised FUSE claim. The production job now installs recovered
+sector recipes from that guarded capture without a preliminary reflink; local
+ext4 and Btrfs interruption/reopen runs exercise handoff and mount-intent
+replay, and the Btrfs run migrates an older reflink capture. Full network
+seed-only guarded recovery, guarded removal/GC, and the platform gates remain
+open.
 A separate local Btrfs regression confirms that a stock Git peer's CRLF
 worktree can yield an LF blob and that our import, checkout, restore, and export
 preserve the exchanged LF blob and object ID. The Git-facing help explains that
