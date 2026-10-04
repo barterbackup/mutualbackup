@@ -424,11 +424,330 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
+    use std::ffi::{CString, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
+
+    #[test]
+    #[ignore = "requires root, FUSE passthrough, and fanotify permission events"]
+    fn separate_release_replays_deferred_guarded_git_file_cleanup() {
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        for stage in 0..4_u8 {
+            let area = tempfile::Builder::new()
+                .prefix("mb-guarded-git-release-")
+                .tempdir_in(&test_root)
+                .unwrap();
+            fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let lower = area.path().join("lower");
+            let view = area.path().join("view");
+            let data_dir = area.path().join("node");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(&view).unwrap();
+            fs::set_permissions(&lower, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+            let original = b"deferred\r\nrelease\0";
+            let edited = b"Deferred\r\nrelease\0";
+            fs::write(lower.join("tracked"), original).unwrap();
+            fs::set_permissions(lower.join("tracked"), fs::Permissions::from_mode(0o644)).unwrap();
+
+            let seed = Seed::from_bytes([stage + 110; 32]);
+            let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+            let root = node
+                .add_guarded_protected_root(&lower, &view, 65534, 65534)
+                .unwrap();
+            let binding = node.guarded_root_mount_binding(&root).unwrap();
+            let repository_id = root.root_id;
+            let key = node.git_catalog_key(repository_id);
+            GitRepository::init_with_catalog_root(
+                &view,
+                &binding.lower_root,
+                repository_id,
+                &key,
+                SourceBackendKind::GuardedLinkFreezeV1,
+            )
+            .unwrap();
+            node.control
+                .put_record(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: view.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let edit = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'D',0); os.fsync(fd); os.close(fd)")
+                .arg(view.join("tracked"))
+                .output()
+                .unwrap();
+            assert!(edit.status.success(), "{edit:?}");
+            node.guarded_mounts.pop().unwrap().stop().unwrap();
+            let control = Arc::new(Mutex::new(
+                ControlStore::open_with_key(
+                    data_dir.join("control.db"),
+                    &node.control_database_key,
+                )
+                .unwrap(),
+            ));
+            let attempt_id = Uuid::new_v4();
+            GuardedViewMount::prepare_stopped_file_capture(
+                binding.anchor_id,
+                attempt_id,
+                Arc::clone(&control),
+                "tracked",
+            )
+            .unwrap();
+            let manifest = GuardedViewMount::finish_stopped_file_capture(
+                binding.anchor_id,
+                attempt_id,
+                Arc::clone(&control),
+            )
+            .unwrap();
+            assert_eq!(manifest.format_version, 1);
+            GuardedViewMount::transfer_stopped_file_capture_to_git(
+                attempt_id,
+                repository_id,
+                repository_id,
+                &control.lock().unwrap(),
+            )
+            .unwrap();
+            drop(control);
+            drop(node);
+
+            let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+            let catalog = ControlStore::open_existing_with_key(
+                binding.lower_root.join(".mutualbackup/catalog.db"),
+                &key,
+            )
+            .unwrap();
+            assert!(mb_git::remove_cached(&catalog, repository_id, "tracked").unwrap());
+            drop(catalog);
+            assert_eq!(
+                node.git_prune(repository_id)
+                    .unwrap()
+                    .native_anchors_removed,
+                0
+            );
+            assert!(manifest.open_verified().is_ok());
+            node.git_retire_empty_guarded_repository(repository_id)
+                .unwrap();
+            assert!(!binding.lower_root.join(".mutualbackup").exists());
+            if stage == 0 {
+                node.remove_guarded_protected_root(repository_id).unwrap();
+            } else {
+                let intent = node
+                    .new_separate_guarded_release_intent(repository_id)
+                    .unwrap();
+                node.control
+                    .put_record(
+                        GUARDED_SEPARATE_RELEASE_KIND,
+                        repository_id.as_bytes(),
+                        &canonical_bytes(&intent).unwrap(),
+                    )
+                    .unwrap();
+                if stage >= 2 {
+                    node.guarded_mounts.pop().unwrap().stop().unwrap();
+                    let control = Arc::new(Mutex::new(
+                        ControlStore::open_with_key(
+                            data_dir.join("control.db"),
+                            &node.control_database_key,
+                        )
+                        .unwrap(),
+                    ));
+                    GuardedViewMount::detach_stopped_files_for_release(
+                        binding.anchor_id,
+                        Arc::clone(&control),
+                    )
+                    .unwrap();
+                    let visible =
+                        GuardedViewMount::snapshot_stopped(binding.anchor_id, control).unwrap();
+                    intent.save_visible(&node.control, visible).unwrap();
+                    GuardedViewMount::retire_claim(binding.anchor_id, &node.control).unwrap();
+                    if stage == 3 {
+                        node.reconcile_guarded_git_file_gc(binding.anchor_id)
+                            .unwrap();
+                        assert!(manifest.open_verified().is_err());
+                    }
+                }
+                drop(node);
+                node = Node::open(&data_dir, seed.clone()).unwrap();
+            }
+            assert!(manifest.open_verified().is_err());
+            assert!(
+                node.control
+                    .get_record(GUARDED_GIT_FILE_GC_KIND, manifest.anchor_id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(node.protected_root_by_id(repository_id).is_err());
+            assert_eq!(fs::read(view.join("tracked")).unwrap(), edited);
+            drop(node);
+            let reopened = Node::open(&data_dir, seed).unwrap();
+            assert!(reopened.protected_root_by_id(repository_id).is_err());
+            assert_eq!(fs::read(view.join("tracked")).unwrap(), edited);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root, FUSE passthrough, and fanotify permission events"]
+    fn in_place_release_replays_deferred_guarded_git_file_cleanup() {
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let area = tempfile::Builder::new()
+            .prefix("mb-guarded-git-in-place-release-")
+            .tempdir_in(&test_root)
+            .unwrap();
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let target = area.path().join("work");
+        let data_dir = area.path().join("node");
+        fs::create_dir(&target).unwrap();
+        let original = b"deferred\r\nrelease\0";
+        let edited = b"Deferred\r\nrelease\0";
+        fs::write(target.join("tracked"), original).unwrap();
+        for path in [&target, &target.join("tracked")] {
+            let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        }
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(target.join("tracked"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let seed = Seed::from_bytes([114; 32]);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let root = node.add_guarded_protected_root_in_place(&target).unwrap();
+        let binding = node.guarded_root_mount_binding(&root).unwrap();
+        let repository_id = root.root_id;
+        let key = node.git_catalog_key(repository_id);
+        GitRepository::init_with_catalog_root(
+            &target,
+            &binding.lower_root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        node.control
+            .put_record(
+                "git-repository",
+                repository_id.as_bytes(),
+                &canonical_bytes(&GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id,
+                    path: target.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let edit = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'D',0); os.fsync(fd); os.close(fd)")
+            .arg(target.join("tracked"))
+            .output()
+            .unwrap();
+        assert!(edit.status.success(), "{edit:?}");
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
+        let control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
+                .unwrap(),
+        ));
+        let attempt_id = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+            "tracked",
+        )
+        .unwrap();
+        let manifest = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        assert_eq!(manifest.format_version, 1);
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            attempt_id,
+            repository_id,
+            repository_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        drop(control);
+        drop(node);
+
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let catalog = ControlStore::open_existing_with_key(
+            binding.lower_root.join(".mutualbackup/catalog.db"),
+            &key,
+        )
+        .unwrap();
+        assert!(mb_git::remove_cached(&catalog, repository_id, "tracked").unwrap());
+        drop(catalog);
+        assert_eq!(
+            node.git_prune(repository_id)
+                .unwrap()
+                .native_anchors_removed,
+            0
+        );
+        assert!(manifest.open_verified().is_ok());
+        node.git_retire_empty_guarded_repository(repository_id)
+            .unwrap();
+        let handoff = GuardedRecoveryHandoff::load(&node.control, repository_id)
+            .unwrap()
+            .unwrap();
+        let intent = GuardedReleaseIntentV1 {
+            format_version: 1,
+            root: root.clone(),
+            anchor_id: binding.anchor_id,
+            handoff_hash: *blake3::hash(&canonical_bytes(&handoff).unwrap()).as_bytes(),
+        };
+        node.control
+            .put_record(
+                GUARDED_RELEASE_KIND,
+                repository_id.as_bytes(),
+                &canonical_bytes(&intent).unwrap(),
+            )
+            .unwrap();
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
+        let control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
+                .unwrap(),
+        ));
+        let parent = PinnedDirectory::open(area.path()).unwrap();
+        handoff
+            .prepare_release_metadata(control, &parent, binding.anchor_id)
+            .unwrap();
+        GuardedViewMount::retire_claim(binding.anchor_id, &node.control).unwrap();
+        drop(node);
+
+        let reopened = Node::open(&data_dir, seed.clone()).unwrap();
+        assert!(manifest.open_verified().is_err());
+        assert!(
+            reopened
+                .control
+                .get_record(GUARDED_GIT_FILE_GC_KIND, manifest.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(reopened.protected_root_by_id(repository_id).is_err());
+        assert_eq!(fs::read(target.join("tracked")).unwrap(), edited);
+        drop(reopened);
+        let reopened = Node::open(&data_dir, seed).unwrap();
+        assert_eq!(fs::read(target.join("tracked")).unwrap(), edited);
+        assert!(reopened.protected_root_by_id(repository_id).is_err());
+    }
 
     #[test]
     #[ignore = "requires root, FUSE passthrough, and fanotify permission events"]

@@ -87,8 +87,12 @@
   per-file deferred cleanup, daemon reopen after catalog deletion, and an
   unrelated lost-pin failure. A second privileged ext4/Btrfs probe retires
   the mount claim and confirms that deferred cleanup then deletes the physical
-  file anchor while preserving edited worktree bytes. A full root-release
-  interruption probe with deferred file cleanup is still required. An empty
+  file anchor while preserving edited worktree bytes. The full separate-layout
+  release probe now resumes before mount stop, after the release snapshot and
+  claim retirement, and after deferred cleanup. The in-place release probe
+  resumes after its claim retirement. Both pass on ext4 and disposable Btrfs,
+  and verify the edited worktree bytes, removed file anchor, cleared cleanup
+  record, and a second daemon reopen. An empty
   guarded Git repository can now be retired explicitly with
   `mutualgit deinit <repository-id>`. The catalog accepts only its exact backend
   binding and expected private files. The node fences their native identities

@@ -3821,9 +3821,9 @@ an unconditional repository invariant, not a configurable compatibility mode.
   Git catalog before guarded-root release. This now uses the explicit
   `mutualgit deinit <repository-id>` command, an exact native-file fence in
   node control, and pre-mount replay; the guarded root remains enrolled until
-  its separate release gate passes. Continue testing the handoff and physical
-  deletion across interruption and reopen, including a release with deferred
-  per-file cleanup.
+  its separate release gate passes. The release handoff now has ext4 and Btrfs
+  interruption probes with deferred per-file cleanup for separate and in-place
+  views; verify that coverage remains valid as guarded Git operations expand.
   A catalog receipt with no node pin must still fail closed unless it belongs
   to an authenticated retirement fence.
   Prune is a real data-deletion operation: once no such protection remains,
