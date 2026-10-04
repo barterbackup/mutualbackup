@@ -727,6 +727,10 @@ Proactive background repair comes later.
   other client's worktree presentation. Reflinks or guarded hard links may
   share physical extents, but no Git index, object database, pack cache, or
   worktree may retain a second permanent copy merely for compatibility.
+  Git line-ending normalization and a configured clean filter are separate
+  conversion paths; neither may change `B` at this boundary, even when an
+  inherited Git setting or repository attribute enables it. The same rule
+  applies to checkout, which must publish the stored blob bytes unchanged.
   Verify the captured bytes before publishing an index entry or revision and
   the restored bytes before replacing a worktree file. A mismatch is an
   operation failure, never a reason to normalize line endings or run a Git
