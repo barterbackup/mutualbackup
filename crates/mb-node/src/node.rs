@@ -255,6 +255,8 @@ const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
 thread_local! {
     static INTERRUPT_AFTER_RECOVERY_STAGING_CREATE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static INTERRUPT_AFTER_RECOVERY_PUBLISH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -13241,6 +13243,7 @@ impl Node {
                         checkpoint_hash,
                         &canonical_bytes(&job)?,
                     )?;
+                    interrupt_after_recovery_publish()?;
                 }
                 RecoveryJobState::Published => {}
                 RecoveryJobState::Building | RecoveryJobState::Anchoring => {
@@ -13286,6 +13289,7 @@ impl Node {
             job.state = RecoveryJobState::Published;
             self.control
                 .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+            interrupt_after_recovery_publish()?;
             return self.finish_recovery(
                 &mut job,
                 checkpoint_hash,
@@ -13368,6 +13372,7 @@ impl Node {
         job.state = RecoveryJobState::Published;
         self.control
             .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        interrupt_after_recovery_publish()?;
         self.finish_recovery(&mut job, checkpoint_hash, revision, &parent, &target_name)
     }
 
@@ -13394,6 +13399,17 @@ impl Node {
                 &target,
             )?;
         }
+        // Recheck signed names and file bytes at the publication boundary.
+        // A crash or local change after reanchoring must not register a
+        // different tree as the recovered protected root.
+        #[cfg(target_os = "linux")]
+        crate::snapshot::verify_guarded_recovered_namespace(
+            &self.control,
+            &self.keys,
+            job.guild_id,
+            revision,
+            &target,
+        )?;
         verify_pinned_parent_path(parent, containing_directory(&job.target))?;
         self.register_protected_root(
             &job.target,
@@ -13638,6 +13654,21 @@ fn run_after_recovery_staging_create_hook() -> Result<()> {
 
 #[cfg(not(test))]
 fn run_after_recovery_staging_create_hook() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn interrupt_after_recovery_publish() -> Result<()> {
+    INTERRUPT_AFTER_RECOVERY_PUBLISH.with(|interrupt| {
+        if interrupt.replace(false) {
+            anyhow::bail!("injected interruption after recovery publication");
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+fn interrupt_after_recovery_publish() -> Result<()> {
     Ok(())
 }
 
@@ -24967,6 +24998,39 @@ pub(crate) mod tests {
                 .join(OsString::from_vec(b"raw-\xfe-parent".to_vec()));
             fs::create_dir(&seed_parent).unwrap();
             let seed_target = seed_parent.join(OsString::from_vec(b"seed-recovered-\xfd".to_vec()));
+            INTERRUPT_AFTER_RECOVERY_PUBLISH.with(|interrupt| interrupt.set(true));
+            assert!(
+                seed_only
+                    .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                    .is_err()
+            );
+            let published: RecoveryJob = decode_canonical(
+                &seed_only
+                    .control
+                    .get_record("recovery-job", &checkpoint_hash)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(published.state, RecoveryJobState::Published);
+            fs::write(seed_target.join("unexpected"), b"extra name").unwrap();
+            assert!(
+                seed_only
+                    .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                    .is_err()
+            );
+            assert!(seed_only.protected_root_by_id(protected_root_id).is_err());
+            fs::remove_file(seed_target.join("unexpected")).unwrap();
+            let mut changed = captured_bytes.clone();
+            changed[0] ^= 1;
+            fs::write(seed_target.join("sample"), &changed).unwrap();
+            assert!(
+                seed_only
+                    .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                    .is_err()
+            );
+            assert!(seed_only.protected_root_by_id(protected_root_id).is_err());
+            fs::write(seed_target.join("sample"), &captured_bytes).unwrap();
             seed_only
                 .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
                 .unwrap();

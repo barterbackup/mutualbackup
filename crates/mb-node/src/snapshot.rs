@@ -5,6 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -2149,6 +2151,37 @@ fn verify_zero_gap(file: &mut File, start: u64, end: u64) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn verify_guarded_file_content(
+    file: &mut File,
+    logical_len: u64,
+    data_extents: &[PrivateDataExtent],
+    encryption_key: &[u8; 32],
+    mut verified_sector: impl FnMut(&SectorRef, u64) -> Result<()>,
+) -> Result<()> {
+    let mut position = 0_u64;
+    for extent in data_extents {
+        verify_zero_gap(file, position, extent.offset)?;
+        let mut offset = extent.offset;
+        for reference in &extent.sectors {
+            file.seek(SeekFrom::Start(offset))?;
+            let mut plaintext = vec![0_u8; reference.logical_len as usize];
+            file.read_exact(&mut plaintext)?;
+            let (actual, _) = encrypted_sector(encryption_key, reference.id, &plaintext)?;
+            ensure!(
+                actual == *reference,
+                "recovered guarded file content differs from a signed sector"
+            );
+            verified_sector(reference, offset)?;
+            offset = offset
+                .checked_add(reference.logical_len as u64)
+                .context("recovered guarded sector offset overflow")?;
+        }
+        position = offset;
+    }
+    verify_zero_gap(file, position, logical_len)
+}
+
+#[cfg(target_os = "linux")]
 fn recovered_guarded_anchor_records(
     keys: &KeyMaterial,
     guild_id: [u8; 32],
@@ -2181,19 +2214,12 @@ fn recovered_guarded_anchor_records(
         );
         let locator = anchored.anchor.file_locator();
         let mut file = anchored.anchor.open_verified()?;
-        let mut position = 0_u64;
-        for extent in data_extents {
-            verify_zero_gap(&mut file, position, extent.offset)?;
-            let mut offset = extent.offset;
-            for reference in &extent.sectors {
-                file.seek(SeekFrom::Start(offset))?;
-                let mut plaintext = vec![0_u8; reference.logical_len as usize];
-                file.read_exact(&mut plaintext)?;
-                let (actual, _) = encrypted_sector(&encryption_key, reference.id, &plaintext)?;
-                ensure!(
-                    actual == *reference,
-                    "recovered guarded anchor content differs from a signed sector"
-                );
+        verify_guarded_file_content(
+            &mut file,
+            *logical_len,
+            data_extents,
+            &encryption_key,
+            |reference, offset| {
                 let recipe = LocalSectorRecipe {
                     guild_id,
                     reference: reference.clone(),
@@ -2208,13 +2234,9 @@ fn recovered_guarded_anchor_records(
                 {
                     bail!("recovered guarded sector has conflicting signed references");
                 }
-                offset = offset
-                    .checked_add(reference.logical_len as u64)
-                    .context("recovered guarded sector offset overflow")?;
-            }
-            position = offset;
-        }
-        verify_zero_gap(&mut file, position, *logical_len)?;
+                Ok(())
+            },
+        )?;
         records.push((
             ANCHOR_AREA_LOCATION_KIND.to_owned(),
             locator.area.area_id.as_bytes().to_vec(),
@@ -2474,6 +2496,72 @@ pub(crate) fn load_private_metadata_bytes(
         )?);
     }
     Ok(metadata_bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_guarded_recovered_namespace(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    root: &PinnedDirectory,
+) -> Result<()> {
+    if revision.value.metadata_sectors.is_empty() {
+        return Ok(());
+    }
+    let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+    if private_metadata_format(&bytes)? == 6 {
+        let metadata = GuardedPrivateMetadataV6::decode(&bytes)?;
+        let (root_id, bound) = metadata.bind_restored_entries(root)?;
+        let encryption_key = keys.guild_data_key(&guild_id);
+        for (entry, bound_entry) in metadata.entries.iter().zip(&bound) {
+            let GuardedPrivateEntryV6::File {
+                path,
+                logical_len,
+                data_extents,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            let path = PathBuf::from(OsString::from_vec(path.clone()));
+            let parent = path
+                .parent()
+                .context("guarded restored file has no parent")?;
+            let directory = if parent.as_os_str().is_empty() {
+                None
+            } else {
+                Some(root.open_descendant_directory(parent)?)
+            };
+            let directory = directory.as_ref().unwrap_or(root);
+            let name = path
+                .file_name()
+                .context("guarded restored file has no name")?;
+            let mut file = directory
+                .open_child_file(name)?
+                .context("guarded restored file disappeared before publication")?;
+            let stat = file.metadata()?;
+            ensure!(
+                stat.len() == *logical_len
+                    && bound_entry.native_id
+                        == (NativeFileId {
+                            filesystem_id: root_id.filesystem_id,
+                            inode: stat.ino(),
+                        })
+                    && directory.entry_identity(name, false)? == Some(bound_entry.native_id),
+                "guarded restored file changed before publication"
+            );
+            verify_guarded_file_content(
+                &mut file,
+                *logical_len,
+                data_extents,
+                &encryption_key,
+                |_, _| Ok(()),
+            )?;
+        }
+        metadata.bind_restored_entries(root)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn revision_git_backup(

@@ -916,6 +916,15 @@
   create, remove, and rename then durably invalidate that length and show the
   live lower-directory length across remount. The privileged ext4/Btrfs probe
   covers create/remove, remount, and marker retirement.
+  Before a published format-6 recovery job registers its protected root, it
+  now rebinds the entire restored namespace to the signed paths and local
+  inode identities and verifies every file and sparse gap against signed
+  sectors. An interrupted-publication Btrfs probe adds an unexpected file and
+  changes a file without changing its length; both retries refuse root
+  registration, then completion succeeds after the bytes are restored;
+  the focused Btrfs probe and strict Clippy pass on this source. The complete
+  normal node suite passed before the final content-verification addition.
+  This check does not yet move the restored tree behind a guarded FUSE mount.
   The production recovery job still
   needs a replayable transition from its published restored directory to a
   private lower tree, guarded root registration/backend selection, and a
