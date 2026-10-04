@@ -147,7 +147,7 @@ enum RootCommand {
     },
     /// Replace an existing user-owned directory with a guarded view in place.
     AddGuardedHere { path: PathBuf },
-    /// Return an in-place guarded root to an ordinary directory.
+    /// Release a guarded root at its user-facing worktree path.
     RemoveGuarded { root_id: Uuid },
 }
 

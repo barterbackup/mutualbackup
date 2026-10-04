@@ -706,6 +706,26 @@ impl GuardedViewMount {
         Ok(())
     }
 
+    /// Verify the retired claim still binds the exact private lower and
+    /// user-facing placeholder before a separate-view name handoff.
+    pub fn require_retired_release_binding(
+        anchor_id: Uuid,
+        control: &ControlStore,
+        lower_root: &Path,
+        lower_id: NativeFileId,
+        mountpoint: &Path,
+        mountpoint_id: NativeFileId,
+    ) -> anyhow::Result<()> {
+        require_retired_claim_for_release(
+            control,
+            anchor_id,
+            lower_root,
+            lower_id,
+            mountpoint,
+            mountpoint_id,
+        )
+    }
+
     /// Reopen a claimed view after process loss using only its durable local
     /// claim, capture plan, and sealed manifest. No caller-held manifest is
     /// needed; `start` still verifies the lower and placeholder identities.

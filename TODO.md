@@ -878,8 +878,8 @@
   through restore, reanchor, root registration, and reopen/retry. That local
   path passes; at that stage it did not cover full network seed-only recovery
   or guarded-view reconstruction without reflinks.
-  In-place guarded-root removal now has a `root remove-guarded` control path.
-  It journals a root/anchor/handoff-bound release intent before stopping FUSE,
+  Guarded-root removal now has a `root remove-guarded` control path. For an
+  in-place root, it journals a root/anchor/handoff-bound intent before stopping FUSE,
   refuses retained Git, signed-revision, checkpoint, recipe, and in-flight
   pins, then detaches live files, retires the claim and original anchor, returns
   the original directory name and visible metadata, and atomically removes the
@@ -890,9 +890,19 @@
   request/response schema and CLI command are wired locally. A child-process
   probe now persists a release intent while its FUSE view is still mounted,
   is killed, and proves startup detaches the dead mount and returns the edited
-  bytes on ext4 and disposable Btrfs. Separate-view guarded removal and
-  guarded Git pin integration remain open before broader guarded enrollment
-  or Git operations can select this backend.
+  bytes on ext4 and disposable Btrfs. A separate-lower root now uses its own
+  parent-identity-bound release journal: after the same stopped-view detach and
+  anchor retirement, it moves the private lower directory into the original
+  view path without copying payloads, then restores the checked visible
+  metadata. Its privileged probe passes on ext4 and disposable Btrfs for
+  each release boundary, distinct lower/view parent directories, a missing
+  placeholder after its name marker, and foreign replacements both before and
+  after that marker that fail closed until the intended name can be restored.
+  The same ext4/Btrfs probe kills a child with a live separate-view
+  FUSE mount and a durable release intent, then verifies that startup returns
+  its edited and newly created files at the view path. Guarded Git pin
+  integration remains open before broader Git operations can select this
+  backend.
   Guarded root capture now uses a version-2 plan and version-3 sealed manifest
   when an entry has raw Unix path bytes; version-1/2 UTF-8 records keep their
   prior bytes. Directory claims, lower ownership, freeze journals, namespace

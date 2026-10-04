@@ -669,6 +669,20 @@ pub fn restore_visible_release_metadata(
     Ok(())
 }
 
+/// Confirm the stopped view still names exactly the same native entries
+/// before a separate lower tree is moved into the user-facing path.
+pub fn verify_visible_release_namespace(
+    root: &PinnedDirectory,
+    visible: &GuardedViewMetadataV1,
+) -> Result<()> {
+    visible.validate_shape()?;
+    ensure!(
+        root.identity()? == visible.lower_root_id,
+        "guarded release root identity changed"
+    );
+    verify_release_namespace(root, visible)
+}
+
 pub(crate) fn release_prepared_for_anchor(control: &ControlStore, anchor_id: Uuid) -> Result<bool> {
     for (record_id, bytes) in control.records(HANDOFF_RELEASE_METADATA_KIND)? {
         ensure!(

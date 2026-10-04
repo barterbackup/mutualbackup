@@ -60,6 +60,11 @@ use crate::snapshot::{
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
+#[cfg(target_os = "linux")]
+mod guarded_release;
+#[cfg(target_os = "linux")]
+use guarded_release::GUARDED_SEPARATE_RELEASE_KIND;
+
 type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
 type LegacyPackingAttestationEntries =
@@ -1446,11 +1451,18 @@ impl Node {
         #[cfg(target_os = "linux")]
         let pending_guarded_releases = Self::pending_guarded_releases(&control)?;
         #[cfg(target_os = "linux")]
+        let pending_separate_releases = Self::pending_separate_guarded_releases(&control)?;
+        #[cfg(target_os = "linux")]
         let guarded_mounts = if GuardedViewMount::has_claims(&control)? {
-            let excluded = pending_guarded_releases
+            let mut excluded = pending_guarded_releases
                 .iter()
                 .map(|(intent, _)| intent.anchor_id)
-                .collect();
+                .collect::<BTreeSet<_>>();
+            excluded.extend(
+                pending_separate_releases
+                    .iter()
+                    .map(|(intent, _)| intent.anchor_id),
+            );
             GuardedViewMount::recover_all_claimed_except(
                 Arc::new(Mutex::new(ControlStore::open_with_key(
                     data_dir.join("control.db"),
@@ -1475,6 +1487,8 @@ impl Node {
         };
         #[cfg(target_os = "linux")]
         node.reconcile_guarded_releases(&pending_guarded_releases)?;
+        #[cfg(target_os = "linux")]
+        node.reconcile_separate_guarded_releases(&pending_separate_releases)?;
         node.backfill_checkpoint_generation_index()?;
         node.reconcile_certified_writer_head()?;
         #[cfg(target_os = "linux")]
@@ -1494,7 +1508,12 @@ impl Node {
     pub fn check_guarded_mounts(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            if !self.control.records(GUARDED_RELEASE_KIND)?.is_empty() {
+            if !self.control.records(GUARDED_RELEASE_KIND)?.is_empty()
+                || !self
+                    .control
+                    .records(GUARDED_SEPARATE_RELEASE_KIND)?
+                    .is_empty()
+            {
                 anyhow::bail!("guarded protected-root release is unfinished");
             }
             let claimed = GuardedViewMount::claimed_anchor_ids(&self.control)?
@@ -1773,8 +1792,7 @@ impl Node {
     /// this read-only gate; this is not a substitute for those fences.
     #[cfg(target_os = "linux")]
     fn guarded_release_preflight(&self, root_id: Uuid) -> Result<mb_store::GuardedViewBinding> {
-        let root = self.protected_root_by_id(root_id)?;
-        let binding = self.guarded_root_mount_binding(&root)?;
+        let (root, binding) = self.guarded_root_release_preflight_common(root_id)?;
         let handoff = GuardedRecoveryHandoff::load(&self.control, root_id)?
             .context("guarded root has no in-place name handoff")?;
         if handoff.mountpoint() != root.path
@@ -1783,6 +1801,16 @@ impl Node {
         {
             anyhow::bail!("guarded release handoff differs from its mounted root");
         }
+        Ok(binding)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn guarded_root_release_preflight_common(
+        &self,
+        root_id: Uuid,
+    ) -> Result<(ProtectedRoot, mb_store::GuardedViewBinding)> {
+        let root = self.protected_root_by_id(root_id)?;
+        let binding = self.guarded_root_mount_binding(&root)?;
         let backend: SourceBackendBinding = decode_canonical(
             &self
                 .control
@@ -1792,11 +1820,16 @@ impl Node {
         if !backend.is_supported_guarded_for(root_id, root.filesystem_id, root.root_inode) {
             anyhow::bail!("guarded release source backend changed");
         }
-        if !self.control.records(GUARDED_RELEASE_KIND)?.is_empty() {
+        if !self.control.records(GUARDED_RELEASE_KIND)?.is_empty()
+            || !self
+                .control
+                .records(GUARDED_SEPARATE_RELEASE_KIND)?
+                .is_empty()
+        {
             anyhow::bail!("finish the pending guarded release before starting another");
         }
         self.require_guarded_release_unpinned(root_id, binding.anchor_id, &root.path)?;
-        Ok(binding)
+        Ok((root, binding))
     }
 
     #[cfg(target_os = "linux")]
@@ -1945,11 +1978,18 @@ impl Node {
         Ok(())
     }
 
-    /// Return an in-place guarded root to an ordinary user-owned directory.
-    /// A durable intent precedes stopping the view; startup completes it
-    /// before recovering the remaining claimed views for normal service.
+    /// Release a guarded worktree at its user-facing path. Both in-place and
+    /// separate-lower layouts journal their name handoff before exposure.
     #[cfg(target_os = "linux")]
     pub fn remove_guarded_protected_root(&mut self, root_id: Uuid) -> Result<()> {
+        if GuardedRecoveryHandoff::load(&self.control, root_id)?.is_none() {
+            return self.remove_separate_guarded_root(root_id);
+        }
+        self.remove_in_place_guarded_root(root_id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_in_place_guarded_root(&mut self, root_id: Uuid) -> Result<()> {
         self.check_guarded_mounts()?;
         let binding = self.guarded_release_preflight(root_id)?;
         let root = self.protected_root_by_id(root_id)?;
@@ -2029,13 +2069,27 @@ impl Node {
         }
         handoff.release_names(&self.control, &parent, intent.anchor_id)?;
         handoff.restore_released_metadata(&self.control, &parent, intent.anchor_id)?;
+        let mut deletions = handoff.released_record_keys(&self.control, intent.anchor_id)?;
+        deletions.push((
+            GUARDED_RELEASE_KIND.to_owned(),
+            intent.root.root_id.as_bytes().to_vec(),
+        ));
+        self.finalize_guarded_root_removal(intent.root.root_id, deletions)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finalize_guarded_root_removal(
+        &self,
+        root_id: Uuid,
+        mut deletions: Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
         let mut automation = self.automatic_backup_state(unix_seconds())?;
         automation
             .root_schedules
-            .retain(|schedule| schedule.protected_root_id != intent.root.root_id);
+            .retain(|schedule| schedule.protected_root_id != root_id);
         automation
             .root_retries
-            .retain(|retry| retry.protected_root_id != intent.root.root_id);
+            .retain(|retry| retry.protected_root_id != root_id);
         automation.dirty_since_unix_seconds = automation
             .root_schedules
             .iter()
@@ -2046,17 +2100,15 @@ impl Node {
             b"automatic-backup".to_vec(),
             canonical_bytes(&automation)?,
         )];
-        let mut deletions = handoff.released_record_keys(&self.control, intent.anchor_id)?;
         deletions.extend(
             [
                 "protected-root",
                 "guarded-protected-root-v1",
                 "source-backend",
                 "root-dirty",
-                GUARDED_RELEASE_KIND,
             ]
             .into_iter()
-            .map(|kind| (kind.to_owned(), intent.root.root_id.as_bytes().to_vec())),
+            .map(|kind| (kind.to_owned(), root_id.as_bytes().to_vec())),
         );
         self.control.put_records_and_delete(&records, &deletions)?;
         Ok(())
@@ -26667,6 +26719,28 @@ pub(crate) mod tests {
                 continue;
             }
             if stage == 0 {
+                let handoff_bytes = node
+                    .control
+                    .get_record("guarded-recovery-handoff-v1", root_id.as_bytes())
+                    .unwrap()
+                    .unwrap();
+                node.control
+                    .delete_record("guarded-recovery-handoff-v1", root_id.as_bytes())
+                    .unwrap();
+                assert!(node.remove_guarded_protected_root(root_id).is_err());
+                assert!(
+                    node.control
+                        .records(GUARDED_SEPARATE_RELEASE_KIND)
+                        .unwrap()
+                        .is_empty()
+                );
+                node.control
+                    .put_record(
+                        "guarded-recovery-handoff-v1",
+                        root_id.as_bytes(),
+                        &handoff_bytes,
+                    )
+                    .unwrap();
                 let child = Command::new("python3")
                     .uid(65534)
                     .gid(65534)

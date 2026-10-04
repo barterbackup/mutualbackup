@@ -517,7 +517,7 @@ impl GuardedRootCapturePlan {
         self.entries.len()
     }
 
-    pub(crate) fn source_root_identity(&self) -> NativeFileId {
+    pub fn source_root_identity(&self) -> NativeFileId {
         NativeFileId {
             filesystem_id: self.root_version.filesystem_id,
             inode: self.root_version.inode,
