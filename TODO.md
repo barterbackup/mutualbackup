@@ -107,10 +107,12 @@
   stopping the view or signing a format-6 revision, so manual guarded Git state
   cannot silently produce a signed revision that omits its history. A separate
   format-7 private metadata type now validates a raw guarded namespace and
-  root-bound Git graph; revision inspection can read it, while recovery still
-  refuses it. Complete graph capture, native-anchor pinning, catalog rebuild,
-  and seed-only recovery before lifting the production signing gate. Linux Git
-  blob recovery now streams verified sectors into one sparse imported native
+  root-bound Git graph; revision inspection can read it, and format-7 restore
+  stages its guarded namespace and Git catalog with a guarded backend binding.
+  Publication still refuses format 7 until catalog-aware namespace verification,
+  graph-sector recipe rebind, and supervised mount replay are complete. Finish
+  graph capture and native-anchor pinning before lifting the production signing
+  gate. Linux Git blob recovery now streams verified sectors into one sparse native
   anchor without a temporary worktree payload or reflink; the guarded catalog
   handoff and graph/virtual-locator rebind are still open.
 - [x] **M6 Git file bytes remain exact under every supported command.**

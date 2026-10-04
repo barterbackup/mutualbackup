@@ -621,7 +621,9 @@ Retain MutualBackup's independent content roots and signed revision authority.
   for Git-backed guarded revisions: it binds that same raw namespace to a
   validated Git graph descriptor and the protected-root ID. Do not emit
   format 7 until capture, pinning, catalog rebuild, and seed-only recovery
-  of its graph pass together.
+  of its graph pass together. Restore format 7 into a private staging tree
+  with a guarded-bound Git catalog, then verify that catalog and the signed
+  namespace before supervised mount publication and sector-recipe rebind.
 - **UserRevision:** guild, owner, protected-root ID, root-scoped monotonic
   revision, optional parent in that root's chain, explicit metadata/data
   `SectorRef` lists, suite versions, and owner signature. Milestone 5 keeps

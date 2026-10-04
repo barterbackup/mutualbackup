@@ -2622,6 +2622,9 @@ pub(crate) fn verify_guarded_recovered_namespace(
         return Ok(());
     }
     let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+    if private_metadata_format(&bytes)? == 7 {
+        bail!("guarded Git catalog namespace verification is not yet supported");
+    }
     if private_metadata_format(&bytes)? == 6 {
         let metadata = GuardedPrivateMetadataV6::decode(&bytes)?;
         let (root_id, bound) = metadata.bind_restored_entries(root)?;
@@ -3147,6 +3150,17 @@ pub(crate) fn restore_signed_root_metadata_at(
     restored_root: &PinnedDirectory,
 ) -> Result<()> {
     let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+    if private_metadata_format(&bytes)? == 7 {
+        #[cfg(target_os = "linux")]
+        return set_guarded_metadata_durable(
+            restored_root.as_file(),
+            &GuardedGitPrivateMetadataV7::decode(&bytes, revision.value.protected_root_id)?
+                .guarded
+                .root,
+        );
+        #[cfg(not(target_os = "linux"))]
+        bail!("guarded Git private metadata cannot be restored on this platform");
+    }
     if private_metadata_format(&bytes)? == 6 {
         #[cfg(target_os = "linux")]
         return set_guarded_metadata_durable(
@@ -4052,7 +4066,36 @@ where
         )?);
     }
     if private_metadata_format(&metadata_bytes)? == 7 {
-        bail!("guarded Git graph recovery is not yet supported");
+        #[cfg(target_os = "linux")]
+        {
+            let metadata = GuardedGitPrivateMetadataV7::decode(
+                &metadata_bytes,
+                revision.value.protected_root_id,
+            )?;
+            restore_guarded_entries(
+                staging,
+                &metadata.guarded,
+                &encryption_key,
+                load_ciphertext,
+                false,
+            )?;
+            restore_git_backup_at(
+                keys,
+                staging,
+                &metadata.git,
+                SourceBackendKind::GuardedLinkFreezeV1,
+                &encryption_key,
+                load_ciphertext,
+            )?;
+            if apply_root_metadata {
+                set_guarded_metadata_durable(staging.as_file(), &metadata.guarded.root)?;
+            } else {
+                staging.sync_all()?;
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("guarded Git private metadata cannot be restored on this platform");
     }
     if private_metadata_format(&metadata_bytes)? == 6 {
         #[cfg(target_os = "linux")]
@@ -4078,7 +4121,14 @@ where
         if descriptor.repository_id != revision.value.protected_root_id {
             bail!("Git backup belongs to another protected root");
         }
-        restore_git_backup_at(keys, staging, &descriptor, &encryption_key, load_ciphertext)?;
+        restore_git_backup_at(
+            keys,
+            staging,
+            &descriptor,
+            SourceBackendKind::ReflinkV1,
+            &encryption_key,
+            load_ciphertext,
+        )?;
         if apply_root_metadata {
             set_metadata_durable(
                 staging.as_file(),
@@ -4097,6 +4147,7 @@ fn restore_git_backup_at<F>(
     keys: &KeyMaterial,
     staging: &PinnedDirectory,
     descriptor: &GitBackupDescriptor,
+    backend: SourceBackendKind,
     encryption_key: &[u8; 32],
     load_ciphertext: &mut F,
 ) -> Result<()>
@@ -4106,7 +4157,8 @@ where
     descriptor.validate()?;
     let root = staging.descriptor_path();
     let catalog_key = mb_git::catalog_key(keys, descriptor.repository_id);
-    let repository = GitRepository::init(&root, descriptor.repository_id, &catalog_key)?;
+    let repository =
+        GitRepository::init_with_backend(&root, descriptor.repository_id, &catalog_key, backend)?;
     let mut anchors = Vec::with_capacity(descriptor.blobs.len());
     let result = (|| {
         for blob in &descriptor.blobs {
@@ -5037,7 +5089,7 @@ mod metadata_compatibility_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn signed_guarded_git_metadata_exposes_graph_but_refuses_unfinished_recovery() {
+    fn signed_guarded_git_metadata_stages_catalog_but_refuses_unfinished_publication() {
         let temporary = tempfile::tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([221; 32]));
         let guild_id = [222; 32];
@@ -5101,8 +5153,10 @@ mod metadata_compatibility_tests {
             revision_git_backup(&control, &keys, guild_id, &revision).unwrap(),
             Some(graph)
         );
-        let staging = PinnedDirectory::open(temporary.path()).unwrap();
-        let error = build_revision_restore(
+        let staging_path = temporary.path().join("staging");
+        fs::create_dir(&staging_path).unwrap();
+        let staging = PinnedDirectory::open(&staging_path).unwrap();
+        build_revision_restore(
             &keys,
             guild_id,
             &revision,
@@ -5113,9 +5167,23 @@ mod metadata_compatibility_tests {
             },
             false,
         )
-        .unwrap_err();
+        .unwrap();
+        restore_signed_root_metadata_at(&control, &keys, guild_id, &revision, &staging).unwrap();
+        assert_eq!(
+            git_catalog_marker(&staging_path).unwrap(),
+            Some(protected_root_id)
+        );
+        let repository = GitRepository::open_with_backend(
+            &staging_path,
+            protected_root_id,
+            &mb_git::catalog_key(&keys, protected_root_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        assert_eq!(repository.export_graph_source().unwrap().refs.len(), 0);
         assert!(
-            error
+            guarded_private_metadata_for_revision(&control, &keys, guild_id, &revision)
+                .unwrap_err()
                 .to_string()
                 .contains("guarded Git graph recovery is not yet supported")
         );
@@ -5209,6 +5277,7 @@ mod metadata_compatibility_tests {
             &keys,
             &staging,
             &descriptor,
+            SourceBackendKind::ReflinkV1,
             &keys.guild_data_key(&guild_id),
             &mut |id| {
                 ciphertexts
@@ -5241,6 +5310,40 @@ mod metadata_compatibility_tests {
                 .to_string_lossy()
                 .starts_with(".mutualbackup-recovered-blob-")
         }));
+        let guarded_restored = temporary.path().join("guarded-restored");
+        fs::create_dir(&guarded_restored).unwrap();
+        let guarded_staging = PinnedDirectory::open(&guarded_restored).unwrap();
+        restore_git_backup_at(
+            &keys,
+            &guarded_staging,
+            &descriptor,
+            SourceBackendKind::GuardedLinkFreezeV1,
+            &keys.guild_data_key(&guild_id),
+            &mut |id| {
+                ciphertexts
+                    .get(id)
+                    .cloned()
+                    .context("missing backed-up sector")
+            },
+        )
+        .unwrap();
+        let guarded_repository = GitRepository::open_with_backend(
+            &guarded_restored,
+            repository_id,
+            &mb_git::catalog_key(&keys, repository_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let guarded_graph = guarded_repository.export_graph_source().unwrap();
+        assert_eq!(guarded_graph.refs, descriptor.refs);
+        assert_eq!(guarded_graph.objects, descriptor.objects);
+        assert_eq!(guarded_graph.blobs.len(), 1);
+        assert_eq!(
+            mb_git::blob_oid_from_anchor(&guarded_graph.blobs[0].anchor)
+                .unwrap()
+                .as_bytes(),
+            blob_oid.as_bytes()
+        );
         let mut damaged = ciphertexts;
         damaged.get_mut(&sectors[0].id).unwrap()[0] ^= 1;
         let encryption_key = keys.guild_data_key(&guild_id);
