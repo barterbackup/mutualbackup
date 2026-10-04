@@ -806,9 +806,19 @@
   reapplies uid/gid, mode, atime and mtime to restored inodes. A signed
   revision fixture exercises durable restore publication and root-metadata
   reapplication; the snapshot compatibility group passes. Git descriptor
-  inspection treats a validated guarded revision as non-Git. Production
-  guarded revision signing, reanchoring after seed recovery, view reconstruction
-  (including virtual directory lengths), and pin transfer remain open.
+  inspection treats a validated guarded revision as non-Git. Guarded revision
+  scheduling, reanchoring after seed recovery, view
+  reconstruction (including virtual directory lengths), and GC remain open.
+  A guarded signing helper now encodes published stopped-view anchors into
+  signed format-5 `UserRevision` sectors with format-6 private metadata. One
+  SQL transaction publishes the revision, sector recipes and a local revision
+  capture map while deleting the stopped-capture attempt by compare-and-delete.
+  Both root and file retirement honor the transferred pins. A privileged node
+  probe signs, retries, restores and releases a captured edit on ext4 and
+  disposable Btrfs; a database test proves stale-intent rollback. The normal
+  protected-root backend binding still selects reflink, so node backup jobs
+  do not yet invoke guarded signing. Recovered guarded anchors and revision
+  GC still need durable replay and safe release before guarded enrollment.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

@@ -517,6 +517,49 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Atomically transfer a stopped guarded view's anchor pins to its signed
+    /// revision and local capture map. A crash cannot expose an unpinned
+    /// interval between intent removal and revision publication.
+    pub fn finalize_guarded_capture_records(
+        &mut self,
+        revision_id: &[u8; 16],
+        expected_intent: &[u8],
+        records: &[(String, Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DatabaseError> {
+        if !records
+            .iter()
+            .any(|(kind, id, _)| kind == "guarded-view-revision-capture-v1" && id == revision_id)
+            || !records
+                .iter()
+                .any(|(kind, id, _)| kind == "user-revision" && id == revision_id)
+            || !records
+                .iter()
+                .any(|(kind, _, _)| kind == "user-revision-head")
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (kind, record_id, bytes) in records {
+                statement.execute(params![kind, record_id, bytes])?;
+            }
+        }
+        let removed = transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'guarded-view-stopped-capture-v1' AND record_id = ?1 AND bytes = ?2",
+            params![revision_id.as_slice(), expected_intent],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn finalize_recovery_anchor_records(
         &mut self,
         revision_id: &[u8; 16],
@@ -3985,6 +4028,71 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn guarded_capture_finalization_transfers_pins_only_with_signed_revision() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([231; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let revision_id = [232; 16];
+        store
+            .put_record(
+                "guarded-view-stopped-capture-v1",
+                &revision_id,
+                b"published",
+            )
+            .unwrap();
+        let records = vec![
+            (
+                "guarded-view-revision-capture-v1".to_owned(),
+                revision_id.to_vec(),
+                b"anchors".to_vec(),
+            ),
+            (
+                "user-revision".to_owned(),
+                revision_id.to_vec(),
+                b"signed".to_vec(),
+            ),
+            (
+                "user-revision-head".to_owned(),
+                b"head".to_vec(),
+                b"signed".to_vec(),
+            ),
+        ];
+        assert!(matches!(
+            store.finalize_guarded_capture_records(&revision_id, b"published", &records[1..]),
+            Err(DatabaseError::Conflict)
+        ));
+        assert!(matches!(
+            store.finalize_guarded_capture_records(&revision_id, b"stale", &records),
+            Err(DatabaseError::Conflict)
+        ));
+        for (kind, id, _) in &records {
+            assert!(store.get_record(kind, id).unwrap().is_none());
+        }
+        assert_eq!(
+            store
+                .get_record("guarded-view-stopped-capture-v1", &revision_id)
+                .unwrap()
+                .unwrap(),
+            b"published"
+        );
+        store
+            .finalize_guarded_capture_records(&revision_id, b"published", &records)
+            .unwrap();
+        assert!(
+            store
+                .get_record("guarded-view-stopped-capture-v1", &revision_id)
+                .unwrap()
+                .is_none()
+        );
+        for (kind, id, bytes) in &records {
+            assert_eq!(
+                store.get_record(kind, id).unwrap().as_deref(),
+                Some(bytes.as_slice())
+            );
+        }
     }
 
     #[test]

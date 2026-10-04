@@ -24702,6 +24702,54 @@ pub(crate) mod tests {
             .read_to_end(&mut captured_bytes)
             .unwrap();
         assert_eq!(captured_bytes, fs::read(lower.join("sample")).unwrap());
+        let guild_id = [223; 32];
+        let protected_root_id = Uuid::new_v4();
+        let writer_secret = [224; 32];
+        let keys = Arc::clone(&recovered.keys);
+        let sign = |control: &mut ControlStore| {
+            crate::snapshot::prepare_guarded_revision(
+                control,
+                &keys,
+                guild_id,
+                protected_root_id,
+                manifest.anchor_id,
+                1,
+                revision_id,
+                WriterCredentials {
+                    epoch: 1,
+                    secret: &writer_secret,
+                    captured_change_sequence: None,
+                },
+            )
+        };
+        let signed = sign(&mut recovered.control).unwrap();
+        assert_eq!(sign(&mut recovered.control).unwrap(), signed);
+        assert!(
+            GuardedViewMount::published_stopped_capture_attempt(
+                manifest.anchor_id,
+                revision_id,
+                &recovered.control,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            GuardedViewMount::load_revision_capture(revision_id, &recovered.control)
+                .unwrap()
+                .unwrap()
+                .capture,
+            capture
+        );
+        let restored = area.path().join("restored");
+        crate::snapshot::restore_revision_from_source(
+            &recovered.control,
+            &keys,
+            guild_id,
+            &signed,
+            &restored,
+            |id| crate::snapshot::render_sector(&recovered.control, &keys, id, Some(&guild_id)),
+        )
+        .unwrap();
+        assert_eq!(fs::read(restored.join("sample")).unwrap(), captured_bytes);
         recovered.check_guarded_mounts().unwrap();
         assert!(fs::read(view.join("sample")).unwrap().starts_with(b"EDIT"));
         recovered.guarded_mounts.pop().unwrap().stop().unwrap();
@@ -24719,13 +24767,39 @@ pub(crate) mod tests {
 
         let control =
             ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap();
-        GuardedViewMount::release_stopped_capture_unreferenced(revision_id, &control).unwrap();
-        GuardedViewMount::retire_claim(manifest.anchor_id, &control).unwrap();
-        mb_store::GuardedFileCapturePlan::load_for_manifest(&control, &captured_file)
-            .unwrap()
-            .unwrap()
-            .discard_unreferenced(&control)
+        assert!(GuardedViewMount::retire_claim(manifest.anchor_id, &control).is_err());
+        let file_plan =
+            mb_store::GuardedFileCapturePlan::load_for_manifest(&control, &captured_file)
+                .unwrap()
+                .unwrap();
+        assert!(file_plan.discard_unreferenced(&control).is_err());
+        for reference in signed
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&signed.value.data_sectors)
+        {
+            control
+                .delete_record("local-sector", &reference.id)
+                .unwrap();
+        }
+        control
+            .delete_record(
+                mb_store::GUARDED_REVISION_CAPTURE_KIND,
+                revision_id.as_bytes(),
+            )
             .unwrap();
+        control
+            .delete_record("user-revision", revision_id.as_bytes())
+            .unwrap();
+        control
+            .delete_record(
+                "user-revision-head",
+                &crate::snapshot::revision_head_id(guild_id, protected_root_id),
+            )
+            .unwrap();
+        GuardedViewMount::retire_claim(manifest.anchor_id, &control).unwrap();
+        file_plan.discard_unreferenced(&control).unwrap();
         plan.discard_unreferenced(&control).unwrap();
     }
 }

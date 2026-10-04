@@ -28,6 +28,7 @@ use crate::{
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
 const MOUNT_RETIRE_KIND: &str = "guarded-view-mount-retired-v1";
 const STOPPED_CAPTURE_KIND: &str = "guarded-view-stopped-capture-v1";
+pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
 const STOPPED_CAPTURE_MAX_BYTES: usize = mb_core::V1_MAX_CATALOG_BYTES * 2 + 4096;
 const MOUNT_SUBTYPE: &str = "mutualbackup_guarded";
 // The daemon is the sole writer for a root. Serialize local mount lifecycle
@@ -79,6 +80,37 @@ pub struct GuardedStoppedFileV1 {
     pub logical_len: u64,
     pub content_hash: [u8; 32],
     pub data_extents: Vec<FileExtent>,
+}
+
+/// Local anchor ownership after a signed owner revision takes over a stopped
+/// capture. The signed private metadata omits these machine-specific IDs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuardedRevisionCaptureV1 {
+    pub format_version: u16,
+    pub revision_id: Uuid,
+    pub capture: GuardedStoppedCaptureV1,
+}
+
+impl GuardedRevisionCaptureV1 {
+    pub fn verify(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.format_version == 1 && !self.revision_id.is_nil(),
+            "invalid guarded revision capture"
+        );
+        self.capture.verify()
+    }
+
+    fn validate_record(&self, record_id: &[u8]) -> anyhow::Result<()> {
+        ensure!(
+            self.format_version == 1
+                && self.revision_id.as_bytes() == record_id
+                && !self.revision_id.is_nil()
+                && self.capture.format_version == 1
+                && mb_core::canonical_bytes(self)?.len() <= STOPPED_CAPTURE_MAX_BYTES,
+            "guarded revision capture key changed"
+        );
+        self.capture.metadata.validate_shape()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -197,6 +229,24 @@ fn stopped_capture_intents(control: &ControlStore) -> anyhow::Result<Vec<Stopped
         .collect()
 }
 
+fn guarded_revision_captures(
+    control: &ControlStore,
+) -> anyhow::Result<Vec<GuardedRevisionCaptureV1>> {
+    control
+        .records(GUARDED_REVISION_CAPTURE_KIND)?
+        .into_iter()
+        .map(|(id, bytes)| {
+            ensure!(
+                bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                "guarded revision capture exceeds its local bound"
+            );
+            let record: GuardedRevisionCaptureV1 = mb_core::decode_canonical(&bytes)?;
+            record.validate_record(&id)?;
+            Ok(record)
+        })
+        .collect()
+}
+
 fn pending_stopped_capture_attempts(
     control: &ControlStore,
     root_anchor_id: Uuid,
@@ -214,7 +264,7 @@ pub(crate) fn stopped_capture_intent_pins_anchor(
     control: &ControlStore,
     anchor_id: Uuid,
 ) -> anyhow::Result<bool> {
-    Ok(stopped_capture_intents(control)?
+    let pending = stopped_capture_intents(control)?
         .into_iter()
         .any(|(_, _, intent)| {
             intent.root_anchor_id == anchor_id
@@ -224,6 +274,19 @@ pub(crate) fn stopped_capture_intent_pins_anchor(
                         .iter()
                         .any(|file| file.locator.anchor_id == anchor_id)
                 })
+        });
+    if pending {
+        return Ok(true);
+    }
+    Ok(guarded_revision_captures(control)?
+        .into_iter()
+        .any(|record| {
+            record.capture.metadata.anchor_id == anchor_id
+                || record
+                    .capture
+                    .files
+                    .iter()
+                    .any(|file| file.locator.anchor_id == anchor_id)
         }))
 }
 
@@ -310,6 +373,25 @@ impl GuardedViewMount {
         self.anchor_id
     }
 
+    pub fn load_revision_capture(
+        revision_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<Option<GuardedRevisionCaptureV1>> {
+        let Some(bytes) =
+            control.get_record(GUARDED_REVISION_CAPTURE_KIND, revision_id.as_bytes())?
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+            "guarded revision capture exceeds its local bound"
+        );
+        let record: GuardedRevisionCaptureV1 = mb_core::decode_canonical(&bytes)?;
+        record.validate_record(revision_id.as_bytes())?;
+        record.verify()?;
+        Ok(Some(record))
+    }
+
     /// Recover every active durable mount claim before the daemon starts
     /// serving requests. A retirement marker wins over an old claim; finish
     /// that retirement instead of remounting a view being released.
@@ -363,10 +445,8 @@ impl GuardedViewMount {
     /// interrupted; retrying this method finishes that deletion.
     pub fn retire_claim(anchor_id: Uuid, control: &ControlStore) -> anyhow::Result<()> {
         ensure!(
-            !stopped_capture_intents(control)?
-                .iter()
-                .any(|(_, _, intent)| intent.root_anchor_id == anchor_id),
-            "guarded mount retains a stopped-capture attempt"
+            !stopped_capture_intent_pins_anchor(control, anchor_id)?,
+            "guarded mount retains a revision capture"
         );
         let id = anchor_id.as_bytes();
         let claim_bytes = control.get_record(MOUNT_CLAIM_KIND, id)?;
@@ -833,6 +913,33 @@ impl GuardedViewMount {
             )?;
             Ok(capture)
         })
+    }
+
+    /// Return the exact published intent bytes for a database transaction
+    /// that transfers its pins to a signed revision capture record.
+    pub fn published_stopped_capture_attempt(
+        anchor_id: Uuid,
+        attempt_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<(Vec<u8>, GuardedStoppedCaptureV1)> {
+        let bytes = control
+            .get_record(STOPPED_CAPTURE_KIND, attempt_id.as_bytes())?
+            .context("guarded capture attempt is unavailable")?;
+        ensure!(
+            bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+            "guarded stopped-capture intent exceeds its local bound"
+        );
+        let intent: StoppedCaptureIntent = mb_core::decode_canonical(&bytes)?;
+        intent.validate(attempt_id.as_bytes())?;
+        ensure!(
+            intent.root_anchor_id == anchor_id,
+            "guarded capture attempt belongs to another root"
+        );
+        let capture = intent
+            .published
+            .context("guarded capture attempt is not yet published")?;
+        capture.verify()?;
+        Ok((bytes, capture))
     }
 
     pub fn capture_stopped_view_for_attempt(

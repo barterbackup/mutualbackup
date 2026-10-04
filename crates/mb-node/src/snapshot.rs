@@ -29,6 +29,8 @@ use mb_store::{
     ReflinkCapturePlan, SourceBackendKind, SourceCapturePlan, SourceFileCapturePlan,
     StableAnchorFileLocator, git_catalog_marker,
 };
+#[cfg(target_os = "linux")]
+use mb_store::{GUARDED_REVISION_CAPTURE_KIND, GuardedRevisionCaptureV1, GuardedViewMount};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1102,6 +1104,210 @@ pub(crate) fn prepare_revision(
             Err(error)
         }
     }
+}
+
+/// Sign one stopped guarded-view attempt. The store's published attempt owns
+/// all anchors until the final SQL transaction replaces it with a durable
+/// revision capture record and sector recipes.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Guarded root enrollment must select this path after its recovery gate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_guarded_revision(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    protected_root_id: Uuid,
+    root_anchor_id: Uuid,
+    sequence: u64,
+    revision_id: Uuid,
+    writer: WriterCredentials<'_>,
+) -> Result<SignedRecord<UserRevision>> {
+    let writer_key = SigningKey::from_bytes(writer.secret);
+    if let Some(bytes) = control.get_record("user-revision", revision_id.as_bytes())? {
+        let existing: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+        existing.verify(USER_REVISION_DOMAIN)?;
+        existing.value.verify_writer()?;
+        if existing.signer != keys.node_id()
+            || existing.value.revision_id != revision_id
+            || existing.value.owner != keys.node_id()
+            || existing.value.guild_id != guild_id
+            || existing.value.protected_root_id != protected_root_id
+            || existing.value.sequence != sequence
+            || existing.value.writer_epoch != writer.epoch
+            || existing.value.writer_public_key != writer_key.verifying_key().to_bytes()
+        {
+            bail!("guarded revision retry differs from its committed revision");
+        }
+        let retained = GuardedViewMount::load_revision_capture(revision_id, control)?
+            .context("committed guarded revision lost its local anchor map")?;
+        if retained.capture.metadata.anchor_id != root_anchor_id {
+            bail!("guarded revision retry belongs to another root anchor");
+        }
+        return Ok(existing);
+    }
+    if control
+        .get_record("capture-intent", revision_id.as_bytes())?
+        .is_some()
+        || control
+            .get_record(GUARDED_REVISION_CAPTURE_KIND, revision_id.as_bytes())?
+            .is_some()
+    {
+        bail!("guarded revision attempt conflicts with another source capture");
+    }
+    let head_id = revision_head_id(guild_id, protected_root_id);
+    let parent = match control.get_record("user-revision-head", &head_id)? {
+        Some(bytes) => {
+            let previous: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+            previous.verify(USER_REVISION_DOMAIN)?;
+            previous.value.verify_writer()?;
+            if previous.signer != keys.node_id()
+                || previous.value.owner != keys.node_id()
+                || previous.value.guild_id != guild_id
+                || previous.value.protected_root_id != protected_root_id
+                || !matches!(previous.value.format_version, 3..=5)
+                || previous.value.cipher_profile != V1_CIPHER_PROFILE
+                || previous.value.sequence.checked_add(1) != Some(sequence)
+            {
+                bail!("guarded revision does not extend the durable local head");
+            }
+            Some(previous.value.hash()?)
+        }
+        None if sequence == 1 => None,
+        None => bail!("the first guarded revision must have sequence one"),
+    };
+    let (attempt_bytes, capture) =
+        GuardedViewMount::published_stopped_capture_attempt(root_anchor_id, revision_id, control)?;
+    let content_id_key = keys.guild_content_id_key(&guild_id);
+    let encryption_key = keys.guild_data_key(&guild_id);
+    let mut recipes = Vec::new();
+    let mut commitments = BTreeMap::<SectorId, MerkleCommitment>::new();
+    let mut ordinal = 0_u64;
+    let metadata =
+        crate::guarded_metadata::GuardedPrivateMetadataV6::from_capture(&capture, |file| {
+            prepare_sparse_file(
+                &mut recipes,
+                keys,
+                guild_id,
+                protected_root_id,
+                &content_id_key,
+                &mut ordinal,
+                &mut commitments,
+                &file.locator,
+                file.logical_len,
+                &file.data_extents,
+            )
+        })?;
+    let mut data_references = Vec::new();
+    for entry in &metadata.entries {
+        if let GuardedPrivateEntryV6::File { data_extents, .. } = entry {
+            for reference in data_extents.iter().flat_map(|extent| extent.sectors.iter()) {
+                push_data_reference(&mut data_references, reference.clone())?;
+            }
+        }
+    }
+    let metadata_bytes = canonical_bytes(&metadata)?;
+    let mut metadata_references = Vec::new();
+    for plaintext in metadata_bytes.chunks(V1_SECTOR_SIZE) {
+        let id = make_content_sector_id(
+            &content_id_key,
+            keys.node_id(),
+            guild_id,
+            protected_root_id,
+            SectorPurpose::Metadata,
+            plaintext,
+        )?;
+        let (reference, ciphertext) = encrypted_sector(&encryption_key, id, plaintext)?;
+        commitments.insert(id, merkle_commit(&ciphertext)?);
+        metadata_references.push(reference.clone());
+        queue_recipe(
+            &mut recipes,
+            LocalSectorRecipe {
+                guild_id,
+                reference,
+                source: LocalPlaintextSource::Inline(plaintext.to_vec()),
+            },
+        )?;
+    }
+    let signed_commitments = metadata_references
+        .iter()
+        .chain(&data_references)
+        .map(|reference| {
+            commitments
+                .get(&reference.id)
+                .cloned()
+                .context("guarded sector lacks a Merkle commitment")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut revision = UserRevision {
+        format_version: 5,
+        guild_id,
+        protected_root_id,
+        cipher_profile: V1_CIPHER_PROFILE,
+        revision_id,
+        owner: keys.node_id(),
+        writer_epoch: writer.epoch,
+        writer_public_key: writer_key.verifying_key().to_bytes(),
+        writer_signature: Vec::new(),
+        sequence,
+        parent,
+        metadata_sectors: metadata_references,
+        data_sectors: data_references,
+        sector_commitments: Some(signed_commitments),
+    };
+    revision.sign_writer(&writer_key)?;
+    let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, keys)?;
+    if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
+        bail!("guarded revision catalog exceeds the bounded-object limit");
+    }
+    let retained = GuardedRevisionCaptureV1 {
+        format_version: 1,
+        revision_id,
+        capture: capture.clone(),
+    };
+    retained.verify()?;
+    let mut areas = BTreeMap::<Uuid, PathBuf>::new();
+    for file in &capture.files {
+        let area = &file.locator.area;
+        if areas
+            .insert(area.area_id, area.path_hint.clone())
+            .is_some_and(|path| path != area.path_hint)
+        {
+            bail!("guarded capture uses conflicting anchor-area hints");
+        }
+    }
+    for (area_id, hint) in areas {
+        recipes.push((
+            ANCHOR_AREA_LOCATION_KIND.to_owned(),
+            area_id.as_bytes().to_vec(),
+            canonical_bytes(&hint)?,
+        ));
+    }
+    recipes.extend([
+        (
+            GUARDED_REVISION_CAPTURE_KIND.to_owned(),
+            revision_id.as_bytes().to_vec(),
+            canonical_bytes(&retained)?,
+        ),
+        (
+            "user-revision".to_owned(),
+            revision_id.as_bytes().to_vec(),
+            canonical_bytes(&revision)?,
+        ),
+        (
+            "user-revision-head".to_owned(),
+            head_id,
+            canonical_bytes(&revision)?,
+        ),
+    ]);
+    if let Some(change_sequence) = writer.captured_change_sequence {
+        recipes.push((
+            "revision-root-change".to_owned(),
+            revision_id.as_bytes().to_vec(),
+            canonical_bytes(&change_sequence)?,
+        ));
+    }
+    control.finalize_guarded_capture_records(revision_id.as_bytes(), &attempt_bytes, &recipes)?;
+    Ok(revision)
 }
 
 #[allow(clippy::too_many_arguments)]
