@@ -184,6 +184,66 @@ pub struct PinnedDirectory {
     filesystem_id: u64,
 }
 
+/// Descriptor-relative worktree reads. The transient constructor may inspect
+/// a supervised FUSE view without claiming its mount-local device ID is a
+/// durable source identity. No mutation or identity-publication API is exposed.
+pub struct PinnedReadDirectory(PinnedDirectory);
+
+impl PinnedReadDirectory {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        PinnedDirectory::open(path).map(Self)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn open_transient(path: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let file = open_source_root(path.as_ref())?;
+        let filesystem_id = file.metadata()?.dev();
+        Ok(Self(PinnedDirectory {
+            file,
+            filesystem_id,
+        }))
+    }
+
+    pub fn try_clone(&self) -> Result<Self, AnchorError> {
+        self.0.try_clone().map(Self)
+    }
+
+    pub fn descriptor_path(&self) -> PathBuf {
+        self.0.descriptor_path()
+    }
+
+    pub fn open_child_directory(
+        &self,
+        name: impl AsRef<Path>,
+    ) -> Result<Option<Self>, AnchorError> {
+        self.0
+            .open_child_directory(name)
+            .map(|child| child.map(Self))
+    }
+
+    pub fn open_descendant_directory(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<Self, AnchorError> {
+        self.0.open_descendant_directory(relative).map(Self)
+    }
+
+    pub fn open_child_file(&self, name: impl AsRef<Path>) -> Result<Option<File>, AnchorError> {
+        self.0.open_child_file(name)
+    }
+
+    pub fn read_child_symlink(
+        &self,
+        name: impl AsRef<Path>,
+    ) -> Result<Option<Vec<u8>>, AnchorError> {
+        self.0
+            .read_child_symlink(name)
+            .map(|target| target.map(|(bytes, _)| bytes))
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl PinnedDirectory {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AnchorError> {
@@ -420,7 +480,12 @@ impl PinnedDirectory {
         if !pinned.metadata()?.is_file() {
             return Err(AnchorError::UnsupportedObject(name.to_path_buf()));
         }
-        Ok(Some(reopen_pinned_file(&pinned, false, name)?))
+        // The pinned inode is already known to be regular. A guarded FUSE
+        // worktree rejects O_NONBLOCK on file opens, and no FIFO can be reached
+        // through this verified descriptor.
+        Ok(Some(reopen_pinned_file_with_nonblock(
+            &pinned, false, name, false,
+        )?))
     }
 
     fn pin_child_symlink(&self, name: &Path) -> Result<Option<File>, AnchorError> {
@@ -5340,21 +5405,33 @@ fn reopen_pinned_file(
     directory: bool,
     relative: &Path,
 ) -> Result<File, AnchorError> {
+    reopen_pinned_file_with_nonblock(pinned, directory, relative, !directory)
+}
+
+#[cfg(target_os = "linux")]
+fn reopen_pinned_file_with_nonblock(
+    pinned: &File,
+    directory: bool,
+    relative: &Path,
+    nonblock: bool,
+) -> Result<File, AnchorError> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
 
     let path = CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
         .expect("a numeric proc descriptor path has no NUL");
-    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    if nonblock {
+        flags |= libc::O_NONBLOCK;
+    }
     if directory {
         flags |= libc::O_DIRECTORY;
-        flags &= !libc::O_NONBLOCK;
     }
     let mut descriptor = unsafe { libc::open(path.as_ptr(), flags | libc::O_NOATIME) };
     if descriptor < 0
         && matches!(
             std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EPERM | libc::EINVAL | libc::EOPNOTSUPP)
+            Some(libc::EPERM | libc::EACCES | libc::EINVAL | libc::EOPNOTSUPP)
         )
     {
         descriptor = unsafe { libc::open(path.as_ptr(), flags) };

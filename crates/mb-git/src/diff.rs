@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use git2::{DiffOptions, ObjectType, Oid, Patch};
-use mb_store::{AnchorError, ControlStore, PinnedDirectory};
+use mb_store::{AnchorError, ControlStore, PinnedReadDirectory};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -98,7 +98,7 @@ fn fingerprint(metadata: &Metadata) -> (u64, u64, u64, u32, i64, i64, i64, i64) 
 }
 
 fn read_worktree(
-    root: &PinnedDirectory,
+    root: &PinnedReadDirectory,
     path: &[u8],
     expected: &GitIndexEntry,
     expected_hash: [u8; 32],
@@ -124,7 +124,7 @@ fn read_worktree(
     }
     let leaf = leaf.ok_or(StageError::UnsafePath)?;
     match parent.read_child_symlink(leaf) {
-        Ok(Some((bytes, _))) => {
+        Ok(Some(bytes)) => {
             if bytes.len() as u64 == expected_len
                 && blake3::hash(&bytes).as_bytes() == &expected_hash
             {
@@ -387,6 +387,36 @@ pub(crate) fn repository_diff_for_scope(
     root: &Path,
     cached: bool,
 ) -> Result<GitDiff, DiffError> {
+    let working_root = (!cached)
+        .then(|| PinnedReadDirectory::open(root))
+        .transpose()?;
+    repository_diff_with_directory(control, scope, working_root, cached)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn repository_diff_for_guarded(
+    control: &ControlStore,
+    repository_id: Uuid,
+    root: &Path,
+    cached: bool,
+) -> Result<GitDiff, DiffError> {
+    let working_root = (!cached)
+        .then(|| PinnedReadDirectory::open_transient(root))
+        .transpose()?;
+    repository_diff_with_directory(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        working_root,
+        cached,
+    )
+}
+
+fn repository_diff_with_directory(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    working_root: Option<PinnedReadDirectory>,
+    cached: bool,
+) -> Result<GitDiff, DiffError> {
     let repository_id = scope.repository_id();
     let staged = staged_entries_for_scope(control, scope)?
         .into_iter()
@@ -395,11 +425,6 @@ pub(crate) fn repository_diff_for_scope(
         committed_files_for_scope(control, scope)?
     } else {
         BTreeMap::new()
-    };
-    let working_root = if cached {
-        None
-    } else {
-        Some(PinnedDirectory::open(root)?)
     };
     let paths = if cached {
         staged

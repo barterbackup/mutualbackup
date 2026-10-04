@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{ObjectType, Oid, Repository};
 use mb_core::{ModelError, decode_canonical};
-use mb_store::{AnchorError, ControlStore, DatabaseError, PinnedDirectory};
+use mb_store::{AnchorError, ControlStore, DatabaseError, PinnedReadDirectory};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -208,7 +208,7 @@ fn file_fingerprint(metadata: &Metadata) -> (u64, u64, u64, u32, i64, i64, i64, 
 }
 
 fn worktree_change(
-    root: &PinnedDirectory,
+    root: &PinnedReadDirectory,
     path: &[u8],
     staged: &GitIndexEntry,
     expected_hash: [u8; 32],
@@ -247,8 +247,8 @@ fn worktree_change(
             Err(AnchorError::UnsupportedObject(_)) => return Ok(Some(GitChange::TypeChanged)),
             Err(error) => return Err(error.into()),
         };
-        return Ok((target.0.len() as u64 != expected_len
-            || blake3::hash(&target.0).as_bytes() != &expected_hash)
+        return Ok((target.len() as u64 != expected_len
+            || blake3::hash(&target).as_bytes() != &expected_hash)
             .then_some(GitChange::Modified));
     }
     let mut file = match parent.open_child_file(name) {
@@ -289,7 +289,7 @@ fn worktree_change(
 }
 
 fn walk_untracked(
-    root: &PinnedDirectory,
+    root: &PinnedReadDirectory,
     tracked: &BTreeSet<Vec<u8>>,
 ) -> Result<Vec<Vec<u8>>, StatusError> {
     let mut pending = vec![(root.try_clone()?, Vec::<u8>::new())];
@@ -338,6 +338,27 @@ pub(crate) fn repository_status_for_scope(
     scope: GitWorktreeScope,
     root: &Path,
 ) -> Result<GitStatus, StatusError> {
+    repository_status_with_directory(control, scope, PinnedReadDirectory::open(root)?)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn repository_status_for_guarded(
+    control: &ControlStore,
+    repository_id: Uuid,
+    root: &Path,
+) -> Result<GitStatus, StatusError> {
+    repository_status_with_directory(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        PinnedReadDirectory::open_transient(root)?,
+    )
+}
+
+fn repository_status_with_directory(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root: PinnedReadDirectory,
+) -> Result<GitStatus, StatusError> {
     let repository_id = scope.repository_id();
     let head = head_oid_for_scope(control, scope)?;
     let committed = files_for_commit(control, repository_id, head)?;
@@ -349,7 +370,6 @@ pub(crate) fn repository_status_for_scope(
     }
     let mut all_paths = staged.keys().cloned().collect::<BTreeSet<_>>();
     all_paths.extend(committed.keys().cloned());
-    let root = PinnedDirectory::open(root)?;
     let mut changes = Vec::new();
     for path in all_paths {
         let staged_entry = staged.get(&path);
@@ -404,7 +424,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("file"), b"same bytes").unwrap();
         symlink(outside.path(), root.path().join("dir")).unwrap();
-        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let pinned = PinnedReadDirectory::open(root.path()).unwrap();
         let staged = GitIndexEntry {
             format_version: 1,
             oid: Oid::hash_object(ObjectType::Blob, b"same bytes")
@@ -428,7 +448,7 @@ mod tests {
     #[test]
     fn tracked_status_reports_a_missing_parent_as_deleted() {
         let root = tempfile::tempdir().unwrap();
-        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let pinned = PinnedReadDirectory::open(root.path()).unwrap();
         let staged = GitIndexEntry {
             format_version: 1,
             oid: [1; 20],
@@ -447,7 +467,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("file"), b"same bytes").unwrap();
         symlink(outside.path().join("file"), root.path().join("file")).unwrap();
-        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let pinned = PinnedReadDirectory::open(root.path()).unwrap();
         let staged = GitIndexEntry {
             format_version: 1,
             oid: Oid::hash_object(ObjectType::Blob, b"same bytes")
@@ -468,7 +488,7 @@ mod tests {
     fn matching_git_id_does_not_hide_different_worktree_bytes() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("file"), b"bravo").unwrap();
-        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let pinned = PinnedReadDirectory::open(root.path()).unwrap();
         let staged = GitIndexEntry {
             format_version: 1,
             oid: Oid::hash_object(ObjectType::Blob, b"bravo")

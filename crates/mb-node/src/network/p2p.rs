@@ -33242,6 +33242,7 @@ mod tests {
     #[ignore = "requires a privileged guarded FUSE view and a reflink test filesystem"]
     async fn guarded_git_graph_recovers_from_format_seven_packed_checkpoint() {
         use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
 
         let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
@@ -33463,6 +33464,62 @@ mod tests {
             );
         }
         assert_eq!(root_anchor_ids.len(), 1);
+        {
+            let mut recovered_owner = recovered_node.lock().unwrap();
+            let status = recovered_owner.git_status(root_id).unwrap();
+            assert!(status.history_backed_up);
+            assert_eq!(status.head_oid, Some(original_graph.refs[0].oid));
+            assert!(status.changes.is_empty());
+            assert!(status.untracked.is_empty());
+            assert_eq!(
+                recovered_owner.git_log(root_id, 1).unwrap()[0].oid,
+                original_graph.refs[0].oid
+            );
+            assert!(
+                recovered_owner
+                    .git_branches(root_id)
+                    .unwrap()
+                    .iter()
+                    .any(|branch| branch.name == "main" && branch.current)
+            );
+            assert!(recovered_owner.git_tags(root_id).unwrap().is_empty());
+            assert!(
+                recovered_owner
+                    .git_diff(root_id, false)
+                    .unwrap()
+                    .patch
+                    .is_empty()
+            );
+            assert!(
+                recovered_owner
+                    .git_add_path(root_id, std::path::Path::new("first"))
+                    .is_err()
+            );
+        }
+        let edit = std::process::Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'\\n',0); os.fsync(fd); os.close(fd)")
+            .arg(restored.join("first"))
+            .output()
+            .unwrap();
+        assert!(edit.status.success(), "{edit:?}");
+        {
+            let owner = recovered_node.lock().unwrap();
+            let status = owner.git_status(root_id).unwrap();
+            assert!(status.history_backed_up);
+            assert!(status.changes.iter().any(|change| {
+                change.path == b"first" && change.worktree == Some(mb_git::GitChange::Modified)
+            }));
+            assert!(!owner.git_diff(root_id, false).unwrap().patch.is_empty());
+        }
+        assert_eq!(
+            mb_git::blob_oid_from_anchor(&recovered_graph.blobs[0].anchor)
+                .unwrap()
+                .as_bytes(),
+            recovered_graph.blobs[0].oid
+        );
 
         recovery_client.shutdown().await.unwrap();
         recovery_task.await.unwrap().unwrap();

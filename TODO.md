@@ -176,7 +176,14 @@
   and source, then recovers both raw files and reachable Git objects from a
   fresh node on ext4 and disposable Btrfs. The provisioned five-daemon
   topology and its failure-domain/source-loss gate remain open; the QUIC
-  fixture runs all five peers in one process.
+  fixture runs all five peers in one process. Recovered guarded catalogs now
+  support verified `status`, `log`, branch/tag listing, and raw `diff` through
+  a descriptor-pinned inspection reader that does not require a durable UUID
+  from the FUSE view. The same ext4/Btrfs QUIC fixture checks that status
+  reports the format-7 history as backed up, a later FUSE edit appears in raw
+  status/diff without changing the signed blob, and `add` still refuses the
+  guarded root. Enrollment, staging, checkout, and the provisioned daemon gate
+  remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

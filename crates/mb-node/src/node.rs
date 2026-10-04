@@ -3114,6 +3114,14 @@ impl Node {
         self.open_git_repository_with_policy(repository_id, None)
     }
 
+    fn open_git_repository_for_inspection(&self, repository_id: Uuid) -> Result<GitRepository> {
+        #[cfg(target_os = "linux")]
+        if self.protected_root_by_id(repository_id)?.format_version == 4 {
+            return self.open_guarded_git_repository(repository_id);
+        }
+        self.open_git_repository(repository_id)
+    }
+
     #[cfg(target_os = "linux")]
     fn open_guarded_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
         anyhow::ensure!(
@@ -3505,19 +3513,19 @@ impl Node {
     }
 
     pub fn git_log(&self, repository_id: Uuid, limit: usize) -> Result<Vec<GitLogEntry>> {
-        self.open_git_repository(repository_id)?
+        self.open_git_repository_for_inspection(repository_id)?
             .log(limit)
             .map_err(Into::into)
     }
 
     pub fn git_branches(&self, repository_id: Uuid) -> Result<Vec<GitBranchInfo>> {
-        self.open_git_repository(repository_id)?
+        self.open_git_repository_for_inspection(repository_id)?
             .branches()
             .map_err(Into::into)
     }
 
     pub fn git_tags(&self, repository_id: Uuid) -> Result<Vec<GitTagInfo>> {
-        self.open_git_repository(repository_id)?
+        self.open_git_repository_for_inspection(repository_id)?
             .tags()
             .map_err(Into::into)
     }
@@ -4309,13 +4317,13 @@ impl Node {
     }
 
     pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
-        self.open_git_repository(repository_id)?
+        self.open_git_repository_for_inspection(repository_id)?
             .diff(cached)
             .map_err(Into::into)
     }
 
     pub fn git_status(&self, repository_id: Uuid) -> Result<GitStatus> {
-        let repository = self.open_git_repository(repository_id)?;
+        let repository = self.open_git_repository_for_inspection(repository_id)?;
         let mut status = repository.status()?;
         status.history_backed_up = self.git_history_backed_up(repository_id, &repository)?;
         Ok(status)
@@ -28197,6 +28205,8 @@ pub(crate) mod tests {
         let node = recovered.lock().unwrap();
         assert_eq!(fs::read(restored.join("sample")).unwrap(), original);
         assert_eq!(fs::read(restored.join("second")).unwrap(), second);
+        let read_root = mb_store::PinnedReadDirectory::open_transient(&restored).unwrap();
+        assert!(read_root.open_child_file("sample").unwrap().is_some());
         let repository = node.open_guarded_git_repository(root_id).unwrap();
         let graph = repository.export_graph_source().unwrap();
         assert_eq!(graph.refs, protected_graph.refs);

@@ -24,6 +24,8 @@ use crate::checkout::{
     begin_switch, begin_switch_for_scope, continue_merge, continue_merge_for_scope,
     has_pending_checkout_for_scope, resume_pending_checkout, resume_pending_checkout_for_scope,
 };
+#[cfg(target_os = "linux")]
+use crate::diff::repository_diff_for_guarded;
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
 use crate::fetch::{FetchError, fetch_bare, import_pushed_branch, import_pushed_tag};
 use crate::head::{HeadError, selected_branch, selected_branch_for_scope};
@@ -66,6 +68,8 @@ use crate::stage::{
     guarded_catalog_recovery_rebinds, guarded_catalog_stage_pins, guarded_stage_receipt_matches,
     publish_guarded_stage_for_scope, rebind_recovered_guarded_blob,
 };
+#[cfg(target_os = "linux")]
+use crate::status::repository_status_for_guarded;
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
     GitWorktreeError, GitWorktreeInfo, GitWorktreeState, add_worktree, get_worktree,
@@ -1269,7 +1273,7 @@ impl GitRepository {
     }
 
     pub fn tags(&self) -> Result<Vec<GitTagInfo>, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(list_tags(&self.catalog, self.repository_id)?)
     }
 
@@ -1427,6 +1431,15 @@ impl GitRepository {
     }
 
     pub fn status(&self) -> Result<GitStatus, RepositoryError> {
+        #[cfg(target_os = "linux")]
+        if self.source_backend == SourceBackendKind::GuardedLinkFreezeV1 {
+            self.require_guarded_stage_ready()?;
+            return Ok(repository_status_for_guarded(
+                &self.catalog,
+                self.repository_id,
+                &self.root,
+            )?);
+        }
         self.resume_checkout()?;
         Ok(repository_status(
             &self.catalog,
@@ -1436,6 +1449,16 @@ impl GitRepository {
     }
 
     pub fn diff(&self, cached: bool) -> Result<GitDiff, RepositoryError> {
+        #[cfg(target_os = "linux")]
+        if self.source_backend == SourceBackendKind::GuardedLinkFreezeV1 {
+            self.require_guarded_stage_ready()?;
+            return Ok(repository_diff_for_guarded(
+                &self.catalog,
+                self.repository_id,
+                &self.root,
+                cached,
+            )?);
+        }
         self.resume_checkout()?;
         Ok(repository_diff(
             &self.catalog,
