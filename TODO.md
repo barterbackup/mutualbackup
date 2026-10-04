@@ -165,9 +165,13 @@
   reconciled guarded catalog, while refusing an unregistered private marker.
   A five-member in-memory guild test signs this graph through the production
   node path, deletes the owner's node state and source, reconstructs sectors
-  from other members, and restores the exact file and reachable Git blob on
-  ext4 and disposable Btrfs. That lab uses a format-3 checkpoint; it does not
-  prove the required live-daemon format-7 packing checkpoint gate.
+  from other members, and restores two exact files and reachable Git blobs on
+  ext4 and disposable Btrfs. It checks that the signed data sector IDs are
+  unique and both recovered blobs use virtual mappings to the one retained
+  guarded root anchor, with no separate blob-owned sector recipes. Broader
+  blob-only and edited-file physical-reclamation cases remain. That lab uses
+  a format-3 checkpoint; it does not prove the required live-daemon format-7
+  packing checkpoint gate.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

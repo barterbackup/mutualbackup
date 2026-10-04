@@ -27967,6 +27967,12 @@ pub(crate) mod tests {
         original[..4].copy_from_slice(b"\r\n\0G");
         fs::write(lower.join("sample"), &original).unwrap();
         fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o644)).unwrap();
+        let mut second = (0..97_003)
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        second[..4].copy_from_slice(b"\n\r\0H");
+        fs::write(lower.join("second"), &second).unwrap();
+        fs::set_permissions(lower.join("second"), fs::Permissions::from_mode(0o644)).unwrap();
 
         let seeds = (0_u8..5)
             .map(|index| Seed::from_bytes([index + 205; 32]))
@@ -28010,28 +28016,30 @@ pub(crate) mod tests {
                 )
                 .unwrap(),
             ));
-            let stage_id = Uuid::new_v4();
-            GuardedViewMount::prepare_stopped_file_capture(
-                binding.anchor_id,
-                stage_id,
-                Arc::clone(&stage_control),
-                "sample",
-            )
-            .unwrap();
-            let stage_anchor = GuardedViewMount::finish_stopped_file_capture(
-                binding.anchor_id,
-                stage_id,
-                Arc::clone(&stage_control),
-            )
-            .unwrap();
-            assert_eq!(stage_anchor.format_version, 2);
-            GuardedViewMount::transfer_stopped_file_capture_to_git(
-                stage_id,
-                root.root_id,
-                root.root_id,
-                &stage_control.lock().unwrap(),
-            )
-            .unwrap();
+            for path in ["sample", "second"] {
+                let stage_id = Uuid::new_v4();
+                GuardedViewMount::prepare_stopped_file_capture(
+                    binding.anchor_id,
+                    stage_id,
+                    Arc::clone(&stage_control),
+                    path,
+                )
+                .unwrap();
+                let stage_anchor = GuardedViewMount::finish_stopped_file_capture(
+                    binding.anchor_id,
+                    stage_id,
+                    Arc::clone(&stage_control),
+                )
+                .unwrap();
+                assert_eq!(stage_anchor.format_version, 2);
+                GuardedViewMount::transfer_stopped_file_capture_to_git(
+                    stage_id,
+                    root.root_id,
+                    root.root_id,
+                    &stage_control.lock().unwrap(),
+                )
+                .unwrap();
+            }
             drop(stage_control);
             let mount_control = Arc::new(Mutex::new(
                 ControlStore::open_with_key(
@@ -28068,7 +28076,22 @@ pub(crate) mod tests {
             .unwrap()
         };
         assert_eq!(protected_graph.refs.len(), 1);
-        assert_eq!(protected_graph.blobs.len(), 1);
+        assert_eq!(protected_graph.blobs.len(), 2);
+        let signed_sector_ids = signed
+            .value
+            .data_sectors
+            .iter()
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(signed_sector_ids.len(), signed.value.data_sectors.len());
+        let blob_sector_ids = protected_graph
+            .blobs
+            .iter()
+            .flat_map(|blob| blob.data_extents.iter())
+            .flat_map(|extent| extent.sectors.iter())
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(signed_sector_ids, blob_sector_ids);
         drop(owner);
         let lost_data_dir = guild.lose_node(0).unwrap();
         fs::remove_dir_all(lost_data_dir).unwrap();
@@ -28080,18 +28103,41 @@ pub(crate) mod tests {
             .unwrap();
         let node = recovered.lock().unwrap();
         assert_eq!(fs::read(restored.join("sample")).unwrap(), original);
+        assert_eq!(fs::read(restored.join("second")).unwrap(), second);
         let repository = node.open_guarded_git_repository(root_id).unwrap();
         let graph = repository.export_graph_source().unwrap();
         assert_eq!(graph.refs, protected_graph.refs);
         assert_eq!(graph.objects, protected_graph.objects);
-        assert_eq!(graph.blobs.len(), 1);
-        assert_eq!(graph.blobs[0].oid, protected_graph.blobs[0].oid);
-        assert_eq!(
-            mb_git::blob_oid_from_anchor(&graph.blobs[0].anchor)
+        assert_eq!(graph.blobs.len(), 2);
+        let root_manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &node
+                .control
+                .get_record("anchor-manifest", signed.value.revision_id.as_bytes())
                 .unwrap()
-                .as_bytes(),
-            graph.blobs[0].oid
-        );
+                .unwrap(),
+        )
+        .unwrap();
+        let recipe_anchors = git_prune_recipe_anchor_ids(&node.control).unwrap();
+        assert!(recipe_anchors.contains(&root_manifest.anchor_id));
+        for (blob, signed_blob) in graph.blobs.iter().zip(&protected_graph.blobs) {
+            assert_eq!(blob.oid, signed_blob.oid);
+            assert_eq!(blob.anchor.format_version, 2);
+            assert_eq!(
+                blob.anchor
+                    .guarded_root_file
+                    .as_ref()
+                    .unwrap()
+                    .root_anchor_id,
+                root_manifest.anchor_id
+            );
+            assert!(!recipe_anchors.contains(&blob.anchor.anchor_id));
+            assert_eq!(
+                mb_git::blob_oid_from_anchor(&blob.anchor)
+                    .unwrap()
+                    .as_bytes(),
+                blob.oid
+            );
+        }
         assert!(fs::symlink_metadata(restored.join(".mutualbackup")).is_err());
     }
 
