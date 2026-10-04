@@ -2034,6 +2034,13 @@ impl RawFileAnchorManifestV2 {
 }
 
 impl FileAnchorManifest {
+    pub(crate) fn source_file_identity(&self) -> NativeFileId {
+        NativeFileId {
+            filesystem_id: self.source_version.filesystem_id,
+            inode: self.source_version.inode,
+        }
+    }
+
     pub fn file_locator(&self) -> StableAnchorFileLocator {
         StableAnchorFileLocator {
             area: self.area.clone(),

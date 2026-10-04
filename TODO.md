@@ -26,6 +26,16 @@
   cannot retire that anchor while Git retains it. Publish checkout files only
   through a guarded editable view, with byte-exact, no-copy and crash/reopen
   probes on ext4 and Btrfs. Keep the current guard until those proofs pass.
+  The store now has a versioned per-file stopped-view attempt: preparation
+  fences remount, startup completes the same capture after reopen, and its
+  published record pins the root and file anchor until an owner releases it.
+  The privileged ext4 and disposable local Btrfs probe covers a crash window
+  after the hard-link anchor exists but before attempt publication, then edits
+  the view and retries the same immutable capture. Published retries also
+  verify the source plan against the exact mount claim; a normal unit test
+  checks raw Unix path round-trip and malformed intent refusal. Both privileged
+  runs pass, as do all 129 normal store tests and strict workspace Clippy. The Git
+  catalog handoff, guarded checkout, and cross-catalog prune are still open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

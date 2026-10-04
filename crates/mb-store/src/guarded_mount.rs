@@ -22,9 +22,9 @@ use crate::guarded_view_probe::{
     virtual_directory_size_dirty_ids, virtual_time_dirty_masks,
 };
 use crate::{
-    CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedRootCapturePlan,
-    NativeFileId, PinnedDirectory, StableAnchorFileLocator, StableAnchorManifest,
-    filesystem_identity,
+    CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedFileCapturePlan,
+    GuardedRootCapturePlan, NativeFileId, PinnedDirectory, StableAnchorFileLocator,
+    StableAnchorManifest, filesystem_identity,
 };
 
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
@@ -32,6 +32,7 @@ const MOUNT_RETIRE_KIND: &str = "guarded-view-mount-retired-v1";
 const VIRTUAL_METADATA_KIND: &str = "guarded-view-virtual-metadata-v1";
 const VIRTUAL_TIME_BASELINE_KIND: &str = "guarded-view-virtual-time-baseline-v1";
 const STOPPED_CAPTURE_KIND: &str = "guarded-view-stopped-capture-v1";
+const STOPPED_FILE_CAPTURE_KIND: &str = "guarded-view-stopped-file-capture-v1";
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
 const GUARDED_REVISION_RETIREMENT_KIND: &str = "guarded-view-revision-retirement-v1";
 const STOPPED_CAPTURE_MAX_BYTES: usize = mb_core::V1_MAX_CATALOG_BYTES * 2 + 4096;
@@ -142,6 +143,73 @@ struct StoppedCaptureIntent {
     root_anchor_id: Uuid,
     metadata: GuardedViewMetadataV1,
     published: Option<GuardedStoppedCaptureV1>,
+}
+
+/// A single file reserved for a future Git index publication. The node keeps
+/// this record until the Git catalog has durably taken over its anchor pin.
+/// A prepared record fences remount, so replay observes the same view bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoppedFileCaptureIntent {
+    format_version: u16,
+    attempt_id: Uuid,
+    root_anchor_id: Uuid,
+    entry: GuardedViewMetadataEntry,
+    published: Option<FileAnchorManifest>,
+}
+
+impl StoppedFileCaptureIntent {
+    fn validate(&self, record_id: &[u8]) -> anyhow::Result<()> {
+        let path = PathBuf::from(OsString::from_vec(self.entry.path.clone()));
+        ensure!(
+            self.format_version == 1
+                && !self.attempt_id.is_nil()
+                && self.attempt_id.as_bytes() == record_id
+                && !self.root_anchor_id.is_nil()
+                && self.entry.kind == GuardedViewEntryKind::File
+                && !self.entry.path.is_empty()
+                && !self.entry.path.contains(&0)
+                && path
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                && path.as_os_str().as_bytes() == self.entry.path
+                && self.entry.native_id.inode != 0
+                && self.entry.native_id.filesystem_id != 0
+                && self.entry.mode & !0o7777 == 0
+                && self.entry.atime_nanos < 1_000_000_000
+                && self.entry.modified_nanos < 1_000_000_000
+                && self.published.as_ref().is_none_or(|manifest| {
+                    manifest.format_version == 1
+                        && !manifest.anchor_id.is_nil()
+                        && manifest.source_file_identity() == self.entry.native_id
+                        && manifest.logical_len == self.entry.logical_len
+                }),
+            "guarded stopped-file capture intent is invalid"
+        );
+        Ok(())
+    }
+}
+
+fn verify_published_file_capture_binding(
+    control: &ControlStore,
+    intent: &StoppedFileCaptureIntent,
+    manifest: &FileAnchorManifest,
+) -> anyhow::Result<()> {
+    let claim_bytes = control
+        .get_record(MOUNT_CLAIM_KIND, intent.root_anchor_id.as_bytes())?
+        .context("guarded file attempt lost its mount claim")?;
+    let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
+    let plan = GuardedFileCapturePlan::load_for_manifest(control, manifest)?
+        .context("guarded file attempt lost its source plan")?;
+    ensure!(
+        claim.version == 1
+            && claim.anchor_id == intent.root_anchor_id
+            && plan.source_root() == claim.lower_root
+            && plan.source_root_identity() == claim.lower_id
+            && plan.source_file_identity() == intent.entry.native_id,
+        "guarded file attempt differs from its claimed source"
+    );
+    manifest.open_verified()?;
+    Ok(())
 }
 
 type StoppedCaptureRecord = (Vec<u8>, Vec<u8>, StoppedCaptureIntent);
@@ -334,6 +402,41 @@ fn pending_stopped_capture_attempts(
         .collect())
 }
 
+fn stopped_file_capture_intents(
+    control: &ControlStore,
+) -> anyhow::Result<Vec<StoppedFileCaptureIntent>> {
+    let records = control.records(STOPPED_FILE_CAPTURE_KIND)?;
+    ensure!(
+        records.len() <= 1024,
+        "too many guarded file-capture attempts"
+    );
+    records
+        .into_iter()
+        .map(|(id, bytes)| {
+            ensure!(
+                bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                "guarded stopped-file intent exceeds its local bound"
+            );
+            let intent: StoppedFileCaptureIntent = mb_core::decode_canonical(&bytes)?;
+            intent.validate(&id)?;
+            Ok(intent)
+        })
+        .collect()
+}
+
+fn pending_stopped_file_capture_attempts(
+    control: &ControlStore,
+    root_anchor_id: Uuid,
+) -> anyhow::Result<Vec<Uuid>> {
+    Ok(stopped_file_capture_intents(control)?
+        .into_iter()
+        .filter_map(|intent| {
+            (intent.root_anchor_id == root_anchor_id && intent.published.is_none())
+                .then_some(intent.attempt_id)
+        })
+        .collect())
+}
+
 pub(crate) fn stopped_capture_intent_pins_anchor(
     control: &ControlStore,
     anchor_id: Uuid,
@@ -349,7 +452,17 @@ pub(crate) fn stopped_capture_intent_pins_anchor(
                         .any(|file| file.locator.anchor_id == anchor_id)
                 })
         });
-    if pending {
+    if pending
+        || stopped_file_capture_intents(control)?
+            .into_iter()
+            .any(|intent| {
+                intent.root_anchor_id == anchor_id
+                    || intent
+                        .published
+                        .as_ref()
+                        .is_some_and(|manifest| manifest.anchor_id == anchor_id)
+            })
+    {
         return Ok(true);
     }
     Ok(guarded_revision_captures(control)?
@@ -612,8 +725,10 @@ impl GuardedViewMount {
                     Self::retire_claim(anchor_id, &control)?;
                 } else if release_anchors.contains(&anchor_id) {
                     ensure!(
-                        pending_stopped_capture_attempts(&control, anchor_id)?.is_empty(),
-                        "guarded release overlaps a prepared revision capture"
+                        pending_stopped_capture_attempts(&control, anchor_id)?.is_empty()
+                            && pending_stopped_file_capture_attempts(&control, anchor_id)?
+                                .is_empty(),
+                        "guarded release overlaps a prepared capture"
                     );
                 } else {
                     active.push(anchor_id);
@@ -631,6 +746,15 @@ impl GuardedViewMount {
             };
             for attempt_id in pending {
                 Self::finish_stopped_capture(anchor_id, attempt_id, Arc::clone(&control))?;
+            }
+            let pending_files = {
+                let store = control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                pending_stopped_file_capture_attempts(&store, anchor_id)?
+            };
+            for attempt_id in pending_files {
+                Self::finish_stopped_file_capture(anchor_id, attempt_id, Arc::clone(&control))?;
             }
             let mount = Self::recover_claimed(anchor_id, Arc::clone(&control))?;
             mount.check_health()?;
@@ -822,7 +946,9 @@ impl GuardedViewMount {
                 "guarded mount has been retired"
             );
             ensure!(
-                pending_stopped_capture_attempts(&control, manifest.anchor_id)?.is_empty(),
+                pending_stopped_capture_attempts(&control, manifest.anchor_id)?.is_empty()
+                    && pending_stopped_file_capture_attempts(&control, manifest.anchor_id)?
+                        .is_empty(),
                 "guarded view has a prepared capture to finish before remount"
             );
             ensure!(
@@ -1285,6 +1411,160 @@ impl GuardedViewMount {
         })
     }
 
+    /// Reserve one exact visible file before creating its Git-stage anchor.
+    /// An unpublished attempt blocks remount and is completed by startup
+    /// recovery. A published attempt is immutable even after later edits.
+    pub fn prepare_stopped_file_capture(
+        anchor_id: Uuid,
+        attempt_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+        relative_path: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        ensure!(!attempt_id.is_nil(), "guarded file attempt ID is nil");
+        let path = relative_path.as_ref().as_os_str().as_bytes().to_vec();
+        {
+            let store = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            if let Some(bytes) =
+                store.get_record(STOPPED_FILE_CAPTURE_KIND, attempt_id.as_bytes())?
+            {
+                ensure!(
+                    bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                    "guarded file attempt exceeds its local bound"
+                );
+                let intent: StoppedFileCaptureIntent = mb_core::decode_canonical(&bytes)?;
+                intent.validate(attempt_id.as_bytes())?;
+                ensure!(
+                    intent.root_anchor_id == anchor_id && intent.entry.path == path,
+                    "guarded file attempt belongs to another source"
+                );
+                return Ok(());
+            }
+        }
+        let control_for_prepare = Arc::clone(&control);
+        Self::with_stopped_view(anchor_id, control, |view, _, _| {
+            let metadata = view.verified_metadata_snapshot(anchor_id)?;
+            let entry = metadata
+                .entries
+                .into_iter()
+                .find(|entry| entry.path == path && entry.kind == GuardedViewEntryKind::File)
+                .context("guarded file attempt path is not a visible regular file")?;
+            let intent = StoppedFileCaptureIntent {
+                format_version: 1,
+                attempt_id,
+                root_anchor_id: anchor_id,
+                entry,
+                published: None,
+            };
+            intent.validate(attempt_id.as_bytes())?;
+            let encoded = mb_core::canonical_bytes(&intent)?;
+            ensure!(
+                encoded.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                "guarded file attempt exceeds its local bound"
+            );
+            let store = control_for_prepare
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            ensure!(
+                pending_stopped_capture_attempts(&store, anchor_id)?.is_empty()
+                    && pending_stopped_file_capture_attempts(&store, anchor_id)?.is_empty(),
+                "another guarded capture attempt is still prepared"
+            );
+            ensure!(store.put_record_if_absent(
+                STOPPED_FILE_CAPTURE_KIND,
+                attempt_id.as_bytes(),
+                &encoded,
+            )?);
+            Ok(())
+        })
+    }
+
+    /// Finish a prepared file while its view is stopped. A retry after
+    /// publication verifies and returns the original immutable anchor.
+    pub fn finish_stopped_file_capture(
+        anchor_id: Uuid,
+        attempt_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+    ) -> anyhow::Result<FileAnchorManifest> {
+        let (encoded, intent) = {
+            let store = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            let encoded = store
+                .get_record(STOPPED_FILE_CAPTURE_KIND, attempt_id.as_bytes())?
+                .context("guarded file attempt was not prepared")?;
+            ensure!(
+                encoded.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                "guarded file attempt exceeds its local bound"
+            );
+            let intent: StoppedFileCaptureIntent = mb_core::decode_canonical(&encoded)?;
+            intent.validate(attempt_id.as_bytes())?;
+            ensure!(
+                intent.root_anchor_id == anchor_id,
+                "guarded file attempt belongs to another root"
+            );
+            if let Some(manifest) = intent.published.as_ref() {
+                verify_published_file_capture_binding(&store, &intent, manifest)?;
+                return Ok(manifest.clone());
+            }
+            (encoded, intent)
+        };
+        let control_for_finish = Arc::clone(&control);
+        Self::with_stopped_view(anchor_id, control, |view, claim, _| {
+            let metadata = view.verified_metadata_snapshot(anchor_id)?;
+            ensure!(
+                metadata.entries.iter().any(|entry| entry == &intent.entry),
+                "guarded file changed after its stage attempt was prepared"
+            );
+            let path = PathBuf::from(OsString::from_vec(intent.entry.path.clone()));
+            let manifest = view.capture_stopped_file(&claim.lower_root, &path)?;
+            let mut published = intent;
+            published.published = Some(manifest.clone());
+            published.validate(attempt_id.as_bytes())?;
+            let published_bytes = mb_core::canonical_bytes(&published)?;
+            ensure!(
+                published_bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                "published guarded file attempt exceeds its local bound"
+            );
+            let store = control_for_finish
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            store.replace_record_if_value(
+                STOPPED_FILE_CAPTURE_KIND,
+                attempt_id.as_bytes(),
+                &encoded,
+                &published_bytes,
+            )?;
+            Ok(manifest)
+        })
+    }
+
+    /// Caller must first prove a Git catalog pin has taken over, or that the
+    /// attempt is abandoned and no Git catalog references its anchor.
+    pub fn release_stopped_file_capture_unreferenced(
+        attempt_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<()> {
+        let bytes = control
+            .get_record(STOPPED_FILE_CAPTURE_KIND, attempt_id.as_bytes())?
+            .context("guarded file attempt has no durable record")?;
+        ensure!(
+            bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+            "guarded file attempt exceeds its local bound"
+        );
+        let intent: StoppedFileCaptureIntent = mb_core::decode_canonical(&bytes)?;
+        intent.validate(attempt_id.as_bytes())?;
+        ensure!(
+            intent.published.is_some(),
+            "prepared guarded file attempt must finish before release"
+        );
+        let manifest = intent.published.as_ref().expect("checked published file");
+        verify_published_file_capture_binding(control, &intent, manifest)?;
+        control.delete_record_if_value(STOPPED_FILE_CAPTURE_KIND, attempt_id.as_bytes(), &bytes)?;
+        Ok(())
+    }
+
     /// Freeze every visible file under one stopped-mount fence. An unchanged
     /// file may reuse its original root anchor; an edited or newly created
     /// file gets a durable per-inode guard before this method returns.
@@ -1352,7 +1632,8 @@ impl GuardedViewMount {
                 return Ok(metadata);
             }
             ensure!(
-                pending_stopped_capture_attempts(&store, anchor_id)?.is_empty(),
+                pending_stopped_capture_attempts(&store, anchor_id)?.is_empty()
+                    && pending_stopped_file_capture_attempts(&store, anchor_id)?.is_empty(),
                 "another guarded capture attempt is still prepared"
             );
             let intent = StoppedCaptureIntent {
@@ -1990,8 +2271,46 @@ mod tests {
 
     use super::{
         GuardedStoppedCaptureV1, GuardedViewMount, MOUNT_CLAIM_KIND, MOUNT_RETIRE_KIND,
-        decode_mountinfo_path, mounted_filesystem_from_bytes,
+        StoppedFileCaptureIntent, decode_mountinfo_path, mounted_filesystem_from_bytes,
     };
+
+    #[test]
+    fn stopped_file_attempt_keeps_raw_path_and_rejects_changed_record_shape() {
+        let attempt_id = uuid::Uuid::new_v4();
+        let record = StoppedFileCaptureIntent {
+            format_version: 1,
+            attempt_id,
+            root_anchor_id: uuid::Uuid::new_v4(),
+            entry: crate::guarded_view_probe::GuardedViewMetadataEntry {
+                path: b"parent/raw-\xff".to_vec(),
+                kind: crate::guarded_view_probe::GuardedViewEntryKind::File,
+                native_id: crate::NativeFileId {
+                    filesystem_id: 5,
+                    inode: 9,
+                },
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                logical_len: 3,
+                atime_secs: 1,
+                atime_nanos: 2,
+                modified_secs: 3,
+                modified_nanos: 4,
+            },
+            published: None,
+        };
+        let bytes = mb_core::canonical_bytes(&record).unwrap();
+        let decoded: StoppedFileCaptureIntent = mb_core::decode_canonical(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        decoded.validate(attempt_id.as_bytes()).unwrap();
+        assert!(decoded.validate(uuid::Uuid::new_v4().as_bytes()).is_err());
+        let mut unsafe_path = decoded.clone();
+        unsafe_path.entry.path = b"parent/../raw".to_vec();
+        assert!(unsafe_path.validate(attempt_id.as_bytes()).is_err());
+        let mut bad_time = decoded;
+        bad_time.entry.atime_nanos = 1_000_000_000;
+        assert!(bad_time.validate(attempt_id.as_bytes()).is_err());
+    }
 
     #[test]
     #[ignore = "requires root, CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
@@ -3633,17 +3952,66 @@ print('DONE', flush=True)
         assert!(create.status.success(), "{create:?}");
         remounted.stop().unwrap();
         let created_bytes = fs::read(lower.join("created")).unwrap();
-        let created = GuardedViewMount::capture_stopped_file(
+        let git_attempt = uuid::Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            original.anchor_id,
+            git_attempt,
+            Arc::clone(&control),
+            "created",
+        )
+        .unwrap();
+        let before_publication = GuardedViewMount::capture_stopped_file(
             original.anchor_id,
             Arc::clone(&control),
             "created",
         )
         .unwrap();
+        assert_eq!(anchor_bytes(&before_publication), created_bytes);
+        assert!(
+            GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).is_err()
+        );
+        drop(control);
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(control_dir.join("control.db"), &keys).unwrap(),
+        ));
+        let mut resumed = GuardedViewMount::recover_all_claimed(Arc::clone(&control)).unwrap();
+        assert_eq!(resumed.len(), 1);
+        resumed.pop().unwrap().stop().unwrap();
+        let created = GuardedViewMount::finish_stopped_file_capture(
+            original.anchor_id,
+            git_attempt,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        assert_eq!(created, before_publication);
+        assert!(
+            GuardedViewMount::require_release_unpinned(
+                original.anchor_id,
+                &control.lock().unwrap()
+            )
+            .is_err()
+        );
         assert_eq!(anchor_bytes(&created), created_bytes);
         let remounted =
             GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).unwrap();
         edit(&mountpoint.join("created"), "EDIT4");
         assert_eq!(anchor_bytes(&created), created_bytes);
+        assert_eq!(
+            GuardedViewMount::finish_stopped_file_capture(
+                original.anchor_id,
+                git_attempt,
+                Arc::clone(&control)
+            )
+            .unwrap(),
+            created
+        );
+        GuardedViewMount::release_stopped_file_capture_unreferenced(
+            git_attempt,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        GuardedViewMount::require_release_unpinned(original.anchor_id, &control.lock().unwrap())
+            .unwrap();
         remounted.stop().unwrap();
 
         let store = control.lock().unwrap();
