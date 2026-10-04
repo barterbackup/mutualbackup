@@ -26157,10 +26157,41 @@ pub(crate) mod tests {
         use std::os::unix::process::CommandExt;
         use std::process::Command;
 
+        if let Some(area) = std::env::var_os("MUTUALBACKUP_GUARDED_RELEASE_CHILD") {
+            let area = PathBuf::from(area);
+            let node = Node::open(area.join("node"), Seed::from_bytes([233; 32])).unwrap();
+            let root = node.protected_roots().unwrap().pop().unwrap();
+            let binding = node.guarded_release_preflight(root.root_id).unwrap();
+            let handoff = GuardedRecoveryHandoff::load(&node.control, root.root_id)
+                .unwrap()
+                .unwrap();
+            let intent = GuardedReleaseIntentV1 {
+                format_version: 1,
+                root: root.clone(),
+                anchor_id: binding.anchor_id,
+                handoff_hash: *blake3::hash(&canonical_bytes(&handoff).unwrap()).as_bytes(),
+            };
+            node.control
+                .put_record(
+                    GUARDED_RELEASE_KIND,
+                    root.root_id.as_bytes(),
+                    &canonical_bytes(&intent).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                fs::read(root.path.join("sample")).unwrap(),
+                b"live\r\nedit\0"
+            );
+            fs::write(area.join("release-child-ready"), b"ready").unwrap();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+
         let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
-        for stage in 0..13_u8 {
+        for stage in 0..14_u8 {
             let area = tempfile::Builder::new()
                 .prefix("mb-guarded-in-place-")
                 .tempdir_in(&test_root)
@@ -26501,6 +26532,39 @@ pub(crate) mod tests {
                 let anchor_id = node.guarded_release_preflight(root_id).unwrap().anchor_id;
                 if stage == 6 {
                     node.remove_guarded_protected_root(root_id).unwrap();
+                } else if stage == 13 {
+                    drop(node);
+                    struct ReleaseChild(std::process::Child);
+                    impl Drop for ReleaseChild {
+                        fn drop(&mut self) {
+                            let _ = self.0.kill();
+                            let _ = self.0.wait();
+                        }
+                    }
+                    let mut child = ReleaseChild(
+                        Command::new(std::env::current_exe().unwrap())
+                            .args([
+                                "--ignored",
+                                "--exact",
+                                "node::tests::guarded_in_place_enrollment_replays_handoff_plan_and_mount",
+                                "--nocapture",
+                            ])
+                            .env("MUTUALBACKUP_GUARDED_RELEASE_CHILD", area.path())
+                            .spawn()
+                            .unwrap(),
+                    );
+                    for _ in 0..200 {
+                        if area.path().join("release-child-ready").exists() {
+                            break;
+                        }
+                        assert!(child.0.try_wait().unwrap().is_none());
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    assert!(area.path().join("release-child-ready").exists());
+                    child.0.kill().unwrap();
+                    assert!(!child.0.wait().unwrap().success());
+                    assert!(fs::read(target.join("sample")).is_err());
+                    node = Node::open(&data_dir, seed.clone()).unwrap();
                 } else {
                     let intent = GuardedReleaseIntentV1 {
                         format_version: 1,

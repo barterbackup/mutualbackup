@@ -887,10 +887,12 @@
   only validated pending releases from mount recovery and finishes them before
   serving the node. The privileged node probe covers a live ordinary-user edit
   and restart after each release boundary on ext4 and disposable Btrfs; the
-  request/response schema and CLI command are wired locally. Separate-view
-  guarded removal, an abrupt-process-loss release probe, and guarded Git pin
-  integration remain open before broader guarded enrollment or Git operations
-  can select this backend.
+  request/response schema and CLI command are wired locally. A child-process
+  probe now persists a release intent while its FUSE view is still mounted,
+  is killed, and proves startup detaches the dead mount and returns the edited
+  bytes on ext4 and disposable Btrfs. Separate-view guarded removal and
+  guarded Git pin integration remain open before broader guarded enrollment
+  or Git operations can select this backend.
   Guarded root capture now uses a version-2 plan and version-3 sealed manifest
   when an entry has raw Unix path bytes; version-1/2 UTF-8 records keep their
   prior bytes. Directory claims, lower ownership, freeze journals, namespace
