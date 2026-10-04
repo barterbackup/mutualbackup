@@ -833,7 +833,10 @@
   through durable per-file reflinks on a capable restore filesystem. Versioned
   local plans and sealed manifests preserve raw Unix filenames; the Btrfs
   fixture covers sparse bytes, a hard-link alias, interruption after capture,
-  control-DB reopen, retry, and reachability-based anchor retirement. This
+  control-DB reopen, retry, and reachability-based anchor retirement. A
+  signed-byte mismatch now discards only the unpublished capture intent, so
+  correcting the restored source permits a fresh plan; the Btrfs fixture
+  checks a nonzero byte in a signed sparse gap before a successful retry. This
   does not yet reconstruct the guarded FUSE view or reanchor on a non-reflink
   filesystem; those remain enrollment and recovery gates. Recovery root and
   anchor-area path hints still use UTF-8 local serialization, so non-UTF-8

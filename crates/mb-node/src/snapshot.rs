@@ -875,14 +875,7 @@ pub(crate) fn abandon_recovered_anchor_capture(
                 && intent.revision_id == revision_id,
             "pending guarded recovery conflicts with the recovery job"
         );
-        for file in &intent.files {
-            file.plan.discard_with_control(control)?;
-        }
-        control.delete_record_if_value(
-            GUARDED_RECOVERY_INTENT_KIND,
-            revision_id.as_bytes(),
-            &bytes,
-        )?;
+        discard_guarded_recovery_intent(control, &intent, &bytes)?;
     }
     let Some(bytes) = control.get_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())?
     else {
@@ -899,6 +892,23 @@ pub(crate) fn abandon_recovered_anchor_capture(
     if !control.delete_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())? {
         bail!("pending recovered-anchor capture disappeared");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn discard_guarded_recovery_intent(
+    control: &ControlStore,
+    intent: &GuardedRecoveryIntentV1,
+    bytes: &[u8],
+) -> Result<()> {
+    for file in &intent.files {
+        file.plan.discard_with_control(control)?;
+    }
+    control.delete_record_if_value(
+        GUARDED_RECOVERY_INTENT_KIND,
+        intent.revision_id.as_bytes(),
+        bytes,
+    )?;
     Ok(())
 }
 
@@ -2375,14 +2385,21 @@ fn reanchor_recovered_guarded_revision(
         metadata_hash: intent.metadata_hash,
         files,
     };
-    let mut records = recovered_guarded_anchor_records(
+    let mut records = match recovered_guarded_anchor_records(
         keys,
         guild_id,
         revision,
         &metadata,
         metadata_bytes,
         &capture,
-    )?;
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            discard_guarded_recovery_intent(control, &intent, &intent_bytes)
+                .with_context(|| format!("discard unverified guarded capture: {error:#}"))?;
+            return Err(error);
+        }
+    };
     records.push((
         GUARDED_RECOVERY_CAPTURE_KIND.to_owned(),
         revision.value.revision_id.as_bytes().to_vec(),
@@ -4545,6 +4562,32 @@ mod metadata_compatibility_tests {
                     &canonical_bytes(&revision).unwrap(),
                 )
                 .unwrap();
+            let mut writable = OpenOptions::new().write(true).open(&first).unwrap();
+            writable.seek(SeekFrom::Start(3)).unwrap();
+            writable.write_all(b"x").unwrap();
+            writable.sync_all().unwrap();
+            let error =
+                reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
+                    .unwrap_err();
+            assert!(error.to_string().contains("sparse hole"));
+            assert!(
+                control
+                    .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                control
+                    .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !recovered_recipe_is_stable(&control, &keys, guild_id, &data_reference).unwrap()
+            );
+            writable.seek(SeekFrom::Start(3)).unwrap();
+            writable.write_all(&[0]).unwrap();
+            writable.sync_all().unwrap();
             INTERRUPT_GUARDED_RECOVERY_AFTER_CAPTURE.with(|interrupt| interrupt.set(true));
             assert!(
                 reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
