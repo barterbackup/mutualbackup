@@ -588,6 +588,43 @@ impl ControlStore {
         Ok(())
     }
 
+    /// A recovered guarded revision may use one reflink anchor per raw-path
+    /// file. Publish all sector recipes and their local ownership map before
+    /// releasing the durable capture plans that own those anchors.
+    pub fn finalize_guarded_recovery_records(
+        &mut self,
+        revision_id: &[u8; 16],
+        expected_intent: &[u8],
+        records: &[(String, Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DatabaseError> {
+        if !records
+            .iter()
+            .any(|(kind, id, _)| kind == "guarded-recovery-reflink-capture-v1" && id == revision_id)
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (kind, record_id, bytes) in records {
+                statement.execute(params![kind, record_id, bytes])?;
+            }
+        }
+        let removed = transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'guarded-recovery-reflink-intent-v1' AND record_id = ?1 AND bytes = ?2",
+            params![revision_id.as_slice(), expected_intent],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn put_operation_result(
         &mut self,
         operation_id: &[u8; 16],
@@ -4155,6 +4192,62 @@ mod tests {
                 .unwrap(),
             b"committed"
         );
+    }
+
+    #[test]
+    fn guarded_recovery_finalization_keeps_capture_pinned_on_stale_intent() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([134; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let revision_id = [135; 16];
+        store
+            .put_record(
+                "guarded-recovery-reflink-intent-v1",
+                &revision_id,
+                b"current",
+            )
+            .unwrap();
+        let records = vec![
+            (
+                "guarded-recovery-reflink-capture-v1".to_owned(),
+                revision_id.to_vec(),
+                b"anchors".to_vec(),
+            ),
+            (
+                "local-sector".to_owned(),
+                b"sector".to_vec(),
+                b"recipe".to_vec(),
+            ),
+        ];
+        assert!(matches!(
+            store.finalize_guarded_recovery_records(&revision_id, b"stale", &records),
+            Err(DatabaseError::Conflict)
+        ));
+        for (kind, id, _) in &records {
+            assert!(store.get_record(kind, id).unwrap().is_none());
+        }
+        assert_eq!(
+            store
+                .get_record("guarded-recovery-reflink-intent-v1", &revision_id)
+                .unwrap()
+                .unwrap(),
+            b"current"
+        );
+        store
+            .finalize_guarded_recovery_records(&revision_id, b"current", &records)
+            .unwrap();
+        assert!(
+            store
+                .get_record("guarded-recovery-reflink-intent-v1", &revision_id)
+                .unwrap()
+                .is_none()
+        );
+        for (kind, id, bytes) in &records {
+            assert_eq!(
+                store.get_record(kind, id).unwrap().as_deref(),
+                Some(bytes.as_slice())
+            );
+        }
     }
 
     #[test]

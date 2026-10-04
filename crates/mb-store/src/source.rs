@@ -18,7 +18,10 @@ use crate::{
     StableAnchorManifest, probe_reflink,
 };
 #[cfg(target_os = "linux")]
-use crate::{GuardedFileCapturePlan, GuardedRootCapturePlan, probe_guarded_link_freeze};
+use crate::{
+    GuardedFileCapturePlan, GuardedRootCapturePlan, RawReflinkFileCapturePlanV2,
+    probe_guarded_link_freeze,
+};
 
 /// Local source capabilities never enter a signed peer record. ReflinkV1
 /// provides byte-exact sparse reflink capture, raw imports, and reflink
@@ -219,6 +222,8 @@ pub enum SourceFileCapturePlan {
     ReflinkV1(ReflinkFileCapturePlan),
     #[cfg(target_os = "linux")]
     GuardedLinkFreezeV1(GuardedFileCapturePlan),
+    #[cfg(target_os = "linux")]
+    ReflinkRawV2(RawReflinkFileCapturePlanV2),
 }
 
 #[derive(Debug, Error)]
@@ -235,6 +240,8 @@ impl SourceFileCapturePlan {
         match self {
             Self::ReflinkV1(_) => SourceBackendKind::ReflinkV1,
             #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(_) => SourceBackendKind::ReflinkV1,
+            #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => SourceBackendKind::GuardedLinkFreezeV1,
         }
     }
@@ -246,9 +253,19 @@ impl SourceFileCapturePlan {
         ReflinkAnchor::plan_file(source_root, relative_path).map(Self::ReflinkV1)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn plan_reflink_raw(
+        source_root: impl AsRef<Path>,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Self, AnchorError> {
+        ReflinkAnchor::plan_file_raw(source_root, relative_path).map(Self::ReflinkRawV2)
+    }
+
     pub fn capture(&self) -> Result<FileAnchorManifest, AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::capture_file_plan(plan),
+            #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.capture(),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
                 "guarded file capture needs the control store",
@@ -265,6 +282,8 @@ impl SourceFileCapturePlan {
     ) -> Result<FileAnchorManifest, SourceFileCaptureError> {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_file_plan(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => Ok(plan.capture()?),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => Ok(plan.capture(control)?),
         }
@@ -291,6 +310,8 @@ impl SourceFileCapturePlan {
         match self {
             Self::ReflinkV1(_) => Ok(()),
             #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(_) => Ok(()),
+            #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => {
                 Ok(plan.prepare_edit_at(control, current_relative_path)?)
             }
@@ -301,6 +322,8 @@ impl SourceFileCapturePlan {
         match self {
             Self::ReflinkV1(plan) => plan.source_mode(),
             #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.source_mode(),
+            #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => Ok(plan.source_mode()),
         }
     }
@@ -308,6 +331,8 @@ impl SourceFileCapturePlan {
     pub fn source_root(&self) -> &Path {
         match self {
             Self::ReflinkV1(plan) => plan.source_root(),
+            #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.source_root(),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => plan.source_root(),
         }
@@ -317,6 +342,8 @@ impl SourceFileCapturePlan {
         match self {
             Self::ReflinkV1(plan) => plan.source_root_identity(),
             #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.source_root_identity(),
+            #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => plan.source_root_identity(),
         }
     }
@@ -325,6 +352,8 @@ impl SourceFileCapturePlan {
         match self {
             Self::ReflinkV1(plan) => plan.relative_path(),
             #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.relative_path(),
+            #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => plan.relative_path(),
         }
     }
@@ -332,6 +361,8 @@ impl SourceFileCapturePlan {
     pub fn reconcile(&self) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::reconcile_file_capture(plan),
+            #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.reconcile(),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
                 "guarded file reconciliation needs the control store",
@@ -346,6 +377,8 @@ impl SourceFileCapturePlan {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::reconcile_file_capture(plan)?),
             #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => Ok(plan.reconcile()?),
+            #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => {
                 // capture() verified and synced the guarded manifest before
                 // returning; replay calls capture() again before reaching here.
@@ -357,6 +390,8 @@ impl SourceFileCapturePlan {
     pub fn discard(&self) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::discard_file_capture(plan),
+            #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.discard(),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
                 "guarded file retirement needs the control store",
@@ -370,6 +405,8 @@ impl SourceFileCapturePlan {
     ) -> Result<(), SourceFileCaptureError> {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::discard_file_capture(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => Ok(plan.discard()?),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => Ok(plan.discard_unreferenced(control)?),
         }

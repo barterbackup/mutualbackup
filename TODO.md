@@ -829,6 +829,15 @@
   recipe retained or restored after the map transfer still pins its source;
   the reopened-control lifecycle probe checks that cleanup waits for its
   removal.
+  Restored format-6 revisions can now reanchor their signed data sectors
+  through durable per-file reflinks on a capable restore filesystem. Versioned
+  local plans and sealed manifests preserve raw Unix filenames; the Btrfs
+  fixture covers sparse bytes, a hard-link alias, interruption after capture,
+  control-DB reopen, retry, and reachability-based anchor retirement. This
+  does not yet reconstruct the guarded FUSE view or reanchor on a non-reflink
+  filesystem; those remain enrollment and recovery gates. Recovery root and
+  anchor-area path hints still use UTF-8 local serialization, so non-UTF-8
+  parent or target paths also remain a recovery gate.
   Production protected-root removal must retire the claimed view, and guarded
   Git pins must join this proof before guarded enrollment or Git operations
   can select the backend.

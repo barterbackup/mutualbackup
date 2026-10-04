@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -30,7 +30,10 @@ use mb_store::{
     StableAnchorFileLocator, git_catalog_marker,
 };
 #[cfg(target_os = "linux")]
-use mb_store::{GUARDED_REVISION_CAPTURE_KIND, GuardedRevisionCaptureV1, GuardedViewMount};
+use mb_store::{
+    GUARDED_REVISION_CAPTURE_KIND, GuardedRevisionCaptureV1, GuardedViewMount,
+    RawFileAnchorManifestV2,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -42,6 +45,12 @@ use crate::guarded_metadata::{
 type RecordWrite = (String, Vec<u8>, Vec<u8>);
 const ANCHOR_AREA_LOCATION_KIND: &str = "anchor-area-location";
 const RECOVERY_ANCHOR_INTENT_KIND: &str = "recovery-anchor-intent";
+#[cfg(target_os = "linux")]
+const GUARDED_RECOVERY_INTENT_KIND: &str = "guarded-recovery-reflink-intent-v1";
+#[cfg(target_os = "linux")]
+const GUARDED_RECOVERY_CAPTURE_KIND: &str = "guarded-recovery-reflink-capture-v1";
+#[cfg(target_os = "linux")]
+const GUARDED_RECOVERY_RETIRE_KIND: &str = "guarded-recovery-reflink-retirement-v1";
 const ANCHOR_RETIREMENT_KIND: &str = "anchor-retirement";
 const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
 const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
@@ -54,6 +63,8 @@ type RestoreRenameHook = Box<dyn FnOnce() -> Result<()>>;
 #[cfg(test)]
 thread_local! {
     static INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static INTERRUPT_GUARDED_RECOVERY_AFTER_CAPTURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static INTERRUPT_AFTER_LEGACY_RESTORE_RETIRE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -349,6 +360,41 @@ struct RecoveryAnchorIntent {
     replaced_anchor: Option<mb_store::StableAnchorManifest>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedRecoveredFilePlanV1 {
+    path: Vec<u8>,
+    plan: SourceFileCapturePlan,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedRecoveryIntentV1 {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    source_root: PathBuf,
+    metadata_hash: [u8; 32],
+    files: Vec<GuardedRecoveredFilePlanV1>,
+    replaced: Option<GuardedRecoveredCaptureV1>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedRecoveredFileV1 {
+    path: Vec<u8>,
+    anchor: RawFileAnchorManifestV2,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedRecoveredCaptureV1 {
+    format_version: u16,
+    revision_id: Uuid,
+    metadata_hash: [u8; 32],
+    files: Vec<GuardedRecoveredFileV1>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct LegacyRecoveryAnchorIntentV1 {
     format_version: u16,
@@ -615,6 +661,19 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
         }
         let _ = intent.plan.reconcile(control);
     }
+    #[cfg(target_os = "linux")]
+    for (record_id, bytes) in control.records(GUARDED_RECOVERY_INTENT_KIND)? {
+        let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
+        ensure!(
+            intent.format_version == 1
+                && record_id.as_slice() == intent.revision_id.as_bytes()
+                && canonical_bytes(&intent)?.len() <= V1_MAX_CATALOG_BYTES * 2,
+            "pending guarded recovery intent is invalid"
+        );
+        for file in &intent.files {
+            let _ = file.plan.reconcile_with_control(control);
+        }
+    }
     reconcile_anchor_retirements(control)?;
     Ok(())
 }
@@ -648,6 +707,64 @@ fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
             &git_prune_recipe_anchor_ids(control)?,
         )?;
     }
+    #[cfg(target_os = "linux")]
+    reconcile_guarded_recovered_retirements(control)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn guarded_recovered_capture_ids(control: &ControlStore) -> Result<BTreeSet<Uuid>> {
+    let mut ids = BTreeSet::new();
+    for (record_id, bytes) in control.records(GUARDED_RECOVERY_CAPTURE_KIND)? {
+        let capture: GuardedRecoveredCaptureV1 = decode_canonical(&bytes)?;
+        ensure!(
+            capture.format_version == 1 && record_id.as_slice() == capture.revision_id.as_bytes(),
+            "recovered guarded capture record is invalid"
+        );
+        ids.extend(capture.files.iter().map(|file| file.anchor.anchor_id));
+    }
+    Ok(ids)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_guarded_recovered_retirements(control: &ControlStore) -> Result<()> {
+    let retirements = control.records(GUARDED_RECOVERY_RETIRE_KIND)?;
+    if retirements.is_empty() {
+        return Ok(());
+    }
+    let mut pinned = git_prune_recipe_anchor_ids(control)?;
+    pinned.extend(guarded_recovered_capture_ids(control)?);
+    for (id, bytes) in retirements {
+        ensure!(
+            id.as_slice() == blake3::hash(&bytes).as_bytes()
+                && bytes.len() <= V1_MAX_CATALOG_BYTES * 2,
+            "recovered guarded anchor retirement record is invalid"
+        );
+        let capture: GuardedRecoveredCaptureV1 = decode_canonical(&bytes)?;
+        ensure!(
+            capture.format_version == 1
+                && capture.files.iter().all(|file| {
+                    file.anchor.format_version == 2
+                        && file.anchor.source_relative_path.as_os_str().as_bytes() == file.path
+                }),
+            "recovered guarded anchor retirement is inconsistent"
+        );
+        if capture
+            .files
+            .iter()
+            .any(|file| pinned.contains(&file.anchor.anchor_id))
+        {
+            continue;
+        }
+        if capture
+            .files
+            .iter()
+            .any(|file| file.anchor.remove().is_err())
+        {
+            continue;
+        }
+        control.delete_record_if_value(GUARDED_RECOVERY_RETIRE_KIND, &id, &bytes)?;
+    }
     Ok(())
 }
 
@@ -658,6 +775,13 @@ pub(crate) fn retire_revision_anchor(
     control: &mut ControlStore,
     revision_id: Uuid,
 ) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if control
+        .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())?
+        .is_some()
+    {
+        return Ok(false);
+    }
     #[cfg(target_os = "linux")]
     if let Some(capture) = GuardedViewMount::load_revision_capture(revision_id, control)? {
         if control
@@ -683,6 +807,43 @@ pub(crate) fn retire_revision_anchor(
         )?;
         return Ok(true);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(bytes) =
+        control.get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())?
+    {
+        let capture: GuardedRecoveredCaptureV1 = decode_canonical(&bytes)?;
+        ensure!(
+            capture.format_version == 1 && capture.revision_id == revision_id,
+            "recovered guarded revision capture is inconsistent"
+        );
+        let recipe_anchors = git_prune_recipe_anchor_ids(control)?;
+        if control
+            .get_record("user-revision", revision_id.as_bytes())?
+            .is_some()
+            || capture
+                .files
+                .iter()
+                .any(|file| recipe_anchors.contains(&file.anchor.anchor_id))
+        {
+            return Ok(false);
+        }
+        let retirement_id = blake3::hash(&bytes);
+        ensure!(
+            control
+                .get_record(GUARDED_RECOVERY_RETIRE_KIND, retirement_id.as_bytes())?
+                .is_none_or(|existing| existing == bytes),
+            "recovered guarded retirement conflicts with its capture"
+        );
+        control.move_protocol_record(
+            GUARDED_RECOVERY_CAPTURE_KIND,
+            revision_id.as_bytes(),
+            &bytes,
+            GUARDED_RECOVERY_RETIRE_KIND,
+            retirement_id.as_bytes(),
+        )?;
+        reconcile_guarded_recovered_retirements(control)?;
+        return Ok(true);
+    }
     let Some(bytes) = control.get_record("anchor-manifest", revision_id.as_bytes())? else {
         return Ok(true);
     };
@@ -705,6 +866,24 @@ pub(crate) fn abandon_recovered_anchor_capture(
     guild_id: [u8; 32],
     revision_id: Uuid,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(bytes) = control.get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())? {
+        let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
+        ensure!(
+            intent.format_version == 1
+                && intent.guild_id == guild_id
+                && intent.revision_id == revision_id,
+            "pending guarded recovery conflicts with the recovery job"
+        );
+        for file in &intent.files {
+            file.plan.discard_with_control(control)?;
+        }
+        control.delete_record_if_value(
+            GUARDED_RECOVERY_INTENT_KIND,
+            revision_id.as_bytes(),
+            &bytes,
+        )?;
+    }
     let Some(bytes) = control.get_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())?
     else {
         return Ok(());
@@ -1692,6 +1871,20 @@ pub(crate) fn reanchor_recovered_revision(
         return Ok(());
     }
     reconcile_anchor_retirements(control)?;
+    #[cfg(target_os = "linux")]
+    {
+        let metadata_bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+        if private_metadata_format(&metadata_bytes)? == 6 {
+            return reanchor_recovered_guarded_revision(
+                control,
+                keys,
+                guild_id,
+                revision,
+                restored_root,
+                &metadata_bytes,
+            );
+        }
+    }
     let (metadata, git_backup) = load_private_metadata_with_git(control, keys, guild_id, revision)?;
     let git_repository = if let Some(descriptor) = git_backup.as_ref() {
         if descriptor.repository_id != revision.value.protected_root_id {
@@ -1867,6 +2060,349 @@ fn recovered_anchor_records(
         canonical_bytes(manifest)?,
     ));
     Ok(records)
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedRecoveredCaptureV1 {
+    fn validate(
+        &self,
+        revision_id: Uuid,
+        metadata_bytes: &[u8],
+        metadata: &GuardedPrivateMetadataV6,
+    ) -> Result<()> {
+        ensure!(
+            self.format_version == 1
+                && self.revision_id == revision_id
+                && self.metadata_hash == *blake3::hash(metadata_bytes).as_bytes(),
+            "recovered guarded anchor map differs from signed metadata"
+        );
+        let primary_paths = metadata.entries.iter().filter_map(|entry| match entry {
+            GuardedPrivateEntryV6::File { path, .. } => Some(path.as_slice()),
+            _ => None,
+        });
+        ensure!(
+            self.files
+                .iter()
+                .map(|file| file.path.as_slice())
+                .eq(primary_paths),
+            "recovered guarded anchor paths differ from signed metadata"
+        );
+        let mut anchor_ids = BTreeSet::new();
+        for file in &self.files {
+            ensure!(
+                file.anchor.format_version == 2
+                    && file.anchor.source_relative_path.as_os_str().as_bytes() == file.path
+                    && anchor_ids.insert(file.anchor.anchor_id),
+                "recovered guarded file anchor is inconsistent"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_zero_gap(file: &mut File, start: u64, end: u64) -> Result<()> {
+    ensure!(start <= end, "recovered guarded sparse extents overlap");
+    file.seek(SeekFrom::Start(start))?;
+    let mut remaining = end - start;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let size = usize::try_from(remaining.min(buffer.len() as u64))?;
+        file.read_exact(&mut buffer[..size])?;
+        ensure!(
+            buffer[..size].iter().all(|byte| *byte == 0),
+            "recovered guarded sparse hole contains unexpected bytes"
+        );
+        remaining -= size as u64;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn recovered_guarded_anchor_records(
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    metadata: &GuardedPrivateMetadataV6,
+    metadata_bytes: &[u8],
+    capture: &GuardedRecoveredCaptureV1,
+) -> Result<Vec<RecordWrite>> {
+    capture.validate(revision.value.revision_id, metadata_bytes, metadata)?;
+    let encryption_key = keys.guild_data_key(&guild_id);
+    let mut recipes = BTreeMap::<SectorId, LocalSectorRecipe>::new();
+    let mut files = capture.files.iter();
+    let mut records = Vec::new();
+    for entry in &metadata.entries {
+        let GuardedPrivateEntryV6::File {
+            path,
+            logical_len,
+            data_extents,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let anchored = files
+            .next()
+            .context("recovered guarded file anchor is missing")?;
+        ensure!(
+            anchored.path == *path && anchored.anchor.logical_len == *logical_len,
+            "recovered guarded file length or path differs from signed metadata"
+        );
+        let locator = anchored.anchor.file_locator();
+        let mut file = anchored.anchor.open_verified()?;
+        let mut position = 0_u64;
+        for extent in data_extents {
+            verify_zero_gap(&mut file, position, extent.offset)?;
+            let mut offset = extent.offset;
+            for reference in &extent.sectors {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut plaintext = vec![0_u8; reference.logical_len as usize];
+                file.read_exact(&mut plaintext)?;
+                let (actual, _) = encrypted_sector(&encryption_key, reference.id, &plaintext)?;
+                ensure!(
+                    actual == *reference,
+                    "recovered guarded anchor content differs from a signed sector"
+                );
+                let recipe = LocalSectorRecipe {
+                    guild_id,
+                    reference: reference.clone(),
+                    source: LocalPlaintextSource::StableAnchorFile {
+                        locator: locator.clone(),
+                        offset,
+                    },
+                };
+                if recipes
+                    .insert(reference.id, recipe.clone())
+                    .is_some_and(|previous| previous.reference != recipe.reference)
+                {
+                    bail!("recovered guarded sector has conflicting signed references");
+                }
+                offset = offset
+                    .checked_add(reference.logical_len as u64)
+                    .context("recovered guarded sector offset overflow")?;
+            }
+            position = offset;
+        }
+        verify_zero_gap(&mut file, position, *logical_len)?;
+        records.push((
+            ANCHOR_AREA_LOCATION_KIND.to_owned(),
+            locator.area.area_id.as_bytes().to_vec(),
+            canonical_bytes(&locator.area.path_hint)?,
+        ));
+    }
+    ensure!(
+        files.next().is_none(),
+        "recovered guarded anchor has an extra file"
+    );
+    ensure!(
+        recipes.len() == revision.value.data_sectors.len()
+            && revision.value.data_sectors.iter().all(|reference| {
+                recipes.get(&reference.id).map(|recipe| &recipe.reference) == Some(reference)
+            }),
+        "recovered guarded anchor data catalog differs from signed revision"
+    );
+    for recipe in recipes.into_values() {
+        records.push((
+            "local-sector".to_owned(),
+            recipe.reference.id.to_vec(),
+            canonical_bytes(&recipe)?,
+        ));
+    }
+    Ok(records)
+}
+
+#[cfg(target_os = "linux")]
+fn guarded_recovery_primary_paths(metadata: &GuardedPrivateMetadataV6) -> Vec<&[u8]> {
+    metadata
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            GuardedPrivateEntryV6::File { path, .. } => Some(path.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedRecoveryIntentV1 {
+    fn validate(
+        &self,
+        revision: &SignedRecord<UserRevision>,
+        guild_id: [u8; 32],
+        metadata_bytes: &[u8],
+        metadata: &GuardedPrivateMetadataV6,
+        source_root: &Path,
+        previous: Option<&GuardedRecoveredCaptureV1>,
+    ) -> Result<()> {
+        ensure!(
+            self.format_version == 1
+                && self.guild_id == guild_id
+                && self.revision_id == revision.value.revision_id
+                && self.source_root == source_root
+                && self.metadata_hash == *blake3::hash(metadata_bytes).as_bytes()
+                && self.replaced.as_ref() == previous
+                && canonical_bytes(self)?.len() <= V1_MAX_CATALOG_BYTES * 2,
+            "pending guarded recovery differs from its signed revision"
+        );
+        let paths = guarded_recovery_primary_paths(metadata);
+        ensure!(
+            self.files.iter().map(|file| file.path.as_slice()).eq(paths)
+                && self.files.iter().all(|file| {
+                    file.plan.backend_kind() == SourceBackendKind::ReflinkV1
+                        && file.plan.source_root() == source_root
+                        && file.plan.relative_path().as_os_str().as_bytes() == file.path
+                }),
+            "pending guarded recovery file plans differ from signed paths"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reanchor_recovered_guarded_revision(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    restored_root: &Path,
+    metadata_bytes: &[u8],
+) -> Result<()> {
+    let metadata = GuardedPrivateMetadataV6::decode(metadata_bytes)?;
+    let existing = control
+        .get_record(
+            GUARDED_RECOVERY_CAPTURE_KIND,
+            revision.value.revision_id.as_bytes(),
+        )?
+        .map(|bytes| decode_canonical::<GuardedRecoveredCaptureV1>(&bytes))
+        .transpose()?;
+    let pending_intent = control.get_record(
+        GUARDED_RECOVERY_INTENT_KIND,
+        revision.value.revision_id.as_bytes(),
+    )?;
+    if let Some(capture) = existing.as_ref()
+        && pending_intent.is_none()
+    {
+        capture.validate(revision.value.revision_id, metadata_bytes, &metadata)?;
+        if let Ok(records) = recovered_guarded_anchor_records(
+            keys,
+            guild_id,
+            revision,
+            &metadata,
+            metadata_bytes,
+            capture,
+        ) {
+            control.put_records(&records)?;
+            return Ok(());
+        }
+    }
+    if control
+        .get_record(
+            GUARDED_REVISION_CAPTURE_KIND,
+            revision.value.revision_id.as_bytes(),
+        )?
+        .is_some()
+    {
+        bail!("recovered guarded revision still has an original claimed-view capture");
+    }
+    let source_root = restored_root
+        .canonicalize()
+        .context("resolve guarded recovered source before reflink capture")?;
+    let (intent, intent_bytes) = match pending_intent {
+        Some(bytes) => {
+            let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
+            intent.validate(
+                revision,
+                guild_id,
+                metadata_bytes,
+                &metadata,
+                &source_root,
+                existing.as_ref(),
+            )?;
+            (intent, bytes)
+        }
+        None => {
+            let mut files = Vec::new();
+            for path in guarded_recovery_primary_paths(&metadata) {
+                let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
+                files.push(GuardedRecoveredFilePlanV1 {
+                    path: path.to_vec(),
+                    plan: SourceFileCapturePlan::plan_reflink_raw(&source_root, relative)
+                        .context("plan guarded recovered file reflink")?,
+                });
+            }
+            let intent = GuardedRecoveryIntentV1 {
+                format_version: 1,
+                guild_id,
+                revision_id: revision.value.revision_id,
+                source_root: source_root.clone(),
+                metadata_hash: *blake3::hash(metadata_bytes).as_bytes(),
+                files,
+                replaced: existing.clone(),
+            };
+            intent.validate(
+                revision,
+                guild_id,
+                metadata_bytes,
+                &metadata,
+                &source_root,
+                existing.as_ref(),
+            )?;
+            let bytes = canonical_bytes(&intent)?;
+            control.put_record(
+                GUARDED_RECOVERY_INTENT_KIND,
+                revision.value.revision_id.as_bytes(),
+                &bytes,
+            )?;
+            (intent, bytes)
+        }
+    };
+    let mut files = Vec::with_capacity(intent.files.len());
+    for planned in &intent.files {
+        let anchor = planned.plan.capture_with_control(control)?;
+        files.push(GuardedRecoveredFileV1 {
+            path: planned.path.clone(),
+            anchor: RawFileAnchorManifestV2::from_file_anchor(anchor),
+        });
+    }
+    #[cfg(test)]
+    if INTERRUPT_GUARDED_RECOVERY_AFTER_CAPTURE.with(|interrupt| interrupt.replace(false)) {
+        bail!("injected interruption after guarded recovered file capture");
+    }
+    let capture = GuardedRecoveredCaptureV1 {
+        format_version: 1,
+        revision_id: revision.value.revision_id,
+        metadata_hash: intent.metadata_hash,
+        files,
+    };
+    let mut records = recovered_guarded_anchor_records(
+        keys,
+        guild_id,
+        revision,
+        &metadata,
+        metadata_bytes,
+        &capture,
+    )?;
+    records.push((
+        GUARDED_RECOVERY_CAPTURE_KIND.to_owned(),
+        revision.value.revision_id.as_bytes().to_vec(),
+        canonical_bytes(&capture)?,
+    ));
+    if let Some(old) = &intent.replaced {
+        let bytes = canonical_bytes(old)?;
+        records.push((
+            GUARDED_RECOVERY_RETIRE_KIND.to_owned(),
+            blake3::hash(&bytes).as_bytes().to_vec(),
+            bytes,
+        ));
+    }
+    control.finalize_guarded_recovery_records(
+        revision.value.revision_id.as_bytes(),
+        &intent_bytes,
+        &records,
+    )?;
+    reconcile_anchor_retirements(control)?;
+    Ok(())
 }
 
 fn load_private_metadata_with_git(
@@ -3996,6 +4532,115 @@ mod metadata_compatibility_tests {
         assert_eq!(root_stat.mode() & 0o7777, 0o750);
         assert_eq!(root_stat.atime(), 1_700_000_000);
         assert_eq!(root_stat.atime_nsec(), 123);
+        if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
+            let mut plaintext = vec![0_u8; 1024];
+            plaintext[1000..1003].copy_from_slice(b"raw");
+            let data_reference = revision.value.data_sectors[0].clone();
+            install_inline_recipe(&mut control, guild_id, data_reference.clone(), plaintext)
+                .unwrap();
+            control
+                .put_record(
+                    "user-revision",
+                    revision_id.as_bytes(),
+                    &canonical_bytes(&revision).unwrap(),
+                )
+                .unwrap();
+            INTERRUPT_GUARDED_RECOVERY_AFTER_CAPTURE.with(|interrupt| interrupt.set(true));
+            assert!(
+                reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
+                    .is_err()
+            );
+            assert!(
+                control
+                    .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())
+                    .unwrap()
+                    .is_some()
+            );
+            drop(control);
+            let mut control =
+                ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
+            reconcile_pending_captures(&control).unwrap();
+            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
+                .unwrap();
+            assert!(
+                recovered_recipe_is_stable(&control, &keys, guild_id, &data_reference).unwrap()
+            );
+            let mut captured: GuardedRecoveredCaptureV1 = decode_canonical(
+                &control
+                    .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(captured.files.len(), 1);
+            assert_eq!(captured.files[0].path, b"nested/\xfe");
+            assert_eq!(
+                captured.files[0]
+                    .anchor
+                    .open_verified()
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .len(),
+                1024
+            );
+            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
+                .unwrap();
+            let replacement = GuardedRecoveryIntentV1 {
+                format_version: 1,
+                guild_id,
+                revision_id,
+                source_root: root_path.canonicalize().unwrap(),
+                metadata_hash: *blake3::hash(&canonical_bytes(&metadata).unwrap()).as_bytes(),
+                files: vec![GuardedRecoveredFilePlanV1 {
+                    path: b"nested/\xfe".to_vec(),
+                    plan: SourceFileCapturePlan::plan_reflink_raw(
+                        &root_path,
+                        PathBuf::from(OsString::from_vec(b"nested/\xfe".to_vec())),
+                    )
+                    .unwrap(),
+                }],
+                replaced: Some(captured.clone()),
+            };
+            control
+                .put_record(
+                    GUARDED_RECOVERY_INTENT_KIND,
+                    revision_id.as_bytes(),
+                    &canonical_bytes(&replacement).unwrap(),
+                )
+                .unwrap();
+            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
+                .unwrap();
+            assert!(
+                control
+                    .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            let replacement_capture: GuardedRecoveredCaptureV1 = decode_canonical(
+                &control
+                    .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(
+                replacement_capture.files[0].anchor.anchor_id,
+                captured.files[0].anchor.anchor_id
+            );
+            assert!(captured.files[0].anchor.open_verified().is_err());
+            captured = replacement_capture;
+            assert!(!retire_revision_anchor(&mut control, revision_id).unwrap());
+            control
+                .delete_record("user-revision", revision_id.as_bytes())
+                .unwrap();
+            assert!(!retire_revision_anchor(&mut control, revision_id).unwrap());
+            control
+                .delete_record("local-sector", &data_reference.id)
+                .unwrap();
+            assert!(retire_revision_anchor(&mut control, revision_id).unwrap());
+            assert!(captured.files[0].anchor.open_verified().is_err());
+        }
     }
 
     #[test]

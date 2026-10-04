@@ -1475,6 +1475,103 @@ pub struct ReflinkFileCapturePlan {
     file_version: CaptureVersion,
 }
 
+#[derive(Clone, Copy)]
+enum FileManifestEncoding {
+    Utf8V1,
+    #[cfg(target_os = "linux")]
+    RawV2,
+}
+
+/// Versioned local file plan whose relative path is encoded as raw Unix
+/// bytes. Historical ReflinkFileCapturePlan records keep their original
+/// UTF-8 serialization; no old Postcard discriminant or field is changed.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RawReflinkFileCapturePlanV2 {
+    format_version: u16,
+    root: ReflinkCapturePlan,
+    #[serde(with = "raw_path_bytes")]
+    relative_path: PathBuf,
+    file_version: CaptureVersion,
+}
+
+#[cfg(target_os = "linux")]
+mod raw_path_bytes {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(path.as_os_str().as_bytes())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RawReflinkFileCapturePlanV2 {
+    fn from_legacy(plan: ReflinkFileCapturePlan) -> Self {
+        Self {
+            format_version: 2,
+            root: plan.root,
+            relative_path: plan.relative_path,
+            file_version: plan.file_version,
+        }
+    }
+
+    fn as_legacy(&self) -> Result<ReflinkFileCapturePlan, AnchorError> {
+        if self.format_version != 2 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_relative(&self.relative_path)?;
+        Ok(ReflinkFileCapturePlan {
+            format_version: 1,
+            root: self.root.clone(),
+            relative_path: self.relative_path.clone(),
+            file_version: self.file_version.clone(),
+        })
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub fn source_root(&self) -> &Path {
+        &self.root.source_root
+    }
+
+    pub fn source_root_identity(&self) -> NativeFileId {
+        NativeFileId {
+            filesystem_id: self.root.root_version.filesystem_id,
+            inode: self.root.root_version.inode,
+        }
+    }
+
+    pub fn source_mode(&self) -> Result<u32, AnchorError> {
+        self.as_legacy()?.source_mode()
+    }
+
+    pub fn capture(&self) -> Result<FileAnchorManifest, AnchorError> {
+        ReflinkAnchor::capture_file_plan_encoding(&self.as_legacy()?, FileManifestEncoding::RawV2)
+    }
+
+    pub fn reconcile(&self) -> Result<(), AnchorError> {
+        ReflinkAnchor::reconcile_file_capture_encoding(
+            &self.as_legacy()?,
+            FileManifestEncoding::RawV2,
+        )
+    }
+
+    pub fn discard(&self) -> Result<(), AnchorError> {
+        ReflinkAnchor::discard_file_capture(&self.as_legacy()?)
+    }
+}
+
 /// Durable direct import of bytes supplied by an external object source.
 /// The payload is written once into the native anchor area; no second local
 /// Git blob file is required. A published anchor can be recovered without
@@ -1737,6 +1834,68 @@ pub struct FileAnchorManifest {
     pub logical_len: u64,
     pub content_hash: [u8; 32],
     source_version: CaptureVersion,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RawFileAnchorManifestV2 {
+    pub format_version: u16,
+    pub anchor_id: Uuid,
+    pub area: StableAnchorAreaLocator,
+    pub source_root_hint: PathBuf,
+    #[serde(with = "raw_path_bytes")]
+    pub source_relative_path: PathBuf,
+    pub logical_len: u64,
+    pub content_hash: [u8; 32],
+    source_version: CaptureVersion,
+}
+
+#[cfg(target_os = "linux")]
+impl RawFileAnchorManifestV2 {
+    pub fn from_file_anchor(anchor: FileAnchorManifest) -> Self {
+        Self {
+            format_version: 2,
+            anchor_id: anchor.anchor_id,
+            area: anchor.area,
+            source_root_hint: anchor.source_root_hint,
+            source_relative_path: anchor.source_relative_path,
+            logical_len: anchor.logical_len,
+            content_hash: anchor.content_hash,
+            source_version: anchor.source_version,
+        }
+    }
+
+    fn as_file_anchor(&self) -> Result<FileAnchorManifest, AnchorError> {
+        if self.format_version != 2 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        Ok(FileAnchorManifest {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            area: self.area.clone(),
+            source_root_hint: self.source_root_hint.clone(),
+            source_relative_path: self.source_relative_path.clone(),
+            logical_len: self.logical_len,
+            content_hash: self.content_hash,
+            source_version: self.source_version.clone(),
+        })
+    }
+
+    pub fn file_locator(&self) -> StableAnchorFileLocator {
+        StableAnchorFileLocator {
+            area: self.area.clone(),
+            anchor_id: self.anchor_id,
+            relative_path: FILE_ANCHOR_PAYLOAD.to_owned(),
+        }
+    }
+
+    pub fn open_verified(&self) -> Result<File, AnchorError> {
+        self.as_file_anchor()?.open_verified()
+    }
+
+    pub fn remove(&self) -> Result<(), AnchorError> {
+        self.as_file_anchor()?.remove()
+    }
 }
 
 impl FileAnchorManifest {
@@ -2245,8 +2404,23 @@ impl ReflinkAnchor {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn plan_file_raw(
+        source_root: impl AsRef<Path>,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<RawReflinkFileCapturePlanV2, AnchorError> {
+        Self::plan_file(source_root, relative_path).map(RawReflinkFileCapturePlanV2::from_legacy)
+    }
+
     pub fn capture_file_plan(
         plan: &ReflinkFileCapturePlan,
+    ) -> Result<FileAnchorManifest, AnchorError> {
+        Self::capture_file_plan_encoding(plan, FileManifestEncoding::Utf8V1)
+    }
+
+    fn capture_file_plan_encoding(
+        plan: &ReflinkFileCapturePlan,
+        encoding: FileManifestEncoding,
     ) -> Result<FileAnchorManifest, AnchorError> {
         if plan.format_version != 1 || plan.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
@@ -2259,7 +2433,7 @@ impl ReflinkAnchor {
         let staging = area_path.join(&staging_name);
         let anchor_root = area_path.join(&anchor_name);
         match open_path_no_xdev_beneath(&area_file, Path::new(&anchor_name)) {
-            Ok(_) => return read_planned_file_manifest_at(&area_file, &area_path, plan),
+            Ok(_) => return read_planned_file_manifest_at(&area_file, &area_path, plan, encoding),
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
             Err(_) => return Err(AnchorError::AnchorAreaCollision(anchor_root)),
         }
@@ -2336,10 +2510,15 @@ impl ReflinkAnchor {
                 &manifest_name,
                 &staging.join(&manifest_name),
             )?;
-            manifest_file.write_all(
-                &canonical_bytes(&manifest)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?,
-            )?;
+            let encoded = match encoding {
+                FileManifestEncoding::Utf8V1 => canonical_bytes(&manifest),
+                #[cfg(target_os = "linux")]
+                FileManifestEncoding::RawV2 => {
+                    canonical_bytes(&RawFileAnchorManifestV2::from_file_anchor(manifest.clone()))
+                }
+            }
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            manifest_file.write_all(&encoded)?;
             manifest_file.sync_all()?;
             seal_anchor_file_handle(&manifest_file)?;
             staging_file.sync_all()?;
@@ -2368,6 +2547,13 @@ impl ReflinkAnchor {
     }
 
     pub fn reconcile_file_capture(plan: &ReflinkFileCapturePlan) -> Result<(), AnchorError> {
+        Self::reconcile_file_capture_encoding(plan, FileManifestEncoding::Utf8V1)
+    }
+
+    fn reconcile_file_capture_encoding(
+        plan: &ReflinkFileCapturePlan,
+        encoding: FileManifestEncoding,
+    ) -> Result<(), AnchorError> {
         if plan.format_version != 1 || plan.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
@@ -2376,7 +2562,7 @@ impl ReflinkAnchor {
         let anchor_name = plan.root.anchor_id.to_string();
         match open_path_no_xdev_beneath(&area_file, Path::new(&anchor_name)) {
             Ok(_) => {
-                read_planned_file_manifest_at(&area_file, &area_path, plan)?;
+                read_planned_file_manifest_at(&area_file, &area_path, plan, encoding)?;
             }
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
             Err(_) => {
@@ -4409,6 +4595,7 @@ fn read_planned_file_manifest_at(
     area: &File,
     area_display: &Path,
     plan: &ReflinkFileCapturePlan,
+    encoding: FileManifestEncoding,
 ) -> Result<FileAnchorManifest, AnchorError> {
     let anchor_name = plan.root.anchor_id.to_string();
     let anchor_root = area_display.join(&anchor_name);
@@ -4429,8 +4616,16 @@ fn read_planned_file_manifest_at(
     }
     let mut encoded = Vec::new();
     manifest_file.read_to_end(&mut encoded)?;
-    let manifest: FileAnchorManifest = decode_canonical(&encoded)
-        .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.clone()))?;
+    let manifest = match encoding {
+        FileManifestEncoding::Utf8V1 => decode_canonical::<FileAnchorManifest>(&encoded)
+            .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.clone()))?,
+        #[cfg(target_os = "linux")]
+        FileManifestEncoding::RawV2 => {
+            let raw: RawFileAnchorManifestV2 = decode_canonical(&encoded)
+                .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.clone()))?;
+            raw.as_file_anchor()?
+        }
+    };
     if manifest.format_version != 1
         || manifest.anchor_id != plan.root.anchor_id
         || manifest.area != plan.root.area

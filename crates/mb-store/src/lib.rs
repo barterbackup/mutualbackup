@@ -24,7 +24,10 @@ pub use anchor::{
     remove_owned_directory_tree,
 };
 #[cfg(target_os = "linux")]
-pub use anchor::{GuardedFileCapturePlan, GuardedRootCapturePlan, probe_guarded_link_freeze};
+pub use anchor::{
+    GuardedFileCapturePlan, GuardedRootCapturePlan, RawFileAnchorManifestV2,
+    RawReflinkFileCapturePlanV2, probe_guarded_link_freeze,
+};
 pub use database::{
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,
     ObjectAttemptState, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
