@@ -1635,7 +1635,7 @@ impl GuardedRootCapturePlan {
 
     /// Recover the root plan from its durable claim or retirement marker.
     /// The latter remains after the sealed catalog is unlinked during GC.
-    pub(crate) fn load_for_retirement(
+    pub fn load_for_retirement(
         control: &ControlStore,
         anchor_id: Uuid,
     ) -> anyhow::Result<Option<Self>> {

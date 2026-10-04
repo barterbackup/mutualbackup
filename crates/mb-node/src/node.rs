@@ -26064,6 +26064,19 @@ pub(crate) mod tests {
                         .is_some()
                 );
                 GuardedViewMount::retire_claim(anchor_id, &node.control).unwrap();
+                if stage == 5 {
+                    let plan =
+                        GuardedRootCapturePlan::load_for_retirement(&node.control, anchor_id)
+                            .unwrap()
+                            .unwrap();
+                    plan.discard_unreferenced(&node.control).unwrap();
+                    plan.discard_unreferenced(&node.control).unwrap();
+                    assert!(
+                        GuardedRootCapturePlan::load_for_retirement(&node.control, anchor_id)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
                 assert!(
                     handoff
                         .release_names(&node.control, &parent, Uuid::new_v4())
@@ -26148,14 +26161,20 @@ pub(crate) mod tests {
                     fs::read(target.join("nested/child")).unwrap(),
                     b"nested\nbytes"
                 );
-                let manifest =
-                    GuardedRootCapturePlan::load_published_manifest(&node.control, anchor_id)
-                        .unwrap();
-                let anchor = manifest.file_locator("sample".to_owned()).unwrap();
+                let retained = if stage == 1 {
+                    let manifest =
+                        GuardedRootCapturePlan::load_published_manifest(&node.control, anchor_id)
+                            .unwrap();
+                    Some(manifest.file_locator("sample".to_owned()).unwrap())
+                } else {
+                    None
+                };
                 fs::write(target.join("sample"), b"independent released edit").unwrap();
-                let mut retained = Vec::new();
-                anchor.open().unwrap().read_to_end(&mut retained).unwrap();
-                assert_eq!(retained, b"in-place\r\n\0bytes");
+                if let Some(anchor) = retained {
+                    let mut bytes = Vec::new();
+                    anchor.open().unwrap().read_to_end(&mut bytes).unwrap();
+                    assert_eq!(bytes, b"in-place\r\n\0bytes");
+                }
                 handoff
                     .restore_released_metadata(&node.control, &parent, anchor_id)
                     .unwrap();

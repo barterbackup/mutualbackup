@@ -881,6 +881,14 @@
   Production protected-root removal must retire the claimed view, and guarded
   Git pins must join this proof before guarded enrollment or Git operations
   can select the backend.
+  The in-place release probe now also retires the original guarded anchor
+  after stopped-view file detachment and claim retirement, before reversing
+  the name handoff. It reloads the retirement plan from its durable record,
+  repeats retirement after the sealed manifest is gone, and verifies the
+  released tree remains byte-exact and independently editable. The privileged
+  probe passes locally on ext4 and disposable Btrfs. Production removal still
+  needs a durable Node operation and startup reconciliation for every release
+  boundary, followed by protected-root and source-backend record retirement.
   Guarded root capture now uses a version-2 plan and version-3 sealed manifest
   when an entry has raw Unix path bytes; version-1/2 UTF-8 records keep their
   prior bytes. Directory claims, lower ownership, freeze journals, namespace
