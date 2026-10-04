@@ -733,7 +733,10 @@ Proactive background repair comes later.
   own safety probe before offering a hard-link alternative. Preserve sparse
   extents and file identity where the backend supports them. The index records
   the raw captured blob ID: Git configuration and attributes cannot normalize
-  line endings or run a clean filter between capture and staging.
+  line endings or run a clean filter between capture and staging. On Btrfs,
+  prove that the staged anchor initially shares physical extents with the
+  source file and that a later source edit changes neither the anchor's bytes
+  nor its Git blob ID. Equal logical sizes alone do not establish sharing.
 - Capture Git symlinks without following them: their blob bytes are the exact
   link-target bytes, and checkout recreates the link under the path-safety
   policy. Never treat a symlink as a regular-file reflink; explicitly reject
@@ -759,7 +762,10 @@ Proactive background repair comes later.
   Make any unavoidable cross-filesystem copy explicit and bounded, and do not
   confuse checkout copy policy with the no-silent-copy capture rule. Protect
   dirty or untracked worktree files from destructive checkout. Keep per-worktree
-  HEAD/index state distinct while sharing immutable anchors safely.
+  HEAD/index state distinct while sharing immutable anchors safely. On Btrfs,
+  verify extent sharing immediately after checkout and COW isolation after an
+  edit in either worktree; the repository must not retain a second Git-format
+  copy of the same payload to obtain that behavior.
 - Back up the reachable Git object graph and refs as encrypted owner-owned
   content/metadata through the existing UserRevision pipeline, including
   commits on branches that are not checked out. A Git commit is only locally
@@ -3803,8 +3809,9 @@ an unconditional repository invariant, not a configurable compatibility mode.
   dirty and untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
   ref, checkout, switch, merge, worktree HEAD/index, import, prune, and backup
   transitions; byte-exact branch recovery from a seed after source loss; Btrfs
-  extent-sharing and deletion measurements; and bidirectional stock-Git round
-  trips without a persistent payload mirror.
+  extent-sharing assertions for stage and each same-filesystem checkout, COW
+  isolation after worktree edits, and physical-deletion measurements; and
+  bidirectional stock-Git round trips without a persistent payload mirror.
 - Close guarded link-freeze separately with its full atomic edit/failure and
   anchor-recovery probe, including `ENOSPC`, unknown hard-link aliases, and
   restart at each permission and sparse-detach transition. Before enabling a
