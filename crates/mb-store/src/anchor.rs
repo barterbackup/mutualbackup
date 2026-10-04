@@ -1504,11 +1504,30 @@ pub mod raw_path_bytes {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
 
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HexUnixPath {
+        unix_bytes: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HumanPath {
+        Utf8(String),
+        Raw(HexUnixPath),
+    }
 
     pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
-            path.serialize(serializer)
+            match path.to_str() {
+                Some(utf8) => serializer.serialize_str(utf8),
+                None => HexUnixPath {
+                    unix_bytes: hex::encode(path.as_os_str().as_bytes()),
+                }
+                .serialize(serializer),
+            }
         } else {
             serializer.serialize_bytes(path.as_os_str().as_bytes())
         }
@@ -1516,11 +1535,52 @@ pub mod raw_path_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
         if deserializer.is_human_readable() {
-            PathBuf::deserialize(deserializer)
+            match HumanPath::deserialize(deserializer)? {
+                HumanPath::Utf8(path) => Ok(PathBuf::from(path)),
+                HumanPath::Raw(HexUnixPath { unix_bytes }) => {
+                    let bytes = hex::decode(unix_bytes).map_err(D::Error::custom)?;
+                    Ok(PathBuf::from(OsString::from_vec(bytes)))
+                }
+            }
         } else {
             let bytes = Vec::<u8>::deserialize(deserializer)?;
             Ok(PathBuf::from(OsString::from_vec(bytes)))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub mod raw_path_bytes_vec {
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
+
+    struct PathRef<'a>(&'a Path);
+
+    impl Serialize for PathRef<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            super::raw_path_bytes::serialize(self.0, serializer)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct OwnedPath(#[serde(with = "super::raw_path_bytes")] PathBuf);
+
+    pub fn serialize<S: Serializer>(paths: &[PathBuf], serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(paths.len()))?;
+        for path in paths {
+            sequence.serialize_element(&PathRef(path))?;
+        }
+        sequence.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<PathBuf>, D::Error> {
+        Ok(Vec::<OwnedPath>::deserialize(deserializer)?
+            .into_iter()
+            .map(|path| path.0)
+            .collect())
     }
 }
 

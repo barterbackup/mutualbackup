@@ -5,6 +5,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -1015,6 +1017,80 @@ fn locked_daemon_exits_cleanly_on_sigterm() {
     );
     daemon.start();
     assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+    daemon.stop_gracefully();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an explicitly provisioned reflink test filesystem"]
+fn raw_unix_root_path_survives_cli_daemon_control() {
+    let test_root = PathBuf::from(
+        std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+    );
+    let source_area = tempfile::tempdir_in(test_root).unwrap();
+    let source = source_area
+        .path()
+        .join(OsString::from_vec(b"source-\xfe".to_vec()));
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        source.join(OsString::from_vec(b"file-\xff".to_vec())),
+        b"exact bytes",
+    )
+    .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let seed_file = temp.path().join("seed");
+    let socket = temp.path().join("control.sock");
+    run_cli(
+        &[
+            os("init"),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--seed-file"),
+            seed_file.as_os_str().to_owned(),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    let mut daemon = Daemon::with_args(
+        vec![
+            os("--data-dir"),
+            data_dir.into_os_string(),
+            os("--seed-file"),
+            seed_file.into_os_string(),
+            os("--control-socket"),
+            socket.as_os_str().to_owned(),
+            os("--failure-domain"),
+            os("raw-path-test"),
+            os("--tor-mode"),
+            os("disable-tor"),
+            os("--listen"),
+            os("/ip4/127.0.0.1/udp/0/quic-v1"),
+        ],
+        temp.path().join("daemon.log"),
+    );
+    daemon.start();
+    wait_for_status(&socket, &mut daemon, CLI_TIMEOUT);
+    cli_path(&socket, ["root", "add"], &source);
+    let response = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(mb_node::local_control_call(
+            &socket,
+            &mb_node::LocalRequest::Status,
+        ))
+        .unwrap();
+    let mb_node::LocalResponse::Status(status) = response else {
+        panic!("daemon returned the wrong status response");
+    };
+    assert!(
+        status
+            .protected_roots
+            .iter()
+            .any(|root| root.path == source)
+    );
     daemon.stop_gracefully();
 }
 

@@ -843,8 +843,11 @@
   raw paths without changing historical UTF-8 record bytes. The Btrfs fixtures
   pass with non-UTF-8 mountpoint, parent, target and file names across recovery,
   reanchor, node reopen and guarded mount supervision. The JSON local control
-  protocol still requires UTF-8 path arguments, so CLI management of these
-  raw-path roots remains open; the recovery fixtures call the node API directly.
+  codec now keeps UTF-8 paths as strings and carries raw Unix path bytes in a
+  tagged hex form. CDDL-validated request, path-list and status round trips
+  pass, including rejection of malformed hex. A provisioned local Btrfs
+  process test now passes a non-UTF-8 root through `mutualbackup root add`,
+  then reads its exact path back from the daemon over the control socket.
   The privileged node fixture now feeds signed format-6 sectors to a fresh
   same-seed node on disposable Btrfs and runs the production recovery job
   through restore, reanchor, root registration, and reopen/retry. That local

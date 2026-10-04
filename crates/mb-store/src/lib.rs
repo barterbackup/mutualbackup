@@ -16,6 +16,8 @@ mod source;
 
 #[cfg(target_os = "linux")]
 pub use anchor::raw_path_bytes;
+#[cfg(target_os = "linux")]
+pub use anchor::raw_path_bytes_vec;
 pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
     FileAnchorManifest, FileExtent, FilesystemIdentity, GIT_CATALOG_DIRECTORY,

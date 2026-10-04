@@ -52,6 +52,7 @@ pub struct ProtectedRoot {
 pub struct GitRepositoryInfo {
     pub format_version: u16,
     pub repository_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     pub path: PathBuf,
 }
 
@@ -59,6 +60,7 @@ pub struct GitRepositoryInfo {
 pub struct GitStagedFile {
     pub format_version: u16,
     pub repository_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     pub path: PathBuf,
     pub oid: String,
     pub mode: u32,
@@ -78,6 +80,7 @@ impl ProtectedRoot {
 pub struct NodeStatus {
     pub format_version: u16,
     pub node_id: NodeId,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     pub data_dir: PathBuf,
     pub protected_roots: Vec<ProtectedRoot>,
     pub checkpoint_count: u64,

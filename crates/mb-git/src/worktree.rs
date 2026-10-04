@@ -140,6 +140,7 @@ pub struct GitWorktreeInfo {
     pub format_version: u16,
     pub repository_id: Uuid,
     pub worktree_id: Uuid,
+    #[serde(with = "mb_store::raw_path_bytes")]
     pub path: PathBuf,
     pub root_id: NativeFileId,
     /// Reserved target while preparing; the selected HEAD in ready views.

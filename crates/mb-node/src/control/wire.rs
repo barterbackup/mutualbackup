@@ -54,13 +54,16 @@ pub enum LocalRequest {
         secret: UnlockSecret,
     },
     AddRoot {
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitInit {
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitWorktreeAdd {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
         branch: String,
     },
@@ -78,16 +81,19 @@ pub enum LocalRequest {
     GitWorktreeAddPath {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitWorktreeRemoveCached {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitWorktreeAbandonPendingAdd {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitWorktreeCommit {
@@ -109,11 +115,13 @@ pub enum LocalRequest {
     GitWorktreeResetIndex {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes_vec"))]
         paths: Vec<PathBuf>,
     },
     GitWorktreeRestore {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes_vec"))]
         paths: Vec<PathBuf>,
     },
     GitWorktreeHardReset {
@@ -149,14 +157,17 @@ pub enum LocalRequest {
     },
     GitAdd {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitRemoveCached {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitAbandonPendingAdd {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitCommit {
@@ -196,20 +207,26 @@ pub enum LocalRequest {
     },
     GitExportToGitRepository {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         source_root: PathBuf,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         destination: PathBuf,
         advertised: Vec<GitBranchInfo>,
     },
     GitExportToGitRepositoryV2 {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         source_root: PathBuf,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         destination: PathBuf,
         advertised_branches: Vec<GitBranchInfo>,
         advertised_tags: Vec<GitTagInfo>,
     },
     GitReceivePushedBranch {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         source_root: PathBuf,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         source_git_directory: PathBuf,
         target_branch: String,
         target_oid: [u8; 20],
@@ -217,7 +234,9 @@ pub enum LocalRequest {
     },
     GitReceivePushedTag {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         source_root: PathBuf,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         source_git_directory: PathBuf,
         target_tag: String,
         target_oid: [u8; 20],
@@ -242,10 +261,12 @@ pub enum LocalRequest {
     },
     GitResetIndex {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes_vec"))]
         paths: Vec<PathBuf>,
     },
     GitRestoreWorktree {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes_vec"))]
         paths: Vec<PathBuf>,
     },
     GitHardReset {
@@ -271,30 +292,36 @@ pub enum LocalRequest {
     },
     GitPushBare {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitWorktreePushBare {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitPushBranchBare {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
         source_branch: String,
         target_branch: String,
     },
     GitPushTagBare {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
         name: String,
     },
     GitFetchBare {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitPullBare {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
         #[serde(default)]
         author_name: String,
@@ -354,11 +381,13 @@ pub enum LocalRequest {
         revision_id: Uuid,
     },
     Recover {
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         target: PathBuf,
     },
     SnapshotList,
     SnapshotRestore {
         revision_id: Option<Uuid>,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         target: PathBuf,
     },
     GitWorktreePrune {
@@ -372,25 +401,30 @@ pub enum LocalRequest {
     },
     GitRemoveTracked {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitWorktreeRemoveTracked {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitRestoreBoth {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes_vec"))]
         paths: Vec<PathBuf>,
     },
     GitWorktreeRestoreBoth {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes_vec"))]
         paths: Vec<PathBuf>,
     },
     GitWorktreePullBare {
         repository_id: Uuid,
         worktree_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
         #[serde(default)]
         author_name: String,
@@ -443,6 +477,7 @@ pub enum LocalResponse {
     GitFileStaged(GitStagedFile),
     GitDeletionStaged {
         repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
     GitCachedPathRemoved {
@@ -629,6 +664,86 @@ mod tests {
         assert!(
             cddl_cat::validate_json_str("local-request-envelope", SCHEMA, INVALID_VERSION).is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_json_preserves_raw_unix_path_arguments_and_status() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let target = PathBuf::from(OsString::from_vec(b"/raw-\xfe/target-\xff".to_vec()));
+        let relative = PathBuf::from(OsString::from_vec(b"tracked-\xfd".to_vec()));
+        let repository_id = Uuid::from_bytes([97; 16]);
+        let requests = [
+            LocalRequest::AddRoot {
+                path: target.clone(),
+            },
+            LocalRequest::Recover {
+                target: target.clone(),
+            },
+            LocalRequest::SnapshotRestore {
+                revision_id: None,
+                target: target.clone(),
+            },
+            LocalRequest::GitAdd {
+                repository_id,
+                path: relative.clone(),
+            },
+            LocalRequest::GitWorktreeRestoreBoth {
+                repository_id,
+                worktree_id: Uuid::from_bytes([98; 16]),
+                paths: vec![relative.clone()],
+            },
+        ];
+        for request in requests {
+            let envelope = LocalRequestEnvelope {
+                format_version: LOCAL_WIRE_FORMAT_VERSION,
+                request_id: [99; 16],
+                request,
+            };
+            let encoded = serde_json::to_string(&envelope).unwrap();
+            cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &encoded).unwrap();
+            assert!(encoded.contains("\"unix_bytes\""));
+            let decoded: LocalRequestEnvelope<LocalRequest> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+            match decoded.request {
+                LocalRequest::AddRoot { path }
+                | LocalRequest::Recover { target: path }
+                | LocalRequest::SnapshotRestore { target: path, .. } => {
+                    assert_eq!(path, target);
+                }
+                LocalRequest::GitAdd { path, .. } => assert_eq!(path, relative),
+                LocalRequest::GitWorktreeRestoreBoth { paths, .. } => {
+                    assert_eq!(paths, vec![relative.clone()]);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let mut status: LocalResponseEnvelope = serde_json::from_str(STATUS_RESPONSE).unwrap();
+        let Ok(LocalResponse::Status(node)) = &mut status.result else {
+            panic!("status vector changed");
+        };
+        node.data_dir = target.clone();
+        node.protected_roots[0].path = target;
+        let encoded = serde_json::to_string(&status).unwrap();
+        cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
+        assert!(encoded.contains("\"unix_bytes\""));
+        let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        let Ok(LocalResponse::Status(node)) = decoded.result else {
+            panic!("raw path status round trip changed its response");
+        };
+        assert_eq!(node.data_dir, node.protected_roots[0].path);
+
+        let malformed = serde_json::json!({
+            "format_version": LOCAL_WIRE_FORMAT_VERSION,
+            "request_id": vec![99; 16],
+            "request": { "Recover": { "target": { "unix_bytes": "not-hex" } } }
+        });
+        assert!(serde_json::from_value::<LocalRequestEnvelope<LocalRequest>>(malformed).is_err());
     }
 
     #[test]
