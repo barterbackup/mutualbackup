@@ -250,6 +250,17 @@
   later event-37 requests to two signers exhausted transport tiers, yet
   coding advanced and the backups committed. This passing run does not explain
   or exclude the historical long stall; keep the reliability item open.
+  The isolated five-daemon topology and seed-recovery gate passed again on
+  exact source `9f7d35b` in 1,467.50 seconds. The first local harness attempt
+  stopped before daemon setup because its disposable Btrfs mount was root-owned;
+  rerunning with that mount owned by the test user completed. During recovery,
+  the coordinator retried event 25 with four of five signatures while the
+  storage member's old endpoint was unreachable and its replacement caught up.
+  A second short quorum at event 37 coincided with relay restart and missing
+  circuit reservations; the relay-only backup advanced from event 38 through
+  41, committed, and seed recovery passed. The local image, mount, daemons,
+  namespaces, and firewall chains were cleaned up. This run adds successful
+  retry evidence but still does not explain the historical 5,400-second stall.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
