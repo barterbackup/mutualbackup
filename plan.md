@@ -3667,6 +3667,11 @@ Repositories with conversion rules remain usable: our binary treats those
 rules as inert for file bytes rather than rejecting the repository or copying
 stock Git's transformed worktree. This rule applies at each Git command gate,
 while the original source-backend and platform gates remain separate.
+Test line-ending conversion and clean filters independently: Git can normalize
+CRLF through `core.autocrlf` or `text`/`eol` attributes without a clean filter,
+while a clean filter can change arbitrary bytes. Neither mechanism may run in
+our binary, even under inherited system or global Git configuration. This is
+an unconditional repository invariant, not a configurable compatibility mode.
 
 - First extract and version the source-backend boundary from section 4 without
   changing the existing signed peer format. Prove a custom object-store adapter
