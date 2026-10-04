@@ -465,57 +465,7 @@ impl GuardedRecoveryHandoff {
         let root = parent
             .open_child_directory(&self.target_name)?
             .context("guarded release target disappeared")?;
-        ensure!(
-            root.identity()? == self.target_id,
-            "guarded release target was replaced"
-        );
-        let root_stat = root.as_file().metadata()?;
-        let root_mode = root_stat.mode() & 0o7777;
-        if root_stat.uid() == visible.root_uid && root_mode != 0 {
-            ensure!(
-                root_mode == u32::from(visible.root_mode),
-                "guarded released root mode changed after exposure"
-            );
-            // Once the original owner can use the tree, a retry must not
-            // reapply old times or modes over subsequent ordinary edits.
-            return Ok(());
-        }
-        verify_release_namespace(&root, &visible)?;
-
-        // Parent directories are restored after their children, so metadata
-        // operations on a child cannot invalidate a parent's recorded mtime.
-        let mut entries = visible.entries.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| {
-            std::cmp::Reverse(entry.path.iter().filter(|b| **b == b'/').count())
-        });
-        for entry in entries {
-            let file = open_release_entry(&root, entry)?;
-            apply_release_metadata(&file, entry)?;
-        }
-        // Keep the root closed to the ordinary owner even if the process
-        // crashes between chown and the final mode installation.
-        root.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o000))?;
-        if unsafe {
-            libc::fchown(
-                root.as_file().as_raw_fd(),
-                visible.root_uid,
-                visible.root_gid,
-            )
-        } < 0
-        {
-            return Err(std::io::Error::last_os_error()).context("restore guarded root owner");
-        }
-        root.as_file().set_times(release_file_times(
-            visible.root_atime_secs,
-            visible.root_atime_nanos,
-            visible.root_modified_secs,
-            visible.root_modified_nanos,
-        )?)?;
-        root.as_file()
-            .set_permissions(fs::Permissions::from_mode(u32::from(visible.root_mode)))?;
-        root.sync_all()?;
-        Ok(())
+        restore_visible_release_metadata(&root, &visible)
     }
 
     pub fn verify_recovery_target(
@@ -660,6 +610,63 @@ impl GuardedRecoveryHandoff {
     pub fn mountpoint(&self) -> PathBuf {
         self.parent_path.join(&self.target_name)
     }
+}
+
+/// Restore a stopped view's exact visible metadata onto its unmounted lower
+/// tree after the caller has fenced the mount and journaled any name handoff.
+/// Replaying after the root becomes user-visible leaves later edits untouched.
+pub fn restore_visible_release_metadata(
+    root: &PinnedDirectory,
+    visible: &GuardedViewMetadataV1,
+) -> Result<()> {
+    visible.validate_shape()?;
+    ensure!(
+        mb_core::canonical_bytes(visible)?.len() <= RELEASE_METADATA_MAX_BYTES
+            && root.identity()? == visible.lower_root_id,
+        "guarded release metadata differs from its lower tree"
+    );
+    let root_stat = root.as_file().metadata()?;
+    let root_mode = root_stat.mode() & 0o7777;
+    if root_stat.uid() == visible.root_uid && root_mode != 0 {
+        ensure!(
+            root_mode == u32::from(visible.root_mode),
+            "guarded released root mode changed after exposure"
+        );
+        return Ok(());
+    }
+    verify_release_namespace(root, visible)?;
+    // Descendants first: updating a child must not change a restored parent's
+    // recorded modification time.
+    let mut entries = visible.entries.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| {
+        std::cmp::Reverse(entry.path.iter().filter(|byte| **byte == b'/').count())
+    });
+    for entry in entries {
+        let file = open_release_entry(root, entry)?;
+        apply_release_metadata(&file, entry)?;
+    }
+    root.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o000))?;
+    if unsafe {
+        libc::fchown(
+            root.as_file().as_raw_fd(),
+            visible.root_uid,
+            visible.root_gid,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error()).context("restore guarded root owner");
+    }
+    root.as_file().set_times(release_file_times(
+        visible.root_atime_secs,
+        visible.root_atime_nanos,
+        visible.root_modified_secs,
+        visible.root_modified_nanos,
+    )?)?;
+    root.as_file()
+        .set_permissions(fs::Permissions::from_mode(u32::from(visible.root_mode)))?;
+    root.sync_all()?;
+    Ok(())
 }
 
 pub(crate) fn release_prepared_for_anchor(control: &ControlStore, anchor_id: Uuid) -> Result<bool> {

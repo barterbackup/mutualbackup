@@ -47,7 +47,7 @@ pub use guarded_mount::{
     GuardedStoppedFileV1, GuardedViewBinding, GuardedViewMount,
 };
 #[cfg(target_os = "linux")]
-pub use guarded_recovery_handoff::GuardedRecoveryHandoff;
+pub use guarded_recovery_handoff::{GuardedRecoveryHandoff, restore_visible_release_metadata};
 #[cfg(target_os = "linux")]
 pub use guarded_view_probe::{
     GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
