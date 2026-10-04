@@ -133,9 +133,12 @@
   is also a visible guarded-file sector, recovery now retains the root-anchor
   recipe instead of replacing it with the imported Git anchor. The privileged
   ext4 and Btrfs probe confirms that the imported anchor no longer owns those
-  sector recipes after the mount. A durable catalog mapping and pin handoff
-  must still move the Git blob to the recovered root anchor and retire the
-  imported payload before this storage gate closes.
+  sector recipes after the mount. The store now derives a verified virtual Git
+  manifest from a published, still-frozen root file without another hard link;
+  the ext4 and Btrfs recovery probes confirm its blob ID and reject a new
+  mapping after the visible file becomes editable. A durable catalog mapping
+  and pin handoff must still move the Git blob to that root anchor and retire
+  the imported payload before this storage gate closes.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

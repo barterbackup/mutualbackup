@@ -29035,6 +29035,22 @@ pub(crate) mod tests {
         let recipe_anchors = git_prune_recipe_anchor_ids(&git_node.control).unwrap();
         assert!(recipe_anchors.contains(&signed_root_manifest.anchor_id));
         assert!(!recipe_anchors.contains(&recovered_graph.blobs[0].anchor.anchor_id));
+        let virtual_blob = mb_store::GuardedRootCapturePlan::verified_git_file_manifest(
+            &git_node.control,
+            signed_root_manifest.anchor_id,
+            Uuid::new_v4(),
+            Path::new("sample"),
+        )
+        .unwrap();
+        assert_eq!(virtual_blob.format_version, 2);
+        assert_eq!(
+            virtual_blob.file_locator().anchor_id,
+            signed_root_manifest.anchor_id
+        );
+        assert_eq!(
+            mb_git::blob_oid_from_anchor(&virtual_blob).unwrap(),
+            git_blob_oid
+        );
         let git_edit = Command::new("python3")
             .uid(65534)
             .gid(65534)
@@ -29044,6 +29060,15 @@ pub(crate) mod tests {
             .output()
             .unwrap();
         assert!(git_edit.status.success(), "{git_edit:?}");
+        assert!(
+            mb_store::GuardedRootCapturePlan::verified_git_file_manifest(
+                &git_node.control,
+                signed_root_manifest.anchor_id,
+                Uuid::new_v4(),
+                Path::new("sample"),
+            )
+            .is_err()
+        );
         assert!(
             fs::read(git_target.join("sample"))
                 .unwrap()

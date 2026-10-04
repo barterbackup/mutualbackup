@@ -16,13 +16,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    AnchorError, CaptureVersion, CapturedEntry, DirectoryStream, FilesystemIdentity,
-    GIT_CATALOG_DIRECTORY, MAX_CAPTURE_DEPTH, MAX_CAPTURE_ENTRIES, MAX_CAPTURE_EXTENTS,
-    MAX_RELATIVE_PATH_BYTES, NativeFileId, PinnedDirectory, StableAnchorAreaLocator,
-    StableAnchorManifest, capture_manifest_name, capture_version, filesystem_identity_for_file,
-    git_catalog_marker_from_root, modified_parts, open_path_no_xdev_beneath, open_source_beneath,
-    open_source_root, open_stable_anchor_area, probe_guarded_link_freeze, reopen_pinned_file,
-    resolve_anchor_area, unix_mode, validate_relative,
+    AnchorError, CaptureVersion, CapturedEntry, DirectoryStream, FileAnchorManifest,
+    FilesystemIdentity, GIT_CATALOG_DIRECTORY, MAX_CAPTURE_DEPTH, MAX_CAPTURE_ENTRIES,
+    MAX_CAPTURE_EXTENTS, MAX_RELATIVE_PATH_BYTES, NativeFileId, PinnedDirectory,
+    StableAnchorAreaLocator, StableAnchorManifest, capture_manifest_name, capture_version,
+    filesystem_identity_for_file, git_catalog_marker_from_root, modified_parts,
+    open_path_no_xdev_beneath, open_source_beneath, open_source_root, open_stable_anchor_area,
+    probe_guarded_link_freeze, reopen_pinned_file, resolve_anchor_area, unix_mode,
+    validate_relative,
 };
 use crate::guarded_view_probe::{
     GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
@@ -1565,6 +1566,47 @@ impl GuardedRootCapturePlan {
             "guarded root file journal differs from its anchor"
         );
         Ok(intent.content_proof().clone())
+    }
+
+    /// Build a Git object mapping onto a still-frozen file in a published
+    /// guarded root. The virtual ID owns no extra hard link; callers must
+    /// compare its blob ID with the signed Git object before publication and
+    /// durably pin the root before retiring an independent imported anchor.
+    pub fn verified_git_file_manifest(
+        control: &ControlStore,
+        root_anchor_id: Uuid,
+        virtual_anchor_id: Uuid,
+        relative_path: &Path,
+    ) -> anyhow::Result<FileAnchorManifest> {
+        validate_relative(relative_path)?;
+        let original = Self::load_published_manifest(control, root_anchor_id)?;
+        let plan = Self::load_active_for_view(control, &original)?;
+        anyhow::ensure!(
+            !plan.file_has_editable_inode(control, relative_path)?,
+            "guarded root file is already editable"
+        );
+        let native_id = original
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                CapturedEntry::FileV2 {
+                    path, native_id, ..
+                } if path == relative_path => Some(*native_id),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("guarded root has no captured file at {relative_path:?}")
+            })?;
+        let proof = plan.captured_file_content_proof(control, relative_path)?;
+        Ok(FileAnchorManifest::from_guarded_root_file(
+            virtual_anchor_id,
+            &original,
+            &original.source_root_hint,
+            relative_path,
+            relative_path,
+            native_id,
+            &proof,
+        )?)
     }
 
     pub(crate) fn load_active_for_view(
