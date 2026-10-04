@@ -113,8 +113,12 @@
   compares reachable refs, objects, HEAD, blob IDs and signed blob sectors,
   and binds the visible lower tree to its signed raw namespace while excluding
   only that bound catalog. An unexpected lower-tree name or catalog file fails
-  verification. Publication still refuses format 7 until graph-sector recipe
-  rebind and supervised mount replay are complete. Finish
+  verification. The guarded root recipe installer can now merge verified Git
+  blob sectors with visible-file sectors and record each restored native anchor
+  area. The nonempty-graph recovery test serves those signed sectors from the
+  imported guarded-bound anchors. Production publication still refuses format
+  7 until this installer is joined to the supervised mount replay and recovered
+  Git registration. Finish
   graph capture and native-anchor pinning before lifting the production signing
   gate. Linux Git blob recovery now streams verified sectors into one sparse native
   anchor without a temporary worktree payload or reflink; the guarded catalog

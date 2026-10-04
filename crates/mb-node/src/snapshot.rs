@@ -2649,7 +2649,11 @@ pub(crate) fn verify_guarded_recovered_namespace(
             &encryption_key,
             |reference| record_verified_sector(&mut sectors, reference),
         )?;
-        verify_recovered_git_graph(&repository, &metadata.git, &encryption_key, &mut sectors)?;
+        for recipe in
+            verify_recovered_git_graph(&repository, &metadata.git, &encryption_key, guild_id)?
+        {
+            record_verified_sector(&mut sectors, &recipe.reference)?;
+        }
         let signed = revision
             .value
             .data_sectors
@@ -2764,8 +2768,8 @@ fn verify_recovered_git_graph(
     repository: &GitRepository,
     descriptor: &GitBackupDescriptor,
     encryption_key: &[u8; 32],
-    sectors: &mut BTreeMap<SectorId, SectorRef>,
-) -> Result<()> {
+    guild_id: [u8; 32],
+) -> Result<Vec<LocalSectorRecipe>> {
     descriptor.validate()?;
     ensure!(
         repository.selected_branch()? == descriptor.head_branch,
@@ -2807,6 +2811,7 @@ fn verify_recovered_git_graph(
         source_blobs.len() == descriptor.blobs.len(),
         "recovered Git blob set differs from signed graph"
     );
+    let mut recipes = BTreeMap::<SectorId, LocalSectorRecipe>::new();
     for blob in &descriptor.blobs {
         let anchor = source_blobs
             .remove(&blob.oid)
@@ -2817,6 +2822,7 @@ fn verify_recovered_git_graph(
             "recovered Git blob has another length or object ID"
         );
         let mut file = anchor.open_verified()?;
+        let locator = anchor.file_locator();
         let mut position = 0_u64;
         for extent in &blob.data_extents {
             verify_zero_gap(&mut file, position, extent.offset)?;
@@ -2830,7 +2836,20 @@ fn verify_recovered_git_graph(
                     actual == *reference,
                     "recovered Git blob differs from a signed data sector"
                 );
-                record_verified_sector(sectors, reference)?;
+                let recipe = LocalSectorRecipe {
+                    guild_id,
+                    reference: reference.clone(),
+                    source: LocalPlaintextSource::StableAnchorFile {
+                        locator: locator.clone(),
+                        offset,
+                    },
+                };
+                ensure!(
+                    recipes
+                        .insert(reference.id, recipe.clone())
+                        .is_none_or(|previous| previous.reference == recipe.reference),
+                    "recovered Git sector has conflicting signed references"
+                );
                 offset = offset
                     .checked_add(reference.logical_len as u64)
                     .context("recovered Git blob sector range overflow")?;
@@ -2839,7 +2858,7 @@ fn verify_recovered_git_graph(
         }
         verify_zero_gap(&mut file, position, blob.logical_len)?;
     }
-    Ok(())
+    Ok(recipes.into_values().collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -2918,6 +2937,7 @@ pub(crate) fn install_guarded_recovery_root_recipes(
     revision: &SignedRecord<UserRevision>,
     metadata: &GuardedPrivateMetadataV6,
     manifest: &mb_store::StableAnchorManifest,
+    git: Option<(&GitBackupDescriptor, &GitRepository)>,
 ) -> Result<()> {
     ensure!(
         matches!(manifest.format_version, 2 | 3),
@@ -2934,6 +2954,8 @@ pub(crate) fn install_guarded_recovery_root_recipes(
     );
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut recipes = BTreeMap::<SectorId, LocalSectorRecipe>::new();
+    let mut area_locations =
+        BTreeMap::from([(manifest.area.area_id, manifest.area.path_hint.clone())]);
     for entry in &metadata.entries {
         let GuardedPrivateEntryV6::File {
             path,
@@ -2971,6 +2993,31 @@ pub(crate) fn install_guarded_recovery_root_recipes(
             },
         )?;
     }
+    if let Some((descriptor, repository)) = git {
+        ensure!(
+            descriptor.repository_id == revision.value.protected_root_id
+                && repository.id() == descriptor.repository_id,
+            "recovered guarded Git graph belongs to another protected root"
+        );
+        for recipe in verify_recovered_git_graph(repository, descriptor, &encryption_key, guild_id)?
+        {
+            let LocalPlaintextSource::StableAnchorFile { locator, .. } = &recipe.source else {
+                bail!("recovered Git blob lacks a native anchor recipe");
+            };
+            ensure!(
+                area_locations
+                    .insert(locator.area.area_id, locator.area.path_hint.clone())
+                    .is_none_or(|previous| previous == locator.area.path_hint),
+                "recovered Git anchors disagree about their area location"
+            );
+            ensure!(
+                recipes
+                    .insert(recipe.reference.id, recipe.clone())
+                    .is_none_or(|previous| previous.reference == recipe.reference),
+                "guarded recovery Git sector conflicts with signed file sector"
+            );
+        }
+    }
     ensure!(
         recipes.len() == revision.value.data_sectors.len()
             && revision.value.data_sectors.iter().all(|reference| {
@@ -2986,11 +3033,13 @@ pub(crate) fn install_guarded_recovery_root_recipes(
             canonical_bytes(&recipe)?,
         ));
     }
-    records.push((
-        ANCHOR_AREA_LOCATION_KIND.to_owned(),
-        manifest.area.area_id.as_bytes().to_vec(),
-        canonical_bytes(&RawLocalPath(manifest.area.path_hint.clone()))?,
-    ));
+    for (area_id, path) in area_locations {
+        records.push((
+            ANCHOR_AREA_LOCATION_KIND.to_owned(),
+            area_id.as_bytes().to_vec(),
+            canonical_bytes(&RawLocalPath(path))?,
+        ));
+    }
     records.push((
         "anchor-manifest".to_owned(),
         revision_key.to_vec(),
@@ -5606,6 +5655,33 @@ mod metadata_compatibility_tests {
             .to_string()
             .contains("guarded Git data sectors differ")
         );
+        let recovered_recipes = verify_recovered_git_graph(
+            &guarded_repository,
+            &descriptor,
+            &keys.guild_data_key(&guild_id),
+            guild_id,
+        )
+        .unwrap();
+        assert_eq!(recovered_recipes.len(), sectors.len());
+        for recipe in recovered_recipes {
+            control
+                .put_record(
+                    "local-sector",
+                    &recipe.reference.id,
+                    &canonical_bytes(&recipe).unwrap(),
+                )
+                .unwrap();
+        }
+        for reference in &sectors {
+            assert!(
+                recovered_recipe_is_stable(&control, &keys, guild_id, reference).unwrap(),
+                "recovered Git sector should be served from its native anchor"
+            );
+            assert_eq!(
+                render_sector(&control, &keys, &reference.id, Some(&guild_id)).unwrap(),
+                ciphertexts[&reference.id]
+            );
+        }
         guarded_repository.create_branch("other").unwrap();
         assert!(
             verify_guarded_recovered_namespace(

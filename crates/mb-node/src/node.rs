@@ -15515,6 +15515,7 @@ impl Node {
                 revision,
                 metadata,
                 &manifest,
+                None,
             )?;
             #[cfg(test)]
             if INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.replace(false)) {
