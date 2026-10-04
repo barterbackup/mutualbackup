@@ -2499,6 +2499,26 @@ pub(crate) fn load_private_metadata_bytes(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn guarded_private_metadata_for_revision(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+) -> Result<Option<(GuardedPrivateMetadataV6, [u8; 32])>> {
+    if revision.value.metadata_sectors.is_empty() {
+        return Ok(None);
+    }
+    let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+    if private_metadata_format(&bytes)? != 6 {
+        return Ok(None);
+    }
+    Ok(Some((
+        GuardedPrivateMetadataV6::decode(&bytes)?,
+        *blake3::hash(&bytes).as_bytes(),
+    )))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn verify_guarded_recovered_namespace(
     control: &ControlStore,
     keys: &KeyMaterial,
@@ -2560,6 +2580,74 @@ pub(crate) fn verify_guarded_recovered_namespace(
             )?;
         }
         metadata.bind_restored_entries(root)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_guarded_recovery_capture(
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    metadata: &GuardedPrivateMetadataV6,
+    manifest: &mb_store::StableAnchorManifest,
+) -> Result<()> {
+    let mut expected = BTreeMap::new();
+    for entry in &metadata.entries {
+        let path = PathBuf::from(OsString::from_vec(entry.path().to_vec()));
+        let shape = match entry {
+            GuardedPrivateEntryV6::Directory { .. } => None,
+            GuardedPrivateEntryV6::File { logical_len, .. }
+            | GuardedPrivateEntryV6::HardLink { logical_len, .. } => Some(*logical_len),
+        };
+        ensure!(
+            expected.insert(path, shape).is_none(),
+            "duplicate signed guarded path"
+        );
+    }
+    let mut captured = BTreeMap::new();
+    for entry in &manifest.entries {
+        let (path, shape) = match entry {
+            mb_store::CapturedEntry::Directory { path, .. } => (path, None),
+            mb_store::CapturedEntry::File {
+                path, logical_len, ..
+            }
+            | mb_store::CapturedEntry::FileV2 {
+                path, logical_len, ..
+            } => (path, Some(*logical_len)),
+        };
+        ensure!(
+            captured.insert(path.clone(), shape).is_none(),
+            "duplicate captured guarded path"
+        );
+    }
+    ensure!(
+        captured == expected,
+        "guarded recovery capture differs from signed namespace"
+    );
+    let encryption_key = keys.guild_data_key(&guild_id);
+    for entry in &metadata.entries {
+        let GuardedPrivateEntryV6::File {
+            path,
+            logical_len,
+            data_extents,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let path = PathBuf::from(OsString::from_vec(path.clone()));
+        let mut file = manifest.file_locator_path(&path)?.open()?;
+        ensure!(
+            file.metadata()?.len() == *logical_len,
+            "guarded recovery anchor length differs from signed file"
+        );
+        verify_guarded_file_content(
+            &mut file,
+            *logical_len,
+            data_extents,
+            &encryption_key,
+            |_, _| Ok(()),
+        )?;
     }
     Ok(())
 }

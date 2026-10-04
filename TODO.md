@@ -935,10 +935,16 @@
   than FUSE's transient filesystem identity. After node reopen, the guarded
   source backend routes a new revision through stopped-view capture and signed
   format-6 sectors; focused ext4/Btrfs tests restore the exact CRLF/NUL bytes.
-  Git file operations remain gated for this backend. The production recovery
-  job still needs to own and resume the handoff, invoke guarded registration,
-  and provide a non-reflink reanchor path before guarded enrollment can be
-  enabled.
+  Git file operations remain gated for this backend. The production format-6
+  recovery job now journals and resumes the private-lower handoff, persists a
+  signed-view mount intent before hard-link capture, verifies the captured
+  anchors against signed sectors, and registers the supervised format-4 root
+  only after the mount claim and virtual metadata agree. Recovery supersession
+  cannot discard an unfinished private-lower handoff. A privileged disposable-
+  Btrfs fixture exercises publication tampering, interruption and node reopen
+  after the handoff and mount intent, completed mount reopen, and exact file
+  bytes. Non-reflink reanchoring, full network seed-only recovery, guarded
+  removal/GC, and broader FUSE failure paths remain open before enrollment.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

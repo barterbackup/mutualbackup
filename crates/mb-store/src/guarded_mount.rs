@@ -1176,6 +1176,22 @@ impl GuardedViewMount {
         })
     }
 
+    pub fn verify_virtual_metadata(
+        &self,
+        control: &ControlStore,
+        expected: &GuardedViewMetadataV1,
+    ) -> anyhow::Result<()> {
+        self.verified_binding(control)?;
+        let expected_bytes = mb_core::canonical_bytes(expected)?;
+        ensure!(
+            expected.anchor_id == self.anchor_id
+                && control.get_record(VIRTUAL_METADATA_KIND, self.anchor_id.as_bytes())?
+                    == Some(expected_bytes),
+            "guarded mounted view differs from signed recovery metadata"
+        );
+        Ok(())
+    }
+
     /// Reconstruct the current visible namespace after the view has stopped.
     /// This is local, verified input for a future signed owner revision; it
     /// does not itself make the mutable view seed-recoverable.

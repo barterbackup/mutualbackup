@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ControlStore, NativeFileId, PinnedDirectory};
+use crate::{AnchorError, ControlStore, NativeFileId, PinnedDirectory};
 
 const HANDOFF_KIND: &str = "guarded-recovery-handoff-v1";
 
@@ -142,9 +142,30 @@ impl GuardedRecoveryHandoff {
             "guarded recovery handoff record is inconsistent"
         );
         // Validate every recorded component through the pinned lookup.
-        parent.entry_identity(&self.target_name, true)?;
+        // A claimed FUSE view is a different filesystem, so the pinned
+        // no-cross-device lookup rejects it. Replay and mount-claim checks
+        // below establish whether that view is ours; still validate the name.
+        match parent.entry_identity(&self.target_name, true) {
+            Ok(_) => {}
+            Err(AnchorError::Io(error)) if error.raw_os_error() == Some(libc::EXDEV) => {}
+            Err(error) => return Err(error.into()),
+        }
         parent.entry_identity(&self.lower_name, true)?;
         parent.entry_identity(&self.placeholder_name, true)?;
+        Ok(())
+    }
+
+    pub fn verify_recovery_target(
+        &self,
+        parent: &PinnedDirectory,
+        target_name: &Path,
+        target_id: NativeFileId,
+    ) -> Result<()> {
+        self.validate(parent, &parent.descriptor_path().canonicalize()?)?;
+        ensure!(
+            self.target_name == target_name && self.target_id == target_id,
+            "guarded recovery handoff belongs to another restored target"
+        );
         Ok(())
     }
 

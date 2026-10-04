@@ -37,7 +37,10 @@ use mb_store::{
     SourceBackendBinding, SourceBackendKind, VariableParityObject, filesystem_identity,
 };
 #[cfg(target_os = "linux")]
-use mb_store::{GuardedStoppedCaptureV1, GuardedViewMount};
+use mb_store::{
+    GuardedRecoveryHandoff, GuardedRootCapturePlan, GuardedStoppedCaptureV1, GuardedViewMetadataV1,
+    GuardedViewMount,
+};
 use rand::RngCore;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -113,6 +116,53 @@ struct GuardedProtectedRootV1 {
     format_version: u16,
     root_id: Uuid,
     anchor_id: Uuid,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedRecoveryMountIntentV1 {
+    format_version: u16,
+    checkpoint_hash: [u8; 32],
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    protected_root_id: Uuid,
+    metadata_hash: [u8; 32],
+    plan: GuardedRootCapturePlan,
+    view: GuardedViewMetadataV1,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedRecoveryMountIntentV1 {
+    fn validate(
+        &self,
+        job: &RecoveryJob,
+        checkpoint_hash: &[u8; 32],
+        metadata: &crate::GuardedPrivateMetadataV6,
+        metadata_hash: [u8; 32],
+        handoff: &GuardedRecoveryHandoff,
+        protected_root_id: Uuid,
+    ) -> Result<()> {
+        let restored_id = job
+            .staged_native_id
+            .map(tuple_native_id)
+            .context("guarded recovery intent lost its restored inode")?;
+        self.plan.validate()?;
+        metadata.verify_view_fields(&self.view)?;
+        if self.format_version != 1
+            || self.checkpoint_hash != *checkpoint_hash
+            || self.guild_id != job.guild_id
+            || self.revision_id != job.revision_id
+            || self.protected_root_id != protected_root_id
+            || self.metadata_hash != metadata_hash
+            || self.plan.source_root() != handoff.lower_path()
+            || self.view.anchor_id != self.plan.anchor_id()
+            || self.view.lower_root_id != restored_id
+            || canonical_bytes(self)?.len() > mb_core::V1_MAX_CATALOG_BYTES * 3
+        {
+            anyhow::bail!("guarded recovery mount intent differs from signed restore");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -264,6 +314,12 @@ thread_local! {
     static INTERRUPT_AFTER_RECOVERY_STAGING_CREATE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static INTERRUPT_AFTER_RECOVERY_PUBLISH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static INTERRUPT_AFTER_GUARDED_RECOVERY_HANDOFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static INTERRUPT_AFTER_GUARDED_RECOVERY_INTENT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -13154,7 +13210,7 @@ impl Node {
                 anyhow::bail!("durable recovery job has an invalid checkpoint key");
             }
             let job: RecoveryJob = decode_canonical(&bytes)?;
-            self.remove_superseded_recovery_job(&job)?;
+            self.remove_superseded_recovery_job(&job, &record_id)?;
         }
         let attempt = RecoveryAttempt {
             format_version: 1,
@@ -13202,10 +13258,34 @@ impl Node {
         Ok(())
     }
 
-    fn remove_superseded_recovery_job(&mut self, job: &RecoveryJob) -> Result<()> {
+    fn remove_superseded_recovery_job(
+        &mut self,
+        job: &RecoveryJob,
+        checkpoint_hash: &[u8],
+    ) -> Result<()> {
         if job.format_version != 7 {
             anyhow::bail!("unsupported durable recovery job version");
         }
+        #[cfg(target_os = "linux")]
+        if job.state != RecoveryJobState::Complete {
+            let checkpoint_hash: &[u8; 32] = checkpoint_hash
+                .try_into()
+                .context("durable recovery job has an invalid checkpoint key")?;
+            if GuardedRecoveryHandoff::load(
+                &self.control,
+                guarded_recovery_handoff_id(checkpoint_hash),
+            )?
+            .is_some()
+                || self
+                    .control
+                    .get_record("guarded-recovery-mount-intent-v1", checkpoint_hash)?
+                    .is_some()
+            {
+                anyhow::bail!("superseded guarded recovery still owns a private lower tree");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = checkpoint_hash;
         let parent_path = containing_directory(&job.target);
         if job.staging.parent() != Some(parent_path)
             || !job
@@ -13223,10 +13303,11 @@ impl Node {
         let target_name = job
             .target
             .file_name()
-            .and_then(|name| name.to_str())
-            .context("durable recovery target has no UTF-8 file name")?;
-        if parent.entry_identity(target_name, true)?.is_some()
-            && job.state != RecoveryJobState::Complete
+            .context("durable recovery target has no file name")?;
+        if job.state != RecoveryJobState::Complete
+            && parent
+                .entry_identity(Path::new(target_name), true)?
+                .is_some()
         {
             anyhow::bail!("superseded recovery still owns an unfinished published target");
         }
@@ -13425,6 +13506,27 @@ impl Node {
             .context("durable recovery staging path has no UTF-8 file name")?
             .to_owned();
         let expected = job.staged_native_id.map(tuple_native_id);
+        #[cfg(target_os = "linux")]
+        if GuardedRecoveryHandoff::load(
+            &self.control,
+            guarded_recovery_handoff_id(checkpoint_hash),
+        )?
+        .is_some()
+        {
+            if !matches!(
+                job.state,
+                RecoveryJobState::Published | RecoveryJobState::Complete
+            ) {
+                anyhow::bail!("guarded recovery handoff conflicts with the restore job state");
+            }
+            return self.finish_recovery(
+                &mut job,
+                checkpoint_hash,
+                revision,
+                &parent,
+                &target_name,
+            );
+        }
         let target_identity = parent.entry_identity(&target_name, true)?;
 
         if let Some(actual) = target_identity {
@@ -13614,6 +13716,31 @@ impl Node {
         parent: &PinnedDirectory,
         target_name: &Path,
     ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some((metadata, metadata_hash)) =
+            crate::snapshot::guarded_private_metadata_for_revision(
+                &self.control,
+                &self.keys,
+                job.guild_id,
+                revision,
+            )?
+            && (job.state == RecoveryJobState::Published
+                || GuardedRecoveryHandoff::load(
+                    &self.control,
+                    guarded_recovery_handoff_id(checkpoint_hash),
+                )?
+                .is_some())
+        {
+            return self.finish_guarded_recovery(
+                job,
+                checkpoint_hash,
+                revision,
+                parent,
+                target_name,
+                &metadata,
+                metadata_hash,
+            );
+        }
         let expected = job
             .staged_native_id
             .map(tuple_native_id)
@@ -13688,6 +13815,213 @@ impl Node {
             (None, None) => {}
             _ => anyhow::bail!("recovered Git catalog does not match signed history metadata"),
         }
+        job.state = RecoveryJobState::Complete;
+        self.control
+            .complete_recovery_attempt(checkpoint_hash, &canonical_bytes(job)?)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn finish_guarded_recovery(
+        &mut self,
+        job: &mut RecoveryJob,
+        checkpoint_hash: &[u8; 32],
+        revision: &SignedRecord<UserRevision>,
+        parent: &PinnedDirectory,
+        target_name: &Path,
+        metadata: &crate::GuardedPrivateMetadataV6,
+        metadata_hash: [u8; 32],
+    ) -> Result<()> {
+        let restored_id = job
+            .staged_native_id
+            .map(tuple_native_id)
+            .context("guarded recovery job lost its restored inode")?;
+        if metadata.root.uid == 0 {
+            anyhow::bail!("guarded recovery requires an unprivileged view owner");
+        }
+        let handoff_id = guarded_recovery_handoff_id(checkpoint_hash);
+        let recorded_handoff = GuardedRecoveryHandoff::load(&self.control, handoff_id)?;
+        if job.state == RecoveryJobState::Complete {
+            let handoff =
+                recorded_handoff.context("completed guarded recovery lost its handoff")?;
+            handoff.verify_recovery_target(parent, target_name, restored_id)?;
+            let intent: GuardedRecoveryMountIntentV1 = decode_canonical(
+                &self
+                    .control
+                    .get_record("guarded-recovery-mount-intent-v1", checkpoint_hash)?
+                    .context("completed guarded recovery lost its mount intent")?,
+            )?;
+            intent.validate(
+                job,
+                checkpoint_hash,
+                metadata,
+                metadata_hash,
+                &handoff,
+                revision.value.protected_root_id,
+            )?;
+            let root = self.protected_root_by_id(revision.value.protected_root_id)?;
+            if root.format_version != 4 || root.path != job.target {
+                anyhow::bail!("completed guarded recovery lost its protected root");
+            }
+            if self.guarded_root_mount_binding(&root)?.anchor_id != intent.plan.anchor_id() {
+                anyhow::bail!("completed guarded recovery uses another mounted anchor");
+            }
+            self.verified_source_backend_for_root(&root)?;
+            for reference in &revision.value.data_sectors {
+                if !recovered_recipe_is_stable(&self.control, &self.keys, job.guild_id, reference)?
+                {
+                    anyhow::bail!("completed guarded recovery lost a signed local anchor");
+                }
+            }
+            return Ok(());
+        }
+        if job.state != RecoveryJobState::Published {
+            anyhow::bail!("guarded recovery is not ready for mount publication");
+        }
+        verify_pinned_parent_path(parent, containing_directory(&job.target))?;
+        let mut handoff = match recorded_handoff {
+            Some(handoff) => {
+                handoff.verify_recovery_target(parent, target_name, restored_id)?;
+                handoff
+            }
+            None => {
+                let restored =
+                    open_expected_recovery_directory(parent, target_name, Some(restored_id))?;
+                make_restore_root_private_at(&restored)?;
+                restore_signed_root_metadata_at(
+                    &self.control,
+                    &self.keys,
+                    job.guild_id,
+                    revision,
+                    &restored,
+                )?;
+                crate::snapshot::verify_guarded_recovered_namespace(
+                    &self.control,
+                    &self.keys,
+                    job.guild_id,
+                    revision,
+                    &restored,
+                )?;
+                GuardedRecoveryHandoff::prepare(
+                    &self.control,
+                    handoff_id,
+                    parent,
+                    target_name,
+                    restored_id,
+                )?
+            }
+        };
+        let existing_intent = self
+            .control
+            .get_record("guarded-recovery-mount-intent-v1", checkpoint_hash)?
+            .map(|bytes| decode_canonical::<GuardedRecoveryMountIntentV1>(&bytes))
+            .transpose()?;
+        if let Some(intent) = &existing_intent {
+            intent.validate(
+                job,
+                checkpoint_hash,
+                metadata,
+                metadata_hash,
+                &handoff,
+                revision.value.protected_root_id,
+            )?;
+        }
+        let already_mounted = existing_intent.as_ref().is_some_and(|intent| {
+            self.guarded_mounts
+                .iter()
+                .any(|mount| mount.anchor_id() == intent.plan.anchor_id())
+        });
+        if !already_mounted {
+            handoff.resume(&self.control, parent)?;
+            #[cfg(test)]
+            if INTERRUPT_AFTER_GUARDED_RECOVERY_HANDOFF.with(|interrupt| interrupt.replace(false)) {
+                anyhow::bail!("injected interruption after guarded recovery handoff");
+            }
+        }
+        let intent = match existing_intent {
+            Some(intent) => intent,
+            None => {
+                let lower = PinnedDirectory::open(handoff.lower_path())?;
+                let plan = GuardedRootCapturePlan::plan(handoff.lower_path())?;
+                let view = metadata.bind_restored_view(&lower, plan.anchor_id())?;
+                let intent = GuardedRecoveryMountIntentV1 {
+                    format_version: 1,
+                    checkpoint_hash: *checkpoint_hash,
+                    guild_id: job.guild_id,
+                    revision_id: job.revision_id,
+                    protected_root_id: revision.value.protected_root_id,
+                    metadata_hash,
+                    plan,
+                    view,
+                };
+                intent.validate(
+                    job,
+                    checkpoint_hash,
+                    metadata,
+                    metadata_hash,
+                    &handoff,
+                    revision.value.protected_root_id,
+                )?;
+                if !self.control.put_record_if_absent(
+                    "guarded-recovery-mount-intent-v1",
+                    checkpoint_hash,
+                    &canonical_bytes(&intent)?,
+                )? {
+                    anyhow::bail!("guarded recovery mount intent changed concurrently");
+                }
+                intent
+            }
+        };
+        #[cfg(test)]
+        if INTERRUPT_AFTER_GUARDED_RECOVERY_INTENT.with(|interrupt| interrupt.replace(false)) {
+            anyhow::bail!("injected interruption after guarded recovery mount intent");
+        }
+        if !already_mounted {
+            if GuardedViewMount::claimed_anchor_ids(&self.control)?
+                .contains(&intent.plan.anchor_id())
+            {
+                anyhow::bail!("daemon does not supervise the recovered guarded mount claim");
+            }
+            let manifest =
+                intent
+                    .plan
+                    .capture_private_file_owners(&self.control, metadata.root.uid, 0, 0)?;
+            crate::snapshot::verify_guarded_recovery_capture(
+                &self.keys,
+                job.guild_id,
+                metadata,
+                &manifest,
+            )?;
+            intent
+                .plan
+                .isolate_lower_directories(&self.control, &manifest)?;
+            let mount_control = Arc::new(Mutex::new(ControlStore::open_with_key(
+                self.data_dir.join("control.db"),
+                &self.control_database_key,
+            )?));
+            let mount = GuardedViewMount::start_with_virtual_metadata(
+                &manifest,
+                mount_control,
+                handoff.mountpoint(),
+                metadata.root.uid,
+                metadata.root.gid,
+                intent.view.clone(),
+            )?;
+            mount.check_health()?;
+            self.guarded_mounts.push(mount);
+        }
+        let mount = self
+            .guarded_mounts
+            .iter()
+            .find(|mount| mount.anchor_id() == intent.plan.anchor_id())
+            .context("guarded recovery mount was not retained by the daemon")?;
+        mount.verify_virtual_metadata(&self.control, &intent.view)?;
+        self.register_guarded_protected_root(
+            revision.value.protected_root_id,
+            intent.plan.anchor_id(),
+        )?;
+        verify_pinned_parent_path(parent, containing_directory(&job.target))?;
         job.state = RecoveryJobState::Complete;
         self.control
             .complete_recovery_attempt(checkpoint_hash, &canonical_bytes(job)?)?;
@@ -13841,6 +14175,16 @@ fn pinned_recovery_target(target: &Path) -> Result<(PathBuf, PathBuf, PathBuf, P
 
 fn native_id_tuple(identity: NativeFileId) -> (u64, u64) {
     (identity.filesystem_id, identity.inode)
+}
+
+#[cfg(target_os = "linux")]
+fn guarded_recovery_handoff_id(checkpoint_hash: &[u8; 32]) -> Uuid {
+    let bytes = blake3::derive_key("mutualbackup/guarded-recovery-handoff/v1", checkpoint_hash);
+    Uuid::from_bytes(
+        bytes[..16]
+            .try_into()
+            .expect("BLAKE3 output has sixteen bytes"),
+    )
 }
 
 fn tuple_native_id(identity: (u64, u64)) -> NativeFileId {
@@ -24396,7 +24740,8 @@ pub(crate) mod tests {
             )),
         };
 
-        node.remove_superseded_recovery_job(&job).unwrap();
+        node.remove_superseded_recovery_job(&job, &[123; 32])
+            .unwrap();
 
         assert!(!staging.exists());
         assert!(!target.exists());
@@ -24429,13 +24774,54 @@ pub(crate) mod tests {
             )),
         };
 
-        node.remove_superseded_recovery_job(&job).unwrap();
+        node.remove_superseded_recovery_job(&job, &[227; 32])
+            .unwrap();
 
         assert_eq!(
             fs::read(staging.join("must-survive")).unwrap(),
             b"unbound staging"
         );
         assert!(!target.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn superseded_recovery_cannot_abandon_guarded_handoff_after_private_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path().join("node"), Seed::from_bytes([228; 32])).unwrap();
+        let parent = PinnedDirectory::open(temp.path()).unwrap();
+        let target = temp.path().join("restored");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("retained"), b"restored bytes").unwrap();
+        let target_id = parent.entry_identity("restored", true).unwrap().unwrap();
+        let checkpoint_hash = [229; 32];
+        let handoff = GuardedRecoveryHandoff::prepare(
+            &node.control,
+            guarded_recovery_handoff_id(&checkpoint_hash),
+            &parent,
+            "restored",
+            target_id,
+        )
+        .unwrap();
+        fs::rename(&target, handoff.lower_path()).unwrap();
+        let job = RecoveryJob {
+            format_version: 7,
+            guild_id: [230; 32],
+            revision_id: Uuid::from_bytes([231; 16]),
+            target,
+            staging: temp.path().join(".mutualbackup-restore-unpublished"),
+            staged_native_id: Some(native_id_tuple(target_id)),
+            state: RecoveryJobState::Published,
+            parent_native_id: Some(native_id_tuple(parent.identity().unwrap())),
+        };
+        assert!(
+            node.remove_superseded_recovery_job(&job, &checkpoint_hash)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(handoff.lower_path().join("retained")).unwrap(),
+            b"restored bytes"
+        );
     }
 
     #[test]
@@ -25440,6 +25826,47 @@ pub(crate) mod tests {
             );
             assert!(seed_only.protected_root_by_id(protected_root_id).is_err());
             fs::write(seed_target.join("sample"), &captured_bytes).unwrap();
+            INTERRUPT_AFTER_GUARDED_RECOVERY_HANDOFF.with(|interrupt| interrupt.set(true));
+            assert!(
+                seed_only
+                    .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                    .is_err()
+            );
+            assert!(seed_only.protected_root_by_id(protected_root_id).is_err());
+            let pending_handoff = GuardedRecoveryHandoff::load(
+                &seed_only.control,
+                guarded_recovery_handoff_id(&checkpoint_hash),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(pending_handoff.lower_path().join("sample").is_file());
+            assert!(fs::read_dir(&seed_target).unwrap().next().is_none());
+            drop(seed_only);
+            let mut seed_only = Node::open(
+                area.path().join("seed-only-node"),
+                Seed::from_bytes([241; 32]),
+            )
+            .unwrap();
+            INTERRUPT_AFTER_GUARDED_RECOVERY_INTENT.with(|interrupt| interrupt.set(true));
+            assert!(
+                seed_only
+                    .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                    .is_err()
+            );
+            assert!(
+                seed_only
+                    .control
+                    .get_record("guarded-recovery-mount-intent-v1", &checkpoint_hash)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(seed_only.protected_root_by_id(protected_root_id).is_err());
+            drop(seed_only);
+            let mut seed_only = Node::open(
+                area.path().join("seed-only-node"),
+                Seed::from_bytes([241; 32]),
+            )
+            .unwrap();
             seed_only
                 .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
                 .unwrap();
@@ -25459,12 +25886,29 @@ pub(crate) mod tests {
                     .unwrap()
                 );
             }
+            let restored_root = seed_only.protected_root_by_id(protected_root_id).unwrap();
+            assert_eq!(restored_root.path, seed_target);
+            assert_eq!(restored_root.format_version, 4);
             assert_eq!(
                 seed_only
-                    .protected_root_by_id(protected_root_id)
+                    .verified_source_backend_for_root(&restored_root)
                     .unwrap()
-                    .path,
-                seed_target
+                    .backend,
+                SourceBackendKind::GuardedLinkFreezeV1
+            );
+            let handoff = GuardedRecoveryHandoff::load(
+                &seed_only.control,
+                guarded_recovery_handoff_id(&checkpoint_hash),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(handoff.lower_path().is_dir());
+            assert!(
+                seed_only
+                    .control
+                    .get_record("guarded-recovery-mount-intent-v1", &checkpoint_hash)
+                    .unwrap()
+                    .is_some()
             );
             drop(seed_only);
             let mut seed_only = Node::open(
@@ -25475,6 +25919,25 @@ pub(crate) mod tests {
             seed_only
                 .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
                 .unwrap();
+            seed_only.check_guarded_mounts().unwrap();
+            let reopened_root = seed_only.protected_root_by_id(protected_root_id).unwrap();
+            assert_eq!(reopened_root.format_version, 4);
+            let completed: RecoveryJob = decode_canonical(
+                &seed_only
+                    .control
+                    .get_record("recovery-job", &checkpoint_hash)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(completed.state, RecoveryJobState::Complete);
+            seed_only
+                .remove_superseded_recovery_job(&completed, &checkpoint_hash)
+                .unwrap();
+            assert_eq!(
+                fs::read(seed_target.join("sample")).unwrap(),
+                captured_bytes
+            );
         }
         recovered.check_guarded_mounts().unwrap();
         assert!(fs::read(view.join("sample")).unwrap().starts_with(b"EDIT"));

@@ -74,7 +74,7 @@ pub enum GuardedPrivateEntryV6 {
 }
 
 impl GuardedPrivateEntryV6 {
-    fn path(&self) -> &[u8] {
+    pub(crate) fn path(&self) -> &[u8] {
         match self {
             Self::Directory { path, .. }
             | Self::File { path, .. }
@@ -423,6 +423,53 @@ impl GuardedPrivateMetadataV6 {
             root_modified_nanos: self.root.modified_nanos,
             entries,
         })
+    }
+
+    /// Recheck a durable local view intent against portable signed fields
+    /// after capture has added private hard links to the lower files. At that
+    /// point a fresh inode/link-count binding would reject the valid capture;
+    /// the guarded mount separately binds these local inode IDs to its plan.
+    pub fn verify_view_fields(&self, view: &GuardedViewMetadataV1) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            view.format_version == 1
+                && view.root_mode == self.root.mode
+                && view.root_uid == self.root.uid
+                && view.root_gid == self.root.gid
+                && view.root_atime_secs == self.root.atime_secs
+                && view.root_atime_nanos == self.root.atime_nanos
+                && view.root_modified_secs == self.root.modified_secs
+                && view.root_modified_nanos == self.root.modified_nanos
+                && view.entries.len() == self.entries.len(),
+            "guarded recovery view root differs from signed metadata"
+        );
+        for (signed, local) in self.entries.iter().zip(&view.entries) {
+            let expected_kind = if matches!(signed, GuardedPrivateEntryV6::Directory { .. }) {
+                GuardedViewEntryKind::Directory
+            } else {
+                GuardedViewEntryKind::File
+            };
+            let logical_len = match signed {
+                GuardedPrivateEntryV6::Directory { logical_len, .. }
+                | GuardedPrivateEntryV6::File { logical_len, .. }
+                | GuardedPrivateEntryV6::HardLink { logical_len, .. } => *logical_len,
+            };
+            let stat = signed.stat();
+            ensure!(
+                local.path == signed.path()
+                    && local.kind == expected_kind
+                    && local.logical_len == logical_len
+                    && local.mode == stat.mode
+                    && local.uid == stat.uid
+                    && local.gid == stat.gid
+                    && local.atime_secs == stat.atime_secs
+                    && local.atime_nanos == stat.atime_nanos
+                    && local.modified_secs == stat.modified_secs
+                    && local.modified_nanos == stat.modified_nanos,
+                "guarded recovery view entry differs from signed metadata"
+            );
+        }
+        Ok(())
     }
 }
 
