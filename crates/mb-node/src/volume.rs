@@ -79,6 +79,7 @@ pub enum StorageVolumeState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageVolumeStatus {
     pub volume_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     pub path: PathBuf,
     pub state: StorageVolumeState,
     pub budget_bytes: u64,
@@ -111,6 +112,7 @@ struct VolumeManifest {
 struct VolumeRecord {
     format_version: u16,
     volume_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     path: PathBuf,
     database_file: String,
     wrapped_database_key: WrappedDatabaseKey,
@@ -125,6 +127,7 @@ struct VolumeRecord {
 struct VolumeRecordBeforeConfiguredState {
     format_version: u16,
     volume_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     path: PathBuf,
     database_file: String,
     wrapped_database_key: WrappedDatabaseKey,

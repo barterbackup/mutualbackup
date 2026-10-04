@@ -57,6 +57,11 @@ const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
 const RESTORE_JOB_KIND: &str = "restore-job";
 const GIT_GRAPH_INTENT_KIND: &str = "git-graph-intent-v1";
 
+#[derive(Serialize, Deserialize)]
+struct RawLocalPath(
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))] PathBuf,
+);
+
 #[cfg(test)]
 type RestoreRenameHook = Box<dyn FnOnce() -> Result<()>>;
 
@@ -200,6 +205,7 @@ struct RestoreJob {
     format_version: u16,
     guild_id: [u8; 32],
     revision_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     target: PathBuf,
     parent_identity: NativeFileId,
     staging_name: String,
@@ -373,6 +379,7 @@ struct GuardedRecoveryIntentV1 {
     format_version: u16,
     guild_id: [u8; 32],
     revision_id: Uuid,
+    #[serde(with = "mb_store::raw_path_bytes")]
     source_root: PathBuf,
     metadata_hash: [u8; 32],
     files: Vec<GuardedRecoveredFilePlanV1>,
@@ -1281,7 +1288,7 @@ pub(crate) fn prepare_revision(
             (
                 ANCHOR_AREA_LOCATION_KIND.to_owned(),
                 anchor.manifest.area.area_id.as_bytes().to_vec(),
-                canonical_bytes(&anchor.manifest.area.path_hint)?,
+                canonical_bytes(&RawLocalPath(anchor.manifest.area.path_hint.clone()))?,
             ),
             (
                 "anchor-manifest".to_owned(),
@@ -1506,7 +1513,7 @@ pub(crate) fn prepare_guarded_revision(
         recipes.push((
             ANCHOR_AREA_LOCATION_KIND.to_owned(),
             area_id.as_bytes().to_vec(),
-            canonical_bytes(&hint)?,
+            canonical_bytes(&RawLocalPath(hint))?,
         ));
     }
     recipes.extend([
@@ -2062,7 +2069,7 @@ fn recovered_anchor_records(
     records.push((
         ANCHOR_AREA_LOCATION_KIND.to_owned(),
         manifest.area.area_id.as_bytes().to_vec(),
-        canonical_bytes(&manifest.area.path_hint)?,
+        canonical_bytes(&RawLocalPath(manifest.area.path_hint.clone()))?,
     ));
     records.push((
         "anchor-manifest".to_owned(),
@@ -2198,7 +2205,7 @@ fn recovered_guarded_anchor_records(
         records.push((
             ANCHOR_AREA_LOCATION_KIND.to_owned(),
             locator.area.area_id.as_bytes().to_vec(),
-            canonical_bytes(&locator.area.path_hint)?,
+            canonical_bytes(&RawLocalPath(locator.area.path_hint.clone()))?,
         ));
     }
     ensure!(
@@ -3081,7 +3088,8 @@ fn render_sector_with_hint_update(
         LocalPlaintextSource::StableAnchorFile { locator, offset } => {
             let area_hint = control
                 .get_record(ANCHOR_AREA_LOCATION_KIND, locator.area.area_id.as_bytes())?
-                .and_then(|bytes| decode_canonical::<PathBuf>(&bytes).ok());
+                .and_then(|bytes| decode_canonical::<RawLocalPath>(&bytes).ok())
+                .map(|path| path.0);
             let (mut file, resolved_area) = locator
                 .open_with_area_hint(area_hint.as_deref())
                 .context("open stable source anchor")?;
@@ -3089,7 +3097,7 @@ fn render_sector_with_hint_update(
                 control.put_record(
                     ANCHOR_AREA_LOCATION_KIND,
                     locator.area.area_id.as_bytes(),
-                    &canonical_bytes(&resolved_area)?,
+                    &canonical_bytes(&RawLocalPath(resolved_area.clone()))?,
                 )?;
             }
             file.seek(SeekFrom::Start(*offset))?;
@@ -3412,7 +3420,7 @@ fn replace_restore_job(
 
 fn restore_job_record_id(target: &Path) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup restore target reservation v1");
-    hasher.update(&canonical_bytes(&target)?);
+    hasher.update(&canonical_bytes(&RawLocalPath(target.to_path_buf()))?);
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -3709,15 +3717,13 @@ where
     result
 }
 
-fn pinned_restore_parent(target: &Path) -> Result<(PathBuf, String, PinnedDirectory)> {
+fn pinned_restore_parent(target: &Path) -> Result<(PathBuf, PathBuf, PinnedDirectory)> {
     let parent_hint = containing_directory(target);
     fs::create_dir_all(parent_hint)?;
     let parent_path = parent_hint.canonicalize()?;
     let target_name = target
         .file_name()
-        .and_then(|name| name.to_str())
-        .context("restore target needs one UTF-8 file name")?
-        .to_owned();
+        .context("restore target needs one file name")?;
     let relative = Path::new(&target_name);
     if relative.components().count() != 1
         || !matches!(relative.components().next(), Some(Component::Normal(_)))
@@ -3725,7 +3731,11 @@ fn pinned_restore_parent(target: &Path) -> Result<(PathBuf, String, PinnedDirect
         bail!("restore target needs one safe file name");
     }
     let parent = PinnedDirectory::open(&parent_path)?;
-    Ok((parent_path.join(&target_name), target_name, parent))
+    Ok((
+        parent_path.join(target_name),
+        relative.to_path_buf(),
+        parent,
+    ))
 }
 
 fn finish_durable_restore_publication(
@@ -3734,7 +3744,7 @@ fn finish_durable_restore_publication(
     expected_record: &[u8],
     job: &RestoreJob,
     parent: &PinnedDirectory,
-    target_name: &str,
+    target_name: &Path,
 ) -> Result<()> {
     let expected = job
         .staged_identity
@@ -3756,7 +3766,7 @@ fn finish_durable_restore_publication(
 pub(crate) fn publish_owned_restore(
     parent: &PinnedDirectory,
     staging_name: &str,
-    target_name: &str,
+    target_name: &Path,
     expected: NativeFileId,
 ) -> Result<()> {
     match (
@@ -4416,6 +4426,19 @@ mod metadata_compatibility_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn raw_restore_reservation_preserves_utf8_record_id() {
+        let target = Path::new("/ordinary/restore-target");
+        let mut historical =
+            blake3::Hasher::new_derive_key("mutualbackup restore target reservation v1");
+        historical.update(&canonical_bytes(&target).unwrap());
+        assert_eq!(
+            restore_job_record_id(target).unwrap(),
+            *historical.finalize().as_bytes()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn guarded_private_metadata_restores_raw_paths_sparse_bytes_and_hard_links() {
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::MetadataExt;
@@ -4427,7 +4450,20 @@ mod metadata_compatibility_tests {
                 .unwrap(),
             None => tempfile::tempdir().unwrap(),
         };
-        let root_path = temporary.path().join("restored");
+        let restore_parent = if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
+            let parent = temporary
+                .path()
+                .join(OsString::from_vec(b"raw-\xfd-parent".to_vec()));
+            fs::create_dir(&parent).unwrap();
+            parent
+        } else {
+            temporary.path().to_path_buf()
+        };
+        let root_path = if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
+            restore_parent.join(OsString::from_vec(b"restored-\xfc".to_vec()))
+        } else {
+            restore_parent.join("restored")
+        };
         let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([219; 32]));
         let guild_id = [220; 32];
         let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();

@@ -42,6 +42,7 @@ const LOCAL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ProtectedRoot {
     pub format_version: u16,
     pub root_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     pub path: PathBuf,
     pub filesystem_id: u64,
     pub root_inode: u64,

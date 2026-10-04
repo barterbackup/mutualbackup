@@ -59,8 +59,10 @@ struct FileRetirement {
 pub struct GuardedFileCapturePlan {
     format_version: u16,
     anchor_id: Uuid,
+    #[serde(with = "super::raw_path_bytes")]
     source_root: PathBuf,
     source_root_id: NativeFileId,
+    #[serde(with = "super::raw_path_bytes")]
     relative_path: PathBuf,
     source_version: CaptureVersion,
     source_mode: u32,

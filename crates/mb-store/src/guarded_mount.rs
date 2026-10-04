@@ -40,8 +40,10 @@ static MOUNT_LIFECYCLE: Mutex<()> = Mutex::new(());
 struct MountClaim {
     version: u16,
     anchor_id: Uuid,
+    #[serde(with = "crate::raw_path_bytes")]
     lower_root: PathBuf,
     lower_id: NativeFileId,
+    #[serde(with = "crate::raw_path_bytes")]
     mountpoint: PathBuf,
     mountpoint_id: NativeFileId,
     view_uid: u32,
@@ -1397,22 +1399,38 @@ fn canonical_mountpoint(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn mounted_filesystem(mountpoint: &Path) -> anyhow::Result<Option<MountedFilesystem>> {
-    let text = fs::read_to_string("/proc/self/mountinfo")?;
+    mounted_filesystem_from_bytes(mountpoint, &fs::read("/proc/self/mountinfo")?)
+}
+
+fn mounted_filesystem_from_bytes(
+    mountpoint: &Path,
+    mountinfo: &[u8],
+) -> anyhow::Result<Option<MountedFilesystem>> {
     let mut found = None;
-    for line in text.lines() {
-        let (front, back) = line
-            .split_once(" - ")
+    for line in mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let separator = line
+            .windows(3)
+            .position(|bytes| bytes == b" - ")
             .context("invalid Linux mountinfo separator")?;
+        let front = &line[..separator];
+        let back = &line[separator + 3..];
         let encoded_path = front
-            .split_ascii_whitespace()
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
             .nth(4)
             .context("invalid Linux mountinfo mountpoint")?;
         if decode_mountinfo_path(encoded_path)? != mountpoint {
             continue;
         }
-        let mut fields = back.split_ascii_whitespace();
-        let filesystem_type = fields.next().context("missing mountinfo filesystem type")?;
-        let source = fields.next().context("missing mountinfo source")?;
+        let mut fields = back
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let filesystem_type =
+            std::str::from_utf8(fields.next().context("missing mountinfo filesystem type")?)?;
+        let source = std::str::from_utf8(fields.next().context("missing mountinfo source")?)?;
         ensure!(found.is_none(), "guarded mountpoint has stacked mounts");
         found = Some(MountedFilesystem {
             filesystem_type: filesystem_type.to_owned(),
@@ -1422,8 +1440,7 @@ fn mounted_filesystem(mountpoint: &Path) -> anyhow::Result<Option<MountedFilesys
     Ok(found)
 }
 
-fn decode_mountinfo_path(encoded: &str) -> anyhow::Result<PathBuf> {
-    let bytes = encoded.as_bytes();
+fn decode_mountinfo_path(bytes: &[u8]) -> anyhow::Result<PathBuf> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -1453,7 +1470,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1464,16 +1481,29 @@ mod tests {
 
     use super::{
         GuardedStoppedCaptureV1, GuardedViewMount, MOUNT_CLAIM_KIND, MOUNT_RETIRE_KIND,
-        decode_mountinfo_path,
+        decode_mountinfo_path, mounted_filesystem_from_bytes,
     };
 
     #[test]
     fn mountinfo_paths_decode_spaces_and_non_utf8_bytes() {
         use std::os::unix::ffi::OsStrExt;
 
-        let path = decode_mountinfo_path("/one\\040two/odd\\377").unwrap();
+        let path = decode_mountinfo_path(b"/one\\040two/odd\\377").unwrap();
         assert_eq!(path.as_os_str().as_bytes(), b"/one two/odd\xff");
-        assert!(decode_mountinfo_path("/broken\\08").is_err());
+        assert!(decode_mountinfo_path(b"/broken\\08").is_err());
+        let literal = decode_mountinfo_path(b"/raw-\xfe").unwrap();
+        assert_eq!(literal.as_os_str().as_bytes(), b"/raw-\xfe");
+    }
+
+    #[test]
+    fn mountinfo_scan_ignores_unrelated_raw_byte_paths() {
+        let mountinfo = b"1 0 0:1 / /raw-\xfe rw - btrfs /dev/loop0 rw\n\
+                          2 1 0:2 / /wanted rw - fuse mutualbackup-guarded-test rw\n";
+        let mounted = mounted_filesystem_from_bytes(Path::new("/wanted"), mountinfo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mounted.filesystem_type, "fuse");
+        assert_eq!(mounted.source, "mutualbackup-guarded-test");
     }
 
     #[test]

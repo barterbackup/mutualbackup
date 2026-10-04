@@ -1415,8 +1415,10 @@ pub struct AnchorFileLocator {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StableAnchorAreaLocator {
     pub area_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
     pub path_hint: PathBuf,
     pub filesystem_id: u64,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
     pub volume_root_hint: PathBuf,
 }
 
@@ -1458,6 +1460,7 @@ pub struct StableAnchorFileLocator {
 pub struct ReflinkCapturePlan {
     format_version: u16,
     anchor_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
     source_root: PathBuf,
     area: StableAnchorAreaLocator,
     root_version: CaptureVersion,
@@ -1496,20 +1499,28 @@ pub struct RawReflinkFileCapturePlanV2 {
 }
 
 #[cfg(target_os = "linux")]
-mod raw_path_bytes {
+pub mod raw_path_bytes {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
 
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(path.as_os_str().as_bytes())
+        if serializer.is_human_readable() {
+            path.serialize(serializer)
+        } else {
+            serializer.serialize_bytes(path.as_os_str().as_bytes())
+        }
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        Ok(PathBuf::from(OsString::from_vec(bytes)))
+        if deserializer.is_human_readable() {
+            PathBuf::deserialize(deserializer)
+        } else {
+            let bytes = Vec::<u8>::deserialize(deserializer)?;
+            Ok(PathBuf::from(OsString::from_vec(bytes)))
+        }
     }
 }
 
@@ -1829,6 +1840,7 @@ pub struct FileAnchorManifest {
     pub format_version: u16,
     pub anchor_id: Uuid,
     pub area: StableAnchorAreaLocator,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
     pub source_root_hint: PathBuf,
     pub source_relative_path: PathBuf,
     pub logical_len: u64,
@@ -1842,6 +1854,7 @@ pub struct RawFileAnchorManifestV2 {
     pub format_version: u16,
     pub anchor_id: Uuid,
     pub area: StableAnchorAreaLocator,
+    #[serde(with = "raw_path_bytes")]
     pub source_root_hint: PathBuf,
     #[serde(with = "raw_path_bytes")]
     pub source_relative_path: PathBuf,
@@ -2011,6 +2024,7 @@ pub struct AnchorManifest {
 pub struct StableAnchorManifest {
     pub format_version: u16,
     pub anchor_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
     pub source_root_hint: PathBuf,
     pub area: StableAnchorAreaLocator,
     pub root_mode: u32,
@@ -5143,6 +5157,36 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_path_codec_preserves_historical_utf8_record_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        #[derive(Serialize, Deserialize)]
+        struct Historical {
+            path: PathBuf,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct Raw {
+            #[serde(with = "raw_path_bytes")]
+            path: PathBuf,
+        }
+
+        let path = PathBuf::from("/ordinary/utf8");
+        let historical = canonical_bytes(&Historical { path: path.clone() }).unwrap();
+        assert_eq!(
+            historical,
+            canonical_bytes(&Raw { path: path.clone() }).unwrap()
+        );
+        assert_eq!(decode_canonical::<Raw>(&historical).unwrap().path, path);
+
+        let raw = PathBuf::from(OsString::from_vec(b"/raw-\xfe-parent/file".to_vec()));
+        let encoded = canonical_bytes(&Raw { path: raw.clone() }).unwrap();
+        assert_eq!(decode_canonical::<Raw>(&encoded).unwrap().path, raw);
+        assert!(decode_canonical::<Historical>(&encoded).is_err());
+    }
 
     #[cfg(target_os = "linux")]
     fn bind_mount(source: &Path, target: &Path) {

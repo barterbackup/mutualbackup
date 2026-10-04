@@ -143,6 +143,7 @@ struct DirectoryIsolation {
 pub struct GuardedRootCapturePlan {
     format_version: u16,
     anchor_id: Uuid,
+    #[serde(with = "super::raw_path_bytes")]
     source_root: PathBuf,
     area: StableAnchorAreaLocator,
     root_version: CaptureVersion,

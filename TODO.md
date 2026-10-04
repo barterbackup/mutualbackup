@@ -838,9 +838,13 @@
   correcting the restored source permits a fresh plan; the Btrfs fixture
   checks a nonzero byte in a signed sparse gap before a successful retry. This
   does not yet reconstruct the guarded FUSE view or reanchor on a non-reflink
-  filesystem; those remain enrollment and recovery gates. Recovery root and
-  anchor-area path hints still use UTF-8 local serialization, so non-UTF-8
-  parent or target paths also remain a recovery gate.
+  filesystem; those remain enrollment and recovery gates. Linux local plans,
+  anchor-area hints, restore jobs, protected-root and volume records now encode
+  raw paths without changing historical UTF-8 record bytes. The Btrfs fixtures
+  pass with non-UTF-8 mountpoint, parent, target and file names across recovery,
+  reanchor, node reopen and guarded mount supervision. The JSON local control
+  protocol still requires UTF-8 path arguments, so CLI management of these
+  raw-path roots remains open; the recovery fixtures call the node API directly.
   The privileged node fixture now feeds signed format-6 sectors to a fresh
   same-seed node on disposable Btrfs and runs the production recovery job
   through restore, reanchor, root registration, and reopen/retry. That local

@@ -97,7 +97,9 @@ struct RecoveryJob {
     format_version: u16,
     guild_id: [u8; 32],
     revision_id: Uuid,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     target: PathBuf,
+    #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
     staging: PathBuf,
     staged_native_id: Option<(u64, u64)>,
     state: RecoveryJobState,
@@ -13375,7 +13377,7 @@ impl Node {
         checkpoint_hash: &[u8; 32],
         revision: &SignedRecord<UserRevision>,
         parent: &PinnedDirectory,
-        target_name: &str,
+        target_name: &Path,
     ) -> Result<()> {
         let expected = job
             .staged_native_id
@@ -13566,15 +13568,13 @@ fn containing_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn pinned_recovery_target(target: &Path) -> Result<(PathBuf, String, PathBuf, PinnedDirectory)> {
+fn pinned_recovery_target(target: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PinnedDirectory)> {
     let parent_hint = containing_directory(target);
     fs::create_dir_all(parent_hint)?;
     let parent_path = parent_hint.canonicalize()?;
     let target_name = target
         .file_name()
-        .and_then(|name| name.to_str())
-        .context("recovery target needs one UTF-8 file name")?
-        .to_owned();
+        .context("recovery target needs one file name")?;
     let relative = Path::new(&target_name);
     if relative.components().count() != 1
         || !matches!(
@@ -13586,8 +13586,8 @@ fn pinned_recovery_target(target: &Path) -> Result<(PathBuf, String, PathBuf, Pi
     }
     let parent = PinnedDirectory::open(&parent_path)?;
     Ok((
-        parent_path.join(&target_name),
-        target_name,
+        parent_path.join(target_name),
+        relative.to_path_buf(),
         parent_path,
         parent,
     ))
@@ -13606,7 +13606,7 @@ fn tuple_native_id(identity: (u64, u64)) -> NativeFileId {
 
 fn open_expected_recovery_directory(
     parent: &PinnedDirectory,
-    name: &str,
+    name: impl AsRef<Path>,
     expected: Option<NativeFileId>,
 ) -> Result<PinnedDirectory> {
     let expected = expected.context("durable recovery staging has no native identity")?;
@@ -24566,8 +24566,8 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn node_owns_claimed_guarded_mount_across_reopen() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
+        use std::ffi::{CString, OsString};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
         use std::process::Command;
@@ -24784,7 +24784,11 @@ pub(crate) mod tests {
                 .unwrap();
             }
             let checkpoint_hash = [242; 32];
-            let seed_target = area.path().join("seed-recovered");
+            let seed_parent = area
+                .path()
+                .join(OsString::from_vec(b"raw-\xfe-parent".to_vec()));
+            fs::create_dir(&seed_parent).unwrap();
+            let seed_target = seed_parent.join(OsString::from_vec(b"seed-recovered-\xfd".to_vec()));
             seed_only
                 .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
                 .unwrap();

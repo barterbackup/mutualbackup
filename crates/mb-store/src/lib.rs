@@ -14,6 +14,8 @@ mod guarded_view_probe;
 mod link_freeze;
 mod source;
 
+#[cfg(target_os = "linux")]
+pub use anchor::raw_path_bytes;
 pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
     FileAnchorManifest, FileExtent, FilesystemIdentity, GIT_CATALOG_DIRECTORY,
