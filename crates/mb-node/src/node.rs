@@ -2788,6 +2788,86 @@ impl Node {
         self.register_guarded_protected_root(Uuid::new_v4(), manifest.anchor_id)
     }
 
+    /// Capture one registered guarded Git file under a stopped-view fence and
+    /// transfer its immutable bytes to the node-owned Git pin before remount.
+    /// A failure after stopping the view leaves it unsupervised; startup must
+    /// replay the durable attempt before the daemon can serve that root again.
+    /// The public guarded add route remains gated on the full guarded backend
+    /// and provisioned recovery checks.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn stage_registered_guarded_git_file(
+        &mut self,
+        repository_id: Uuid,
+        path: &Path,
+    ) -> Result<(GitStagedFile, mb_store::FileAnchorManifest)> {
+        self.reconcile_guarded_git_stages()?;
+        let repository = self.open_guarded_git_repository(repository_id)?;
+        // Validate the raw relative Git path before taking down the view.
+        repository.staged_entry(path)?;
+        let root = self.protected_root_by_id(repository_id)?;
+        let binding = self.guarded_root_mount_binding(&root)?;
+        let position = self
+            .guarded_mounts
+            .iter()
+            .position(|mount| mount.anchor_id() == binding.anchor_id)
+            .context("daemon does not own the guarded Git view")?;
+        self.guarded_mounts
+            .swap_remove(position)
+            .stop()
+            .context("stop guarded view before Git stage")?;
+
+        let control = Arc::new(Mutex::new(ControlStore::open_with_key(
+            self.data_dir.join("control.db"),
+            &self.control_database_key,
+        )?));
+        let attempt_id = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+            path,
+        )?;
+        let manifest = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+        )?;
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            attempt_id,
+            repository_id,
+            repository_id,
+            &control.lock().unwrap(),
+        )?;
+        drop(control);
+        let mount_control = Arc::new(Mutex::new(ControlStore::open_with_key(
+            self.data_dir.join("control.db"),
+            &self.control_database_key,
+        )?));
+        let mount = GuardedViewMount::recover_claimed(binding.anchor_id, mount_control)?;
+        mount.check_health()?;
+        self.guarded_mounts.push(mount);
+        self.reconcile_guarded_git_stages()?;
+        let entry = self
+            .open_guarded_git_repository(repository_id)?
+            .staged_entry(path)?
+            .context("guarded Git stage has no catalog entry")?;
+        anyhow::ensure!(
+            entry.anchor_id == manifest.anchor_id,
+            "guarded Git stage changed its captured anchor"
+        );
+        Ok((
+            GitStagedFile {
+                format_version: 1,
+                repository_id,
+                path: path.to_path_buf(),
+                oid: hex::encode(entry.oid),
+                mode: entry.mode,
+            },
+            manifest,
+        ))
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn seed_test_guarded_git_commit(
         &mut self,
@@ -2812,50 +2892,13 @@ impl Node {
                 path: root.path,
             })?,
         )?;
-        let position = self
-            .guarded_mounts
-            .iter()
-            .position(|mount| mount.anchor_id() == binding.anchor_id)
-            .context("test guarded mount is absent")?;
-        self.guarded_mounts.swap_remove(position).stop()?;
-        let stage_control = Arc::new(Mutex::new(ControlStore::open_with_key(
-            self.data_dir.join("control.db"),
-            &self.control_database_key,
-        )?));
         for path in paths {
-            let stage_id = Uuid::new_v4();
-            GuardedViewMount::prepare_stopped_file_capture(
-                binding.anchor_id,
-                stage_id,
-                Arc::clone(&stage_control),
-                path,
-            )?;
-            let anchor = GuardedViewMount::finish_stopped_file_capture(
-                binding.anchor_id,
-                stage_id,
-                Arc::clone(&stage_control),
-            )?;
+            let (_, anchor) = self.stage_registered_guarded_git_file(root_id, Path::new(path))?;
             anyhow::ensure!(
                 anchor.format_version == 2,
                 "test Git stage added a file copy"
             );
-            GuardedViewMount::transfer_stopped_file_capture_to_git(
-                stage_id,
-                root_id,
-                root_id,
-                &stage_control.lock().unwrap(),
-            )?;
         }
-        drop(stage_control);
-        let mount_control = Arc::new(Mutex::new(ControlStore::open_with_key(
-            self.data_dir.join("control.db"),
-            &self.control_database_key,
-        )?));
-        self.guarded_mounts.push(GuardedViewMount::recover_claimed(
-            binding.anchor_id,
-            mount_control,
-        )?);
-        self.reconcile_guarded_git_stages()?;
         let repository = self.open_guarded_git_repository(root_id)?;
         repository.commit("Owner", "owner@example.test", "guarded graph")?;
         repository.export_graph_source().map_err(Into::into)

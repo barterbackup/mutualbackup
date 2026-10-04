@@ -184,8 +184,13 @@
   status/diff without changing the signed blob, and `add` still refuses the
   guarded root. The recovered graph can now export into a stock Git object
   database; after the FUSE edit, ext4/Btrfs fixtures verify both exported blob
-  bytes and the commit ID against the signed history. Enrollment, staging,
-  checkout, and the provisioned daemon gate remain open.
+  bytes and the commit ID against the signed history. The node now owns the
+  checked stopped-view file stage sequence: it validates a registered catalog
+  and raw path before stopping FUSE, transfers the exact capture to a durable
+  node pin, remounts, then reconciles and verifies the catalog entry. The
+  two-file format-7 QUIC recovery fixture uses this routine and passes on ext4
+  and disposable local Btrfs; strict workspace Clippy passes. Public guarded
+  enrollment, add/checkout, and the provisioned daemon gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
