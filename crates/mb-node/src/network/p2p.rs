@@ -33236,4 +33236,257 @@ mod tests {
         drop(nodes);
         std::fs::remove_dir_all(run_root).unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a privileged guarded FUSE view and a reflink test filesystem"]
+    async fn guarded_git_graph_recovers_from_format_seven_packed_checkpoint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
+        let run_root =
+            std::path::PathBuf::from(test_root).join(format!("p2p-guarded-git-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&run_root).unwrap();
+        std::fs::set_permissions(&run_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = run_root.join("lower");
+        let view = run_root.join("view");
+        std::fs::create_dir(&lower).unwrap();
+        std::fs::create_dir(&view).unwrap();
+        std::fs::set_permissions(&lower, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&view, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let first = b"\r\n\0guarded Git first\n".repeat(8_000);
+        let second = b"\n\r\0guarded Git second\r\n".repeat(5_000);
+        for (name, bytes) in [("first", &first), ("second", &second)] {
+            std::fs::write(lower.join(name), bytes).unwrap();
+            std::fs::set_permissions(lower.join(name), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+
+        let seeds = (181_u8..=185)
+            .map(|value| Seed::from_bytes([value; 32]))
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, seed) in seeds.iter().cloned().enumerate() {
+            let node = Node::open(run_root.join(format!("node-{index}")), seed).unwrap();
+            let node_id = node.keys().node_id();
+            let node = Arc::new(Mutex::new(node));
+            let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
+            nodes.push(node);
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let genesis = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let mut peer_exchange_tasks = nodes
+            .iter()
+            .cloned()
+            .zip(clients.iter().cloned())
+            .map(|(node, client)| tokio::spawn(run_peer_exchange(node, client)))
+            .collect::<Vec<_>>();
+        let mut dht_publication_tasks = nodes
+            .iter()
+            .cloned()
+            .zip(clients.iter().cloned())
+            .map(|(node, client)| tokio::spawn(run_dht_publications(node, client)))
+            .collect::<Vec<_>>();
+        let mut coding_tasks = nodes
+            .iter()
+            .cloned()
+            .zip(clients.iter().cloned())
+            .map(|(node, client)| tokio::spawn(run_delegated_coding_jobs(node, client)))
+            .collect::<Vec<_>>();
+        let key_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let keys_ready = nodes.iter().all(|node| {
+                let state = node.lock().unwrap().dynamic_guild_state().unwrap().unwrap();
+                state
+                    .active_members()
+                    .all(|member| state.current_recovery_key(member.node_id).is_some())
+            });
+            if keys_ready {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < key_deadline);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let (root_id, original_graph) = {
+            let mut owner = nodes[1].lock().unwrap();
+            let root = owner
+                .enroll_test_guarded_root(&lower, &view, 65534, 65534)
+                .unwrap();
+            let graph = owner
+                .seed_test_guarded_git_commit(root.root_id, &["first", "second"])
+                .unwrap();
+            (root.root_id, graph)
+        };
+        assert_eq!(original_graph.blobs.len(), 2);
+        let owner_id = nodes[1].lock().unwrap().keys().node_id();
+        let descriptor = nodes[1]
+            .lock()
+            .unwrap()
+            .prepare_protected_backup(Some(root_id))
+            .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .enqueue_backup(owner_id, descriptor.clone())
+            .unwrap();
+        let queued = nodes[0]
+            .lock()
+            .unwrap()
+            .claim_backup_job()
+            .unwrap()
+            .unwrap();
+        let checkpoint_hash = tokio::time::timeout(
+            Duration::from_secs(240),
+            commit_backup_job(nodes[0].clone(), &clients[0], &queued),
+        )
+        .await
+        .expect("guarded Git format-7 packing timed out")
+        .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .complete_backup_job(&descriptor, checkpoint_hash)
+            .unwrap();
+        let checkpoint = nodes[0]
+            .lock()
+            .unwrap()
+            .current_checkpoint(genesis.genesis.guild_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.checkpoint.format_version, 7);
+        assert_eq!(checkpoint.checkpoint.revisions.len(), 1);
+        assert!(checkpoint.checkpoint.packing_catalog.is_some());
+        let signed = &checkpoint.checkpoint.revisions[0];
+        assert_eq!(signed.value.protected_root_id, root_id);
+        assert_eq!(
+            signed
+                .value
+                .data_sectors
+                .iter()
+                .map(|sector| sector.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            signed.value.data_sectors.len()
+        );
+        let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if nodes
+                .iter()
+                .all(|node| node.lock().unwrap().seed_recovery_ready().unwrap())
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < readiness_deadline);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        clients[1].shutdown().await.unwrap();
+        tasks.remove(1).await.unwrap().unwrap();
+        for group in [
+            &mut peer_exchange_tasks,
+            &mut dht_publication_tasks,
+            &mut coding_tasks,
+        ] {
+            let task = group.remove(1);
+            task.abort();
+            let _ = task.await;
+        }
+        nodes[1]
+            .lock()
+            .unwrap()
+            .stop_test_guarded_mount(root_id)
+            .unwrap();
+        drop(nodes.remove(1));
+        clients.remove(1);
+        std::fs::remove_dir_all(run_root.join("node-1")).unwrap();
+        std::fs::remove_dir_all(&lower).unwrap();
+        std::fs::remove_dir_all(&view).unwrap();
+
+        let restored = run_root.join("restored");
+        let recovered_state = run_root.join("recovered-node");
+        let recovered_node = Node::open(&recovered_state, seeds[1].clone()).unwrap();
+        let recovered_id = recovered_node.keys().node_id();
+        let recovered_node = Arc::new(Mutex::new(recovered_node));
+        let mut recovery_config = config(recovered_id);
+        recovery_config.bootstrap_addresses = vec![endpoints[0].parse().unwrap()];
+        let (recovery_client, recovery_loop) =
+            build_p2p(recovered_node.clone(), recovery_config).unwrap();
+        let recovery_task = tokio::spawn(recovery_loop.run());
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(180),
+            recover_from_dht(recovered_node.clone(), &recovery_client, &restored),
+        )
+        .await
+        .expect("guarded Git seed-only recovery timed out")
+        .unwrap();
+        assert_eq!(recovered.generation, 1);
+        assert_eq!(std::fs::read(restored.join("first")).unwrap(), first);
+        assert_eq!(std::fs::read(restored.join("second")).unwrap(), second);
+        let recovered_graph = recovered_node
+            .lock()
+            .unwrap()
+            .test_guarded_git_graph(root_id)
+            .unwrap();
+        assert_eq!(recovered_graph.refs, original_graph.refs);
+        assert_eq!(recovered_graph.objects, original_graph.objects);
+        assert_eq!(recovered_graph.blobs.len(), 2);
+        let mut root_anchor_ids = BTreeSet::new();
+        for (recovered_blob, original_blob) in
+            recovered_graph.blobs.iter().zip(&original_graph.blobs)
+        {
+            assert_eq!(recovered_blob.oid, original_blob.oid);
+            assert_eq!(recovered_blob.anchor.format_version, 2);
+            root_anchor_ids.insert(
+                recovered_blob
+                    .anchor
+                    .guarded_root_file
+                    .as_ref()
+                    .unwrap()
+                    .root_anchor_id,
+            );
+            assert_eq!(
+                mb_git::blob_oid_from_anchor(&recovered_blob.anchor)
+                    .unwrap()
+                    .as_bytes(),
+                recovered_blob.oid
+            );
+        }
+        assert_eq!(root_anchor_ids.len(), 1);
+
+        recovery_client.shutdown().await.unwrap();
+        recovery_task.await.unwrap().unwrap();
+        recovered_node
+            .lock()
+            .unwrap()
+            .stop_test_guarded_mount(root_id)
+            .unwrap();
+        drop(recovered_node);
+        for task in coding_tasks
+            .into_iter()
+            .chain(peer_exchange_tasks)
+            .chain(dht_publication_tasks)
+        {
+            task.abort();
+        }
+        for client in &clients {
+            let _ = client.shutdown().await;
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        std::fs::remove_dir_all(run_root).unwrap();
+    }
 }

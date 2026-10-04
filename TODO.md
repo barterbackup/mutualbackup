@@ -170,8 +170,13 @@
   unique and both recovered blobs use virtual mappings to the one retained
   guarded root anchor, with no separate blob-owned sector recipes. Broader
   blob-only and edited-file physical-reclamation cases remain. That lab uses
-  a format-3 checkpoint; it does not prove the required live-daemon format-7
-  packing checkpoint gate.
+  a format-3 checkpoint. A separate five-peer QUIC fixture now uses the
+  production backup coordinator to pack the same two-blob guarded Git graph
+  into a quorum-signed format-7 checkpoint. It deletes the owner's node state
+  and source, then recovers both raw files and reachable Git objects from a
+  fresh node on ext4 and disposable Btrfs. The provisioned five-daemon
+  topology and its failure-domain/source-loss gate remain open; the QUIC
+  fixture runs all five peers in one process.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
