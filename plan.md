@@ -617,6 +617,11 @@ Retain MutualBackup's independent content roots and signed revision authority.
   IDs, mount claims, and source-anchor locators outside the signed format;
   restore and reanchor from sector bytes without depending on those old IDs.
   Do not convert guarded entries through the older UTF-8-only private format.
+  Keep non-Git guarded revisions on private format 6. Use private format 7
+  for Git-backed guarded revisions: it binds that same raw namespace to a
+  validated Git graph descriptor and the protected-root ID. Do not emit
+  format 7 until capture, pinning, catalog rebuild, and seed-only recovery
+  of its graph pass together.
 - **UserRevision:** guild, owner, protected-root ID, root-scoped monotonic
   revision, optional parent in that root's chain, explicit metadata/data
   `SectorRef` lists, suite versions, and owner signature. Milestone 5 keeps

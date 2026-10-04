@@ -9,6 +9,7 @@ use std::path::{Component, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use mb_core::{V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_bytes, decode_canonical};
+use mb_git::GitBackupDescriptor;
 use mb_store::{
     FileExtent, GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewEntryKind,
     GuardedViewMetadataEntry, GuardedViewMetadataV1, NativeFileId, PinnedDirectory,
@@ -99,6 +100,43 @@ pub struct GuardedPrivateMetadataV6 {
     pub format_version: u16,
     pub root: GuardedPrivateStatV6,
     pub entries: Vec<GuardedPrivateEntryV6>,
+}
+
+/// Signed guarded namespace plus the complete reachable Git graph. The graph
+/// uses its own sector references while the namespace retains format-6's raw
+/// paths and virtual metadata. This format is not emitted until guarded graph
+/// capture and seed-only recovery are both available.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GuardedGitPrivateMetadataV7 {
+    pub format_version: u16,
+    pub guarded: GuardedPrivateMetadataV6,
+    pub git: GitBackupDescriptor,
+}
+
+impl GuardedGitPrivateMetadataV7 {
+    pub(crate) fn decode(bytes: &[u8], protected_root_id: Uuid) -> Result<Self> {
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= V1_MAX_CATALOG_BYTES,
+            "guarded Git private metadata exceeds the catalog bound"
+        );
+        let metadata: Self = decode_canonical(bytes)?;
+        metadata.validate(protected_root_id)?;
+        Ok(metadata)
+    }
+
+    pub(crate) fn validate(&self, protected_root_id: Uuid) -> Result<()> {
+        ensure!(
+            self.format_version == 7 && self.git.repository_id == protected_root_id,
+            "guarded Git private metadata has a wrong version or root"
+        );
+        self.guarded.validate()?;
+        self.git.validate()?;
+        ensure!(
+            canonical_bytes(self)?.len() <= V1_MAX_CATALOG_BYTES,
+            "guarded Git private metadata exceeds the catalog bound"
+        );
+        Ok(())
+    }
 }
 
 impl GuardedPrivateMetadataV6 {
@@ -489,6 +527,45 @@ mod tests {
     use mb_core::SectorRef;
 
     use super::*;
+
+    #[test]
+    fn guarded_git_metadata_keeps_raw_namespace_and_binds_graph_to_root() {
+        let root_id = Uuid::new_v4();
+        let guarded = GuardedPrivateMetadataV6 {
+            format_version: 6,
+            root: GuardedPrivateStatV6 {
+                mode: 0o700,
+                uid: 1000,
+                gid: 1000,
+                atime_secs: 1,
+                atime_nanos: 2,
+                modified_secs: 3,
+                modified_nanos: 4,
+            },
+            entries: Vec::new(),
+        };
+        let metadata = GuardedGitPrivateMetadataV7 {
+            format_version: 7,
+            guarded,
+            git: GitBackupDescriptor {
+                format_version: 2,
+                repository_id: root_id,
+                refs: Vec::new(),
+                objects: Vec::new(),
+                blobs: Vec::new(),
+                head_branch: "main".to_owned(),
+            },
+        };
+        let encoded = canonical_bytes(&metadata).unwrap();
+        assert_eq!(
+            GuardedGitPrivateMetadataV7::decode(&encoded, root_id).unwrap(),
+            metadata
+        );
+        assert!(GuardedGitPrivateMetadataV7::decode(&encoded, Uuid::new_v4()).is_err());
+        let mut malformed = metadata;
+        malformed.guarded.root.atime_nanos = 1_000_000_000;
+        assert!(malformed.validate(root_id).is_err());
+    }
 
     #[test]
     fn restored_guarded_binding_keeps_virtual_directory_length_and_rejects_aliases() {

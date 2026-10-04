@@ -41,7 +41,8 @@ use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
 use crate::guarded_metadata::{
-    GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6,
+    GuardedGitPrivateMetadataV7, GuardedPrivateEntryV6, GuardedPrivateMetadataV6,
+    GuardedPrivateStatV6,
 };
 
 type RecordWrite = (String, Vec<u8>, Vec<u8>);
@@ -2595,6 +2596,9 @@ pub(crate) fn guarded_private_metadata_for_revision(
         return Ok(None);
     }
     let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+    if private_metadata_format(&bytes)? == 7 {
+        bail!("guarded Git graph recovery is not yet supported");
+    }
     if private_metadata_format(&bytes)? != 6 {
         return Ok(None);
     }
@@ -2874,12 +2878,23 @@ pub(crate) fn revision_git_backup(
     revision: &SignedRecord<UserRevision>,
 ) -> Result<Option<GitBackupDescriptor>> {
     let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
-    if private_metadata_format(&bytes)? == 6 {
-        #[cfg(target_os = "linux")]
-        GuardedPrivateMetadataV6::decode(&bytes)?;
-        #[cfg(not(target_os = "linux"))]
-        bail!("guarded private metadata cannot be decoded on this platform");
-        return Ok(None);
+    match private_metadata_format(&bytes)? {
+        7 => {
+            #[cfg(target_os = "linux")]
+            return Ok(Some(
+                GuardedGitPrivateMetadataV7::decode(&bytes, revision.value.protected_root_id)?.git,
+            ));
+            #[cfg(not(target_os = "linux"))]
+            bail!("guarded Git private metadata cannot be decoded on this platform");
+        }
+        6 => {
+            #[cfg(target_os = "linux")]
+            GuardedPrivateMetadataV6::decode(&bytes)?;
+            #[cfg(not(target_os = "linux"))]
+            bail!("guarded private metadata cannot be decoded on this platform");
+            return Ok(None);
+        }
+        _ => {}
     }
     Ok(decode_private_metadata_with_git(&bytes)?.1)
 }
@@ -4034,6 +4049,9 @@ where
             load_ciphertext,
         )?);
     }
+    if private_metadata_format(&metadata_bytes)? == 7 {
+        bail!("guarded Git graph recovery is not yet supported");
+    }
     if private_metadata_format(&metadata_bytes)? == 6 {
         #[cfg(target_os = "linux")]
         return restore_guarded_entries(
@@ -4908,6 +4926,92 @@ mod metadata_compatibility_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("guarded Git graph backup is not yet supported")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signed_guarded_git_metadata_exposes_graph_but_refuses_unfinished_recovery() {
+        let temporary = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([221; 32]));
+        let guild_id = [222; 32];
+        let protected_root_id = Uuid::new_v4();
+        let revision_id = Uuid::new_v4();
+        let graph = GitBackupDescriptor {
+            format_version: 2,
+            repository_id: protected_root_id,
+            refs: Vec::new(),
+            objects: Vec::new(),
+            blobs: Vec::new(),
+            head_branch: "main".to_owned(),
+        };
+        let private = GuardedGitPrivateMetadataV7 {
+            format_version: 7,
+            guarded: GuardedPrivateMetadataV6 {
+                format_version: 6,
+                root: GuardedPrivateStatV6 {
+                    mode: 0o700,
+                    uid: 1000,
+                    gid: 1000,
+                    atime_secs: 1,
+                    atime_nanos: 0,
+                    modified_secs: 1,
+                    modified_nanos: 0,
+                },
+                entries: Vec::new(),
+            },
+            git: graph.clone(),
+        };
+        let metadata_bytes = canonical_bytes(&private).unwrap();
+        let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
+        let (metadata_ref, ciphertext) = encrypted_sector(
+            &keys.guild_data_key(&guild_id),
+            metadata_id,
+            &metadata_bytes,
+        )
+        .unwrap();
+        let writer = SigningKey::from_bytes(&[223; 32]);
+        let mut revision = UserRevision {
+            format_version: 5,
+            guild_id,
+            protected_root_id,
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id,
+            owner: keys.node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![metadata_ref.clone()],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![merkle_commit(&ciphertext).unwrap()]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
+        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
+        install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
+        assert_eq!(
+            revision_git_backup(&control, &keys, guild_id, &revision).unwrap(),
+            Some(graph)
+        );
+        let staging = PinnedDirectory::open(temporary.path()).unwrap();
+        let error = build_revision_restore(
+            &keys,
+            guild_id,
+            &revision,
+            &staging,
+            &mut |id| {
+                assert_eq!(*id, metadata_id);
+                Ok(ciphertext.clone())
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("guarded Git graph recovery is not yet supported")
         );
     }
 

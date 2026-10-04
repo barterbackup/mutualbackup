@@ -105,8 +105,11 @@
   remain open. The guarded signing path now refuses a registered Git repository,
   a private catalog marker, or a pending graph intent for that revision before
   stopping the view or signing a format-6 revision, so manual guarded Git state
-  cannot silently produce a signed revision that omits its history. Complete the signed guarded
-  graph descriptor and recovery before lifting this fail-closed gate.
+  cannot silently produce a signed revision that omits its history. A separate
+  format-7 private metadata type now validates a raw guarded namespace and
+  root-bound Git graph; revision inspection can read it, while recovery still
+  refuses it. Complete graph capture, native-anchor pinning, catalog rebuild,
+  and seed-only recovery before lifting the production signing gate.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
