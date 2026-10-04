@@ -139,20 +139,23 @@ pub struct FilesystemIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CapturedEntry {
     Directory {
-        path: String,
+        #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+        path: PathBuf,
         mode: u32,
         modified_secs: i64,
         modified_nanos: u32,
     },
     File {
-        path: String,
+        #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+        path: PathBuf,
         mode: u32,
         logical_len: u64,
         modified_secs: i64,
         modified_nanos: u32,
     },
     FileV2 {
-        path: String,
+        #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+        path: PathBuf,
         mode: u32,
         logical_len: u64,
         modified_secs: i64,
@@ -1453,7 +1456,8 @@ impl StableAnchorAreaLocator {
 pub struct StableAnchorFileLocator {
     pub area: StableAnchorAreaLocator,
     pub anchor_id: Uuid,
-    pub relative_path: String,
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
+    pub relative_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1992,7 +1996,7 @@ impl RawFileAnchorManifestV2 {
         StableAnchorFileLocator {
             area: self.area.clone(),
             anchor_id: self.anchor_id,
-            relative_path: FILE_ANCHOR_PAYLOAD.to_owned(),
+            relative_path: FILE_ANCHOR_PAYLOAD.into(),
         }
     }
 
@@ -2010,7 +2014,7 @@ impl FileAnchorManifest {
         StableAnchorFileLocator {
             area: self.area.clone(),
             anchor_id: self.anchor_id,
-            relative_path: FILE_ANCHOR_PAYLOAD.to_owned(),
+            relative_path: FILE_ANCHOR_PAYLOAD.into(),
         }
     }
 
@@ -2083,9 +2087,9 @@ impl StableAnchorFileLocator {
         &self,
         area_hint: Option<&Path>,
     ) -> Result<(File, PathBuf), AnchorError> {
-        validate_relative(Path::new(&self.relative_path))?;
+        validate_relative(&self.relative_path)?;
         let area = resolve_anchor_area_with_hint(&self.area, area_hint)?;
-        let file = open_anchor_beneath(&area, self.anchor_id, Path::new(&self.relative_path))?;
+        let file = open_anchor_beneath(&area, self.anchor_id, &self.relative_path)?;
         Ok((file, area))
     }
 }
@@ -2132,19 +2136,26 @@ impl StableAnchorManifest {
         &self,
         relative_path: String,
     ) -> Result<StableAnchorFileLocator, AnchorError> {
-        if self.format_version != 2 {
+        self.file_locator_path(Path::new(&relative_path))
+    }
+
+    pub fn file_locator_path(
+        &self,
+        relative_path: &Path,
+    ) -> Result<StableAnchorFileLocator, AnchorError> {
+        if !matches!(self.format_version, 2 | 3) {
             return Err(AnchorError::UnsupportedAnchorFormat(self.format_version));
         }
-        validate_relative(Path::new(&relative_path))?;
+        validate_relative(relative_path)?;
         Ok(StableAnchorFileLocator {
             area: self.area.clone(),
             anchor_id: self.anchor_id,
-            relative_path,
+            relative_path: relative_path.to_path_buf(),
         })
     }
 
     pub fn remove(&self) -> Result<(), AnchorError> {
-        if self.format_version != 2 {
+        if !matches!(self.format_version, 2 | 3) {
             return Err(AnchorError::UnsupportedAnchorFormat(self.format_version));
         }
         let area = resolve_anchor_area(&self.area)?;
@@ -3553,7 +3564,7 @@ impl DescriptorCapture<'_> {
                     create_private_directory_at(destination_directory, component, &destination)?;
                 let (modified_secs, modified_nanos) = modified_parts(&before);
                 self.entries.push(CapturedEntry::Directory {
-                    path: relative_string,
+                    path: relative_string.into(),
                     mode: unix_mode(&before),
                     modified_secs,
                     modified_nanos,
@@ -3634,7 +3645,7 @@ impl DescriptorCapture<'_> {
                     return Err(AnchorError::CatalogTooLarge);
                 }
                 self.entries.push(CapturedEntry::FileV2 {
-                    path: relative_string,
+                    path: relative_string.into(),
                     mode: unix_mode(&after),
                     logical_len: after.len(),
                     modified_secs,
@@ -4134,7 +4145,7 @@ fn read_area_marker_contents(mut marker: File, area: &Path) -> Result<Uuid, Anch
     Ok(id)
 }
 
-fn entry_path(entry: &CapturedEntry) -> &str {
+fn entry_path(entry: &CapturedEntry) -> &Path {
     match entry {
         CapturedEntry::Directory { path, .. }
         | CapturedEntry::File { path, .. }
@@ -5465,7 +5476,7 @@ mod tests {
             .create_child_directory(anchor_id.to_string())
             .unwrap();
         let mut manifest = StableAnchorManifest {
-            format_version: 3,
+            format_version: 4,
             anchor_id,
             source_root_hint: root,
             area,
@@ -5476,11 +5487,11 @@ mod tests {
         };
         assert!(matches!(
             manifest.remove(),
-            Err(AnchorError::UnsupportedAnchorFormat(3))
+            Err(AnchorError::UnsupportedAnchorFormat(4))
         ));
         assert!(matches!(
             manifest.file_locator("file".to_owned()),
-            Err(AnchorError::UnsupportedAnchorFormat(3))
+            Err(AnchorError::UnsupportedAnchorFormat(4))
         ));
         assert!(
             area_directory
@@ -6873,6 +6884,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stable_locator_opens_through_an_indexed_area_hint() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        #[derive(Serialize)]
+        struct HistoricalLocator {
+            area: StableAnchorAreaLocator,
+            anchor_id: Uuid,
+            relative_path: String,
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let area_id = Uuid::new_v4();
         let anchor_id = Uuid::new_v4();
@@ -6889,7 +6910,7 @@ mod tests {
                 volume_root_hint: temp.path().join("stale-volume"),
             },
             anchor_id,
-            relative_path: "payload".to_owned(),
+            relative_path: "payload".into(),
         };
 
         let (mut file, resolved) = locator.open_with_area_hint(Some(&area)).unwrap();
@@ -6897,5 +6918,33 @@ mod tests {
         file.read_to_string(&mut payload).unwrap();
         assert_eq!(payload, "indexed");
         assert_eq!(resolved, area);
+
+        let historical = canonical_bytes(&HistoricalLocator {
+            area: locator.area.clone(),
+            anchor_id,
+            relative_path: "payload".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(historical, canonical_bytes(&locator).unwrap());
+        assert_eq!(
+            decode_canonical::<StableAnchorFileLocator>(&historical).unwrap(),
+            locator
+        );
+
+        let raw_name = OsString::from_vec(b"raw-\xfe".to_vec());
+        fs::write(area.join(anchor_id.to_string()).join(&raw_name), b"raw").unwrap();
+        let raw_locator = StableAnchorFileLocator {
+            relative_path: PathBuf::from(raw_name),
+            ..locator
+        };
+        let (mut file, _) = raw_locator.open_with_area_hint(Some(&area)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"raw");
+        assert_eq!(
+            decode_canonical::<StableAnchorFileLocator>(&canonical_bytes(&raw_locator).unwrap())
+                .unwrap(),
+            raw_locator
+        );
     }
 }

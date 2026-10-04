@@ -135,13 +135,13 @@ pub(crate) fn captured_file_path_for_retirement(
     control: &ControlStore,
     anchor_id: Uuid,
     view_inode: u64,
-    captured_path: &str,
+    captured_path: &Path,
     expected: NativeFileId,
 ) -> anyhow::Result<Option<PathBuf>> {
     let mut id = anchor_id.as_bytes().to_vec();
     id.extend_from_slice(&view_inode.to_le_bytes());
     let Some(bytes) = control.get_record(NAMESPACE_KIND, &id)? else {
-        return Ok(Some(PathBuf::from(captured_path)));
+        return Ok(Some(captured_path.to_path_buf()));
     };
     let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
     ensure!(
@@ -164,13 +164,13 @@ pub(crate) fn captured_directory_path_for_retirement(
     control: &ControlStore,
     anchor_id: Uuid,
     view_inode: u64,
-    captured_path: &str,
+    captured_path: &Path,
     expected: NativeFileId,
 ) -> anyhow::Result<Option<PathBuf>> {
     let mut id = anchor_id.as_bytes().to_vec();
     id.extend_from_slice(&view_inode.to_le_bytes());
     let Some(bytes) = control.get_record(DIRECTORY_KIND, &id)? else {
-        return Ok(Some(PathBuf::from(captured_path)));
+        return Ok(Some(captured_path.to_path_buf()));
     };
     let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
     ensure!(
@@ -187,7 +187,8 @@ pub(crate) fn captured_directory_path_for_retirement(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NamespaceRecord {
     version: u16,
-    captured_path: String,
+    #[serde(with = "crate::raw_path_bytes")]
+    captured_path: PathBuf,
     expected: NativeFileId,
     current: Option<Vec<u8>>,
     // Some(None) is an unlink; Some(Some(path)) is a rename.
@@ -821,7 +822,7 @@ impl GuardedNamespace {
                 );
             } else {
                 ensure!(
-                    record.captured_path.is_empty()
+                    record.captured_path.as_os_str().is_empty()
                         && record.expected.filesystem_id == intent.expected.filesystem_id,
                     "invalid dynamic guarded namespace record"
                 );
@@ -966,7 +967,7 @@ impl GuardedNamespace {
     fn finish_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
         let record = NamespaceRecord {
             version: 1,
-            captured_path: String::new(),
+            captured_path: PathBuf::new(),
             expected: intent.expected,
             current: Some(intent.target.clone()),
             pending: None,
@@ -1803,7 +1804,7 @@ impl GuardedNamespace {
                     );
                 } else {
                     ensure!(
-                        record.captured_path.is_empty(),
+                        record.captured_path.as_os_str().is_empty(),
                         "guarded replacement has unknown captured file"
                     );
                 }
@@ -1878,7 +1879,7 @@ impl GuardedNamespace {
     fn load_or_replay(
         &self,
         inode: u64,
-        captured_path: &str,
+        captured_path: &Path,
         expected: NativeFileId,
         lower_root: &PinnedDirectory,
         directories: &HashMap<PathBuf, INodeNo>,
@@ -1892,9 +1893,9 @@ impl GuardedNamespace {
             Some(bytes) => mb_core::decode_canonical::<NamespaceRecord>(&bytes)?,
             None => NamespaceRecord {
                 version: 1,
-                captured_path: captured_path.to_owned(),
+                captured_path: captured_path.to_path_buf(),
                 expected,
-                current: Some(captured_path.as_bytes().to_vec()),
+                current: Some(captured_path.as_os_str().as_bytes().to_vec()),
                 pending: None,
             },
         };
@@ -2995,7 +2996,11 @@ impl GuardedProbeView {
                         captured_directories
                             .insert(
                                 inode,
-                                (path.as_bytes().to_vec(), expected, (mode & 0o7777) as u16)
+                                (
+                                    path.as_os_str().as_bytes().to_vec(),
+                                    expected,
+                                    (mode & 0o7777) as u16,
+                                )
                             )
                             .is_none(),
                         "duplicate captured guarded directory inode"
@@ -3011,7 +3016,7 @@ impl GuardedProbeView {
                         *native_id == expected,
                         "guarded file identity differs from plan"
                     );
-                    let anchor = manifest.file_locator(path.clone())?.open()?;
+                    let anchor = manifest.file_locator_path(path)?.open()?;
                     let metadata = anchor.metadata()?;
                     ensure!(
                         metadata.uid() != view_uid && metadata.permissions().mode() & 0o022 == 0,
@@ -3023,7 +3028,7 @@ impl GuardedProbeView {
                             version: 1,
                             captured_path: path.clone(),
                             expected,
-                            current: Some(path.as_bytes().to_vec()),
+                            current: Some(path.as_os_str().as_bytes().to_vec()),
                             pending: None,
                         },
                     );
@@ -3116,7 +3121,7 @@ impl GuardedProbeView {
                         *native_id == expected,
                         "guarded manifest file identity differs from its plan"
                     );
-                    let _anchor = manifest.file_locator(path.clone())?.open()?;
+                    let _anchor = manifest.file_locator_path(path)?.open()?;
                     let location = namespace.load_or_replay(
                         inode.0,
                         path,
@@ -3216,13 +3221,13 @@ impl GuardedProbeView {
             highest_inode = highest_inode.max(inode);
             let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
             ensure!(
-                record.captured_path.is_empty()
+                record.captured_path.as_os_str().is_empty()
                     && record.expected.filesystem_id == lower_root.identity()?.filesystem_id,
                 "invalid dynamically created guarded file"
             );
             let location = namespace.load_or_replay(
                 inode,
-                "",
+                Path::new(""),
                 record.expected,
                 &lower_root,
                 &directory_paths,
@@ -5070,7 +5075,7 @@ mod tests {
                 4,
                 NamespaceRecord {
                     version: 1,
-                    captured_path: "source/file".to_owned(),
+                    captured_path: "source/file".into(),
                     expected: file_id,
                     current: Some(b"source/file".to_vec()),
                     pending: None,
@@ -5142,7 +5147,7 @@ mod tests {
             assert_eq!(journal.directory_mode(3).unwrap(), None);
             assert_eq!(
                 journal
-                    .load_or_replay(4, "source/file", file_id, &root, &index.paths)
+                    .load_or_replay(4, Path::new("source/file"), file_id, &root, &index.paths)
                     .unwrap()
                     .unwrap()
                     .relative_path,
@@ -5281,7 +5286,7 @@ mod tests {
                 3,
                 NamespaceRecord {
                     version: 1,
-                    captured_path: "parent/file".to_owned(),
+                    captured_path: "parent/file".into(),
                     expected: file_id,
                     current: Some(b"parent/file".to_vec()),
                     pending: None,
@@ -5313,7 +5318,7 @@ mod tests {
                     5,
                     &NamespaceRecord {
                         version: 1,
-                        captured_path: String::new(),
+                        captured_path: PathBuf::new(),
                         expected: new_id,
                         current: Some(b"parent/sub/new".to_vec()),
                         pending: None,
@@ -5399,7 +5404,7 @@ mod tests {
             assert_eq!(index.paths[Path::new("relocated/sub")], INodeNo(4));
             assert_eq!(
                 journal
-                    .load_or_replay(3, "parent/file", file_id, &root, &index.paths)
+                    .load_or_replay(3, Path::new("parent/file"), file_id, &root, &index.paths)
                     .unwrap()
                     .unwrap()
                     .relative_path,
@@ -5407,7 +5412,7 @@ mod tests {
             );
             assert_eq!(
                 journal
-                    .load_or_replay(5, "", new_id, &root, &index.paths)
+                    .load_or_replay(5, Path::new(""), new_id, &root, &index.paths)
                     .unwrap()
                     .unwrap()
                     .relative_path,
@@ -5921,7 +5926,7 @@ mod tests {
                 3,
                 &NamespaceRecord {
                     version: 1,
-                    captured_path: "original/file".to_owned(),
+                    captured_path: "original/file".into(),
                     expected: file_id,
                     current: Some(b"newparent/relocated/file".to_vec()),
                     pending: None,
@@ -5948,7 +5953,7 @@ mod tests {
         assert_eq!(index.captured[0].parent, INodeNo(4));
         assert_eq!(index.dynamic[0].parent, INodeNo::ROOT);
         let file = journal
-            .load_or_replay(3, "original/file", file_id, &root, &index.paths)
+            .load_or_replay(3, Path::new("original/file"), file_id, &root, &index.paths)
             .unwrap()
             .unwrap();
         assert_eq!(file.parent, INodeNo(2));
@@ -6049,14 +6054,14 @@ mod tests {
             let target_id = root.entry_identity(&target_name, false).unwrap().unwrap();
             let source_record = NamespaceRecord {
                 version: 1,
-                captured_path: String::new(),
+                captured_path: PathBuf::new(),
                 expected: source_id,
                 current: Some(source_name.as_bytes().to_vec()),
                 pending: None,
             };
             let target_record = NamespaceRecord {
                 version: 1,
-                captured_path: target_name.clone(),
+                captured_path: target_name.clone().into(),
                 expected: target_id,
                 current: Some(target_name.as_bytes().to_vec()),
                 pending: None,
@@ -6148,7 +6153,7 @@ mod tests {
         let target_id = root.entry_identity("target", false).unwrap().unwrap();
         let source_record = NamespaceRecord {
             version: 1,
-            captured_path: String::new(),
+            captured_path: PathBuf::new(),
             expected: source_id,
             current: Some(b"temp".to_vec()),
             pending: None,
@@ -6204,7 +6209,7 @@ mod tests {
         let target_id = root.entry_identity("target", false).unwrap().unwrap();
         let source_record = NamespaceRecord {
             version: 1,
-            captured_path: String::new(),
+            captured_path: PathBuf::new(),
             expected: source_id,
             current: Some(b"nested/temp".to_vec()),
             pending: None,
@@ -6394,7 +6399,7 @@ mod tests {
             let target = (!unlink).then(|| new.as_bytes().to_vec());
             let record = NamespaceRecord {
                 version: 1,
-                captured_path: old.clone(),
+                captured_path: old.clone().into(),
                 expected,
                 current: Some(old.as_bytes().to_vec()),
                 pending: Some(target.clone()),
@@ -6427,7 +6432,7 @@ mod tests {
                 )
                 .unwrap();
             let location = journal
-                .load_or_replay(2, &old, expected, &root, &directories)
+                .load_or_replay(2, Path::new(&old), expected, &root, &directories)
                 .unwrap();
             assert!(!lower.join(&old).exists());
             if unlink {
@@ -6483,7 +6488,7 @@ mod tests {
         let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
         assert!(
             journal
-                .load_or_replay(2, "old", expected, &root, &directories)
+                .load_or_replay(2, Path::new("old"), expected, &root, &directories)
                 .is_err()
         );
         assert_eq!(fs::read(lower.join("old")).unwrap(), b"replacement");

@@ -1220,7 +1220,7 @@ impl GuardedViewMount {
                                 && proof.logical_len == entry.logical_len,
                             "unchanged guarded file has another length"
                         );
-                        Some((original.file_locator((*captured_path).clone())?, proof))
+                        Some((original.file_locator_path(captured_path)?, proof))
                     } else {
                         None
                     }

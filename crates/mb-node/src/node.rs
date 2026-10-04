@@ -24590,12 +24590,24 @@ pub(crate) mod tests {
         let original = b"guarded\r\n\0source\n";
         fs::write(lower.join("sample"), original).unwrap();
         fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o666)).unwrap();
+        let raw_directory = OsString::from_vec(b"zdir-\xfe".to_vec());
+        let raw_name = OsString::from_vec(b"nested-\xfd".to_vec());
+        let raw_path = PathBuf::from(&raw_directory).join(&raw_name);
+        let raw_bytes = b"raw\r\n\0file";
+        fs::create_dir(lower.join(&raw_directory)).unwrap();
+        fs::write(lower.join(&raw_path), raw_bytes).unwrap();
+        fs::set_permissions(lower.join(&raw_path), fs::Permissions::from_mode(0o666)).unwrap();
 
         let seed = Seed::from_bytes([241; 32]);
         let node = Node::open(&data_dir, seed.clone()).unwrap();
         let database_key = node.control_database_key;
         let plan = mb_store::GuardedRootCapturePlan::plan(&lower).unwrap();
-        let manifest = plan.capture(&node.control).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&node.control, 65534, 0, 0)
+            .unwrap();
+        plan.isolate_lower_directories(&node.control, &manifest)
+            .unwrap();
+        assert_eq!(manifest.format_version, 3);
         let guarded_control = Arc::new(Mutex::new(
             ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
                 .unwrap(),
@@ -24651,6 +24663,14 @@ pub(crate) mod tests {
             .unwrap();
         assert!(visible.status.success(), "{visible:?}");
         assert_eq!(visible.stdout, original);
+        let raw_visible = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(view.join(&raw_path))
+            .output()
+            .unwrap();
+        assert!(raw_visible.status.success(), "{raw_visible:?}");
+        assert_eq!(raw_visible.stdout, raw_bytes);
         let private = Command::new("cat")
             .uid(65534)
             .gid(65534)
@@ -24681,6 +24701,25 @@ pub(crate) mod tests {
             .unwrap();
         assert!(write.status.success(), "{write:?}");
         assert!(fs::read(lower.join("sample")).unwrap().starts_with(b"EDIT"));
+        let raw_write = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'EDIT',0); os.fsync(fd); os.close(fd)")
+            .arg(view.join(&raw_path))
+            .output()
+            .unwrap();
+        assert!(raw_write.status.success(), "{raw_write:?}");
+        let raw_edited = b"EDIT\n\0file";
+        assert_eq!(fs::read(lower.join(&raw_path)).unwrap(), raw_edited);
+        let mut raw_anchor = manifest
+            .file_locator_path(&raw_path)
+            .unwrap()
+            .open()
+            .unwrap();
+        let mut raw_protected = Vec::new();
+        raw_anchor.read_to_end(&mut raw_protected).unwrap();
+        assert_eq!(raw_protected, raw_bytes);
         let mut anchor = manifest
             .file_locator("sample".to_owned())
             .unwrap()
@@ -24698,6 +24737,12 @@ pub(crate) mod tests {
             .capture_claimed_guarded_view_for_revision(manifest.anchor_id, revision_id)
             .unwrap();
         capture.verify().unwrap();
+        assert!(
+            capture
+                .files
+                .iter()
+                .any(|file| file.path == raw_path.as_os_str().as_bytes())
+        );
         let private = crate::GuardedPrivateMetadataV6::from_capture(&capture, |file| {
             Ok(file
                 .data_extents
@@ -24718,9 +24763,14 @@ pub(crate) mod tests {
         assert_eq!(private.root.uid, 65534);
         assert!(matches!(
             private.entries.as_slice(),
-            [crate::GuardedPrivateEntryV6::File { path, .. }] if path == b"sample"
+            [crate::GuardedPrivateEntryV6::File { path: first, .. },
+             crate::GuardedPrivateEntryV6::Directory { path: directory, .. },
+             crate::GuardedPrivateEntryV6::File { path: second, .. }]
+                if first == b"sample"
+                    && directory == raw_directory.as_bytes()
+                    && second == raw_path.as_os_str().as_bytes()
         ));
-        assert_eq!(capture.files.len(), 1);
+        assert_eq!(capture.files.len(), 2);
         assert_eq!(capture.files[0].path, b"sample");
         let mut captured_bytes = Vec::new();
         capture.files[0]
@@ -24778,6 +24828,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(restored.join("sample")).unwrap(), captured_bytes);
+        assert_eq!(fs::read(restored.join(&raw_path)).unwrap(), raw_edited);
         if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
             let ciphertexts = signed
                 .value
@@ -24825,6 +24876,7 @@ pub(crate) mod tests {
                 fs::read(seed_target.join("sample")).unwrap(),
                 captured_bytes
             );
+            assert_eq!(fs::read(seed_target.join(&raw_path)).unwrap(), raw_edited);
             for reference in &signed.value.data_sectors {
                 assert!(
                     crate::snapshot::recovered_recipe_is_stable(

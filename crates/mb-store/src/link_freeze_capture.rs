@@ -35,7 +35,9 @@ pub struct LinkFreezeCaptureIntent {
     source_parent_id: NativeFileId,
     anchor_parent_id: NativeFileId,
     source_id: NativeFileId,
+    #[serde(with = "crate::raw_path_bytes")]
     source_name: PathBuf,
+    #[serde(with = "crate::raw_path_bytes")]
     anchor_name: PathBuf,
     proof: FrozenAnchorProof,
     phase: LinkFreezeCapturePhase,
@@ -49,7 +51,9 @@ struct LegacyCaptureIntentV1 {
     source_parent_id: NativeFileId,
     anchor_parent_id: NativeFileId,
     source_id: NativeFileId,
+    #[serde(with = "crate::raw_path_bytes")]
     source_name: PathBuf,
+    #[serde(with = "crate::raw_path_bytes")]
     anchor_name: PathBuf,
     proof: FrozenAnchorProof,
     phase: LinkFreezeCapturePhase,

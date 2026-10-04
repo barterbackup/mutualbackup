@@ -78,7 +78,8 @@ struct RootClaim {
 struct DirectoryClaim {
     format_version: u16,
     anchor_id: Uuid,
-    path: String,
+    #[serde(with = "super::raw_path_bytes")]
+    path: PathBuf,
     parent_id: NativeFileId,
     directory_id: NativeFileId,
     plan_hash: [u8; 32],
@@ -102,7 +103,8 @@ struct RootRetirement {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct LowerOwnershipEntry {
-    path: String,
+    #[serde(with = "super::raw_path_bytes")]
+    path: PathBuf,
     native_id: NativeFileId,
     uid: u32,
     gid: u32,
@@ -156,14 +158,16 @@ pub struct GuardedRootCapturePlan {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum GuardedRootEntry {
     Directory {
-        path: String,
+        #[serde(with = "super::raw_path_bytes")]
+        path: PathBuf,
         version: CaptureVersion,
         mode: u32,
         modified_secs: i64,
         modified_nanos: u32,
     },
     File {
-        path: String,
+        #[serde(with = "super::raw_path_bytes")]
+        path: PathBuf,
         capture_id: Uuid,
         version: CaptureVersion,
         mode: u32,
@@ -173,7 +177,7 @@ enum GuardedRootEntry {
 }
 
 impl GuardedRootEntry {
-    fn path(&self) -> &str {
+    fn path(&self) -> &Path {
         match self {
             Self::Directory { path, .. } | Self::File { path, .. } => path,
         }
@@ -236,7 +240,11 @@ impl GuardedRootCapturePlan {
             return Err(AnchorError::FilesystemChanged);
         }
         let plan = Self {
-            format_version: 1,
+            format_version: if entries.iter().any(|entry| entry.path().to_str().is_none()) {
+                2
+            } else {
+                1
+            },
             anchor_id: Uuid::new_v4(),
             source_root,
             area,
@@ -253,7 +261,7 @@ impl GuardedRootCapturePlan {
     /// Validate a decoded durable inventory before using any of its paths or
     /// per-file journal IDs. Planning also calls this before returning it.
     pub fn validate(&self) -> Result<(), AnchorError> {
-        if self.format_version != 1
+        if !matches!(self.format_version, 1 | 2)
             || self.anchor_id.is_nil()
             || self.area.area_id.is_nil()
             || !self.source_root.is_absolute()
@@ -279,17 +287,20 @@ impl GuardedRootCapturePlan {
         let mut directories = BTreeSet::new();
         let mut capture_ids = BTreeSet::from([self.anchor_id]);
         let mut inodes = BTreeSet::from([self.root_version.inode]);
-        let mut previous = None::<&str>;
+        let mut previous = None::<&Path>;
         for entry in &self.entries {
             let path = entry.path();
-            let relative = Path::new(path);
+            if self.format_version == 1 && path.to_str().is_none() {
+                return Err(AnchorError::InvalidGuardedPlan);
+            }
+            let relative = path;
             let (mode, modified_secs, modified_nanos) = entry.mode_and_modified();
             if validate_relative(relative).is_err()
                 || !lexically_normalized(relative)
-                || path.len() > MAX_RELATIVE_PATH_BYTES
+                || path.as_os_str().as_bytes().len() > MAX_RELATIVE_PATH_BYTES
                 || relative.components().count() > MAX_CAPTURE_DEPTH
                 || previous.is_some_and(|prior| prior >= path)
-                || path == capture_manifest_name(self.anchor_id)
+                || path == Path::new(&capture_manifest_name(self.anchor_id))
                 || entry.version().filesystem_id != self.root_version.filesystem_id
                 || entry.version().inode == 0
                 || entry.version().modified_secs != modified_secs
@@ -307,7 +318,7 @@ impl GuardedRootCapturePlan {
             if let Some(parent) = relative
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
-                && !directories.contains(parent.to_str().ok_or(AnchorError::InvalidGuardedPlan)?)
+                && !directories.contains(parent)
             {
                 return Err(AnchorError::InvalidGuardedPlan);
             }
@@ -352,7 +363,7 @@ impl GuardedRootCapturePlan {
         }
     }
 
-    pub(crate) fn captured_entry_identity(&self, path: &str) -> Option<NativeFileId> {
+    pub(crate) fn captured_entry_identity(&self, path: &Path) -> Option<NativeFileId> {
         self.entries
             .iter()
             .find(|entry| entry.path() == path)
@@ -375,12 +386,11 @@ impl GuardedRootCapturePlan {
             lower_root.identity()? == self.source_root_identity(),
             "guarded lower root changed after capture"
         );
-        let mut expected = BTreeMap::<String, BTreeSet<Vec<u8>>>::new();
-        expected.insert(String::new(), BTreeSet::new());
+        let mut expected = BTreeMap::<PathBuf, BTreeSet<Vec<u8>>>::new();
+        expected.insert(PathBuf::new(), BTreeSet::new());
         for entry in &self.entries {
-            let relative = Path::new(entry.path());
+            let relative = entry.path();
             let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
-            let parent = parent.to_str().ok_or(AnchorError::InvalidGuardedPlan)?;
             let name = relative
                 .file_name()
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
@@ -398,21 +408,21 @@ impl GuardedRootCapturePlan {
             anyhow::ensure!(
                 lower_root.entry_identity(relative, entry.is_directory())? == Some(native_id),
                 "guarded lower entry identity changed before first mount: {}",
-                entry.path()
+                entry.path().display()
             );
         }
         let marked_catalog = lower_root.has_marked_git_catalog()?;
         for (parent, names) in expected {
-            let directory = if parent.is_empty() {
+            let directory = if parent.as_os_str().is_empty() {
                 lower_root.try_clone()?
             } else {
                 lower_root.open_descendant_directory(&parent)?
             };
-            let ignored =
-                (parent.is_empty() && marked_catalog).then_some(GIT_CATALOG_DIRECTORY.as_bytes());
+            let ignored = (parent.as_os_str().is_empty() && marked_catalog)
+                .then_some(GIT_CATALOG_DIRECTORY.as_bytes());
             anyhow::ensure!(
                 directory.child_names_match(&names, ignored)?,
-                "guarded lower directory has an unexpected or missing entry: {parent}"
+                "guarded lower directory has an unexpected or missing entry: {parent:?}"
             );
         }
         Ok(())
@@ -441,19 +451,19 @@ impl GuardedRootCapturePlan {
                         filesystem_id: version.filesystem_id,
                         inode: version.inode,
                     }),
-                "guarded private directory changed before mounting: {path}"
+                "guarded private directory changed before mounting: {path:?}"
             );
             let metadata = directory.as_file().metadata()?;
             anyhow::ensure!(
                 metadata.uid() != view_uid && unix_mode(&metadata) & 0o077 == 0,
-                "guarded private directory remains accessible to the view owner: {path}"
+                "guarded private directory remains accessible to the view owner: {path:?}"
             );
         }
         Ok(())
     }
 
     fn lower_ownership_entry(
-        path: String,
+        path: PathBuf,
         file: &File,
         native_id: NativeFileId,
         directory: bool,
@@ -468,7 +478,7 @@ impl GuardedRootCapturePlan {
                 } else {
                     before.is_file() && unix_mode(&before) & 0o222 == 0
                 }),
-            "guarded lower entry changed before ownership snapshot: {path}"
+            "guarded lower entry changed before ownership snapshot: {path:?}"
         );
         let access_acl = read_access_acl(file)?;
         let after = file.metadata()?;
@@ -490,7 +500,7 @@ impl GuardedRootCapturePlan {
                 after.ctime(),
                 after.ctime_nsec()
             ),
-            "guarded lower metadata changed during ownership snapshot: {path}"
+            "guarded lower metadata changed during ownership snapshot: {path:?}"
         );
         Ok(LowerOwnershipEntry {
             path,
@@ -521,7 +531,7 @@ impl GuardedRootCapturePlan {
         anyhow::ensure!(lower.identity()? == root_id, "guarded lower root changed");
         let mut entries = Vec::with_capacity(self.entries.len() + 1);
         entries.push(Self::lower_ownership_entry(
-            String::new(),
+            PathBuf::new(),
             lower.as_file(),
             root_id,
             true,
@@ -546,7 +556,7 @@ impl GuardedRootCapturePlan {
                         intent.phase() == LinkFreezeCapturePhase::Frozen,
                         "guarded file was edited before lower isolation"
                     );
-                    let relative = Path::new(path);
+                    let relative = path;
                     let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
                     let directory = if parent.as_os_str().is_empty() {
                         lower.try_clone()?
@@ -559,12 +569,14 @@ impl GuardedRootCapturePlan {
                                 .file_name()
                                 .ok_or(AnchorError::InvalidGuardedPlan)?,
                         )?
-                        .ok_or_else(|| anyhow::anyhow!("guarded lower file disappeared: {path}"))?;
-                    let anchor = manifest.file_locator(path.to_owned())?.open()?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("guarded lower file disappeared: {path:?}")
+                        })?;
+                    let anchor = manifest.file_locator_path(path)?.open()?;
                     anyhow::ensure!(
                         anchor.metadata()?.ino() == native_id.inode
                             && file.metadata()?.nlink() == 2,
-                        "guarded lower file no longer shares its frozen anchor: {path}"
+                        "guarded lower file no longer shares its frozen anchor: {path:?}"
                     );
                     file
                 }
@@ -757,8 +769,8 @@ impl GuardedRootCapturePlan {
     fn retirement_directory_paths(
         &self,
         control: &ControlStore,
-    ) -> anyhow::Result<BTreeMap<String, Option<PathBuf>>> {
-        let mut paths = BTreeMap::from([(String::new(), Some(PathBuf::new()))]);
+    ) -> anyhow::Result<BTreeMap<PathBuf, Option<PathBuf>>> {
+        let mut paths = BTreeMap::from([(PathBuf::new(), Some(PathBuf::new()))]);
         let mut occupied = std::collections::BTreeSet::from([PathBuf::new()]);
         for (index, entry) in self.entries.iter().enumerate() {
             let GuardedRootEntry::Directory { path, version, .. } = entry else {
@@ -889,7 +901,7 @@ impl GuardedRootCapturePlan {
             anyhow::ensure!(
                 unix_mode(&after_mode) & 0o7777 == 0o700,
                 "guarded lower directory mode was not isolated: {}",
-                entry.path
+                entry.path.display()
             );
             if (after_mode.uid(), after_mode.gid()) != (private.private_uid, private.private_gid) {
                 let result = unsafe {
@@ -910,7 +922,7 @@ impl GuardedRootCapturePlan {
                     && unix_mode(&after) & 0o7777 == 0o700
                     && Self::open_lower_directory(&lower, entry)?.identity()? == entry.native_id,
                 "guarded lower directory owner was not isolated: {}",
-                entry.path
+                entry.path.display()
             );
         }
         self.verify_lower_directories_for_retirement(&snapshot, &lower, Some(&expected), None)?;
@@ -974,7 +986,7 @@ impl GuardedRootCapturePlan {
                 continue;
             };
             let original = &snapshot.entries[index + 1];
-            let relative = Path::new(path);
+            let relative = path.as_path();
             let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
             let source_parent = if parent.as_os_str().is_empty() {
                 source_root.try_clone()?
@@ -990,11 +1002,11 @@ impl GuardedRootCapturePlan {
                 .file_name()
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
             let intent = LinkFreezeCaptureIntent::load(control, *capture_id)?
-                .ok_or_else(|| anyhow::anyhow!("guarded file capture disappeared: {path}"))?;
+                .ok_or_else(|| anyhow::anyhow!("guarded file capture disappeared: {path:?}"))?;
             anyhow::ensure!(
                 source_parent.entry_identity(name, false)? == Some(original.native_id)
                     && anchor_parent.entry_identity(name, false)? == Some(original.native_id),
-                "guarded lower file changed before owner isolation: {path}"
+                "guarded lower file changed before owner isolation: {path:?}"
             );
             anyhow::ensure!(intent.matches_root_file_plan(
                 *capture_id,
@@ -1009,14 +1021,14 @@ impl GuardedRootCapturePlan {
             if original.uid == private_uid {
                 let metadata = anchor_parent
                     .open_child_file(name)?
-                    .ok_or_else(|| anyhow::anyhow!("guarded anchor disappeared: {path}"))?
+                    .ok_or_else(|| anyhow::anyhow!("guarded anchor disappeared: {path:?}"))?
                     .metadata()?;
                 anyhow::ensure!(
                     metadata.uid() == private_uid
                         && metadata.gid() == original.gid
                         && metadata.nlink() == 2
                         && unix_mode(&metadata) & 0o022 == 0,
-                    "guarded file is no longer private: {path}"
+                    "guarded file is no longer private: {path:?}"
                 );
                 continue;
             }
@@ -1089,7 +1101,7 @@ impl GuardedRootCapturePlan {
         snapshot: &LowerOwnershipSnapshot,
         lower: &PinnedDirectory,
         isolation: Option<&DirectoryIsolation>,
-        paths: Option<&BTreeMap<String, Option<PathBuf>>>,
+        paths: Option<&BTreeMap<PathBuf, Option<PathBuf>>>,
     ) -> anyhow::Result<()> {
         for entry in self.lower_directory_entries(snapshot) {
             let current = match paths {
@@ -1105,7 +1117,7 @@ impl GuardedRootCapturePlan {
                 anyhow::ensure!(
                     !lower.contains_descendant_id(entry.native_id)?,
                     "removed captured directory still has a lower-tree name: {}",
-                    entry.path
+                    entry.path.display()
                 );
                 continue;
             };
@@ -1136,7 +1148,7 @@ impl GuardedRootCapturePlan {
             anyhow::ensure!(
                 permitted,
                 "guarded lower directory changed during retirement: {}",
-                entry.path
+                entry.path.display()
             );
         }
         Ok(())
@@ -1157,15 +1169,15 @@ impl GuardedRootCapturePlan {
             lower.open_descendant_directory(parent)?
         };
         let name = path.file_name().ok_or(AnchorError::InvalidGuardedPlan)?;
-        let file = directory
-            .open_child_file(name)?
-            .ok_or_else(|| anyhow::anyhow!("guarded lower file disappeared: {}", entry.path))?;
+        let file = directory.open_child_file(name)?.ok_or_else(|| {
+            anyhow::anyhow!("guarded lower file disappeared: {}", entry.path.display())
+        })?;
         anyhow::ensure!(
             directory.identity()?.filesystem_id == entry.native_id.filesystem_id
                 && file.metadata()?.ino() == entry.native_id.inode
                 && directory.entry_identity(name, false)? == Some(entry.native_id),
             "guarded lower file changed during retirement: {}",
-            entry.path
+            entry.path.display()
         );
         Ok(Some(file))
     }
@@ -1175,7 +1187,7 @@ impl GuardedRootCapturePlan {
         control: &ControlStore,
         snapshot: &LowerOwnershipSnapshot,
         isolation: Option<&DirectoryIsolation>,
-        directory_paths: &BTreeMap<String, Option<PathBuf>>,
+        directory_paths: &BTreeMap<PathBuf, Option<PathBuf>>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
         self.verify_lower_directories_for_retirement(
@@ -1215,7 +1227,7 @@ impl GuardedRootCapturePlan {
         snapshot: &LowerOwnershipSnapshot,
         bytes: &[u8],
         isolation: Option<&DirectoryIsolation>,
-        directory_paths: &BTreeMap<String, Option<PathBuf>>,
+        directory_paths: &BTreeMap<PathBuf, Option<PathBuf>>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
         self.verify_lower_directories_for_retirement(
@@ -1279,7 +1291,7 @@ impl GuardedRootCapturePlan {
                             .identity()?
                             == entry.native_id,
                     "guarded lower directory was not restored: {}",
-                    entry.path
+                    entry.path.display()
                 );
             }
             self.verify_lower_directories_for_retirement(
@@ -1305,7 +1317,7 @@ impl GuardedRootCapturePlan {
     pub(crate) fn file_has_editable_inode(
         &self,
         control: &ControlStore,
-        captured_path: &str,
+        captured_path: &Path,
     ) -> anyhow::Result<bool> {
         let capture_id = match self
             .entries
@@ -1337,7 +1349,7 @@ impl GuardedRootCapturePlan {
     pub(crate) fn captured_file_content_proof(
         &self,
         control: &ControlStore,
-        captured_path: &str,
+        captured_path: &Path,
     ) -> anyhow::Result<IndependentSparseCopy> {
         let (capture_id, source_id) = match self
             .entries
@@ -1355,9 +1367,9 @@ impl GuardedRootCapturePlan {
                     inode: version.inode,
                 },
             ),
-            _ => anyhow::bail!("guarded root has no captured file at {captured_path}"),
+            _ => anyhow::bail!("guarded root has no captured file at {captured_path:?}"),
         };
-        let relative = Path::new(captured_path);
+        let relative = captured_path;
         validate_relative(relative)?;
         let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
         let name = relative
@@ -1544,7 +1556,12 @@ impl GuardedRootCapturePlan {
             );
             for (index, recorded) in snapshot.entries.iter().enumerate() {
                 let (path, expected, directory, planned_mode) = if index == 0 {
-                    ("", self.source_root_identity(), true, self.root_mode)
+                    (
+                        Path::new(""),
+                        self.source_root_identity(),
+                        true,
+                        self.root_mode,
+                    )
                 } else {
                     let planned = &self.entries[index - 1];
                     (
@@ -1566,7 +1583,7 @@ impl GuardedRootCapturePlan {
                         } else {
                             recorded.mode & 0o222 == 0
                         },
-                    "guarded lower ownership entry differs from its capture plan: {path}"
+                    "guarded lower ownership entry differs from its capture plan: {path:?}"
                 );
             }
         }
@@ -1587,7 +1604,7 @@ impl GuardedRootCapturePlan {
         plan.validate()?;
         anyhow::ensure!(
             plan.anchor_id == manifest.anchor_id
-                && manifest.format_version == 2
+                && manifest.format_version == plan.format_version + 1
                 && plan.area == manifest.area
                 && plan.source_root == manifest.source_root_hint
                 && plan.root_mode == manifest.root_mode
@@ -1728,25 +1745,22 @@ impl GuardedRootCapturePlan {
             .open_child_directory(self.anchor_id.to_string())?
             .ok_or_else(|| anyhow::anyhow!("claimed guarded root disappeared"))?;
         anyhow::ensure!(root.identity()? == root_id);
-        let mut opened = BTreeMap::from([(String::new(), root)]);
+        let mut opened = BTreeMap::from([(PathBuf::new(), root)]);
         let claim_kind = self.directory_claim_kind();
         for entry in &self.entries {
             let GuardedRootEntry::Directory { path, .. } = entry else {
                 continue;
             };
-            let relative = Path::new(path);
+            let relative = path.as_path();
             let name = relative
                 .file_name()
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
-            let parent_path = relative
-                .parent()
-                .and_then(|parent| parent.to_str())
-                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent_path = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
             let parent = opened
                 .get(parent_path)
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
             let parent_id = parent.identity()?;
-            let claimed = control.get_record(&claim_kind, path.as_bytes())?;
+            let claimed = control.get_record(&claim_kind, path.as_os_str().as_bytes())?;
             let directory = if let Some(bytes) = claimed {
                 let claim: DirectoryClaim = mb_core::decode_canonical(&bytes)?;
                 let directory = parent
@@ -1755,7 +1769,7 @@ impl GuardedRootCapturePlan {
                 anyhow::ensure!(
                     claim.format_version == 1
                         && claim.anchor_id == self.anchor_id
-                        && claim.path == path.as_str()
+                        && claim.path == *path
                         && claim.parent_id == parent_id
                         && claim.directory_id == directory.identity()?
                         && claim.plan_hash == plan_hash
@@ -1783,7 +1797,7 @@ impl GuardedRootCapturePlan {
                 };
                 anyhow::ensure!(control.put_record_if_absent(
                     &claim_kind,
-                    path.as_bytes(),
+                    path.as_os_str().as_bytes(),
                     &mb_core::canonical_bytes(&claim)?,
                 )?);
                 directory
@@ -1817,7 +1831,7 @@ impl GuardedRootCapturePlan {
             filesystem_id: self.root_version.filesystem_id,
             inode: self.root_version.inode,
         };
-        let mut source_directories = BTreeMap::from([(String::new(), root_parent_id)]);
+        let mut source_directories = BTreeMap::from([(PathBuf::new(), root_parent_id)]);
         let mut captured = Vec::with_capacity(self.entries.len());
         let mut extent_count = 0usize;
         for entry in &self.entries {
@@ -1851,19 +1865,16 @@ impl GuardedRootCapturePlan {
                     modified_secs,
                     modified_nanos,
                 } => {
-                    let relative = Path::new(path);
+                    let relative = path.as_path();
                     let name = relative
                         .file_name()
                         .ok_or(AnchorError::InvalidGuardedPlan)?;
                     let name = Path::new(name);
-                    let parent_path = relative
-                        .parent()
-                        .and_then(|parent| parent.to_str())
-                        .ok_or(AnchorError::InvalidGuardedPlan)?;
+                    let parent_path = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
                     let expected_parent = *source_directories
                         .get(parent_path)
                         .ok_or(AnchorError::InvalidGuardedPlan)?;
-                    let anchor_parent = if parent_path.is_empty() {
+                    let anchor_parent = if parent_path.as_os_str().is_empty() {
                         anchor_root.try_clone()?
                     } else {
                         anchor_root.open_descendant_directory(parent_path)?
@@ -1873,7 +1884,7 @@ impl GuardedRootCapturePlan {
                         if root.identity()? != root_parent_id {
                             return Err(AnchorError::SourceChanged(PathBuf::new()));
                         }
-                        if parent_path.is_empty() {
+                        if parent_path.as_os_str().is_empty() {
                             Ok(root)
                         } else {
                             root.open_descendant_directory(parent_path)
@@ -1887,7 +1898,7 @@ impl GuardedRootCapturePlan {
                         {
                             anchor_parent.try_clone()?
                         }
-                        _ => anyhow::bail!("planned guarded source parent changed: {path}"),
+                        _ => anyhow::bail!("planned guarded source parent changed: {path:?}"),
                     };
                     let expected_source = NativeFileId {
                         filesystem_id: version.filesystem_id,
@@ -1898,7 +1909,7 @@ impl GuardedRootCapturePlan {
                         None => {
                             anyhow::ensure!(
                                 anchor_parent.entry_identity(name, false)?.is_none(),
-                                "unowned guarded file anchor blocks first freeze: {path}"
+                                "unowned guarded file anchor blocks first freeze: {path:?}"
                             );
                             LinkFreezeCaptureIntent::begin_checked(
                                 control,
@@ -1946,7 +1957,9 @@ impl GuardedRootCapturePlan {
                     }
                     let verified = intent
                         .resume(control, &source_parent, &anchor_parent)?
-                        .ok_or_else(|| anyhow::anyhow!("planned guarded source changed: {path}"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("planned guarded source changed: {path:?}")
+                        })?;
                     anyhow::ensure!(matches!(
                         verified.phase(),
                         LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
@@ -1964,7 +1977,7 @@ impl GuardedRootCapturePlan {
                     let proof = verified.content_proof();
                     anyhow::ensure!(
                         proof.logical_len == version.logical_len,
-                        "guarded file proof differs from planned length: {path}"
+                        "guarded file proof differs from planned length: {path:?}"
                     );
                     extent_count = extent_count
                         .checked_add(proof.data_extents.len())
@@ -2004,7 +2017,7 @@ impl GuardedRootCapturePlan {
             .ok_or_else(|| anyhow::anyhow!("claimed guarded root disappeared"))?;
         let manifest_name = capture_manifest_name(self.anchor_id);
         let manifest = StableAnchorManifest {
-            format_version: 2,
+            format_version: self.format_version + 1,
             anchor_id: self.anchor_id,
             source_root_hint: self.source_root.clone(),
             area: self.area.clone(),
@@ -2085,13 +2098,10 @@ impl GuardedRootCapturePlan {
         let current_relative_path = current_relative_path.as_ref();
         validate_relative(captured_relative_path)?;
         validate_relative(current_relative_path)?;
-        let captured_path = captured_relative_path
-            .to_str()
-            .ok_or(AnchorError::NonUtf8Path)?;
         let entry = self
             .entries
             .iter()
-            .find(|entry| entry.path() == captured_path)
+            .find(|entry| entry.path() == captured_relative_path)
             .ok_or_else(|| anyhow::anyhow!("file is not in the guarded root capture"))?;
         let GuardedRootEntry::File {
             capture_id,
@@ -2220,10 +2230,9 @@ impl GuardedRootCapturePlan {
                 anyhow::bail!("invalid guarded root file parent");
             };
             path.push(name);
-            let path_name = path.to_str().ok_or(AnchorError::InvalidGuardedPlan)?;
             let claim: DirectoryClaim = mb_core::decode_canonical(
                 &control
-                    .get_record(&claim_kind, path_name.as_bytes())?
+                    .get_record(&claim_kind, path.as_os_str().as_bytes())?
                     .ok_or_else(|| anyhow::anyhow!("guarded root file parent claim disappeared"))?,
             )?;
             let child = parent
@@ -2232,7 +2241,7 @@ impl GuardedRootCapturePlan {
             anyhow::ensure!(
                 claim.format_version == 1
                     && claim.anchor_id == self.anchor_id
-                    && claim.path == path_name
+                    && claim.path == path
                     && claim.parent_id == parent.identity()?
                     && claim.directory_id == child.identity()?
                     && claim.plan_hash == plan_hash
@@ -2249,34 +2258,30 @@ impl GuardedRootCapturePlan {
         anchor_root: &PinnedDirectory,
         manifest_name: &str,
     ) -> anyhow::Result<()> {
-        let mut expected = BTreeMap::<String, BTreeSet<String>>::new();
-        expected.entry(String::new()).or_default();
+        let mut expected = BTreeMap::<PathBuf, BTreeSet<Vec<u8>>>::new();
+        expected.entry(PathBuf::new()).or_default();
         for entry in &self.entries {
-            let relative = Path::new(entry.path());
+            let relative = entry.path();
             let name = relative
                 .file_name()
-                .and_then(|name| name.to_str())
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
-            let parent = relative
-                .parent()
-                .and_then(|parent| parent.to_str())
-                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
             expected
                 .entry(parent.to_owned())
                 .or_default()
-                .insert(name.to_owned());
+                .insert(name.as_bytes().to_vec());
             if entry.is_directory() {
                 expected.entry(entry.path().to_owned()).or_default();
             }
         }
         if anchor_root.entry_identity(manifest_name, false)?.is_some() {
             expected
-                .get_mut("")
+                .get_mut(Path::new(""))
                 .ok_or(AnchorError::InvalidGuardedPlan)?
-                .insert(manifest_name.to_owned());
+                .insert(manifest_name.as_bytes().to_vec());
         }
         for (path, names) in expected {
-            let directory = if path.is_empty() {
+            let directory = if path.as_os_str().is_empty() {
                 anchor_root.try_clone()?
             } else {
                 anchor_root.open_descendant_directory(&path)?
@@ -2284,11 +2289,11 @@ impl GuardedRootCapturePlan {
             let mut actual = BTreeSet::new();
             let mut stream = DirectoryStream::open(directory.as_file())?;
             while let Some(name) = stream.next_name()? {
-                actual.insert(String::from_utf8(name.as_bytes().to_vec())?);
+                actual.insert(name.as_bytes().to_vec());
             }
             anyhow::ensure!(
                 actual == names,
-                "guarded anchor contains unknown entries: {path}"
+                "guarded anchor contains unknown entries: {path:?}"
             );
         }
         Ok(())
@@ -2465,7 +2470,7 @@ impl GuardedRootCapturePlan {
             )?);
         }
         let mut source_directories = BTreeMap::from([(
-            String::new(),
+            PathBuf::new(),
             NativeFileId {
                 filesystem_id: self.root_version.filesystem_id,
                 inode: self.root_version.inode,
@@ -2492,16 +2497,13 @@ impl GuardedRootCapturePlan {
             else {
                 continue;
             };
-            let relative = Path::new(path);
+            let relative = path.as_path();
             let name = relative
                 .file_name()
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
             let name = Path::new(name);
-            let parent_path = relative
-                .parent()
-                .and_then(|parent| parent.to_str())
-                .ok_or(AnchorError::InvalidGuardedPlan)?;
-            let anchor_parent = if parent_path.is_empty() {
+            let parent_path = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+            let anchor_parent = if parent_path.as_os_str().is_empty() {
                 anchor_root.try_clone()?
             } else {
                 anchor_root.open_descendant_directory(parent_path)?
@@ -2509,7 +2511,7 @@ impl GuardedRootCapturePlan {
             let Some(capture) = LinkFreezeCaptureIntent::load(control, *capture_id)? else {
                 anyhow::ensure!(
                     anchor_parent.entry_identity(name, false)?.is_none(),
-                    "guarded root has an unjournaled file anchor: {path}"
+                    "guarded root has an unjournaled file anchor: {path:?}"
                 );
                 LinkFreezeCaptureIntent::finish_completed_retirement(control, *capture_id)?;
                 continue;
@@ -2685,7 +2687,7 @@ impl GuardedRootCapturePlan {
 
     fn open_source_parent_for_retirement(
         &self,
-        parent_path: &str,
+        parent_path: &Path,
         expected: NativeFileId,
     ) -> Result<PinnedDirectory, AnchorError> {
         let root = PinnedDirectory::open(&self.source_root)?;
@@ -2697,7 +2699,7 @@ impl GuardedRootCapturePlan {
         {
             return Err(AnchorError::SourceChanged(PathBuf::new()));
         }
-        let parent = if parent_path.is_empty() {
+        let parent = if parent_path.as_os_str().is_empty() {
             root
         } else {
             root.open_descendant_directory(parent_path)?
@@ -2779,7 +2781,7 @@ impl GuardedRootCapturePlan {
             );
             let manifest: StableAnchorManifest = mb_core::decode_canonical(&encoded)?;
             anyhow::ensure!(
-                manifest.format_version == 2
+                manifest.format_version == self.format_version + 1
                     && manifest.anchor_id == self.anchor_id
                     && manifest.area == self.area
                     && manifest.source_root_hint == self.source_root
@@ -3020,7 +3022,7 @@ impl GuardedRootCapturePlan {
             .collect::<BTreeSet<_>>();
         for (id, _) in control.records(&claim_kind)? {
             anyhow::ensure!(
-                std::str::from_utf8(&id).is_ok_and(|path| planned.contains(path)),
+                planned.contains(Path::new(std::ffi::OsStr::from_bytes(&id))),
                 "guarded root has an unplanned directory claim"
             );
         }
@@ -3035,16 +3037,13 @@ impl GuardedRootCapturePlan {
             let GuardedRootEntry::Directory { path, .. } = entry else {
                 continue;
             };
-            let Some(bytes) = control.get_record(&claim_kind, path.as_bytes())? else {
+            let Some(bytes) = control.get_record(&claim_kind, path.as_os_str().as_bytes())? else {
                 continue;
             };
             let claim: DirectoryClaim = mb_core::decode_canonical(&bytes)?;
-            let relative = Path::new(path);
-            let parent_path = relative
-                .parent()
-                .and_then(|parent| parent.to_str())
-                .ok_or(AnchorError::InvalidGuardedPlan)?;
-            let parent = if parent_path.is_empty() {
+            let relative = path.as_path();
+            let parent_path = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent = if parent_path.as_os_str().is_empty() {
                 root.try_clone()?
             } else {
                 root.open_descendant_directory(parent_path)?
@@ -3052,7 +3051,7 @@ impl GuardedRootCapturePlan {
             anyhow::ensure!(
                 claim.format_version == 1
                     && claim.anchor_id == self.anchor_id
-                    && claim.path == path.as_str()
+                    && claim.path == *path
                     && claim.parent_id == parent.identity()?
                     && claim.plan_hash == plan_hash
                     && root.entry_identity(relative, true)? == Some(claim.directory_id),
@@ -3079,7 +3078,7 @@ impl GuardedRootCapturePlan {
             .collect::<BTreeSet<_>>();
         for (id, _) in control.records(&claim_kind)? {
             anyhow::ensure!(
-                std::str::from_utf8(&id).is_ok_and(|path| planned.contains(path)),
+                planned.contains(Path::new(std::ffi::OsStr::from_bytes(&id))),
                 "guarded root has an unplanned directory claim"
             );
         }
@@ -3097,16 +3096,13 @@ impl GuardedRootCapturePlan {
             let GuardedRootEntry::Directory { path, .. } = entry else {
                 continue;
             };
-            let relative = Path::new(path);
+            let relative = path.as_path();
             let name = relative
                 .file_name()
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
-            let parent_path = relative
-                .parent()
-                .and_then(|parent| parent.to_str())
-                .ok_or(AnchorError::InvalidGuardedPlan)?;
-            let recorded = control.get_record(&claim_kind, path.as_bytes())?;
-            let parent = if parent_path.is_empty() {
+            let parent_path = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+            let recorded = control.get_record(&claim_kind, path.as_os_str().as_bytes())?;
+            let parent = if parent_path.as_os_str().is_empty() {
                 Some(root.try_clone()?)
             } else if root.entry_identity(parent_path, true)?.is_some() {
                 Some(root.open_descendant_directory(parent_path)?)
@@ -3117,11 +3113,11 @@ impl GuardedRootCapturePlan {
                 anyhow::ensure!(recorded.is_none(), "claimed parent directory disappeared");
                 continue;
             };
-            let expected_parent = if parent_path.is_empty() {
+            let expected_parent = if parent_path.as_os_str().is_empty() {
                 claimed_root
             } else {
                 control
-                    .get_record(&claim_kind, parent_path.as_bytes())?
+                    .get_record(&claim_kind, parent_path.as_os_str().as_bytes())?
                     .map(|bytes| mb_core::decode_canonical::<DirectoryClaim>(&bytes))
                     .transpose()?
                     .map(|claim| claim.directory_id)
@@ -3138,7 +3134,7 @@ impl GuardedRootCapturePlan {
                 anyhow::ensure!(
                     claim.format_version == 1
                         && claim.anchor_id == self.anchor_id
-                        && claim.path == path.as_str()
+                        && claim.path == *path
                         && claim.plan_hash == plan_hash
                         && claim.parent_id == parent.identity()?
                         && claim.directory_id.filesystem_id == self.area.filesystem_id
@@ -3157,7 +3153,7 @@ impl GuardedRootCapturePlan {
                 );
             }
             if let Some(bytes) = recorded {
-                control.delete_record_if_value(&claim_kind, path.as_bytes(), &bytes)?;
+                control.delete_record_if_value(&claim_kind, path.as_os_str().as_bytes(), &bytes)?;
             }
         }
         anyhow::ensure!(
@@ -3270,11 +3266,8 @@ fn scan_directory(
         let component = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
         let relative = relative_directory.join(component);
         validate_relative(&relative)?;
-        let path = relative
-            .to_str()
-            .ok_or(AnchorError::NonUtf8Path)?
-            .to_owned();
-        if path.len() > MAX_RELATIVE_PATH_BYTES {
+        let path = relative.clone();
+        if path.as_os_str().as_bytes().len() > MAX_RELATIVE_PATH_BYTES {
             return Err(AnchorError::CatalogTooLarge);
         }
         if depth == 0
@@ -3344,9 +3337,10 @@ fn scan_directory(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Read;
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::Path;
@@ -3422,6 +3416,133 @@ mod tests {
         let encoded = mb_core::canonical_bytes(&entries).unwrap();
         let decoded: Vec<GuardedRootEntry> = mb_core::decode_canonical(&encoded).unwrap();
         assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn raw_guarded_inventory_requires_new_plan_version_and_keeps_exact_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let directory = OsString::from_vec(b"dir-\xfe".to_vec());
+        let file = OsString::from_vec(b"file-\xff".to_vec());
+        fs::create_dir(root.join(&directory)).unwrap();
+        fs::write(root.join(&directory).join(&file), b"raw\r\n\0bytes").unwrap();
+
+        let mut plan = planned_without_privileged_probe(&root);
+        assert_eq!(plan.entries.len(), 2);
+        assert!(matches!(
+            plan.validate(),
+            Err(AnchorError::InvalidGuardedPlan)
+        ));
+        plan.format_version = 2;
+        plan.validate().unwrap();
+        let decoded: GuardedRootCapturePlan =
+            mb_core::decode_canonical(&mb_core::canonical_bytes(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+        decoded
+            .verify_initial_lower_namespace(&PinnedDirectory::open(&root).unwrap())
+            .unwrap();
+        assert_eq!(
+            decoded.entries[0].path().as_os_str().as_bytes(),
+            b"dir-\xfe"
+        );
+        assert_eq!(
+            decoded.entries[1].path().as_os_str().as_bytes(),
+            b"dir-\xfe/file-\xff"
+        );
+    }
+
+    #[test]
+    fn guarded_v1_inventory_keeps_historical_utf8_bytes() {
+        #[derive(serde::Serialize)]
+        enum HistoricalEntry {
+            Directory {
+                path: String,
+                version: CaptureVersion,
+                mode: u32,
+                modified_secs: i64,
+                modified_nanos: u32,
+            },
+            File {
+                path: String,
+                capture_id: Uuid,
+                version: CaptureVersion,
+                mode: u32,
+                modified_secs: i64,
+                modified_nanos: u32,
+            },
+        }
+        #[derive(serde::Serialize)]
+        struct HistoricalPlan {
+            format_version: u16,
+            anchor_id: Uuid,
+            #[serde(with = "crate::raw_path_bytes")]
+            source_root: PathBuf,
+            area: StableAnchorAreaLocator,
+            root_version: CaptureVersion,
+            root_mode: u32,
+            root_modified_secs: i64,
+            root_modified_nanos: u32,
+            entries: Vec<HistoricalEntry>,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("directory")).unwrap();
+        fs::write(root.join("directory/file"), b"payload").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        plan.validate().unwrap();
+        let historical = HistoricalPlan {
+            format_version: plan.format_version,
+            anchor_id: plan.anchor_id,
+            source_root: plan.source_root.clone(),
+            area: plan.area.clone(),
+            root_version: plan.root_version.clone(),
+            root_mode: plan.root_mode,
+            root_modified_secs: plan.root_modified_secs,
+            root_modified_nanos: plan.root_modified_nanos,
+            entries: plan
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    GuardedRootEntry::Directory {
+                        path,
+                        version,
+                        mode,
+                        modified_secs,
+                        modified_nanos,
+                    } => HistoricalEntry::Directory {
+                        path: path.to_str().unwrap().to_owned(),
+                        version: version.clone(),
+                        mode: *mode,
+                        modified_secs: *modified_secs,
+                        modified_nanos: *modified_nanos,
+                    },
+                    GuardedRootEntry::File {
+                        path,
+                        capture_id,
+                        version,
+                        mode,
+                        modified_secs,
+                        modified_nanos,
+                    } => HistoricalEntry::File {
+                        path: path.to_str().unwrap().to_owned(),
+                        capture_id: *capture_id,
+                        version: version.clone(),
+                        mode: *mode,
+                        modified_secs: *modified_secs,
+                        modified_nanos: *modified_nanos,
+                    },
+                })
+                .collect(),
+        };
+        let bytes = mb_core::canonical_bytes(&historical).unwrap();
+        assert_eq!(bytes, mb_core::canonical_bytes(&plan).unwrap());
+        assert_eq!(
+            mb_core::decode_canonical::<GuardedRootCapturePlan>(&bytes).unwrap(),
+            plan
+        );
     }
 
     #[test]
@@ -3544,7 +3665,7 @@ mod tests {
         let GuardedRootEntry::File { path, .. } = &mut aliased_path.entries[1] else {
             panic!("expected nested file");
         };
-        *path = "dir//first".to_owned();
+        *path = "dir//first".into();
         assert!(matches!(
             aliased_path.validate(),
             Err(AnchorError::InvalidGuardedPlan)
@@ -4016,7 +4137,7 @@ mod tests {
             snapshot
                 .entries
                 .iter()
-                .map(|entry| entry.path.as_str())
+                .map(|entry| entry.path.to_str().unwrap())
                 .collect::<Vec<_>>(),
             ["", "nested", "nested/file"]
         );
@@ -4272,7 +4393,7 @@ mod tests {
         for entry in snapshot
             .entries
             .iter()
-            .filter(|entry| entry.path == "a" || entry.path == "nested/b")
+            .filter(|entry| entry.path == Path::new("a") || entry.path == Path::new("nested/b"))
         {
             assert_eq!((entry.uid, entry.gid), (65534, 65534));
         }

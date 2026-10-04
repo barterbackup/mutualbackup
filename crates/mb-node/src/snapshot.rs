@@ -1080,7 +1080,10 @@ pub(crate) fn prepare_revision(
                     modified_nanos,
                 } => {
                     private_entries.push(PrivateEntry::Directory {
-                        path: path.clone(),
+                        path: path
+                            .to_str()
+                            .context("reflink capture has a raw path")?
+                            .to_owned(),
                         mode: *mode,
                         modified_secs: *modified_secs,
                         modified_nanos: *modified_nanos,
@@ -1093,7 +1096,7 @@ pub(crate) fn prepare_revision(
                     modified_secs,
                     modified_nanos,
                 } => {
-                    let locator = anchor.manifest.file_locator(path.clone())?;
+                    let locator = anchor.manifest.file_locator_path(path)?;
                     let mut file = locator.open().context("open captured anchor file")?;
                     let mut remaining = *logical_len;
                     let mut offset = 0_u64;
@@ -1131,7 +1134,10 @@ pub(crate) fn prepare_revision(
                         remaining -= logical_len as u64;
                     }
                     private_entries.push(PrivateEntry::File {
-                        path: path.clone(),
+                        path: path
+                            .to_str()
+                            .context("reflink capture has a raw path")?
+                            .to_owned(),
                         mode: *mode,
                         logical_len: *logical_len,
                         modified_secs: *modified_secs,
@@ -1150,7 +1156,10 @@ pub(crate) fn prepare_revision(
                 } => {
                     if let Some(link_group) = prepared_links.get(native_id) {
                         private_entries.push(PrivateEntry::HardLinkV3 {
-                            path: path.clone(),
+                            path: path
+                                .to_str()
+                                .context("reflink capture has a raw path")?
+                                .to_owned(),
                             mode: *mode,
                             logical_len: *logical_len,
                             modified_secs: *modified_secs,
@@ -1159,7 +1168,7 @@ pub(crate) fn prepare_revision(
                         });
                         continue;
                     }
-                    let locator = anchor.manifest.file_locator(path.clone())?;
+                    let locator = anchor.manifest.file_locator_path(path)?;
                     let private_extents = prepare_sparse_file(
                         &mut recipe_records,
                         keys,
@@ -1184,7 +1193,10 @@ pub(crate) fn prepare_revision(
                         .context("too many hard-link groups in one revision")?;
                     prepared_links.insert(*native_id, link_group);
                     private_entries.push(PrivateEntry::FileV2 {
-                        path: path.clone(),
+                        path: path
+                            .to_str()
+                            .context("reflink capture has a raw path")?
+                            .to_owned(),
                         mode: *mode,
                         logical_len: *logical_len,
                         modified_secs: *modified_secs,
@@ -2772,9 +2784,13 @@ fn validate_recovered_manifest(
                 | CapturedEntry::File { path, .. }
                 | CapturedEntry::FileV2 { path, .. } => path,
             };
-            (path.as_str(), entry)
+            Ok((
+                path.to_str()
+                    .context("recovered reflink anchor has a raw path")?,
+                entry,
+            ))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>>>()?;
     if captured.len() != manifest.entries.len() {
         bail!("recovered anchor contains duplicate paths");
     }
@@ -4745,7 +4761,7 @@ mod metadata_compatibility_tests {
                         volume_root_hint: temporary.path().to_path_buf(),
                     },
                     anchor_id,
-                    relative_path: "payload".to_owned(),
+                    relative_path: "payload".into(),
                 },
                 offset: 0,
             },

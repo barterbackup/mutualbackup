@@ -5521,7 +5521,7 @@ mod tests {
             .map(|entry| match entry {
                 mb_store::CapturedEntry::Directory { path, .. }
                 | mb_store::CapturedEntry::File { path, .. }
-                | mb_store::CapturedEntry::FileV2 { path, .. } => path.as_str(),
+                | mb_store::CapturedEntry::FileV2 { path, .. } => path.to_str().unwrap(),
             })
             .collect::<Vec<_>>();
         assert!(paths.contains(&"tracked"));

@@ -878,11 +878,18 @@
   Production protected-root removal must retire the claimed view, and guarded
   Git pins must join this proof before guarded enrollment or Git operations
   can select the backend.
-  A recovered format-6 view can contain raw Unix names, while the current
-  guarded root capture plan and sealed root manifest still store entry paths
-  as UTF-8 strings. Reconstructing a guarded view from signed recovery needs
-  a versioned raw-path root plan and manifest before it can mount every valid
-  signed namespace without changing its names.
+  Guarded root capture now uses a version-2 plan and version-3 sealed manifest
+  when an entry has raw Unix path bytes; version-1/2 UTF-8 records keep their
+  prior bytes. Directory claims, lower ownership, freeze journals, namespace
+  records, captured entries, and anchor locators carry those raw names through
+  capture and remount. A normal test verifies raw nested inventory and rejects
+  it under the old plan version; another checks historical UTF-8 plan bytes.
+  The privileged node mount/restart test now includes a raw directory and
+  nested raw filename, edits it through FUSE while preserving its original
+  anchor, signs its guarded stopped capture, restores its exact bytes on ext4
+  and Btrfs, and exercises same-seed recovery/reanchor on Btrfs.
+  Reconstructing a guarded FUSE view from signed recovery on a non-reflink
+  filesystem remains open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
