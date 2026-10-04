@@ -2335,6 +2335,27 @@ impl GuardedViewMount {
         })
     }
 
+    /// Keep a validated guarded attempt's Git graph intent across startup,
+    /// including while its visible-file capture is still being prepared.
+    pub fn has_stopped_capture_attempt(
+        attempt_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<bool> {
+        let Some(bytes) = control.get_record(STOPPED_CAPTURE_KIND, attempt_id.as_bytes())? else {
+            return Ok(false);
+        };
+        ensure!(
+            bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+            "guarded stopped-capture intent exceeds its local bound"
+        );
+        let intent: StoppedCaptureIntent = mb_core::decode_canonical(&bytes)?;
+        intent.validate(attempt_id.as_bytes())?;
+        if let Some(capture) = &intent.published {
+            capture.verify()?;
+        }
+        Ok(true)
+    }
+
     /// Return the exact published intent bytes for a database transaction
     /// that transfers its pins to a signed revision capture record.
     pub fn published_stopped_capture_attempt(

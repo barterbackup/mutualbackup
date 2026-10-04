@@ -61,6 +61,8 @@ const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE
 const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
 const RESTORE_JOB_KIND: &str = "restore-job";
 const GIT_GRAPH_INTENT_KIND: &str = "git-graph-intent-v1";
+#[cfg(target_os = "linux")]
+const GUARDED_GIT_SIGNED_KIND: &str = "guarded-git-signed-v1";
 
 #[derive(Serialize, Deserialize)]
 struct RawLocalPath(
@@ -468,10 +470,57 @@ fn prepare_git_graph_intent(
     protected_root_id: Uuid,
     source_root: &Path,
 ) -> Result<Option<GitGraphIntent>> {
+    prepare_git_graph_intent_with_catalog_root(
+        control,
+        keys,
+        guild_id,
+        revision_id,
+        protected_root_id,
+        source_root,
+        source_root,
+        SourceBackendKind::ReflinkV1,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Production selection waits for the guarded graph recovery gate.
+pub(crate) fn prepare_guarded_git_graph_intent(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    protected_root_id: Uuid,
+    source_root: &Path,
+    catalog_root: &Path,
+) -> Result<bool> {
+    Ok(prepare_git_graph_intent_with_catalog_root(
+        control,
+        keys,
+        guild_id,
+        revision_id,
+        protected_root_id,
+        source_root,
+        catalog_root,
+        SourceBackendKind::GuardedLinkFreezeV1,
+    )?
+    .is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_git_graph_intent_with_catalog_root(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    protected_root_id: Uuid,
+    source_root: &Path,
+    catalog_root: &Path,
+    source_backend: SourceBackendKind,
+) -> Result<Option<GitGraphIntent>> {
     let registration = control.get_record("git-repository", protected_root_id.as_bytes())?;
     let existing = control.get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())?;
     let Some(registration) = registration else {
-        if existing.is_some() || git_catalog_marker(source_root)?.is_some() {
+        if existing.is_some() || git_catalog_marker(catalog_root)?.is_some() {
             bail!(
                 "Git catalog marker or backup intent has no matching protected-root registration"
             );
@@ -482,7 +531,7 @@ fn prepare_git_graph_intent(
     if info.format_version != 1
         || info.repository_id != protected_root_id
         || info.path != source_root
-        || git_catalog_marker(source_root)? != Some(protected_root_id)
+        || git_catalog_marker(catalog_root)? != Some(protected_root_id)
     {
         bail!("protected Git root registration or marker changed before backup");
     }
@@ -506,7 +555,13 @@ fn prepare_git_graph_intent(
         return Ok(Some(intent));
     }
     let catalog_key = mb_git::catalog_key(keys, protected_root_id);
-    let repository = GitRepository::open(source_root, protected_root_id, &catalog_key)?;
+    let repository = GitRepository::open_with_catalog_root(
+        source_root,
+        catalog_root,
+        protected_root_id,
+        &catalog_key,
+        source_backend,
+    )?;
     let graph = repository.export_graph_source()?;
     let head_branch = repository.selected_branch()?;
     let intent = GitGraphIntent {
@@ -656,6 +711,10 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
             .get_record("capture-intent", intent.revision_id.as_bytes())?
             .is_none()
         {
+            #[cfg(target_os = "linux")]
+            if GuardedViewMount::has_stopped_capture_attempt(intent.revision_id, control)? {
+                continue;
+            }
             control.delete_record(GIT_GRAPH_INTENT_KIND, &record_id)?;
         }
     }
@@ -835,6 +894,7 @@ pub(crate) fn retire_revision_anchor_with_recipe_pins(
             control,
             recipe_anchors,
         )?;
+        control.delete_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?;
         return Ok(true);
     }
     #[cfg(target_os = "linux")]
@@ -874,6 +934,13 @@ pub(crate) fn retire_revision_anchor_with_recipe_pins(
         return Ok(true);
     }
     let Some(bytes) = control.get_record("anchor-manifest", revision_id.as_bytes())? else {
+        #[cfg(target_os = "linux")]
+        if control
+            .get_record("user-revision", revision_id.as_bytes())?
+            .is_none()
+        {
+            control.delete_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?;
+        }
         return Ok(true);
     };
     let manifest: mb_store::StableAnchorManifest = decode_canonical(&bytes)?;
@@ -1398,6 +1465,82 @@ pub(crate) fn prepare_guarded_revision(
     writer: WriterCredentials<'_>,
 ) -> Result<SignedRecord<UserRevision>> {
     require_guarded_git_graph_absent(control, protected_root_id, revision_id)?;
+    prepare_guarded_revision_with_graph(
+        control,
+        keys,
+        guild_id,
+        protected_root_id,
+        root_anchor_id,
+        sequence,
+        revision_id,
+        writer,
+        false,
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prepare_guarded_git_revision(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    protected_root_id: Uuid,
+    root_anchor_id: Uuid,
+    sequence: u64,
+    revision_id: Uuid,
+    writer: WriterCredentials<'_>,
+) -> Result<SignedRecord<UserRevision>> {
+    let graph = control
+        .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())?
+        .map(|bytes| decode_git_graph_intent(&bytes).map(|(intent, _)| intent))
+        .transpose()?;
+    if graph.is_none()
+        && control
+            .get_record("user-revision", revision_id.as_bytes())?
+            .is_none()
+    {
+        bail!("guarded Git revision has no durable graph intent");
+    }
+    prepare_guarded_revision_with_graph(
+        control,
+        keys,
+        guild_id,
+        protected_root_id,
+        root_anchor_id,
+        sequence,
+        revision_id,
+        writer,
+        true,
+        graph,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_guarded_revision_with_graph(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    protected_root_id: Uuid,
+    root_anchor_id: Uuid,
+    sequence: u64,
+    revision_id: Uuid,
+    writer: WriterCredentials<'_>,
+    expect_git: bool,
+    git_graph: Option<GitGraphIntent>,
+) -> Result<SignedRecord<UserRevision>> {
+    if let Some(graph) = &git_graph {
+        validate_git_graph_intent(graph)?;
+        if !expect_git
+            || graph.guild_id != guild_id
+            || graph.revision_id != revision_id
+            || graph.protected_root_id != protected_root_id
+            || graph.graph.repository_id != protected_root_id
+        {
+            bail!("guarded Git graph intent conflicts with the revision");
+        }
+    }
     let writer_key = SigningKey::from_bytes(writer.secret);
     if let Some(bytes) = control.get_record("user-revision", revision_id.as_bytes())? {
         let existing: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
@@ -1418,6 +1561,16 @@ pub(crate) fn prepare_guarded_revision(
             .context("committed guarded revision lost its local anchor map")?;
         if retained.capture.metadata.anchor_id != root_anchor_id {
             bail!("guarded revision retry belongs to another root anchor");
+        }
+        let signed_git = control
+            .get_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?
+            .map(|bytes| decode_canonical::<[u8; 32]>(&bytes))
+            .transpose()?;
+        let revision_hash = existing.value.hash()?;
+        if signed_git.is_some() != expect_git
+            || signed_git.is_some_and(|hash| hash != revision_hash)
+        {
+            bail!("guarded revision retry differs from its signed Git graph mode");
         }
         return Ok(existing);
     }
@@ -1481,7 +1634,32 @@ pub(crate) fn prepare_guarded_revision(
             }
         }
     }
-    let metadata_bytes = canonical_bytes(&metadata)?;
+    let metadata_bytes = if let Some(graph) = git_graph.clone() {
+        let git = prepare_git_backup_descriptor(
+            &mut recipes,
+            &mut data_references,
+            keys,
+            guild_id,
+            protected_root_id,
+            &content_id_key,
+            &mut ordinal,
+            &mut commitments,
+            graph,
+        )?;
+        let private = GuardedGitPrivateMetadataV7 {
+            format_version: 7,
+            guarded: metadata,
+            git,
+        };
+        private.validate(protected_root_id)?;
+        canonical_bytes(&private)?
+    } else {
+        canonical_bytes(&metadata)?
+    };
+    // A Git blob may contain the same sector as a visible guarded file. Keep
+    // the visible file's already-pinned root recipe in that case.
+    let mut recipe_ids = BTreeSet::new();
+    recipes.retain(|(kind, id, _)| kind != "local-sector" || recipe_ids.insert(id.clone()));
     let mut metadata_references = Vec::new();
     for plaintext in metadata_bytes.chunks(V1_SECTOR_SIZE) {
         let id = make_content_sector_id(
@@ -1551,6 +1729,17 @@ pub(crate) fn prepare_guarded_revision(
             bail!("guarded capture uses conflicting anchor-area hints");
         }
     }
+    if let Some(graph) = &git_graph {
+        for blob in &graph.graph.blobs {
+            let area = &blob.anchor.area;
+            if areas
+                .insert(area.area_id, area.path_hint.clone())
+                .is_some_and(|path| path != area.path_hint)
+            {
+                bail!("guarded Git graph uses conflicting anchor-area hints");
+            }
+        }
+    }
     for (area_id, hint) in areas {
         recipes.push((
             ANCHOR_AREA_LOCATION_KIND.to_owned(),
@@ -1575,6 +1764,13 @@ pub(crate) fn prepare_guarded_revision(
             canonical_bytes(&revision)?,
         ),
     ]);
+    if git_graph.is_some() {
+        recipes.push((
+            GUARDED_GIT_SIGNED_KIND.to_owned(),
+            revision_id.as_bytes().to_vec(),
+            canonical_bytes(&revision.value.hash()?)?,
+        ));
+    }
     if let Some(change_sequence) = writer.captured_change_sequence {
         recipes.push((
             "revision-root-change".to_owned(),
@@ -1583,6 +1779,10 @@ pub(crate) fn prepare_guarded_revision(
         ));
     }
     control.finalize_guarded_capture_records(revision_id.as_bytes(), &attempt_bytes, &recipes)?;
+    if git_graph.is_some() {
+        // Startup also retires this intent if a crash follows publication.
+        let _ = control.delete_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes());
+    }
     Ok(revision)
 }
 
@@ -5244,6 +5444,93 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_graph_intent_reads_private_catalog_and_survives_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let view = temporary.path().join("view");
+        let lower = temporary.path().join("lower");
+        fs::create_dir(&view).unwrap();
+        fs::create_dir(&lower).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([219; 32]));
+        let control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
+        let repository_id = Uuid::new_v4();
+        let revision_id = Uuid::new_v4();
+        let guild_id = [220; 32];
+        let catalog_key = mb_git::catalog_key(&keys, repository_id);
+        GitRepository::init_with_catalog_root(
+            &view,
+            &lower,
+            repository_id,
+            &catalog_key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        control
+            .put_record(
+                "git-repository",
+                repository_id.as_bytes(),
+                &canonical_bytes(&crate::control::GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id,
+                    path: view.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            prepare_guarded_git_graph_intent(
+                &control,
+                &keys,
+                guild_id,
+                revision_id,
+                repository_id,
+                &view,
+                &lower,
+            )
+            .unwrap()
+        );
+        let encoded = control
+            .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        let (intent, migrated) = decode_git_graph_intent(&encoded).unwrap();
+        assert!(!migrated);
+        assert_eq!(intent.graph.repository_id, repository_id);
+        assert!(intent.graph.refs.is_empty());
+        assert!(
+            prepare_guarded_git_graph_intent(
+                &control,
+                &keys,
+                guild_id,
+                revision_id,
+                repository_id,
+                &view,
+                &lower,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            control
+                .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+            encoded
+        );
+        assert!(
+            prepare_guarded_git_graph_intent(
+                &control,
+                &keys,
+                guild_id,
+                revision_id,
+                repository_id,
+                &lower,
+                &view,
+            )
+            .is_err()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

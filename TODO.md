@@ -149,7 +149,18 @@
   after catalog retirement, and confirm replay releases only Git ownership
   while the edited visible file and signed root recipe survive. Production
   signed graph capture, broader multi-blob/source-loss cases, and the
-  five-member seed-only gate remain open.
+  five-member seed-only gate remain open. A test-selected guarded signer now
+  has a format-7 path that captures the registered private Git catalog into a
+  durable graph intent before stopping the view, signs reachable objects and
+  blob sectors with the guarded namespace, keeps shared visible-file recipes,
+  and retains the intent across startup while a stopped capture owns its
+  anchors. A signed-mode record makes committed retries independent of local
+  metadata recipes. A normal catalog-intent test and privileged ext4 and
+  disposable Btrfs probes cover a reachable commit/blob, intent retention
+  through startup reconciliation,
+  sector-recipe sharing, signing, and retry. Production node selection still
+  refuses guarded Git until the complete graph-pinning, source-loss and
+  five-member seed-only gate proves this path end to end.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

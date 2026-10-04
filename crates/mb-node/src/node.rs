@@ -28566,6 +28566,186 @@ pub(crate) mod tests {
                 .capture,
             capture
         );
+        // A second stopped capture signs the hidden guarded Git catalog as a
+        // format-7 graph. Reconciliation must keep its intent while the
+        // stopped capture owns the visible-file anchors.
+        let graph_revision_id = Uuid::new_v4();
+        let git_key = recovered.git_catalog_key(protected_root_id);
+        let guarded_git = GitRepository::init_with_catalog_root(
+            &lower,
+            &lower,
+            protected_root_id,
+            &git_key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let source_git =
+            git2::Repository::init_bare(area.path().join("captured-git-graph")).unwrap();
+        let source_blob_oid = source_git.blob(&captured_bytes).unwrap();
+        let mut source_tree = source_git.treebuilder(None).unwrap();
+        source_tree
+            .insert("sample", source_blob_oid, 0o100644)
+            .unwrap();
+        let source_tree_oid = source_tree.write().unwrap();
+        let source_tree = source_git.find_tree(source_tree_oid).unwrap();
+        let source_signature = git2::Signature::now("Author", "author@example.test").unwrap();
+        let source_commit_oid = source_git
+            .commit(
+                None,
+                &source_signature,
+                &source_signature,
+                "captured",
+                &source_tree,
+                &[],
+            )
+            .unwrap();
+        let source_odb = source_git.odb().unwrap();
+        let mut source_objects = [(source_commit_oid, 1_u8), (source_tree_oid, 2_u8)]
+            .into_iter()
+            .map(|(oid, kind)| mb_git::GitGraphObject {
+                kind,
+                oid: oid.as_bytes().try_into().unwrap(),
+                bytes: source_odb.read(oid).unwrap().data().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        source_objects.sort_by_key(|object| object.oid);
+        let source_private = crate::GuardedPrivateMetadataV6::decode(
+            &crate::snapshot::load_private_metadata_bytes(
+                &recovered.control,
+                &keys,
+                guild_id,
+                &signed,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let source_extents = source_private
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                crate::GuardedPrivateEntryV6::File {
+                    path, data_extents, ..
+                } if path == b"sample" => Some(data_extents),
+                _ => None,
+            })
+            .unwrap();
+        let source_descriptor = GitBackupDescriptor {
+            format_version: 2,
+            repository_id: protected_root_id,
+            refs: vec![mb_git::GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: source_commit_oid.as_bytes().try_into().unwrap(),
+            }],
+            objects: source_objects,
+            blobs: vec![mb_git::GitBackupBlob {
+                oid: source_blob_oid.as_bytes().try_into().unwrap(),
+                logical_len: captured_bytes.len() as u64,
+                data_extents: source_extents
+                    .iter()
+                    .map(|extent| mb_git::GitDataExtent {
+                        offset: extent.offset,
+                        logical_len: extent.logical_len,
+                        sectors: extent.sectors.clone(),
+                    })
+                    .collect(),
+            }],
+            head_branch: "main".to_owned(),
+        };
+        source_descriptor.validate().unwrap();
+        let source_anchor =
+            mb_store::SourceBlobImportPlan::plan_direct(&lower, captured_bytes.len() as u64)
+                .unwrap()
+                .capture(std::io::Cursor::new(&captured_bytes))
+                .unwrap();
+        guarded_git
+            .import_backup(&source_descriptor, &[source_anchor])
+            .unwrap();
+        drop(guarded_git);
+        recovered
+            .control
+            .put_record(
+                "git-repository",
+                protected_root_id.as_bytes(),
+                &canonical_bytes(&GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id: protected_root_id,
+                    path: view.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            crate::snapshot::prepare_guarded_git_graph_intent(
+                &recovered.control,
+                &keys,
+                guild_id,
+                graph_revision_id,
+                protected_root_id,
+                &view,
+                &lower,
+            )
+            .unwrap()
+        );
+        recovered
+            .capture_claimed_guarded_view_for_revision(manifest.anchor_id, graph_revision_id)
+            .unwrap();
+        crate::snapshot::reconcile_pending_captures(&recovered.control).unwrap();
+        assert!(
+            recovered
+                .control
+                .get_record("git-graph-intent-v1", graph_revision_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        let sign_git = |control: &mut ControlStore| {
+            crate::snapshot::prepare_guarded_git_revision(
+                control,
+                &keys,
+                guild_id,
+                protected_root_id,
+                manifest.anchor_id,
+                2,
+                graph_revision_id,
+                WriterCredentials {
+                    epoch: 1,
+                    secret: &writer_secret,
+                    captured_change_sequence: None,
+                },
+            )
+        };
+        let signed_git = sign_git(&mut recovered.control).unwrap();
+        let metadata_id = signed_git.value.metadata_sectors[0].id;
+        let metadata_recipe = recovered
+            .control
+            .get_record("local-sector", &metadata_id)
+            .unwrap()
+            .unwrap();
+        recovered
+            .control
+            .delete_record("local-sector", &metadata_id)
+            .unwrap();
+        assert_eq!(sign_git(&mut recovered.control).unwrap(), signed_git);
+        recovered
+            .control
+            .put_record("local-sector", &metadata_id, &metadata_recipe)
+            .unwrap();
+        assert_eq!(signed_git.value.parent, Some(signed.value.hash().unwrap()));
+        let graph =
+            crate::snapshot::revision_git_backup(&recovered.control, &keys, guild_id, &signed_git)
+                .unwrap()
+                .unwrap();
+        assert_eq!(graph.repository_id, protected_root_id);
+        assert_eq!(graph.refs, source_descriptor.refs);
+        assert_eq!(graph.objects, source_descriptor.objects);
+        assert_eq!(graph.blobs.len(), 1);
+        assert_eq!(graph.blobs[0].oid, source_blob_oid.as_bytes());
+        assert!(
+            recovered
+                .control
+                .get_record("git-graph-intent-v1", graph_revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
         let restored = area.path().join("restored");
         crate::snapshot::restore_revision_from_source(
             &recovered.control,
@@ -29466,6 +29646,26 @@ pub(crate) mod tests {
         assert!(retire_revision_anchor(&mut control, revision_id).unwrap());
         assert!(
             GuardedViewMount::load_revision_capture(revision_id, &control)
+                .unwrap()
+                .is_none()
+        );
+        control
+            .delete_record("user-revision", graph_revision_id.as_bytes())
+            .unwrap();
+        for reference in signed_git
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&signed_git.value.data_sectors)
+        {
+            control
+                .delete_record("local-sector", &reference.id)
+                .unwrap();
+        }
+        assert!(retire_revision_anchor(&mut control, graph_revision_id).unwrap());
+        assert!(
+            control
+                .get_record("guarded-git-signed-v1", graph_revision_id.as_bytes())
                 .unwrap()
                 .is_none()
         );
