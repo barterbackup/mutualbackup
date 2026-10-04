@@ -1,4 +1,4 @@
-//! Bounded, read-only inventory for a future guarded whole-root capture.
+//! Bounded, read-only inventory for guarded whole-root capture.
 //! The node must persist this plan before freezing any listed file. A root is
 //! not eligible for enrollment until capture, replay, and retirement consume
 //! this inventory through the versioned source-backend boundary.
@@ -23,6 +23,9 @@ use super::{
     git_catalog_marker_from_root, modified_parts, open_path_no_xdev_beneath, open_source_beneath,
     open_source_root, open_stable_anchor_area, probe_guarded_link_freeze, reopen_pinned_file,
     resolve_anchor_area, unix_mode, validate_relative,
+};
+use crate::guarded_view_probe::{
+    GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
 };
 use crate::link_freeze::{AccessAclSnapshot, FileOwner, read_access_acl};
 use crate::{
@@ -346,6 +349,164 @@ impl GuardedRootCapturePlan {
 
     pub fn source_root(&self) -> &Path {
         &self.source_root
+    }
+
+    /// Snapshot the original presentation metadata before a same-path
+    /// handoff changes the root owner and mode. Every entry must still match
+    /// this plan's captured version; a concurrent edit aborts the handoff
+    /// before any source ownership is changed. The caller may later rebind
+    /// only `anchor_id` to a plan of the same inodes at the hidden lower path.
+    pub fn snapshot_original_view_metadata(&self) -> anyhow::Result<GuardedViewMetadataV1> {
+        self.validate()?;
+        let root = PinnedDirectory::open(&self.source_root)?;
+        anyhow::ensure!(
+            root.identity()? == self.source_root_identity(),
+            "guarded presentation root changed since planning"
+        );
+        let root_metadata = root.as_file().metadata()?;
+        anyhow::ensure!(
+            capture_version(self.root_version.filesystem_id, &root_metadata) == self.root_version
+                && unix_mode(&root_metadata) == self.root_mode,
+            "guarded presentation root metadata changed since planning"
+        );
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for planned in &self.entries {
+            let path = planned.path();
+            let metadata = if planned.is_directory() {
+                root.open_descendant_directory(path)?.as_file().metadata()?
+            } else {
+                let parent = path.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+                let directory = if parent.as_os_str().is_empty() {
+                    root.try_clone()?
+                } else {
+                    root.open_descendant_directory(parent)?
+                };
+                directory
+                    .open_child_file(path.file_name().ok_or(AnchorError::InvalidGuardedPlan)?)?
+                    .ok_or_else(|| anyhow::anyhow!("guarded presentation file disappeared"))?
+                    .metadata()?
+            };
+            let (planned_mode, _, _) = planned.mode_and_modified();
+            anyhow::ensure!(
+                capture_version(self.root_version.filesystem_id, &metadata) == *planned.version()
+                    && unix_mode(&metadata) == planned_mode,
+                "guarded presentation entry changed since planning: {path:?}"
+            );
+            entries.push(GuardedViewMetadataEntry {
+                path: path.as_os_str().as_bytes().to_vec(),
+                kind: if planned.is_directory() {
+                    GuardedViewEntryKind::Directory
+                } else {
+                    GuardedViewEntryKind::File
+                },
+                native_id: NativeFileId {
+                    filesystem_id: self.root_version.filesystem_id,
+                    inode: metadata.ino(),
+                },
+                mode: (unix_mode(&metadata) & 0o7777) as u16,
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                logical_len: metadata.len(),
+                atime_secs: metadata.atime(),
+                atime_nanos: u32::try_from(metadata.atime_nsec())?,
+                modified_secs: metadata.mtime(),
+                modified_nanos: u32::try_from(metadata.mtime_nsec())?,
+            });
+        }
+        let snapshot = GuardedViewMetadataV1 {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            lower_root_id: self.source_root_identity(),
+            root_mode: (self.root_mode & 0o7777) as u16,
+            root_uid: root_metadata.uid(),
+            root_gid: root_metadata.gid(),
+            root_atime_secs: root_metadata.atime(),
+            root_atime_nanos: u32::try_from(root_metadata.atime_nsec())?,
+            root_modified_secs: root_metadata.mtime(),
+            root_modified_nanos: u32::try_from(root_metadata.mtime_nsec())?,
+            entries,
+        };
+        snapshot.validate_shape()?;
+        Ok(snapshot)
+    }
+
+    /// Bind a pre-handoff presentation snapshot to the same inodes after the
+    /// original root has moved to its private lower name. Only the root's
+    /// ownership/mode may have changed during that move; entry identities,
+    /// modes and file lengths must still match the fresh lower inventory.
+    pub fn rebind_original_view_metadata(
+        &self,
+        original: &GuardedViewMetadataV1,
+    ) -> anyhow::Result<GuardedViewMetadataV1> {
+        self.validate()?;
+        original.validate_shape()?;
+        anyhow::ensure!(
+            original.lower_root_id == self.source_root_identity()
+                && original.entries.len() == self.entries.len(),
+            "guarded handoff snapshot belongs to another lower root"
+        );
+        if original.anchor_id == self.anchor_id {
+            anyhow::ensure!(
+                original.root_mode == (self.root_mode & 0o7777) as u16
+                    && original.root_modified_secs == self.root_modified_secs
+                    && original.root_modified_nanos == self.root_modified_nanos,
+                "guarded original root presentation differs from its inventory"
+            );
+        }
+        for (visible, planned) in original.entries.iter().zip(&self.entries) {
+            let expected = planned.version();
+            let (mode, _, _) = planned.mode_and_modified();
+            anyhow::ensure!(
+                visible.path == planned.path().as_os_str().as_bytes()
+                    && visible.kind
+                        == if planned.is_directory() {
+                            GuardedViewEntryKind::Directory
+                        } else {
+                            GuardedViewEntryKind::File
+                        }
+                    && visible.native_id
+                        == NativeFileId {
+                            filesystem_id: expected.filesystem_id,
+                            inode: expected.inode,
+                        }
+                    && visible.mode == (mode & 0o7777) as u16
+                    && (planned.is_directory() || visible.logical_len == expected.logical_len)
+                    && visible.modified_secs == expected.modified_secs
+                    && i64::from(visible.modified_nanos) == expected.modified_nanos,
+                "guarded handoff entry changed before private capture"
+            );
+        }
+        let mut rebound = original.clone();
+        rebound.anchor_id = self.anchor_id;
+        Ok(rebound)
+    }
+
+    /// A same-path handoff changes only the root directory's own ctime/mode
+    /// before the hidden lower plan is made. Its size and mtime, and every
+    /// child version including ctime, must still match the pre-handoff
+    /// inventory; a namespace edit or retained-descriptor write during the
+    /// handoff therefore cannot silently enter the capture.
+    pub fn verify_pre_handoff_inventory(&self, original: &Self) -> anyhow::Result<()> {
+        self.validate()?;
+        original.validate()?;
+        anyhow::ensure!(
+            self.source_root_identity() == original.source_root_identity()
+                && self.root_version.logical_len == original.root_version.logical_len
+                && self.root_version.modified_secs == original.root_version.modified_secs
+                && self.root_version.modified_nanos == original.root_version.modified_nanos
+                && self.entries.len() == original.entries.len(),
+            "guarded in-place lower differs from its original inventory"
+        );
+        for (current, before) in self.entries.iter().zip(&original.entries) {
+            anyhow::ensure!(
+                current.path() == before.path()
+                    && current.is_directory() == before.is_directory()
+                    && current.version() == before.version()
+                    && current.mode_and_modified() == before.mode_and_modified(),
+                "guarded in-place entry changed during the private handoff"
+            );
+        }
+        Ok(())
     }
 
     pub fn anchor_id(&self) -> Uuid {
@@ -3377,6 +3538,55 @@ mod tests {
             root_modified_nanos,
             entries: scan_root_inventory(root, &directory, filesystem, &root_version).unwrap(),
         }
+    }
+
+    #[test]
+    fn original_view_snapshot_preserves_raw_names_and_rejects_a_changed_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let raw_directory = OsString::from_vec(b"dir-\xfe".to_vec());
+        let raw_file = OsString::from_vec(b"file-\xff".to_vec());
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join(&raw_directory)).unwrap();
+        fs::write(
+            root.join(&raw_directory).join(&raw_file),
+            b"literal\r\n\0bytes",
+        )
+        .unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o710)).unwrap();
+        fs::set_permissions(root.join(&raw_directory), fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(
+            root.join(&raw_directory).join(&raw_file),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let mut plan = planned_without_privileged_probe(&root);
+        plan.format_version = 2;
+        plan.validate().unwrap();
+        let snapshot = plan.snapshot_original_view_metadata().unwrap();
+        assert_eq!(snapshot.root_mode, 0o710);
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries[0].path, b"dir-\xfe");
+        assert_eq!(snapshot.entries[0].mode, 0o750);
+        assert_eq!(snapshot.entries[1].path, b"dir-\xfe/file-\xff");
+        assert_eq!(snapshot.entries[1].mode, 0o640);
+        assert_eq!(
+            snapshot.entries[1].logical_len,
+            b"literal\r\n\0bytes".len() as u64
+        );
+        assert_eq!(snapshot.entries[1].uid, unsafe { libc::geteuid() });
+        let mut wrong_root_mode = snapshot.clone();
+        wrong_root_mode.root_mode = 0o777;
+        assert!(
+            plan.rebind_original_view_metadata(&wrong_root_mode)
+                .is_err()
+        );
+        fs::write(
+            root.join(&raw_directory).join(&raw_file),
+            b"changed\r\n\0bytes",
+        )
+        .unwrap();
+        assert!(plan.snapshot_original_view_metadata().is_err());
     }
 
     #[test]

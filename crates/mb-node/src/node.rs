@@ -125,6 +125,9 @@ struct GuardedProtectedRootV1 {
 const GUARDED_ENROLLMENT_KIND: &str = "guarded-root-enrollment-v1";
 
 #[cfg(target_os = "linux")]
+const GUARDED_IN_PLACE_KIND: &str = "guarded-in-place-enrollment-v1";
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct GuardedEnrollmentIntentV1 {
     format_version: u16,
@@ -164,6 +167,50 @@ impl GuardedEnrollmentIntentV1 {
             || self.plan.source_root().starts_with(&self.view)
         {
             anyhow::bail!("invalid guarded root enrollment intent");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedInPlaceIntentV1 {
+    format_version: u16,
+    root_id: Uuid,
+    #[serde(with = "mb_store::raw_path_bytes")]
+    original_path: PathBuf,
+    original_id: NativeFileId,
+    original_plan: GuardedRootCapturePlan,
+    presentation: GuardedViewMetadataV1,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedInPlaceIntentV1 {
+    fn validate(&self, record_id: &[u8]) -> Result<()> {
+        self.presentation.validate_shape()?;
+        self.original_plan.validate()?;
+        self.original_plan
+            .rebind_original_view_metadata(&self.presentation)?;
+        let mut normalized = PathBuf::new();
+        for component in self.original_path.components() {
+            normalized.push(component.as_os_str());
+        }
+        if self.format_version != 1
+            || self.root_id.is_nil()
+            || record_id != self.root_id.as_bytes()
+            || !self.original_path.is_absolute()
+            || normalized != self.original_path
+            || self.original_id != self.presentation.lower_root_id
+            || self.original_plan.source_root() != self.original_path
+            || self.original_plan.anchor_id() != self.presentation.anchor_id
+            || self.presentation.root_uid == 0
+            || self
+                .presentation
+                .entries
+                .iter()
+                .any(|entry| entry.uid != self.presentation.root_uid)
+        {
+            anyhow::bail!("invalid guarded in-place enrollment intent");
         }
         Ok(())
     }
@@ -1389,6 +1436,8 @@ impl Node {
         node.backfill_checkpoint_generation_index()?;
         node.reconcile_certified_writer_head()?;
         #[cfg(target_os = "linux")]
+        node.reconcile_guarded_in_place_enrollments()?;
+        #[cfg(target_os = "linux")]
         node.reconcile_guarded_enrollments()?;
         node.reconcile_garbage_collection()?;
         Ok(node)
@@ -1675,7 +1724,9 @@ impl Node {
 
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
         #[cfg(target_os = "linux")]
-        if !self.control.records(GUARDED_ENROLLMENT_KIND)?.is_empty() {
+        if !self.control.records(GUARDED_ENROLLMENT_KIND)?.is_empty()
+            || !self.control.records(GUARDED_IN_PLACE_KIND)?.is_empty()
+        {
             anyhow::bail!("finish the pending guarded enrollment before adding another root");
         }
         self.register_protected_root(source_root, None, true, true)
@@ -1693,6 +1744,9 @@ impl Node {
         view_gid: u32,
     ) -> Result<ProtectedRoot> {
         self.check_guarded_mounts()?;
+        if !self.control.records(GUARDED_IN_PLACE_KIND)?.is_empty() {
+            anyhow::bail!("finish the pending in-place guarded enrollment first");
+        }
         let lower = lower.canonicalize().context("resolve guarded lower root")?;
         let view_metadata = fs::symlink_metadata(view).context("stat guarded view placeholder")?;
         if !view_metadata.is_dir() || view_metadata.file_type().is_symlink() {
@@ -1774,6 +1828,242 @@ impl Node {
             anyhow::bail!("guarded enrollment ID already exists");
         }
         self.finish_guarded_enrollment(&intent, &bytes)
+    }
+
+    /// Replace the original user-visible directory with a guarded view at
+    /// the same path. The target's metadata is captured before the handoff
+    /// changes its root owner or mode; each later phase has a durable journal.
+    #[cfg(target_os = "linux")]
+    pub fn add_guarded_protected_root_in_place(&mut self, source: &Path) -> Result<ProtectedRoot> {
+        self.check_guarded_mounts()?;
+        let metadata = fs::symlink_metadata(source)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            anyhow::bail!("guarded in-place root is not a real directory");
+        }
+        let source = source.canonicalize()?;
+        if source.starts_with(&self.data_dir) || self.data_dir.starts_with(&source) {
+            anyhow::bail!("guarded in-place root overlaps the daemon data directory");
+        }
+        let pending = self.control.records(GUARDED_IN_PLACE_KIND)?;
+        if pending.len() > 1 {
+            anyhow::bail!("multiple guarded in-place enrollments are pending");
+        }
+        if let Some((id, bytes)) = pending.into_iter().next() {
+            let intent: GuardedInPlaceIntentV1 = decode_canonical(&bytes)?;
+            intent.validate(&id)?;
+            if intent.original_path != source {
+                anyhow::bail!("finish the pending guarded in-place enrollment first");
+            }
+            return self.finish_guarded_in_place_enrollment(&intent, &bytes);
+        }
+        if !self.control.records(GUARDED_ENROLLMENT_KIND)?.is_empty() {
+            anyhow::bail!("finish the pending guarded enrollment first");
+        }
+        let roots = self.protected_roots()?;
+        if roots.len() == 256
+            || roots
+                .iter()
+                .any(|root| source.starts_with(&root.path) || root.path.starts_with(&source))
+        {
+            anyhow::bail!("guarded in-place root overlaps or exceeds protected roots");
+        }
+        let plan = GuardedRootCapturePlan::plan(&source)?;
+        let presentation = plan.snapshot_original_view_metadata()?;
+        let intent = GuardedInPlaceIntentV1 {
+            format_version: 1,
+            root_id: Uuid::new_v4(),
+            original_path: source,
+            original_id: presentation.lower_root_id,
+            original_plan: plan,
+            presentation,
+        };
+        intent.validate(intent.root_id.as_bytes())?;
+        let bytes = canonical_bytes(&intent)?;
+        if !self.control.put_record_if_absent(
+            GUARDED_IN_PLACE_KIND,
+            intent.root_id.as_bytes(),
+            &bytes,
+        )? {
+            anyhow::bail!("guarded in-place enrollment ID already exists");
+        }
+        self.finish_guarded_in_place_enrollment(&intent, &bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_guarded_in_place_enrollments(&mut self) -> Result<()> {
+        let pending = self.control.records(GUARDED_IN_PLACE_KIND)?;
+        if pending.len() > 1 {
+            anyhow::bail!("multiple guarded in-place enrollments are pending");
+        }
+        for (id, bytes) in pending {
+            let intent: GuardedInPlaceIntentV1 = decode_canonical(&bytes)?;
+            intent.validate(&id)?;
+            self.finish_guarded_in_place_enrollment(&intent, &bytes)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_guarded_in_place_enrollment(
+        &mut self,
+        intent: &GuardedInPlaceIntentV1,
+        bytes: &[u8],
+    ) -> Result<ProtectedRoot> {
+        intent.validate(intent.root_id.as_bytes())?;
+        if self
+            .control
+            .get_record(GUARDED_IN_PLACE_KIND, intent.root_id.as_bytes())?
+            != Some(bytes.to_vec())
+        {
+            anyhow::bail!("guarded in-place enrollment intent changed");
+        }
+        let parent_path = intent
+            .original_path
+            .parent()
+            .context("guarded in-place root has no parent")?;
+        let name = intent
+            .original_path
+            .file_name()
+            .context("guarded in-place root has no name")?;
+        let parent = PinnedDirectory::open(parent_path)?;
+        let mut handoff = match GuardedRecoveryHandoff::load(&self.control, intent.root_id)? {
+            Some(handoff) => {
+                handoff.verify_recovery_target(&parent, Path::new(name), intent.original_id)?;
+                handoff
+            }
+            None => GuardedRecoveryHandoff::prepare(
+                &self.control,
+                intent.root_id,
+                &parent,
+                Path::new(name),
+                intent.original_id,
+            )?,
+        };
+        if let Some(existing) = self
+            .protected_roots()?
+            .into_iter()
+            .find(|root| root.root_id == intent.root_id)
+        {
+            let binding = self.guarded_root_mount_binding(&existing)?;
+            if binding.lower_root != handoff.lower_path()
+                || binding.mountpoint != intent.original_path
+            {
+                anyhow::bail!("registered guarded root differs from its in-place handoff");
+            }
+            let manifest =
+                GuardedRootCapturePlan::load_published_manifest(&self.control, binding.anchor_id)?;
+            let plan = GuardedRootCapturePlan::load_for_manifest(&self.control, &manifest)?
+                .context("in-place guarded mount lost its source plan")?;
+            plan.verify_pre_handoff_inventory(&intent.original_plan)?;
+            let presentation = plan.rebind_original_view_metadata(&intent.presentation)?;
+            self.guarded_mounts
+                .iter()
+                .find(|mount| mount.anchor_id() == binding.anchor_id)
+                .context("in-place guarded mount is not supervised")?
+                .verify_virtual_metadata(&self.control, &presentation)?;
+            self.control.delete_record_if_value(
+                GUARDED_IN_PLACE_KIND,
+                intent.root_id.as_bytes(),
+                bytes,
+            )?;
+            return Ok(existing);
+        }
+        let normal = self
+            .control
+            .get_record(GUARDED_ENROLLMENT_KIND, intent.root_id.as_bytes())?;
+        if normal.is_none() {
+            handoff.resume(&self.control, &parent)?;
+        }
+        let (normal, normal_bytes) = if let Some(normal_bytes) = normal {
+            let normal: GuardedEnrollmentIntentV1 = decode_canonical(&normal_bytes)?;
+            normal.validate(intent.root_id.as_bytes())?;
+            if normal.root_id != intent.root_id
+                || normal.plan.source_root() != handoff.lower_path()
+                || normal.view != intent.original_path
+                || normal.view_uid != intent.presentation.root_uid
+                || normal.view_gid != intent.presentation.root_gid
+            {
+                anyhow::bail!("guarded in-place capture conflicts with its handoff");
+            }
+            (normal, normal_bytes)
+        } else {
+            let plan = GuardedRootCapturePlan::plan(handoff.lower_path())?;
+            plan.verify_pre_handoff_inventory(&intent.original_plan)?;
+            plan.rebind_original_view_metadata(&intent.presentation)?;
+            let normal = GuardedEnrollmentIntentV1 {
+                format_version: 1,
+                root_id: intent.root_id,
+                view: handoff.mountpoint(),
+                view_id: PinnedDirectory::open(handoff.mountpoint())?.identity()?,
+                plan,
+                view_uid: intent.presentation.root_uid,
+                view_gid: intent.presentation.root_gid,
+            };
+            normal.validate(intent.root_id.as_bytes())?;
+            let normal_bytes = canonical_bytes(&normal)?;
+            if !self.control.put_record_if_absent(
+                GUARDED_ENROLLMENT_KIND,
+                intent.root_id.as_bytes(),
+                &normal_bytes,
+            )? {
+                anyhow::bail!("guarded in-place capture was registered concurrently");
+            }
+            (normal, normal_bytes)
+        };
+        let presentation = normal
+            .plan
+            .rebind_original_view_metadata(&intent.presentation)?;
+        normal
+            .plan
+            .verify_pre_handoff_inventory(&intent.original_plan)?;
+        let anchor_id = normal.plan.anchor_id();
+        if !self
+            .guarded_mounts
+            .iter()
+            .any(|mount| mount.anchor_id() == anchor_id)
+        {
+            let mount_control = Arc::new(Mutex::new(ControlStore::open_with_key(
+                self.data_dir.join("control.db"),
+                &self.control_database_key,
+            )?));
+            let mount = if GuardedViewMount::claimed_anchor_ids(&self.control)?.contains(&anchor_id)
+            {
+                GuardedViewMount::recover_claimed(anchor_id, mount_control)?
+            } else {
+                handoff.resume(&self.control, &parent)?;
+                let manifest = normal.plan.capture_private_file_owners(
+                    &self.control,
+                    normal.view_uid,
+                    0,
+                    0,
+                )?;
+                normal
+                    .plan
+                    .isolate_lower_directories(&self.control, &manifest)?;
+                GuardedViewMount::start_with_virtual_metadata(
+                    &manifest,
+                    mount_control,
+                    &normal.view,
+                    normal.view_uid,
+                    normal.view_gid,
+                    presentation.clone(),
+                )?
+            };
+            mount.check_health()?;
+            self.guarded_mounts.push(mount);
+        }
+        self.guarded_mounts
+            .iter()
+            .find(|mount| mount.anchor_id() == anchor_id)
+            .context("guarded in-place view is not supervised")?
+            .verify_virtual_metadata(&self.control, &presentation)?;
+        let root = self.finish_guarded_enrollment(&normal, &normal_bytes)?;
+        self.control.delete_record_if_value(
+            GUARDED_IN_PLACE_KIND,
+            intent.root_id.as_bytes(),
+            bytes,
+        )?;
+        Ok(root)
     }
 
     #[cfg(target_os = "linux")]
@@ -25514,6 +25804,200 @@ pub(crate) mod tests {
         );
         drop(node);
         fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_in_place_enrollment_replays_handoff_plan_and_mount() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        for stage in 0..5_u8 {
+            let area = tempfile::Builder::new()
+                .prefix("mb-guarded-in-place-")
+                .tempdir_in(&test_root)
+                .unwrap();
+            fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let target = area.path().join("work");
+            let data_dir = area.path().join("node");
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("sample"), b"in-place\r\n\0bytes").unwrap();
+            for path in [&target, &target.join("sample")] {
+                let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+            }
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(target.join("sample"), fs::Permissions::from_mode(0o640)).unwrap();
+            let seed = Seed::from_bytes([stage + 220; 32]);
+            let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+            let root_id = if stage == 0 {
+                node.add_guarded_protected_root_in_place(&target)
+                    .unwrap()
+                    .root_id
+            } else {
+                let original = GuardedRootCapturePlan::plan(&target).unwrap();
+                let presentation = original.snapshot_original_view_metadata().unwrap();
+                let intent = GuardedInPlaceIntentV1 {
+                    format_version: 1,
+                    root_id: Uuid::new_v4(),
+                    original_path: target.clone(),
+                    original_id: presentation.lower_root_id,
+                    original_plan: original,
+                    presentation,
+                };
+                let id = intent.root_id;
+                node.control
+                    .put_record(
+                        GUARDED_IN_PLACE_KIND,
+                        id.as_bytes(),
+                        &canonical_bytes(&intent).unwrap(),
+                    )
+                    .unwrap();
+                let parent = PinnedDirectory::open(area.path()).unwrap();
+                let mut handoff = GuardedRecoveryHandoff::prepare(
+                    &node.control,
+                    id,
+                    &parent,
+                    Path::new("work"),
+                    intent.original_id,
+                )
+                .unwrap();
+                handoff.resume(&node.control, &parent).unwrap();
+                if stage == 4 {
+                    fs::write(handoff.lower_path().join("sample"), b"changed behind view").unwrap();
+                } else if stage >= 2 {
+                    let plan = GuardedRootCapturePlan::plan(handoff.lower_path()).unwrap();
+                    let rebound = plan
+                        .rebind_original_view_metadata(&intent.presentation)
+                        .unwrap();
+                    let normal = GuardedEnrollmentIntentV1 {
+                        format_version: 1,
+                        root_id: id,
+                        plan,
+                        view: target.clone(),
+                        view_id: PinnedDirectory::open(&target).unwrap().identity().unwrap(),
+                        view_uid: intent.presentation.root_uid,
+                        view_gid: intent.presentation.root_gid,
+                    };
+                    node.control
+                        .put_record(
+                            GUARDED_ENROLLMENT_KIND,
+                            id.as_bytes(),
+                            &canonical_bytes(&normal).unwrap(),
+                        )
+                        .unwrap();
+                    if stage == 3 {
+                        let manifest = normal
+                            .plan
+                            .capture_private_file_owners(&node.control, 65534, 0, 0)
+                            .unwrap();
+                        normal
+                            .plan
+                            .isolate_lower_directories(&node.control, &manifest)
+                            .unwrap();
+                        let control = Arc::new(Mutex::new(
+                            ControlStore::open_with_key(
+                                data_dir.join("control.db"),
+                                &node.control_database_key,
+                            )
+                            .unwrap(),
+                        ));
+                        GuardedViewMount::start_with_virtual_metadata(
+                            &manifest, control, &target, 65534, 65534, rebound,
+                        )
+                        .unwrap()
+                        .stop()
+                        .unwrap();
+                    }
+                }
+                id
+            };
+            if stage == 4 {
+                drop(node);
+                assert!(Node::open(&data_dir, seed).is_err());
+                assert!(fs::read_dir(&target).unwrap().next().is_none());
+                continue;
+            }
+            if stage != 0 {
+                drop(node);
+                node = Node::open(&data_dir, seed.clone()).unwrap();
+            }
+            let root = node.protected_root_by_id(root_id).unwrap();
+            assert_eq!(root.path, target);
+            assert_eq!(root.format_version, 4);
+            assert_eq!(
+                fs::read(target.join("sample")).unwrap(),
+                b"in-place\r\n\0bytes"
+            );
+            assert_eq!(fs::metadata(&target).unwrap().uid(), 65534);
+            assert_eq!(fs::metadata(target.join("sample")).unwrap().uid(), 65534);
+            assert_eq!(
+                fs::metadata(target.join("sample")).unwrap().mode() & 0o7777,
+                0o640
+            );
+            assert!(node.root_dirty().unwrap());
+            assert!(
+                node.control
+                    .records(GUARDED_IN_PLACE_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                node.control
+                    .records(GUARDED_ENROLLMENT_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+            let handoff = GuardedRecoveryHandoff::load(&node.control, root_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fs::metadata(handoff.lower_path()).unwrap().uid(), 0);
+            if stage == 0 {
+                let child = Command::new("python3")
+                    .uid(65534)
+                    .gid(65534)
+                    .arg("-c")
+                    .arg("import os,sys; assert open(sys.argv[1], 'rb').read() == b'in-place\\r\\n\\0bytes';\ntry: open(sys.argv[2], 'rb')\nexcept PermissionError: pass\nelse: raise AssertionError('private lower is exposed')")
+                    .arg(target.join("sample"))
+                    .arg(handoff.lower_path().join("sample"))
+                    .output()
+                    .unwrap();
+                assert!(child.status.success(), "{child:?}");
+                let guild_id = [225; 32];
+                let revision = node
+                    .prepare_revision(guild_id, root_id, &target, 1, None)
+                    .unwrap();
+                let restored = area.path().join("restored");
+                crate::snapshot::restore_revision_from_source(
+                    &node.control,
+                    &node.keys,
+                    guild_id,
+                    &revision,
+                    &restored,
+                    |id| {
+                        crate::snapshot::render_sector(
+                            &node.control,
+                            &node.keys,
+                            id,
+                            Some(&guild_id),
+                        )
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    fs::read(restored.join("sample")).unwrap(),
+                    b"in-place\r\n\0bytes"
+                );
+            }
+            node.guarded_mounts.pop().unwrap().stop().unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]

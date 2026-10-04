@@ -65,6 +65,10 @@ pub enum LocalRequest {
         view_uid: u32,
         view_gid: u32,
     },
+    AddGuardedRootInPlace {
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
+        path: PathBuf,
+    },
     GitInit {
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
@@ -693,6 +697,9 @@ mod tests {
                 view_uid: 65534,
                 view_gid: 65534,
             },
+            LocalRequest::AddGuardedRootInPlace {
+                path: target.clone(),
+            },
             LocalRequest::Recover {
                 target: target.clone(),
             },
@@ -724,6 +731,7 @@ mod tests {
             assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
             match decoded.request {
                 LocalRequest::AddRoot { path }
+                | LocalRequest::AddGuardedRootInPlace { path }
                 | LocalRequest::Recover { target: path }
                 | LocalRequest::SnapshotRestore { target: path, .. } => {
                     assert_eq!(path, target);

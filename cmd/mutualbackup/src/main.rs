@@ -145,6 +145,8 @@ enum RootCommand {
         #[arg(long)]
         view_gid: u32,
     },
+    /// Replace an existing user-owned directory with a guarded view in place.
+    AddGuardedHere { path: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -572,6 +574,20 @@ async fn main() -> Result<()> {
             .await?;
             let LocalResponse::RootAdded(root) = response else {
                 bail!("daemon returned the wrong response to guarded-root request");
+            };
+            println!("guarded root registered: {}", root.path.display());
+            println!("root id: {}", root.root_id);
+        }
+        Command::Root {
+            command: RootCommand::AddGuardedHere { path },
+        } => {
+            let response = local_control_call(
+                &control_socket,
+                &LocalRequest::AddGuardedRootInPlace { path },
+            )
+            .await?;
+            let LocalResponse::RootAdded(root) = response else {
+                bail!("daemon returned the wrong response to guarded in-place root request");
             };
             println!("guarded root registered: {}", root.path.display());
             println!("root id: {}", root.root_id);

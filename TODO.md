@@ -301,7 +301,8 @@
 - [ ] **M6 guarded edit guard.** The store now has replayable per-file and
   whole-root sparse detaches. Ordinary `root add` still selects the reflink
   backend; explicit `root add-guarded` now begins a guarded enrollment from a
-  separate private lower tree and empty view. Implement and locally probe a
+  separate private lower tree and empty view, while `root add-guarded-here`
+  migrates a user-owned root at its original path. Implement and locally probe a
   long-lived access decision that permits normal reads without detaching every
   anchor and prevents writes until detach is durable, even after owner `chmod`,
   pathname truncate,
@@ -987,6 +988,17 @@
   needs a durable name handoff, visible metadata restoration, revision/Git pin
   checks, and protected-root record retirement before this primitive can be
   exposed as a command.
+  In-place enrollment now captures the original root and entry presentation
+  metadata before a versioned handoff moves the target to a private lower
+  name. A second durable enrollment intent binds the hidden lower plan and
+  placeholder inode before capture, isolation, virtual-metadata mount, and
+  dirty protected-root registration. Restart replays the handoff, plan, and
+  mount boundaries; privileged ext4 and disposable-Btrfs tests pass those
+  phases, ordinary-user view access versus private-lower denial, a changed
+  private file before capture that fails closed, and a signed backup/restore
+  round-trip with exact CRLF/NUL bytes. The source-only snapshot test preserves
+  raw names and rejects a changed entry. Mixed-owner trees,
+  broader fault injection, removal, and the complete guarded gate remain open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

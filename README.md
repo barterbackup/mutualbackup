@@ -60,6 +60,7 @@ mutualbackup status
 mutualbackup unlock [--seed-stdin|--seed-file FILE]
 mutualbackup root add PATH
 mutualbackup root add-guarded LOWER VIEW --view-uid UID --view-gid GID
+mutualbackup root add-guarded-here PATH
 mutualbackup guild create|invite|join|finalize|status
 mutualbackup backup --wait
 mutualbackup snapshot list
@@ -72,13 +73,17 @@ mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 
 On Linux, `root add-guarded` starts the guarded source backend from an existing
 lower directory and a separate, empty view directory on the same filesystem.
-It requires a privileged daemon; the view placeholder must be owned by a
-different user than `UID` and must not be group- or world-writable. Enrollment
+`root add-guarded-here` replaces an existing user-owned directory with its
+guarded view at the same path, retaining its visible ownership, modes, times,
+and file bytes through a durable private-name handoff. Every file in this
+initial in-place path must belong to the directory owner.
+Both commands require a privileged daemon. For `add-guarded`, the view
+placeholder must be owned by a different user than `UID` and must not be
+group- or world-writable. Enrollment
 privately isolates the lower tree, mounts the editable view, and marks the new
 root dirty for its first signed backup. The daemon resumes interrupted
-enrollment on reopen. This is an incremental Milestone 6 path; same-path
-migration, data-preserving root removal, and the full guarded failure gate are
-still pending.
+enrollment on reopen. This is an incremental Milestone 6 path; data-preserving
+root removal and the full guarded failure and metadata gates are still pending.
 
 Parity may span several configured filesystems. Each volume has a signed UUID,
 an independently wrapped SQLCipher key, a byte budget and repair headroom.
