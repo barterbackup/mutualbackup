@@ -1394,6 +1394,7 @@ pub(crate) fn prepare_guarded_revision(
     revision_id: Uuid,
     writer: WriterCredentials<'_>,
 ) -> Result<SignedRecord<UserRevision>> {
+    require_guarded_git_graph_absent(control, protected_root_id, revision_id)?;
     let writer_key = SigningKey::from_bytes(writer.secret);
     if let Some(bytes) = control.get_record("user-revision", revision_id.as_bytes())? {
         let existing: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
@@ -1580,6 +1581,36 @@ pub(crate) fn prepare_guarded_revision(
     }
     control.finalize_guarded_capture_records(revision_id.as_bytes(), &attempt_bytes, &recipes)?;
     Ok(revision)
+}
+
+/// Format-6 guarded private metadata has no Git graph descriptor. Refuse to
+/// sign a revision that would silently drop registered local history.
+#[cfg(target_os = "linux")]
+pub(crate) fn require_guarded_git_graph_absent(
+    control: &ControlStore,
+    protected_root_id: Uuid,
+    revision_id: Uuid,
+) -> Result<()> {
+    if control
+        .get_record("git-repository", protected_root_id.as_bytes())?
+        .is_some()
+        || control
+            .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())?
+            .is_some()
+    {
+        bail!("guarded Git graph backup is not yet supported");
+    }
+    Ok(())
+}
+
+/// The private catalog is hidden from the guarded view and can survive a
+/// missing node registration. Check it before the node stops that view.
+#[cfg(target_os = "linux")]
+pub(crate) fn require_guarded_git_catalog_absent(lower_root: &Path) -> Result<()> {
+    if git_catalog_marker(lower_root)?.is_some() {
+        bail!("guarded Git graph backup is not yet supported");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4805,6 +4836,80 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_revision_refuses_registered_or_pending_git_graph_before_signing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([216; 32]));
+        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
+        let root_id = Uuid::new_v4();
+        let revision_id = Uuid::new_v4();
+        let writer_secret = [217; 32];
+        let sign = |control: &mut ControlStore| {
+            prepare_guarded_revision(
+                control,
+                &keys,
+                [218; 32],
+                root_id,
+                Uuid::new_v4(),
+                1,
+                revision_id,
+                WriterCredentials {
+                    epoch: 1,
+                    secret: &writer_secret,
+                    captured_change_sequence: None,
+                },
+            )
+        };
+
+        control
+            .put_record("git-repository", root_id.as_bytes(), b"registered")
+            .unwrap();
+        assert!(
+            sign(&mut control)
+                .unwrap_err()
+                .to_string()
+                .contains("guarded Git graph backup is not yet supported")
+        );
+        control
+            .delete_record("git-repository", root_id.as_bytes())
+            .unwrap();
+        control
+            .put_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes(), b"pending")
+            .unwrap();
+        assert!(
+            sign(&mut control)
+                .unwrap_err()
+                .to_string()
+                .contains("guarded Git graph backup is not yet supported")
+        );
+        assert!(
+            control
+                .get_record("user-revision", revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_revision_refuses_private_catalog_without_registration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join(mb_store::GIT_CATALOG_DIRECTORY);
+        fs::create_dir(&catalog).unwrap();
+        fs::write(
+            catalog.join(mb_store::GIT_CATALOG_MARKER_FILE),
+            mb_store::git_catalog_marker_bytes(Uuid::new_v4()),
+        )
+        .unwrap();
+        assert!(
+            require_guarded_git_catalog_absent(temporary.path())
+                .unwrap_err()
+                .to_string()
+                .contains("guarded Git graph backup is not yet supported")
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -7084,9 +7084,18 @@ impl Node {
             .root_dirty_state(protected_root_id)?
             .filter(|state| state.dirty)
             .map(|state| state.change_sequence);
-        let writer = self.writer_incarnation(guild_id)?;
         #[cfg(target_os = "linux")]
         if backend.backend == SourceBackendKind::GuardedLinkFreezeV1 {
+            let revision_id = operation_id
+                .map(Uuid::from_bytes)
+                .unwrap_or_else(Uuid::new_v4);
+            let binding = self.guarded_root_mount_binding(&root)?;
+            crate::snapshot::require_guarded_git_catalog_absent(&binding.lower_root)?;
+            crate::snapshot::require_guarded_git_graph_absent(
+                &self.control,
+                protected_root_id,
+                revision_id,
+            )?;
             let bytes = self
                 .control
                 .get_record("guarded-protected-root-v1", protected_root_id.as_bytes())?
@@ -7098,9 +7107,7 @@ impl Node {
             {
                 anyhow::bail!("guarded protected root anchor binding changed");
             }
-            let revision_id = operation_id
-                .map(Uuid::from_bytes)
-                .unwrap_or_else(Uuid::new_v4);
+            let writer = self.writer_incarnation(guild_id)?;
             if self
                 .control
                 .get_record("user-revision", revision_id.as_bytes())?
@@ -7123,6 +7130,7 @@ impl Node {
                 },
             );
         }
+        let writer = self.writer_incarnation(guild_id)?;
         prepare_revision(
             &mut self.control,
             &self.keys,
@@ -27594,6 +27602,29 @@ pub(crate) mod tests {
                 &canonical_bytes(&registration).unwrap(),
             )
             .unwrap();
+        let rejected_revision_id = Uuid::new_v4();
+        let error = node
+            .prepare_revision(
+                [0; 32],
+                repository_id,
+                &view,
+                1,
+                Some(*rejected_revision_id.as_bytes()),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("guarded Git graph backup is not yet supported"),
+            "{error:#}"
+        );
+        node.check_guarded_mounts().unwrap();
+        assert!(
+            node.control
+                .get_record("user-revision", rejected_revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
         let detach = std::process::Command::new("python3")
             .uid(65534)
             .gid(65534)

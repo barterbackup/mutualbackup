@@ -102,7 +102,11 @@
   deletion, and subsequent guarded-root release. Retained Git history or any
   unrecognized catalog state still blocks retirement. Guarded Git enrollment,
   checkout, signed graph protection, and seed-only virtual-locator rebind
-  remain open.
+  remain open. The guarded signing path now refuses a registered Git repository,
+  a private catalog marker, or a pending graph intent for that revision before
+  stopping the view or signing a format-6 revision, so manual guarded Git state
+  cannot silently produce a signed revision that omits its history. Complete the signed guarded
+  graph descriptor and recovery before lifting this fail-closed gate.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

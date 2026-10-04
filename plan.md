@@ -804,7 +804,12 @@ Proactive background repair comes later.
   durable until a signed backup revision and checkpoint cover its graph; status
   must distinguish local history from guild-protected, seed-recoverable history.
   Recovery reconstructs the Git graph, refs, object map, and checked-out view
-  from authenticated backup data without a cached local catalog.
+  from authenticated backup data without a cached local catalog. The guarded
+  format-6 private metadata currently has no signed Git graph descriptor:
+  refuse a guarded revision before stopping its view or signing if a Git
+  registration, catalog marker, or matching graph intent exists. Enable that
+  combination only after a versioned signed descriptor, native-anchor pin
+  handoff, and seed-only graph and virtual-locator recovery pass together.
 - Represent explicit commit protection pins as namespaced Git refs so graph
   export, signed backup, and recovery retain their ancestry without another
   object format. Removing a branch or pin only changes reachability; physical
