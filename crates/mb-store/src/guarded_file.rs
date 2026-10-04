@@ -750,8 +750,8 @@ impl GuardedFileCapturePlan {
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         anyhow::ensure!(self.format_version == 1 && !self.anchor_id.is_nil());
         anyhow::ensure!(
-            !crate::guarded_mount::stopped_capture_intent_pins_anchor(control, self.anchor_id)?,
-            "guarded file anchor is pinned by a stopped-view capture"
+            !crate::guarded_mount::guarded_anchor_is_pinned(control, self.anchor_id)?,
+            "guarded file anchor is pinned by a capture, revision, or Git catalog"
         );
         let view_guard =
             crate::guarded_view_probe::file_guard_record_for_retirement(control, self)?;

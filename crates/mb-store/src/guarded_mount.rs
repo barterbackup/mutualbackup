@@ -33,6 +33,8 @@ const VIRTUAL_METADATA_KIND: &str = "guarded-view-virtual-metadata-v1";
 const VIRTUAL_TIME_BASELINE_KIND: &str = "guarded-view-virtual-time-baseline-v1";
 const STOPPED_CAPTURE_KIND: &str = "guarded-view-stopped-capture-v1";
 const STOPPED_FILE_CAPTURE_KIND: &str = "guarded-view-stopped-file-capture-v1";
+const GIT_ANCHOR_PIN_KIND: &str = "guarded-git-anchor-pin-v1";
+const GIT_ROOT_PIN_KIND: &str = "guarded-git-root-pin-v1";
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
 const GUARDED_REVISION_RETIREMENT_KIND: &str = "guarded-view-revision-retirement-v1";
 const STOPPED_CAPTURE_MAX_BYTES: usize = mb_core::V1_MAX_CATALOG_BYTES * 2 + 4096;
@@ -155,6 +157,64 @@ struct StoppedFileCaptureIntent {
     root_anchor_id: Uuid,
     entry: GuardedViewMetadataEntry,
     published: Option<FileAnchorManifest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedGitAnchorPin {
+    format_version: u16,
+    repository_id: Uuid,
+    root_anchor_id: Uuid,
+    manifest: FileAnchorManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedGitRootPin {
+    format_version: u16,
+    repository_id: Uuid,
+    root_anchor_id: Uuid,
+}
+
+fn git_anchor_pin(
+    control: &ControlStore,
+    anchor_id: Uuid,
+) -> anyhow::Result<Option<(Vec<u8>, GuardedGitAnchorPin)>> {
+    let Some(bytes) = control.get_record(GIT_ANCHOR_PIN_KIND, anchor_id.as_bytes())? else {
+        return Ok(None);
+    };
+    ensure!(
+        bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+        "guarded Git pin is too large"
+    );
+    let pin: GuardedGitAnchorPin = mb_core::decode_canonical(&bytes)?;
+    ensure!(
+        pin.format_version == 1
+            && !pin.repository_id.is_nil()
+            && !pin.root_anchor_id.is_nil()
+            && pin.manifest.format_version == 1
+            && pin.manifest.anchor_id == anchor_id
+            && mb_core::canonical_bytes(&pin)? == bytes,
+        "guarded Git anchor pin is invalid"
+    );
+    Ok(Some((bytes, pin)))
+}
+
+fn git_root_pin(
+    control: &ControlStore,
+    root_anchor_id: Uuid,
+) -> anyhow::Result<Option<(Vec<u8>, GuardedGitRootPin)>> {
+    let Some(bytes) = control.get_record(GIT_ROOT_PIN_KIND, root_anchor_id.as_bytes())? else {
+        return Ok(None);
+    };
+    ensure!(bytes.len() <= 4096, "guarded Git root pin is too large");
+    let pin: GuardedGitRootPin = mb_core::decode_canonical(&bytes)?;
+    ensure!(
+        pin.format_version == 1
+            && !pin.repository_id.is_nil()
+            && pin.root_anchor_id == root_anchor_id
+            && mb_core::canonical_bytes(&pin)? == bytes,
+        "guarded Git root pin is invalid"
+    );
+    Ok(Some((bytes, pin)))
 }
 
 impl StoppedFileCaptureIntent {
@@ -437,10 +497,14 @@ fn pending_stopped_file_capture_attempts(
         .collect())
 }
 
-pub(crate) fn stopped_capture_intent_pins_anchor(
+pub(crate) fn guarded_anchor_is_pinned(
     control: &ControlStore,
     anchor_id: Uuid,
 ) -> anyhow::Result<bool> {
+    if git_anchor_pin(control, anchor_id)?.is_some() || git_root_pin(control, anchor_id)?.is_some()
+    {
+        return Ok(true);
+    }
     let pending = stopped_capture_intents(control)?
         .into_iter()
         .any(|(_, _, intent)| {
@@ -824,8 +888,8 @@ impl GuardedViewMount {
     /// Retirement repeats it after the view has stopped and files detach.
     pub fn require_release_unpinned(anchor_id: Uuid, control: &ControlStore) -> anyhow::Result<()> {
         ensure!(
-            !stopped_capture_intent_pins_anchor(control, anchor_id)?,
-            "guarded mount retains a revision capture"
+            !guarded_anchor_is_pinned(control, anchor_id)?,
+            "guarded mount retains a capture, revision, or Git pin"
         );
         Ok(())
     }
@@ -1562,6 +1626,120 @@ impl GuardedViewMount {
         let manifest = intent.published.as_ref().expect("checked published file");
         verify_published_file_capture_binding(control, &intent, manifest)?;
         control.delete_record_if_value(STOPPED_FILE_CAPTURE_KIND, attempt_id.as_bytes(), &bytes)?;
+        Ok(())
+    }
+
+    /// Atomically replace a stopped-file attempt with node-owned Git pins.
+    /// The caller publishes the returned exact manifest into the separate Git
+    /// catalog only after this transaction commits. A crash on either side
+    /// leaves at least the attempt or these pins durably protecting the bytes.
+    pub fn transfer_stopped_file_capture_to_git(
+        attempt_id: Uuid,
+        repository_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<FileAnchorManifest> {
+        ensure!(!repository_id.is_nil(), "guarded Git repository ID is nil");
+        let attempt_bytes = control
+            .get_record(STOPPED_FILE_CAPTURE_KIND, attempt_id.as_bytes())?
+            .context("guarded Git file attempt is unavailable")?;
+        ensure!(
+            attempt_bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+            "guarded Git file attempt exceeds its local bound"
+        );
+        let attempt: StoppedFileCaptureIntent = mb_core::decode_canonical(&attempt_bytes)?;
+        attempt.validate(attempt_id.as_bytes())?;
+        let manifest = attempt
+            .published
+            .as_ref()
+            .context("guarded Git file attempt is not published")?;
+        verify_published_file_capture_binding(control, &attempt, manifest)?;
+        let file_pin = GuardedGitAnchorPin {
+            format_version: 1,
+            repository_id,
+            root_anchor_id: attempt.root_anchor_id,
+            manifest: manifest.clone(),
+        };
+        let root_pin = GuardedGitRootPin {
+            format_version: 1,
+            repository_id,
+            root_anchor_id: attempt.root_anchor_id,
+        };
+        if let Some((_, existing)) = git_anchor_pin(control, manifest.anchor_id)? {
+            ensure!(existing == file_pin, "guarded Git anchor has another owner");
+        }
+        if let Some((_, existing)) = git_root_pin(control, attempt.root_anchor_id)? {
+            ensure!(existing == root_pin, "guarded Git root has another owner");
+        }
+        control.put_records_and_retire_if_value(
+            &[
+                (
+                    GIT_ANCHOR_PIN_KIND.to_owned(),
+                    manifest.anchor_id.as_bytes().to_vec(),
+                    mb_core::canonical_bytes(&file_pin)?,
+                ),
+                (
+                    GIT_ROOT_PIN_KIND.to_owned(),
+                    attempt.root_anchor_id.as_bytes().to_vec(),
+                    mb_core::canonical_bytes(&root_pin)?,
+                ),
+            ],
+            STOPPED_FILE_CAPTURE_KIND,
+            attempt_id.as_bytes(),
+            &attempt_bytes,
+        )?;
+        Ok(manifest.clone())
+    }
+
+    /// Retire a node-owned Git pin only after the caller proves that the Git
+    /// catalog no longer maps this anchor and no signed revision or recipe
+    /// needs it. The root pin leaves with the last file pin for that root.
+    pub fn retire_git_anchor_pin_unreferenced(
+        repository_id: Uuid,
+        anchor_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<()> {
+        let (bytes, pin) = git_anchor_pin(control, anchor_id)?
+            .context("guarded Git anchor has no node-owned pin")?;
+        ensure!(
+            pin.repository_id == repository_id,
+            "guarded Git anchor belongs to another repository"
+        );
+        let (_, root_pin) = git_root_pin(control, pin.root_anchor_id)?
+            .context("guarded Git anchor lost its root pin")?;
+        ensure!(
+            root_pin.repository_id == repository_id,
+            "guarded Git root belongs to another repository"
+        );
+        let mut other_files = false;
+        for (id, _) in control.records(GIT_ANCHOR_PIN_KIND)? {
+            let other_id = Uuid::from_slice(&id)?;
+            if other_id != anchor_id {
+                let (_, other) = git_anchor_pin(control, other_id)?
+                    .context("guarded Git anchor pin vanished during retirement")?;
+                if other.root_anchor_id == pin.root_anchor_id {
+                    ensure!(
+                        other.repository_id == repository_id,
+                        "guarded Git root has conflicting anchor owners"
+                    );
+                    other_files = true;
+                }
+            }
+        }
+        let deletions = if other_files {
+            Vec::new()
+        } else {
+            vec![(
+                GIT_ROOT_PIN_KIND.to_owned(),
+                pin.root_anchor_id.as_bytes().to_vec(),
+            )]
+        };
+        control.put_records_and_retire_and_delete_if_value(
+            &[],
+            &deletions,
+            GIT_ANCHOR_PIN_KIND,
+            anchor_id.as_bytes(),
+            &bytes,
+        )?;
         Ok(())
     }
 
@@ -4005,19 +4183,115 @@ print('DONE', flush=True)
             .unwrap(),
             created
         );
-        GuardedViewMount::release_stopped_file_capture_unreferenced(
-            git_attempt,
+        let repository_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            GuardedViewMount::transfer_stopped_file_capture_to_git(
+                git_attempt,
+                repository_id,
+                &control.lock().unwrap(),
+            )
+            .unwrap(),
+            created
+        );
+        assert!(
+            GuardedViewMount::release_stopped_file_capture_unreferenced(
+                git_attempt,
+                &control.lock().unwrap(),
+            )
+            .is_err()
+        );
+        assert!(
+            GuardedViewMount::require_release_unpinned(
+                original.anchor_id,
+                &control.lock().unwrap()
+            )
+            .is_err()
+        );
+        remounted.stop().unwrap();
+        drop(control);
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(control_dir.join("control.db"), &keys).unwrap(),
+        ));
+        assert!(
+            GuardedViewMount::require_release_unpinned(
+                original.anchor_id,
+                &control.lock().unwrap()
+            )
+            .is_err()
+        );
+        let created_plan =
+            crate::GuardedFileCapturePlan::load_for_manifest(&control.lock().unwrap(), &created)
+                .unwrap()
+                .unwrap();
+        assert!(
+            created_plan
+                .discard_unreferenced(&control.lock().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("Git catalog")
+        );
+        let moved_attempt = uuid::Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            original.anchor_id,
+            moved_attempt,
+            Arc::clone(&control),
+            "moved",
+        )
+        .unwrap();
+        let moved_git = GuardedViewMount::finish_stopped_file_capture(
+            original.anchor_id,
+            moved_attempt,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        assert!(
+            GuardedViewMount::transfer_stopped_file_capture_to_git(
+                moved_attempt,
+                uuid::Uuid::new_v4(),
+                &control.lock().unwrap(),
+            )
+            .is_err()
+        );
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            moved_attempt,
+            repository_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            GuardedViewMount::retire_git_anchor_pin_unreferenced(
+                uuid::Uuid::new_v4(),
+                created.anchor_id,
+                &control.lock().unwrap(),
+            )
+            .is_err()
+        );
+        GuardedViewMount::retire_git_anchor_pin_unreferenced(
+            repository_id,
+            created.anchor_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            GuardedViewMount::require_release_unpinned(
+                original.anchor_id,
+                &control.lock().unwrap()
+            )
+            .is_err()
+        );
+        GuardedViewMount::retire_git_anchor_pin_unreferenced(
+            repository_id,
+            moved_git.anchor_id,
             &control.lock().unwrap(),
         )
         .unwrap();
         GuardedViewMount::require_release_unpinned(original.anchor_id, &control.lock().unwrap())
             .unwrap();
-        remounted.stop().unwrap();
 
         let store = control.lock().unwrap();
         GuardedViewMount::retire_claim(original.anchor_id, &store).unwrap();
         assert!(root_plan.discard_unreferenced(&store).is_err());
-        for anchor in [&second, &created] {
+        for anchor in [&second, &created, &moved_git] {
             let plan = crate::GuardedFileCapturePlan::load_for_manifest(&store, anchor)
                 .unwrap()
                 .unwrap();

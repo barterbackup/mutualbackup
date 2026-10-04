@@ -34,8 +34,14 @@
   the view and retries the same immutable capture. Published retries also
   verify the source plan against the exact mount claim; a normal unit test
   checks raw Unix path round-trip and malformed intent refusal. Both privileged
-  runs pass, as do all 129 normal store tests and strict workspace Clippy. The Git
-  catalog handoff, guarded checkout, and cross-catalog prune are still open.
+  runs pass, as do all 129 normal store tests and strict workspace Clippy. The
+  node control store can now atomically transfer a published stopped-file
+  attempt into durable file and root Git pins. Root and file retirement reject
+  those pins across a control-store reopen; the privileged ext4 and Btrfs probe
+  covers two pinned files, wrong-repository retirement, and last-pin release.
+  The node must still bind the repository to its protected root, reconcile
+  orphaned pins after crashes, and publish the corresponding Git catalog entry.
+  Guarded checkout and cross-catalog prune remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

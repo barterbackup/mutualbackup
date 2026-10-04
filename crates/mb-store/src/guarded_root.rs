@@ -2510,8 +2510,8 @@ impl GuardedRootCapturePlan {
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
         anyhow::ensure!(
-            !crate::guarded_mount::stopped_capture_intent_pins_anchor(control, self.anchor_id)?,
-            "guarded root anchor is pinned by a stopped-view capture"
+            !crate::guarded_mount::guarded_anchor_is_pinned(control, self.anchor_id)?,
+            "guarded root anchor is pinned by a capture, revision, or Git catalog"
         );
         crate::guarded_mount::require_mount_claim_retired(control, self.anchor_id)?;
         crate::guarded_view_probe::verify_retired_namespace_quiescent(control, self.anchor_id)?;
