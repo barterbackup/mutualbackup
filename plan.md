@@ -3609,14 +3609,16 @@ Milestone 5.
   member add/remove/replacement during interrupted work, key rotation across
   retained revisions, and bounded storage/network amplification.
 
-### Milestone 6 — Git-compatible local history, then additional source backends and platforms
+### Milestone 6 — Git-compatible local history and additional source backends and platforms
 
 The Git pivot adds local history and interoperability to this milestone; its
 original source-backend and platform deliverables remain required. Review each
 completed Git command against the byte-exact policy and crash/recovery gates
-below, then continue through graph protection, two-way ordinary-Git exchange,
-and physical reclamation before closing the guarded link-freeze and platform
-backend gates. A command being present does not by itself close its slice.
+below, and continue through graph protection, two-way ordinary-Git exchange,
+physical reclamation, guarded link-freeze, and platform backends. These work
+streams may progress together; the open Milestone 6 items in `TODO.md` remain
+part of the closure gate as the plan is iterated. A command being present does
+not by itself close its slice.
 The native `.mutualbackup` catalog, not a `.git` directory, owns local history;
 the same immutable captured bytes serve backup and Git blobs without a second
 persistent payload copy. Git compatibility applies to the supported command
@@ -3633,7 +3635,8 @@ plan; passing a Git command gate does not close a source-backend or platform gat
 - Complete the supported Git command set over native anchors, including
   branches, linked worktrees, protected history, recovery, and two-way ordinary-
   Git object exchange. For each file-touching command, verify that line-ending
-  settings and all clean/smudge/process, encoding, and ident rules are inert:
+  settings and all clean/smudge/process, encoding, and ident rules are inert,
+  even if a Git installation or repository enables them by default:
   the captured file, staged blob, exported blob, and restored file have the
   same bytes unless the user or merge operation explicitly changes content.
   Include repositories that configure Git LFS in this check: its pointer bytes
@@ -3807,14 +3810,14 @@ while the original source-backend and platform gates remain separate.
   Milestone 6 closes only after the Git, guarded-link-freeze, and listed
   platform gates.
 
-Iterate through Milestone 6 in this order: versioned source boundary and native
+Use this dependency order for the Git work: versioned source boundary and native
 Git object access; byte-exact local history and worktrees; encrypted graph
 protection and recovery; ordinary-Git exchange in both directions; reachability-
-based expiry and physical reclamation; then guarded link-freeze and the listed
-platform backends. Keep the Git byte-policy and relevant crash/recovery checks
-in each slice, with the complete local gates above required for closure. The Git
-pivot adds local history and interoperability to the original source-backend
-work; it does not replace the guarded link-freeze or platform deliverables.
+based expiry and physical reclamation. Continue guarded link-freeze and the
+listed platform backends whenever their prerequisites are ready, rather than
+deferring their open `TODO.md` items until every Git slice is closed. Keep the
+Git byte-policy and relevant crash/recovery checks in each slice. Milestone 6
+closes only when all Git, original source-backend, and platform gates above pass.
 
 ### Milestone 7 — release candidate and compatibility freeze
 
