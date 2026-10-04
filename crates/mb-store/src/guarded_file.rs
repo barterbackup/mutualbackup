@@ -699,6 +699,10 @@ impl GuardedFileCapturePlan {
     /// both finish, so a crash can replay the same retirement.
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         anyhow::ensure!(self.format_version == 1 && !self.anchor_id.is_nil());
+        anyhow::ensure!(
+            !crate::guarded_mount::stopped_capture_intent_pins_anchor(control, self.anchor_id)?,
+            "guarded file anchor is pinned by a stopped-view capture"
+        );
         let view_guard =
             crate::guarded_view_probe::file_guard_record_for_retirement(control, self)?;
         let plan_bytes = mb_core::canonical_bytes(self)?;

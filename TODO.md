@@ -765,10 +765,19 @@
   alone is insufficient. Edited and created files use durable secondary guards.
   The aggregate verifies after canonical encoding and control-DB reopen, and
   its focused nested-path regression passes on ext4 and disposable Btrfs.
-  This remains local capture input: the node still must persist the aggregate
-  as a replayable intent, bind its metadata and file bytes into a signed owner
-  revision, recover the mutable view from a seed, and drive reachability-based
-  cleanup before guarded enrollment.
+  This remains local capture input: the node still must bind its metadata and
+  file bytes into a signed owner revision, recover the mutable view from a
+  seed, and drive reachability-based cleanup before guarded enrollment.
+  The store now durably prepares a stopped-view revision attempt before any
+  file recapture. Prepared attempts block remount; daemon claim recovery
+  finishes them under the stopped-view fence, including after one file was
+  frozen and the control DB reopened. A published retry verifies and returns
+  the original anchors even after later view edits. Both root and per-file
+  retirement honor the attempt's anchor pins until the owner explicitly
+  releases the intent. The focused privileged test passes on ext4 and a fresh
+  disposable Btrfs image. Node revision creation still needs to own this
+  attempt ID, transfer its pins into signed-revision retention, and release
+  the local intent only after that transfer commits.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
