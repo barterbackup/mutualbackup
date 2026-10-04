@@ -7,6 +7,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use git2::Oid;
+#[cfg(target_os = "linux")]
+use mb_store::GuardedGitStagePin;
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
     GIT_CATALOG_MARKER_FILE, PinnedDirectory, SourceBackendKind, git_catalog_marker_bytes,
@@ -47,9 +49,12 @@ use crate::merge::{
     session_kind_for_scope,
 };
 use crate::prune::{
-    GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
+    GitPruneError, GitPruneReport, GitPruneRoots, has_pending_prune, prune_unreachable,
+    resume_pending_prune,
 };
 use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
+#[cfg(target_os = "linux")]
+use crate::stage::publish_guarded_stage_for_scope;
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
     anchors_for_oid, remove_cached, remove_cached_for_scope,
@@ -208,7 +213,7 @@ impl GitRepository {
             source_backend,
         };
         repository.resume_checkout()?;
-        resume_pending_prune(&repository.catalog, repository.repository_id)?;
+        repository.resume_prune_for_backend()?;
         Ok(repository)
     }
 
@@ -332,12 +337,25 @@ impl GitRepository {
         } else {
             repository.resume_checkout()?;
         }
-        resume_pending_prune(&repository.catalog, repository.repository_id)?;
+        repository.resume_prune_for_backend()?;
         Ok(repository)
     }
 
     pub fn id(&self) -> Uuid {
         self.repository_id
+    }
+
+    fn resume_prune_for_backend(&self) -> Result<(), RepositoryError> {
+        if self.source_backend == SourceBackendKind::GuardedLinkFreezeV1 {
+            // The Git catalog cannot see pins in the separate node control
+            // database. Never replay physical deletion without that proof.
+            if has_pending_prune(&self.catalog, self.repository_id)? {
+                return Err(RepositoryError::Conflict);
+            }
+            return Ok(());
+        }
+        resume_pending_prune(&self.catalog, self.repository_id)?;
+        Ok(())
     }
 
     fn native_source(&self) -> NativeSource<'_> {
@@ -814,6 +832,32 @@ impl GitRepository {
         )?)
     }
 
+    /// Publish a capture already pinned in the node's guarded control store.
+    /// The caller must first verify the node's repository-to-root binding and
+    /// keep the pin until Git reachability no longer needs the anchor.
+    #[cfg(target_os = "linux")]
+    pub fn publish_guarded_stage(
+        &self,
+        pin: &GuardedGitStagePin,
+        expected_root_anchor_id: Uuid,
+    ) -> Result<GitIndexEntry, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1
+            || pin.repository_id != self.repository_id
+            || pin.root_anchor_id != expected_root_anchor_id
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        let scope = if pin.worktree_id == self.repository_id {
+            self.resume_checkout()?;
+            crate::GitWorktreeScope::primary(self.repository_id)
+        } else {
+            self.resume_linked_worktree(pin.worktree_id)?
+                .scope()
+                .ok_or(RepositoryError::Conflict)?
+        };
+        Ok(publish_guarded_stage_for_scope(&self.catalog, scope, pin)?)
+    }
+
     /// Like `git add <path>`, capture a present file or symlink, or stage the
     /// deletion of a missing indexed path. Unsupported objects are not deletions.
     pub fn add_path(
@@ -1283,6 +1327,9 @@ impl GitRepository {
         &self,
         protected: &GitPruneRoots,
     ) -> Result<GitPruneReport, RepositoryError> {
+        if self.source_backend == SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
         self.resume_checkout()?;
         Ok(prune_unreachable(
             &self.catalog,
@@ -1797,6 +1844,68 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_catalog_publication_requires_matching_root_and_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let reflink_root = temp.path().join("reflink");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&reflink_root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let root_anchor_id = Uuid::new_v4();
+        let manifest = mb_store::SourceBlobImportPlan::plan_direct(&root, 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"exact"))
+            .unwrap();
+        let pin = mb_store::GuardedGitStagePin {
+            repository_id,
+            root_anchor_id,
+            manifest,
+            attempt_id: Uuid::new_v4(),
+            worktree_id: repository_id,
+            relative_path: b"tracked".to_vec(),
+            git_mode: 0o100644,
+        };
+        let key = [91_u8; 32];
+        let reflink = GitRepository::init(&reflink_root, repository_id, &key).unwrap();
+        assert!(reflink.publish_guarded_stage(&pin, root_anchor_id).is_err());
+        let guarded = GitRepository::init_with_backend(
+            &root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        assert!(guarded.publish_guarded_stage(&pin, Uuid::new_v4()).is_err());
+        let staged = guarded.publish_guarded_stage(&pin, root_anchor_id).unwrap();
+        assert_eq!(guarded.staged_entry("tracked").unwrap(), Some(staged));
+        assert!(
+            guarded
+                .prune_unreachable(&GitPruneRoots::default())
+                .is_err()
+        );
+        guarded
+            .catalog
+            .put_record(
+                &format!("git-prune-intent-v1/{repository_id}"),
+                b"active",
+                b"pending",
+            )
+            .unwrap();
+        drop(guarded);
+        assert!(
+            GitRepository::open_with_backend(
+                &root,
+                repository_id,
+                &key,
+                SourceBackendKind::GuardedLinkFreezeV1,
+            )
+            .is_err()
+        );
+        pin.manifest.open_verified().unwrap();
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -14,6 +16,8 @@ use std::path::{Component, Path, PathBuf};
 
 use git2::Oid;
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
+#[cfg(target_os = "linux")]
+use mb_store::GuardedGitStagePin;
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
     NativeFileId, PinnedDirectory, SourceBackendKind, SourceFileCaptureError,
@@ -47,6 +51,8 @@ const WORKTREE_STAGE_INTENT_PREFIX: &str = "git-worktree-stage-intent-v1/";
 const WORKTREE_SYMLINK_INTENT_PREFIX: &str = "git-worktree-symlink-stage-intent-v1/";
 const WORKTREE_INDEX_PREFIX: &str = "git-worktree-index-entry-v1/";
 const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
+#[cfg(target_os = "linux")]
+const GUARDED_STAGE_RECEIPT_PREFIX: &str = "git-guarded-stage-receipt-v1/";
 
 #[cfg(test)]
 thread_local! {
@@ -130,6 +136,19 @@ pub struct GitIndexEntry {
     pub oid: [u8; 20],
     pub mode: u32,
     pub anchor_id: Uuid,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedStageReceipt {
+    format_version: u16,
+    repository_id: Uuid,
+    worktree_id: Uuid,
+    root_anchor_id: Uuid,
+    attempt_id: Uuid,
+    relative_path: Vec<u8>,
+    manifest: FileAnchorManifest,
+    entry: GitIndexEntry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -679,6 +698,101 @@ fn finish_stage_for_scope(
     Ok(entry)
 }
 
+/// Publish a node-pinned guarded capture into the Git catalog. The node's
+/// control database owns the capture before this call; one catalog transaction
+/// publishes the object map, index entry, and exact attempt receipt. Replaying
+/// a receipt never rewrites a path that was staged again later.
+#[cfg(target_os = "linux")]
+pub(crate) fn publish_guarded_stage_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    pin: &GuardedGitStagePin,
+) -> Result<GitIndexEntry, StageError> {
+    if pin.repository_id != scope.repository_id()
+        || pin.worktree_id != scope.worktree_id()
+        || pin.root_anchor_id.is_nil()
+        || pin.attempt_id.is_nil()
+        || !matches!(pin.git_mode, 0o100644 | 0o100755)
+    {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let path = PathBuf::from(OsString::from_vec(pin.relative_path.clone()));
+    let key = stage_path_key(&path)?;
+    if key != pin.relative_path {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let oid = blob_oid_from_anchor(&pin.manifest)?;
+    let entry = GitIndexEntry {
+        format_version: 1,
+        oid: oid.as_bytes().try_into().expect("SHA-1 OID has 20 bytes"),
+        mode: pin.git_mode,
+        anchor_id: pin.manifest.anchor_id,
+    };
+    let receipt = GuardedStageReceipt {
+        format_version: 1,
+        repository_id: pin.repository_id,
+        worktree_id: pin.worktree_id,
+        root_anchor_id: pin.root_anchor_id,
+        attempt_id: pin.attempt_id,
+        relative_path: key.clone(),
+        manifest: pin.manifest.clone(),
+        entry: entry.clone(),
+    };
+    let receipt_kind = format!("{GUARDED_STAGE_RECEIPT_PREFIX}{}", scope.repository_id());
+    let receipt_bytes = canonical_bytes(&receipt)?;
+    if let Some(existing) = control.get_record(&receipt_kind, pin.attempt_id.as_bytes())? {
+        let recorded: GuardedStageReceipt = decode_canonical(&existing)?;
+        if existing != receipt_bytes || recorded != receipt {
+            return Err(StageError::IncompatibleRecord);
+        }
+        let mapped = control.get_record(
+            &object_kind(scope.repository_id(), oid),
+            pin.manifest.anchor_id.as_bytes(),
+        )?;
+        if mapped.as_deref() != Some(canonical_bytes(&pin.manifest)?.as_slice()) {
+            return Err(StageError::IncompatibleRecord);
+        }
+        return Ok(entry);
+    }
+    if control
+        .get_record(&intent_kind_for_scope(scope), &key)?
+        .is_some()
+        || control
+            .get_record(&symlink_intent_kind_for_scope(scope), &key)?
+            .is_some()
+        || control
+            .get_record(&crate::rm::intent_kind_for_scope(scope), &key)?
+            .is_some()
+    {
+        return Err(StageError::PendingStage);
+    }
+    for existing in anchors_for_oid(control, scope.repository_id(), oid)? {
+        require_same_blob_bytes(&existing, &pin.manifest)?;
+    }
+    let mut records = vec![
+        (
+            object_kind(scope.repository_id(), oid),
+            pin.manifest.anchor_id.as_bytes().to_vec(),
+            canonical_bytes(&pin.manifest)?,
+        ),
+        (
+            index_kind_for_scope(scope),
+            key.clone(),
+            canonical_bytes(&entry)?,
+        ),
+        (
+            receipt_kind,
+            pin.attempt_id.as_bytes().to_vec(),
+            receipt_bytes,
+        ),
+    ];
+    if let Some(resolution) = resolution_record_for_stage(control, scope, &key, true)? {
+        records.push(resolution);
+    }
+    control.put_records_and_delete(&records, &[])?;
+    Ok(entry)
+}
+
 /// Stage an exact regular-file snapshot. The caller must serialize writes to
 /// this repository's catalog; a failed add keeps a replayable intent.
 pub fn stage_file(
@@ -1156,8 +1270,8 @@ mod tests {
     use git2::Oid;
     use mb_core::canonical_bytes;
     use mb_store::{
-        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceBackendKind,
-        SourceFileCapturePlan, StableAnchorAreaLocator,
+        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, GuardedGitStagePin, PinnedDirectory,
+        SourceBackendKind, SourceFileCapturePlan, StableAnchorAreaLocator,
     };
     use serde::Serialize;
     use uuid::Uuid;
@@ -1171,6 +1285,73 @@ mod tests {
     };
     use crate::GitWorktreeScope;
     use crate::merge::{MergeSession, merge_state_for_scope, store_merge_session_for_scope};
+
+    #[test]
+    fn guarded_stage_receipt_replays_without_rewriting_a_later_index() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository_id = Uuid::new_v4();
+        let root_anchor_id = Uuid::new_v4();
+        let scope = GitWorktreeScope::primary(repository_id);
+        let catalog_path = temporary.path().join("catalog.db");
+        let make_pin = |bytes: &'static [u8]| GuardedGitStagePin {
+            repository_id,
+            root_anchor_id,
+            manifest: mb_store::SourceBlobImportPlan::plan_direct(
+                temporary.path(),
+                bytes.len() as u64,
+            )
+            .unwrap()
+            .capture(std::io::Cursor::new(bytes))
+            .unwrap(),
+            attempt_id: Uuid::new_v4(),
+            worktree_id: repository_id,
+            relative_path: b"tracked".to_vec(),
+            git_mode: 0o100644,
+        };
+        let first = make_pin(b"alpha");
+        let control = ControlStore::open_with_key(&catalog_path, &[31; 32]).unwrap();
+        let first_entry = super::publish_guarded_stage_for_scope(&control, scope, &first).unwrap();
+        assert_eq!(
+            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
+            Some(first_entry.clone())
+        );
+        drop(control);
+        let control = ControlStore::open_existing_with_key(&catalog_path, &[31; 32]).unwrap();
+        assert_eq!(
+            super::publish_guarded_stage_for_scope(&control, scope, &first).unwrap(),
+            first_entry
+        );
+        let second = make_pin(b"bravo");
+        let second_entry =
+            super::publish_guarded_stage_for_scope(&control, scope, &second).unwrap();
+        assert_eq!(
+            super::publish_guarded_stage_for_scope(&control, scope, &first).unwrap(),
+            first_entry
+        );
+        assert_eq!(
+            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
+            Some(second_entry.clone())
+        );
+        let linked_scope = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        let mut linked = make_pin(b"linked");
+        linked.worktree_id = linked_scope.worktree_id();
+        let linked_entry =
+            super::publish_guarded_stage_for_scope(&control, linked_scope, &linked).unwrap();
+        assert_eq!(
+            staged_entry_for_scope(&control, linked_scope, "tracked").unwrap(),
+            Some(linked_entry)
+        );
+        assert_eq!(
+            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
+            Some(second_entry)
+        );
+        let mut altered = first.clone();
+        altered.git_mode = 0o100755;
+        assert!(matches!(
+            super::publish_guarded_stage_for_scope(&control, scope, &altered),
+            Err(StageError::IncompatibleRecord)
+        ));
+    }
 
     #[test]
     fn index_removal_and_conflict_resolution_share_one_catalog_transition() {

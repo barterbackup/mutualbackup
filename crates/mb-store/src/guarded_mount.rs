@@ -170,6 +170,14 @@ struct GuardedGitAnchorPin {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedGitAnchorPinV1 {
+    format_version: u16,
+    repository_id: Uuid,
+    root_anchor_id: Uuid,
+    manifest: FileAnchorManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct GuardedGitStageContext {
     attempt_id: Uuid,
     worktree_id: Uuid,
@@ -224,7 +232,21 @@ fn git_anchor_pin(
         bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
         "guarded Git pin is too large"
     );
-    let pin: GuardedGitAnchorPin = mb_core::decode_canonical(&bytes)?;
+    // Canonical CBOR structs are positional. A trailing optional field does
+    // not make an older four-field pin decode as the new five-field record.
+    let pin: GuardedGitAnchorPin = match mb_core::decode_canonical(&bytes) {
+        Ok(pin) => pin,
+        Err(_) => {
+            let old: GuardedGitAnchorPinV1 = mb_core::decode_canonical(&bytes)?;
+            GuardedGitAnchorPin {
+                format_version: old.format_version,
+                repository_id: old.repository_id,
+                root_anchor_id: old.root_anchor_id,
+                manifest: old.manifest,
+                stage: None,
+            }
+        }
+    };
     ensure!(
         matches!(pin.format_version, 1 | 2)
             && !pin.repository_id.is_nil()
@@ -4356,6 +4378,14 @@ print('DONE', flush=True)
                     &legacy_bytes,
                 )
                 .unwrap();
+            assert_eq!(
+                super::git_anchor_pin(&store, created.anchor_id)
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .format_version,
+                1
+            );
             assert!(GuardedViewMount::git_stage_pins(repository_id, &store).is_err());
             store
                 .replace_record_if_value(

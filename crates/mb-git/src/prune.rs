@@ -93,6 +93,15 @@ fn intent_kind(repository_id: Uuid) -> String {
     format!("{INTENT_PREFIX}{repository_id}")
 }
 
+pub(crate) fn has_pending_prune(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<bool, GitPruneError> {
+    Ok(control
+        .get_record(&intent_kind(repository_id), ACTIVE)?
+        .is_some())
+}
+
 #[cfg(test)]
 thread_local! {
     static AFTER_CATALOG_DELETE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =

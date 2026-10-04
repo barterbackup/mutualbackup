@@ -43,7 +43,14 @@
   reopened node can enumerate and verify the pending stage without guessing;
   legacy pins missing that context fail closed. The node must still bind the
   repository to its protected root, reconcile pins after crashes, and publish
-  the corresponding Git catalog entry.
+  the corresponding Git catalog entry. The Git catalog now has a guarded-pin
+  publication primitive: it atomically records the exact object mapping,
+  worktree index entry, and attempt receipt, and replay leaves a newer index
+  untouched. Its normal catalog tests cover reopen, retry, and wrong backend
+  or root. Guarded repository prune is fenced, including a pending prune intent
+  on reopen, because that catalog cannot yet see node-owned pins. The node
+  still does not call the publication primitive; cross-catalog pin
+  reconciliation and guarded-aware prune must precede enabling Git operations.
   Guarded checkout and cross-catalog prune remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
