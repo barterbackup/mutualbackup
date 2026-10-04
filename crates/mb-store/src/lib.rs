@@ -9,6 +9,8 @@ mod database;
 #[cfg(target_os = "linux")]
 mod guarded_mount;
 #[cfg(target_os = "linux")]
+mod guarded_recovery_handoff;
+#[cfg(target_os = "linux")]
 mod guarded_view_probe;
 #[cfg(target_os = "linux")]
 mod link_freeze;
@@ -44,6 +46,8 @@ pub use guarded_mount::{
     GUARDED_REVISION_CAPTURE_KIND, GuardedRevisionCaptureV1, GuardedStoppedCaptureV1,
     GuardedStoppedFileV1, GuardedViewBinding, GuardedViewMount,
 };
+#[cfg(target_os = "linux")]
+pub use guarded_recovery_handoff::GuardedRecoveryHandoff;
 #[cfg(target_os = "linux")]
 pub use guarded_view_probe::{
     GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,

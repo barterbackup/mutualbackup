@@ -24860,10 +24860,8 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(fs::read(restored.join("sample")).unwrap(), captured_bytes);
         assert_eq!(fs::read(restored.join(&raw_path)).unwrap(), raw_edited);
-        // Bind the actual signed private metadata to a newly restored local
-        // tree, then prove that the guarded view can present it on ext4 as
-        // well as Btrfs. The production recovery job still needs the
-        // replayable path transition from target directory to private lower.
+        // Move the restored inode behind a replayable private-lower name,
+        // then mount the guarded view at the original recovery target.
         let signed_private = crate::GuardedPrivateMetadataV6::decode(
             &crate::snapshot::load_private_metadata_bytes(
                 &recovered.control,
@@ -24874,10 +24872,23 @@ pub(crate) mod tests {
             .unwrap(),
         )
         .unwrap();
-        let restored_plan = mb_store::GuardedRootCapturePlan::plan(&restored).unwrap();
+        let parent = PinnedDirectory::open(area.path()).unwrap();
+        let restored_id = parent.entry_identity("restored", true).unwrap().unwrap();
+        let mut handoff = mb_store::GuardedRecoveryHandoff::prepare(
+            &recovered.control,
+            revision_id,
+            &parent,
+            "restored",
+            restored_id,
+        )
+        .unwrap();
+        handoff.resume(&recovered.control, &parent).unwrap();
+        let restored_lower = handoff.lower_path();
+        let restored_view = handoff.mountpoint();
+        let restored_plan = mb_store::GuardedRootCapturePlan::plan(&restored_lower).unwrap();
         let virtual_metadata = signed_private
             .bind_restored_view(
-                &PinnedDirectory::open(&restored).unwrap(),
+                &PinnedDirectory::open(&restored_lower).unwrap(),
                 restored_plan.anchor_id(),
             )
             .unwrap();
@@ -24894,8 +24905,6 @@ pub(crate) mod tests {
         restored_plan
             .isolate_lower_directories(&recovered.control, &restored_manifest)
             .unwrap();
-        let restored_view = area.path().join("restored-view");
-        fs::create_dir(&restored_view).unwrap();
         let restored_control = Arc::new(Mutex::new(
             ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap(),
         ));

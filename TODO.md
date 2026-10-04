@@ -924,10 +924,14 @@
   registration, then completion succeeds after the bytes are restored;
   the focused Btrfs probe and strict Clippy pass on this source. The complete
   normal node suite passed before the final content-verification addition.
-  This check does not yet move the restored tree behind a guarded FUSE mount.
-  The production recovery job still
-  needs a replayable transition from its published restored directory to a
-  private lower tree, guarded root registration/backend selection, and a
+  A versioned local handoff now journals the restored inode and a private
+  placeholder before moving the restored target to a hidden lower path.
+  Replay finishes either rename boundary, leaves an unbound crash-time
+  placeholder untouched, and rejects a foreign lower inode. A raw-name store
+  probe passes on ext4 and disposable Btrfs; the privileged node fixture now
+  uses this handoff to mount its signed restored tree at the original target
+  path on both filesystems. The production recovery job still needs to own and
+  resume this handoff, register/select the guarded backend, and provide a
   non-reflink recovery path before guarded enrollment can be enabled.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
