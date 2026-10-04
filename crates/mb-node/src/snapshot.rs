@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
 #[cfg(test)]
@@ -27,6 +31,11 @@ use mb_store::{
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[cfg(target_os = "linux")]
+use crate::guarded_metadata::{
+    GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6,
+};
 
 type RecordWrite = (String, Vec<u8>, Vec<u8>);
 const ANCHOR_AREA_LOCATION_KIND: &str = "anchor-area-location";
@@ -1616,21 +1625,23 @@ fn recovered_anchor_records(
     Ok(records)
 }
 
-fn load_private_metadata(
-    control: &ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    revision: &SignedRecord<UserRevision>,
-) -> Result<PrivateMetadata> {
-    Ok(load_private_metadata_with_git(control, keys, guild_id, revision)?.0)
-}
-
 fn load_private_metadata_with_git(
     control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
 ) -> Result<(PrivateMetadata, Option<GitBackupDescriptor>)> {
+    decode_private_metadata_with_git(&load_private_metadata_bytes(
+        control, keys, guild_id, revision,
+    )?)
+}
+
+fn load_private_metadata_bytes(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+) -> Result<Vec<u8>> {
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut metadata_bytes = Vec::with_capacity(checked_metadata_length(revision)?);
     for reference in &revision.value.metadata_sectors {
@@ -1640,7 +1651,7 @@ fn load_private_metadata_with_git(
             &mut |sector_id| render_sector(control, keys, sector_id, Some(&guild_id)),
         )?);
     }
-    decode_private_metadata_with_git(&metadata_bytes)
+    Ok(metadata_bytes)
 }
 
 pub(crate) fn revision_git_backup(
@@ -1649,7 +1660,15 @@ pub(crate) fn revision_git_backup(
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
 ) -> Result<Option<GitBackupDescriptor>> {
-    Ok(load_private_metadata_with_git(control, keys, guild_id, revision)?.1)
+    let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+    if private_metadata_format(&bytes)? == 6 {
+        #[cfg(target_os = "linux")]
+        GuardedPrivateMetadataV6::decode(&bytes)?;
+        #[cfg(not(target_os = "linux"))]
+        bail!("guarded private metadata cannot be decoded on this platform");
+        return Ok(None);
+    }
+    Ok(decode_private_metadata_with_git(&bytes)?.1)
 }
 
 #[cfg(test)]
@@ -1660,8 +1679,7 @@ fn decode_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
 fn decode_private_metadata_with_git(
     bytes: &[u8],
 ) -> Result<(PrivateMetadata, Option<GitBackupDescriptor>)> {
-    let (format_version, _) =
-        postcard::take_from_bytes::<u16>(bytes).context("decode private metadata version")?;
+    let format_version = private_metadata_format(bytes)?;
     match format_version {
         1 | 3 => {
             let metadata: PrivateMetadata = decode_canonical(bytes)?;
@@ -1717,6 +1735,12 @@ fn decode_private_metadata_with_git(
         }
         _ => bail!("unsupported private metadata version"),
     }
+}
+
+fn private_metadata_format(bytes: &[u8]) -> Result<u16> {
+    Ok(postcard::take_from_bytes::<u16>(bytes)
+        .context("decode private metadata version")?
+        .0)
 }
 
 fn decode_v2_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
@@ -1892,7 +1916,17 @@ pub(crate) fn restore_signed_root_metadata_at(
     revision: &SignedRecord<UserRevision>,
     restored_root: &PinnedDirectory,
 ) -> Result<()> {
-    let metadata = load_private_metadata(control, keys, guild_id, revision)?;
+    let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
+    if private_metadata_format(&bytes)? == 6 {
+        #[cfg(target_os = "linux")]
+        return set_guarded_metadata_durable(
+            restored_root.as_file(),
+            &GuardedPrivateMetadataV6::decode(&bytes)?.root,
+        );
+        #[cfg(not(target_os = "linux"))]
+        bail!("guarded private metadata cannot be restored on this platform");
+    }
+    let (metadata, _) = decode_private_metadata_with_git(&bytes)?;
     set_metadata_durable(
         restored_root.as_file(),
         metadata.root_mode,
@@ -2782,6 +2816,18 @@ where
             load_ciphertext,
         )?);
     }
+    if private_metadata_format(&metadata_bytes)? == 6 {
+        #[cfg(target_os = "linux")]
+        return restore_guarded_entries(
+            staging,
+            &GuardedPrivateMetadataV6::decode(&metadata_bytes)?,
+            &encryption_key,
+            load_ciphertext,
+            apply_root_metadata,
+        );
+        #[cfg(not(target_os = "linux"))]
+        bail!("guarded private metadata cannot be restored on this platform");
+    }
     let (metadata, git) = decode_private_metadata_with_git(&metadata_bytes)?;
     restore_entries(
         staging,
@@ -3188,6 +3234,165 @@ where
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn restore_guarded_entries<F>(
+    staging: &PinnedDirectory,
+    metadata: &GuardedPrivateMetadataV6,
+    encryption_key: &[u8; 32],
+    load_ciphertext: &mut F,
+    apply_root_metadata: bool,
+) -> Result<()>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    metadata.validate()?;
+    let mut expected = BTreeMap::<PathBuf, ExpectedRestoreEntry>::new();
+    let mut directory_stats = BTreeMap::<PathBuf, GuardedPrivateStatV6>::new();
+    let mut links = BTreeMap::<u64, (String, NativeFileId)>::new();
+    let link_pool_name = loop {
+        let candidate = format!(".mutualbackup-restore-links-{}", Uuid::new_v4());
+        if !metadata.entries.iter().any(|entry| {
+            let path = match entry {
+                GuardedPrivateEntryV6::Directory { path, .. }
+                | GuardedPrivateEntryV6::File { path, .. }
+                | GuardedPrivateEntryV6::HardLink { path, .. } => path,
+            };
+            path.split(|byte| *byte == b'/')
+                .next()
+                .is_some_and(|first| first == candidate.as_bytes())
+        }) {
+            break candidate;
+        }
+    };
+    let link_pool = staging.create_child_directory(&link_pool_name)?;
+    let link_pool_identity = link_pool.identity()?;
+    for entry in &metadata.entries {
+        match entry {
+            GuardedPrivateEntryV6::Directory { path, stat, .. } => {
+                let path = PathBuf::from(OsString::from_vec(path.clone()));
+                ensure_restore_directory(staging, &path, &mut expected)?;
+                directory_stats.insert(path, stat.clone());
+            }
+            GuardedPrivateEntryV6::File {
+                path,
+                stat,
+                logical_len,
+                link_group,
+                data_extents,
+            } => {
+                let path = PathBuf::from(OsString::from_vec(path.clone()));
+                let (parent, name) = restore_destination(staging, &path, &mut expected)?;
+                let mut file = parent.create_child_file(&name)?;
+                restore_sparse_file(
+                    &mut file,
+                    *logical_len,
+                    data_extents,
+                    encryption_key,
+                    load_ciphertext,
+                )?;
+                set_guarded_metadata_durable(&file, stat)?;
+                let identity = native_id_for_file(staging, &file)?;
+                let pool_name = link_group.to_string();
+                parent.hard_link_child_from(&name, &link_pool, &pool_name)?;
+                links.insert(*link_group, (pool_name, identity));
+                expected.insert(
+                    path,
+                    ExpectedRestoreEntry {
+                        directory: false,
+                        identity,
+                    },
+                );
+            }
+            GuardedPrivateEntryV6::HardLink {
+                path, link_group, ..
+            } => {
+                let path = PathBuf::from(OsString::from_vec(path.clone()));
+                let (parent, name) = restore_destination(staging, &path, &mut expected)?;
+                let (pool_name, identity) = links
+                    .get(link_group)
+                    .context("guarded hard-link primary is missing during restore")?;
+                link_pool.hard_link_child_from(pool_name, &parent, &name)?;
+                expected.insert(
+                    path,
+                    ExpectedRestoreEntry {
+                        directory: false,
+                        identity: *identity,
+                    },
+                );
+            }
+        }
+    }
+    for (pool_name, _) in links.values() {
+        link_pool.remove_child_file(pool_name)?;
+    }
+    link_pool.sync_all()?;
+    staging.remove_child_directory(&link_pool_name, link_pool_identity)?;
+
+    for (path, entry) in &expected {
+        ensure!(
+            staging.entry_identity(path, entry.directory)? == Some(entry.identity),
+            "guarded restored entry changed during construction: {}",
+            path.display()
+        );
+    }
+    let mut directories = expected
+        .iter()
+        .filter(|(_, entry)| entry.directory)
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in directories {
+        let directory = open_expected_restore_directory(staging, &path, &expected)?;
+        let stat = directory_stats
+            .remove(&path)
+            .context("guarded restored directory has no signed metadata")?;
+        set_guarded_metadata_durable(directory.as_file(), &stat)?;
+    }
+    ensure!(
+        directory_stats.is_empty(),
+        "guarded directory metadata has no restored directory"
+    );
+    if apply_root_metadata {
+        set_guarded_metadata_durable(staging.as_file(), &metadata.root)?;
+    } else {
+        staging.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_guarded_metadata_durable(file: &File, stat: &GuardedPrivateStatV6) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let current = file.metadata()?;
+    if current.uid() != stat.uid || current.gid() != stat.gid {
+        // SAFETY: the descriptor is an identity-checked restored inode and
+        // the signed uid/gid have already passed the private-format decoder.
+        if unsafe { libc::fchown(file.as_raw_fd(), stat.uid, stat.gid) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("restore guarded owner");
+        }
+    }
+    file.set_permissions(fs::Permissions::from_mode(stat.mode.into()))?;
+    let timestamps = [
+        libc::timespec {
+            tv_sec: stat.atime_secs,
+            tv_nsec: i64::from(stat.atime_nanos),
+        },
+        libc::timespec {
+            tv_sec: stat.modified_secs,
+            tv_nsec: i64::from(stat.modified_nanos),
+        },
+    ];
+    // SAFETY: both signed nanosecond values are below one billion and the
+    // descriptor remains open across the syscall.
+    if unsafe { libc::futimens(file.as_raw_fd(), timestamps.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("restore guarded times");
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct ExpectedRestoreEntry {
     directory: bool,
@@ -3411,6 +3616,143 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_private_metadata_restores_raw_paths_sparse_bytes_and_hard_links() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-restore-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root_path = temporary.path().join("restored");
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([219; 32]));
+        let guild_id = [220; 32];
+        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
+        let revision_id = Uuid::new_v4();
+        let encryption_key = keys.guild_data_key(&guild_id);
+        let data_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, 0);
+        let (data_ref, data_ciphertext) =
+            encrypted_sector(&encryption_key, data_id, b"raw").unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let group = unsafe { libc::getegid() };
+        let stat = |mode| GuardedPrivateStatV6 {
+            mode,
+            uid: owner,
+            gid: group,
+            atime_secs: 1_700_000_000,
+            atime_nanos: 123,
+            modified_secs: 1_700_000_001,
+            modified_nanos: 456,
+        };
+        let metadata = GuardedPrivateMetadataV6 {
+            format_version: 6,
+            root: stat(0o750),
+            entries: vec![
+                GuardedPrivateEntryV6::Directory {
+                    path: b"nested".to_vec(),
+                    stat: stat(0o700),
+                    logical_len: 4096,
+                },
+                GuardedPrivateEntryV6::File {
+                    path: b"nested/\xfe".to_vec(),
+                    stat: stat(0o640),
+                    logical_len: 1024,
+                    link_group: 0,
+                    data_extents: vec![PrivateDataExtent {
+                        offset: 1000,
+                        logical_len: 3,
+                        sectors: vec![data_ref.clone()],
+                    }],
+                },
+                GuardedPrivateEntryV6::HardLink {
+                    path: b"nested/\xff".to_vec(),
+                    stat: stat(0o640),
+                    logical_len: 1024,
+                    link_group: 0,
+                },
+            ],
+        };
+        metadata.validate().unwrap();
+        let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
+        let metadata_bytes = canonical_bytes(&metadata).unwrap();
+        let (metadata_ref, metadata_ciphertext) =
+            encrypted_sector(&encryption_key, metadata_id, &metadata_bytes).unwrap();
+        let ciphertexts = BTreeMap::from([
+            (data_id, data_ciphertext.clone()),
+            (metadata_id, metadata_ciphertext.clone()),
+        ]);
+        let writer = SigningKey::from_bytes(&[221; 32]);
+        let mut revision = UserRevision {
+            format_version: 5,
+            guild_id,
+            protected_root_id: Uuid::new_v4(),
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id,
+            owner: keys.node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![metadata_ref.clone()],
+            data_sectors: vec![data_ref],
+            sector_commitments: Some(vec![
+                merkle_commit(&metadata_ciphertext).unwrap(),
+                merkle_commit(&data_ciphertext).unwrap(),
+            ]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
+        restore_revision(
+            &control,
+            &keys,
+            guild_id,
+            &revision,
+            &ciphertexts,
+            &root_path,
+        )
+        .unwrap();
+        let root = PinnedDirectory::open(&root_path).unwrap();
+
+        let first = root_path.join(OsString::from_vec(b"nested/\xfe".to_vec()));
+        let second = root_path.join(OsString::from_vec(b"nested/\xff".to_vec()));
+        let first_stat = fs::metadata(&first).unwrap();
+        let second_stat = fs::metadata(&second).unwrap();
+        assert_eq!(first_stat.ino(), second_stat.ino());
+        assert_eq!(first_stat.len(), 1024);
+        assert_eq!(first_stat.uid(), owner);
+        assert_eq!(first_stat.gid(), group);
+        assert_eq!(first_stat.mode() & 0o7777, 0o640);
+        assert_eq!(first_stat.mtime(), 1_700_000_001);
+        assert_eq!(first_stat.mtime_nsec(), 456);
+        assert_eq!(first_stat.atime(), 1_700_000_000);
+        assert_eq!(first_stat.atime_nsec(), 123);
+        assert_eq!(fs::read(&first).unwrap()[1000..1003], *b"raw");
+        assert_eq!(fs::read(&second).unwrap(), fs::read(&first).unwrap());
+        let root_stat = fs::metadata(&root_path).unwrap();
+        assert_eq!(root_stat.mode() & 0o7777, 0o750);
+        assert_eq!(root_stat.mtime(), 1_700_000_001);
+        assert_eq!(root_stat.mtime_nsec(), 456);
+        install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
+        assert!(
+            revision_git_backup(&control, &keys, guild_id, &revision)
+                .unwrap()
+                .is_none()
+        );
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        restore_signed_root_metadata_at(&control, &keys, guild_id, &revision, &root).unwrap();
+        let root_stat = fs::metadata(&root_path).unwrap();
+        assert_eq!(root_stat.mode() & 0o7777, 0o750);
+        assert_eq!(root_stat.atime(), 1_700_000_000);
+        assert_eq!(root_stat.atime_nsec(), 123);
+    }
 
     #[test]
     fn git_prune_pins_exact_anchor_used_by_a_local_sector_recipe() {

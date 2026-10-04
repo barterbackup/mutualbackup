@@ -800,6 +800,15 @@
   and round-trips a non-UTF-8 hard-link fixture. The node-level privileged
   capture probe constructs it from an edited view. Revision signing, seed
   restore, and recovered-anchor pin transfer still need to consume this shape.
+  Format-6 restore now dispatches through the signed `UserRevision` restore
+  path: it validates the private metadata before creating names, rebuilds raw
+  filenames, sparse bytes and hard-link aliases from signed sectors, and
+  reapplies uid/gid, mode, atime and mtime to restored inodes. A signed
+  revision fixture exercises durable restore publication and root-metadata
+  reapplication; the snapshot compatibility group passes. Git descriptor
+  inspection treats a validated guarded revision as non-Git. Production
+  guarded revision signing, reanchoring after seed recovery, view reconstruction
+  (including virtual directory lengths), and pin transfer remain open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
