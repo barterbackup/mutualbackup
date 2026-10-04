@@ -32,12 +32,12 @@ use mb_git::{
     GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitPruneRoots,
     GitRemoteBranchInfo, GitRepository, GitStatus, GitTagInfo, GitWorktreeInfo,
 };
-#[cfg(target_os = "linux")]
-use mb_store::GuardedViewMount;
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     SourceBackendBinding, SourceBackendKind, VariableParityObject, filesystem_identity,
 };
+#[cfg(target_os = "linux")]
+use mb_store::{GuardedStoppedCaptureV1, GuardedViewMount};
 use rand::RngCore;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -1278,10 +1278,59 @@ impl Node {
     /// worktree: the private lower root must never become its fallback path.
     pub fn check_guarded_mounts(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
-        for mount in &self.guarded_mounts {
-            mount.check_health()?;
+        {
+            let claimed = GuardedViewMount::claimed_anchor_ids(&self.control)?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let mounted = self
+                .guarded_mounts
+                .iter()
+                .map(GuardedViewMount::anchor_id)
+                .collect::<BTreeSet<_>>();
+            if claimed != mounted || mounted.len() != self.guarded_mounts.len() {
+                anyhow::bail!("daemon is not supervising every claimed guarded view");
+            }
+            for mount in &self.guarded_mounts {
+                mount.check_health()?;
+            }
         }
         Ok(())
+    }
+
+    /// Stop the owned FUSE view, freeze a durable revision attempt, and only
+    /// then remount it. Any failure leaves the claim unsupervised and the
+    /// daemon health check fails closed; startup finishes a prepared attempt
+    /// before recovering that mount.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Called by the guarded signed-revision path once its private format lands.
+    pub(crate) fn capture_claimed_guarded_view_for_revision(
+        &mut self,
+        anchor_id: Uuid,
+        revision_id: Uuid,
+    ) -> Result<GuardedStoppedCaptureV1> {
+        self.check_guarded_mounts()?;
+        let index = self
+            .guarded_mounts
+            .iter()
+            .position(|mount| mount.anchor_id() == anchor_id)
+            .context("daemon does not own the requested guarded view")?;
+        let mount = self.guarded_mounts.swap_remove(index);
+        mount
+            .stop()
+            .context("stop guarded view before revision capture")?;
+        let control = Arc::new(Mutex::new(ControlStore::open_with_key(
+            self.data_dir.join("control.db"),
+            &self.control_database_key,
+        )?));
+        let capture = GuardedViewMount::capture_stopped_view_for_attempt(
+            anchor_id,
+            revision_id,
+            Arc::clone(&control),
+        )?;
+        let mount = GuardedViewMount::recover_claimed(anchor_id, control)?;
+        mount.check_health()?;
+        self.guarded_mounts.push(mount);
+        Ok(capture)
     }
 
     pub fn keys(&self) -> &KeyMaterial {
@@ -24592,7 +24641,7 @@ pub(crate) mod tests {
         assert!(fs::read(view.join("sample")).is_err());
         drop(reopened);
 
-        let recovered = Node::open(&data_dir, seed).unwrap();
+        let mut recovered = Node::open(&data_dir, seed).unwrap();
         recovered.check_guarded_mounts().unwrap();
         let write = Command::new("python3")
             .uid(65534)
@@ -24613,11 +24662,48 @@ pub(crate) mod tests {
         use std::io::Read;
         anchor.read_to_end(&mut protected).unwrap();
         assert_eq!(protected, original);
+        let unsupervised = recovered.guarded_mounts.pop().unwrap();
+        assert!(recovered.check_guarded_mounts().is_err());
+        recovered.guarded_mounts.push(unsupervised);
+        let revision_id = Uuid::new_v4();
+        let capture = recovered
+            .capture_claimed_guarded_view_for_revision(manifest.anchor_id, revision_id)
+            .unwrap();
+        capture.verify().unwrap();
+        assert_eq!(capture.files.len(), 1);
+        assert_eq!(capture.files[0].path, b"sample");
+        let mut captured_bytes = Vec::new();
+        capture.files[0]
+            .locator
+            .open()
+            .unwrap()
+            .read_to_end(&mut captured_bytes)
+            .unwrap();
+        assert_eq!(captured_bytes, fs::read(lower.join("sample")).unwrap());
+        recovered.check_guarded_mounts().unwrap();
+        assert!(fs::read(view.join("sample")).unwrap().starts_with(b"EDIT"));
+        recovered.guarded_mounts.pop().unwrap().stop().unwrap();
+        let guarded_control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap(),
+        ));
+        let captured_file = GuardedViewMount::capture_stopped_file(
+            manifest.anchor_id,
+            Arc::clone(&guarded_control),
+            "sample",
+        )
+        .unwrap();
+        drop(guarded_control);
         drop(recovered);
 
         let control =
             ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap();
+        GuardedViewMount::release_stopped_capture_unreferenced(revision_id, &control).unwrap();
         GuardedViewMount::retire_claim(manifest.anchor_id, &control).unwrap();
+        mb_store::GuardedFileCapturePlan::load_for_manifest(&control, &captured_file)
+            .unwrap()
+            .unwrap()
+            .discard_unreferenced(&control)
+            .unwrap();
         plan.discard_unreferenced(&control).unwrap();
     }
 }

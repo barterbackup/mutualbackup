@@ -785,6 +785,14 @@
   stopped-capture probe passes with that validation. The signed private
   revision format still needs to carry these raw paths, ownership, modes,
   atimes, and file anchors losslessly, then restore them from a seed.
+  The node now checks that its live guarded mount set exactly matches the
+  durable claims. Its stopped-capture operation stops the owned FUSE view,
+  publishes a revision-ID-bound capture, and remounts only after publication;
+  an error leaves the missing mount visible to the daemon health check. The
+  node-level privileged probe covers an edited file, anchor bytes, remount,
+  and eventual anchor cleanup on ext4 and disposable Btrfs. This operation
+  still needs to be called from the signed revision path after the lossless
+  private metadata and recovery format are implemented.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

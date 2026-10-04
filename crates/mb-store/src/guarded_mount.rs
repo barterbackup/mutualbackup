@@ -55,6 +55,7 @@ struct MountedFilesystem {
 /// A mounted guarded view. Keep this with the daemon's root registration;
 /// dropping it unmounts the view, while `stop` propagates unmount errors.
 pub struct GuardedViewMount {
+    anchor_id: Uuid,
     session: Option<BackgroundSession>,
     mountpoint: PathBuf,
     source: String,
@@ -287,6 +288,26 @@ impl GuardedStoppedCaptureV1 {
 impl GuardedViewMount {
     pub fn has_claims(control: &ControlStore) -> anyhow::Result<bool> {
         Ok(!control.records(MOUNT_CLAIM_KIND)?.is_empty())
+    }
+
+    pub fn claimed_anchor_ids(control: &ControlStore) -> anyhow::Result<Vec<Uuid>> {
+        let claims = control.records(MOUNT_CLAIM_KIND)?;
+        ensure!(claims.len() <= 256, "too many guarded mount claims");
+        let mut ids = Vec::with_capacity(claims.len());
+        for (record_id, bytes) in claims {
+            let anchor_id = Uuid::from_slice(&record_id)?;
+            let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                claim.version == 1 && claim.anchor_id == anchor_id,
+                "guarded mount claim record is inconsistent"
+            );
+            ids.push(anchor_id);
+        }
+        Ok(ids)
+    }
+
+    pub fn anchor_id(&self) -> Uuid {
+        self.anchor_id
     }
 
     /// Recover every active durable mount claim before the daemon starts
@@ -607,6 +628,7 @@ impl GuardedViewMount {
             "guarded mount was retired while starting"
         );
         Ok(Self {
+            anchor_id: manifest.anchor_id,
             session: Some(session),
             mountpoint,
             source,
