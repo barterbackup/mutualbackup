@@ -1494,6 +1494,54 @@ impl GitRepository {
         )?)
     }
 
+    /// Return the pinned private directory identity only when it contains no
+    /// Git history, index, worktree, object mapping, or unfinished operation.
+    /// The node must durably fence this identity before removing the catalog.
+    pub fn empty_guarded_catalog_identity(
+        &self,
+    ) -> Result<mb_store::NativeFileId, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
+        if read_marker(&self.directory, GIT_CATALOG_MARKER_FILE)?
+            != Some(git_catalog_marker_bytes(self.repository_id))
+            || self.directory.open_child_file(CATALOG_DATABASE)?.is_none()
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        let expected = GitSourceBackendRecord {
+            format_version: 1,
+            repository_id: self.repository_id,
+            backend: self.source_backend,
+        };
+        let encoded = mb_core::canonical_bytes(&expected).map_err(|_| RepositoryError::Conflict)?;
+        let records = self.catalog.records_with_kind_prefix("")?;
+        if records.len() != 1
+            || records[0].0 != SOURCE_BACKEND_KIND
+            || records[0].1 != self.repository_id.as_bytes()
+            || records[0].2 != encoded
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        for entry in fs::read_dir(self.directory.descriptor_path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !matches!(
+                name.to_str(),
+                Some(
+                    CATALOG_DATABASE
+                        | "catalog.db-wal"
+                        | "catalog.db-shm"
+                        | GIT_CATALOG_MARKER_FILE
+                )
+            ) || !entry.file_type()?.is_file()
+            {
+                return Err(RepositoryError::Conflict);
+            }
+        }
+        Ok(self.directory.identity()?)
+    }
+
     pub fn push_current_branch_to_bare(
         &self,
         destination: impl AsRef<Path>,
@@ -2000,6 +2048,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_guarded_catalog_retirement_preflight_rejects_live_or_unknown_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let other = temp.path().join("other");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&other).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [89_u8; 32];
+        let guarded = GitRepository::init_with_backend(
+            &root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        assert_eq!(
+            guarded.empty_guarded_catalog_identity().unwrap(),
+            guarded.catalog_directory_identity().unwrap()
+        );
+        let reflink = GitRepository::init(&other, Uuid::new_v4(), &key).unwrap();
+        assert!(reflink.empty_guarded_catalog_identity().is_err());
+
+        guarded
+            .catalog
+            .put_record("future-git-record-v2", b"live", b"unknown")
+            .unwrap();
+        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        guarded
+            .catalog
+            .delete_record("future-git-record-v2", b"live")
+            .unwrap();
+        let catalog_path = root.join(GIT_CATALOG_DIRECTORY);
+        fs::write(catalog_path.join("unrecognized"), b"owned by someone else").unwrap();
+        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        fs::remove_file(catalog_path.join("unrecognized")).unwrap();
+        assert!(guarded.empty_guarded_catalog_identity().is_ok());
+        fs::write(catalog_path.join(GIT_CATALOG_MARKER_FILE), b"wrong marker").unwrap();
+        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        fs::write(
+            catalog_path.join(GIT_CATALOG_MARKER_FILE),
+            git_catalog_marker_bytes(repository_id),
+        )
+        .unwrap();
+        guarded
+            .catalog
+            .put_record(&crate::head::head_kind(repository_id), b"branch", b"main")
+            .unwrap();
+        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        guarded
+            .catalog
+            .delete_record(&crate::head::head_kind(repository_id), b"branch")
+            .unwrap();
+        fs::remove_file(catalog_path.join(CATALOG_DATABASE)).unwrap();
+        assert!(guarded.empty_guarded_catalog_identity().is_err());
     }
 
     #[cfg(target_os = "linux")]

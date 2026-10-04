@@ -90,9 +90,15 @@
   file anchor while preserving edited worktree bytes. A full root-release
   interruption probe is still required. An explicit safe way to retire an empty
   Git repository and its private catalog is also needed before guarded-root
-  release, which currently rejects every registered Git repository. Guarded Git
-  enrollment, checkout, signed graph protection, and seed-only virtual-locator
-  rebind remain open.
+  release, which currently rejects every registered Git repository. The Git
+  catalog now has a strict empty-retirement preflight: it accepts only its
+  exact guarded backend binding and expected private files, and returns the
+  pinned catalog-directory identity. It rejects retained history, unknown
+  records, extra files, and a changed marker. The node still needs to durably
+  fence that identity, remove the catalog with crash replay, and retire the
+  repository registration before root release. Guarded Git enrollment,
+  checkout, signed graph protection, and seed-only virtual-locator rebind
+  remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
