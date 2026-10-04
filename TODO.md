@@ -299,10 +299,12 @@
   source `d53b4be`, including all new replay cases and the five-daemon smoke.
   Its disposable Btrfs image, namespaces, and firewall rules were cleaned up.
 - [ ] **M6 guarded edit guard.** The store now has replayable per-file and
-  whole-root sparse detaches, but node enrollment still selects only the
-  reflink backend. Implement and locally probe a long-lived access decision
-  that permits normal reads without detaching every anchor and prevents writes
-  until detach is durable, even after owner `chmod`, pathname truncate,
+  whole-root sparse detaches. Ordinary `root add` still selects the reflink
+  backend; explicit `root add-guarded` now begins a guarded enrollment from a
+  separate private lower tree and empty view. Implement and locally probe a
+  long-lived access decision that permits normal reads without detaching every
+  anchor and prevents writes until detach is durable, even after owner `chmod`,
+  pathname truncate,
   pre-opened handles, rename, and restart. `FAN_PRE_ACCESS` covers both reads
   and writes and reports a range rather than an edit intent, so it cannot be
   used alone as a write detector. Use the versioned FUSE worktree view specified
@@ -964,6 +966,18 @@
   keeps an old anchor through retirement replay while a separate recipe pins
   it, then collects it after that pin is removed. Guarded-root claim retirement
   and data-preserving removal remain open.
+  Node enrollment now persists a versioned plan and placeholder inode before
+  changing lower ownership, then replays private capture, directory isolation,
+  mount claim, and protected-root registration on restart. The initial root is
+  marked dirty for its first signed backup. Privileged local replay tests cover
+  interruption before capture, after isolation, and after mount claim, plus a
+  replaced-placeholder refusal before mutation on ext4 and disposable Btrfs.
+  The existing guarded signed-backup fixture now uses the production enrollment
+  API and passes on both filesystems. The 325 normal node tests, local-control
+  raw-path schema test, CLI help check, and strict workspace Clippy pass. This
+  enables the separate lower/view path. Original-path migration,
+  data-preserving removal and claim retirement, Git operations through the
+  guarded backend, and the complete guarded failure gate remain open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

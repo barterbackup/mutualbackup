@@ -1427,7 +1427,7 @@ impl GuardedRootCapturePlan {
     /// Rebuild a published view from the sealed anchor catalog after the
     /// process that held its manifest has exited. The manifest claim and plan
     /// must still identify the exact catalog bytes before a caller remounts.
-    pub(crate) fn load_published_manifest(
+    pub fn load_published_manifest(
         control: &ControlStore,
         anchor_id: Uuid,
     ) -> anyhow::Result<StableAnchorManifest> {

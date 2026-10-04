@@ -136,6 +136,15 @@ enum Command {
 enum RootCommand {
     /// Probe and register a reflink-capable directory.
     Add { path: PathBuf },
+    /// Capture a private lower directory behind a separate empty FUSE view.
+    AddGuarded {
+        lower: PathBuf,
+        view: PathBuf,
+        #[arg(long)]
+        view_uid: u32,
+        #[arg(long)]
+        view_gid: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -540,6 +549,31 @@ async fn main() -> Result<()> {
                 bail!("daemon returned the wrong response to root-add request");
             };
             println!("protected root registered: {}", root.path.display());
+            println!("root id: {}", root.root_id);
+        }
+        Command::Root {
+            command:
+                RootCommand::AddGuarded {
+                    lower,
+                    view,
+                    view_uid,
+                    view_gid,
+                },
+        } => {
+            let response = local_control_call(
+                &control_socket,
+                &LocalRequest::AddGuardedRoot {
+                    lower,
+                    view,
+                    view_uid,
+                    view_gid,
+                },
+            )
+            .await?;
+            let LocalResponse::RootAdded(root) = response else {
+                bail!("daemon returned the wrong response to guarded-root request");
+            };
+            println!("guarded root registered: {}", root.path.display());
             println!("root id: {}", root.root_id);
         }
         Command::Guild { command } => {

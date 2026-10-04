@@ -9,7 +9,8 @@ state through Kademlia, and recover a lost member from its offline seed.
 Peer traffic uses authenticated QUIC with Identify, circuit relay v2,
 AutoNAT/DCUtR hole punching, optional gateway port mapping, and embedded Arti
 onion services. Every path authenticates the same recovery-string-derived
-identity. Non-reflink source backends, membership changes, and cross-user
+identity. Guarded non-reflink capture is available as an incremental Linux
+path; its full enrollment and removal gate, membership changes, and cross-user
 packing remain later work. Do not entrust unique data to this prototype.
 
 ## Programs
@@ -58,6 +59,7 @@ Routine operations go through the daemon:
 mutualbackup status
 mutualbackup unlock [--seed-stdin|--seed-file FILE]
 mutualbackup root add PATH
+mutualbackup root add-guarded LOWER VIEW --view-uid UID --view-gid GID
 mutualbackup guild create|invite|join|finalize|status
 mutualbackup backup --wait
 mutualbackup snapshot list
@@ -67,6 +69,16 @@ mutualbackup storage list|scrub|reclaim|drain|migrate|reactivate|reconcile
 mutualbackup audit [--repair]
 mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 ```
+
+On Linux, `root add-guarded` starts the guarded source backend from an existing
+lower directory and a separate, empty view directory on the same filesystem.
+It requires a privileged daemon; the view placeholder must be owned by a
+different user than `UID` and must not be group- or world-writable. Enrollment
+privately isolates the lower tree, mounts the editable view, and marks the new
+root dirty for its first signed backup. The daemon resumes interrupted
+enrollment on reopen. This is an incremental Milestone 6 path; same-path
+migration, data-preserving root removal, and the full guarded failure gate are
+still pending.
 
 Parity may span several configured filesystems. Each volume has a signed UUID,
 an independently wrapped SQLCipher key, a byte budget and repair headroom.

@@ -57,6 +57,14 @@ pub enum LocalRequest {
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
+    AddGuardedRoot {
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
+        lower: PathBuf,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
+        view: PathBuf,
+        view_uid: u32,
+        view_gid: u32,
+    },
     GitInit {
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
@@ -679,6 +687,12 @@ mod tests {
             LocalRequest::AddRoot {
                 path: target.clone(),
             },
+            LocalRequest::AddGuardedRoot {
+                lower: target.clone(),
+                view: relative.clone(),
+                view_uid: 65534,
+                view_gid: 65534,
+            },
             LocalRequest::Recover {
                 target: target.clone(),
             },
@@ -713,6 +727,16 @@ mod tests {
                 | LocalRequest::Recover { target: path }
                 | LocalRequest::SnapshotRestore { target: path, .. } => {
                     assert_eq!(path, target);
+                }
+                LocalRequest::AddGuardedRoot {
+                    lower,
+                    view,
+                    view_uid,
+                    view_gid,
+                } => {
+                    assert_eq!(lower, target);
+                    assert_eq!(view, relative);
+                    assert_eq!((view_uid, view_gid), (65534, 65534));
                 }
                 LocalRequest::GitAdd { path, .. } => assert_eq!(path, relative),
                 LocalRequest::GitWorktreeRestoreBoth { paths, .. } => {

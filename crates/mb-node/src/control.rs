@@ -369,6 +369,26 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::AddGuardedRoot {
+            lower,
+            view,
+            view_uid,
+            view_gid,
+        } => {
+            blocking_node(node, move |node| {
+                #[cfg(target_os = "linux")]
+                {
+                    node.add_guarded_protected_root(&lower, &view, view_uid, view_gid)
+                        .map(LocalResponse::RootAdded)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (node, lower, view, view_uid, view_gid);
+                    anyhow::bail!("guarded roots require Linux")
+                }
+            })
+            .await
+        }
         LocalRequest::GitInit { path } => {
             blocking_node(node, move |node| {
                 node.git_init(&path)

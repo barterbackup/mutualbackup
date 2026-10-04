@@ -3797,8 +3797,11 @@ an unconditional repository invariant, not a configurable compatibility mode.
   before selecting this backend for any root; include read-only passthrough,
   writable-open and shared-mapping detach, `chmod` and pathname truncate,
   rename/unlink, replayable new-file creation, atomic replacement, and remount
-  recovery. Never expose a raw hard link between an editable worktree and an
-  immutable anchor.
+  recovery. Make enrollment a durable, restartable transition from a private
+  lower tree to a supervised view. A separate lower/view path is an initial
+  operational slice; finish original-path migration and data-preserving root
+  removal before closing the guarded backend gate. Never expose a raw hard
+  link between an editable worktree and an immutable anchor.
 - Then validate the already planned native Windows NTFS capture, including VSS
   where appropriate, macOS cloning, platform watchers, portable metadata/ACL
   policy, and explicit application-consistent capture hooks. Each enrolled root

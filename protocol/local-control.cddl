@@ -28,6 +28,7 @@ local-request =
   / { "GuildAudit": { repair: bool } }
   / { "Unlock": { secret: bytes32-array } }
   / { "AddRoot": { path: local-path } }
+  / { "AddGuardedRoot": { lower: local-path, view: local-path, view_uid: uint, view_gid: uint } }
   / { "GitInit": { path: local-path } }
   / { "GitWorktreeAdd": { repository_id: uuid-text, path: local-path, branch: tstr } }
   / { "GitWorktrees": { repository_id: uuid-text } }

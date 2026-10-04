@@ -122,6 +122,54 @@ struct GuardedProtectedRootV1 {
 }
 
 #[cfg(target_os = "linux")]
+const GUARDED_ENROLLMENT_KIND: &str = "guarded-root-enrollment-v1";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedEnrollmentIntentV1 {
+    format_version: u16,
+    root_id: Uuid,
+    plan: GuardedRootCapturePlan,
+    #[serde(with = "mb_store::raw_path_bytes")]
+    view: PathBuf,
+    view_id: NativeFileId,
+    view_uid: u32,
+    view_gid: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedEnrollmentIntentV1 {
+    fn validate(&self, record_id: &[u8]) -> Result<()> {
+        self.plan.validate()?;
+        let mut normalized_view = PathBuf::new();
+        for component in self.view.components() {
+            normalized_view.push(component.as_os_str());
+        }
+        if self.format_version != 1
+            || self.root_id.is_nil()
+            || record_id != self.root_id.as_bytes()
+            || self.view_uid == 0
+            || self.view_id.filesystem_id == 0
+            || self.view_id.inode == 0
+            || !self.view.is_absolute()
+            || normalized_view != self.view
+            || self.view.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            || self.view == self.plan.source_root()
+            || self.view.starts_with(self.plan.source_root())
+            || self.plan.source_root().starts_with(&self.view)
+        {
+            anyhow::bail!("invalid guarded root enrollment intent");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct GuardedRecoveryMountIntentV1 {
     format_version: u16,
@@ -1340,6 +1388,8 @@ impl Node {
         };
         node.backfill_checkpoint_generation_index()?;
         node.reconcile_certified_writer_head()?;
+        #[cfg(target_os = "linux")]
+        node.reconcile_guarded_enrollments()?;
         node.reconcile_garbage_collection()?;
         Ok(node)
     }
@@ -1624,7 +1674,207 @@ impl Node {
     }
 
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
+        #[cfg(target_os = "linux")]
+        if !self.control.records(GUARDED_ENROLLMENT_KIND)?.is_empty() {
+            anyhow::bail!("finish the pending guarded enrollment before adding another root");
+        }
         self.register_protected_root(source_root, None, true, true)
+    }
+
+    /// Enroll a private lower tree behind a separate, empty FUSE view. The
+    /// durable intent precedes all ownership changes, so reopen can finish an
+    /// interrupted enrollment without rescanning already isolated sources.
+    #[cfg(target_os = "linux")]
+    pub fn add_guarded_protected_root(
+        &mut self,
+        lower: &Path,
+        view: &Path,
+        view_uid: u32,
+        view_gid: u32,
+    ) -> Result<ProtectedRoot> {
+        self.check_guarded_mounts()?;
+        let lower = lower.canonicalize().context("resolve guarded lower root")?;
+        let view_metadata = fs::symlink_metadata(view).context("stat guarded view placeholder")?;
+        if !view_metadata.is_dir() || view_metadata.file_type().is_symlink() {
+            anyhow::bail!("guarded view placeholder is not a real directory");
+        }
+        let view = view
+            .canonicalize()
+            .context("resolve guarded view placeholder")?;
+        if view_uid == 0
+            || lower == view
+            || lower.starts_with(&view)
+            || view.starts_with(&lower)
+            || lower.starts_with(&self.data_dir)
+            || self.data_dir.starts_with(&lower)
+            || view.starts_with(&self.data_dir)
+            || self.data_dir.starts_with(&view)
+        {
+            anyhow::bail!("guarded lower, view, owner, or data directory is invalid");
+        }
+        let pending = self.control.records(GUARDED_ENROLLMENT_KIND)?;
+        if pending.len() > 1 {
+            anyhow::bail!("multiple guarded root enrollments are pending");
+        }
+        if let Some((record_id, bytes)) = pending.into_iter().next() {
+            let intent: GuardedEnrollmentIntentV1 = decode_canonical(&bytes)?;
+            intent.validate(&record_id)?;
+            if intent.plan.source_root() == lower
+                && intent.view == view
+                && intent.view_uid == view_uid
+                && intent.view_gid == view_gid
+            {
+                return self.finish_guarded_enrollment(&intent, &bytes);
+            }
+            anyhow::bail!("finish the pending guarded root enrollment before starting another");
+        }
+        if self.protected_roots()?.iter().any(|root| {
+            [lower.as_path(), view.as_path()]
+                .iter()
+                .any(|path| path.starts_with(&root.path) || root.path.starts_with(path))
+        }) || self.guarded_mounts.iter().any(|mount| {
+            mount.verified_binding(&self.control).is_ok_and(|binding| {
+                lower.starts_with(&binding.lower_root)
+                    || binding.lower_root.starts_with(&lower)
+                    || view.starts_with(&binding.lower_root)
+                    || binding.lower_root.starts_with(&view)
+                    || binding.mountpoint == view
+            })
+        }) {
+            anyhow::bail!("guarded enrollment overlaps an existing protected root or view");
+        }
+        if self.protected_roots()?.len() == 256 {
+            anyhow::bail!("at most 256 protected roots may be registered");
+        }
+        if view_metadata.uid() == view_uid || view_metadata.mode() & 0o022 != 0 {
+            anyhow::bail!("guarded view placeholder is writable by the view owner");
+        }
+        if fs::read_dir(&view)?.next().is_some() {
+            anyhow::bail!("guarded view placeholder is not empty");
+        }
+        if filesystem_identity(&lower)?.stable_id != filesystem_identity(&view)?.stable_id {
+            anyhow::bail!("guarded lower and view must be on one filesystem");
+        }
+        let intent = GuardedEnrollmentIntentV1 {
+            format_version: 1,
+            root_id: Uuid::new_v4(),
+            plan: GuardedRootCapturePlan::plan(&lower)?,
+            view_id: PinnedDirectory::open(&view)?.identity()?,
+            view,
+            view_uid,
+            view_gid,
+        };
+        intent.validate(intent.root_id.as_bytes())?;
+        let bytes = canonical_bytes(&intent)?;
+        if !self.control.put_record_if_absent(
+            GUARDED_ENROLLMENT_KIND,
+            intent.root_id.as_bytes(),
+            &bytes,
+        )? {
+            anyhow::bail!("guarded enrollment ID already exists");
+        }
+        self.finish_guarded_enrollment(&intent, &bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_guarded_enrollments(&mut self) -> Result<()> {
+        let pending = self.control.records(GUARDED_ENROLLMENT_KIND)?;
+        if pending.len() > 256 {
+            anyhow::bail!("too many guarded enrollment intents");
+        }
+        for (record_id, bytes) in pending {
+            let intent: GuardedEnrollmentIntentV1 = decode_canonical(&bytes)?;
+            intent.validate(&record_id)?;
+            self.finish_guarded_enrollment(&intent, &bytes)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_guarded_enrollment(
+        &mut self,
+        intent: &GuardedEnrollmentIntentV1,
+        bytes: &[u8],
+    ) -> Result<ProtectedRoot> {
+        intent.validate(intent.root_id.as_bytes())?;
+        if self
+            .control
+            .get_record(GUARDED_ENROLLMENT_KIND, intent.root_id.as_bytes())?
+            != Some(bytes.to_vec())
+        {
+            anyhow::bail!("guarded enrollment intent changed");
+        }
+        let anchor_id = intent.plan.anchor_id();
+        if filesystem_identity(intent.plan.source_root())?.stable_id != intent.view_id.filesystem_id
+        {
+            anyhow::bail!("guarded enrollment filesystem changed");
+        }
+        if !self
+            .guarded_mounts
+            .iter()
+            .any(|mount| mount.anchor_id() == anchor_id)
+        {
+            let mount_control = Arc::new(Mutex::new(ControlStore::open_with_key(
+                self.data_dir.join("control.db"),
+                &self.control_database_key,
+            )?));
+            let claimed = GuardedViewMount::claimed_anchor_ids(&self.control)?.contains(&anchor_id);
+            let mount = if claimed {
+                GuardedViewMount::recover_claimed(anchor_id, mount_control)?
+            } else {
+                let placeholder = PinnedDirectory::open(&intent.view)?;
+                if placeholder.identity()? != intent.view_id
+                    || placeholder.as_file().metadata()?.uid() == intent.view_uid
+                    || placeholder.as_file().metadata()?.mode() & 0o022 != 0
+                    || fs::read_dir(&intent.view)?.next().is_some()
+                {
+                    anyhow::bail!("guarded view placeholder changed before enrollment");
+                }
+                let manifest = intent.plan.capture_private_file_owners(
+                    &self.control,
+                    intent.view_uid,
+                    0,
+                    0,
+                )?;
+                intent
+                    .plan
+                    .isolate_lower_directories(&self.control, &manifest)?;
+                GuardedViewMount::start(
+                    &manifest,
+                    mount_control,
+                    &intent.view,
+                    intent.view_uid,
+                    intent.view_gid,
+                )?
+            };
+            mount.check_health()?;
+            self.guarded_mounts.push(mount);
+        }
+        let mount = self
+            .guarded_mounts
+            .iter()
+            .find(|mount| mount.anchor_id() == anchor_id)
+            .context("guarded enrollment mount is not supervised")?;
+        let binding = mount.verified_binding(&self.control)?;
+        let manifest = GuardedRootCapturePlan::load_published_manifest(&self.control, anchor_id)?;
+        if GuardedRootCapturePlan::load_for_manifest(&self.control, &manifest)?
+            != Some(intent.plan.clone())
+            || binding.lower_root != intent.plan.source_root()
+            || binding.mountpoint != intent.view
+            || binding.mountpoint_id != intent.view_id
+            || binding.view_uid != intent.view_uid
+            || binding.view_gid != intent.view_gid
+        {
+            anyhow::bail!("guarded mount differs from its enrollment intent");
+        }
+        let root =
+            self.register_guarded_protected_root_with_state(intent.root_id, anchor_id, true)?;
+        self.control.delete_record_if_value(
+            GUARDED_ENROLLMENT_KIND,
+            intent.root_id.as_bytes(),
+            bytes,
+        )?;
+        Ok(root)
     }
 
     /// Register a recovered guarded worktree only after this daemon owns the
@@ -1636,6 +1886,16 @@ impl Node {
         &mut self,
         root_id: Uuid,
         anchor_id: Uuid,
+    ) -> Result<ProtectedRoot> {
+        self.register_guarded_protected_root_with_state(root_id, anchor_id, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn register_guarded_protected_root_with_state(
+        &mut self,
+        root_id: Uuid,
+        anchor_id: Uuid,
+        initial_dirty: bool,
     ) -> Result<ProtectedRoot> {
         if root_id.is_nil() || anchor_id.is_nil() {
             anyhow::bail!("guarded protected root ID is nil");
@@ -1720,8 +1980,12 @@ impl Node {
                 canonical_bytes(&RootDirtyState {
                     format_version: 3,
                     protected_root_id: root_id,
-                    dirty: false,
-                    reason: "guarded root was restored from its committed revision".to_owned(),
+                    dirty: initial_dirty,
+                    reason: if initial_dirty {
+                        "guarded root enrolled before its first signed backup".to_owned()
+                    } else {
+                        "guarded root was restored from its committed revision".to_owned()
+                    },
                     change_sequence: 0,
                 })?,
             ),
@@ -25255,6 +25519,97 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_enrollment_replays_intent_isolation_and_claim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        for stage in 0..3_u8 {
+            let area = tempfile::Builder::new()
+                .prefix("mb-guarded-enroll-replay-")
+                .tempdir_in(&test_root)
+                .unwrap();
+            let lower = area.path().join("lower");
+            let view = area.path().join("view");
+            let data_dir = area.path().join("node");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(&view).unwrap();
+            fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(lower.join("sample"), b"exact\r\nbytes\0").unwrap();
+            let seed = Seed::from_bytes([stage + 211; 32]);
+            let node = Node::open(&data_dir, seed.clone()).unwrap();
+            let intent = GuardedEnrollmentIntentV1 {
+                format_version: 1,
+                root_id: Uuid::new_v4(),
+                plan: GuardedRootCapturePlan::plan(&lower).unwrap(),
+                view_id: PinnedDirectory::open(&view).unwrap().identity().unwrap(),
+                view: view.clone(),
+                view_uid: 65534,
+                view_gid: 65534,
+            };
+            let bytes = canonical_bytes(&intent).unwrap();
+            node.control
+                .put_record(GUARDED_ENROLLMENT_KIND, intent.root_id.as_bytes(), &bytes)
+                .unwrap();
+            if stage >= 1 {
+                let manifest = intent
+                    .plan
+                    .capture_private_file_owners(&node.control, 65534, 0, 0)
+                    .unwrap();
+                intent
+                    .plan
+                    .isolate_lower_directories(&node.control, &manifest)
+                    .unwrap();
+                if stage == 2 {
+                    let mount_control = Arc::new(Mutex::new(
+                        ControlStore::open_with_key(
+                            data_dir.join("control.db"),
+                            &node.control_database_key,
+                        )
+                        .unwrap(),
+                    ));
+                    GuardedViewMount::start(&manifest, mount_control, &view, 65534, 65534)
+                        .unwrap()
+                        .stop()
+                        .unwrap();
+                }
+            }
+            drop(node);
+
+            if stage == 0 {
+                let original_view = area.path().join("original-view");
+                fs::rename(&view, &original_view).unwrap();
+                fs::create_dir(&view).unwrap();
+                fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(Node::open(&data_dir, seed.clone()).is_err());
+                assert_eq!(fs::read(lower.join("sample")).unwrap(), b"exact\r\nbytes\0");
+                assert_eq!(fs::metadata(&lower).unwrap().uid(), 0);
+                fs::remove_dir(&view).unwrap();
+                fs::rename(&original_view, &view).unwrap();
+            }
+
+            let mut reopened = Node::open(&data_dir, seed).unwrap();
+            let root = reopened.protected_root_by_id(intent.root_id).unwrap();
+            assert_eq!(root.format_version, 4);
+            assert_eq!(root.path, view);
+            assert_eq!(fs::read(view.join("sample")).unwrap(), b"exact\r\nbytes\0");
+            assert!(reopened.root_dirty().unwrap());
+            assert!(
+                reopened
+                    .control
+                    .records(GUARDED_ENROLLMENT_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+            reopened.guarded_mounts.pop().unwrap().stop().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn guarded_protected_root_reopens_and_signs_a_backup() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -25277,23 +25632,18 @@ pub(crate) mod tests {
         fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o666)).unwrap();
         let seed = Seed::from_bytes([233; 32]);
         let mut node = Node::open(&data_dir, seed.clone()).unwrap();
-        let plan = mb_store::GuardedRootCapturePlan::plan(&lower).unwrap();
-        let manifest = plan
-            .capture_private_file_owners(&node.control, 65534, 0, 0)
-            .unwrap();
-        plan.isolate_lower_directories(&node.control, &manifest)
-            .unwrap();
-        let mount_control = Arc::new(Mutex::new(
-            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
-                .unwrap(),
-        ));
-        node.guarded_mounts
-            .push(GuardedViewMount::start(&manifest, mount_control, &view, 65534, 65534).unwrap());
-        let root_id = Uuid::new_v4();
         let root = node
-            .register_guarded_protected_root(root_id, manifest.anchor_id)
+            .add_guarded_protected_root(&lower, &view, 65534, 65534)
             .unwrap();
+        let root_id = root.root_id;
         assert_eq!(root.format_version, 4);
+        assert!(node.root_dirty().unwrap());
+        assert!(
+            node.control
+                .records(GUARDED_ENROLLMENT_KIND)
+                .unwrap()
+                .is_empty()
+        );
         node.guarded_mounts.pop().unwrap().stop().unwrap();
         drop(node);
 

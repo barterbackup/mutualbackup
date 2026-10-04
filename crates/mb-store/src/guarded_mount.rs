@@ -79,6 +79,7 @@ pub struct GuardedViewBinding {
     pub lower_root: PathBuf,
     pub lower_id: NativeFileId,
     pub mountpoint: PathBuf,
+    pub mountpoint_id: NativeFileId,
     pub view_uid: u32,
     pub view_gid: u32,
 }
@@ -1171,6 +1172,7 @@ impl GuardedViewMount {
             lower_root: claim.lower_root,
             lower_id: claim.lower_id,
             mountpoint: claim.mountpoint,
+            mountpoint_id: claim.mountpoint_id,
             view_uid: claim.view_uid,
             view_gid: claim.view_gid,
         })
