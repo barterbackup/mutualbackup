@@ -388,7 +388,7 @@ impl PrototypeGuild {
         Ok(recovered)
     }
 
-    fn live_node(&self, index: usize) -> Result<SharedNode> {
+    pub(crate) fn live_node(&self, index: usize) -> Result<SharedNode> {
         self.nodes[index].clone().context("node is offline")
     }
 

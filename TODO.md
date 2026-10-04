@@ -101,11 +101,11 @@
   disposable Btrfs probes cover normal retirement, replay after database
   deletion, and subsequent guarded-root release. Retained Git history or any
   unrecognized catalog state still blocks retirement. Guarded Git enrollment,
-  checkout, signed graph protection, and seed-only virtual-locator rebind
-  remain open. The guarded signing path now refuses a registered Git repository,
-  a private catalog marker, or a pending graph intent for that revision before
-  stopping the view or signing a format-6 revision, so manual guarded Git state
-  cannot silently produce a signed revision that omits its history. A separate
+  checkout and complete format-7 network protection remain open. The guarded
+  format-6 signer refuses a registered Git repository or a pending graph
+  intent. Node preparation refuses a private catalog marker without matching
+  registration before stopping the view; a registered, reconciled catalog now
+  selects format-7 signing so its reachable history is not omitted. A separate
   format-7 private metadata type now validates a raw guarded namespace and
   root-bound Git graph; revision inspection can read it, and format-7 restore
   stages its guarded namespace and Git catalog with a guarded backend binding.
@@ -122,10 +122,10 @@
   and blob, hides the catalog from
   the FUSE view, interrupts after recipe installation, reopens to finish the
   mount, then edits the visible file without changing its signed blob or
-  sector recipes and reopens the completed recovery. Finish production graph
-  capture and pinning, broader recovered-blob prune and no-duplicate
-  payload proof before lifting the production signing guard. A provisioned
-  five-member seed-only network recovery gate for format 7 also remains open.
+  sector recipes and reopens the completed recovery. Finish broader multi-blob
+  source-loss cases and the no-duplicate payload proof before enabling ordinary
+  guarded Git enrollment and file commands. A provisioned five-member seed-only
+  network recovery gate with a format-7 packing checkpoint remains open.
   Linux Git blob recovery streams verified sectors into a sparse native anchor
   without a temporary worktree payload or reflink. When a signed Git sector
   is also a visible guarded-file sector, recovery now retains the root-anchor
@@ -147,10 +147,9 @@
   normal pin reconciliation. The ext4 and Btrfs probes retain the live graph,
   then remove local ref/index reachability in the synthetic fixture, interrupt
   after catalog retirement, and confirm replay releases only Git ownership
-  while the edited visible file and signed root recipe survive. Production
-  signed graph capture, broader multi-blob/source-loss cases, and the
-  five-member seed-only gate remain open. A test-selected guarded signer now
-  has a format-7 path that captures the registered private Git catalog into a
+  while the edited visible file and signed root recipe survive. Broader
+  multi-blob/source-loss cases and the format-7 five-member network gate remain
+  open. The guarded signer captures the registered private Git catalog into a
   durable graph intent before stopping the view, signs reachable objects and
   blob sectors with the guarded namespace, keeps shared visible-file recipes,
   and retains the intent across startup while a stopped capture owns its
@@ -162,8 +161,13 @@
   stages an untouched root file with a node-owned pin, reopens to publish its
   catalog receipt, creates a real guarded Git commit without checkout replay,
   then reopens again with a stopped graph capture and signs its reachable blob.
-  Production node selection still refuses guarded Git until the source-loss
-  and five-member seed-only gate proves this path end to end.
+  Node revision preparation now selects this path for a registered and
+  reconciled guarded catalog, while refusing an unregistered private marker.
+  A five-member in-memory guild test signs this graph through the production
+  node path, deletes the owner's node state and source, reconstructs sectors
+  from other members, and restores the exact file and reachable Git blob on
+  ext4 and disposable Btrfs. That lab uses a format-3 checkpoint; it does not
+  prove the required live-daemon format-7 packing checkpoint gate.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

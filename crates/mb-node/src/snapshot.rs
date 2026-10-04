@@ -483,7 +483,6 @@ fn prepare_git_graph_intent(
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // Production selection waits for the guarded graph recovery gate.
 pub(crate) fn prepare_guarded_git_graph_intent(
     control: &ControlStore,
     keys: &KeyMaterial,
@@ -504,6 +503,16 @@ pub(crate) fn prepare_guarded_git_graph_intent(
         SourceBackendKind::GuardedLinkFreezeV1,
     )?
     .is_some())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn guarded_git_revision_signed(
+    control: &ControlStore,
+    revision_id: Uuid,
+) -> Result<bool> {
+    Ok(control
+        .get_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?
+        .is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1452,7 +1461,6 @@ pub(crate) fn prepare_revision(
 /// all anchors until the final SQL transaction replaces it with a durable
 /// revision capture record and sector recipes.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // Guarded root enrollment must select this path after its recovery gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_guarded_revision(
     control: &mut ControlStore,
@@ -1480,7 +1488,7 @@ pub(crate) fn prepare_guarded_revision(
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_guarded_git_revision(
     control: &mut ControlStore,
     keys: &KeyMaterial,
@@ -1627,10 +1635,20 @@ fn prepare_guarded_revision_with_graph(
             )
         })?;
     let mut data_references = Vec::new();
+    let mut visible_references = BTreeMap::<SectorId, SectorRef>::new();
     for entry in &metadata.entries {
         if let GuardedPrivateEntryV6::File { data_extents, .. } = entry {
             for reference in data_extents.iter().flat_map(|extent| extent.sectors.iter()) {
-                push_data_reference(&mut data_references, reference.clone())?;
+                match visible_references.get(&reference.id) {
+                    Some(previous) if previous != reference => {
+                        bail!("guarded file sector ID has conflicting references")
+                    }
+                    Some(_) => {}
+                    None => {
+                        push_data_reference(&mut data_references, reference.clone())?;
+                        visible_references.insert(reference.id, reference.clone());
+                    }
+                }
             }
         }
     }
@@ -1807,8 +1825,9 @@ pub(crate) fn require_guarded_git_graph_absent(
 }
 
 /// The private catalog is hidden from the guarded view and can survive a
-/// missing node registration. Check it before the node stops that view.
-#[cfg(target_os = "linux")]
+/// missing node registration. The production node checks this through graph
+/// intent preparation before stopping the view.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn require_guarded_git_catalog_absent(lower_root: &Path) -> Result<()> {
     if git_catalog_marker(lower_root)?.is_some() {
         bail!("guarded Git graph backup is not yet supported");
@@ -1908,6 +1927,15 @@ fn prepare_git_backup_descriptor(
         objects,
         blobs: source_blobs,
     } = graph;
+    let mut signed_data = BTreeMap::<SectorId, SectorRef>::new();
+    for reference in data_references.iter() {
+        ensure!(
+            signed_data
+                .insert(reference.id, reference.clone())
+                .is_none_or(|previous| previous == *reference),
+            "Git backup data sector ID has conflicting references"
+        );
+    }
     let mut blobs = Vec::with_capacity(source_blobs.len());
     for blob in &source_blobs {
         if mb_git::blob_oid_from_anchor(&blob.anchor)?.as_bytes() != blob.oid {
@@ -1935,7 +1963,16 @@ fn prepare_git_backup_descriptor(
                 .context("too many Git blob sectors")?;
             let (reference, ciphertext) = encrypted_sector(&encryption_key, id, &plaintext)?;
             sector_commitments.insert(id, merkle_commit(&ciphertext)?);
-            push_data_reference(data_references, reference.clone())?;
+            match signed_data.get(&id) {
+                Some(previous) if previous != &reference => {
+                    bail!("Git backup data sector ID has conflicting references")
+                }
+                Some(_) => {}
+                None => {
+                    push_data_reference(data_references, reference.clone())?;
+                    signed_data.insert(id, reference.clone());
+                }
+            }
             sectors.push(reference.clone());
             queue_recipe(
                 recipe_records,

@@ -821,12 +821,16 @@ Proactive background repair comes later.
   durable until a signed backup revision and checkpoint cover its graph; status
   must distinguish local history from guild-protected, seed-recoverable history.
   Recovery reconstructs the Git graph, refs, object map, and checked-out view
-  from authenticated backup data without a cached local catalog. The guarded
-  format-6 private metadata currently has no signed Git graph descriptor:
-  refuse a guarded revision before stopping its view or signing if a Git
-  registration, catalog marker, or matching graph intent exists. Enable that
-  combination only after a versioned signed descriptor, native-anchor pin
-  handoff, and seed-only graph and virtual-locator recovery pass together.
+  from authenticated backup data without a cached local catalog. Guarded
+  format-6 private metadata has no signed Git graph descriptor, so its signing
+  path refuses a Git registration or matching graph intent. A registered
+  guarded Git root instead captures a durable graph intent before stopping
+  the view and signs format-7 private metadata; a private catalog marker with
+  no matching registration fails before capture. The guarded stage pin and
+  signed sector recipes retain its native anchors across this handoff. Keep
+  guarded Git enrollment, file operations, and milestone closure gated until
+  format-7 checkpoint protection, source-loss recovery, and virtual-locator
+  rebind pass the complete five-member network gate.
   On a non-reflink recovery filesystem, stream verified Git blob sectors
   directly into one native anchor and preserve sparse zero ranges; do not
   require a temporary worktree payload and a reflink just to rebuild history.
