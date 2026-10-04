@@ -240,6 +240,16 @@
   daemons, namespaces, and firewall rules were removed. This passing run
   validates the corrected request path in a real topology but does not prove
   it caused the historical 5,400-second stall, so this gate remains open.
+  The complete local Git acceptance gate passed on exact committed source
+  `9ec4953`: all 62 provisioned Btrfs Git cases, extent measurement, node
+  recovery, stock-Git exchange, the raw-path CLI/daemon test, and five-daemon
+  topology/seed recovery (1,522.23 seconds). The disposable image, mount,
+  daemons, namespaces, and firewall rules were removed. The coordinator
+  temporarily lacked p4's event-26 signature while its recovered daemon was
+  unreachable, then received authorization denials during guild catch-up;
+  later event-37 requests to two signers exhausted transport tiers, yet
+  coding advanced and the backups committed. This passing run does not explain
+  or exclude the historical long stall; keep the reliability item open.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
@@ -861,6 +871,11 @@
   Production protected-root removal must retire the claimed view, and guarded
   Git pins must join this proof before guarded enrollment or Git operations
   can select the backend.
+  A recovered format-6 view can contain raw Unix names, while the current
+  guarded root capture plan and sealed root manifest still store entry paths
+  as UTF-8 strings. Reconstructing a guarded view from signed recovery needs
+  a versioned raw-path root plan and manifest before it can mount every valid
+  signed namespace without changing its names.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
