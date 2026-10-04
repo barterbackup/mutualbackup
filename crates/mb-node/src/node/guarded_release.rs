@@ -258,12 +258,18 @@ impl Node {
                     anyhow::bail!("separate guarded release source backend changed");
                 }
                 intent.parents()?;
-                if let Some(plan) =
-                    GuardedRootCapturePlan::load_for_retirement(control, intent.anchor_id)?
-                    && (plan.source_root() != intent.lower_path
-                        || plan.source_root_identity() != intent.lower_id)
-                {
-                    anyhow::bail!("separate guarded release source plan changed");
+                match GuardedRootCapturePlan::load_for_retirement(control, intent.anchor_id)? {
+                    Some(plan)
+                        if plan.source_root() != intent.lower_path
+                            || plan.source_root_identity() != intent.lower_id =>
+                    {
+                        anyhow::bail!("separate guarded release source plan changed");
+                    }
+                    None => GuardedRootCapturePlan::require_completed_retirement(
+                        control,
+                        intent.anchor_id,
+                    )?,
+                    Some(_) => {}
                 }
                 intent.visible(control)?;
                 if let Some(marker) = control.get_record(RELEASE_NAMES_KIND, &id)?
@@ -388,6 +394,7 @@ impl Node {
         {
             plan.discard_unreferenced(&self.control)?;
         }
+        GuardedRootCapturePlan::require_completed_retirement(&self.control, intent.anchor_id)?;
         intent.release_names(&self.control, &visible)?;
         let (_, view_parent) = intent.parents()?;
         let name = intent
@@ -451,7 +458,7 @@ mod tests {
         let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
-        for stage in 0..11_u8 {
+        for stage in 0..12_u8 {
             let area = tempfile::Builder::new()
                 .prefix("mb-separate-release-")
                 .tempdir_in(&test_root)
@@ -566,7 +573,7 @@ mod tests {
                     if stage >= 3 {
                         GuardedViewMount::retire_claim(anchor_id, &node.control).unwrap();
                     }
-                    if stage >= 4 {
+                    if stage >= 4 && stage != 11 {
                         GuardedRootCapturePlan::load_for_retirement(&node.control, anchor_id)
                             .unwrap()
                             .unwrap()
@@ -587,7 +594,7 @@ mod tests {
                                 .remove_empty_child_directory("view", intent.placeholder_id)
                                 .unwrap()
                         );
-                    } else if stage >= 6 && stage != 8 && stage != 10 {
+                    } else if stage >= 6 && stage != 8 && stage != 10 && stage != 11 {
                         intent.release_names(&node.control, &visible).unwrap();
                     }
                     if stage == 7 {
@@ -595,7 +602,29 @@ mod tests {
                         restore_visible_release_metadata(&view_root, &visible).unwrap();
                     }
                 }
-                if stage == 8 || stage == 10 {
+                if stage == 11 {
+                    let plan_bytes = node
+                        .control
+                        .get_record("guarded-root-plan-v1", anchor_id.as_bytes())
+                        .unwrap()
+                        .unwrap();
+                    node.control
+                        .delete_record("guarded-root-plan-v1", anchor_id.as_bytes())
+                        .unwrap();
+                    let database_key = node.control_database_key;
+                    drop(node);
+                    assert!(Node::open(&data_dir, seed.clone()).is_err());
+                    assert_eq!(
+                        fs::read(lower.join("sample")).unwrap(),
+                        b"edited\r\nbytes\0"
+                    );
+                    assert!(!view.join("sample").exists());
+                    ControlStore::open_with_key(data_dir.join("control.db"), &database_key)
+                        .unwrap()
+                        .put_record("guarded-root-plan-v1", anchor_id.as_bytes(), &plan_bytes)
+                        .unwrap();
+                    node = Node::open(&data_dir, seed.clone()).unwrap();
+                } else if stage == 8 || stage == 10 {
                     let original_placeholder = area.path().join("original-placeholder");
                     if stage == 8 {
                         fs::rename(&view, &original_placeholder).unwrap();

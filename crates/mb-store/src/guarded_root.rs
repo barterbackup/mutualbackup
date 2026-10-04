@@ -1668,6 +1668,48 @@ impl GuardedRootCapturePlan {
         Ok(Some(plan))
     }
 
+    /// A release may outlive deletion of its root plan. In that state, only
+    /// the anchor-bound retirement marker and the absence of root ownership
+    /// records establish that cleanup completed; a missing plan alone does not.
+    pub fn require_completed_retirement(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            control
+                .get_record(PLAN_KIND, anchor_id.as_bytes())?
+                .is_none(),
+            "guarded root still has a capture plan"
+        );
+        let bytes = control
+            .get_record(RETIRE_KIND, anchor_id.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("guarded root lost its retirement marker"))?;
+        let retired: RootRetirement = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            retired.format_version == 1 && retired.anchor_id == anchor_id,
+            "guarded root retirement marker changed"
+        );
+        for kind in [
+            ROOT_CLAIM_KIND,
+            MANIFEST_CLAIM_KIND,
+            LOWER_OWNERSHIP_KIND,
+            PRIVATE_FILE_CAPTURE_KIND,
+            DIRECTORY_ISOLATION_KIND,
+        ] {
+            anyhow::ensure!(
+                control.get_record(kind, anchor_id.as_bytes())?.is_none(),
+                "guarded root retains an anchor ownership record"
+            );
+        }
+        anyhow::ensure!(
+            control
+                .records(&format!("{DIRECTORY_CLAIM_PREFIX}{anchor_id}"))?
+                .is_empty(),
+            "guarded root retains directory anchor claims"
+        );
+        Ok(())
+    }
+
     /// Decode a pending guarded plan without requiring its source volume to
     /// be online. Capture itself performs the descriptor and journal checks.
     pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
@@ -4084,6 +4126,37 @@ mod tests {
         fs::write(&catalog, bytes).unwrap();
         fs::set_permissions(&catalog, fs::Permissions::from_mode(0o444)).unwrap();
         assert!(GuardedRootCapturePlan::load_published_manifest(&store, plan.anchor_id).is_err());
+    }
+
+    #[test]
+    fn completed_root_retirement_requires_tombstone_and_no_owner_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([129; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.capture(&store).unwrap();
+        assert!(
+            GuardedRootCapturePlan::require_completed_retirement(&store, plan.anchor_id).is_err()
+        );
+        plan.discard_unreferenced(&store).unwrap();
+        GuardedRootCapturePlan::require_completed_retirement(&store, plan.anchor_id).unwrap();
+        store
+            .put_record(ROOT_CLAIM_KIND, plan.anchor_id.as_bytes(), b"orphan")
+            .unwrap();
+        assert!(
+            GuardedRootCapturePlan::require_completed_retirement(&store, plan.anchor_id).is_err()
+        );
+        store
+            .delete_record(ROOT_CLAIM_KIND, plan.anchor_id.as_bytes())
+            .unwrap();
+        store
+            .delete_record(RETIRE_KIND, plan.anchor_id.as_bytes())
+            .unwrap();
+        assert!(
+            GuardedRootCapturePlan::require_completed_retirement(&store, plan.anchor_id).is_err()
+        );
     }
 
     #[test]

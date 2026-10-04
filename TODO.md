@@ -902,7 +902,13 @@
   FUSE mount and a durable release intent, then verifies that startup returns
   its edited and newly created files at the view path. Guarded Git pin
   integration remains open before broader Git operations can select this
-  backend.
+  backend. Both release layouts now require a matching durable root-retirement
+  marker and no remaining root ownership claims before the directory name is
+  returned; a missing capture plan alone is insufficient. A separate-view
+  interruption test removes the plan before retirement, confirms startup fails
+  closed with the lower tree intact, then restores the plan and completes
+  replay. That test and the in-place release fixture pass on ext4 and fresh
+  local Btrfs.
   Guarded root capture now uses a version-2 plan and version-3 sealed manifest
   when an entry has raw Unix path bytes; version-1/2 UTF-8 records keep their
   prior bytes. Directory claims, lower ownership, freeze journals, namespace

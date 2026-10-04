@@ -1820,6 +1820,10 @@ impl Node {
         if !backend.is_supported_guarded_for(root_id, root.filesystem_id, root.root_inode) {
             anyhow::bail!("guarded release source backend changed");
         }
+        if GuardedRootCapturePlan::load_for_retirement(&self.control, binding.anchor_id)?.is_none()
+        {
+            anyhow::bail!("guarded root has no live capture plan");
+        }
         if !self.control.records(GUARDED_RELEASE_KIND)?.is_empty()
             || !self
                 .control
@@ -1956,11 +1960,15 @@ impl Node {
                 {
                     anyhow::bail!("guarded release name handoff changed");
                 }
-                if let Some(plan) =
-                    GuardedRootCapturePlan::load_for_retirement(control, intent.anchor_id)?
-                    && plan.source_root() != handoff.lower_path()
-                {
-                    anyhow::bail!("guarded release source plan changed");
+                match GuardedRootCapturePlan::load_for_retirement(control, intent.anchor_id)? {
+                    Some(plan) if plan.source_root() != handoff.lower_path() => {
+                        anyhow::bail!("guarded release source plan changed");
+                    }
+                    None => GuardedRootCapturePlan::require_completed_retirement(
+                        control,
+                        intent.anchor_id,
+                    )?,
+                    Some(_) => {}
                 }
                 Ok((intent, bytes))
             })
@@ -2067,6 +2075,7 @@ impl Node {
         {
             plan.discard_unreferenced(&self.control)?;
         }
+        GuardedRootCapturePlan::require_completed_retirement(&self.control, intent.anchor_id)?;
         handoff.release_names(&self.control, &parent, intent.anchor_id)?;
         handoff.restore_released_metadata(&self.control, &parent, intent.anchor_id)?;
         let mut deletions = handoff.released_record_keys(&self.control, intent.anchor_id)?;
