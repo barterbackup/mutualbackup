@@ -32,6 +32,8 @@ struct Cli {
 enum Command {
     /// Enroll this directory as a protected Git-compatible repository.
     Init { directory: Option<PathBuf> },
+    /// Retire an empty guarded Git catalog before removing its protected root.
+    Deinit { repository_id: Uuid },
     /// Create, list, resume, remove, or prune linked worktrees of this repository.
     Worktree {
         #[command(subcommand)]
@@ -201,6 +203,18 @@ async fn main() -> Result<()> {
                 info.repository_id,
                 info.path.display()
             );
+        }
+        Command::Deinit { repository_id } => {
+            let LocalResponse::GitRepositoryRetired {
+                repository_id: retired,
+            } = local_control_call(&socket, &LocalRequest::GitDeinit { repository_id }).await?
+            else {
+                bail!("daemon returned the wrong response to Git deinitialization");
+            };
+            if retired != repository_id {
+                bail!("daemon retired another Git repository");
+            }
+            println!("Retired empty guarded Git repository {repository_id}");
         }
         Command::Worktree { command } => {
             let repository_id = discover_shared_repository(&working_directory)?;

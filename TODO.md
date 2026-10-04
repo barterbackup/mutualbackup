@@ -88,15 +88,15 @@
   unrelated lost-pin failure. A second privileged ext4/Btrfs probe retires
   the mount claim and confirms that deferred cleanup then deletes the physical
   file anchor while preserving edited worktree bytes. A full root-release
-  interruption probe is still required. An explicit safe way to retire an empty
-  Git repository and its private catalog is also needed before guarded-root
-  release, which currently rejects every registered Git repository. The Git
-  catalog now has a strict empty-retirement preflight: it accepts only its
-  exact guarded backend binding and expected private files, and returns the
-  pinned catalog-directory identity. It rejects retained history, unknown
-  records, extra files, and a changed marker. The node still needs to durably
-  fence that identity, remove the catalog with crash replay, and retire the
-  repository registration before root release. Guarded Git enrollment,
+  interruption probe with deferred file cleanup is still required. An empty
+  guarded Git repository can now be retired explicitly with
+  `mutualgit deinit <repository-id>`. The catalog accepts only its exact backend
+  binding and expected private files. The node fences their native identities
+  before removing them. Startup replays an interrupted retirement before guarded
+  mount recovery, then atomically removes the node registration; ext4 and
+  disposable Btrfs probes cover normal retirement, replay after database
+  deletion, and subsequent guarded-root release. Retained Git history or any
+  unrecognized catalog state still blocks retirement. Guarded Git enrollment,
   checkout, signed graph protection, and seed-only virtual-locator rebind
   remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**

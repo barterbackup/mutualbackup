@@ -32,6 +32,7 @@ local-request =
   / { "AddGuardedRootInPlace": { path: local-path } }
   / { "RemoveGuardedRoot": { root_id: uuid-text } }
   / { "GitInit": { path: local-path } }
+  / { "GitDeinit": { repository_id: uuid-text } }
   / { "GitWorktreeAdd": { repository_id: uuid-text, path: local-path, branch: tstr } }
   / { "GitWorktrees": { repository_id: uuid-text } }
   / { "GitWorktreeResume": { repository_id: uuid-text, worktree_id: uuid-text } }
@@ -129,6 +130,7 @@ local-response =
   / { "RootAdded": protected-root }
   / { "RootRemoved": { root_id: uuid-text } }
   / { "GitRepositoryInitialized": git-repository-info }
+  / { "GitRepositoryRetired": { repository_id: uuid-text } }
   / { "GitWorktreeRegistered": git-worktree-info }
   / { "GitWorktreePruned": git-worktree-info }
   / { "GitWorktreeRemoved": git-worktree-info }

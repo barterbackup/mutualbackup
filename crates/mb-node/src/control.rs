@@ -426,6 +426,21 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitDeinit { repository_id } => {
+            blocking_node(node, move |node| {
+                #[cfg(target_os = "linux")]
+                {
+                    node.git_retire_empty_guarded_repository(repository_id)?;
+                    Ok(LocalResponse::GitRepositoryRetired { repository_id })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (node, repository_id);
+                    anyhow::bail!("guarded Git repository retirement requires Linux")
+                }
+            })
+            .await
+        }
         LocalRequest::GitWorktreeAdd {
             repository_id,
             path,

@@ -61,7 +61,11 @@ use crate::snapshot::{
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
 #[cfg(target_os = "linux")]
+mod guarded_git_retirement;
+#[cfg(target_os = "linux")]
 mod guarded_release;
+#[cfg(target_os = "linux")]
+use guarded_git_retirement::GUARDED_GIT_RETIRE_KIND;
 #[cfg(target_os = "linux")]
 use guarded_release::GUARDED_SEPARATE_RELEASE_KIND;
 
@@ -1509,6 +1513,8 @@ impl Node {
         let (mut control, control_database_key) = open_control_store(&data_dir, &keys)?;
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
+        #[cfg(target_os = "linux")]
+        Self::reconcile_guarded_git_repository_retirements(&control, &keys)?;
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
         volumes.reconcile(&control)?;
         let volume_readers = Arc::new(RwLock::new(volumes.reader_configs()));
@@ -2913,6 +2919,12 @@ impl Node {
 
     #[cfg(target_os = "linux")]
     fn open_guarded_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
+        anyhow::ensure!(
+            self.control
+                .get_record(GUARDED_GIT_RETIRE_KIND, repository_id.as_bytes())?
+                .is_none(),
+            "guarded Git repository retirement is unfinished"
+        );
         let registration = self
             .control
             .get_record("git-repository", repository_id.as_bytes())?

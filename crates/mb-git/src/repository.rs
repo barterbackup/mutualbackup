@@ -134,6 +134,39 @@ pub struct GitRepository {
     source_backend: SourceBackendKind,
 }
 
+/// Exact native names fenced by the node before retiring an empty guarded
+/// catalog. Missing files on replay are prior progress; replacements fail.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitGuardedCatalogRetirementV1 {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub directory_id: mb_store::NativeFileId,
+    pub database_id: mb_store::NativeFileId,
+    pub marker_id: mb_store::NativeFileId,
+    pub wal_id: Option<mb_store::NativeFileId>,
+    pub shm_id: Option<mb_store::NativeFileId>,
+}
+
+impl GitGuardedCatalogRetirementV1 {
+    fn validate(&self) -> Result<(), RepositoryError> {
+        if self.format_version != 1
+            || self.repository_id.is_nil()
+            || self.directory_id.filesystem_id == 0
+            || self.directory_id.filesystem_id != self.database_id.filesystem_id
+            || self.directory_id.filesystem_id != self.marker_id.filesystem_id
+            || self
+                .wal_id
+                .is_some_and(|id| id.filesystem_id != self.directory_id.filesystem_id)
+            || self
+                .shm_id
+                .is_some_and(|id| id.filesystem_id != self.directory_id.filesystem_id)
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(())
+    }
+}
+
 impl GitRepository {
     pub fn init(
         source_root: impl AsRef<Path>,
@@ -1494,12 +1527,12 @@ impl GitRepository {
         )?)
     }
 
-    /// Return the pinned private directory identity only when it contains no
+    /// Return exact private file identities only when the catalog contains no
     /// Git history, index, worktree, object mapping, or unfinished operation.
-    /// The node must durably fence this identity before removing the catalog.
-    pub fn empty_guarded_catalog_identity(
+    /// The node must durably fence these identities before removing them.
+    pub fn prepare_empty_guarded_catalog_retirement(
         &self,
-    ) -> Result<mb_store::NativeFileId, RepositoryError> {
+    ) -> Result<GitGuardedCatalogRetirementV1, RepositoryError> {
         if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
             return Err(RepositoryError::Conflict);
         }
@@ -1509,20 +1542,7 @@ impl GitRepository {
         {
             return Err(RepositoryError::Conflict);
         }
-        let expected = GitSourceBackendRecord {
-            format_version: 1,
-            repository_id: self.repository_id,
-            backend: self.source_backend,
-        };
-        let encoded = mb_core::canonical_bytes(&expected).map_err(|_| RepositoryError::Conflict)?;
-        let records = self.catalog.records_with_kind_prefix("")?;
-        if records.len() != 1
-            || records[0].0 != SOURCE_BACKEND_KIND
-            || records[0].1 != self.repository_id.as_bytes()
-            || records[0].2 != encoded
-        {
-            return Err(RepositoryError::Conflict);
-        }
+        require_empty_guarded_catalog_records(&self.catalog, self.repository_id)?;
         for entry in fs::read_dir(self.directory.descriptor_path())? {
             let entry = entry?;
             let name = entry.file_name();
@@ -1539,7 +1559,104 @@ impl GitRepository {
                 return Err(RepositoryError::Conflict);
             }
         }
-        Ok(self.directory.identity()?)
+        let fence = GitGuardedCatalogRetirementV1 {
+            format_version: 1,
+            repository_id: self.repository_id,
+            directory_id: self.directory.identity()?,
+            database_id: self
+                .directory
+                .entry_identity(CATALOG_DATABASE, false)?
+                .ok_or(RepositoryError::Conflict)?,
+            marker_id: self
+                .directory
+                .entry_identity(GIT_CATALOG_MARKER_FILE, false)?
+                .ok_or(RepositoryError::Conflict)?,
+            wal_id: self.directory.entry_identity("catalog.db-wal", false)?,
+            shm_id: self.directory.entry_identity("catalog.db-shm", false)?,
+        };
+        fence.validate()?;
+        Ok(fence)
+    }
+
+    /// Replay the node's durable fence before guarded mount recovery. A
+    /// surviving database is reopened and checked; a missing one is progress.
+    pub fn resume_empty_guarded_catalog_retirement(
+        catalog_root: &Path,
+        catalog_root_id: mb_store::NativeFileId,
+        fence: &GitGuardedCatalogRetirementV1,
+        catalog_key: &[u8; 32],
+    ) -> Result<(), RepositoryError> {
+        fence.validate()?;
+        let lower = PinnedDirectory::open(catalog_root)?;
+        if lower.identity()? != catalog_root_id
+            || catalog_root_id.filesystem_id != fence.directory_id.filesystem_id
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        let Some(directory) = lower.open_child_directory(GIT_CATALOG_DIRECTORY)? else {
+            return Ok(());
+        };
+        if directory.identity()? != fence.directory_id {
+            return Err(RepositoryError::Conflict);
+        }
+        require_private_catalog(&directory)?;
+        if let Some(marker) = read_marker(&directory, GIT_CATALOG_MARKER_FILE)?
+            && marker != git_catalog_marker_bytes(fence.repository_id)
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        for entry in fs::read_dir(directory.descriptor_path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let expected = match name.to_str() {
+                Some(CATALOG_DATABASE) => Some(fence.database_id),
+                Some(GIT_CATALOG_MARKER_FILE) => Some(fence.marker_id),
+                Some("catalog.db-wal") => fence.wal_id,
+                Some("catalog.db-shm") => fence.shm_id,
+                _ => return Err(RepositoryError::Conflict),
+            };
+            if !entry.file_type()?.is_file() || directory.entry_identity(&name, false)? != expected
+            {
+                return Err(RepositoryError::Conflict);
+            }
+        }
+        // Marker removal is last so interrupted pre-mount recovery still sees
+        // the directory as private. If it is already absent, no payload file
+        // may remain from an earlier, interrupted retirement step.
+        if directory
+            .entry_identity(GIT_CATALOG_MARKER_FILE, false)?
+            .is_none()
+            && (directory.entry_identity(CATALOG_DATABASE, false)?.is_some()
+                || directory.entry_identity("catalog.db-wal", false)?.is_some()
+                || directory.entry_identity("catalog.db-shm", false)?.is_some())
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        if directory.entry_identity(CATALOG_DATABASE, false)?.is_some() {
+            let catalog = ControlStore::open_existing_with_key(
+                directory.descriptor_path().join(CATALOG_DATABASE),
+                catalog_key,
+            )?;
+            require_empty_guarded_catalog_records(&catalog, fence.repository_id)?;
+            drop(catalog);
+        }
+        for (name, expected) in [
+            (CATALOG_DATABASE, Some(fence.database_id)),
+            ("catalog.db-wal", fence.wal_id),
+            ("catalog.db-shm", fence.shm_id),
+            (GIT_CATALOG_MARKER_FILE, Some(fence.marker_id)),
+        ] {
+            if let Some(actual) = directory.entry_identity(name, false)? {
+                if Some(actual) != expected {
+                    return Err(RepositoryError::Conflict);
+                }
+                directory.remove_child_file_if_identity(name, actual)?;
+            }
+        }
+        if !lower.remove_empty_child_directory(GIT_CATALOG_DIRECTORY, fence.directory_id)? {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(())
     }
 
     pub fn push_current_branch_to_bare(
@@ -1863,6 +1980,27 @@ fn require_source_backend_binding(
     Ok(())
 }
 
+fn require_empty_guarded_catalog_records(
+    catalog: &ControlStore,
+    repository_id: Uuid,
+) -> Result<(), RepositoryError> {
+    let expected = GitSourceBackendRecord {
+        format_version: 1,
+        repository_id,
+        backend: SourceBackendKind::GuardedLinkFreezeV1,
+    };
+    let encoded = mb_core::canonical_bytes(&expected).map_err(|_| RepositoryError::Conflict)?;
+    let records = catalog.records_with_kind_prefix("")?;
+    if records.len() != 1
+        || records[0].0 != SOURCE_BACKEND_KIND
+        || records[0].1 != repository_id.as_bytes()
+        || records[0].2 != encoded
+    {
+        return Err(RepositoryError::Conflict);
+    }
+    Ok(())
+}
+
 fn initialization_intent_bytes(repository_id: Uuid) -> Vec<u8> {
     format!("{INITIALIZATION_MAGIC}{repository_id}\n").into_bytes()
 }
@@ -2068,28 +2206,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            guarded.empty_guarded_catalog_identity().unwrap(),
+            guarded
+                .prepare_empty_guarded_catalog_retirement()
+                .unwrap()
+                .directory_id,
             guarded.catalog_directory_identity().unwrap()
         );
         let reflink = GitRepository::init(&other, Uuid::new_v4(), &key).unwrap();
-        assert!(reflink.empty_guarded_catalog_identity().is_err());
+        assert!(reflink.prepare_empty_guarded_catalog_retirement().is_err());
 
         guarded
             .catalog
             .put_record("future-git-record-v2", b"live", b"unknown")
             .unwrap();
-        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        assert!(guarded.prepare_empty_guarded_catalog_retirement().is_err());
         guarded
             .catalog
             .delete_record("future-git-record-v2", b"live")
             .unwrap();
         let catalog_path = root.join(GIT_CATALOG_DIRECTORY);
         fs::write(catalog_path.join("unrecognized"), b"owned by someone else").unwrap();
-        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        assert!(guarded.prepare_empty_guarded_catalog_retirement().is_err());
         fs::remove_file(catalog_path.join("unrecognized")).unwrap();
-        assert!(guarded.empty_guarded_catalog_identity().is_ok());
+        assert!(guarded.prepare_empty_guarded_catalog_retirement().is_ok());
         fs::write(catalog_path.join(GIT_CATALOG_MARKER_FILE), b"wrong marker").unwrap();
-        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        assert!(guarded.prepare_empty_guarded_catalog_retirement().is_err());
         fs::write(
             catalog_path.join(GIT_CATALOG_MARKER_FILE),
             git_catalog_marker_bytes(repository_id),
@@ -2099,13 +2240,125 @@ mod tests {
             .catalog
             .put_record(&crate::head::head_kind(repository_id), b"branch", b"main")
             .unwrap();
-        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        assert!(guarded.prepare_empty_guarded_catalog_retirement().is_err());
         guarded
             .catalog
             .delete_record(&crate::head::head_kind(repository_id), b"branch")
             .unwrap();
         fs::remove_file(catalog_path.join(CATALOG_DATABASE)).unwrap();
-        assert!(guarded.empty_guarded_catalog_identity().is_err());
+        assert!(guarded.prepare_empty_guarded_catalog_retirement().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_guarded_catalog_retirement_replays_after_database_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [90_u8; 32];
+        let guarded = GitRepository::init_with_backend(
+            &root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let fence = guarded.prepare_empty_guarded_catalog_retirement().unwrap();
+        let root_id = PinnedDirectory::open(&root).unwrap().identity().unwrap();
+        drop(guarded);
+        let catalog_path = root.join(GIT_CATALOG_DIRECTORY);
+        for name in ["catalog.db-wal", "catalog.db-shm", CATALOG_DATABASE] {
+            let path = catalog_path.join(name);
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        GitRepository::resume_empty_guarded_catalog_retirement(&root, root_id, &fence, &key)
+            .unwrap();
+        assert!(!catalog_path.exists());
+        GitRepository::resume_empty_guarded_catalog_retirement(&root, root_id, &fence, &key)
+            .unwrap();
+        assert!(
+            GitRepository::open_with_backend(
+                &root,
+                repository_id,
+                &key,
+                SourceBackendKind::GuardedLinkFreezeV1,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_guarded_catalog_retirement_refuses_replaced_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [91_u8; 32];
+        let guarded = GitRepository::init_with_backend(
+            &root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let fence = guarded.prepare_empty_guarded_catalog_retirement().unwrap();
+        let root_id = PinnedDirectory::open(&root).unwrap().identity().unwrap();
+        drop(guarded);
+        let catalog_path = root.join(GIT_CATALOG_DIRECTORY);
+        fs::remove_file(catalog_path.join(CATALOG_DATABASE)).unwrap();
+        fs::write(catalog_path.join(CATALOG_DATABASE), b"replacement").unwrap();
+        assert!(
+            GitRepository::resume_empty_guarded_catalog_retirement(&root, root_id, &fence, &key)
+                .is_err()
+        );
+        assert!(catalog_path.join(GIT_CATALOG_MARKER_FILE).exists());
+        assert!(catalog_path.join(CATALOG_DATABASE).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_guarded_catalog_retirement_refuses_new_records_after_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [92_u8; 32];
+        let guarded = GitRepository::init_with_backend(
+            &root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let fence = guarded.prepare_empty_guarded_catalog_retirement().unwrap();
+        let root_id = PinnedDirectory::open(&root).unwrap().identity().unwrap();
+        drop(guarded);
+        let catalog_path = root.join(GIT_CATALOG_DIRECTORY);
+        let catalog =
+            ControlStore::open_existing_with_key(catalog_path.join(CATALOG_DATABASE), &key)
+                .unwrap();
+        catalog
+            .put_record("git-object-added-after-fence", b"live", b"must stay")
+            .unwrap();
+        drop(catalog);
+        assert!(
+            GitRepository::resume_empty_guarded_catalog_retirement(&root, root_id, &fence, &key)
+                .is_err()
+        );
+        let catalog =
+            ControlStore::open_existing_with_key(catalog_path.join(CATALOG_DATABASE), &key)
+                .unwrap();
+        assert_eq!(
+            catalog
+                .get_record("git-object-added-after-fence", b"live")
+                .unwrap()
+                .as_deref(),
+            Some(b"must stay".as_slice())
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -76,6 +76,9 @@ pub enum LocalRequest {
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
+    GitDeinit {
+        repository_id: Uuid,
+    },
     GitWorktreeAdd {
         repository_id: Uuid,
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
@@ -490,6 +493,9 @@ pub enum LocalResponse {
         root_id: Uuid,
     },
     GitRepositoryInitialized(GitRepositoryInfo),
+    GitRepositoryRetired {
+        repository_id: Uuid,
+    },
     GitWorktreeRegistered(GitWorktreeInfo),
     GitWorktrees(Vec<GitWorktreeInfo>),
     GitFileStaged(GitStagedFile),
@@ -863,6 +869,7 @@ mod tests {
             LocalRequest::GitInit {
                 path: PathBuf::from("/home/user/work"),
             },
+            LocalRequest::GitDeinit { repository_id },
             LocalRequest::GitWorktreeAdd {
                 repository_id,
                 path: PathBuf::from("/home/user/linked"),
@@ -1262,6 +1269,7 @@ mod tests {
                 repository_id,
                 path: PathBuf::from("/home/user/work"),
             }),
+            LocalResponse::GitRepositoryRetired { repository_id },
             LocalResponse::GitWorktreeRegistered(GitWorktreeInfo {
                 format_version: 1,
                 repository_id,
