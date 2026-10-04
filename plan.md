@@ -826,6 +826,12 @@ Proactive background repair comes later.
   On a non-reflink recovery filesystem, stream verified Git blob sectors
   directly into one native anchor and preserve sparse zero ranges; do not
   require a temporary worktree payload and a reflink just to rebuild history.
+  After a guarded root capture, rebind any recovered Git blob whose signed
+  bytes match a retained root file to that verified root anchor through a
+  guarded virtual mapping, then retire its temporary imported anchor. Preserve
+  the root file's two-link edit invariant; blobs absent from the visible tree
+  retain independent native anchors. Prove this handoff survives a crash and
+  does not leave a second permanent payload copy on ext4 or Btrfs.
 - Represent explicit commit protection pins as namespaced Git refs so graph
   export, signed backup, and recovery retain their ancestry without another
   object format. Removing a branch or pin only changes reachability; physical

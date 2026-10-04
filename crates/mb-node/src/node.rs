@@ -29,8 +29,9 @@ use mb_core::{
     verify_guild_event_signature,
 };
 use mb_git::{
-    GitBranchInfo, GitCommitInfo, GitDiff, GitGuardedPrunePreview, GitLogEntry, GitPruneReport,
-    GitPruneRoots, GitRemoteBranchInfo, GitRepository, GitStatus, GitTagInfo, GitWorktreeInfo,
+    GitBackupDescriptor, GitBranchInfo, GitCommitInfo, GitDiff, GitGuardedPrunePreview,
+    GitLogEntry, GitPruneReport, GitPruneRoots, GitRemoteBranchInfo, GitRepository, GitStatus,
+    GitTagInfo, GitWorktreeInfo,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -15238,19 +15239,17 @@ impl Node {
         target_name: &Path,
     ) -> Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some((metadata, metadata_hash)) =
-            crate::snapshot::guarded_private_metadata_for_revision(
+        if let Some(metadata) = crate::snapshot::guarded_private_metadata_for_revision(
+            &self.control,
+            &self.keys,
+            job.guild_id,
+            revision,
+        )? && (job.state == RecoveryJobState::Published
+            || GuardedRecoveryHandoff::load(
                 &self.control,
-                &self.keys,
-                job.guild_id,
-                revision,
+                guarded_recovery_handoff_id(checkpoint_hash),
             )?
-            && (job.state == RecoveryJobState::Published
-                || GuardedRecoveryHandoff::load(
-                    &self.control,
-                    guarded_recovery_handoff_id(checkpoint_hash),
-                )?
-                .is_some())
+            .is_some())
         {
             return self.finish_guarded_recovery(
                 job,
@@ -15258,8 +15257,9 @@ impl Node {
                 revision,
                 parent,
                 target_name,
-                &metadata,
-                metadata_hash,
+                &metadata.guarded,
+                metadata.git.as_ref(),
+                metadata.metadata_hash,
             );
         }
         let expected = job
@@ -15352,6 +15352,7 @@ impl Node {
         parent: &PinnedDirectory,
         target_name: &Path,
         metadata: &crate::GuardedPrivateMetadataV6,
+        git_backup: Option<&GitBackupDescriptor>,
         metadata_hash: [u8; 32],
     ) -> Result<()> {
         let restored_id = job
@@ -15389,6 +15390,9 @@ impl Node {
                 anyhow::bail!("completed guarded recovery uses another mounted anchor");
             }
             self.verified_source_backend_for_root(&root)?;
+            if let Some(descriptor) = git_backup {
+                self.verify_recovered_guarded_git(&root, job.guild_id, descriptor, true)?;
+            }
             for reference in &revision.value.data_sectors {
                 if !recovered_recipe_is_stable(&self.control, &self.keys, job.guild_id, reference)?
                 {
@@ -15465,7 +15469,23 @@ impl Node {
             None => {
                 let lower = PinnedDirectory::open(handoff.lower_path())?;
                 let plan = GuardedRootCapturePlan::plan(handoff.lower_path())?;
-                let view = metadata.bind_restored_view(&lower, plan.anchor_id())?;
+                let view = if let Some(descriptor) = git_backup {
+                    let repository = GitRepository::open_with_backend(
+                        handoff.lower_path(),
+                        descriptor.repository_id,
+                        &self.git_catalog_key(descriptor.repository_id),
+                        SourceBackendKind::GuardedLinkFreezeV1,
+                    )?;
+                    repository.verify_guarded_catalog_files()?;
+                    metadata.bind_restored_view_with_git_catalog(
+                        &lower,
+                        plan.anchor_id(),
+                        descriptor.repository_id,
+                        repository.catalog_directory_identity()?,
+                    )?
+                } else {
+                    metadata.bind_restored_view(&lower, plan.anchor_id())?
+                };
                 let intent = GuardedRecoveryMountIntentV1 {
                     format_version: 1,
                     checkpoint_hash: *checkpoint_hash,
@@ -15508,6 +15528,16 @@ impl Node {
                 intent
                     .plan
                     .capture_private_file_owners(&self.control, metadata.root.uid, 0, 0)?;
+            let repository = git_backup
+                .map(|descriptor| {
+                    GitRepository::open_with_backend(
+                        handoff.lower_path(),
+                        descriptor.repository_id,
+                        &self.git_catalog_key(descriptor.repository_id),
+                        SourceBackendKind::GuardedLinkFreezeV1,
+                    )
+                })
+                .transpose()?;
             crate::snapshot::install_guarded_recovery_root_recipes(
                 &mut self.control,
                 &self.keys,
@@ -15515,7 +15545,7 @@ impl Node {
                 revision,
                 metadata,
                 &manifest,
-                None,
+                git_backup.zip(repository.as_ref()),
             )?;
             #[cfg(test)]
             if INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.replace(false)) {
@@ -15545,14 +15575,74 @@ impl Node {
             .find(|mount| mount.anchor_id() == intent.plan.anchor_id())
             .context("guarded recovery mount was not retained by the daemon")?;
         mount.verify_virtual_metadata(&self.control, &intent.view)?;
-        self.register_guarded_protected_root(
+        let root = self.register_guarded_protected_root(
             revision.value.protected_root_id,
             intent.plan.anchor_id(),
         )?;
+        if let Some(descriptor) = git_backup {
+            self.verify_recovered_guarded_git(&root, job.guild_id, descriptor, false)?;
+            self.reconcile_guarded_git_stages()?;
+        }
         verify_pinned_parent_path(parent, containing_directory(&job.target))?;
         job.state = RecoveryJobState::Complete;
         self.control
             .complete_recovery_attempt(checkpoint_hash, &canonical_bytes(job)?)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_recovered_guarded_git(
+        &self,
+        root: &ProtectedRoot,
+        guild_id: [u8; 32],
+        descriptor: &GitBackupDescriptor,
+        require_registration: bool,
+    ) -> Result<()> {
+        if root.format_version != 4 || descriptor.repository_id != root.root_id {
+            anyhow::bail!("recovered guarded Git graph belongs to another root");
+        }
+        let binding = self.guarded_root_mount_binding(root)?;
+        let repository = GitRepository::open_with_catalog_root(
+            &root.path,
+            &binding.lower_root,
+            descriptor.repository_id,
+            &self.git_catalog_key(descriptor.repository_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )?;
+        repository.verify_guarded_catalog_files()?;
+        crate::snapshot::verify_recovered_git_graph(
+            &repository,
+            descriptor,
+            &self.keys.guild_data_key(&guild_id),
+            guild_id,
+        )?;
+        let info = GitRepositoryInfo {
+            format_version: 1,
+            repository_id: descriptor.repository_id,
+            path: root.path.clone(),
+        };
+        let encoded = canonical_bytes(&info)?;
+        match self
+            .control
+            .get_record("git-repository", descriptor.repository_id.as_bytes())?
+        {
+            Some(existing) if existing == encoded => {}
+            Some(_) => {
+                anyhow::bail!("recovered guarded Git registration conflicts with local state")
+            }
+            None if require_registration => {
+                anyhow::bail!("completed guarded Git recovery lost its repository registration")
+            }
+            None => {
+                if !self.control.put_record_if_absent(
+                    "git-repository",
+                    descriptor.repository_id.as_bytes(),
+                    &encoded,
+                )? {
+                    anyhow::bail!("recovered guarded Git registration changed concurrently");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -28768,6 +28858,217 @@ pub(crate) mod tests {
                 edited_recovered
             );
         }
+        // A format-7 revision uses the same visible namespace but rebuilds a
+        // guarded-bound Git catalog in the private lower tree. Exercise the
+        // complete mount handoff and registration before enabling signing.
+        assert_eq!(signed.value.metadata_sectors.len(), 1);
+        let ordinary_git =
+            git2::Repository::init_bare(area.path().join("signed-git-graph")).unwrap();
+        let git_blob_oid = ordinary_git.blob(&captured_bytes).unwrap();
+        let mut tree_builder = ordinary_git.treebuilder(None).unwrap();
+        tree_builder
+            .insert("sample", git_blob_oid, 0o100644)
+            .unwrap();
+        let git_tree_oid = tree_builder.write().unwrap();
+        let git_tree = ordinary_git.find_tree(git_tree_oid).unwrap();
+        let git_signature = git2::Signature::now("Author", "author@example.test").unwrap();
+        let git_commit_oid = ordinary_git
+            .commit(
+                None,
+                &git_signature,
+                &git_signature,
+                "recovered",
+                &git_tree,
+                &[],
+            )
+            .unwrap();
+        let git_odb = ordinary_git.odb().unwrap();
+        let mut git_objects = [(git_commit_oid, 1_u8), (git_tree_oid, 2_u8)]
+            .into_iter()
+            .map(|(oid, kind)| mb_git::GitGraphObject {
+                kind,
+                oid: oid.as_bytes().try_into().unwrap(),
+                bytes: git_odb.read(oid).unwrap().data().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        git_objects.sort_by_key(|object| object.oid);
+        let sample_extents = signed_private
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                crate::GuardedPrivateEntryV6::File {
+                    path, data_extents, ..
+                } if path == b"sample" => Some(data_extents),
+                _ => None,
+            })
+            .unwrap();
+        let git_descriptor = GitBackupDescriptor {
+            format_version: 2,
+            repository_id: protected_root_id,
+            refs: vec![mb_git::GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: git_commit_oid.as_bytes().try_into().unwrap(),
+            }],
+            objects: git_objects,
+            blobs: vec![mb_git::GitBackupBlob {
+                oid: git_blob_oid.as_bytes().try_into().unwrap(),
+                logical_len: captured_bytes.len() as u64,
+                data_extents: sample_extents
+                    .iter()
+                    .map(|extent| mb_git::GitDataExtent {
+                        offset: extent.offset,
+                        logical_len: extent.logical_len,
+                        sectors: extent.sectors.clone(),
+                    })
+                    .collect(),
+            }],
+            head_branch: "main".to_owned(),
+        };
+        git_descriptor.validate().unwrap();
+        let git_private = crate::guarded_metadata::GuardedGitPrivateMetadataV7 {
+            format_version: 7,
+            guarded: signed_private.clone(),
+            git: git_descriptor.clone(),
+        };
+        let git_metadata_bytes = canonical_bytes(&git_private).unwrap();
+        let (git_metadata_ref, git_metadata_ciphertext) = mb_core::encrypted_sector(
+            &keys.guild_data_key(&guild_id),
+            signed.value.metadata_sectors[0].id,
+            &git_metadata_bytes,
+        )
+        .unwrap();
+        let git_data_ciphertexts = signed
+            .value
+            .data_sectors
+            .iter()
+            .map(|reference| {
+                crate::snapshot::render_sector(
+                    &recovered.control,
+                    &keys,
+                    &reference.id,
+                    Some(&guild_id),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut git_revision = signed.value.clone();
+        git_revision.metadata_sectors = vec![git_metadata_ref.clone()];
+        git_revision.sector_commitments = Some(
+            std::iter::once(&git_metadata_ciphertext)
+                .chain(git_data_ciphertexts.iter())
+                .map(|bytes| merkle_commit(bytes).unwrap())
+                .collect(),
+        );
+        git_revision
+            .sign_writer(&ed25519_dalek::SigningKey::from_bytes(&writer_secret))
+            .unwrap();
+        let git_signed = SignedRecord::sign(USER_REVISION_DOMAIN, git_revision, &keys).unwrap();
+        let git_checkpoint_hash = [243; 32];
+        let git_data_dir = area.path().join("seed-only-git-node");
+        let git_target = area.path().join("guarded-git-restored");
+        let mut git_node = Node::open(&git_data_dir, Seed::from_bytes([241; 32])).unwrap();
+        crate::snapshot::install_recovered_sector_recipe(
+            &mut git_node.control,
+            &keys,
+            guild_id,
+            git_metadata_ref,
+            &git_metadata_ciphertext,
+        )
+        .unwrap();
+        for (reference, ciphertext) in signed.value.data_sectors.iter().zip(&git_data_ciphertexts) {
+            crate::snapshot::install_recovered_sector_recipe(
+                &mut git_node.control,
+                &keys,
+                guild_id,
+                reference.clone(),
+                ciphertext,
+            )
+            .unwrap();
+        }
+        INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.set(true));
+        assert!(
+            git_node
+                .restore_recovered_revision(
+                    &git_checkpoint_hash,
+                    guild_id,
+                    &git_signed,
+                    &git_target,
+                )
+                .is_err()
+        );
+        assert!(git_node.protected_root_by_id(protected_root_id).is_err());
+        drop(git_node);
+        let mut git_node = Node::open(&git_data_dir, Seed::from_bytes([241; 32])).unwrap();
+        git_node
+            .restore_recovered_revision(&git_checkpoint_hash, guild_id, &git_signed, &git_target)
+            .unwrap();
+        assert_eq!(fs::read(git_target.join("sample")).unwrap(), captured_bytes);
+        assert!(fs::symlink_metadata(git_target.join(".mutualbackup")).is_err());
+        let git_root = git_node.protected_root_by_id(protected_root_id).unwrap();
+        let git_binding = git_node.guarded_root_mount_binding(&git_root).unwrap();
+        let git_catalog = GitRepository::open_with_catalog_root(
+            &git_target,
+            &git_binding.lower_root,
+            protected_root_id,
+            &git_node.git_catalog_key(protected_root_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let recovered_graph = git_catalog.export_graph_source().unwrap();
+        assert_eq!(recovered_graph.refs, git_descriptor.refs);
+        assert_eq!(recovered_graph.objects, git_descriptor.objects);
+        assert_eq!(recovered_graph.blobs.len(), 1);
+        assert_eq!(
+            mb_git::blob_oid_from_anchor(&recovered_graph.blobs[0].anchor)
+                .unwrap()
+                .as_bytes(),
+            git_blob_oid.as_bytes()
+        );
+        let git_edit = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'GIT!',0); os.fsync(fd); os.close(fd)")
+            .arg(git_target.join("sample"))
+            .output()
+            .unwrap();
+        assert!(git_edit.status.success(), "{git_edit:?}");
+        assert!(
+            fs::read(git_target.join("sample"))
+                .unwrap()
+                .starts_with(b"GIT!")
+        );
+        assert_eq!(
+            mb_git::blob_oid_from_anchor(&recovered_graph.blobs[0].anchor)
+                .unwrap()
+                .as_bytes(),
+            git_blob_oid.as_bytes()
+        );
+        for reference in &git_signed.value.data_sectors {
+            assert!(
+                crate::snapshot::recovered_recipe_is_stable(
+                    &git_node.control,
+                    &keys,
+                    guild_id,
+                    reference,
+                )
+                .unwrap()
+            );
+        }
+        drop(git_catalog);
+        drop(git_node);
+        let mut git_node = Node::open(&git_data_dir, Seed::from_bytes([241; 32])).unwrap();
+        git_node
+            .restore_recovered_revision(&git_checkpoint_hash, guild_id, &git_signed, &git_target)
+            .unwrap();
+        git_node.check_guarded_mounts().unwrap();
+        assert!(fs::symlink_metadata(git_target.join(".mutualbackup")).is_err());
+        assert!(
+            fs::read(git_target.join("sample"))
+                .unwrap()
+                .starts_with(b"GIT!")
+        );
+        drop(git_node);
         recovered.check_guarded_mounts().unwrap();
         assert!(fs::read(view.join("sample")).unwrap().starts_with(b"EDIT"));
         recovered.guarded_mounts.pop().unwrap().stop().unwrap();

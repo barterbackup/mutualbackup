@@ -479,8 +479,36 @@ impl GuardedPrivateMetadataV6 {
         root: &PinnedDirectory,
         anchor_id: Uuid,
     ) -> Result<GuardedViewMetadataV1> {
+        self.bind_restored_view_with_catalog_policy(root, anchor_id, None)
+    }
+
+    pub(crate) fn bind_restored_view_with_git_catalog(
+        &self,
+        root: &PinnedDirectory,
+        anchor_id: Uuid,
+        repository_id: Uuid,
+        catalog_id: NativeFileId,
+    ) -> Result<GuardedViewMetadataV1> {
+        self.bind_restored_view_with_catalog_policy(
+            root,
+            anchor_id,
+            Some((repository_id, catalog_id)),
+        )
+    }
+
+    fn bind_restored_view_with_catalog_policy(
+        &self,
+        root: &PinnedDirectory,
+        anchor_id: Uuid,
+        catalog: Option<(Uuid, NativeFileId)>,
+    ) -> Result<GuardedViewMetadataV1> {
         ensure!(!anchor_id.is_nil(), "guarded recovered anchor ID is nil");
-        let (lower_root_id, entries) = self.bind_restored_entries(root)?;
+        let (lower_root_id, entries) = match catalog {
+            Some((repository_id, catalog_id)) => {
+                self.bind_restored_entries_with_git_catalog(root, repository_id, catalog_id)?
+            }
+            None => self.bind_restored_entries(root)?,
+        };
         Ok(GuardedViewMetadataV1 {
             format_version: 1,
             anchor_id,

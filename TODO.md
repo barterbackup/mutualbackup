@@ -115,14 +115,21 @@
   only that bound catalog. An unexpected lower-tree name or catalog file fails
   verification. The guarded root recipe installer can now merge verified Git
   blob sectors with visible-file sectors and record each restored native anchor
-  area. The nonempty-graph recovery test serves those signed sectors from the
-  imported guarded-bound anchors. Production publication still refuses format
-  7 until this installer is joined to the supervised mount replay and recovered
-  Git registration. Finish
-  graph capture and native-anchor pinning before lifting the production signing
-  gate. Linux Git blob recovery now streams verified sectors into one sparse native
-  anchor without a temporary worktree payload or reflink; the guarded catalog
-  handoff and graph/virtual-locator rebind are still open.
+  area. Format-7 restore from a fresh local node and authenticated sectors now
+  replays that installer through the supervised guarded mount, registers the
+  recovered Git catalog, and verifies the signed graph again after mount. A
+  privileged ext4 and disposable local Btrfs probe restores a reachable commit
+  and blob, hides the catalog from
+  the FUSE view, interrupts after recipe installation, reopens to finish the
+  mount, then edits the visible file without changing its signed blob or
+  sector recipes and reopens the completed recovery. Finish graph capture,
+  native-anchor pinning, root-backed virtual-locator rebind, and proof that
+  recovery leaves no second permanent payload copy before lifting the
+  production signing guard. A provisioned five-member seed-only network
+  recovery gate for format 7 also remains open. Linux Git blob recovery streams
+  verified sectors into a sparse native anchor without a temporary worktree
+  payload or reflink; reusing a recovered root
+  file anchor for an identical Git blob remains open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

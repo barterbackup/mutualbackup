@@ -2588,26 +2588,41 @@ pub(crate) fn load_private_metadata_bytes(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct GuardedRecoveryMetadata {
+    pub(crate) guarded: GuardedPrivateMetadataV6,
+    pub(crate) git: Option<GitBackupDescriptor>,
+    pub(crate) metadata_hash: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn guarded_private_metadata_for_revision(
     control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
-) -> Result<Option<(GuardedPrivateMetadataV6, [u8; 32])>> {
+) -> Result<Option<GuardedRecoveryMetadata>> {
     if revision.value.metadata_sectors.is_empty() {
         return Ok(None);
     }
     let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
-    if private_metadata_format(&bytes)? == 7 {
-        bail!("guarded Git graph recovery is not yet supported");
+    let metadata_hash = *blake3::hash(&bytes).as_bytes();
+    match private_metadata_format(&bytes)? {
+        7 => {
+            let metadata =
+                GuardedGitPrivateMetadataV7::decode(&bytes, revision.value.protected_root_id)?;
+            Ok(Some(GuardedRecoveryMetadata {
+                guarded: metadata.guarded,
+                git: Some(metadata.git),
+                metadata_hash,
+            }))
+        }
+        6 => Ok(Some(GuardedRecoveryMetadata {
+            guarded: GuardedPrivateMetadataV6::decode(&bytes)?,
+            git: None,
+            metadata_hash,
+        })),
+        _ => Ok(None),
     }
-    if private_metadata_format(&bytes)? != 6 {
-        return Ok(None);
-    }
-    Ok(Some((
-        GuardedPrivateMetadataV6::decode(&bytes)?,
-        *blake3::hash(&bytes).as_bytes(),
-    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -2764,7 +2779,7 @@ fn verify_guarded_restored_files(
 }
 
 #[cfg(target_os = "linux")]
-fn verify_recovered_git_graph(
+pub(crate) fn verify_recovered_git_graph(
     repository: &GitRepository,
     descriptor: &GitBackupDescriptor,
     encryption_key: &[u8; 32],
@@ -5301,7 +5316,7 @@ mod metadata_compatibility_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn signed_guarded_git_metadata_stages_catalog_but_refuses_unfinished_publication() {
+    fn signed_guarded_git_metadata_prepares_catalog_bound_mount_view() {
         let temporary = tempfile::tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([221; 32]));
         let guild_id = [222; 32];
@@ -5363,7 +5378,7 @@ mod metadata_compatibility_tests {
         install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
         assert_eq!(
             revision_git_backup(&control, &keys, guild_id, &revision).unwrap(),
-            Some(graph)
+            Some(graph.clone())
         );
         let staging_path = temporary.path().join("staging");
         fs::create_dir(&staging_path).unwrap();
@@ -5394,6 +5409,28 @@ mod metadata_compatibility_tests {
         .unwrap();
         assert_eq!(repository.export_graph_source().unwrap().refs.len(), 0);
         verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging).unwrap();
+        let selected = guarded_private_metadata_for_revision(&control, &keys, guild_id, &revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.git, Some(graph));
+        assert!(
+            selected
+                .guarded
+                .bind_restored_view(&staging, Uuid::new_v4())
+                .is_err()
+        );
+        let view = selected
+            .guarded
+            .bind_restored_view_with_git_catalog(
+                &staging,
+                Uuid::new_v4(),
+                protected_root_id,
+                repository.catalog_directory_identity().unwrap(),
+            )
+            .unwrap();
+        assert!(view.entries.is_empty());
+        prepare_recovered_revision_publication(&mut control, &keys, guild_id, &revision, &staging)
+            .unwrap();
         fs::write(staging_path.join("extra"), b"not signed").unwrap();
         assert!(
             verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging)
@@ -5423,10 +5460,14 @@ mod metadata_compatibility_tests {
                 .is_err()
         );
         assert!(
-            guarded_private_metadata_for_revision(&control, &keys, guild_id, &revision)
-                .unwrap_err()
-                .to_string()
-                .contains("guarded Git graph recovery is not yet supported")
+            prepare_recovered_revision_publication(
+                &mut control,
+                &keys,
+                guild_id,
+                &revision,
+                &staging,
+            )
+            .is_err()
         );
     }
 

@@ -1163,7 +1163,7 @@ impl GitRepository {
     }
 
     pub fn selected_branch(&self) -> Result<String, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(selected_branch(&self.catalog, self.repository_id)?)
     }
 
@@ -1414,7 +1414,7 @@ impl GitRepository {
     }
 
     pub fn export_graph_source(&self) -> Result<GitGraphSource, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(export_graph_source(&self.catalog, self.repository_id)?)
     }
 
