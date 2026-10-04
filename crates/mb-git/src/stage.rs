@@ -64,6 +64,11 @@ pub(crate) fn guarded_stage_receipt_matches(
         || pin.root_anchor_id.is_nil()
         || pin.attempt_id.is_nil()
         || !matches!(pin.git_mode, 0o100644 | 0o100755)
+        || pin
+            .manifest
+            .guarded_root_file
+            .as_ref()
+            .is_some_and(|backing| backing.root_anchor_id != pin.root_anchor_id)
     {
         return Err(StageError::IncompatibleRecord);
     }
@@ -99,6 +104,72 @@ pub(crate) fn guarded_stage_receipt_matches(
         return Err(StageError::IncompatibleRecord);
     }
     Ok(true)
+}
+
+/// Read the catalog side of the cross-database guarded handoff. A receipt
+/// remains after a newer stage replaces its index entry, so every receipt
+/// must still have its original object mapping and an owner in node control.
+/// Root-backed virtual mappings are always guarded and may not appear without
+/// a receipt even if the node-side pin was lost.
+#[cfg(target_os = "linux")]
+pub(crate) fn guarded_catalog_stage_pins(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<GuardedGitStagePin>, StageError> {
+    if repository_id.is_nil() {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let mut pins = Vec::new();
+    let mut by_anchor = std::collections::HashMap::new();
+    let kind = format!("{GUARDED_STAGE_RECEIPT_PREFIX}{repository_id}");
+    for (key, bytes) in control.records(&kind)? {
+        let receipt: GuardedStageReceipt = decode_canonical(&bytes)?;
+        if receipt.format_version != 1
+            || receipt.repository_id != repository_id
+            || key != receipt.attempt_id.as_bytes()
+            || receipt.manifest.anchor_id != receipt.entry.anchor_id
+            || canonical_bytes(&receipt)? != bytes
+        {
+            return Err(StageError::IncompatibleRecord);
+        }
+        let oid = receipt.entry.oid;
+        let pin = GuardedGitStagePin {
+            repository_id,
+            root_anchor_id: receipt.root_anchor_id,
+            manifest: receipt.manifest,
+            attempt_id: receipt.attempt_id,
+            worktree_id: receipt.worktree_id,
+            relative_path: receipt.relative_path,
+            git_mode: receipt.entry.mode,
+        };
+        if !guarded_stage_receipt_matches(control, &pin)?
+            || by_anchor
+                .insert(pin.manifest.anchor_id, (pin.clone(), oid))
+                .is_some()
+        {
+            return Err(StageError::IncompatibleRecord);
+        }
+        pins.push(pin);
+    }
+    for (kind, key, bytes) in
+        control.records_with_kind_prefix(&object_kind_prefix(repository_id))?
+    {
+        let manifest: FileAnchorManifest = decode_canonical(&bytes)?;
+        if manifest.guarded_root_file.is_some() {
+            let (pin, oid) = by_anchor
+                .get(&manifest.anchor_id)
+                .ok_or(StageError::IncompatibleRecord)?;
+            let oid = Oid::from_bytes(oid).map_err(|_| StageError::IncompatibleRecord)?;
+            if key != manifest.anchor_id.as_bytes()
+                || manifest != pin.manifest
+                || kind != object_kind(repository_id, oid)
+            {
+                return Err(StageError::IncompatibleRecord);
+            }
+        }
+    }
+    pins.sort_by_key(|pin| pin.attempt_id);
+    Ok(pins)
 }
 
 #[cfg(test)]
@@ -760,6 +831,11 @@ pub(crate) fn publish_guarded_stage_for_scope(
         || pin.root_anchor_id.is_nil()
         || pin.attempt_id.is_nil()
         || !matches!(pin.git_mode, 0o100644 | 0o100755)
+        || pin
+            .manifest
+            .guarded_root_file
+            .as_ref()
+            .is_some_and(|backing| backing.root_anchor_id != pin.root_anchor_id)
     {
         return Err(StageError::IncompatibleRecord);
     }
@@ -1317,8 +1393,9 @@ mod tests {
     use git2::Oid;
     use mb_core::canonical_bytes;
     use mb_store::{
-        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, GuardedGitStagePin, PinnedDirectory,
-        SourceBackendKind, SourceFileCapturePlan, StableAnchorAreaLocator,
+        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, GuardedGitStagePin,
+        GuardedRootFileBacking, NativeFileId, PinnedDirectory, SourceBackendKind,
+        SourceFileCapturePlan, StableAnchorAreaLocator,
     };
     use serde::Serialize;
     use uuid::Uuid;
@@ -1402,6 +1479,49 @@ mod tests {
         ));
         assert!(matches!(
             super::publish_guarded_stage_for_scope(&control, scope, &altered),
+            Err(StageError::IncompatibleRecord)
+        ));
+        let catalog = super::guarded_catalog_stage_pins(&control, repository_id).unwrap();
+        assert_eq!(catalog.len(), 3);
+        assert!(catalog.contains(&first));
+        assert!(catalog.contains(&second));
+        assert!(catalog.contains(&linked));
+
+        let mut wrong_root = make_pin(b"wrong-root");
+        wrong_root.manifest.format_version = 2;
+        wrong_root.manifest.guarded_root_file = Some(GuardedRootFileBacking {
+            root_anchor_id: Uuid::new_v4(),
+            captured_relative_path: PathBuf::from("tracked"),
+            native_id: NativeFileId {
+                filesystem_id: wrong_root.manifest.area.filesystem_id,
+                inode: 1,
+            },
+        });
+        assert!(matches!(
+            super::publish_guarded_stage_for_scope(&control, scope, &wrong_root),
+            Err(StageError::IncompatibleRecord)
+        ));
+
+        let mut unreceipted = make_pin(b"virtual").manifest;
+        let oid = crate::blob_oid_from_anchor(&unreceipted).unwrap();
+        unreceipted.format_version = 2;
+        unreceipted.guarded_root_file = Some(GuardedRootFileBacking {
+            root_anchor_id,
+            captured_relative_path: PathBuf::from("tracked"),
+            native_id: NativeFileId {
+                filesystem_id: unreceipted.area.filesystem_id,
+                inode: 1,
+            },
+        });
+        control
+            .put_record(
+                &super::object_kind(repository_id, oid),
+                unreceipted.anchor_id.as_bytes(),
+                &canonical_bytes(&unreceipted).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            super::guarded_catalog_stage_pins(&control, repository_id),
             Err(StageError::IncompatibleRecord)
         ));
     }

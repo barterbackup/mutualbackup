@@ -33,8 +33,8 @@ pub use anchor::{
 };
 #[cfg(target_os = "linux")]
 pub use anchor::{
-    GuardedFileCapturePlan, GuardedRootCapturePlan, RawFileAnchorManifestV2,
-    RawReflinkFileCapturePlanV2, probe_guarded_link_freeze,
+    GuardedFileCapturePlan, GuardedRootCapturePlan, GuardedRootFileBacking,
+    RawFileAnchorManifestV2, RawReflinkFileCapturePlanV2, probe_guarded_link_freeze,
 };
 pub use database::{
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,

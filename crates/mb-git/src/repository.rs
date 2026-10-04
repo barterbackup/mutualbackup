@@ -61,7 +61,9 @@ use crate::stage::{
     staged_entry,
 };
 #[cfg(target_os = "linux")]
-use crate::stage::{guarded_stage_receipt_matches, publish_guarded_stage_for_scope};
+use crate::stage::{
+    guarded_catalog_stage_pins, guarded_stage_receipt_matches, publish_guarded_stage_for_scope,
+};
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
     GitWorktreeError, GitWorktreeInfo, GitWorktreeState, add_worktree, get_worktree,
@@ -935,6 +937,20 @@ impl GitRepository {
             return Err(RepositoryError::Conflict);
         }
         Ok(guarded_stage_receipt_matches(&self.catalog, pin)?)
+    }
+
+    /// Enumerate every durable guarded receipt and reject a root-backed
+    /// virtual object mapping that has no matching receipt. The node compares
+    /// this catalog-side view with its independent control-store pins.
+    #[cfg(target_os = "linux")]
+    pub fn guarded_catalog_stage_pins(&self) -> Result<Vec<GuardedGitStagePin>, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(guarded_catalog_stage_pins(
+            &self.catalog,
+            self.repository_id,
+        )?)
     }
 
     /// Like `git add <path>`, capture a present file or symlink, or stage the

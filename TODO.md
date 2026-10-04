@@ -65,6 +65,11 @@
   its staged bytes. Guarded prune must eventually retire virtual mappings and
   their root pins together, and seed-only recovery must rebind their root
   locators to the recovered anchor before guarded Git protection is enabled.
+  Startup now also enumerates every guarded catalog receipt, checks it against
+  node-owned pins, and rejects a root-backed virtual object map with no
+  receipt; the node probe removes a pin after publication and confirms that
+  reconciliation fails closed. Guarded prune still needs a cross-catalog
+  retirement intent so legitimate pin removal cannot be mistaken for loss.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

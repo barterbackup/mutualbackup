@@ -755,7 +755,10 @@ Proactive background repair comes later.
   add a third hard link: the guarded edit journal must retain its exact
   two-link invariant until it detaches the working inode. Keep the root pinned
   for as long as any such Git mapping needs its bytes, and rebind the mapping
-  only through a verified backend transition after source-loss recovery.
+  only through a verified backend transition after source-loss recovery. On
+  reopen, reconcile guarded stage pins and catalog receipts in both directions;
+  a catalog mapping without its node-owned protection must stop startup rather
+  than let root retirement or stage replay guess its owner.
   A failed conversion-requesting command must leave the captured anchor,
   index, and working file unchanged; an inert repository attribute or config
   setting alone is not a reason to reject raw staging.

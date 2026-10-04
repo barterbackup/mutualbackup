@@ -2721,8 +2721,14 @@ impl Node {
                 .or_default()
                 .push(pin);
         }
-        for (repository_id, pins) in by_repository {
+        for (id, registration) in self.control.records("git-repository")? {
+            let repository_id = Uuid::from_slice(&id)?;
+            let info: GitRepositoryInfo = decode_canonical(&registration)?;
             let root = self.protected_root_by_id(repository_id)?;
+            if root.format_version != 4 {
+                continue;
+            }
+            let pins = by_repository.remove(&repository_id).unwrap_or_default();
             let binding = self.guarded_root_mount_binding(&root)?;
             let backend = self.verified_source_backend_for_root(&root)?;
             if backend.backend != SourceBackendKind::GuardedLinkFreezeV1
@@ -2737,11 +2743,6 @@ impl Node {
             {
                 anyhow::bail!("guarded Git pin differs from its protected root");
             }
-            let registration = self
-                .control
-                .get_record("git-repository", repository_id.as_bytes())?
-                .context("guarded Git pin lost its repository registration")?;
-            let info: GitRepositoryInfo = decode_canonical(&registration)?;
             if info.format_version != 1
                 || info.repository_id != repository_id
                 || info.path != root.path
@@ -2756,6 +2757,18 @@ impl Node {
                 &self.git_catalog_key(repository_id),
                 SourceBackendKind::GuardedLinkFreezeV1,
             )?;
+            let pinned_by_attempt = pins
+                .iter()
+                .map(|pin| (pin.attempt_id, pin))
+                .collect::<BTreeMap<_, _>>();
+            if pinned_by_attempt.len() != pins.len() {
+                anyhow::bail!("duplicate guarded Git attempt pin");
+            }
+            for receipt in repository.guarded_catalog_stage_pins()? {
+                if pinned_by_attempt.get(&receipt.attempt_id).copied() != Some(&receipt) {
+                    anyhow::bail!("guarded Git catalog receipt lost its node-owned pin");
+                }
+            }
             let mut unpublished_paths = BTreeSet::new();
             let mut unpublished = Vec::new();
             for pin in &pins {
@@ -2769,6 +2782,17 @@ impl Node {
             for pin in unpublished {
                 repository.publish_guarded_stage(pin, binding.anchor_id)?;
             }
+            let receipts = repository.guarded_catalog_stage_pins()?;
+            if receipts.len() != pins.len()
+                || receipts.iter().any(|receipt| {
+                    pinned_by_attempt.get(&receipt.attempt_id).copied() != Some(receipt)
+                })
+            {
+                anyhow::bail!("guarded Git pins and catalog receipts do not match");
+            }
+        }
+        if !by_repository.is_empty() {
+            anyhow::bail!("guarded Git pin lost its repository registration");
         }
         Ok(())
     }
@@ -27236,8 +27260,15 @@ pub(crate) mod tests {
             .read_to_end(&mut anchored)
             .unwrap();
         assert_eq!(anchored, original);
+        reopened
+            .control
+            .delete_record("guarded-git-anchor-pin-v1", manifest.anchor_id.as_bytes())
+            .unwrap();
+        assert!(reopened.reconcile_guarded_git_stages().is_err());
         drop(repository);
         reopened.guarded_mounts.pop().unwrap().stop().unwrap();
+        drop(reopened);
+        assert!(Node::open(&data_dir, seed).is_err());
     }
 
     #[cfg(target_os = "linux")]
