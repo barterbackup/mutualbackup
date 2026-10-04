@@ -54,6 +54,53 @@ const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
 #[cfg(target_os = "linux")]
 const GUARDED_STAGE_RECEIPT_PREFIX: &str = "git-guarded-stage-receipt-v1/";
 
+#[cfg(target_os = "linux")]
+pub(crate) fn guarded_stage_receipt_matches(
+    control: &ControlStore,
+    pin: &GuardedGitStagePin,
+) -> Result<bool, StageError> {
+    if pin.repository_id.is_nil()
+        || pin.worktree_id.is_nil()
+        || pin.root_anchor_id.is_nil()
+        || pin.attempt_id.is_nil()
+        || !matches!(pin.git_mode, 0o100644 | 0o100755)
+    {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let path = PathBuf::from(OsString::from_vec(pin.relative_path.clone()));
+    if stage_path_key(&path)? != pin.relative_path {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let kind = format!("{GUARDED_STAGE_RECEIPT_PREFIX}{}", pin.repository_id);
+    let Some(bytes) = control.get_record(&kind, pin.attempt_id.as_bytes())? else {
+        return Ok(false);
+    };
+    let receipt: GuardedStageReceipt = decode_canonical(&bytes)?;
+    if receipt.format_version != 1
+        || receipt.repository_id != pin.repository_id
+        || receipt.worktree_id != pin.worktree_id
+        || receipt.root_anchor_id != pin.root_anchor_id
+        || receipt.attempt_id != pin.attempt_id
+        || receipt.relative_path != pin.relative_path
+        || receipt.manifest != pin.manifest
+        || receipt.entry.format_version != 1
+        || receipt.entry.mode != pin.git_mode
+        || receipt.entry.anchor_id != pin.manifest.anchor_id
+        || canonical_bytes(&receipt)? != bytes
+    {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let oid = Oid::from_bytes(&receipt.entry.oid).map_err(|_| StageError::IncompatibleRecord)?;
+    let mapped = control.get_record(
+        &object_kind(pin.repository_id, oid),
+        pin.manifest.anchor_id.as_bytes(),
+    )?;
+    if mapped.as_deref() != Some(canonical_bytes(&pin.manifest)?.as_slice()) {
+        return Err(StageError::IncompatibleRecord);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 thread_local! {
     static AFTER_MISSING_STAGE_DISCARD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -1310,7 +1357,9 @@ mod tests {
         };
         let first = make_pin(b"alpha");
         let control = ControlStore::open_with_key(&catalog_path, &[31; 32]).unwrap();
+        assert!(!super::guarded_stage_receipt_matches(&control, &first).unwrap());
         let first_entry = super::publish_guarded_stage_for_scope(&control, scope, &first).unwrap();
+        assert!(super::guarded_stage_receipt_matches(&control, &first).unwrap());
         assert_eq!(
             staged_entry_for_scope(&control, scope, "tracked").unwrap(),
             Some(first_entry.clone())
@@ -1347,6 +1396,10 @@ mod tests {
         );
         let mut altered = first.clone();
         altered.git_mode = 0o100755;
+        assert!(matches!(
+            super::guarded_stage_receipt_matches(&control, &altered),
+            Err(StageError::IncompatibleRecord)
+        ));
         assert!(matches!(
             super::publish_guarded_stage_for_scope(&control, scope, &altered),
             Err(StageError::IncompatibleRecord)

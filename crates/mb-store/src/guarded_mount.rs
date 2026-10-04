@@ -1786,26 +1786,37 @@ impl GuardedViewMount {
         control: &ControlStore,
     ) -> anyhow::Result<Vec<GuardedGitStagePin>> {
         ensure!(!repository_id.is_nil(), "guarded Git repository ID is nil");
+        Ok(Self::all_git_stage_pins(control)?
+            .into_iter()
+            .filter(|pin| pin.repository_id == repository_id)
+            .collect())
+    }
+
+    /// Discover all node-owned guarded Git anchors before reconciling the
+    /// separate repository catalogs. A malformed or legacy pin fails closed;
+    /// payload verification belongs to catalog publication and object reads.
+    pub fn all_git_stage_pins(control: &ControlStore) -> anyhow::Result<Vec<GuardedGitStagePin>> {
         let mut pins = Vec::new();
+        let mut attempts = BTreeSet::new();
         for (id, _) in control.records(GIT_ANCHOR_PIN_KIND)? {
             let anchor_id = Uuid::from_slice(&id)?;
             let (_, pin) = git_anchor_pin(control, anchor_id)?
                 .context("guarded Git anchor pin vanished during listing")?;
-            if pin.repository_id != repository_id {
-                continue;
-            }
             let (_, root) = git_root_pin(control, pin.root_anchor_id)?
                 .context("guarded Git stage pin lost its root pin")?;
             ensure!(
-                root.repository_id == repository_id,
+                root.repository_id == pin.repository_id,
                 "guarded Git stage pin has another root owner"
             );
             let stage = pin
                 .stage
                 .context("legacy guarded Git pin lacks stage context")?;
-            pin.manifest.open_verified()?;
+            ensure!(
+                attempts.insert((pin.repository_id, stage.attempt_id)),
+                "guarded Git stage attempt has duplicate anchor pins"
+            );
             pins.push(GuardedGitStagePin {
-                repository_id,
+                repository_id: pin.repository_id,
                 root_anchor_id: pin.root_anchor_id,
                 manifest: pin.manifest,
                 attempt_id: stage.attempt_id,

@@ -22,7 +22,7 @@ use crate::checkout::{
     CheckoutError, begin_hard_reset_for_scope, begin_merge_branch, begin_merge_branch_for_scope,
     begin_pull, begin_pull_for_scope, begin_restore_both_for_scope, begin_restore_for_scope,
     begin_switch, begin_switch_for_scope, continue_merge, continue_merge_for_scope,
-    resume_pending_checkout, resume_pending_checkout_for_scope,
+    has_pending_checkout_for_scope, resume_pending_checkout, resume_pending_checkout_for_scope,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
 use crate::fetch::{FetchError, fetch_bare, import_pushed_branch, import_pushed_tag};
@@ -43,25 +43,25 @@ use crate::interop::{
 };
 use crate::merge::{
     MergeBlobError, has_merge_session, has_merge_session_for_scope,
-    has_merge_session_outside_scope, load_merge_session, load_merge_session_for_scope,
-    mark_merge_resolved, mark_merge_resolved_for_scope, primary_merge_blob_source,
-    resume_pending_merge_blob, resume_pending_merge_blob_for_scope, session_key, session_kind,
-    session_kind_for_scope,
+    has_merge_session_outside_scope, has_pending_merge_blob_for_scope, load_merge_session,
+    load_merge_session_for_scope, mark_merge_resolved, mark_merge_resolved_for_scope,
+    primary_merge_blob_source, resume_pending_merge_blob, resume_pending_merge_blob_for_scope,
+    session_key, session_kind, session_kind_for_scope,
 };
 use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, has_pending_prune, prune_unreachable,
     resume_pending_prune,
 };
 use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
-#[cfg(target_os = "linux")]
-use crate::stage::publish_guarded_stage_for_scope;
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
-    anchors_for_oid, remove_cached, remove_cached_for_scope,
+    anchors_for_oid, has_pending_stages_for_scope, remove_cached, remove_cached_for_scope,
     remove_cached_for_scope_with_resolution, resume_pending_stages_for_scope_with_backend,
     stage_file_for_scope_with_backend, stage_path_key, stage_symlink_for_scope_with_backend,
     staged_entry,
 };
+#[cfg(target_os = "linux")]
+use crate::stage::{guarded_stage_receipt_matches, publish_guarded_stage_for_scope};
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
     GitWorktreeError, GitWorktreeInfo, GitWorktreeState, add_worktree, get_worktree,
@@ -151,16 +151,38 @@ impl GitRepository {
         catalog_key: &[u8; 32],
         source_backend: SourceBackendKind,
     ) -> Result<Self, RepositoryError> {
+        Self::init_with_catalog_root(
+            source_root.as_ref(),
+            source_root.as_ref(),
+            repository_id,
+            catalog_key,
+            source_backend,
+        )
+    }
+
+    /// Keep the encrypted catalog under a native pinned directory while the
+    /// working tree may be a guarded FUSE view of the same lower root.
+    pub fn init_with_catalog_root(
+        source_root: impl AsRef<Path>,
+        catalog_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
+    ) -> Result<Self, RepositoryError> {
         if repository_id.is_nil() {
             return Err(RepositoryError::Conflict);
         }
         let root = source_root.as_ref().canonicalize()?;
-        let root_dir = PinnedDirectory::open(&root)?;
-        let directory = match root_dir.open_child_directory(GIT_CATALOG_DIRECTORY)? {
+        let catalog_root = catalog_root.as_ref().canonicalize()?;
+        if root != catalog_root && source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
+        let catalog_root_dir = PinnedDirectory::open(&catalog_root)?;
+        let directory = match catalog_root_dir.open_child_directory(GIT_CATALOG_DIRECTORY)? {
             Some(existing) => existing,
             None => {
-                let created = root_dir.create_child_directory(GIT_CATALOG_DIRECTORY)?;
-                root_dir.sync_all()?;
+                let created = catalog_root_dir.create_child_directory(GIT_CATALOG_DIRECTORY)?;
+                catalog_root_dir.sync_all()?;
                 created
             }
         };
@@ -212,7 +234,7 @@ impl GitRepository {
             repository_id,
             source_backend,
         };
-        repository.resume_checkout()?;
+        repository.resume_for_backend_on_open()?;
         repository.resume_prune_for_backend()?;
         Ok(repository)
     }
@@ -237,7 +259,25 @@ impl GitRepository {
         source_backend: SourceBackendKind,
     ) -> Result<Self, RepositoryError> {
         Self::open_with_backend_policy(
+            source_root.as_ref(),
+            source_root.as_ref(),
+            repository_id,
+            catalog_key,
+            source_backend,
+            None,
+        )
+    }
+
+    pub fn open_with_catalog_root(
+        source_root: impl AsRef<Path>,
+        catalog_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_with_backend_policy(
             source_root,
+            catalog_root,
             repository_id,
             catalog_key,
             source_backend,
@@ -256,7 +296,8 @@ impl GitRepository {
         force: bool,
     ) -> Result<Self, RepositoryError> {
         Self::open_with_backend_policy(
-            source_root,
+            source_root.as_ref(),
+            source_root.as_ref(),
             repository_id,
             catalog_key,
             source_backend,
@@ -266,6 +307,7 @@ impl GitRepository {
 
     fn open_with_backend_policy(
         source_root: impl AsRef<Path>,
+        catalog_root: impl AsRef<Path>,
         repository_id: Uuid,
         catalog_key: &[u8; 32],
         source_backend: SourceBackendKind,
@@ -275,8 +317,12 @@ impl GitRepository {
             return Err(RepositoryError::Conflict);
         }
         let root = source_root.as_ref().canonicalize()?;
-        let root_dir = PinnedDirectory::open(&root)?;
-        let directory = root_dir
+        let catalog_root = catalog_root.as_ref().canonicalize()?;
+        if root != catalog_root && source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
+        let catalog_root_dir = PinnedDirectory::open(&catalog_root)?;
+        let directory = catalog_root_dir
             .open_child_directory(GIT_CATALOG_DIRECTORY)?
             .ok_or(RepositoryError::NotInitialized)?;
         Self::open_from_pinned_with_policy(
@@ -335,7 +381,7 @@ impl GitRepository {
         {
             repository.resume_primary_worktree()?;
         } else {
-            repository.resume_checkout()?;
+            repository.resume_for_backend_on_open()?;
         }
         repository.resume_prune_for_backend()?;
         Ok(repository)
@@ -355,6 +401,24 @@ impl GitRepository {
             return Ok(());
         }
         resume_pending_prune(&self.catalog, self.repository_id)?;
+        Ok(())
+    }
+
+    fn resume_for_backend_on_open(&self) -> Result<(), RepositoryError> {
+        if self.source_backend == SourceBackendKind::GuardedLinkFreezeV1 {
+            return self.require_guarded_stage_ready();
+        }
+        self.resume_checkout()
+    }
+
+    fn require_guarded_stage_ready(&self) -> Result<(), RepositoryError> {
+        let scope = crate::GitWorktreeScope::primary(self.repository_id);
+        if has_pending_checkout_for_scope(&self.catalog, scope)?
+            || has_pending_merge_blob_for_scope(&self.catalog, scope)?
+            || has_pending_stages_for_scope(&self.catalog, scope)?
+        {
+            return Err(RepositoryError::Conflict);
+        }
         Ok(())
     }
 
@@ -848,7 +912,7 @@ impl GitRepository {
             return Err(RepositoryError::Conflict);
         }
         let scope = if pin.worktree_id == self.repository_id {
-            self.resume_checkout()?;
+            self.require_guarded_stage_ready()?;
             crate::GitWorktreeScope::primary(self.repository_id)
         } else {
             self.resume_linked_worktree(pin.worktree_id)?
@@ -856,6 +920,21 @@ impl GitRepository {
                 .ok_or(RepositoryError::Conflict)?
         };
         Ok(publish_guarded_stage_for_scope(&self.catalog, scope, pin)?)
+    }
+
+    /// Check a published receipt and its object mapping without rereading a
+    /// potentially large historical payload on every node startup.
+    #[cfg(target_os = "linux")]
+    pub fn guarded_stage_receipt_matches(
+        &self,
+        pin: &GuardedGitStagePin,
+    ) -> Result<bool, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1
+            || pin.repository_id != self.repository_id
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(guarded_stage_receipt_matches(&self.catalog, pin)?)
     }
 
     /// Like `git add <path>`, capture a present file or symlink, or stage the
@@ -973,7 +1052,7 @@ impl GitRepository {
         &self,
         relative_path: impl AsRef<Path>,
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(staged_entry(
             &self.catalog,
             self.repository_id,

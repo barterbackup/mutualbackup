@@ -731,7 +731,10 @@ Proactive background repair comes later.
   file scans and protect its reachable graph through encrypted revision metadata
   instead of recursively capturing itself. Reject initialization if that
   protection backend is unavailable; adding a worktree does not silently enroll
-  its uncommitted edits.
+  its uncommitted edits. For a guarded FUSE worktree, pin the marked catalog in
+  its verified private lower root and hide it from the editable view; the FUSE
+  mount does not provide the remount-stable filesystem identity required by
+  native catalog and anchor operations.
 - Stage a regular file by first creating and durably recording an immutable same-
   filesystem reflink of the user's bytes. Hash that captured file through the
   Git library, record its blob ID, source locator, and index entry atomically

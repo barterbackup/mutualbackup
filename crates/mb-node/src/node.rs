@@ -1495,6 +1495,8 @@ impl Node {
         node.reconcile_guarded_in_place_enrollments()?;
         #[cfg(target_os = "linux")]
         node.reconcile_guarded_enrollments()?;
+        #[cfg(target_os = "linux")]
+        node.reconcile_guarded_git_stages()?;
         node.reconcile_garbage_collection()?;
         Ok(node)
     }
@@ -2708,6 +2710,67 @@ impl Node {
 
     fn git_catalog_key(&self, repository_id: Uuid) -> [u8; 32] {
         mb_git::catalog_key(&self.keys, repository_id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_guarded_git_stages(&self) -> Result<()> {
+        let mut by_repository = BTreeMap::<Uuid, Vec<mb_store::GuardedGitStagePin>>::new();
+        for pin in GuardedViewMount::all_git_stage_pins(&self.control)? {
+            by_repository
+                .entry(pin.repository_id)
+                .or_default()
+                .push(pin);
+        }
+        for (repository_id, pins) in by_repository {
+            let root = self.protected_root_by_id(repository_id)?;
+            let binding = self.guarded_root_mount_binding(&root)?;
+            let backend = self.verified_source_backend_for_root(&root)?;
+            if backend.backend != SourceBackendKind::GuardedLinkFreezeV1
+                || !backend.is_supported_guarded_for(
+                    repository_id,
+                    root.filesystem_id,
+                    root.root_inode,
+                )
+                || pins
+                    .iter()
+                    .any(|pin| pin.root_anchor_id != binding.anchor_id)
+            {
+                anyhow::bail!("guarded Git pin differs from its protected root");
+            }
+            let registration = self
+                .control
+                .get_record("git-repository", repository_id.as_bytes())?
+                .context("guarded Git pin lost its repository registration")?;
+            let info: GitRepositoryInfo = decode_canonical(&registration)?;
+            if info.format_version != 1
+                || info.repository_id != repository_id
+                || info.path != root.path
+                || canonical_bytes(&info)? != registration
+            {
+                anyhow::bail!("guarded Git repository registration is invalid");
+            }
+            let repository = GitRepository::open_with_catalog_root(
+                &root.path,
+                &binding.lower_root,
+                repository_id,
+                &self.git_catalog_key(repository_id),
+                SourceBackendKind::GuardedLinkFreezeV1,
+            )?;
+            let mut unpublished_paths = BTreeSet::new();
+            let mut unpublished = Vec::new();
+            for pin in &pins {
+                if !repository.guarded_stage_receipt_matches(pin)? {
+                    if !unpublished_paths.insert((pin.worktree_id, pin.relative_path.clone())) {
+                        anyhow::bail!("multiple unpublished guarded Git stages own one path");
+                    }
+                    unpublished.push(pin);
+                }
+            }
+            for pin in unpublished {
+                repository.publish_guarded_stage(pin, binding.anchor_id)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn git_init(&mut self, source_root: &Path) -> Result<GitRepositoryInfo> {
@@ -27007,6 +27070,123 @@ pub(crate) mod tests {
             mount.stop().unwrap();
         }
         drop(node);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_git_pin_replays_into_catalog_after_node_reopen() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let area = tempfile::Builder::new()
+            .prefix("mb-node-guarded-git-")
+            .tempdir_in(test_root)
+            .unwrap();
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let view = area.path().join("view");
+        let data_dir = area.path().join("node");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&view).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = b"guarded Git\r\n\0exact";
+        fs::write(lower.join("sample"), original).unwrap();
+        fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let seed = Seed::from_bytes([119; 32]);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let root = node
+            .enroll_test_guarded_root(&lower, &view, 65534, 65534)
+            .unwrap();
+        let binding = node.guarded_root_mount_binding(&root).unwrap();
+        let repository_id = root.root_id;
+        let key = node.git_catalog_key(repository_id);
+        let repository = GitRepository::init_with_catalog_root(
+            &view,
+            &binding.lower_root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        assert!(binding.lower_root.join(".mutualbackup").is_dir());
+        assert!(fs::symlink_metadata(view.join(".mutualbackup")).is_err());
+        drop(repository);
+        let registration = GitRepositoryInfo {
+            format_version: 1,
+            repository_id,
+            path: view.clone(),
+        };
+        node.control
+            .put_record(
+                "git-repository",
+                repository_id.as_bytes(),
+                &canonical_bytes(&registration).unwrap(),
+            )
+            .unwrap();
+        let detach = std::process::Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-c")
+            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'g',0); os.fsync(fd); os.close(fd)")
+            .arg(view.join("sample"))
+            .output()
+            .unwrap();
+        assert!(detach.status.success(), "{detach:?}");
+        assert_eq!(fs::read(view.join("sample")).unwrap(), original);
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
+        let control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
+                .unwrap(),
+        ));
+        let attempt_id = Uuid::new_v4();
+        GuardedViewMount::prepare_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+            "sample",
+        )
+        .unwrap();
+        let manifest = GuardedViewMount::finish_stopped_file_capture(
+            binding.anchor_id,
+            attempt_id,
+            Arc::clone(&control),
+        )
+        .unwrap();
+        GuardedViewMount::transfer_stopped_file_capture_to_git(
+            attempt_id,
+            repository_id,
+            repository_id,
+            &control.lock().unwrap(),
+        )
+        .unwrap();
+        drop(control);
+        drop(node);
+
+        let mut reopened = Node::open(&data_dir, seed.clone()).unwrap();
+        reopened.reconcile_guarded_git_stages().unwrap();
+        let repository = GitRepository::open_with_catalog_root(
+            &view,
+            &binding.lower_root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        let staged = repository.staged_entry("sample").unwrap().unwrap();
+        assert_eq!(staged.anchor_id, manifest.anchor_id);
+        assert!(fs::symlink_metadata(view.join(".mutualbackup")).is_err());
+        assert_eq!(
+            staged.oid.as_slice(),
+            mb_git::blob_oid_from_anchor(&manifest).unwrap().as_bytes()
+        );
+        drop(repository);
+        reopened.guarded_mounts.pop().unwrap().stop().unwrap();
     }
 
     #[cfg(target_os = "linux")]

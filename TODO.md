@@ -49,9 +49,15 @@
   untouched. Its normal catalog tests cover reopen, retry, and wrong backend
   or root. Guarded repository prune is fenced, including a pending prune intent
   on reopen, because that catalog cannot yet see node-owned pins. The node
-  still does not call the publication primitive; cross-catalog pin
-  reconciliation and guarded-aware prune must precede enabling Git operations.
-  Guarded checkout and cross-catalog prune remain open.
+  now verifies guarded root, backend, and repository registration at startup,
+  checks exact catalog receipts, rejects two unpublished stages for one path,
+  and publishes missing receipts. The catalog is pinned in the private lower
+  root and hidden from the FUSE worktree, whose mount lacks a stable native
+  filesystem ID. A privileged ext4 and disposable local Btrfs node probe covers
+  stopped-view capture, pin transfer, crash/reopen replay, raw blob ID, and
+  idempotent reconciliation. Production guarded Git enrollment and stage are
+  still gated on the live edit guard; guarded checkout, signed graph protection,
+  and cross-catalog prune remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
