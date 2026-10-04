@@ -16,7 +16,9 @@ use fuser::{BackgroundSession, Config, MountOption, SessionACL};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::guarded_view_probe::{GuardedProbeView, GuardedViewEntryKind, GuardedViewMetadataV1};
+use crate::guarded_view_probe::{
+    GuardedProbeView, GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
+};
 use crate::{
     CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedRootCapturePlan,
     NativeFileId, PinnedDirectory, StableAnchorFileLocator, StableAnchorManifest,
@@ -91,6 +93,7 @@ type StoppedCaptureRecord = (Vec<u8>, Vec<u8>, StoppedCaptureIntent);
 
 impl StoppedCaptureIntent {
     fn validate(&self, record_id: &[u8]) -> anyhow::Result<()> {
+        self.metadata.validate_shape()?;
         ensure!(
             self.format_version == 1
                 && !self.attempt_id.is_nil()
@@ -104,6 +107,75 @@ impl StoppedCaptureIntent {
                     .is_none_or(|capture| capture.metadata == self.metadata),
             "guarded stopped-capture intent differs from its metadata"
         );
+        Ok(())
+    }
+}
+
+impl GuardedViewMetadataV1 {
+    /// Validate the raw-byte namespace before it is retained by a local
+    /// attempt or embedded in encrypted revision metadata. A restored view
+    /// must never infer missing parents or normalize a path while decoding.
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.format_version == 1
+                && !self.anchor_id.is_nil()
+                && self.lower_root_id.filesystem_id != 0
+                && self.lower_root_id.inode != 0
+                && self.root_atime_nanos < 1_000_000_000
+                && self.root_modified_nanos < 1_000_000_000,
+            "invalid guarded view root metadata"
+        );
+        let mut previous = None::<&[u8]>;
+        let mut directories = std::collections::BTreeSet::<&[u8]>::new();
+        let mut identities = BTreeMap::<NativeFileId, &GuardedViewMetadataEntry>::new();
+        for entry in &self.entries {
+            let path = PathBuf::from(OsString::from_vec(entry.path.clone()));
+            let mut normalized = PathBuf::new();
+            for component in path.components() {
+                let Component::Normal(name) = component else {
+                    anyhow::bail!("guarded view has an unsafe path")
+                };
+                normalized.push(name);
+            }
+            ensure!(
+                !entry.path.is_empty()
+                    && !entry.path.contains(&0)
+                    && normalized.as_os_str().as_bytes() == entry.path
+                    && previous.is_none_or(|prior| prior < entry.path.as_slice()),
+                "guarded view has an unsafe or unordered path"
+            );
+            ensure!(
+                entry.native_id.filesystem_id == self.lower_root_id.filesystem_id
+                    && entry.native_id.inode != 0
+                    && entry.native_id != self.lower_root_id
+                    && entry.atime_nanos < 1_000_000_000
+                    && entry.modified_nanos < 1_000_000_000,
+                "invalid guarded view entry metadata"
+            );
+            if let Some(first) = identities.insert(entry.native_id, entry) {
+                ensure!(
+                    entry.kind == GuardedViewEntryKind::File
+                        && first.kind == entry.kind
+                        && first.mode == entry.mode
+                        && first.uid == entry.uid
+                        && first.gid == entry.gid
+                        && first.logical_len == entry.logical_len
+                        && first.modified_secs == entry.modified_secs
+                        && first.modified_nanos == entry.modified_nanos,
+                    "guarded view inode aliases disagree"
+                );
+            }
+            if let Some(slash) = entry.path.iter().rposition(|byte| *byte == b'/') {
+                ensure!(
+                    directories.contains(&entry.path[..slash]),
+                    "guarded view entry has no recorded parent directory"
+                );
+            }
+            if entry.kind == GuardedViewEntryKind::Directory {
+                directories.insert(&entry.path);
+            }
+            previous = Some(&entry.path);
+        }
         Ok(())
     }
 }
@@ -159,32 +231,12 @@ impl GuardedStoppedCaptureV1 {
     /// This proves each locator still supplies the exact captured bytes and
     /// sparse layout, without depending on the mutable lower worktree.
     pub fn verify(&self) -> anyhow::Result<()> {
+        self.metadata.validate_shape()?;
         ensure!(
             self.format_version == 1
-                && self.metadata.format_version == 1
-                && !self.metadata.anchor_id.is_nil()
                 && mb_core::canonical_bytes(self)?.len() <= mb_core::V1_MAX_CATALOG_BYTES,
             "invalid guarded stopped-capture version or size"
         );
-        let mut previous = None::<&[u8]>;
-        for entry in &self.metadata.entries {
-            let path = PathBuf::from(OsString::from_vec(entry.path.clone()));
-            let mut normalized = PathBuf::new();
-            for component in path.components() {
-                let Component::Normal(name) = component else {
-                    anyhow::bail!("guarded stopped capture has an unsafe path")
-                };
-                normalized.push(name);
-            }
-            ensure!(
-                !entry.path.is_empty()
-                    && !entry.path.contains(&0)
-                    && normalized.as_os_str().as_bytes() == entry.path
-                    && previous.is_none_or(|prior| prior < entry.path.as_slice()),
-                "guarded stopped capture has an unsafe or unordered path"
-            );
-            previous = Some(&entry.path);
-        }
         let file_entries: Vec<_> = self
             .metadata
             .entries
@@ -588,7 +640,9 @@ impl GuardedViewMount {
         control: Arc<Mutex<ControlStore>>,
     ) -> anyhow::Result<GuardedViewMetadataV1> {
         Self::with_stopped_view(anchor_id, control, |view, _, _| {
-            view.verified_metadata_snapshot(anchor_id)
+            let metadata = view.verified_metadata_snapshot(anchor_id)?;
+            metadata.validate_shape()?;
+            Ok(metadata)
         })
     }
 
@@ -656,6 +710,7 @@ impl GuardedViewMount {
         let control_for_prepare = Arc::clone(&control);
         Self::with_stopped_view(anchor_id, control, |view, _, _| {
             let metadata = view.verified_metadata_snapshot(anchor_id)?;
+            metadata.validate_shape()?;
             let store = control_for_prepare
                 .lock()
                 .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
@@ -925,6 +980,7 @@ impl GuardedViewMount {
             metadata: before,
             files,
         };
+        capture.metadata.validate_shape()?;
         ensure!(
             mb_core::canonical_bytes(&capture)?.len() <= mb_core::V1_MAX_CATALOG_BYTES,
             "guarded stopped capture exceeds its catalog bound"
@@ -1177,6 +1233,74 @@ mod tests {
         let path = decode_mountinfo_path("/one\\040two/odd\\377").unwrap();
         assert_eq!(path.as_os_str().as_bytes(), b"/one two/odd\xff");
         assert!(decode_mountinfo_path("/broken\\08").is_err());
+    }
+
+    #[test]
+    fn guarded_view_metadata_requires_a_complete_raw_byte_namespace() {
+        use crate::{
+            GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1, NativeFileId,
+        };
+
+        let root_id = NativeFileId {
+            filesystem_id: 23,
+            inode: 10,
+        };
+        let entry = |path: &[u8], kind, inode| GuardedViewMetadataEntry {
+            path: path.to_vec(),
+            kind,
+            native_id: NativeFileId {
+                filesystem_id: root_id.filesystem_id,
+                inode,
+            },
+            mode: 0o700,
+            uid: 1000,
+            gid: 1000,
+            logical_len: 0,
+            atime_secs: 1,
+            atime_nanos: 2,
+            modified_secs: 3,
+            modified_nanos: 4,
+        };
+        let valid = GuardedViewMetadataV1 {
+            format_version: 1,
+            anchor_id: uuid::Uuid::new_v4(),
+            lower_root_id: root_id,
+            root_mode: 0o700,
+            root_uid: 1000,
+            root_gid: 1000,
+            root_atime_secs: 1,
+            root_atime_nanos: 2,
+            root_modified_secs: 3,
+            root_modified_nanos: 4,
+            entries: vec![
+                entry(b"nested", GuardedViewEntryKind::Directory, 11),
+                entry(b"nested/\xff", GuardedViewEntryKind::File, 12),
+            ],
+        };
+        valid.validate_shape().unwrap();
+
+        let mut invalid = valid.clone();
+        invalid.entries.remove(0);
+        assert!(invalid.validate_shape().is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[1].path = b"nested/../escape".to_vec();
+        assert!(invalid.validate_shape().is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[1].native_id.filesystem_id += 1;
+        assert!(invalid.validate_shape().is_err());
+        let mut invalid = valid.clone();
+        invalid.entries[1].atime_nanos = 1_000_000_000;
+        assert!(invalid.validate_shape().is_err());
+        let mut invalid = valid.clone();
+        invalid.entries.push(invalid.entries[1].clone());
+        assert!(invalid.validate_shape().is_err());
+        let mut aliases = valid.clone();
+        let mut alias = aliases.entries[1].clone();
+        alias.path = b"nested/\xfe".to_vec();
+        aliases.entries.insert(1, alias);
+        aliases.validate_shape().unwrap();
+        aliases.entries[1].mode = 0o600;
+        assert!(aliases.validate_shape().is_err());
     }
 
     #[test]

@@ -778,6 +778,13 @@
   and a fresh disposable Btrfs image. Node revision creation still needs to
   own this attempt ID, transfer its pins into signed-revision retention, and
   release the local intent only after that transfer commits.
+  The stopped-view metadata now validates raw paths, complete parent
+  directories, source filesystem identity, timestamp bounds, and hard-link
+  alias consistency before an attempt is retained or published. A normal
+  unit test covers malformed metadata and a non-UTF-8 filename; the privileged
+  stopped-capture probe passes with that validation. The signed private
+  revision format still needs to carry these raw paths, ownership, modes,
+  atimes, and file anchors losslessly, then restore them from a seed.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
