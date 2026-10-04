@@ -2,6 +2,23 @@
 
 ## Milestone 6 active implementation gates
 
+- [ ] **M6 finish the versioned source-backend boundary across platforms.**
+  The Linux reflink and guarded backends have versioned capture records, but
+  milestone closure still requires the planned Windows NTFS/VSS and macOS clone
+  backends, portable metadata and watcher behavior, application-consistent
+  capture hooks, and each platform's local capture/edit/restore, source-loss
+  recovery, and raw Git add/checkout/interoperability gates. Do not treat the
+  passing Linux Git or guarded probes as evidence for those platforms. Keep
+  signed peer formats independent of backend choice and reject an unsupported
+  capture rather than making an unannounced full copy.
+- [ ] **M6 integrate guarded Git anchors and worktrees.** The guarded FUSE view
+  can recapture a stopped file and detach it on edit, but `SourceBackendKind`
+  still rejects guarded Git stage/checkout and the node rejects operations on
+  a guarded protected root. Bind each Git index/object pin to its guarded
+  per-inode capture with a replayable handoff, and prove prune/root release
+  cannot retire that anchor while Git retains it. Publish checkout files only
+  through a guarded editable view, with byte-exact, no-copy and crash/reopen
+  probes on ext4 and Btrfs. Keep the current guard until those proofs pass.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
@@ -261,6 +278,11 @@
   41, committed, and seed recovery passed. The local image, mount, daemons,
   namespaces, and firewall chains were cleaned up. This run adds successful
   retry evidence but still does not explain the historical 5,400-second stall.
+  Startup now excludes the local peer ID from a generic bootstrap list before
+  installing addresses or scheduling initial/retry dials. A focused test keeps
+  a remote bootstrap peer while proving the own endpoint creates no policy
+  dial. This removes one observed class of useless dial attempts, but it does
+  not explain the missing remote signer or close this reliability gate.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

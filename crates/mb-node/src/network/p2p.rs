@@ -1426,16 +1426,23 @@ pub fn build_p2p_with_tor(
         swarm.add_external_address(address.clone());
     }
     let mut persistent_addresses = HashMap::<PeerId, BTreeSet<Multiaddr>>::new();
-    let bootstrap_addresses = config.bootstrap_addresses.clone();
+    let mut bootstrap_addresses = Vec::new();
     let mut bootstrap_peers = BTreeSet::new();
-    for address in &bootstrap_addresses {
+    for address in &config.bootstrap_addresses {
         let peer = terminal_peer_id(address)?;
         let normalized = normalize_known_address(peer, address.clone())?;
+        // A restored node can receive its own endpoint in a generic bootstrap
+        // list. Retaining it would make initial and periodic policy dials try
+        // the local peer ID, without helping DHT discovery.
+        if peer == *swarm.local_peer_id() {
+            continue;
+        }
         persistent_addresses
             .entry(peer)
             .or_default()
             .insert(normalized);
         bootstrap_peers.insert(peer);
+        bootstrap_addresses.push(address.clone());
     }
     let mut relay_reservations = Vec::new();
     let mut relay_listeners = HashMap::new();
@@ -21031,6 +21038,46 @@ mod tests {
                 .is_err()
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn own_bootstrap_endpoint_is_not_dialed_or_retained() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([213; 32]);
+        let local = KeyMaterial::from_seed(&seed).node_id();
+        let local_peer = local.libp2p_peer_id().unwrap();
+        let remote_peer = KeyMaterial::from_seed(&Seed::from_bytes([214; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let own_address: Multiaddr = format!("/ip4/127.0.0.1/udp/44000/quic-v1/p2p/{local_peer}")
+            .parse()
+            .unwrap();
+        let remote_address: Multiaddr =
+            format!("/ip4/127.0.0.1/udp/44001/quic-v1/p2p/{remote_peer}")
+                .parse()
+                .unwrap();
+        let mut settings = config(local);
+        settings.bootstrap_addresses = vec![own_address, remote_address.clone()];
+        let node = Node::open(temp.path(), seed).unwrap();
+        let (_client, mut event_loop) = build_p2p(Arc::new(Mutex::new(node)), settings).unwrap();
+
+        assert_eq!(event_loop.bootstrap_addresses, vec![remote_address]);
+        assert!(!event_loop.persistent_addresses.contains_key(&local_peer));
+        assert!(event_loop.persistent_addresses.contains_key(&remote_peer));
+        assert!(
+            event_loop
+                .policy_dials
+                .values()
+                .all(|dial| dial.peer != local_peer)
+        );
+        event_loop.retry_bootstrap();
+        assert!(
+            event_loop
+                .policy_dials
+                .values()
+                .all(|dial| dial.peer != local_peer)
+        );
     }
 
     #[tokio::test]
