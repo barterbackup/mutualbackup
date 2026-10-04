@@ -1459,6 +1459,41 @@ impl GuardedRootCapturePlan {
         Ok(manifest)
     }
 
+    /// Recover the root plan from its durable claim or retirement marker.
+    /// The latter remains after the sealed catalog is unlinked during GC.
+    pub(crate) fn load_for_retirement(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(bytes) = control.get_record(PLAN_KIND, anchor_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let plan: Self = mb_core::decode_canonical(&bytes)?;
+        plan.validate()?;
+        anyhow::ensure!(
+            plan.anchor_id == anchor_id && mb_core::canonical_bytes(&plan)? == bytes,
+            "guarded retirement root plan changed"
+        );
+        if let Some(retired) = control.get_record(RETIRE_KIND, anchor_id.as_bytes())? {
+            anyhow::ensure!(
+                mb_core::decode_canonical::<RootRetirement>(&retired)?
+                    == RootRetirement {
+                        format_version: 1,
+                        anchor_id,
+                        plan_hash: *blake3::hash(&bytes).as_bytes(),
+                    },
+                "guarded root retirement belongs to another plan"
+            );
+        } else {
+            let manifest = Self::load_published_manifest(control, anchor_id)?;
+            anyhow::ensure!(
+                Self::load_for_manifest(control, &manifest)?.as_ref() == Some(&plan),
+                "guarded retirement root lost its published claim"
+            );
+        }
+        Ok(Some(plan))
+    }
+
     /// Decode a pending guarded plan without requiring its source volume to
     /// be online. Capture itself performs the descriptor and journal checks.
     pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {

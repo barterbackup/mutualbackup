@@ -641,12 +641,41 @@ fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
             let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, &record_id)?;
         }
     }
+    #[cfg(target_os = "linux")]
+    GuardedViewMount::reconcile_revision_capture_retirements(control)?;
     Ok(())
 }
 
-pub(crate) fn retire_revision_anchor(control: &mut ControlStore, revision_id: Uuid) -> Result<()> {
+/// Return false while an unreachable guarded revision still has a signed
+/// record or a local sector recipe. GC retries its anchor candidate after
+/// those sources are released, then transfers cleanup to a durable journal.
+pub(crate) fn retire_revision_anchor(
+    control: &mut ControlStore,
+    revision_id: Uuid,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Some(capture) = GuardedViewMount::load_revision_capture(revision_id, control)? {
+        if control
+            .get_record("user-revision", revision_id.as_bytes())?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let recipe_anchors = git_prune_recipe_anchor_ids(control)?;
+        if recipe_anchors.contains(&capture.capture.metadata.anchor_id)
+            || capture
+                .capture
+                .files
+                .iter()
+                .any(|file| recipe_anchors.contains(&file.locator.anchor_id))
+        {
+            return Ok(false);
+        }
+        GuardedViewMount::retire_revision_capture_unreferenced(revision_id, control)?;
+        return Ok(true);
+    }
     let Some(bytes) = control.get_record("anchor-manifest", revision_id.as_bytes())? else {
-        return Ok(());
+        return Ok(true);
     };
     let manifest: mb_store::StableAnchorManifest = decode_canonical(&bytes)?;
     control.move_protocol_record(
@@ -659,7 +688,7 @@ pub(crate) fn retire_revision_anchor(control: &mut ControlStore, revision_id: Uu
     if remove_revision_anchor(control, &manifest).is_ok() {
         let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, manifest.anchor_id.as_bytes())?;
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn abandon_recovered_anchor_capture(

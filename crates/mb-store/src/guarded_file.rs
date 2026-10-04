@@ -239,6 +239,54 @@ impl GuardedFileCapturePlan {
         Ok(Some(plan))
     }
 
+    /// Recover a file plan for a revision-retirement journal after its
+    /// original source name may have moved. A live claim is checked against
+    /// the sealed manifest; an interrupted retirement uses its plan hash.
+    pub(crate) fn load_for_retirement(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(bytes) = control.get_record(PLAN_KIND, anchor_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let plan: Self = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            mb_core::canonical_bytes(&plan)? == bytes
+                && plan.format_version == 1
+                && plan.anchor_id == anchor_id
+                && !anchor_id.is_nil()
+                && !plan.area.area_id.is_nil()
+                && plan.source_root.is_absolute()
+                && plan.area.path_hint.is_absolute()
+                && plan.area.volume_root_hint.is_absolute()
+                && plan.source_root_id.filesystem_id == plan.area.filesystem_id
+                && plan.source_root_id.inode != 0
+                && plan.source_version.filesystem_id == plan.area.filesystem_id
+                && plan.source_version.inode != 0
+                && plan.source_mode & libc::S_IFMT == libc::S_IFREG
+                && validate_relative(&plan.relative_path).is_ok(),
+            "guarded retirement file plan is invalid"
+        );
+        if let Some(retired) = control.get_record(RETIRE_KIND, anchor_id.as_bytes())? {
+            anyhow::ensure!(
+                mb_core::decode_canonical::<FileRetirement>(&retired)?
+                    == FileRetirement {
+                        format_version: 1,
+                        anchor_id,
+                        plan_hash: *blake3::hash(&bytes).as_bytes(),
+                    },
+                "guarded file retirement belongs to another plan"
+            );
+        } else {
+            let (manifest, _) = plan.published_manifest(control)?;
+            anyhow::ensure!(
+                Self::load_for_manifest(control, &manifest)?.as_ref() == Some(&plan),
+                "guarded file retirement lost its published claim"
+            );
+        }
+        Ok(Some(plan))
+    }
+
     /// Persist plan ownership before creating an anchor directory, then use
     /// the per-file freeze journal to make its payload durable. The manifest
     /// appears only after journal replay proves the anchor's exact bytes.

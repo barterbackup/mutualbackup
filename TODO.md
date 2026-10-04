@@ -817,8 +817,17 @@
   probe signs, retries, restores and releases a captured edit on ext4 and
   disposable Btrfs; a database test proves stale-intent rollback. The normal
   protected-root backend binding still selects reflink, so node backup jobs
-  do not yet invoke guarded signing. Recovered guarded anchors and revision
-  GC still need durable replay and safe release before guarded enrollment.
+  do not yet invoke guarded signing. Recovered guarded anchors still need
+  durable replay and safe release before guarded enrollment.
+  Guarded revision GC now waits for the signed revision and every local-sector
+  recipe to release its anchors, then atomically transfers the local capture
+  map to a durable retirement record. Restart reconciliation retires secondary
+  file guards before the root and leaves the record pending while a claimed
+  view, another revision, or an unavailable source prevents cleanup. The
+  privileged node lifecycle probe exercises this handoff on ext4 and Btrfs.
+  Production protected-root removal must retire the claimed view, and guarded
+  Git pins must join this proof before guarded enrollment or Git operations
+  can select the backend.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

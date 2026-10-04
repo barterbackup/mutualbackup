@@ -11503,13 +11503,13 @@ impl Node {
         live_groups: &BTreeSet<[u8; 32]>,
     ) -> Result<()> {
         for kind in [
-            "gc-anchor",
             "gc-revision",
             "gc-sector",
             "gc-parity",
             "gc-variable-sector",
             "gc-variable-parity",
             "gc-packed-sector",
+            "gc-anchor",
         ] {
             for (record_id, bytes) in self.control.records(kind)? {
                 let candidate: GarbageCandidate = decode_canonical(&bytes)?;
@@ -11556,8 +11556,7 @@ impl Node {
                 }
                 let collected = match kind {
                     "gc-anchor" => {
-                        retire_revision_anchor(&mut self.control, Uuid::from_slice(&record_id)?)?;
-                        true
+                        retire_revision_anchor(&mut self.control, Uuid::from_slice(&record_id)?)?
                     }
                     "gc-revision" => {
                         self.control.delete_record("user-revision", &record_id)?;
@@ -24765,7 +24764,7 @@ pub(crate) mod tests {
         drop(guarded_control);
         drop(recovered);
 
-        let control =
+        let mut control =
             ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap();
         assert!(GuardedViewMount::retire_claim(manifest.anchor_id, &control).is_err());
         let file_plan =
@@ -24773,6 +24772,11 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
         assert!(file_plan.discard_unreferenced(&control).is_err());
+        assert!(!retire_revision_anchor(&mut control, revision_id).unwrap());
+        control
+            .delete_record("user-revision", revision_id.as_bytes())
+            .unwrap();
+        assert!(!retire_revision_anchor(&mut control, revision_id).unwrap());
         for reference in signed
             .value
             .metadata_sectors
@@ -24783,23 +24787,35 @@ pub(crate) mod tests {
                 .delete_record("local-sector", &reference.id)
                 .unwrap();
         }
-        control
-            .delete_record(
-                mb_store::GUARDED_REVISION_CAPTURE_KIND,
-                revision_id.as_bytes(),
-            )
-            .unwrap();
-        control
-            .delete_record("user-revision", revision_id.as_bytes())
-            .unwrap();
+        assert!(retire_revision_anchor(&mut control, revision_id).unwrap());
+        assert!(
+            GuardedViewMount::load_revision_capture(revision_id, &control)
+                .unwrap()
+                .is_none()
+        );
+        assert!(file_plan.discard_unreferenced(&control).is_err());
         control
             .delete_record(
                 "user-revision-head",
                 &crate::snapshot::revision_head_id(guild_id, protected_root_id),
             )
             .unwrap();
+        drop(control);
+        let control =
+            ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap();
         GuardedViewMount::retire_claim(manifest.anchor_id, &control).unwrap();
-        file_plan.discard_unreferenced(&control).unwrap();
-        plan.discard_unreferenced(&control).unwrap();
+        GuardedViewMount::reconcile_revision_capture_retirements(&control).unwrap();
+        assert!(
+            control
+                .get_record("guarded-file-plan-v1", file_plan.anchor_id().as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            control
+                .get_record("guarded-root-plan-v1", plan.anchor_id().as_bytes())
+                .unwrap()
+                .is_none()
+        );
     }
 }

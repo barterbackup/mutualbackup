@@ -2,7 +2,7 @@
 //! root has already been captured. Enrollment still owns the separate,
 //! replayable transition from a user's original directory to this layout.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{self, Read};
@@ -29,6 +29,7 @@ const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
 const MOUNT_RETIRE_KIND: &str = "guarded-view-mount-retired-v1";
 const STOPPED_CAPTURE_KIND: &str = "guarded-view-stopped-capture-v1";
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
+const GUARDED_REVISION_RETIREMENT_KIND: &str = "guarded-view-revision-retirement-v1";
 const STOPPED_CAPTURE_MAX_BYTES: usize = mb_core::V1_MAX_CATALOG_BYTES * 2 + 4096;
 const MOUNT_SUBTYPE: &str = "mutualbackup_guarded";
 // The daemon is the sole writer for a root. Serialize local mount lifecycle
@@ -109,7 +110,7 @@ impl GuardedRevisionCaptureV1 {
                 && mb_core::canonical_bytes(self)?.len() <= STOPPED_CAPTURE_MAX_BYTES,
             "guarded revision capture key changed"
         );
-        self.capture.metadata.validate_shape()
+        self.capture.validate_shape()
     }
 }
 
@@ -291,27 +292,24 @@ pub(crate) fn stopped_capture_intent_pins_anchor(
 }
 
 impl GuardedStoppedCaptureV1 {
-    /// Recheck a persisted local capture before building signed sector data.
-    /// This proves each locator still supplies the exact captured bytes and
-    /// sparse layout, without depending on the mutable lower worktree.
-    pub fn verify(&self) -> anyhow::Result<()> {
+    fn validate_shape(&self) -> anyhow::Result<()> {
         self.metadata.validate_shape()?;
         ensure!(
             self.format_version == 1
                 && mb_core::canonical_bytes(self)?.len() <= mb_core::V1_MAX_CATALOG_BYTES,
             "invalid guarded stopped-capture version or size"
         );
-        let file_entries: Vec<_> = self
+        let files: Vec<_> = self
             .metadata
             .entries
             .iter()
             .filter(|entry| entry.kind == GuardedViewEntryKind::File)
             .collect();
         ensure!(
-            file_entries.len() == self.files.len(),
+            files.len() == self.files.len(),
             "guarded stopped capture lacks a visible file anchor"
         );
-        for (entry, captured) in file_entries.into_iter().zip(&self.files) {
+        for (entry, captured) in files.into_iter().zip(&self.files) {
             ensure!(
                 captured.path == entry.path
                     && captured.native_id == entry.native_id
@@ -320,6 +318,16 @@ impl GuardedStoppedCaptureV1 {
                         == self.metadata.lower_root_id.filesystem_id,
                 "guarded stopped file differs from visible metadata"
             );
+        }
+        Ok(())
+    }
+
+    /// Recheck a persisted local capture before building signed sector data.
+    /// This proves each locator still supplies the exact captured bytes and
+    /// sparse layout, without depending on the mutable lower worktree.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        self.validate_shape()?;
+        for captured in &self.files {
             let mut file = captured.locator.open()?;
             ensure!(
                 file.metadata()?.len() == captured.logical_len,
@@ -390,6 +398,91 @@ impl GuardedViewMount {
         record.validate_record(revision_id.as_bytes())?;
         record.verify()?;
         Ok(Some(record))
+    }
+
+    /// Transfer an unreachable revision's local anchor map to a replayable
+    /// retirement obligation. The node must first prove that the signed
+    /// revision and every local sector recipe using these anchors are gone.
+    pub fn retire_revision_capture_unreferenced(
+        revision_id: Uuid,
+        control: &mut ControlStore,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            control
+                .get_record("user-revision", revision_id.as_bytes())?
+                .is_none(),
+            "signed guarded revision still retains its capture"
+        );
+        if let Some(bytes) =
+            control.get_record(GUARDED_REVISION_CAPTURE_KIND, revision_id.as_bytes())?
+        {
+            Self::load_revision_capture(revision_id, control)?
+                .context("guarded revision lost its local capture")?;
+            ensure!(
+                control
+                    .get_record(GUARDED_REVISION_RETIREMENT_KIND, revision_id.as_bytes())?
+                    .is_none_or(|existing| existing == bytes),
+                "guarded revision retirement conflicts with its capture"
+            );
+            control.move_protocol_record(
+                GUARDED_REVISION_CAPTURE_KIND,
+                revision_id.as_bytes(),
+                &bytes,
+                GUARDED_REVISION_RETIREMENT_KIND,
+                revision_id.as_bytes(),
+            )?;
+        }
+        Self::reconcile_revision_capture_retirements(control)
+    }
+
+    /// Resume physical cleanup after a crash. A still claimed view, another
+    /// revision pin, or an unavailable source volume leaves the obligation
+    /// durable for a later retry.
+    pub fn reconcile_revision_capture_retirements(control: &ControlStore) -> anyhow::Result<()> {
+        for (id, bytes) in control.records(GUARDED_REVISION_RETIREMENT_KIND)? {
+            ensure!(
+                bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                "guarded revision retirement exceeds its local bound"
+            );
+            let record: GuardedRevisionCaptureV1 = mb_core::decode_canonical(&bytes)?;
+            record.validate_record(&id)?;
+            if control.get_record("user-revision", &id)?.is_some() {
+                continue;
+            }
+            let root_id = record.capture.metadata.anchor_id;
+            let mut file_ids = BTreeSet::new();
+            for file in &record.capture.files {
+                if file.locator.anchor_id != root_id {
+                    file_ids.insert(file.locator.anchor_id);
+                }
+            }
+            let mut pending = false;
+            for file_id in file_ids {
+                match crate::GuardedFileCapturePlan::load_for_retirement(control, file_id) {
+                    Ok(Some(plan)) => {
+                        if plan.discard_unreferenced(control).is_err() {
+                            pending = true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => pending = true,
+                }
+            }
+            if pending {
+                continue;
+            }
+            match GuardedRootCapturePlan::load_for_retirement(control, root_id) {
+                Ok(Some(plan)) => {
+                    if plan.discard_unreferenced(control).is_err() {
+                        continue;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => continue,
+            }
+            control.delete_record_if_value(GUARDED_REVISION_RETIREMENT_KIND, &id, &bytes)?;
+        }
+        Ok(())
     }
 
     /// Recover every active durable mount claim before the daemon starts
