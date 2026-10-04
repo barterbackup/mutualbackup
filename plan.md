@@ -41,7 +41,10 @@ them as ADRs and test vectors before promising wire compatibility.
   and only an explicit user edit or the built-in merge result may create new
   file content. This includes Git LFS filters: an LFS pointer is
   tracked and restored as its literal bytes, with no automatic LFS transfer or
-  pointer substitution by our binary.
+  pointer substitution by our binary. A `.gitattributes` file is itself tracked
+  byte-for-byte, but its conversion rules do not transform other files in this
+  frontend. This is the repository's fixed behavior, not a Git configuration
+  default that a user or installation can override.
   Do not offer a compatibility flag, `--renormalize` equivalent, or per-command
   override that enables such conversion in our binary. Existing Git attributes
   and configuration that request conversion are inert for file content in our
@@ -744,6 +747,9 @@ Proactive background repair comes later.
   prove that the staged anchor initially shares physical extents with the
   source file and that a later source edit changes neither the anchor's bytes
   nor its Git blob ID. Equal logical sizes alone do not establish sharing.
+  A failed conversion-requesting command must leave the captured anchor,
+  index, and working file unchanged; an inert repository attribute or config
+  setting alone is not a reason to reject raw staging.
 - Capture Git symlinks without following them: their blob bytes are the exact
   link-target bytes, and checkout recreates the link under the path-safety
   policy. Never treat a symlink as a regular-file reflink; explicitly reject
@@ -3674,6 +3680,11 @@ reads or writes file content, check byte identity from the user's file through
 the immutable anchor, Git blob, exported object, and restored worktree. A
 line-ending-only change is a real content change; no default, configuration,
 attribute, filter, or compatibility option may silently convert it.
+Keep the gate list below as the work queue even when a Git slice passes: after
+each slice, check which source-backend, guarded edit, platform, recovery, and
+physical-prune obligations remain open. A Git command's implementation or an
+earlier passing run does not substitute for its byte-exact acceptance on the
+current source.
 
 Track Milestone 6 against these separate closure gates when iterating over this
 plan; passing a Git command gate does not close a source-backend or platform gate:
