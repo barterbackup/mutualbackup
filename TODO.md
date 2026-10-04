@@ -39,8 +39,11 @@
   attempt into durable file and root Git pins. Root and file retirement reject
   those pins across a control-store reopen; the privileged ext4 and Btrfs probe
   covers two pinned files, wrong-repository retirement, and last-pin release.
-  The node must still bind the repository to its protected root, reconcile
-  orphaned pins after crashes, and publish the corresponding Git catalog entry.
+  The pin now records the exact attempt, worktree, raw path, and Git mode so a
+  reopened node can enumerate and verify the pending stage without guessing;
+  legacy pins missing that context fail closed. The node must still bind the
+  repository to its protected root, reconcile pins after crashes, and publish
+  the corresponding Git catalog entry.
   Guarded checkout and cross-catalog prune remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,

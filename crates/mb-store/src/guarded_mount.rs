@@ -3,7 +3,7 @@
 //! replayable transition from a user's original directory to this layout.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -165,6 +165,45 @@ struct GuardedGitAnchorPin {
     repository_id: Uuid,
     root_anchor_id: Uuid,
     manifest: FileAnchorManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage: Option<GuardedGitStageContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedGitStageContext {
+    attempt_id: Uuid,
+    worktree_id: Uuid,
+    relative_path: Vec<u8>,
+    git_mode: u32,
+}
+
+/// A durable guarded capture ready for replayable Git catalog publication.
+/// A version-1 pin without stage context fails closed during listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardedGitStagePin {
+    pub repository_id: Uuid,
+    pub root_anchor_id: Uuid,
+    pub manifest: FileAnchorManifest,
+    pub attempt_id: Uuid,
+    pub worktree_id: Uuid,
+    pub relative_path: Vec<u8>,
+    pub git_mode: u32,
+}
+
+fn valid_git_stage_path(bytes: &[u8]) -> bool {
+    let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    !bytes.is_empty()
+        && bytes.len() <= 4096
+        && !bytes.contains(&0)
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        && !matches!(
+            path.components().next(),
+            Some(Component::Normal(name))
+                if name == OsStr::new(".git") || name == OsStr::new(".mutualbackup")
+        )
+        && path.as_os_str().as_bytes() == bytes
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -187,11 +226,21 @@ fn git_anchor_pin(
     );
     let pin: GuardedGitAnchorPin = mb_core::decode_canonical(&bytes)?;
     ensure!(
-        pin.format_version == 1
+        matches!(pin.format_version, 1 | 2)
             && !pin.repository_id.is_nil()
             && !pin.root_anchor_id.is_nil()
             && pin.manifest.format_version == 1
             && pin.manifest.anchor_id == anchor_id
+            && match (&pin.stage, pin.format_version) {
+                (None, 1) => true,
+                (Some(stage), 2) => {
+                    !stage.attempt_id.is_nil()
+                        && !stage.worktree_id.is_nil()
+                        && valid_git_stage_path(&stage.relative_path)
+                        && matches!(stage.git_mode, 0o100644 | 0o100755)
+                }
+                _ => false,
+            }
             && mb_core::canonical_bytes(&pin)? == bytes,
         "guarded Git anchor pin is invalid"
     );
@@ -1636,9 +1685,11 @@ impl GuardedViewMount {
     pub fn transfer_stopped_file_capture_to_git(
         attempt_id: Uuid,
         repository_id: Uuid,
+        worktree_id: Uuid,
         control: &ControlStore,
     ) -> anyhow::Result<FileAnchorManifest> {
         ensure!(!repository_id.is_nil(), "guarded Git repository ID is nil");
+        ensure!(!worktree_id.is_nil(), "guarded Git worktree ID is nil");
         let attempt_bytes = control
             .get_record(STOPPED_FILE_CAPTURE_KIND, attempt_id.as_bytes())?
             .context("guarded Git file attempt is unavailable")?;
@@ -1652,12 +1703,26 @@ impl GuardedViewMount {
             .published
             .as_ref()
             .context("guarded Git file attempt is not published")?;
+        ensure!(
+            valid_git_stage_path(&attempt.entry.path),
+            "guarded Git stage path is unsupported"
+        );
         verify_published_file_capture_binding(control, &attempt, manifest)?;
         let file_pin = GuardedGitAnchorPin {
-            format_version: 1,
+            format_version: 2,
             repository_id,
             root_anchor_id: attempt.root_anchor_id,
             manifest: manifest.clone(),
+            stage: Some(GuardedGitStageContext {
+                attempt_id,
+                worktree_id,
+                relative_path: attempt.entry.path.clone(),
+                git_mode: if attempt.entry.mode & 0o111 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                },
+            }),
         };
         let root_pin = GuardedGitRootPin {
             format_version: 1,
@@ -1688,6 +1753,47 @@ impl GuardedViewMount {
             &attempt_bytes,
         )?;
         Ok(manifest.clone())
+    }
+
+    /// Enumerate durable file pins for one repository. The node compares each
+    /// pin with the Git catalog before deciding whether to replay publication
+    /// or retire an unreferenced anchor. Legacy pins without stage context
+    /// require trusted recovery rather than guessing the index path or mode.
+    pub fn git_stage_pins(
+        repository_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<Vec<GuardedGitStagePin>> {
+        ensure!(!repository_id.is_nil(), "guarded Git repository ID is nil");
+        let mut pins = Vec::new();
+        for (id, _) in control.records(GIT_ANCHOR_PIN_KIND)? {
+            let anchor_id = Uuid::from_slice(&id)?;
+            let (_, pin) = git_anchor_pin(control, anchor_id)?
+                .context("guarded Git anchor pin vanished during listing")?;
+            if pin.repository_id != repository_id {
+                continue;
+            }
+            let (_, root) = git_root_pin(control, pin.root_anchor_id)?
+                .context("guarded Git stage pin lost its root pin")?;
+            ensure!(
+                root.repository_id == repository_id,
+                "guarded Git stage pin has another root owner"
+            );
+            let stage = pin
+                .stage
+                .context("legacy guarded Git pin lacks stage context")?;
+            pin.manifest.open_verified()?;
+            pins.push(GuardedGitStagePin {
+                repository_id,
+                root_anchor_id: pin.root_anchor_id,
+                manifest: pin.manifest,
+                attempt_id: stage.attempt_id,
+                worktree_id: stage.worktree_id,
+                relative_path: stage.relative_path,
+                git_mode: stage.git_mode,
+            });
+        }
+        pins.sort_by_key(|pin| pin.manifest.anchor_id);
+        Ok(pins)
     }
 
     /// Retire a node-owned Git pin only after the caller proves that the Git
@@ -2450,6 +2556,7 @@ mod tests {
     use super::{
         GuardedStoppedCaptureV1, GuardedViewMount, MOUNT_CLAIM_KIND, MOUNT_RETIRE_KIND,
         StoppedFileCaptureIntent, decode_mountinfo_path, mounted_filesystem_from_bytes,
+        valid_git_stage_path,
     };
 
     #[test]
@@ -2488,6 +2595,11 @@ mod tests {
         let mut bad_time = decoded;
         bad_time.entry.atime_nanos = 1_000_000_000;
         assert!(bad_time.validate(attempt_id.as_bytes()).is_err());
+        assert!(valid_git_stage_path(b"parent/raw-\xff"));
+        assert!(!valid_git_stage_path(b".git/config"));
+        assert!(!valid_git_stage_path(b".mutualbackup/catalog"));
+        assert!(!valid_git_stage_path(b"parent/../raw"));
+        assert!(!valid_git_stage_path(&vec![b'x'; 4097]));
     }
 
     #[test]
@@ -4188,6 +4300,7 @@ print('DONE', flush=True)
             GuardedViewMount::transfer_stopped_file_capture_to_git(
                 git_attempt,
                 repository_id,
+                repository_id,
                 &control.lock().unwrap(),
             )
             .unwrap(),
@@ -4219,6 +4332,40 @@ print('DONE', flush=True)
             )
             .is_err()
         );
+        let stage_pins =
+            GuardedViewMount::git_stage_pins(repository_id, &control.lock().unwrap()).unwrap();
+        assert_eq!(stage_pins.len(), 1);
+        assert_eq!(stage_pins[0].attempt_id, git_attempt);
+        assert_eq!(stage_pins[0].worktree_id, repository_id);
+        assert_eq!(stage_pins[0].relative_path, b"created");
+        assert_eq!(stage_pins[0].manifest, created);
+        assert!(matches!(stage_pins[0].git_mode, 0o100644 | 0o100755));
+        {
+            let store = control.lock().unwrap();
+            let (current_bytes, mut legacy) = super::git_anchor_pin(&store, created.anchor_id)
+                .unwrap()
+                .unwrap();
+            legacy.format_version = 1;
+            legacy.stage = None;
+            let legacy_bytes = mb_core::canonical_bytes(&legacy).unwrap();
+            store
+                .replace_record_if_value(
+                    super::GIT_ANCHOR_PIN_KIND,
+                    created.anchor_id.as_bytes(),
+                    &current_bytes,
+                    &legacy_bytes,
+                )
+                .unwrap();
+            assert!(GuardedViewMount::git_stage_pins(repository_id, &store).is_err());
+            store
+                .replace_record_if_value(
+                    super::GIT_ANCHOR_PIN_KIND,
+                    created.anchor_id.as_bytes(),
+                    &legacy_bytes,
+                    &current_bytes,
+                )
+                .unwrap();
+        }
         let created_plan =
             crate::GuardedFileCapturePlan::load_for_manifest(&control.lock().unwrap(), &created)
                 .unwrap()
@@ -4248,6 +4395,7 @@ print('DONE', flush=True)
             GuardedViewMount::transfer_stopped_file_capture_to_git(
                 moved_attempt,
                 uuid::Uuid::new_v4(),
+                repository_id,
                 &control.lock().unwrap(),
             )
             .is_err()
@@ -4255,9 +4403,16 @@ print('DONE', flush=True)
         GuardedViewMount::transfer_stopped_file_capture_to_git(
             moved_attempt,
             repository_id,
+            repository_id,
             &control.lock().unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            GuardedViewMount::git_stage_pins(repository_id, &control.lock().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(
             GuardedViewMount::retire_git_anchor_pin_unreferenced(
                 uuid::Uuid::new_v4(),
