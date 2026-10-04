@@ -4,13 +4,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use mb_core::{V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_bytes, decode_canonical};
 use mb_store::{
     FileExtent, GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewEntryKind,
-    GuardedViewMetadataEntry,
+    GuardedViewMetadataEntry, NativeFileId, PinnedDirectory,
 };
 use serde::{Deserialize, Serialize};
 
@@ -281,6 +282,122 @@ impl GuardedPrivateMetadataV6 {
         }
         Ok(())
     }
+
+    /// Bind portable signed paths to a newly restored local tree. The returned
+    /// entries retain signed virtual attributes, including directory length,
+    /// while replacing only machine-specific inode identities. A later FUSE
+    /// view may use these entries after it has claimed and isolated this tree.
+    /// Sector verification separately proves each file's content bytes.
+    pub(crate) fn bind_restored_entries(
+        &self,
+        root: &PinnedDirectory,
+    ) -> Result<(NativeFileId, Vec<GuardedViewMetadataEntry>)> {
+        self.validate()?;
+        let root_id = root.identity()?;
+        let mut expected = BTreeMap::new();
+        let mut groups = BTreeMap::<u64, (NativeFileId, u64, u64)>::new();
+        let mut primary_ids = BTreeSet::new();
+        let mut directory_ids = BTreeSet::from([root_id]);
+        let mut bound = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let path = PathBuf::from(OsString::from_vec(entry.path().to_vec()));
+            let (kind, native_id, logical_len) = match entry {
+                GuardedPrivateEntryV6::Directory { logical_len, .. } => {
+                    let native_id = root.open_descendant_directory(&path)?.identity()?;
+                    ensure!(
+                        native_id.filesystem_id == root_id.filesystem_id
+                            && directory_ids.insert(native_id)
+                            && root.entry_identity(&path, true)? == Some(native_id),
+                        "guarded restored directory has another identity"
+                    );
+                    (GuardedViewEntryKind::Directory, native_id, *logical_len)
+                }
+                GuardedPrivateEntryV6::File {
+                    logical_len,
+                    link_group,
+                    ..
+                }
+                | GuardedPrivateEntryV6::HardLink {
+                    logical_len,
+                    link_group,
+                    ..
+                } => {
+                    let parent = path
+                        .parent()
+                        .context("guarded restored file has no parent")?;
+                    let opened_parent = if parent.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(root.open_descendant_directory(parent)?)
+                    };
+                    let directory = opened_parent.as_ref().unwrap_or(root);
+                    let name = path
+                        .file_name()
+                        .context("guarded restored file has no name")?;
+                    let file = directory
+                        .open_child_file(name)?
+                        .context("guarded restored file disappeared")?;
+                    let metadata = file.metadata()?;
+                    let native_id = NativeFileId {
+                        filesystem_id: root_id.filesystem_id,
+                        inode: metadata.ino(),
+                    };
+                    ensure!(
+                        metadata.len() == *logical_len
+                            && directory.entry_identity(name, false)? == Some(native_id)
+                            && root.entry_identity(&path, false)? == Some(native_id),
+                        "guarded restored file changed or has another length"
+                    );
+                    if matches!(entry, GuardedPrivateEntryV6::File { .. }) {
+                        ensure!(
+                            primary_ids.insert(native_id)
+                                && groups
+                                    .insert(*link_group, (native_id, metadata.nlink(), 1))
+                                    .is_none(),
+                            "distinct guarded link groups share one inode"
+                        );
+                    } else {
+                        let group = groups
+                            .get_mut(link_group)
+                            .context("guarded restored hard link has no primary")?;
+                        ensure!(
+                            group.0 == native_id && group.1 == metadata.nlink(),
+                            "guarded restored hard link has another inode"
+                        );
+                        group.2 += 1;
+                    }
+                    (GuardedViewEntryKind::File, native_id, *logical_len)
+                }
+            };
+            ensure!(
+                expected.insert(path, native_id).is_none(),
+                "duplicate guarded restored path"
+            );
+            let stat = entry.stat();
+            bound.push(GuardedViewMetadataEntry {
+                path: entry.path().to_vec(),
+                kind,
+                native_id,
+                mode: stat.mode,
+                uid: stat.uid,
+                gid: stat.gid,
+                logical_len,
+                atime_secs: stat.atime_secs,
+                atime_nanos: stat.atime_nanos,
+                modified_secs: stat.modified_secs,
+                modified_nanos: stat.modified_nanos,
+            });
+        }
+        ensure!(
+            groups.values().all(|(_, links, bound)| links == bound),
+            "guarded restored inode has an unrecorded hard-link alias"
+        );
+        ensure!(
+            root.exact_descendant_paths(&expected)?,
+            "guarded restored tree has an unrecorded or replaced name"
+        );
+        Ok((root_id, bound))
+    }
 }
 
 fn matching_extents(private: &[PrivateDataExtent], captured: &[FileExtent]) -> bool {
@@ -294,9 +411,72 @@ fn matching_extents(private: &[PrivateDataExtent], captured: &[FileExtent]) -> b
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use mb_core::SectorRef;
 
     use super::*;
+
+    #[test]
+    fn restored_guarded_binding_keeps_virtual_directory_length_and_rejects_aliases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let restored = temporary.path().join("restored");
+        let directory_name = OsString::from_vec(b"dir-\xfe".to_vec());
+        let directory = restored.join(&directory_name);
+        fs::create_dir(&restored).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("a"), b"payload").unwrap();
+        fs::hard_link(directory.join("a"), directory.join("b")).unwrap();
+        let stat = GuardedPrivateStatV6 {
+            mode: 0o640,
+            uid: 1234,
+            gid: 1235,
+            atime_secs: 101,
+            atime_nanos: 102,
+            modified_secs: 103,
+            modified_nanos: 104,
+        };
+        let private = GuardedPrivateMetadataV6 {
+            format_version: 6,
+            root: stat.clone(),
+            entries: vec![
+                GuardedPrivateEntryV6::Directory {
+                    path: b"dir-\xfe".to_vec(),
+                    stat: stat.clone(),
+                    logical_len: 8192,
+                },
+                GuardedPrivateEntryV6::File {
+                    path: b"dir-\xfe/a".to_vec(),
+                    stat: stat.clone(),
+                    logical_len: 7,
+                    link_group: 0,
+                    data_extents: Vec::new(),
+                },
+                GuardedPrivateEntryV6::HardLink {
+                    path: b"dir-\xfe/b".to_vec(),
+                    stat,
+                    logical_len: 7,
+                    link_group: 0,
+                },
+            ],
+        };
+        let root = PinnedDirectory::open(&restored).unwrap();
+        let (root_id, bound) = private.bind_restored_entries(&root).unwrap();
+        assert_eq!(root_id, root.identity().unwrap());
+        assert_eq!(bound[0].path, b"dir-\xfe");
+        assert_eq!(bound[0].logical_len, 8192);
+        assert_eq!(bound[1].native_id, bound[2].native_id);
+        assert_eq!(bound[1].uid, 1234);
+
+        fs::write(directory.join("extra"), b"unrecorded").unwrap();
+        assert!(private.bind_restored_entries(&root).is_err());
+        fs::remove_file(directory.join("extra")).unwrap();
+        fs::hard_link(directory.join("a"), temporary.path().join("outside")).unwrap();
+        assert!(private.bind_restored_entries(&root).is_err());
+        fs::remove_file(temporary.path().join("outside")).unwrap();
+        fs::write(directory.join("a"), b"different length").unwrap();
+        assert!(private.bind_restored_entries(&root).is_err());
+    }
 
     #[test]
     fn guarded_private_metadata_roundtrips_raw_names_and_rejects_invalid_layout() {

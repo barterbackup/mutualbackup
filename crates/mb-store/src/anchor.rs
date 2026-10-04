@@ -682,6 +682,30 @@ impl PinnedDirectory {
         &self,
         grants: &BTreeMap<PathBuf, BTreeSet<NativeFileId>>,
     ) -> Result<bool, AnchorError> {
+        self.all_descendant_paths_granted_with_catalog_policy(grants, true)
+    }
+
+    /// A restored signed namespace cannot inherit an unrecorded catalog or
+    /// another lower-tree name. Unlike guarded remount replay, no local name
+    /// has authority to be excluded from this comparison.
+    #[cfg(target_os = "linux")]
+    pub fn exact_descendant_paths(
+        &self,
+        expected: &BTreeMap<PathBuf, NativeFileId>,
+    ) -> Result<bool, AnchorError> {
+        let grants = expected
+            .iter()
+            .map(|(path, id)| (path.clone(), BTreeSet::from([*id])))
+            .collect();
+        self.all_descendant_paths_granted_with_catalog_policy(&grants, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn all_descendant_paths_granted_with_catalog_policy(
+        &self,
+        grants: &BTreeMap<PathBuf, BTreeSet<NativeFileId>>,
+        skip_marked_catalog: bool,
+    ) -> Result<bool, AnchorError> {
         fn scan(
             directory: &PinnedDirectory,
             parent: &Path,
@@ -729,7 +753,7 @@ impl PinnedDirectory {
             Path::new(""),
             grants,
             0,
-            self.has_marked_git_catalog()?,
+            skip_marked_catalog && self.has_marked_git_catalog()?,
         )
     }
 

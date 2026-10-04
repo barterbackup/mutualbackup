@@ -890,6 +890,12 @@
   and Btrfs, and exercises same-seed recovery/reanchor on Btrfs.
   Reconstructing a guarded FUSE view from signed recovery on a non-reflink
   filesystem remains open.
+  Recovery now binds signed format-6 raw paths and virtual attributes to the
+  restored tree's local inodes before retaining new anchors. It rejects extra
+  names, changed lengths, and hard-link aliases outside the signed namespace;
+  a directory-only revision is bound even with no data sectors. The binding
+  carries signed directory lengths for later FUSE reconstruction, which is
+  still required before non-reflink guarded recovery can be enabled.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

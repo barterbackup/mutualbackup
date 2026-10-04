@@ -1896,14 +1896,11 @@ pub(crate) fn reanchor_recovered_revision(
     {
         bail!("recovered revision does not belong to the local seed and guild");
     }
-    if revision.value.data_sectors.is_empty() {
-        return Ok(());
-    }
-    reconcile_anchor_retirements(control)?;
     #[cfg(target_os = "linux")]
-    {
+    if !revision.value.metadata_sectors.is_empty() {
         let metadata_bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
         if private_metadata_format(&metadata_bytes)? == 6 {
+            reconcile_anchor_retirements(control)?;
             return reanchor_recovered_guarded_revision(
                 control,
                 keys,
@@ -1914,6 +1911,10 @@ pub(crate) fn reanchor_recovered_revision(
             );
         }
     }
+    if revision.value.data_sectors.is_empty() {
+        return Ok(());
+    }
+    reconcile_anchor_retirements(control)?;
     let (metadata, git_backup) = load_private_metadata_with_git(control, keys, guild_id, revision)?;
     let git_repository = if let Some(descriptor) = git_backup.as_ref() {
         if descriptor.repository_id != revision.value.protected_root_id {
@@ -2337,6 +2338,11 @@ fn reanchor_recovered_guarded_revision(
     let source_root = restored_root
         .canonicalize()
         .context("resolve guarded recovered source before reflink capture")?;
+    // Reconstruct local inode identities from the signed namespace before
+    // retaining any file anchors. This rejects extra names and aliases that
+    // the portable metadata never authorized, including on recovery retries.
+    let restored = PinnedDirectory::open(&source_root)?;
+    let _bound_view = metadata.bind_restored_entries(&restored)?;
     let (intent, intent_bytes) = match pending_intent {
         Some(bytes) => {
             let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
@@ -4439,6 +4445,88 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_guarded_recovery_binds_signed_directories_without_data_sectors() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root_path = temporary.path().join("restored");
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([218; 32]));
+        let guild_id = [219; 32];
+        let revision_id = Uuid::new_v4();
+        let stat = GuardedPrivateStatV6 {
+            mode: 0o700,
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            atime_secs: 1_700_000_000,
+            atime_nanos: 0,
+            modified_secs: 1_700_000_001,
+            modified_nanos: 0,
+        };
+        let metadata = GuardedPrivateMetadataV6 {
+            format_version: 6,
+            root: stat.clone(),
+            entries: vec![GuardedPrivateEntryV6::Directory {
+                path: b"empty-\xfe".to_vec(),
+                stat,
+                logical_len: 8192,
+            }],
+        };
+        let metadata_bytes = canonical_bytes(&metadata).unwrap();
+        let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
+        let (metadata_ref, metadata_ciphertext) = encrypted_sector(
+            &keys.guild_data_key(&guild_id),
+            metadata_id,
+            &metadata_bytes,
+        )
+        .unwrap();
+        let writer = SigningKey::from_bytes(&[220; 32]);
+        let mut revision = UserRevision {
+            format_version: 5,
+            guild_id,
+            protected_root_id: Uuid::new_v4(),
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id,
+            owner: keys.node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![metadata_ref.clone()],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![merkle_commit(&metadata_ciphertext).unwrap()]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
+        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
+        restore_revision(
+            &control,
+            &keys,
+            guild_id,
+            &revision,
+            &BTreeMap::from([(metadata_id, metadata_ciphertext)]),
+            &root_path,
+        )
+        .unwrap();
+        install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
+        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path).unwrap();
+        let capture: GuardedRecoveredCaptureV1 = decode_canonical(
+            &control
+                .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(capture.files.is_empty());
+        assert!(
+            root_path
+                .join(std::ffi::OsString::from_vec(b"empty-\xfe".to_vec()))
+                .is_dir()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
