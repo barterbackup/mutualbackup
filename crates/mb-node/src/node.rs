@@ -24749,6 +24749,77 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(restored.join("sample")).unwrap(), captured_bytes);
+        if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
+            let ciphertexts = signed
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&signed.value.data_sectors)
+                .map(|reference| {
+                    (
+                        reference.clone(),
+                        crate::snapshot::render_sector(
+                            &recovered.control,
+                            &keys,
+                            &reference.id,
+                            Some(&guild_id),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut seed_only = Node::open(
+                area.path().join("seed-only-node"),
+                Seed::from_bytes([241; 32]),
+            )
+            .unwrap();
+            for (reference, ciphertext) in ciphertexts {
+                crate::snapshot::install_recovered_sector_recipe(
+                    &mut seed_only.control,
+                    &keys,
+                    guild_id,
+                    reference,
+                    &ciphertext,
+                )
+                .unwrap();
+            }
+            let checkpoint_hash = [242; 32];
+            let seed_target = area.path().join("seed-recovered");
+            seed_only
+                .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                .unwrap();
+            assert_eq!(
+                fs::read(seed_target.join("sample")).unwrap(),
+                captured_bytes
+            );
+            for reference in &signed.value.data_sectors {
+                assert!(
+                    crate::snapshot::recovered_recipe_is_stable(
+                        &seed_only.control,
+                        &keys,
+                        guild_id,
+                        reference,
+                    )
+                    .unwrap()
+                );
+            }
+            assert_eq!(
+                seed_only
+                    .protected_root_by_id(protected_root_id)
+                    .unwrap()
+                    .path,
+                seed_target
+            );
+            drop(seed_only);
+            let mut seed_only = Node::open(
+                area.path().join("seed-only-node"),
+                Seed::from_bytes([241; 32]),
+            )
+            .unwrap();
+            seed_only
+                .restore_recovered_revision(&checkpoint_hash, guild_id, &signed, &seed_target)
+                .unwrap();
+        }
         recovered.check_guarded_mounts().unwrap();
         assert!(fs::read(view.join("sample")).unwrap().starts_with(b"EDIT"));
         recovered.guarded_mounts.pop().unwrap().stop().unwrap();

@@ -841,6 +841,11 @@
   filesystem; those remain enrollment and recovery gates. Recovery root and
   anchor-area path hints still use UTF-8 local serialization, so non-UTF-8
   parent or target paths also remain a recovery gate.
+  The privileged node fixture now feeds signed format-6 sectors to a fresh
+  same-seed node on disposable Btrfs and runs the production recovery job
+  through restore, reanchor, root registration, and reopen/retry. That local
+  path passes; a full network seed-only recovery and non-reflink guarded-view
+  reconstruction remain open.
   Production protected-root removal must retire the claimed view, and guarded
   Git pins must join this proof before guarded enrollment or Git operations
   can select the backend.
