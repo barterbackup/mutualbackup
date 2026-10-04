@@ -52,7 +52,47 @@ const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
 const DIRECTORY_MODE_KIND: &str = "guarded-view-directory-mode-v1";
 const VIRTUAL_TIME_DIRTY_KIND: &str = "guarded-view-virtual-time-dirty-v1";
+const VIRTUAL_DIRECTORY_SIZE_DIRTY_KIND: &str = "guarded-view-virtual-directory-size-dirty-v1";
 pub(crate) const FILE_GUARD_KIND: &str = "guarded-view-file-guard-v1";
+
+pub(crate) fn virtual_directory_size_dirty_ids(
+    control: &ControlStore,
+    anchor_id: Uuid,
+    max_inode: u64,
+) -> anyhow::Result<std::collections::HashSet<u64>> {
+    let mut dirty = std::collections::HashSet::new();
+    for (id, value) in control.records(VIRTUAL_DIRECTORY_SIZE_DIRTY_KIND)? {
+        if !id.starts_with(anchor_id.as_bytes()) {
+            continue;
+        }
+        ensure!(
+            id.len() == 24 && value == [1],
+            "invalid guarded virtual directory size record"
+        );
+        let inode = u64::from_le_bytes(id[16..24].try_into()?);
+        ensure!(
+            (2..max_inode).contains(&inode) && dirty.insert(inode),
+            "guarded virtual directory size record has another inode"
+        );
+    }
+    Ok(dirty)
+}
+
+pub(crate) fn retire_virtual_directory_size_dirty(
+    control: &ControlStore,
+    anchor_id: Uuid,
+) -> anyhow::Result<()> {
+    for (id, value) in control.records(VIRTUAL_DIRECTORY_SIZE_DIRTY_KIND)? {
+        if id.starts_with(anchor_id.as_bytes()) {
+            ensure!(
+                id.len() == 24 && value == [1],
+                "invalid guarded virtual directory size record"
+            );
+            control.delete_record_if_value(VIRTUAL_DIRECTORY_SIZE_DIRTY_KIND, &id, &value)?;
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn virtual_time_dirty_masks(
     control: &ControlStore,
@@ -340,6 +380,35 @@ struct GuardedNamespace {
 }
 
 impl GuardedNamespace {
+    fn mark_virtual_directory_size_dirty(&self, inode: u64) -> io::Result<()> {
+        let control = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        let id = self.record_id(inode);
+        match control
+            .get_record(VIRTUAL_DIRECTORY_SIZE_DIRTY_KIND, &id)
+            .map_err(io::Error::other)?
+        {
+            Some(value) if value == [1] => Ok(()),
+            Some(_) => Err(io::Error::other(
+                "invalid guarded virtual directory size record",
+            )),
+            None => control
+                .put_record_if_absent(VIRTUAL_DIRECTORY_SIZE_DIRTY_KIND, &id, &[1])
+                .map_err(io::Error::other)
+                .and_then(|inserted| {
+                    if inserted {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(
+                            "guarded virtual directory size record changed",
+                        ))
+                    }
+                }),
+        }
+    }
+
     fn mark_virtual_time_dirty(&self, inode: u64, mask: u8) -> io::Result<()> {
         if !(1..=3).contains(&mask) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -1782,6 +1851,7 @@ impl GuardedNamespace {
             let view = GuardedProbeDirectory {
                 attr,
                 virtual_time: None,
+                virtual_size_dirty: None,
                 parent,
                 name,
                 relative_path: path,
@@ -2158,6 +2228,7 @@ struct VerifiedFileGuard {
 struct GuardedProbeDirectory {
     attr: FileAttr,
     virtual_time: Option<GuardedVirtualTime>,
+    virtual_size_dirty: Option<Arc<AtomicBool>>,
     parent: INodeNo,
     name: OsString,
     relative_path: PathBuf,
@@ -2396,6 +2467,24 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    fn mark_virtual_directory_size_dirty(&self, inode: INodeNo) -> io::Result<()> {
+        if inode == INodeNo::ROOT {
+            return Ok(());
+        }
+        let Some(dirty) = self
+            .directory(inode.0)
+            .and_then(|directory| directory.virtual_size_dirty)
+        else {
+            return Ok(());
+        };
+        self.namespace
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?
+            .mark_virtual_directory_size_dirty(inode.0)?;
+        dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
     fn mark_virtual_time_dirty(&self, inode: INodeNo, mask: u8) -> io::Result<()> {
         let virtual_time = if inode == INodeNo::ROOT {
             self.root_virtual_time.clone()
@@ -2469,6 +2558,7 @@ impl GuardedProbeView {
         metadata: &GuardedViewMetadataV1,
         baseline: Option<&GuardedViewTimeBaselineV1>,
         dirty_times: &HashMap<u64, u8>,
+        dirty_sizes: &std::collections::HashSet<u64>,
         initial_mount: bool,
     ) -> anyhow::Result<()> {
         self.root_uid = metadata.root_uid;
@@ -2508,11 +2598,13 @@ impl GuardedProbeView {
             });
             match entry.kind {
                 GuardedViewEntryKind::Directory => {
+                    let size_dirty = Arc::new(AtomicBool::new(dirty_sizes.contains(&inode)));
                     if let Some(directory) = self.directories.get_mut(&inode) {
                         directory.attr.size = entry.logical_len;
                         directory.attr.uid = entry.uid;
                         directory.attr.gid = entry.gid;
                         directory.virtual_time = virtual_time.clone();
+                        directory.virtual_size_dirty = Some(Arc::clone(&size_dirty));
                         present = true;
                     }
                     if let Some(directory) =
@@ -2522,6 +2614,7 @@ impl GuardedProbeView {
                         directory.attr.uid = entry.uid;
                         directory.attr.gid = entry.gid;
                         directory.virtual_time = virtual_time.clone();
+                        directory.virtual_size_dirty = Some(Arc::clone(&size_dirty));
                         present = true;
                     }
                     if present {
@@ -3761,6 +3854,14 @@ impl GuardedProbeView {
         }
         let metadata = lower.as_file().metadata()?;
         let mut attr = directory.attr;
+        if directory
+            .virtual_size_dirty
+            .as_ref()
+            .is_some_and(|dirty| dirty.load(Ordering::Acquire))
+        {
+            attr.size = metadata.len();
+            attr.blocks = metadata.blocks();
+        }
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
         attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
@@ -4533,6 +4634,10 @@ impl Filesystem for GuardedProbeView {
             expected: None,
         };
         let visible_mode = ((mode & !umask) & 0o777) as u16;
+        if let Err(error) = self.mark_virtual_directory_size_dirty(parent) {
+            reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+            return;
+        }
         if let Err(error) = namespace.store_directory_create_with_mode(inode, &intent, visible_mode)
         {
             reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
@@ -4573,6 +4678,7 @@ impl Filesystem for GuardedProbeView {
             Ok(GuardedProbeDirectory {
                 attr,
                 virtual_time: None,
+                virtual_size_dirty: None,
                 parent,
                 name: name.to_os_string(),
                 relative_path: target,
@@ -4697,6 +4803,7 @@ impl Filesystem for GuardedProbeView {
                 target: relative_path.as_os_str().as_bytes().to_vec(),
                 expected,
             };
+            self.mark_virtual_directory_size_dirty(parent)?;
             namespace.store_create(inode, &intent)?;
             if let Err(error) = lower.publish_unlinked_child_file(&source, name, expected) {
                 self.poisoned.store(true, Ordering::Release);
@@ -4822,6 +4929,13 @@ impl Filesystem for GuardedProbeView {
                 reply.error(Errno::ENOTDIR);
                 return;
             }
+            if let Err(error) = self
+                .mark_virtual_directory_size_dirty(parent)
+                .and_then(|()| self.mark_virtual_directory_size_dirty(newparent))
+            {
+                reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+                return;
+            }
             let result = self.rename_directory(inode, &old_key, &new_key, replaced, &mut names);
             match result {
                 Ok(()) => reply.ok(),
@@ -4842,6 +4956,13 @@ impl Filesystem for GuardedProbeView {
         if let Some(&target_inode) = names.get(&new_key) {
             if flags == RenameFlags::RENAME_NOREPLACE {
                 reply.error(Errno::EEXIST);
+                return;
+            }
+            if let Err(error) = self
+                .mark_virtual_directory_size_dirty(parent)
+                .and_then(|()| self.mark_virtual_directory_size_dirty(newparent))
+            {
+                reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
                 return;
             }
             let result =
@@ -4904,6 +5025,8 @@ impl Filesystem for GuardedProbeView {
                     .map_err(io::Error::other)
             };
             let moved = if let Some(namespace) = &self.namespace {
+                self.mark_virtual_directory_size_dirty(parent)?;
+                self.mark_virtual_directory_size_dirty(newparent)?;
                 namespace.transition(inode, &location.relative_path, Some(&new_path), move_file)
             } else {
                 move_file(expected)
@@ -4985,6 +5108,7 @@ impl Filesystem for GuardedProbeView {
                     .map_err(io::Error::other)
             };
             let removed = if let Some(namespace) = &self.namespace {
+                self.mark_virtual_directory_size_dirty(parent)?;
                 namespace.transition(inode, &location.relative_path, None, remove_file)
             } else {
                 remove_file(expected)
@@ -5080,6 +5204,7 @@ impl Filesystem for GuardedProbeView {
                 target: directory.relative_path.as_os_str().as_bytes().to_vec(),
                 expected: record.expected,
             };
+            self.mark_virtual_directory_size_dirty(parent)?;
             namespace.store_directory_remove(inode, &intent)?;
             if !lower_parent
                 .remove_empty_child_directory(name, record.expected)

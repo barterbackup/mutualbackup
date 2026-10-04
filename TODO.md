@@ -912,6 +912,10 @@
   durable per-inode dirty bits before changing the lower inode, so setting a
   time back to its original lower value cannot resurrect the signed time after
   remount; the ext4/Btrfs probes cover that sequence and dirty-record cleanup.
+  A recovered directory presents its signed length until its namespace changes;
+  create, remove, and rename then durably invalidate that length and show the
+  live lower-directory length across remount. The privileged ext4/Btrfs probe
+  covers create/remove, remount, and marker retirement.
   The production recovery job still
   needs a replayable transition from its published restored directory to a
   private lower tree, guarded root registration/backend selection, and a

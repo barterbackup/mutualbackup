@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use crate::guarded_view_probe::{
     GuardedProbeView, GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
-    GuardedViewTimeBaselineV1, retire_virtual_time_dirty, virtual_time_dirty_masks,
+    GuardedViewTimeBaselineV1, retire_virtual_directory_size_dirty, retire_virtual_time_dirty,
+    virtual_directory_size_dirty_ids, virtual_time_dirty_masks,
 };
 use crate::{
     CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedRootCapturePlan,
@@ -649,6 +650,7 @@ impl GuardedViewMount {
             control.delete_record(VIRTUAL_METADATA_KIND, id)?;
             control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
             retire_virtual_time_dirty(control, anchor_id)?;
+            retire_virtual_directory_size_dirty(control, anchor_id)?;
             return Ok(());
         };
         let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
@@ -677,6 +679,7 @@ impl GuardedViewMount {
         control.delete_record(VIRTUAL_METADATA_KIND, id)?;
         control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
         retire_virtual_time_dirty(control, anchor_id)?;
+        retire_virtual_directory_size_dirty(control, anchor_id)?;
         Ok(())
     }
 
@@ -848,6 +851,18 @@ impl GuardedViewMount {
                     .context("guarded virtual inode overflow")?,
             )?
         };
+        let dirty_sizes = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            virtual_directory_size_dirty_ids(
+                &control,
+                manifest.anchor_id,
+                u64::try_from(manifest.entries.len())?
+                    .checked_add(2)
+                    .context("guarded virtual inode overflow")?,
+            )?
+        };
         if let Some(metadata) = &virtual_metadata {
             validate_virtual_metadata_binding(metadata, manifest, &plan)?;
             ensure!(
@@ -881,6 +896,22 @@ impl GuardedViewMount {
             ensure!(
                 dirty_times.is_empty(),
                 "guarded virtual time change lacks its baseline"
+            );
+        }
+        if let Some(metadata) = virtual_metadata.as_ref().or(requested_metadata.as_ref()) {
+            ensure!(
+                dirty_sizes.iter().all(|inode| {
+                    usize::try_from(inode - 2)
+                        .ok()
+                        .and_then(|index| metadata.entries.get(index))
+                        .is_some_and(|entry| entry.kind == GuardedViewEntryKind::Directory)
+                }),
+                "guarded virtual directory size marker aliases a file"
+            );
+        } else {
+            ensure!(
+                dirty_sizes.is_empty(),
+                "guarded virtual directory size marker has no metadata"
             );
         }
         if let Some(claim) = &existing {
@@ -971,6 +1002,7 @@ impl GuardedViewMount {
                 metadata,
                 time_baseline.as_ref().or(new_time_baseline.as_ref()),
                 &dirty_times,
+                &dirty_sizes,
                 existing.is_none(),
             )?;
         }
@@ -2562,6 +2594,12 @@ print('DONE', flush=True)
             fs::read(mountpoint.join("nested/file")).unwrap(),
             b"raw\r\nbytes\0"
         );
+        fs::write(mountpoint.join("nested/new"), b"new").unwrap();
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().len(),
+            fs::metadata(lower.join("nested")).unwrap().len()
+        );
+        fs::remove_file(mountpoint.join("nested/new")).unwrap();
         fs::set_permissions(mountpoint.join("nested"), fs::Permissions::from_mode(0o711)).unwrap();
         let lower_nested = fs::metadata(lower.join("nested")).unwrap();
         let baseline_mtime = (lower_nested.mtime(), lower_nested.mtime_nsec());
@@ -2587,7 +2625,10 @@ print('DONE', flush=True)
         assert_eq!(fs::metadata(&mountpoint).unwrap().uid(), 65533);
         assert_eq!(fs::metadata(&mountpoint).unwrap().mode() & 0o7777, 0o750);
         assert_eq!(fs::metadata(&mountpoint).unwrap().mtime(), 1_700_000_000);
-        assert_eq!(fs::metadata(mountpoint.join("nested")).unwrap().len(), 8192);
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().len(),
+            fs::metadata(lower.join("nested")).unwrap().len()
+        );
         assert_eq!(
             fs::metadata(mountpoint.join("nested")).unwrap().mtime(),
             1_600_000_000
@@ -2626,6 +2667,10 @@ print('DONE', flush=True)
             fs::metadata(mountpoint.join("nested")).unwrap().mtime(),
             baseline_mtime.0
         );
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().len(),
+            fs::metadata(lower.join("nested")).unwrap().len()
+        );
         remounted.stop().unwrap();
         let remounted =
             GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
@@ -2653,6 +2698,15 @@ print('DONE', flush=True)
         );
         assert!(
             super::virtual_time_dirty_masks(
+                &store,
+                manifest.anchor_id,
+                u64::try_from(manifest.entries.len()).unwrap() + 2,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            super::virtual_directory_size_dirty_ids(
                 &store,
                 manifest.anchor_id,
                 u64::try_from(manifest.entries.len()).unwrap() + 2,
