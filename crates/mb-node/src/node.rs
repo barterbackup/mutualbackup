@@ -107,6 +107,14 @@ struct RecoveryJob {
     parent_native_id: Option<(u64, u64)>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedProtectedRootV1 {
+    format_version: u16,
+    root_id: Uuid,
+    anchor_id: Uuid,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct RecoveryAttempt {
     format_version: u16,
@@ -1377,7 +1385,7 @@ impl Node {
         let mut roots = Vec::new();
         for (record_id, bytes) in self.control.records("protected-root")? {
             let root: ProtectedRoot = decode_canonical(&bytes)?;
-            if root.format_version != 3
+            if !matches!(root.format_version, 3 | 4)
                 || root.root_id.is_nil()
                 || record_id != root.root_id.as_bytes()
                 || root.filesystem_id == 0
@@ -1413,6 +1421,49 @@ impl Node {
         root: &ProtectedRoot,
         filesystem: mb_store::FilesystemIdentity,
     ) -> Result<SourceBackendBinding> {
+        #[cfg(target_os = "linux")]
+        if root.format_version == 4 {
+            let binding = self.guarded_root_mount_binding(root)?;
+            let lower_filesystem = filesystem_identity(&binding.lower_root)?;
+            if lower_filesystem.stable_id != binding.lower_id.filesystem_id {
+                anyhow::bail!("guarded protected root lower filesystem changed");
+            }
+            let expected = SourceBackendBinding::guarded_link_freeze_v1(
+                root.root_id,
+                lower_filesystem.stable_id,
+                binding.lower_id.inode,
+                lower_filesystem.mount_id,
+            );
+            let existing = self
+                .control
+                .get_record("source-backend", root.root_id.as_bytes())?
+                .map(|bytes| decode_canonical::<SourceBackendBinding>(&bytes))
+                .transpose()?;
+            if let Some(existing) = &existing {
+                if !existing.is_supported_guarded_for(
+                    root.root_id,
+                    lower_filesystem.stable_id,
+                    binding.lower_id.inode,
+                ) {
+                    anyhow::bail!("guarded protected root has an incompatible source backend");
+                }
+                if existing.mount_id == lower_filesystem.mount_id {
+                    return Ok(existing.clone());
+                }
+                self.control.put_record(
+                    "source-backend",
+                    root.root_id.as_bytes(),
+                    &canonical_bytes(&expected)?,
+                )?;
+            } else if !self.control.put_record_if_absent(
+                "source-backend",
+                root.root_id.as_bytes(),
+                &canonical_bytes(&expected)?,
+            )? {
+                anyhow::bail!("guarded protected root backend changed concurrently");
+            }
+            return Ok(expected);
+        }
         let expected = SourceBackendBinding::reflink_v1(
             root.root_id,
             filesystem.stable_id,
@@ -1452,8 +1503,169 @@ impl Node {
         Ok(expected)
     }
 
+    fn verified_source_backend_for_root(
+        &self,
+        root: &ProtectedRoot,
+    ) -> Result<SourceBackendBinding> {
+        let metadata = fs::symlink_metadata(&root.path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            anyhow::bail!("protected root is not a directory");
+        }
+        #[cfg(target_os = "linux")]
+        if root.format_version == 4 {
+            let binding = self.guarded_root_mount_binding(root)?;
+            return self.source_backend_for_root(root, filesystem_identity(&binding.lower_root)?);
+        }
+        let filesystem = filesystem_identity(&root.path)?;
+        #[cfg(unix)]
+        if root.format_version != 4 && !root.matches_identity(filesystem, metadata.ino()) {
+            anyhow::bail!("protected root identity changed");
+        }
+        #[cfg(not(unix))]
+        if !root.matches_identity(filesystem, 0) {
+            anyhow::bail!("protected root identity changed");
+        }
+        self.source_backend_for_root(root, filesystem)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn guarded_root_mount_binding(
+        &self,
+        root: &ProtectedRoot,
+    ) -> Result<mb_store::GuardedViewBinding> {
+        if root.format_version != 4 {
+            anyhow::bail!("protected root is not guarded");
+        }
+        let bytes = self
+            .control
+            .get_record("guarded-protected-root-v1", root.root_id.as_bytes())?
+            .context("guarded protected root lost its anchor binding")?;
+        let record: GuardedProtectedRootV1 = decode_canonical(&bytes)?;
+        if record.format_version != 1 || record.root_id != root.root_id || record.anchor_id.is_nil()
+        {
+            anyhow::bail!("guarded protected root anchor binding is invalid");
+        }
+        self.check_guarded_mounts()?;
+        let mount = self
+            .guarded_mounts
+            .iter()
+            .find(|mount| mount.anchor_id() == record.anchor_id)
+            .context("daemon does not supervise the guarded protected root")?;
+        let binding = mount.verified_binding(&self.control)?;
+        if binding.mountpoint != root.path
+            || binding.lower_id.filesystem_id != root.filesystem_id
+            || binding.lower_id.inode != root.root_inode
+        {
+            anyhow::bail!("guarded protected root differs from its mounted lower tree");
+        }
+        Ok(binding)
+    }
+
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
         self.register_protected_root(source_root, None, true, true)
+    }
+
+    /// Register a recovered guarded worktree only after this daemon owns the
+    /// live mount claim. The protected root identity is the private lower
+    /// inode; FUSE's device and mount IDs may change on remount.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Production recovery selects this after the guarded handoff gate.
+    pub(crate) fn register_guarded_protected_root(
+        &mut self,
+        root_id: Uuid,
+        anchor_id: Uuid,
+    ) -> Result<ProtectedRoot> {
+        if root_id.is_nil() || anchor_id.is_nil() {
+            anyhow::bail!("guarded protected root ID is nil");
+        }
+        self.check_guarded_mounts()?;
+        let mount = self
+            .guarded_mounts
+            .iter()
+            .find(|mount| mount.anchor_id() == anchor_id)
+            .context("daemon does not own the recovered guarded mount")?;
+        let binding = mount.verified_binding(&self.control)?;
+        if binding.mountpoint.starts_with(&self.data_dir)
+            || self.data_dir.starts_with(&binding.mountpoint)
+        {
+            anyhow::bail!("guarded protected root and daemon data directory overlap");
+        }
+        let lower_filesystem = filesystem_identity(&binding.lower_root)?;
+        if lower_filesystem.stable_id != binding.lower_id.filesystem_id {
+            anyhow::bail!("guarded protected root lower filesystem changed");
+        }
+        let root = ProtectedRoot {
+            format_version: 4,
+            root_id,
+            path: binding.mountpoint,
+            filesystem_id: binding.lower_id.filesystem_id,
+            root_inode: binding.lower_id.inode,
+        };
+        let guarded = GuardedProtectedRootV1 {
+            format_version: 1,
+            root_id,
+            anchor_id,
+        };
+        let backend = SourceBackendBinding::guarded_link_freeze_v1(
+            root_id,
+            lower_filesystem.stable_id,
+            binding.lower_id.inode,
+            lower_filesystem.mount_id,
+        );
+        let configured = self.protected_roots()?;
+        if let Some(existing) = configured
+            .iter()
+            .find(|existing| existing.root_id == root_id)
+        {
+            if existing != &root
+                || self
+                    .control
+                    .get_record("guarded-protected-root-v1", root_id.as_bytes())?
+                    != Some(canonical_bytes(&guarded)?)
+            {
+                anyhow::bail!("guarded protected root conflicts with its registration");
+            }
+            self.verified_source_backend_for_root(existing)?;
+            return Ok(existing.clone());
+        }
+        if configured.iter().any(|existing| {
+            existing.path.starts_with(&root.path) || root.path.starts_with(&existing.path)
+        }) {
+            anyhow::bail!("guarded protected root overlaps another root");
+        }
+        if configured.len() == 256 {
+            anyhow::bail!("at most 256 protected roots may be registered");
+        }
+        let records = vec![
+            (
+                "protected-root".to_owned(),
+                root_id.as_bytes().to_vec(),
+                canonical_bytes(&root)?,
+            ),
+            (
+                "guarded-protected-root-v1".to_owned(),
+                root_id.as_bytes().to_vec(),
+                canonical_bytes(&guarded)?,
+            ),
+            (
+                "source-backend".to_owned(),
+                root_id.as_bytes().to_vec(),
+                canonical_bytes(&backend)?,
+            ),
+            (
+                "root-dirty".to_owned(),
+                root_id.as_bytes().to_vec(),
+                canonical_bytes(&RootDirtyState {
+                    format_version: 3,
+                    protected_root_id: root_id,
+                    dirty: false,
+                    reason: "guarded root was restored from its committed revision".to_owned(),
+                    change_sequence: 0,
+                })?,
+            ),
+        ];
+        self.control.put_records_and_delete(&records, &[])?;
+        Ok(root)
     }
 
     fn git_catalog_key(&self, repository_id: Uuid) -> [u8; 32] {
@@ -1513,6 +1725,9 @@ impl Node {
             .context("Git repository is not registered with this daemon")?;
         let info: GitRepositoryInfo = decode_canonical(&encoded)?;
         let root = self.protected_root_by_id(repository_id)?;
+        if root.format_version == 4 {
+            anyhow::bail!("Git operations are not enabled for guarded protected roots");
+        }
         if info.format_version != 1 || info.repository_id != repository_id || info.path != root.path
         {
             anyhow::bail!("Git repository registration is invalid");
@@ -4812,22 +5027,7 @@ impl Node {
                     .context("this node has no protected root")?,
             },
         };
-        let current_filesystem = filesystem_identity(&root.path)?;
-        let root_metadata = fs::symlink_metadata(&root.path)?;
-        #[cfg(unix)]
-        let root_inode = {
-            use std::os::unix::fs::MetadataExt;
-            root_metadata.ino()
-        };
-        #[cfg(not(unix))]
-        let root_inode = 0;
-        if !root_metadata.is_dir()
-            || root_metadata.file_type().is_symlink()
-            || !root.matches_identity(current_filesystem, root_inode)
-        {
-            anyhow::bail!("protected root identity changed");
-        }
-        self.source_backend_for_root(&root, current_filesystem)?;
+        self.verified_source_backend_for_root(&root)?;
         let local_head = self
             .control
             .get_record(
@@ -5320,20 +5520,50 @@ impl Node {
         if source_root.canonicalize()? != root.path {
             anyhow::bail!("source path does not match the protected root");
         }
-        let metadata = fs::symlink_metadata(&root.path)?;
-        let filesystem = filesystem_identity(&root.path)?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || !root.matches_identity(filesystem, metadata.ino())
-        {
-            anyhow::bail!("protected root identity changed");
-        }
-        let backend = self.source_backend_for_root(&root, filesystem)?;
+        let backend = self.verified_source_backend_for_root(&root)?;
         let captured_change_sequence = self
             .root_dirty_state(protected_root_id)?
             .filter(|state| state.dirty)
             .map(|state| state.change_sequence);
         let writer = self.writer_incarnation(guild_id)?;
+        #[cfg(target_os = "linux")]
+        if backend.backend == SourceBackendKind::GuardedLinkFreezeV1 {
+            let bytes = self
+                .control
+                .get_record("guarded-protected-root-v1", protected_root_id.as_bytes())?
+                .context("guarded protected root lost its anchor binding")?;
+            let guarded: GuardedProtectedRootV1 = decode_canonical(&bytes)?;
+            if guarded.format_version != 1
+                || guarded.root_id != protected_root_id
+                || guarded.anchor_id.is_nil()
+            {
+                anyhow::bail!("guarded protected root anchor binding changed");
+            }
+            let revision_id = operation_id
+                .map(Uuid::from_bytes)
+                .unwrap_or_else(Uuid::new_v4);
+            if self
+                .control
+                .get_record("user-revision", revision_id.as_bytes())?
+                .is_none()
+            {
+                self.capture_claimed_guarded_view_for_revision(guarded.anchor_id, revision_id)?;
+            }
+            return crate::snapshot::prepare_guarded_revision(
+                &mut self.control,
+                &self.keys,
+                guild_id,
+                protected_root_id,
+                guarded.anchor_id,
+                sequence,
+                revision_id,
+                WriterCredentials {
+                    epoch: writer.epoch,
+                    secret: &writer.secret_key,
+                    captured_change_sequence,
+                },
+            );
+        }
         prepare_revision(
             &mut self.control,
             &self.keys,
@@ -24596,6 +24826,131 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_protected_root_reopens_and_signs_a_backup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let area = tempfile::Builder::new()
+            .prefix("mb-guarded-backup-")
+            .tempdir_in(test_root)
+            .unwrap();
+        let lower = area.path().join("lower");
+        let view = area.path().join("view");
+        let data_dir = area.path().join("node");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&view).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = b"guarded\r\nbackup\0";
+        fs::write(lower.join("sample"), original).unwrap();
+        fs::set_permissions(lower.join("sample"), fs::Permissions::from_mode(0o666)).unwrap();
+        let seed = Seed::from_bytes([233; 32]);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let plan = mb_store::GuardedRootCapturePlan::plan(&lower).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&node.control, 65534, 0, 0)
+            .unwrap();
+        plan.isolate_lower_directories(&node.control, &manifest)
+            .unwrap();
+        let mount_control = Arc::new(Mutex::new(
+            ControlStore::open_with_key(data_dir.join("control.db"), &node.control_database_key)
+                .unwrap(),
+        ));
+        node.guarded_mounts
+            .push(GuardedViewMount::start(&manifest, mount_control, &view, 65534, 65534).unwrap());
+        let root_id = Uuid::new_v4();
+        let root = node
+            .register_guarded_protected_root(root_id, manifest.anchor_id)
+            .unwrap();
+        assert_eq!(root.format_version, 4);
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
+        drop(node);
+
+        let mut node = Node::open(&data_dir, seed).unwrap();
+        assert_eq!(node.protected_root_by_id(root_id).unwrap(), root);
+        assert_eq!(
+            node.verified_source_backend_for_root(&root)
+                .unwrap()
+                .backend,
+            SourceBackendKind::GuardedLinkFreezeV1
+        );
+        let guarded_bytes = node
+            .control
+            .get_record("guarded-protected-root-v1", root_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        node.control
+            .put_record(
+                "guarded-protected-root-v1",
+                root_id.as_bytes(),
+                &canonical_bytes(&GuardedProtectedRootV1 {
+                    format_version: 1,
+                    root_id,
+                    anchor_id: Uuid::new_v4(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(node.verified_source_backend_for_root(&root).is_err());
+        node.control
+            .put_record(
+                "guarded-protected-root-v1",
+                root_id.as_bytes(),
+                &guarded_bytes,
+            )
+            .unwrap();
+        let backend_bytes = node
+            .control
+            .get_record("source-backend", root_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        let mut wrong_backend: SourceBackendBinding = decode_canonical(&backend_bytes).unwrap();
+        wrong_backend.backend = SourceBackendKind::ReflinkV1;
+        node.control
+            .put_record(
+                "source-backend",
+                root_id.as_bytes(),
+                &canonical_bytes(&wrong_backend).unwrap(),
+            )
+            .unwrap();
+        assert!(node.verified_source_backend_for_root(&root).is_err());
+        node.control
+            .put_record("source-backend", root_id.as_bytes(), &backend_bytes)
+            .unwrap();
+        let guild_id = [234; 32];
+        let revision_id = Uuid::new_v4();
+        let revision = node
+            .prepare_revision(guild_id, root_id, &view, 1, Some(*revision_id.as_bytes()))
+            .unwrap();
+        assert_eq!(revision.value.format_version, 5);
+        assert_eq!(revision.value.revision_id, revision_id);
+        assert_eq!(
+            node.prepare_revision(guild_id, root_id, &view, 1, Some(*revision_id.as_bytes()),)
+                .unwrap(),
+            revision
+        );
+        let restored = area.path().join("roundtrip");
+        crate::snapshot::restore_revision_from_source(
+            &node.control,
+            &node.keys,
+            guild_id,
+            &revision,
+            &restored,
+            |id| crate::snapshot::render_sector(&node.control, &node.keys, id, Some(&guild_id)),
+        )
+        .unwrap();
+        assert_eq!(fs::read(restored.join("sample")).unwrap(), original);
+        for mount in node.guarded_mounts.drain(..) {
+            mount.stop().unwrap();
+        }
+        drop(node);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn node_owns_claimed_guarded_mount_across_reopen() {
         use std::ffi::{CString, OsString};
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -24961,7 +25316,52 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(restored_view.join(&raw_path)).unwrap(), raw_edited);
-        remounted.stop().unwrap();
+        recovered.guarded_mounts.push(remounted);
+        let restored_root_id = Uuid::new_v4();
+        let restored_root = recovered
+            .register_guarded_protected_root(restored_root_id, restored_manifest.anchor_id)
+            .unwrap();
+        assert_eq!(restored_root.format_version, 4);
+        assert_eq!(restored_root.path, restored_view);
+        assert_eq!(
+            restored_root.filesystem_id,
+            restored_manifest.area.filesystem_id
+        );
+        assert_eq!(
+            recovered
+                .verified_source_backend_for_root(&restored_root)
+                .unwrap()
+                .backend,
+            SourceBackendKind::GuardedLinkFreezeV1
+        );
+        assert_eq!(
+            recovered
+                .register_guarded_protected_root(restored_root_id, restored_manifest.anchor_id)
+                .unwrap(),
+            restored_root
+        );
+        for kind in [
+            "protected-root",
+            "guarded-protected-root-v1",
+            "source-backend",
+            "root-dirty",
+        ] {
+            recovered
+                .control
+                .delete_record(kind, restored_root_id.as_bytes())
+                .unwrap();
+        }
+        recovered
+            .guarded_mounts
+            .swap_remove(
+                recovered
+                    .guarded_mounts
+                    .iter()
+                    .position(|mount| mount.anchor_id() == restored_manifest.anchor_id)
+                    .unwrap(),
+            )
+            .stop()
+            .unwrap();
         let store = restored_control.lock().unwrap();
         GuardedViewMount::retire_claim(restored_manifest.anchor_id, &store).unwrap();
         restored_plan.discard_unreferenced(&store).unwrap();

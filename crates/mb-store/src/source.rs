@@ -72,6 +72,40 @@ impl SourceBackendBinding {
             && self.root_inode == root_inode
             && self.mount_id != 0
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn guarded_link_freeze_v1(
+        root_id: Uuid,
+        filesystem_id: u64,
+        lower_inode: u64,
+        mount_id: u64,
+    ) -> Self {
+        Self {
+            format_version: 1,
+            contract_version: 1,
+            root_id,
+            backend: SourceBackendKind::GuardedLinkFreezeV1,
+            filesystem_id,
+            root_inode: lower_inode,
+            mount_id,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn is_supported_guarded_for(
+        &self,
+        root_id: Uuid,
+        filesystem_id: u64,
+        lower_inode: u64,
+    ) -> bool {
+        self.format_version == 1
+            && self.contract_version == 1
+            && self.root_id == root_id
+            && self.backend == SourceBackendKind::GuardedLinkFreezeV1
+            && self.filesystem_id == filesystem_id
+            && self.root_inode == lower_inode
+            && self.mount_id != 0
+    }
 }
 
 impl SourceBackendKind {

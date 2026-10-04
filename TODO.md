@@ -930,9 +930,15 @@
   placeholder untouched, and rejects a foreign lower inode. A raw-name store
   probe passes on ext4 and disposable Btrfs; the privileged node fixture now
   uses this handoff to mount its signed restored tree at the original target
-  path on both filesystems. The production recovery job still needs to own and
-  resume this handoff, register/select the guarded backend, and provide a
-  non-reflink recovery path before guarded enrollment can be enabled.
+  path on both filesystems. A version-4 protected-root registration now binds
+  that public mount to its supervised claim and private lower inode, rather
+  than FUSE's transient filesystem identity. After node reopen, the guarded
+  source backend routes a new revision through stopped-view capture and signed
+  format-6 sectors; focused ext4/Btrfs tests restore the exact CRLF/NUL bytes.
+  Git file operations remain gated for this backend. The production recovery
+  job still needs to own and resume the handoff, invoke guarded registration,
+  and provide a non-reflink reanchor path before guarded enrollment can be
+  enabled.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
