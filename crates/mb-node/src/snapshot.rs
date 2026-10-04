@@ -642,7 +642,12 @@ fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
         }
     }
     #[cfg(target_os = "linux")]
-    GuardedViewMount::reconcile_revision_capture_retirements(control)?;
+    if GuardedViewMount::has_revision_capture_retirements(control)? {
+        GuardedViewMount::reconcile_revision_capture_retirements(
+            control,
+            &git_prune_recipe_anchor_ids(control)?,
+        )?;
+    }
     Ok(())
 }
 
@@ -671,7 +676,11 @@ pub(crate) fn retire_revision_anchor(
         {
             return Ok(false);
         }
-        GuardedViewMount::retire_revision_capture_unreferenced(revision_id, control)?;
+        GuardedViewMount::retire_revision_capture_unreferenced(
+            revision_id,
+            control,
+            &recipe_anchors,
+        )?;
         return Ok(true);
     }
     let Some(bytes) = control.get_record("anchor-manifest", revision_id.as_bytes())? else {

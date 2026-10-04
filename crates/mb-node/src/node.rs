@@ -24777,6 +24777,11 @@ pub(crate) mod tests {
             .delete_record("user-revision", revision_id.as_bytes())
             .unwrap();
         assert!(!retire_revision_anchor(&mut control, revision_id).unwrap());
+        let retained_recipe_id = signed.value.data_sectors[0].id;
+        let retained_recipe = control
+            .get_record("local-sector", &retained_recipe_id)
+            .unwrap()
+            .unwrap();
         for reference in signed
             .value
             .metadata_sectors
@@ -24804,7 +24809,22 @@ pub(crate) mod tests {
         let control =
             ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap();
         GuardedViewMount::retire_claim(manifest.anchor_id, &control).unwrap();
-        GuardedViewMount::reconcile_revision_capture_retirements(&control).unwrap();
+        control
+            .put_record("local-sector", &retained_recipe_id, &retained_recipe)
+            .unwrap();
+        let pinned = git_prune_recipe_anchor_ids(&control).unwrap();
+        assert!(pinned.contains(&file_plan.anchor_id()));
+        reconcile_pending_captures(&control).unwrap();
+        assert!(
+            control
+                .get_record("guarded-file-plan-v1", file_plan.anchor_id().as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        control
+            .delete_record("local-sector", &retained_recipe_id)
+            .unwrap();
+        reconcile_pending_captures(&control).unwrap();
         assert!(
             control
                 .get_record("guarded-file-plan-v1", file_plan.anchor_id().as_bytes())

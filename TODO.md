@@ -825,6 +825,10 @@
   file guards before the root and leaves the record pending while a claimed
   view, another revision, or an unavailable source prevents cleanup. The
   privileged node lifecycle probe exercises this handoff on ext4 and Btrfs.
+  Replay now rescans surviving sector recipes before physical cleanup, so a
+  recipe retained or restored after the map transfer still pins its source;
+  the reopened-control lifecycle probe checks that cleanup waits for its
+  removal.
   Production protected-root removal must retire the claimed view, and guarded
   Git pins must join this proof before guarded enrollment or Git operations
   can select the backend.

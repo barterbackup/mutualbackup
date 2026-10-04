@@ -357,6 +357,12 @@ impl GuardedStoppedCaptureV1 {
 }
 
 impl GuardedViewMount {
+    pub fn has_revision_capture_retirements(control: &ControlStore) -> anyhow::Result<bool> {
+        Ok(!control
+            .records(GUARDED_REVISION_RETIREMENT_KIND)?
+            .is_empty())
+    }
+
     pub fn has_claims(control: &ControlStore) -> anyhow::Result<bool> {
         Ok(!control.records(MOUNT_CLAIM_KIND)?.is_empty())
     }
@@ -406,6 +412,7 @@ impl GuardedViewMount {
     pub fn retire_revision_capture_unreferenced(
         revision_id: Uuid,
         control: &mut ControlStore,
+        pinned_anchor_ids: &BTreeSet<Uuid>,
     ) -> anyhow::Result<()> {
         ensure!(
             control
@@ -432,13 +439,16 @@ impl GuardedViewMount {
                 revision_id.as_bytes(),
             )?;
         }
-        Self::reconcile_revision_capture_retirements(control)
+        Self::reconcile_revision_capture_retirements(control, pinned_anchor_ids)
     }
 
     /// Resume physical cleanup after a crash. A still claimed view, another
     /// revision pin, or an unavailable source volume leaves the obligation
     /// durable for a later retry.
-    pub fn reconcile_revision_capture_retirements(control: &ControlStore) -> anyhow::Result<()> {
+    pub fn reconcile_revision_capture_retirements(
+        control: &ControlStore,
+        pinned_anchor_ids: &BTreeSet<Uuid>,
+    ) -> anyhow::Result<()> {
         for (id, bytes) in control.records(GUARDED_REVISION_RETIREMENT_KIND)? {
             ensure!(
                 bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
@@ -455,6 +465,15 @@ impl GuardedViewMount {
                 if file.locator.anchor_id != root_id {
                     file_ids.insert(file.locator.anchor_id);
                 }
+            }
+            // An unrelated retained revision can still use an old sector
+            // recipe after this revision's map is retired. The node supplies
+            // its freshly scanned recipe pins on every replay, not just when
+            // it first transfers the capture map.
+            if pinned_anchor_ids.contains(&root_id)
+                || file_ids.iter().any(|id| pinned_anchor_ids.contains(id))
+            {
+                continue;
             }
             let mut pending = false;
             for file_id in file_ids {
