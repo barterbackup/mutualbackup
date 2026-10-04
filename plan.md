@@ -815,6 +815,9 @@ Proactive background repair comes later.
   registration, catalog marker, or matching graph intent exists. Enable that
   combination only after a versioned signed descriptor, native-anchor pin
   handoff, and seed-only graph and virtual-locator recovery pass together.
+  On a non-reflink recovery filesystem, stream verified Git blob sectors
+  directly into one native anchor and preserve sparse zero ranges; do not
+  require a temporary worktree payload and a reflink just to rebuild history.
 - Represent explicit commit protection pins as namespaced Git refs so graph
   export, signed backup, and recovery retain their ancestry without another
   object format. Removing a branch or pin only changes reachability; physical

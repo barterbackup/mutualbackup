@@ -1810,13 +1810,20 @@ impl ImportedBlobCapturePlan {
                 if read == 0 {
                     return Err(AnchorError::SourceChanged(self.synthetic_source_path()));
                 }
-                payload.write_all(&buffer[..read])?;
+                if buffer[..read].iter().all(|byte| *byte == 0) {
+                    payload.seek(SeekFrom::Current(i64::try_from(read).map_err(|_| {
+                        AnchorError::SourceChanged(self.synthetic_source_path())
+                    })?))?;
+                } else {
+                    payload.write_all(&buffer[..read])?;
+                }
                 hasher.update(&buffer[..read]);
                 remaining -= read as u64;
             }
             if source.read(&mut buffer[..1])? != 0 {
                 return Err(AnchorError::SourceChanged(self.synthetic_source_path()));
             }
+            payload.set_len(self.logical_len)?;
             payload.sync_all()?;
             seal_anchor_file_handle(&payload)?;
             let manifest = FileAnchorManifest {
@@ -5555,6 +5562,27 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn imported_blob_keeps_zero_runs_sparse_without_an_intermediate_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let mut bytes = vec![0; 4 * 1024 * 1024];
+        bytes[0] = b'A';
+        *bytes.last_mut().unwrap() = b'Z';
+        let plan = ImportedBlobCapturePlan::plan(&root, bytes.len() as u64).unwrap();
+        let anchor = plan.capture(std::io::Cursor::new(&bytes)).unwrap();
+        let mut file = anchor.open_verified().unwrap();
+        let mut restored = Vec::new();
+        file.read_to_end(&mut restored).unwrap();
+        assert_eq!(restored, bytes);
+        assert!(file.metadata().unwrap().blocks() * 512 < bytes.len() as u64 / 4);
+        anchor.remove().unwrap();
+    }
 
     #[test]
     fn file_manifest_v2_keeps_old_wire_bytes_and_round_trips_root_locator() {

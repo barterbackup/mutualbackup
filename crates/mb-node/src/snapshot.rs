@@ -24,6 +24,8 @@ use mb_git::{
     GitBackupBlob, GitBackupDescriptor, GitDataExtent, GitGraphObject, GitGraphRef, GitGraphSource,
     GitRepository,
 };
+#[cfg(target_os = "linux")]
+use mb_store::ImportedBlobCapturePlan;
 #[cfg(test)]
 use mb_store::ReflinkAnchor;
 use mb_store::{
@@ -4108,34 +4110,48 @@ where
     let mut anchors = Vec::with_capacity(descriptor.blobs.len());
     let result = (|| {
         for blob in &descriptor.blobs {
+            #[cfg(target_os = "linux")]
+            let anchor = {
+                let plan = ImportedBlobCapturePlan::plan(&root, blob.logical_len)?;
+                let mut reader = RecoveredGitBlobReader::new(blob, encryption_key, load_ciphertext);
+                plan.capture(&mut reader)?
+            };
+            #[cfg(not(target_os = "linux"))]
             let temporary_name = format!(".mutualbackup-recovered-blob-{}", Uuid::new_v4());
-            let mut file = staging.create_child_file(&temporary_name)?;
-            file.set_len(blob.logical_len)?;
-            for extent in &blob.data_extents {
-                file.seek(SeekFrom::Start(extent.offset))?;
-                let mut written = 0_u64;
-                for reference in &extent.sectors {
-                    let plaintext = decrypt_reference(encryption_key, reference, load_ciphertext)?;
-                    file.write_all(&plaintext)?;
-                    written = written
-                        .checked_add(plaintext.len() as u64)
-                        .context("Git recovered extent length overflow")?;
+            #[cfg(not(target_os = "linux"))]
+            let anchor = {
+                let mut file = staging.create_child_file(&temporary_name)?;
+                file.set_len(blob.logical_len)?;
+                for extent in &blob.data_extents {
+                    file.seek(SeekFrom::Start(extent.offset))?;
+                    let mut written = 0_u64;
+                    for reference in &extent.sectors {
+                        let plaintext =
+                            decrypt_reference(encryption_key, reference, load_ciphertext)?;
+                        file.write_all(&plaintext)?;
+                        written = written
+                            .checked_add(plaintext.len() as u64)
+                            .context("Git recovered extent length overflow")?;
+                    }
+                    if written != extent.logical_len {
+                        bail!("Git recovered extent does not match signed sector lengths");
+                    }
                 }
-                if written != extent.logical_len {
-                    bail!("Git recovered extent does not match signed sector lengths");
-                }
-            }
-            file.sync_all()?;
-            drop(file);
-            let plan = SourceFileCapturePlan::plan_reflink(&root, &temporary_name)?;
-            let anchor = plan.capture()?;
+                file.sync_all()?;
+                drop(file);
+                let plan = SourceFileCapturePlan::plan_reflink(&root, &temporary_name)?;
+                plan.capture()?
+            };
             let actual_oid = mb_git::blob_oid_from_anchor(&anchor);
             anchors.push(anchor);
             if actual_oid?.as_bytes() != blob.oid {
                 bail!("recovered Git blob bytes do not match their signed object ID");
             }
-            staging.remove_child_file(&temporary_name)?;
-            staging.sync_all()?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                staging.remove_child_file(&temporary_name)?;
+                staging.sync_all()?;
+            }
         }
         repository.import_backup(descriptor, &anchors)?;
         Ok(())
@@ -4146,6 +4162,96 @@ where
         }
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+struct RecoveredGitBlobReader<'a, F> {
+    blob: &'a GitBackupBlob,
+    encryption_key: &'a [u8; 32],
+    load_ciphertext: &'a mut F,
+    position: u64,
+    extent_index: usize,
+    sector_index: usize,
+    plaintext: Vec<u8>,
+    plaintext_offset: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a, F> RecoveredGitBlobReader<'a, F>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    fn new(
+        blob: &'a GitBackupBlob,
+        encryption_key: &'a [u8; 32],
+        load_ciphertext: &'a mut F,
+    ) -> Self {
+        Self {
+            blob,
+            encryption_key,
+            load_ciphertext,
+            position: 0,
+            extent_index: 0,
+            sector_index: 0,
+            plaintext: Vec::new(),
+            plaintext_offset: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<F> Read for RecoveredGitBlobReader<'_, F>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || self.position == self.blob.logical_len {
+            return Ok(0);
+        }
+        loop {
+            let Some(extent) = self.blob.data_extents.get(self.extent_index) else {
+                let count =
+                    (self.blob.logical_len - self.position).min(output.len() as u64) as usize;
+                output[..count].fill(0);
+                self.position += count as u64;
+                return Ok(count);
+            };
+            let extent_end = extent.offset + extent.logical_len;
+            if self.position == extent_end {
+                self.extent_index += 1;
+                self.sector_index = 0;
+                continue;
+            }
+            if self.position < extent.offset {
+                let count = (extent.offset - self.position).min(output.len() as u64) as usize;
+                output[..count].fill(0);
+                self.position += count as u64;
+                return Ok(count);
+            }
+            if self.plaintext_offset == self.plaintext.len() {
+                let reference = extent.sectors.get(self.sector_index).ok_or_else(|| {
+                    std::io::Error::other("recovered Git extent lost a signed sector")
+                })?;
+                self.plaintext =
+                    decrypt_reference(self.encryption_key, reference, self.load_ciphertext)
+                        .map_err(std::io::Error::other)?;
+                self.plaintext_offset = 0;
+                self.sector_index += 1;
+            }
+            let count = (extent_end - self.position)
+                .min((self.plaintext.len() - self.plaintext_offset) as u64)
+                .min(output.len() as u64) as usize;
+            if count == 0 {
+                return Err(std::io::Error::other("recovered Git sector has no bytes"));
+            }
+            output[..count].copy_from_slice(
+                &self.plaintext[self.plaintext_offset..self.plaintext_offset + count],
+            );
+            self.plaintext_offset += count;
+            self.position += count as u64;
+            return Ok(count);
+        }
+    }
 }
 
 fn pinned_restore_parent(target: &Path) -> Result<(PathBuf, PathBuf, PinnedDirectory)> {
@@ -5013,6 +5119,135 @@ mod metadata_compatibility_tests {
                 .to_string()
                 .contains("guarded Git graph recovery is not yet supported")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovered_git_blobs_stream_to_sparse_native_anchors_without_reflink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let ordinary = git2::Repository::init_bare(temporary.path().join("ordinary.git")).unwrap();
+        let mut bytes = vec![0; 4 * 1024 * 1024];
+        bytes[0] = b'A';
+        *bytes.last_mut().unwrap() = b'Z';
+        let blob_oid = ordinary.blob(&bytes).unwrap();
+        let mut builder = ordinary.treebuilder(None).unwrap();
+        builder.insert("tracked", blob_oid, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = ordinary.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Author", "author@example.test").unwrap();
+        let commit_oid = ordinary
+            .commit(None, &signature, &signature, "first", &tree, &[])
+            .unwrap();
+        let odb = ordinary.odb().unwrap();
+        let mut objects = [(commit_oid, 1_u8), (tree_oid, 2_u8)]
+            .into_iter()
+            .map(|(oid, kind)| GitGraphObject {
+                kind,
+                oid: oid.as_bytes().try_into().unwrap(),
+                bytes: odb.read(oid).unwrap().data().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|object| object.oid);
+
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([225; 32]));
+        let guild_id = [226; 32];
+        let revision_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let mut ciphertexts = BTreeMap::new();
+        let mut sectors = Vec::new();
+        for (index, chunk) in [
+            &bytes[..V1_SECTOR_SIZE],
+            &bytes[bytes.len() - V1_SECTOR_SIZE..],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = make_sector_id(
+                keys.node_id(),
+                revision_id,
+                SectorPurpose::Data,
+                index as u64,
+            );
+            let (reference, ciphertext) =
+                encrypted_sector(&keys.guild_data_key(&guild_id), id, chunk).unwrap();
+            sectors.push(reference);
+            ciphertexts.insert(id, ciphertext);
+        }
+        let descriptor = GitBackupDescriptor {
+            format_version: 2,
+            repository_id,
+            refs: vec![GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: commit_oid.as_bytes().try_into().unwrap(),
+            }],
+            objects,
+            blobs: vec![GitBackupBlob {
+                oid: blob_oid.as_bytes().try_into().unwrap(),
+                logical_len: bytes.len() as u64,
+                data_extents: vec![
+                    GitDataExtent {
+                        offset: 0,
+                        logical_len: V1_SECTOR_SIZE as u64,
+                        sectors: vec![sectors[0].clone()],
+                    },
+                    GitDataExtent {
+                        offset: (bytes.len() - V1_SECTOR_SIZE) as u64,
+                        logical_len: V1_SECTOR_SIZE as u64,
+                        sectors: vec![sectors[1].clone()],
+                    },
+                ],
+            }],
+            head_branch: "main".to_owned(),
+        };
+        descriptor.validate().unwrap();
+        let restored = temporary.path().join("restored");
+        fs::create_dir(&restored).unwrap();
+        let staging = PinnedDirectory::open(&restored).unwrap();
+        restore_git_backup_at(
+            &keys,
+            &staging,
+            &descriptor,
+            &keys.guild_data_key(&guild_id),
+            &mut |id| {
+                ciphertexts
+                    .get(id)
+                    .cloned()
+                    .context("missing backed-up sector")
+            },
+        )
+        .unwrap();
+        assert_eq!(git_catalog_marker(&restored).unwrap(), Some(repository_id));
+        let repository = GitRepository::open(
+            &restored,
+            repository_id,
+            &mb_git::catalog_key(&keys, repository_id),
+        )
+        .unwrap();
+        let graph = repository.export_graph_source().unwrap();
+        assert_eq!(graph.refs, descriptor.refs);
+        assert_eq!(graph.objects, descriptor.objects);
+        assert_eq!(graph.blobs.len(), 1);
+        let mut anchored = Vec::new();
+        let mut file = graph.blobs[0].anchor.open_verified().unwrap();
+        file.read_to_end(&mut anchored).unwrap();
+        assert_eq!(anchored, bytes);
+        assert!(file.metadata().unwrap().blocks() * 512 < bytes.len() as u64 / 4);
+        assert!(fs::read_dir(&restored).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mutualbackup-recovered-blob-")
+        }));
+        let mut damaged = ciphertexts;
+        damaged.get_mut(&sectors[0].id).unwrap()[0] ^= 1;
+        let encryption_key = keys.guild_data_key(&guild_id);
+        let mut load = |id: &SectorId| damaged.get(id).cloned().context("missing backed-up sector");
+        let mut reader =
+            RecoveredGitBlobReader::new(&descriptor.blobs[0], &encryption_key, &mut load);
+        assert!(reader.read_to_end(&mut Vec::new()).is_err());
     }
 
     #[cfg(target_os = "linux")]
