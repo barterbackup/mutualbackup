@@ -1002,10 +1002,16 @@
   The in-place handoff now has a reverse-name primitive for removal: a durable
   release marker fences enrollment replay, the exact retired mount claim must
   bind the lower and placeholder, and interruption after placeholder deletion
-  can replay the no-replace return of the private directory. This still leaves
-  the returned root private. Removal needs durable visible-metadata restoration,
-  revision/Git pin checks, root-record retirement, and handoff-record cleanup
-  before exposing a command or reopening the root as ordinary user data.
+  can replay the no-replace return of the private directory. A post-detach
+  stopped-view snapshot is now retained before claim retirement and fences
+  remount. The stopped-view path applies durable virtual presentation metadata,
+  and replayable restoration checks the full raw-name namespace and inode IDs,
+  then restores file and directory owner/mode/times with the root exposed last.
+  The ext4 and Btrfs release probe covers nested entries, an unrecorded-file
+  refusal, repeated restore, and anchor isolation after an edit. Removal still
+  needs revision/Git pin checks, protected-root record retirement, release and
+  handoff-record cleanup, startup reconciliation, and the remaining ACL/xattr
+  fidelity gate before exposing a command.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

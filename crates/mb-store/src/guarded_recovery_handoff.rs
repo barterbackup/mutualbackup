@@ -2,19 +2,38 @@
 //! A caller still has to capture/isolate the private lower tree and claim the
 //! FUSE mount before advertising the recovered root as protected.
 
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, FileTimes};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AnchorError, ControlStore, NativeFileId, PinnedDirectory};
+use crate::{
+    AnchorError, ControlStore, GuardedViewEntryKind, GuardedViewMetadataEntry,
+    GuardedViewMetadataV1, NativeFileId, PinnedDirectory,
+};
 
 const HANDOFF_KIND: &str = "guarded-recovery-handoff-v1";
 const HANDOFF_RELEASE_KIND: &str = "guarded-recovery-handoff-release-v1";
+const HANDOFF_RELEASE_METADATA_KIND: &str = "guarded-recovery-handoff-release-metadata-v1";
+const RELEASE_METADATA_MAX_BYTES: usize = mb_core::V1_MAX_CATALOG_BYTES * 2 + 4096;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GuardedReleaseMetadataV1 {
+    format_version: u16,
+    handoff_id: Uuid,
+    anchor_id: Uuid,
+    handoff_hash: [u8; 32],
+    visible: GuardedViewMetadataV1,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GuardedRecoveryHandoff {
@@ -156,6 +175,107 @@ impl GuardedRecoveryHandoff {
         Ok(())
     }
 
+    fn release_metadata(
+        &self,
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> Result<GuardedViewMetadataV1> {
+        let bytes = control
+            .get_record(HANDOFF_RELEASE_METADATA_KIND, self.handoff_id.as_bytes())?
+            .context("guarded release lost its visible metadata")?;
+        ensure!(
+            bytes.len() <= RELEASE_METADATA_MAX_BYTES,
+            "guarded release metadata exceeds its local bound"
+        );
+        let record: GuardedReleaseMetadataV1 = mb_core::decode_canonical(&bytes)?;
+        record.visible.validate_shape()?;
+        ensure!(
+            record.format_version == 1
+                && record.handoff_id == self.handoff_id
+                && record.anchor_id == anchor_id
+                && record.handoff_hash
+                    == *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes()
+                && record.visible.anchor_id == anchor_id
+                && record.visible.lower_root_id == self.target_id,
+            "guarded release metadata differs from its handoff"
+        );
+        Ok(record.visible)
+    }
+
+    /// Freeze the stopped view's post-detach visible metadata before the
+    /// mount claim can retire. A retry must find the same snapshot; it cannot
+    /// substitute newer view state for a release already in progress.
+    pub fn prepare_release_metadata(
+        &self,
+        control: Arc<Mutex<ControlStore>>,
+        parent: &PinnedDirectory,
+        anchor_id: Uuid,
+    ) -> Result<GuardedViewMetadataV1> {
+        self.validate(parent, &parent.descriptor_path().canonicalize()?)?;
+        let placeholder = self
+            .placeholder_id
+            .context("guarded release has no placeholder")?;
+        {
+            let store = control
+                .lock()
+                .map_err(|_| std::io::Error::other("guarded release control lock is poisoned"))?;
+            ensure!(
+                Self::load(&store, self.handoff_id)?.as_ref() == Some(self),
+                "guarded release handoff changed"
+            );
+            crate::guarded_mount::require_active_claim_for_release(
+                &store,
+                anchor_id,
+                &self.lower_path(),
+                self.target_id,
+                &self.mountpoint(),
+                placeholder,
+            )?;
+        }
+        crate::GuardedViewMount::detach_stopped_files_for_release(anchor_id, Arc::clone(&control))?;
+        let visible = crate::GuardedViewMount::snapshot_stopped(anchor_id, Arc::clone(&control))?;
+        visible.validate_shape()?;
+        ensure!(
+            visible.anchor_id == anchor_id && visible.lower_root_id == self.target_id,
+            "guarded release view differs from its handoff"
+        );
+        let record = GuardedReleaseMetadataV1 {
+            format_version: 1,
+            handoff_id: self.handoff_id,
+            anchor_id,
+            handoff_hash: *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes(),
+            visible: visible.clone(),
+        };
+        let bytes = mb_core::canonical_bytes(&record)?;
+        ensure!(
+            bytes.len() <= RELEASE_METADATA_MAX_BYTES,
+            "guarded release metadata exceeds its local bound"
+        );
+        let store = control
+            .lock()
+            .map_err(|_| std::io::Error::other("guarded release control lock is poisoned"))?;
+        crate::guarded_mount::require_active_claim_for_release(
+            &store,
+            anchor_id,
+            &self.lower_path(),
+            self.target_id,
+            &self.mountpoint(),
+            placeholder,
+        )?;
+        if !store.put_record_if_absent(
+            HANDOFF_RELEASE_METADATA_KIND,
+            self.handoff_id.as_bytes(),
+            &bytes,
+        )? {
+            ensure!(
+                store.get_record(HANDOFF_RELEASE_METADATA_KIND, self.handoff_id.as_bytes())?
+                    == Some(bytes),
+                "guarded release visible metadata changed after preparation"
+            );
+        }
+        Ok(visible)
+    }
+
     /// Return the private lower tree to its original name after the guarded
     /// view has stopped, every live file has detached from immutable anchors,
     /// and the mount claim has retired. The durable release marker fences
@@ -187,6 +307,7 @@ impl GuardedRecoveryHandoff {
             &self.mountpoint(),
             self.placeholder_id.unwrap(),
         )?;
+        self.release_metadata(control, anchor_id)?;
         if parent.entry_identity(&self.lower_name, true)? == Some(self.target_id) {
             let lower = parent
                 .open_child_directory(&self.lower_name)?
@@ -262,6 +383,100 @@ impl GuardedRecoveryHandoff {
                 && parent.entry_identity(&self.target_name, true)? == Some(self.target_id),
             "guarded release failed to return the original directory"
         );
+        Ok(())
+    }
+
+    /// Apply the durable post-detach stopped-view snapshot to the returned
+    /// directory. This operation can replay after any partial ownership or
+    /// timestamp change. The root remains inaccessible to its ordinary owner
+    /// until all descendants have been restored.
+    pub fn restore_released_metadata(
+        &self,
+        control: &ControlStore,
+        parent: &PinnedDirectory,
+        anchor_id: Uuid,
+    ) -> Result<()> {
+        let visible = self.release_metadata(control, anchor_id)?;
+        visible.validate_shape()?;
+        ensure!(
+            visible.anchor_id == anchor_id
+                && visible.lower_root_id == self.target_id
+                && mb_core::canonical_bytes(&visible)?.len() <= RELEASE_METADATA_MAX_BYTES,
+            "guarded release metadata differs from its lower tree"
+        );
+        self.validate(parent, &parent.descriptor_path().canonicalize()?)?;
+        ensure!(
+            control.get_record(HANDOFF_RELEASE_KIND, self.handoff_id.as_bytes())?
+                == Some(mb_core::canonical_bytes(self)?),
+            "guarded release has no durable name handoff"
+        );
+        crate::guarded_mount::require_retired_claim_for_release(
+            control,
+            anchor_id,
+            &self.lower_path(),
+            self.target_id,
+            &self.mountpoint(),
+            self.placeholder_id
+                .context("guarded release lost its placeholder")?,
+        )?;
+        ensure!(
+            parent.entry_identity(&self.lower_name, true)?.is_none()
+                && parent.entry_identity(&self.target_name, true)? == Some(self.target_id),
+            "guarded lower tree has not returned to its original name"
+        );
+        let root = parent
+            .open_child_directory(&self.target_name)?
+            .context("guarded release target disappeared")?;
+        ensure!(
+            root.identity()? == self.target_id,
+            "guarded release target was replaced"
+        );
+        let root_stat = root.as_file().metadata()?;
+        let root_mode = root_stat.mode() & 0o7777;
+        if root_stat.uid() == visible.root_uid && root_mode != 0 {
+            ensure!(
+                root_mode == u32::from(visible.root_mode),
+                "guarded released root mode changed after exposure"
+            );
+            // Once the original owner can use the tree, a retry must not
+            // reapply old times or modes over subsequent ordinary edits.
+            return Ok(());
+        }
+        verify_release_namespace(&root, &visible)?;
+
+        // Parent directories are restored after their children, so metadata
+        // operations on a child cannot invalidate a parent's recorded mtime.
+        let mut entries = visible.entries.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| {
+            std::cmp::Reverse(entry.path.iter().filter(|b| **b == b'/').count())
+        });
+        for entry in entries {
+            let file = open_release_entry(&root, entry)?;
+            apply_release_metadata(&file, entry)?;
+        }
+        // Keep the root closed to the ordinary owner even if the process
+        // crashes between chown and the final mode installation.
+        root.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o000))?;
+        if unsafe {
+            libc::fchown(
+                root.as_file().as_raw_fd(),
+                visible.root_uid,
+                visible.root_gid,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error()).context("restore guarded root owner");
+        }
+        root.as_file().set_times(release_file_times(
+            visible.root_atime_secs,
+            visible.root_atime_nanos,
+            visible.root_modified_secs,
+            visible.root_modified_nanos,
+        )?)?;
+        root.as_file()
+            .set_permissions(fs::Permissions::from_mode(u32::from(visible.root_mode)))?;
+        root.sync_all()?;
         Ok(())
     }
 
@@ -403,6 +618,142 @@ impl GuardedRecoveryHandoff {
     pub fn mountpoint(&self) -> PathBuf {
         self.parent_path.join(&self.target_name)
     }
+}
+
+pub(crate) fn release_prepared_for_anchor(control: &ControlStore, anchor_id: Uuid) -> Result<bool> {
+    for (record_id, bytes) in control.records(HANDOFF_RELEASE_METADATA_KIND)? {
+        ensure!(
+            bytes.len() <= RELEASE_METADATA_MAX_BYTES,
+            "guarded release metadata exceeds its local bound"
+        );
+        let record: GuardedReleaseMetadataV1 = mb_core::decode_canonical(&bytes)?;
+        ensure!(
+            record.format_version == 1
+                && record.handoff_id.as_bytes() == record_id.as_slice()
+                && !record.anchor_id.is_nil(),
+            "guarded release metadata record is inconsistent"
+        );
+        if record.anchor_id == anchor_id {
+            let handoff = GuardedRecoveryHandoff::load(control, record.handoff_id)?
+                .context("guarded release lost its handoff")?;
+            handoff.release_metadata(control, anchor_id)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn open_release_entry(root: &PinnedDirectory, entry: &GuardedViewMetadataEntry) -> Result<File> {
+    let path = PathBuf::from(OsString::from_vec(entry.path.clone()));
+    let file = match entry.kind {
+        GuardedViewEntryKind::Directory => root
+            .open_descendant_directory(&path)?
+            .as_file()
+            .try_clone()?,
+        GuardedViewEntryKind::File => {
+            let parent_path = path
+                .parent()
+                .context("guarded release entry has no parent")?;
+            let parent = if parent_path.as_os_str().is_empty() {
+                root.try_clone()?
+            } else {
+                root.open_descendant_directory(parent_path)?
+            };
+            parent
+                .open_child_file(
+                    path.file_name()
+                        .context("guarded release entry has no name")?,
+                )?
+                .context("guarded release file disappeared")?
+        }
+    };
+    let stat = file.metadata()?;
+    ensure!(
+        NativeFileId {
+            filesystem_id: root.identity()?.filesystem_id,
+            inode: stat.ino(),
+        } == entry.native_id
+            && match entry.kind {
+                GuardedViewEntryKind::Directory => stat.is_dir(),
+                GuardedViewEntryKind::File =>
+                    stat.is_file() && stat.len() == entry.logical_len && stat.nlink() == 1,
+            },
+        "guarded release entry changed before metadata restoration"
+    );
+    Ok(file)
+}
+
+fn verify_release_namespace(root: &PinnedDirectory, visible: &GuardedViewMetadataV1) -> Result<()> {
+    let mut children = BTreeMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
+    children.insert(Vec::new(), BTreeSet::new());
+    for entry in &visible.entries {
+        let parent_end = entry.path.iter().rposition(|byte| *byte == b'/');
+        let (parent, name) = match parent_end {
+            Some(index) => (&entry.path[..index], &entry.path[index + 1..]),
+            None => (&[][..], entry.path.as_slice()),
+        };
+        children
+            .get_mut(parent)
+            .context("guarded release entry has no recorded parent")?
+            .insert(name.to_vec());
+        if entry.kind == GuardedViewEntryKind::Directory {
+            children.insert(entry.path.clone(), BTreeSet::new());
+        }
+        open_release_entry(root, entry)?;
+    }
+    for (path, expected) in children {
+        let directory = if path.is_empty() {
+            root.try_clone()?
+        } else {
+            root.open_descendant_directory(Path::new(OsStr::from_bytes(&path)))?
+        };
+        let actual = fs::read_dir(directory.descriptor_path())?
+            .map(|entry| Ok(entry?.file_name().as_bytes().to_vec()))
+            .collect::<std::io::Result<BTreeSet<_>>>()?;
+        ensure!(actual == expected, "guarded release namespace changed");
+    }
+    Ok(())
+}
+
+fn release_system_time(seconds: i64, nanos: u32) -> Result<SystemTime> {
+    let value = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
+    let magnitude = value.unsigned_abs();
+    let duration = Duration::new(
+        u64::try_from(magnitude / 1_000_000_000)?,
+        (magnitude % 1_000_000_000) as u32,
+    );
+    if value >= 0 {
+        UNIX_EPOCH.checked_add(duration)
+    } else {
+        UNIX_EPOCH.checked_sub(duration)
+    }
+    .context("guarded release timestamp is out of range")
+}
+
+fn release_file_times(
+    atime_secs: i64,
+    atime_nanos: u32,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+) -> Result<FileTimes> {
+    Ok(FileTimes::new()
+        .set_accessed(release_system_time(atime_secs, atime_nanos)?)
+        .set_modified(release_system_time(mtime_secs, mtime_nanos)?))
+}
+
+fn apply_release_metadata(file: &File, entry: &GuardedViewMetadataEntry) -> Result<()> {
+    if unsafe { libc::fchown(file.as_raw_fd(), entry.uid, entry.gid) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("restore guarded entry owner");
+    }
+    file.set_permissions(fs::Permissions::from_mode(u32::from(entry.mode)))?;
+    file.set_times(release_file_times(
+        entry.atime_secs,
+        entry.atime_nanos,
+        entry.modified_secs,
+        entry.modified_nanos,
+    )?)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]

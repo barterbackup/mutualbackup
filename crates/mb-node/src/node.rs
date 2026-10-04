@@ -25830,12 +25830,25 @@ pub(crate) mod tests {
             let data_dir = area.path().join("node");
             fs::create_dir(&target).unwrap();
             fs::write(target.join("sample"), b"in-place\r\n\0bytes").unwrap();
-            for path in [&target, &target.join("sample")] {
+            fs::create_dir(target.join("nested")).unwrap();
+            fs::write(target.join("nested/child"), b"nested\nbytes").unwrap();
+            for path in [
+                &target,
+                &target.join("sample"),
+                &target.join("nested"),
+                &target.join("nested/child"),
+            ] {
                 let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
                 assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
             }
             fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
             fs::set_permissions(target.join("sample"), fs::Permissions::from_mode(0o640)).unwrap();
+            fs::set_permissions(target.join("nested"), fs::Permissions::from_mode(0o750)).unwrap();
+            fs::set_permissions(
+                target.join("nested/child"),
+                fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
             let seed = Seed::from_bytes([stage + 220; 32]);
             let mut node = Node::open(&data_dir, seed.clone()).unwrap();
             let root_id = if stage == 0 {
@@ -25976,7 +25989,28 @@ pub(crate) mod tests {
                     )
                     .unwrap(),
                 ));
-                GuardedViewMount::detach_stopped_files_for_release(anchor_id, control).unwrap();
+                let visible = handoff
+                    .prepare_release_metadata(Arc::clone(&control), &parent, anchor_id)
+                    .unwrap();
+                assert_eq!(
+                    handoff
+                        .prepare_release_metadata(Arc::clone(&control), &parent, anchor_id)
+                        .unwrap(),
+                    visible
+                );
+                assert!(
+                    GuardedViewMount::recover_claimed(anchor_id, control).is_err(),
+                    "prepared release must fence guarded remount"
+                );
+                assert!(
+                    node.control
+                        .get_record(
+                            "guarded-recovery-handoff-release-metadata-v1",
+                            root_id.as_bytes(),
+                        )
+                        .unwrap()
+                        .is_some()
+                );
                 GuardedViewMount::retire_claim(anchor_id, &node.control).unwrap();
                 assert!(
                     handoff
@@ -26022,6 +26056,46 @@ pub(crate) mod tests {
                     b"in-place\r\n\0bytes"
                 );
                 assert_eq!(fs::metadata(&target).unwrap().uid(), 0);
+                if stage == 5 {
+                    fs::write(target.join("unrecorded"), b"must not be adopted").unwrap();
+                    assert!(
+                        handoff
+                            .restore_released_metadata(&node.control, &parent, anchor_id)
+                            .is_err()
+                    );
+                    assert_eq!(fs::metadata(&target).unwrap().uid(), 0);
+                    fs::remove_file(target.join("unrecorded")).unwrap();
+                }
+                handoff
+                    .restore_released_metadata(&node.control, &parent, anchor_id)
+                    .unwrap();
+                handoff
+                    .restore_released_metadata(&node.control, &parent, anchor_id)
+                    .unwrap();
+                assert_eq!(fs::metadata(&target).unwrap().uid(), 65534);
+                assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o755);
+                assert_eq!(
+                    fs::metadata(&target).unwrap().mtime(),
+                    visible.root_modified_secs
+                );
+                assert_eq!(
+                    fs::metadata(&target).unwrap().mtime_nsec(),
+                    i64::from(visible.root_modified_nanos)
+                );
+                assert_eq!(fs::metadata(target.join("sample")).unwrap().uid(), 65534);
+                assert_eq!(
+                    fs::metadata(target.join("sample")).unwrap().mode() & 0o7777,
+                    0o640
+                );
+                assert_eq!(fs::metadata(target.join("nested")).unwrap().uid(), 65534);
+                assert_eq!(
+                    fs::metadata(target.join("nested")).unwrap().mode() & 0o7777,
+                    0o750
+                );
+                assert_eq!(
+                    fs::read(target.join("nested/child")).unwrap(),
+                    b"nested\nbytes"
+                );
                 let manifest =
                     GuardedRootCapturePlan::load_published_manifest(&node.control, anchor_id)
                         .unwrap();
@@ -26030,6 +26104,13 @@ pub(crate) mod tests {
                 let mut retained = Vec::new();
                 anchor.open().unwrap().read_to_end(&mut retained).unwrap();
                 assert_eq!(retained, b"in-place\r\n\0bytes");
+                handoff
+                    .restore_released_metadata(&node.control, &parent, anchor_id)
+                    .unwrap();
+                assert_eq!(
+                    fs::read(target.join("sample")).unwrap(),
+                    b"independent released edit"
+                );
                 continue;
             }
             if stage == 0 {
@@ -26067,6 +26148,10 @@ pub(crate) mod tests {
                 assert_eq!(
                     fs::read(restored.join("sample")).unwrap(),
                     b"in-place\r\n\0bytes"
+                );
+                assert_eq!(
+                    fs::read(restored.join("nested/child")).unwrap(),
+                    b"nested\nbytes"
                 );
             }
             node.guarded_mounts.pop().unwrap().stop().unwrap();

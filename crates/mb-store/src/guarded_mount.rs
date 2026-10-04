@@ -783,6 +783,13 @@ impl GuardedViewMount {
                 pending_stopped_capture_attempts(&control, manifest.anchor_id)?.is_empty(),
                 "guarded view has a prepared capture to finish before remount"
             );
+            ensure!(
+                !crate::guarded_recovery_handoff::release_prepared_for_anchor(
+                    &control,
+                    manifest.anchor_id,
+                )?,
+                "guarded view has a prepared release and cannot remount"
+            );
             GuardedRootCapturePlan::load_active_for_view(&control, manifest)?
         };
         if let Some(metadata) = &requested_metadata {
@@ -1602,7 +1609,7 @@ impl GuardedViewMount {
         let _lifecycle = MOUNT_LIFECYCLE
             .lock()
             .map_err(|_| io::Error::other("guarded mount lifecycle lock is poisoned"))?;
-        let (claim_bytes, claim, manifest) = {
+        let (claim_bytes, claim, manifest, plan) = {
             let control = control
                 .lock()
                 .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
@@ -1627,7 +1634,7 @@ impl GuardedViewMount {
                     && claim.lower_id == plan.source_root_identity(),
                 "guarded mount claim differs from its source plan"
             );
-            (bytes, claim, manifest)
+            (bytes, claim, manifest, plan)
         };
         if let Some(mounted) = mounted_filesystem(&claim.mountpoint)? {
             ensure!(
@@ -1652,12 +1659,54 @@ impl GuardedViewMount {
             lower.identity()? == claim.lower_id && placeholder.identity()? == claim.mountpoint_id,
             "guarded mount paths changed before inspecting its source"
         );
-        let view = GuardedProbeView::from_guarded_capture(
+        let mut view = GuardedProbeView::from_guarded_capture(
             &manifest,
             Arc::clone(&control),
             claim.view_uid,
             claim.view_gid,
         )?;
+        let virtual_view = {
+            let store = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            if let Some(bytes) = store.get_record(VIRTUAL_METADATA_KIND, anchor_id.as_bytes())? {
+                ensure!(
+                    bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                    "guarded virtual metadata exceeds its local bound"
+                );
+                let metadata: GuardedViewMetadataV1 = mb_core::decode_canonical(&bytes)?;
+                validate_virtual_metadata_binding(&metadata, &manifest, &plan)?;
+                let baseline = store
+                    .get_record(VIRTUAL_TIME_BASELINE_KIND, anchor_id.as_bytes())?
+                    .map(|bytes| {
+                        ensure!(
+                            bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                            "guarded virtual time baseline exceeds its local bound"
+                        );
+                        Ok(mb_core::decode_canonical::<GuardedViewTimeBaselineV1>(
+                            &bytes,
+                        )?)
+                    })
+                    .transpose()?;
+                let max_inode = u64::try_from(manifest.entries.len())?
+                    .checked_add(2)
+                    .context("guarded virtual inode overflow")?;
+                let dirty_times = virtual_time_dirty_masks(&store, anchor_id, max_inode)?;
+                let dirty_sizes = virtual_directory_size_dirty_ids(&store, anchor_id, max_inode)?;
+                Some((metadata, baseline, dirty_times, dirty_sizes))
+            } else {
+                None
+            }
+        };
+        if let Some((metadata, baseline, dirty_times, dirty_sizes)) = virtual_view {
+            view.apply_virtual_metadata(
+                &metadata,
+                baseline.as_ref(),
+                &dirty_times,
+                &dirty_sizes,
+                false,
+            )?;
+        }
         let value = operation(&view, &claim, &manifest)?;
         let control = control
             .lock()
@@ -1749,6 +1798,36 @@ pub(crate) fn require_retired_claim_for_release(
             && claim.mountpoint == mountpoint
             && claim.mountpoint_id == mountpoint_id,
         "guarded release differs from its retired mount claim"
+    );
+    Ok(())
+}
+
+pub(crate) fn require_active_claim_for_release(
+    control: &ControlStore,
+    anchor_id: Uuid,
+    lower_root: &Path,
+    lower_id: NativeFileId,
+    mountpoint: &Path,
+    mountpoint_id: NativeFileId,
+) -> anyhow::Result<()> {
+    ensure!(
+        control
+            .get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())?
+            .is_none(),
+        "guarded release mount is already retired"
+    );
+    let bytes = control
+        .get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())?
+        .ok_or_else(|| anyhow::anyhow!("guarded release has no active mount claim"))?;
+    let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+    ensure!(
+        claim.version == 1
+            && claim.anchor_id == anchor_id
+            && claim.lower_root == lower_root
+            && claim.lower_id == lower_id
+            && claim.mountpoint == mountpoint
+            && claim.mountpoint_id == mountpoint_id,
+        "guarded release differs from its active mount claim"
     );
     Ok(())
 }
