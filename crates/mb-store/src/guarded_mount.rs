@@ -35,6 +35,7 @@ const STOPPED_CAPTURE_KIND: &str = "guarded-view-stopped-capture-v1";
 const STOPPED_FILE_CAPTURE_KIND: &str = "guarded-view-stopped-file-capture-v1";
 const GIT_ANCHOR_PIN_KIND: &str = "guarded-git-anchor-pin-v1";
 const GIT_ROOT_PIN_KIND: &str = "guarded-git-root-pin-v1";
+const GIT_RECOVERY_PIN_KIND: &str = "guarded-git-recovered-root-pin-v1";
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
 const GUARDED_REVISION_RETIREMENT_KIND: &str = "guarded-view-revision-retirement-v1";
 const STOPPED_CAPTURE_MAX_BYTES: usize = mb_core::V1_MAX_CATALOG_BYTES * 2 + 4096;
@@ -196,6 +197,43 @@ pub struct GuardedGitStagePin {
     pub worktree_id: Uuid,
     pub relative_path: Vec<u8>,
     pub git_mode: u32,
+}
+
+/// Node-owned half of an imported Git blob's move onto a recovered guarded
+/// root file. The same canonical record is retained as the catalog receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuardedGitRecoveryPin {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub oid: [u8; 20],
+    pub imported: FileAnchorManifest,
+    pub root_file: FileAnchorManifest,
+}
+
+impl GuardedGitRecoveryPin {
+    pub fn root_anchor_id(&self) -> anyhow::Result<Uuid> {
+        let backing = self
+            .root_file
+            .guarded_root_file
+            .as_ref()
+            .context("recovered Git pin has no root-file backing")?;
+        ensure!(
+            self.format_version == 1
+                && !self.repository_id.is_nil()
+                && self.imported.format_version == 1
+                && self.imported.guarded_root_file.is_none()
+                && self.root_file.format_version == 2
+                && !self.imported.anchor_id.is_nil()
+                && self.imported.anchor_id == self.root_file.anchor_id
+                && !backing.root_anchor_id.is_nil()
+                && backing.root_anchor_id != self.imported.anchor_id
+                && self.imported.area == self.root_file.area
+                && self.imported.logical_len == self.root_file.logical_len
+                && self.imported.content_hash == self.root_file.content_hash,
+            "invalid recovered Git root pin"
+        );
+        Ok(backing.root_anchor_id)
+    }
 }
 
 fn valid_git_stage_path(bytes: &[u8]) -> bool {
@@ -1898,6 +1936,92 @@ impl GuardedViewMount {
         Ok(pins)
     }
 
+    /// Pin a recovered root file before the Git catalog replaces its imported
+    /// blob mapping. Replay can finish the catalog transition from this exact
+    /// record if the process stops between the two database writes.
+    pub fn pin_recovered_git_blob(
+        control: &ControlStore,
+        pin: &GuardedGitRecoveryPin,
+    ) -> anyhow::Result<()> {
+        let root_anchor_id = pin.root_anchor_id()?;
+        let encoded = mb_core::canonical_bytes(pin)?;
+        if let Some(existing) =
+            control.get_record(GIT_RECOVERY_PIN_KIND, pin.imported.anchor_id.as_bytes())?
+        {
+            ensure!(
+                existing == encoded,
+                "recovered Git anchor has another owner"
+            );
+            ensure!(
+                Self::all_git_recovery_pins(control)?.contains(pin),
+                "recovered Git anchor lost its root pin"
+            );
+            return Ok(());
+        }
+        let backing = pin
+            .root_file
+            .guarded_root_file
+            .as_ref()
+            .expect("validated backing");
+        let verified = GuardedRootCapturePlan::verified_git_file_manifest(
+            control,
+            root_anchor_id,
+            pin.imported.anchor_id,
+            &backing.captured_relative_path,
+        )?;
+        ensure!(
+            verified == pin.root_file
+                && pin.imported.open_verified()?.metadata()?.len() == pin.imported.logical_len
+                && git_anchor_pin(control, pin.imported.anchor_id)?.is_none(),
+            "recovered Git pin differs from its imported or root file"
+        );
+        let root_pin = GuardedGitRootPin {
+            format_version: 1,
+            repository_id: pin.repository_id,
+            root_anchor_id,
+        };
+        if let Some((_, existing)) = git_root_pin(control, root_anchor_id)? {
+            ensure!(existing == root_pin, "recovered Git root has another owner");
+        }
+        control.put_records_and_delete(
+            &[
+                (
+                    GIT_RECOVERY_PIN_KIND.to_owned(),
+                    pin.imported.anchor_id.as_bytes().to_vec(),
+                    encoded,
+                ),
+                (
+                    GIT_ROOT_PIN_KIND.to_owned(),
+                    root_anchor_id.as_bytes().to_vec(),
+                    mb_core::canonical_bytes(&root_pin)?,
+                ),
+            ],
+            &[],
+        )?;
+        Ok(())
+    }
+
+    pub fn all_git_recovery_pins(
+        control: &ControlStore,
+    ) -> anyhow::Result<Vec<GuardedGitRecoveryPin>> {
+        let mut pins = Vec::new();
+        for (id, bytes) in control.records(GIT_RECOVERY_PIN_KIND)? {
+            let pin: GuardedGitRecoveryPin = mb_core::decode_canonical(&bytes)?;
+            let root_anchor_id = pin.root_anchor_id()?;
+            ensure!(
+                id == pin.imported.anchor_id.as_bytes()
+                    && mb_core::canonical_bytes(&pin)? == bytes
+                    && git_anchor_pin(control, pin.imported.anchor_id)?.is_none()
+                    && git_root_pin(control, root_anchor_id)?
+                        .is_some_and(|(_, root)| root.repository_id == pin.repository_id),
+                "recovered Git pin lost its root ownership"
+            );
+            pins.push(pin);
+        }
+        pins.sort_by_key(|pin| pin.imported.anchor_id);
+        Ok(pins)
+    }
+
     /// Retire a node-owned Git pin only after the caller proves that the Git
     /// catalog no longer maps this anchor and no signed revision or recipe
     /// needs it. The root pin leaves with the last file pin for that root.
@@ -1967,6 +2091,9 @@ impl GuardedViewMount {
                 }
             }
         }
+        other_files |= Self::all_git_recovery_pins(control)?
+            .iter()
+            .any(|other| other.root_anchor_id().ok() == Some(pin.root_anchor_id));
         let deletions = if other_files {
             Vec::new()
         } else {

@@ -43,8 +43,9 @@ pub use database::{
 };
 #[cfg(target_os = "linux")]
 pub use guarded_mount::{
-    GUARDED_REVISION_CAPTURE_KIND, GuardedGitStagePin, GuardedRevisionCaptureV1,
-    GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewBinding, GuardedViewMount,
+    GUARDED_REVISION_CAPTURE_KIND, GuardedGitRecoveryPin, GuardedGitStagePin,
+    GuardedRevisionCaptureV1, GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewBinding,
+    GuardedViewMount,
 };
 #[cfg(target_os = "linux")]
 pub use guarded_recovery_handoff::{

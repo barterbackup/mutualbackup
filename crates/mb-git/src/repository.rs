@@ -7,12 +7,12 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use git2::Oid;
-#[cfg(target_os = "linux")]
-use mb_store::GuardedGitStagePin;
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
     GIT_CATALOG_MARKER_FILE, PinnedDirectory, SourceBackendKind, git_catalog_marker_bytes,
 };
+#[cfg(target_os = "linux")]
+use mb_store::{GuardedGitRecoveryPin, GuardedGitStagePin};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -63,7 +63,8 @@ use crate::stage::{
 };
 #[cfg(target_os = "linux")]
 use crate::stage::{
-    guarded_catalog_stage_pins, guarded_stage_receipt_matches, publish_guarded_stage_for_scope,
+    guarded_catalog_recovery_rebinds, guarded_catalog_stage_pins, guarded_stage_receipt_matches,
+    publish_guarded_stage_for_scope, rebind_recovered_guarded_blob,
 };
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
@@ -982,6 +983,37 @@ impl GitRepository {
             return Err(RepositoryError::Conflict);
         }
         Ok(guarded_catalog_stage_pins(
+            &self.catalog,
+            self.repository_id,
+        )?)
+    }
+
+    /// The catalog side of a recovered Git blob's root-backed handoff. Node
+    /// control must durably pin the matching root before calling this.
+    #[cfg(target_os = "linux")]
+    pub fn rebind_recovered_guarded_blob(
+        &self,
+        record: &GuardedGitRecoveryPin,
+    ) -> Result<(), RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1
+            || record.repository_id != self.repository_id
+            || self.has_pending_guarded_prune_catalog()?
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(rebind_recovered_guarded_blob(&self.catalog, record)?)
+    }
+
+    /// Enumerate the catalog's recovered root-backed mappings for independent
+    /// comparison with node-owned pins during startup and prune.
+    #[cfg(target_os = "linux")]
+    pub fn guarded_catalog_recovery_rebinds(
+        &self,
+    ) -> Result<Vec<GuardedGitRecoveryPin>, RepositoryError> {
+        if self.source_backend != SourceBackendKind::GuardedLinkFreezeV1 {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(guarded_catalog_recovery_rebinds(
             &self.catalog,
             self.repository_id,
         )?)

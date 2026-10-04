@@ -16,13 +16,13 @@ use std::path::{Component, Path, PathBuf};
 
 use git2::Oid;
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
-#[cfg(target_os = "linux")]
-use mb_store::GuardedGitStagePin;
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
     NativeFileId, PinnedDirectory, SourceBackendKind, SourceFileCaptureError,
     SourceFileCapturePlan,
 };
+#[cfg(target_os = "linux")]
+use mb_store::{GuardedGitRecoveryPin, GuardedGitStagePin};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -53,6 +53,100 @@ const WORKTREE_INDEX_PREFIX: &str = "git-worktree-index-entry-v1/";
 const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
 #[cfg(target_os = "linux")]
 const GUARDED_STAGE_RECEIPT_PREFIX: &str = "git-guarded-stage-receipt-v1/";
+#[cfg(target_os = "linux")]
+const GUARDED_RECOVERY_REBIND_PREFIX: &str = "git-guarded-recovery-rebind-v1/";
+
+#[cfg(target_os = "linux")]
+fn guarded_recovery_rebind_kind(repository_id: Uuid) -> String {
+    format!("{GUARDED_RECOVERY_REBIND_PREFIX}{repository_id}")
+}
+
+#[cfg(target_os = "linux")]
+fn validate_recovery_rebind(record: &GuardedGitRecoveryPin) -> Result<Oid, StageError> {
+    record
+        .root_anchor_id()
+        .map_err(|_| StageError::IncompatibleRecord)?;
+    Oid::from_bytes(&record.oid).map_err(|_| StageError::IncompatibleRecord)
+}
+
+/// Validate every durable recovered mapping without needing the imported
+/// payload, which may have been physically retired after publication.
+#[cfg(target_os = "linux")]
+pub(crate) fn guarded_catalog_recovery_rebinds(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<GuardedGitRecoveryPin>, StageError> {
+    if repository_id.is_nil() {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let mut rebinds = Vec::new();
+    for (key, bytes) in control.records(&guarded_recovery_rebind_kind(repository_id))? {
+        let record: GuardedGitRecoveryPin = decode_canonical(&bytes)?;
+        let oid = validate_recovery_rebind(&record)?;
+        if record.repository_id != repository_id
+            || key != record.imported.anchor_id.as_bytes()
+            || canonical_bytes(&record)? != bytes
+            || control.get_record(
+                &object_kind(repository_id, oid),
+                record.root_file.anchor_id.as_bytes(),
+            )? != Some(canonical_bytes(&record.root_file)?)
+        {
+            return Err(StageError::IncompatibleRecord);
+        }
+        rebinds.push(record);
+    }
+    rebinds.sort_by_key(|record| record.imported.anchor_id);
+    Ok(rebinds)
+}
+
+/// Atomically replace an imported blob's object map with a verified virtual
+/// root-file mapping and publish the catalog receipt. A caller must establish
+/// a node-owned root pin before this operation and retire the imported payload
+/// only after both halves match on replay.
+#[cfg(target_os = "linux")]
+pub(crate) fn rebind_recovered_guarded_blob(
+    control: &ControlStore,
+    record: &GuardedGitRecoveryPin,
+) -> Result<(), StageError> {
+    let oid = validate_recovery_rebind(record)?;
+    let kind = object_kind(record.repository_id, oid);
+    let key = record.imported.anchor_id.as_bytes();
+    let receipt_kind = guarded_recovery_rebind_kind(record.repository_id);
+    let encoded = canonical_bytes(record)?;
+    let virtual_bytes = canonical_bytes(&record.root_file)?;
+    if let Some(existing) = control.get_record(&receipt_kind, key)? {
+        if existing != encoded || control.get_record(&kind, key)? != Some(virtual_bytes) {
+            return Err(StageError::IncompatibleRecord);
+        }
+        return Ok(());
+    }
+    if guarded_catalog_stage_pins(control, record.repository_id)?
+        .iter()
+        .any(|pin| pin.manifest.anchor_id == record.imported.anchor_id)
+        || control
+            .records_with_kind_prefix(&object_kind_prefix(record.repository_id))?
+            .iter()
+            .any(|(mapped_kind, mapped_key, _)| mapped_key == key && mapped_kind != &kind)
+        || blob_oid_from_anchor(&record.imported)? != oid
+        || blob_oid_from_anchor(&record.root_file)? != oid
+    {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let imported_bytes = canonical_bytes(&record.imported)?;
+    if control.get_record(&kind, key)? != Some(imported_bytes.clone()) {
+        return Err(StageError::IncompatibleRecord);
+    }
+    control.put_records_and_retire_if_value(
+        &[
+            (kind.clone(), key.to_vec(), virtual_bytes),
+            (receipt_kind, key.to_vec(), encoded),
+        ],
+        &kind,
+        key,
+        &imported_bytes,
+    )?;
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) fn guarded_stage_receipt_kind(repository_id: Uuid) -> String {
@@ -126,6 +220,11 @@ pub(crate) fn guarded_catalog_stage_pins(
     }
     let mut pins = Vec::new();
     let mut by_anchor = std::collections::HashMap::new();
+    let recovered = guarded_catalog_recovery_rebinds(control, repository_id)?;
+    let recovered_by_anchor = recovered
+        .iter()
+        .map(|record| (record.root_file.anchor_id, record))
+        .collect::<std::collections::HashMap<_, _>>();
     let kind = guarded_stage_receipt_kind(repository_id);
     for (key, bytes) in control.records(&kind)? {
         let receipt: GuardedStageReceipt = decode_canonical(&bytes)?;
@@ -161,15 +260,30 @@ pub(crate) fn guarded_catalog_stage_pins(
     {
         let manifest: FileAnchorManifest = decode_canonical(&bytes)?;
         if manifest.guarded_root_file.is_some() {
-            let (pin, oid) = by_anchor
-                .get(&manifest.anchor_id)
-                .ok_or(StageError::IncompatibleRecord)?;
-            let oid = Oid::from_bytes(oid).map_err(|_| StageError::IncompatibleRecord)?;
-            if key != manifest.anchor_id.as_bytes()
-                || manifest != pin.manifest
-                || kind != object_kind(repository_id, oid)
-            {
-                return Err(StageError::IncompatibleRecord);
+            match (
+                by_anchor.get(&manifest.anchor_id),
+                recovered_by_anchor.get(&manifest.anchor_id),
+            ) {
+                (Some((pin, oid)), None) => {
+                    let oid = Oid::from_bytes(oid).map_err(|_| StageError::IncompatibleRecord)?;
+                    if key != manifest.anchor_id.as_bytes()
+                        || manifest != pin.manifest
+                        || kind != object_kind(repository_id, oid)
+                    {
+                        return Err(StageError::IncompatibleRecord);
+                    }
+                }
+                (None, Some(rebind)) => {
+                    let oid =
+                        Oid::from_bytes(&rebind.oid).map_err(|_| StageError::IncompatibleRecord)?;
+                    if key != manifest.anchor_id.as_bytes()
+                        || manifest != rebind.root_file
+                        || kind != object_kind(repository_id, oid)
+                    {
+                        return Err(StageError::IncompatibleRecord);
+                    }
+                }
+                _ => return Err(StageError::IncompatibleRecord),
             }
         }
     }

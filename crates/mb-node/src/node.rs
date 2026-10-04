@@ -39,7 +39,7 @@ use mb_store::{
 };
 #[cfg(target_os = "linux")]
 use mb_store::{
-    GuardedFileCapturePlan, GuardedRecoveryHandoff, GuardedRootCapturePlan,
+    GuardedFileCapturePlan, GuardedGitRecoveryPin, GuardedRecoveryHandoff, GuardedRootCapturePlan,
     GuardedStoppedCaptureV1, GuardedViewMetadataV1, GuardedViewMount,
 };
 use rand::RngCore;
@@ -525,6 +525,9 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     #[cfg(target_os = "linux")]
     static INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static INTERRUPT_AFTER_GUARDED_GIT_RECOVERY_PIN: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -1570,6 +1573,8 @@ impl Node {
         node.reconcile_guarded_git_prunes()?;
         #[cfg(target_os = "linux")]
         node.audit_guarded_git_file_gc()?;
+        #[cfg(target_os = "linux")]
+        node.reconcile_guarded_git_rebinds()?;
         #[cfg(target_os = "linux")]
         node.reconcile_guarded_git_stages()?;
         node.reconcile_garbage_collection()?;
@@ -2789,6 +2794,97 @@ impl Node {
     }
 
     #[cfg(target_os = "linux")]
+    fn reconcile_guarded_git_rebinds(&self) -> Result<()> {
+        let recipe_pins = git_prune_recipe_anchor_ids(&self.control)?;
+        for pin in GuardedViewMount::all_git_recovery_pins(&self.control)? {
+            anyhow::ensure!(
+                !recipe_pins.contains(&pin.imported.anchor_id),
+                "recovered Git imported anchor still owns a sector recipe"
+            );
+            let oid = git2::Oid::from_bytes(&pin.oid)?;
+            anyhow::ensure!(
+                mb_git::blob_oid_from_anchor(&pin.root_file)? == oid,
+                "recovered Git root file differs from its pinned blob"
+            );
+            let repository = GitRepository::open_with_backend(
+                &pin.root_file.source_root_hint,
+                pin.repository_id,
+                &self.git_catalog_key(pin.repository_id),
+                SourceBackendKind::GuardedLinkFreezeV1,
+            )?;
+            repository.rebind_recovered_guarded_blob(&pin)?;
+            anyhow::ensure!(
+                repository
+                    .guarded_catalog_recovery_rebinds()?
+                    .contains(&pin),
+                "recovered Git catalog lost its root-backed receipt"
+            );
+            pin.imported.remove()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rebind_guarded_recovered_blobs(
+        &self,
+        root_manifest: &mb_store::StableAnchorManifest,
+        repository: &GitRepository,
+        descriptor: &GitBackupDescriptor,
+    ) -> Result<()> {
+        let recipe_pins = git_prune_recipe_anchor_ids(&self.control)?;
+        let mut root_paths_by_oid = BTreeMap::new();
+        for entry in &root_manifest.entries {
+            if let mb_store::CapturedEntry::FileV2 { path, .. } = entry {
+                let candidate = GuardedRootCapturePlan::verified_git_file_manifest(
+                    &self.control,
+                    root_manifest.anchor_id,
+                    Uuid::new_v4(),
+                    path,
+                )?;
+                root_paths_by_oid
+                    .entry(mb_git::blob_oid_from_anchor(&candidate)?)
+                    .or_insert_with(|| path.clone());
+            }
+        }
+        let signed_oids = descriptor
+            .blobs
+            .iter()
+            .map(|blob| blob.oid)
+            .collect::<BTreeSet<_>>();
+        for blob in repository.export_graph_source()?.blobs {
+            if !signed_oids.contains(&blob.oid)
+                || blob.anchor.guarded_root_file.is_some()
+                || recipe_pins.contains(&blob.anchor.anchor_id)
+            {
+                continue;
+            }
+            let oid = git2::Oid::from_bytes(&blob.oid)?;
+            let Some(path) = root_paths_by_oid.get(&oid) else {
+                continue;
+            };
+            let root_file = GuardedRootCapturePlan::verified_git_file_manifest(
+                &self.control,
+                root_manifest.anchor_id,
+                blob.anchor.anchor_id,
+                path,
+            )?;
+            let pin = GuardedGitRecoveryPin {
+                format_version: 1,
+                repository_id: descriptor.repository_id,
+                oid: blob.oid,
+                imported: blob.anchor,
+                root_file,
+            };
+            GuardedViewMount::pin_recovered_git_blob(&self.control, &pin)?;
+        }
+        #[cfg(test)]
+        if INTERRUPT_AFTER_GUARDED_GIT_RECOVERY_PIN.with(|interrupt| interrupt.replace(false)) {
+            anyhow::bail!("injected interruption after recovered Git root pin");
+        }
+        self.reconcile_guarded_git_rebinds()
+    }
+
+    #[cfg(target_os = "linux")]
     fn reconcile_guarded_git_stages(&self) -> Result<()> {
         let mut by_repository = BTreeMap::<Uuid, Vec<mb_store::GuardedGitStagePin>>::new();
         for pin in GuardedViewMount::all_git_stage_pins(&self.control)? {
@@ -2833,6 +2929,14 @@ impl Node {
                 &self.git_catalog_key(repository_id),
                 SourceBackendKind::GuardedLinkFreezeV1,
             )?;
+            let recovered = GuardedViewMount::all_git_recovery_pins(&self.control)?;
+            let expected = recovered
+                .into_iter()
+                .filter(|pin| pin.repository_id == repository_id)
+                .collect::<Vec<_>>();
+            if repository.guarded_catalog_recovery_rebinds()? != expected {
+                anyhow::bail!("recovered Git root-backed mapping lost its node-owned pin");
+            }
             if repository.has_pending_guarded_prune_catalog()? {
                 anyhow::bail!("guarded Git catalog prune lost its node retirement fence");
             }
@@ -3577,6 +3681,12 @@ impl Node {
         protected: &GitPruneRoots,
     ) -> Result<GitPruneReport> {
         self.reconcile_guarded_git_prunes()?;
+        anyhow::ensure!(
+            !GuardedViewMount::all_git_recovery_pins(&self.control)?
+                .iter()
+                .any(|pin| pin.repository_id == repository_id),
+            "guarded Git prune waits for recovered root-pin retirement support"
+        );
         self.reconcile_guarded_git_stages()?;
         let repository = self.open_guarded_git_repository(repository_id)?;
         let mut report = GitPruneReport {
@@ -3712,6 +3822,18 @@ impl Node {
         intent: &GuardedGitPruneIntentV1,
         bytes: &[u8],
     ) -> Result<()> {
+        let recovery_pins = GuardedViewMount::all_git_recovery_pins(&self.control)?;
+        anyhow::ensure!(
+            !intent
+                .batch
+                .anchors
+                .iter()
+                .any(|candidate| recovery_pins.iter().any(|pin| {
+                    pin.repository_id == intent.repository_id
+                        && pin.root_file.anchor_id == candidate.manifest.anchor_id
+                })),
+            "guarded Git prune cannot retire a recovered root-backed mapping"
+        );
         intent.validate(intent.repository_id.as_bytes())?;
         anyhow::ensure!(
             self.control
@@ -15547,6 +15669,9 @@ impl Node {
                 &manifest,
                 git_backup.zip(repository.as_ref()),
             )?;
+            if let (Some(descriptor), Some(repository)) = (git_backup, repository.as_ref()) {
+                self.rebind_guarded_recovered_blobs(&manifest, repository, descriptor)?;
+            }
             #[cfg(test)]
             if INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.replace(false)) {
                 anyhow::bail!("injected interruption after guarded recovery capture");
@@ -28985,7 +29110,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
-        INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.set(true));
+        INTERRUPT_AFTER_GUARDED_GIT_RECOVERY_PIN.with(|interrupt| interrupt.set(true));
         assert!(
             git_node
                 .restore_recovered_revision(
@@ -28997,6 +29122,28 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert!(git_node.protected_root_by_id(protected_root_id).is_err());
+        assert_eq!(
+            GuardedViewMount::all_git_recovery_pins(&git_node.control)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(git_node);
+        let mut git_node = Node::open(&git_data_dir, Seed::from_bytes([241; 32])).unwrap();
+        let replayed_pins = GuardedViewMount::all_git_recovery_pins(&git_node.control).unwrap();
+        assert_eq!(replayed_pins.len(), 1);
+        assert!(replayed_pins[0].imported.open_verified().is_err());
+        INTERRUPT_AFTER_GUARDED_RECOVERY_CAPTURE.with(|interrupt| interrupt.set(true));
+        assert!(
+            git_node
+                .restore_recovered_revision(
+                    &git_checkpoint_hash,
+                    guild_id,
+                    &git_signed,
+                    &git_target
+                )
+                .is_err()
+        );
         drop(git_node);
         let mut git_node = Node::open(&git_data_dir, Seed::from_bytes([241; 32])).unwrap();
         git_node
@@ -29018,6 +29165,7 @@ pub(crate) mod tests {
         assert_eq!(recovered_graph.refs, git_descriptor.refs);
         assert_eq!(recovered_graph.objects, git_descriptor.objects);
         assert_eq!(recovered_graph.blobs.len(), 1);
+        assert_eq!(recovered_graph.blobs[0].anchor.format_version, 2);
         assert_eq!(
             mb_git::blob_oid_from_anchor(&recovered_graph.blobs[0].anchor)
                 .unwrap()
@@ -29035,6 +29183,26 @@ pub(crate) mod tests {
         let recipe_anchors = git_prune_recipe_anchor_ids(&git_node.control).unwrap();
         assert!(recipe_anchors.contains(&signed_root_manifest.anchor_id));
         assert!(!recipe_anchors.contains(&recovered_graph.blobs[0].anchor.anchor_id));
+        assert_eq!(
+            recovered_graph.blobs[0]
+                .anchor
+                .guarded_root_file
+                .as_ref()
+                .unwrap()
+                .root_anchor_id,
+            signed_root_manifest.anchor_id
+        );
+        assert_eq!(
+            git_catalog.guarded_catalog_recovery_rebinds().unwrap(),
+            GuardedViewMount::all_git_recovery_pins(&git_node.control).unwrap()
+        );
+        assert!(
+            git_node
+                .git_prune(protected_root_id)
+                .unwrap_err()
+                .to_string()
+                .contains("recovered root-pin retirement")
+        );
         let virtual_blob = mb_store::GuardedRootCapturePlan::verified_git_file_manifest(
             &git_node.control,
             signed_root_manifest.anchor_id,
@@ -29104,6 +29272,31 @@ pub(crate) mod tests {
                 .unwrap()
                 .starts_with(b"GIT!")
         );
+        let recovered_pin = GuardedViewMount::all_git_recovery_pins(&git_node.control)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let pin_bytes = canonical_bytes(&recovered_pin).unwrap();
+        git_node
+            .control
+            .delete_record_if_value(
+                "guarded-git-recovered-root-pin-v1",
+                recovered_pin.imported.anchor_id.as_bytes(),
+                &pin_bytes,
+            )
+            .unwrap();
+        assert!(git_node.reconcile_guarded_git_stages().is_err());
+        assert!(
+            git_node
+                .control
+                .put_record_if_absent(
+                    "guarded-git-recovered-root-pin-v1",
+                    recovered_pin.imported.anchor_id.as_bytes(),
+                    &pin_bytes,
+                )
+                .unwrap()
+        );
+        git_node.reconcile_guarded_git_stages().unwrap();
         drop(git_node);
         recovered.check_guarded_mounts().unwrap();
         assert!(fs::read(view.join("sample")).unwrap().starts_with(b"EDIT"));

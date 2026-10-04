@@ -18,9 +18,9 @@ use crate::fetch::{FetchError, has_pending_fetch};
 use crate::history::{HistoryError, export_graph_source, metadata_kind, verified_metadata_ids};
 use crate::merge::{MergeBlobError, has_merge_session, has_pending_merge_blob};
 use crate::stage::{
-    StageError, guarded_catalog_stage_pins, guarded_stage_receipt_kind, has_pending_stages,
-    has_pending_stages_for_scope, object_kind, object_kind_prefix, staged_entries,
-    staged_entries_for_scope, worktree_scopes_with_stage_state,
+    StageError, guarded_catalog_recovery_rebinds, guarded_catalog_stage_pins,
+    guarded_stage_receipt_kind, has_pending_stages, has_pending_stages_for_scope, object_kind,
+    object_kind_prefix, staged_entries, staged_entries_for_scope, worktree_scopes_with_stage_state,
 };
 
 const INTENT_PREFIX: &str = "git-prune-intent-v1/";
@@ -238,6 +238,14 @@ pub(crate) fn retire_guarded_prune_catalog(
     }
 
     let receipts = guarded_catalog_stage_pins(control, batch.repository_id)?;
+    let recovered = guarded_catalog_recovery_rebinds(control, batch.repository_id)?;
+    if batch.anchors.iter().any(|candidate| {
+        recovered
+            .iter()
+            .any(|pin| pin.root_file.anchor_id == candidate.manifest.anchor_id)
+    }) {
+        return Err(GitPruneError::PendingOperation);
+    }
     let by_attempt = receipts
         .iter()
         .map(|pin| (pin.attempt_id, pin))

@@ -122,23 +122,27 @@
   and blob, hides the catalog from
   the FUSE view, interrupts after recipe installation, reopens to finish the
   mount, then edits the visible file without changing its signed blob or
-  sector recipes and reopens the completed recovery. Finish graph capture,
-  native-anchor pinning, root-backed virtual-locator rebind, and proof that
-  recovery leaves no second permanent payload copy before lifting the
-  production signing guard. A provisioned five-member seed-only network
-  recovery gate for format 7 also remains open. Linux Git blob recovery streams
-  verified sectors into a sparse native anchor without a temporary worktree
-  payload or reflink; moving an identical Git blob's catalog mapping onto the
-  recovered root file anchor remains open. When a signed Git sector
+  sector recipes and reopens the completed recovery. Finish production graph
+  capture and pinning, recovered-root prune/retirement, and broader no-duplicate
+  payload proof before lifting the production signing guard. A provisioned
+  five-member seed-only network recovery gate for format 7 also remains open.
+  Linux Git blob recovery streams verified sectors into a sparse native anchor
+  without a temporary worktree payload or reflink. When a signed Git sector
   is also a visible guarded-file sector, recovery now retains the root-anchor
   recipe instead of replacing it with the imported Git anchor. The privileged
   ext4 and Btrfs probe confirms that the imported anchor no longer owns those
   sector recipes after the mount. The store now derives a verified virtual Git
-  manifest from a published, still-frozen root file without another hard link;
-  the ext4 and Btrfs recovery probes confirm its blob ID and reject a new
-  mapping after the visible file becomes editable. A durable catalog mapping
-  and pin handoff must still move the Git blob to that root anchor and retire
-  the imported payload before this storage gate closes.
+  manifest from a published, still-frozen root file without another hard link.
+  The node now durably pins that root before the catalog atomically changes the
+  imported blob's mapping to the virtual manifest under the same object-map ID.
+  Startup replays a crash after the pin write, checks the catalog receipt against
+  the node pin, and removes the unreferenced imported payload. The privileged
+  ext4 and Btrfs recovery probes confirm the imported anchor is gone, the
+  signed blob remains readable after a visible edit and daemon reopen, and a
+  new virtual mapping is rejected once the file becomes editable. Guarded
+  prune currently refuses repositories with recovered root pins; add their
+  receipt and root-pin retirement to the fenced prune protocol before closing
+  the physical-deletion gate.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
