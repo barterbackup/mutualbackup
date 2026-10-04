@@ -704,6 +704,11 @@ Proactive background repair comes later.
   immutable source bytes, metadata, source filesystem capabilities, restore
   behavior, and reachability pins. Every backend must capture and restore file
   content byte-for-byte; a backend that cannot do so rejects the operation.
+  Verify the captured bytes before publishing an index entry or revision and
+  the restored bytes before replacing a worktree file. A mismatch is an
+  operation failure, never a reason to normalize line endings or run a Git
+  filter to make the file match an expected blob. This contract also applies
+  to guarded link-freeze and future Windows and macOS backends.
   Keep blocking filesystem work in bounded workers and keep the signed guild
   protocol independent of backend choice.
   The existing reflink root is the first implementation; Git history consumes
