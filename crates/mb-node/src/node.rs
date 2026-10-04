@@ -1293,7 +1293,7 @@ impl Node {
                 anyhow::bail!("daemon is not supervising every claimed guarded view");
             }
             for mount in &self.guarded_mounts {
-                mount.check_health()?;
+                mount.verified_binding(&self.control)?;
             }
         }
         Ok(())
@@ -24613,6 +24613,35 @@ pub(crate) mod tests {
         drop(node);
 
         let reopened = Node::open(&data_dir, seed.clone()).unwrap();
+        reopened.check_guarded_mounts().unwrap();
+        let binding = reopened.guarded_mounts[0]
+            .verified_binding(&reopened.control)
+            .unwrap();
+        assert_eq!(binding.anchor_id, manifest.anchor_id);
+        assert_eq!(binding.lower_root, lower);
+        assert_eq!(binding.mountpoint, view);
+        let claim = reopened
+            .control
+            .get_record("guarded-view-mount-v1", manifest.anchor_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        reopened
+            .control
+            .put_record(
+                "guarded-view-mount-v1",
+                manifest.anchor_id.as_bytes(),
+                &[0xff],
+            )
+            .unwrap();
+        assert!(reopened.check_guarded_mounts().is_err());
+        reopened
+            .control
+            .put_record(
+                "guarded-view-mount-v1",
+                manifest.anchor_id.as_bytes(),
+                &claim,
+            )
+            .unwrap();
         reopened.check_guarded_mounts().unwrap();
         let visible = Command::new("cat")
             .uid(65534)

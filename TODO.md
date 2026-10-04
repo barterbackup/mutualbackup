@@ -549,6 +549,13 @@
   instead of remounted. A privileged node test verifies clean startup
   recovery, detection of an externally detached view, another restart,
   ordinary-user edit, and claim retirement on ext4 and fresh local Btrfs.
+  The live mount now retains its exact durable claim. The daemon health check
+  verifies that claim has not changed and that the private lower directory
+  still has its recorded native identity; it exposes that verified binding
+  for the eventual protected-root enrollment path. The privileged node
+  restart test now corrupts the claim while FUSE remains live and confirms
+  fail-closed health, then restores it. That test passes locally on ext4 and
+  disposable Btrfs, as do normal store tests and strict workspace Clippy.
   Guarded root enrollment and seed-only recovery of mutable view state still
   need their own implementation and acceptance gate.
   A disposable local pre-opened-descriptor probe exposed an enrollment

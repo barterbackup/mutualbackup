@@ -42,7 +42,7 @@ pub use database::{
 #[cfg(target_os = "linux")]
 pub use guarded_mount::{
     GUARDED_REVISION_CAPTURE_KIND, GuardedRevisionCaptureV1, GuardedStoppedCaptureV1,
-    GuardedStoppedFileV1, GuardedViewMount,
+    GuardedStoppedFileV1, GuardedViewBinding, GuardedViewMount,
 };
 #[cfg(target_os = "linux")]
 pub use guarded_view_probe::{

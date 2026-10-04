@@ -63,6 +63,20 @@ pub struct GuardedViewMount {
     session: Option<BackgroundSession>,
     mountpoint: PathBuf,
     source: String,
+    claim: MountClaim,
+}
+
+/// The durable claim behind a live, supervised guarded view. The protected
+/// root's stable filesystem identity belongs to the private lower directory,
+/// not to the FUSE mount that presents its editable namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardedViewBinding {
+    pub anchor_id: Uuid,
+    pub lower_root: PathBuf,
+    pub lower_id: NativeFileId,
+    pub mountpoint: PathBuf,
+    pub view_uid: u32,
+    pub view_gid: u32,
 }
 
 /// One quiescent view with an immutable anchor for every visible file. This
@@ -813,19 +827,39 @@ impl GuardedViewMount {
                 .is_some_and(|mounted| mounted.matches_guarded(&source)),
             "guarded mount did not appear with its claimed identity: {mounted:?}"
         );
-        ensure!(
-            control
+        let claim = {
+            let control = control
                 .lock()
-                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
-                .get_record(MOUNT_RETIRE_KIND, manifest.anchor_id.as_bytes())?
-                .is_none(),
-            "guarded mount was retired while starting"
-        );
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            ensure!(
+                control
+                    .get_record(MOUNT_RETIRE_KIND, manifest.anchor_id.as_bytes())?
+                    .is_none(),
+                "guarded mount was retired while starting"
+            );
+            let bytes = control
+                .get_record(MOUNT_CLAIM_KIND, manifest.anchor_id.as_bytes())?
+                .context("guarded mount lost its claim while starting")?;
+            let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+            ensure!(
+                claim.version == 1
+                    && claim.anchor_id == manifest.anchor_id
+                    && claim.lower_root == plan.source_root()
+                    && claim.lower_id == plan.source_root_identity()
+                    && claim.mountpoint == mountpoint
+                    && claim.mountpoint_id == placeholder_id
+                    && claim.view_uid == view_uid
+                    && claim.view_gid == view_gid,
+                "guarded mount claim changed while starting"
+            );
+            claim
+        };
         Ok(Self {
             anchor_id: manifest.anchor_id,
             session: Some(session),
             mountpoint,
             source,
+            claim,
         })
     }
 
@@ -846,6 +880,37 @@ impl GuardedViewMount {
         );
         fs::metadata(&self.mountpoint).context("guarded FUSE view is not responding")?;
         Ok(())
+    }
+
+    /// Check the live FUSE mount against its durable claim and lower inode.
+    /// Callers must use this verified binding when associating a guarded view
+    /// with a protected root; FUSE's own filesystem ID is not the source ID.
+    pub fn verified_binding(&self, control: &ControlStore) -> anyhow::Result<GuardedViewBinding> {
+        self.check_health()?;
+        let bytes = control
+            .get_record(MOUNT_CLAIM_KIND, self.anchor_id.as_bytes())?
+            .context("guarded view lost its durable mount claim")?;
+        let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+        ensure!(
+            claim == self.claim
+                && self.source == mount_source(self.anchor_id)
+                && control
+                    .get_record(MOUNT_RETIRE_KIND, self.anchor_id.as_bytes())?
+                    .is_none(),
+            "guarded view differs from its durable mount claim"
+        );
+        ensure!(
+            PinnedDirectory::open(&claim.lower_root)?.identity()? == claim.lower_id,
+            "guarded private lower root changed"
+        );
+        Ok(GuardedViewBinding {
+            anchor_id: claim.anchor_id,
+            lower_root: claim.lower_root,
+            lower_id: claim.lower_id,
+            mountpoint: claim.mountpoint,
+            view_uid: claim.view_uid,
+            view_gid: claim.view_gid,
+        })
     }
 
     /// Reconstruct the current visible namespace after the view has stopped.
