@@ -1214,7 +1214,10 @@ open. A five-member memory-guild check now reconstructs signed guarded sectors
 from the remaining peers after deleting the old owner's data directory and
 source tree; ext4 and Btrfs runs restore the view from the seed and serve its
 exact bytes to the ordinary owner. A provisioned P2P recovery gate is still
-required.
+required. Revision-anchor retirement now checks live signed revisions and
+sector-recipe pins before transferring an anchor to cleanup; retirement replay
+rechecks recipe pins before physical deletion. The guarded mount claim still
+needs a data-preserving removal path before its root anchor can be retired.
 A separate local Btrfs regression confirms that a stock Git peer's CRLF
 worktree can yield an LF blob and that our import, checkout, restore, and export
 preserve the exchanged LF blob and object ID. The Git-facing help explains that

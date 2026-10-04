@@ -46,6 +46,8 @@ use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::control::{GitRepositoryInfo, GitStagedFile, NodeStatus, ProtectedRoot};
+#[cfg(test)]
+use crate::snapshot::retire_revision_anchor;
 use crate::snapshot::{
     WriterCredentials, abandon_recovered_anchor_capture, build_revision_restore,
     git_prune_capture_pending, git_prune_recipe_anchor_ids, install_inline_recipe,
@@ -53,7 +55,8 @@ use crate::snapshot::{
     prepare_recovered_revision_publication, prepare_revision, publish_owned_restore,
     reanchor_recovered_revision, reconcile_pending_captures, recovered_recipe_is_stable,
     render_sector, restore_revision_from_source, restore_signed_root_metadata_at,
-    resume_restore_publication, retire_revision_anchor, revision_git_backup, revision_head_id,
+    resume_restore_publication, retire_revision_anchor_with_recipe_pins, revision_git_backup,
+    revision_head_id,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -11825,7 +11828,13 @@ impl Node {
             "gc-packed-sector",
             "gc-anchor",
         ] {
-            for (record_id, bytes) in self.control.records(kind)? {
+            let candidates = self.control.records(kind)?;
+            let recipe_anchor_pins = if kind == "gc-anchor" && !candidates.is_empty() {
+                Some(git_prune_recipe_anchor_ids(&self.control)?)
+            } else {
+                None
+            };
+            for (record_id, bytes) in candidates {
                 let candidate: GarbageCandidate = decode_canonical(&bytes)?;
                 if candidate.format_version != 1
                     || candidate.first_unreachable_generation == 0
@@ -11869,9 +11878,13 @@ impl Node {
                     continue;
                 }
                 let collected = match kind {
-                    "gc-anchor" => {
-                        retire_revision_anchor(&mut self.control, Uuid::from_slice(&record_id)?)?
-                    }
+                    "gc-anchor" => retire_revision_anchor_with_recipe_pins(
+                        &mut self.control,
+                        Uuid::from_slice(&record_id)?,
+                        recipe_anchor_pins
+                            .as_ref()
+                            .context("garbage collection lost its recipe anchor index")?,
+                    )?,
                     "gc-revision" => {
                         self.control.delete_record("user-revision", &record_id)?;
                         true

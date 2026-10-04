@@ -957,7 +957,13 @@
   guarded view from the seed on ext4 and disposable Btrfs. This closes the
   reconstructed-shard integration check; a provisioned P2P network gate,
   guarded removal/GC, and broader FUSE failure paths remain open before
-  enrollment.
+  enrollment. The general revision-anchor retirement path now waits for the
+  signed revision and every local-sector recipe referencing its anchor; replay
+  rechecks recipe pins before physical deletion. GC builds this recipe-pin set
+  once after sector cleanup for an anchor batch. A privileged Btrfs regression
+  keeps an old anchor through retirement replay while a separate recipe pins
+  it, then collects it after that pin is removed. Guarded-root claim retirement
+  and data-preserving removal remain open.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

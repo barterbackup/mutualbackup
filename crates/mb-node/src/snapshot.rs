@@ -700,10 +700,19 @@ fn remove_revision_anchor(
 }
 
 fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
-    for (record_id, bytes) in control.records(ANCHOR_RETIREMENT_KIND)? {
+    let retirements = control.records(ANCHOR_RETIREMENT_KIND)?;
+    let recipe_anchors = if retirements.is_empty() {
+        BTreeSet::new()
+    } else {
+        git_prune_recipe_anchor_ids(control)?
+    };
+    for (record_id, bytes) in retirements {
         let manifest: mb_store::StableAnchorManifest = decode_canonical(&bytes)?;
         if record_id.as_slice() != manifest.anchor_id.as_bytes() {
             bail!("durable anchor retirement is inconsistent");
+        }
+        if recipe_anchors.contains(&manifest.anchor_id) {
+            continue;
         }
         if remove_revision_anchor(control, &manifest).is_ok() {
             let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, &record_id)?;
@@ -780,9 +789,19 @@ fn reconcile_guarded_recovered_retirements(control: &ControlStore) -> Result<()>
 /// Return false while an unreachable guarded revision still has a signed
 /// record or a local sector recipe. GC retries its anchor candidate after
 /// those sources are released, then transfers cleanup to a durable journal.
+#[cfg(test)]
 pub(crate) fn retire_revision_anchor(
     control: &mut ControlStore,
     revision_id: Uuid,
+) -> Result<bool> {
+    let recipe_anchors = git_prune_recipe_anchor_ids(control)?;
+    retire_revision_anchor_with_recipe_pins(control, revision_id, &recipe_anchors)
+}
+
+pub(crate) fn retire_revision_anchor_with_recipe_pins(
+    control: &mut ControlStore,
+    revision_id: Uuid,
+    recipe_anchors: &BTreeSet<Uuid>,
 ) -> Result<bool> {
     #[cfg(target_os = "linux")]
     if control
@@ -799,7 +818,6 @@ pub(crate) fn retire_revision_anchor(
         {
             return Ok(false);
         }
-        let recipe_anchors = git_prune_recipe_anchor_ids(control)?;
         if recipe_anchors.contains(&capture.capture.metadata.anchor_id)
             || capture
                 .capture
@@ -812,7 +830,7 @@ pub(crate) fn retire_revision_anchor(
         GuardedViewMount::retire_revision_capture_unreferenced(
             revision_id,
             control,
-            &recipe_anchors,
+            recipe_anchors,
         )?;
         return Ok(true);
     }
@@ -825,7 +843,6 @@ pub(crate) fn retire_revision_anchor(
             capture.format_version == 1 && capture.revision_id == revision_id,
             "recovered guarded revision capture is inconsistent"
         );
-        let recipe_anchors = git_prune_recipe_anchor_ids(control)?;
         if control
             .get_record("user-revision", revision_id.as_bytes())?
             .is_some()
@@ -857,6 +874,13 @@ pub(crate) fn retire_revision_anchor(
         return Ok(true);
     };
     let manifest: mb_store::StableAnchorManifest = decode_canonical(&bytes)?;
+    if control
+        .get_record("user-revision", revision_id.as_bytes())?
+        .is_some()
+        || recipe_anchors.contains(&manifest.anchor_id)
+    {
+        return Ok(false);
+    }
     control.move_protocol_record(
         "anchor-manifest",
         revision_id.as_bytes(),
@@ -7022,13 +7046,37 @@ mod metadata_compatibility_tests {
         )
         .unwrap();
         let old_root = old.area.path_hint.join(old.anchor_id.to_string());
+        assert!(!retire_revision_anchor(&mut control, revision.value.revision_id).unwrap());
         bind_mount_for_recovery_test(&external, &old_root);
 
         reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored).unwrap();
         assert_eq!(control.records(ANCHOR_RETIREMENT_KIND).unwrap().len(), 1);
+        let mut pinned_reference = revision.value.data_sectors[0].clone();
+        pinned_reference.id = [240; 32];
+        control
+            .put_record(
+                "local-sector",
+                &pinned_reference.id,
+                &canonical_bytes(&LocalSectorRecipe {
+                    guild_id,
+                    reference: pinned_reference.clone(),
+                    source: LocalPlaintextSource::StableAnchorFile {
+                        locator: old.file_locator("payload".to_owned()).unwrap(),
+                        offset: 0,
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
         unmount_for_recovery_test(&old_root);
         assert_eq!(fs::read(&sentinel).unwrap(), b"external bytes");
 
+        reconcile_pending_captures(&control).unwrap();
+        assert_eq!(control.records(ANCHOR_RETIREMENT_KIND).unwrap().len(), 1);
+        assert!(old_root.exists());
+        control
+            .delete_record("local-sector", &pinned_reference.id)
+            .unwrap();
         reconcile_pending_captures(&control).unwrap();
         assert!(control.records(ANCHOR_RETIREMENT_KIND).unwrap().is_empty());
         assert!(!old_root.exists());
@@ -7039,7 +7087,28 @@ mod metadata_compatibility_tests {
                 .unwrap(),
         )
         .unwrap();
-        current.remove().unwrap();
+        control
+            .delete_record("user-revision", revision.value.revision_id.as_bytes())
+            .unwrap();
+        assert!(!retire_revision_anchor(&mut control, revision.value.revision_id).unwrap());
+        for reference in revision
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&revision.value.data_sectors)
+        {
+            control
+                .delete_record("local-sector", &reference.id)
+                .unwrap();
+        }
+        assert!(retire_revision_anchor(&mut control, revision.value.revision_id).unwrap());
+        assert!(
+            current
+                .file_locator("payload".to_owned())
+                .unwrap()
+                .open()
+                .is_err()
+        );
         drop(control);
         fs::remove_dir_all(run_root).unwrap();
     }
