@@ -25811,6 +25811,7 @@ pub(crate) mod tests {
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn guarded_in_place_enrollment_replays_handoff_plan_and_mount() {
         use std::ffi::CString;
+        use std::io::Read;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
@@ -25819,7 +25820,7 @@ pub(crate) mod tests {
         let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
-        for stage in 0..5_u8 {
+        for stage in 0..6_u8 {
             let area = tempfile::Builder::new()
                 .prefix("mb-guarded-in-place-")
                 .tempdir_in(&test_root)
@@ -25959,6 +25960,78 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(fs::metadata(handoff.lower_path()).unwrap().uid(), 0);
+            if stage == 1 || stage == 5 {
+                let anchor_id = node.guarded_root_mount_binding(&root).unwrap().anchor_id;
+                node.guarded_mounts.pop().unwrap().stop().unwrap();
+                let parent = PinnedDirectory::open(area.path()).unwrap();
+                assert!(
+                    handoff
+                        .release_names(&node.control, &parent, anchor_id)
+                        .is_err()
+                );
+                let control = Arc::new(Mutex::new(
+                    ControlStore::open_with_key(
+                        data_dir.join("control.db"),
+                        &node.control_database_key,
+                    )
+                    .unwrap(),
+                ));
+                GuardedViewMount::detach_stopped_files_for_release(anchor_id, control).unwrap();
+                GuardedViewMount::retire_claim(anchor_id, &node.control).unwrap();
+                assert!(
+                    handoff
+                        .release_names(&node.control, &parent, Uuid::new_v4())
+                        .is_err(),
+                    "a different retired claim cannot release this handoff"
+                );
+                if stage == 5 {
+                    node.control
+                        .put_record(
+                            "guarded-recovery-handoff-release-v1",
+                            root_id.as_bytes(),
+                            &canonical_bytes(&handoff).unwrap(),
+                        )
+                        .unwrap();
+                    let placeholder_id = parent.entry_identity("work", true).unwrap().unwrap();
+                    assert!(
+                        parent
+                            .remove_empty_child_directory("work", placeholder_id)
+                            .unwrap()
+                    );
+                }
+                handoff
+                    .release_names(&node.control, &parent, anchor_id)
+                    .unwrap();
+                handoff
+                    .release_names(&node.control, &parent, anchor_id)
+                    .unwrap();
+                assert!(
+                    handoff.clone().resume(&node.control, &parent).is_err(),
+                    "release marker must fence forward enrollment replay"
+                );
+                assert!(!handoff.lower_path().exists());
+                assert_eq!(
+                    parent.entry_identity("work", true).unwrap(),
+                    Some(NativeFileId {
+                        filesystem_id: root.filesystem_id,
+                        inode: root.root_inode,
+                    })
+                );
+                assert_eq!(
+                    fs::read(target.join("sample")).unwrap(),
+                    b"in-place\r\n\0bytes"
+                );
+                assert_eq!(fs::metadata(&target).unwrap().uid(), 0);
+                let manifest =
+                    GuardedRootCapturePlan::load_published_manifest(&node.control, anchor_id)
+                        .unwrap();
+                let anchor = manifest.file_locator("sample".to_owned()).unwrap();
+                fs::write(target.join("sample"), b"independent released edit").unwrap();
+                let mut retained = Vec::new();
+                anchor.open().unwrap().read_to_end(&mut retained).unwrap();
+                assert_eq!(retained, b"in-place\r\n\0bytes");
+                continue;
+            }
             if stage == 0 {
                 let child = Command::new("python3")
                     .uid(65534)

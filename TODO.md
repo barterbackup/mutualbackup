@@ -976,7 +976,7 @@
   The existing guarded signed-backup fixture now uses the production enrollment
   API and passes on both filesystems. The 325 normal node tests, local-control
   raw-path schema test, CLI help check, and strict workspace Clippy pass. This
-  enables the separate lower/view path. Original-path migration,
+  enabled the separate lower/view path. At that stage original-path migration,
   data-preserving removal and claim retirement, Git operations through the
   guarded backend, and the complete guarded failure gate remain open.
   A stopped-view release primitive now walks every live file through its
@@ -999,6 +999,13 @@
   round-trip with exact CRLF/NUL bytes. The source-only snapshot test preserves
   raw names and rejects a changed entry. Mixed-owner trees,
   broader fault injection, removal, and the complete guarded gate remain open.
+  The in-place handoff now has a reverse-name primitive for removal: a durable
+  release marker fences enrollment replay, the exact retired mount claim must
+  bind the lower and placeholder, and interruption after placeholder deletion
+  can replay the no-replace return of the private directory. This still leaves
+  the returned root private. Removal needs durable visible-metadata restoration,
+  revision/Git pin checks, root-record retirement, and handoff-record cleanup
+  before exposing a command or reopening the root as ordinary user data.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

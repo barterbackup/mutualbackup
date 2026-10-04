@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{AnchorError, ControlStore, NativeFileId, PinnedDirectory};
 
 const HANDOFF_KIND: &str = "guarded-recovery-handoff-v1";
+const HANDOFF_RELEASE_KIND: &str = "guarded-recovery-handoff-release-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GuardedRecoveryHandoff {
@@ -155,6 +156,115 @@ impl GuardedRecoveryHandoff {
         Ok(())
     }
 
+    /// Return the private lower tree to its original name after the guarded
+    /// view has stopped, every live file has detached from immutable anchors,
+    /// and the mount claim has retired. The durable release marker fences
+    /// forward handoff replay. Until the caller restores visible metadata,
+    /// the returned root remains private (root-owned and mode 0700).
+    pub fn release_names(
+        &self,
+        control: &ControlStore,
+        parent: &PinnedDirectory,
+        anchor_id: Uuid,
+    ) -> Result<()> {
+        ensure!(!anchor_id.is_nil(), "guarded release anchor ID is nil");
+        self.validate(parent, &parent.descriptor_path().canonicalize()?)?;
+        ensure!(
+            Self::load(control, self.handoff_id)?.as_ref() == Some(self),
+            "guarded recovery handoff changed before release"
+        );
+        ensure!(
+            self.placeholder_id.is_some(),
+            "guarded recovery handoff has no published placeholder"
+        );
+        // Releasing a still-claimed view would expose its lower tree at the
+        // mounted path while the daemon believes the FUSE view is active.
+        crate::guarded_mount::require_retired_claim_for_release(
+            control,
+            anchor_id,
+            &self.lower_path(),
+            self.target_id,
+            &self.mountpoint(),
+            self.placeholder_id.unwrap(),
+        )?;
+        if parent.entry_identity(&self.lower_name, true)? == Some(self.target_id) {
+            let lower = parent
+                .open_child_directory(&self.lower_name)?
+                .context("guarded release lower tree disappeared")?;
+            let metadata = lower.as_file().metadata()?;
+            ensure!(
+                lower.identity()? == self.target_id
+                    && metadata.uid() == 0
+                    && metadata.mode() & 0o7777 == 0o700,
+                "guarded release lower tree is not private"
+            );
+        }
+        let marker = mb_core::canonical_bytes(self)?;
+        match control.get_record(HANDOFF_RELEASE_KIND, self.handoff_id.as_bytes())? {
+            Some(existing) => ensure!(existing == marker, "guarded handoff release changed"),
+            None => {
+                let lower = parent.entry_identity(&self.lower_name, true)?;
+                let target = parent.entry_identity(&self.target_name, true)?;
+                ensure!(
+                    lower == Some(self.target_id) && target == self.placeholder_id,
+                    "guarded release names changed before preparation"
+                );
+                ensure!(
+                    parent.child_directory_is_empty(
+                        &self.target_name,
+                        self.placeholder_id.unwrap()
+                    )?,
+                    "guarded release placeholder is not empty"
+                );
+                ensure!(
+                    control.put_record_if_absent(
+                        HANDOFF_RELEASE_KIND,
+                        self.handoff_id.as_bytes(),
+                        &marker,
+                    )?,
+                    "guarded handoff release changed concurrently"
+                );
+            }
+        }
+        ensure!(
+            parent
+                .entry_identity(&self.placeholder_name, true)?
+                .is_none(),
+            "guarded release has an unexpected spare placeholder"
+        );
+        match (
+            parent.entry_identity(&self.lower_name, true)?,
+            parent.entry_identity(&self.target_name, true)?,
+        ) {
+            (None, Some(actual)) if actual == self.target_id => return Ok(()),
+            (Some(actual), Some(placeholder))
+                if actual == self.target_id && Some(placeholder) == self.placeholder_id =>
+            {
+                ensure!(
+                    parent.remove_empty_child_directory(
+                        &self.target_name,
+                        self.placeholder_id.unwrap()
+                    )?,
+                    "guarded release placeholder changed before removal"
+                );
+            }
+            (Some(actual), None) if actual == self.target_id => {}
+            _ => anyhow::bail!("guarded release lower or placeholder changed"),
+        }
+        parent.move_child_directory_no_replace(
+            &self.lower_name,
+            self.target_id,
+            parent,
+            &self.target_name,
+        )?;
+        ensure!(
+            parent.entry_identity(&self.lower_name, true)?.is_none()
+                && parent.entry_identity(&self.target_name, true)? == Some(self.target_id),
+            "guarded release failed to return the original directory"
+        );
+        Ok(())
+    }
+
     pub fn verify_recovery_target(
         &self,
         parent: &PinnedDirectory,
@@ -186,6 +296,12 @@ impl GuardedRecoveryHandoff {
         ensure!(
             Self::load(control, self.handoff_id)?.as_ref() == Some(self),
             "guarded recovery handoff changed during replay"
+        );
+        ensure!(
+            control
+                .get_record(HANDOFF_RELEASE_KIND, self.handoff_id.as_bytes())?
+                .is_none(),
+            "guarded recovery handoff is being released"
         );
         let lower = parent.entry_identity(&self.lower_name, true)?;
         let target = parent.entry_identity(&self.target_name, true)?;

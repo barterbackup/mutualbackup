@@ -1725,6 +1725,34 @@ pub(crate) fn require_mount_claim_retired(
     Ok(())
 }
 
+/// Bind a reverse name handoff to the exact claim that previously owned the
+/// private lower and visible placeholder. The retirement marker survives
+/// claim deletion, so replay remains verifiable after the lower name moves.
+pub(crate) fn require_retired_claim_for_release(
+    control: &ControlStore,
+    anchor_id: Uuid,
+    lower_root: &Path,
+    lower_id: NativeFileId,
+    mountpoint: &Path,
+    mountpoint_id: NativeFileId,
+) -> anyhow::Result<()> {
+    require_mount_claim_retired(control, anchor_id)?;
+    let bytes = control
+        .get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())?
+        .ok_or_else(|| anyhow::anyhow!("guarded release has no retired mount claim"))?;
+    let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+    ensure!(
+        claim.version == 1
+            && claim.anchor_id == anchor_id
+            && claim.lower_root == lower_root
+            && claim.lower_id == lower_id
+            && claim.mountpoint == mountpoint
+            && claim.mountpoint_id == mountpoint_id,
+        "guarded release differs from its retired mount claim"
+    );
+    Ok(())
+}
+
 pub(crate) fn mount_claim_exists(control: &ControlStore, anchor_id: Uuid) -> anyhow::Result<bool> {
     Ok(control
         .get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())?
