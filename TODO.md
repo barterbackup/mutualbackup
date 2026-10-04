@@ -1012,6 +1012,13 @@
   needs revision/Git pin checks, protected-root record retirement, release and
   handoff-record cleanup, startup reconciliation, and the remaining ACL/xattr
   fidelity gate before exposing a command.
+  A read-only node removal preflight now refuses a Git repository, unfinished
+  capture/backup/restore/GC work, a guarded revision-capture pin, and a local
+  sector recipe using the root anchor before any view mutation. Claim retirement
+  repeats its revision-pin check. Privileged ext4 and Btrfs probes confirm an
+  unbacked root passes while a Git record and a signed guarded revision block
+  removal. The preflight is not yet a removal command; retained revision and
+  Git anchor ownership still require end-to-end retirement and replay gates.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

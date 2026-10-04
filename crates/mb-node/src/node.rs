@@ -1722,6 +1722,51 @@ impl Node {
         Ok(binding)
     }
 
+    /// Refuse guarded-root removal before stopping its view if any local
+    /// operation could still need the claimed source or its Git catalog.
+    /// The mount retirement and anchor GC repeat their own pin checks after
+    /// this read-only gate; this is not a substitute for those fences.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // The removal command will call this before its first mutation.
+    fn guarded_release_preflight(&self, root_id: Uuid) -> Result<mb_store::GuardedViewBinding> {
+        let root = self.protected_root_by_id(root_id)?;
+        let binding = self.guarded_root_mount_binding(&root)?;
+        if self
+            .control
+            .get_record("git-repository", root_id.as_bytes())?
+            .is_some()
+        {
+            anyhow::bail!("guarded root still owns a Git repository");
+        }
+        if git_prune_capture_pending(&self.control, root_id, &root.path)? {
+            anyhow::bail!("guarded root has an unfinished source capture");
+        }
+        if !self.control.records("restore-job")?.is_empty() {
+            anyhow::bail!("a restore is in progress; guarded removal must wait");
+        }
+        for kind in ["gc-anchor", "gc-revision", "gc-sector"] {
+            if !self.control.records(kind)?.is_empty() {
+                anyhow::bail!("revision cleanup is in progress; guarded removal must wait");
+            }
+        }
+        for (_, bytes) in self.control.records("backup-job")? {
+            let job: BackupJob = decode_canonical(&bytes)?;
+            validate_backup_descriptor(&job.descriptor)?;
+            if job.format_version != 1 {
+                anyhow::bail!("durable backup job is invalid");
+            }
+            if job.descriptor.protected_root_id == root_id && job.state != BackupJobState::Committed
+            {
+                anyhow::bail!("guarded root has an unfinished backup job");
+            }
+        }
+        GuardedViewMount::require_release_unpinned(binding.anchor_id, &self.control)?;
+        if git_prune_recipe_anchor_ids(&self.control)?.contains(&binding.anchor_id) {
+            anyhow::bail!("guarded root anchor still serves a local sector recipe");
+        }
+        Ok(binding)
+    }
+
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
         #[cfg(target_os = "linux")]
         if !self.control.records(GUARDED_ENROLLMENT_KIND)?.is_empty()
@@ -25974,7 +26019,14 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(fs::metadata(handoff.lower_path()).unwrap().uid(), 0);
             if stage == 1 || stage == 5 {
-                let anchor_id = node.guarded_root_mount_binding(&root).unwrap().anchor_id;
+                let anchor_id = node.guarded_release_preflight(root_id).unwrap().anchor_id;
+                node.control
+                    .put_record("git-repository", root_id.as_bytes(), b"held")
+                    .unwrap();
+                assert!(node.guarded_release_preflight(root_id).is_err());
+                node.control
+                    .delete_record("git-repository", root_id.as_bytes())
+                    .unwrap();
                 node.guarded_mounts.pop().unwrap().stop().unwrap();
                 let parent = PinnedDirectory::open(area.path()).unwrap();
                 assert!(
@@ -26128,6 +26180,10 @@ pub(crate) mod tests {
                 let revision = node
                     .prepare_revision(guild_id, root_id, &target, 1, None)
                     .unwrap();
+                assert!(
+                    node.guarded_release_preflight(root_id).is_err(),
+                    "a retained guarded revision must pin the view"
+                );
                 let restored = area.path().join("restored");
                 crate::snapshot::restore_revision_from_source(
                     &node.control,

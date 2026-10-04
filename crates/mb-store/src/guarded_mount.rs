@@ -629,10 +629,7 @@ impl GuardedViewMount {
     /// The retirement marker fences remount even if deletion of the claim is
     /// interrupted; retrying this method finishes that deletion.
     pub fn retire_claim(anchor_id: Uuid, control: &ControlStore) -> anyhow::Result<()> {
-        ensure!(
-            !stopped_capture_intent_pins_anchor(control, anchor_id)?,
-            "guarded mount retains a revision capture"
-        );
+        Self::require_release_unpinned(anchor_id, control)?;
         let id = anchor_id.as_bytes();
         let claim_bytes = control.get_record(MOUNT_CLAIM_KIND, id)?;
         let retired = control.get_record(MOUNT_RETIRE_KIND, id)?;
@@ -681,6 +678,16 @@ impl GuardedViewMount {
         control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
         retire_virtual_time_dirty(control, anchor_id)?;
         retire_virtual_directory_size_dirty(control, anchor_id)?;
+        Ok(())
+    }
+
+    /// Read-only pin check for the node's guarded-root removal preflight.
+    /// Retirement repeats it after the view has stopped and files detach.
+    pub fn require_release_unpinned(anchor_id: Uuid, control: &ControlStore) -> anyhow::Result<()> {
+        ensure!(
+            !stopped_capture_intent_pins_anchor(control, anchor_id)?,
+            "guarded mount retains a revision capture"
+        );
         Ok(())
     }
 
