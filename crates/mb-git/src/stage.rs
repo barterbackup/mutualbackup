@@ -136,6 +136,7 @@ pub struct GitIndexEntry {
 struct StageIntent {
     format_version: u16,
     repository_id: Uuid,
+    #[serde(with = "mb_store::raw_path_bytes")]
     relative_path: PathBuf,
     git_mode: u32,
     plan: SourceFileCapturePlan,
@@ -145,9 +146,11 @@ struct StageIntent {
 struct SymlinkStageIntent {
     format_version: u16,
     repository_id: Uuid,
+    #[serde(with = "mb_store::raw_path_bytes")]
     source_root: PathBuf,
     root_id: NativeFileId,
     catalog_id: NativeFileId,
+    #[serde(with = "mb_store::raw_path_bytes")]
     relative_path: PathBuf,
     source_id: NativeFileId,
     target: Vec<u8>,
@@ -155,6 +158,7 @@ struct SymlinkStageIntent {
     temp_id: Option<NativeFileId>,
     plan: Option<SourceFileCapturePlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "mb_store::raw_path_bytes_option")]
     catalog_root: Option<PathBuf>,
 }
 
@@ -164,9 +168,11 @@ struct SymlinkStageIntent {
 struct SymlinkStageIntentV1 {
     format_version: u16,
     repository_id: Uuid,
+    #[serde(with = "mb_store::raw_path_bytes")]
     source_root: PathBuf,
     root_id: NativeFileId,
     catalog_id: NativeFileId,
+    #[serde(with = "mb_store::raw_path_bytes")]
     relative_path: PathBuf,
     source_id: NativeFileId,
     target: Vec<u8>,

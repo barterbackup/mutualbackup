@@ -1023,7 +1023,7 @@ fn locked_daemon_exits_cleanly_on_sigterm() {
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires an explicitly provisioned reflink test filesystem"]
-fn raw_unix_root_path_survives_cli_daemon_control() {
+fn raw_unix_paths_survive_cli_daemon_and_git_checkout() {
     let test_root = PathBuf::from(
         std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .expect("the acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
@@ -1033,11 +1033,10 @@ fn raw_unix_root_path_survives_cli_daemon_control() {
         .path()
         .join(OsString::from_vec(b"source-\xfe".to_vec()));
     fs::create_dir(&source).unwrap();
-    fs::write(
-        source.join(OsString::from_vec(b"file-\xff".to_vec())),
-        b"exact bytes",
-    )
-    .unwrap();
+    let relative = PathBuf::from(OsString::from_vec(b"file-\xff".to_vec()));
+    let link_relative = PathBuf::from(OsString::from_vec(b"link-\xfc".to_vec()));
+    fs::write(source.join(&relative), b"exact bytes").unwrap();
+    std::os::unix::fs::symlink(&relative, source.join(&link_relative)).unwrap();
 
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());
@@ -1091,6 +1090,68 @@ fn raw_unix_root_path_survives_cli_daemon_control() {
             .iter()
             .any(|root| root.path == source)
     );
+    git_cli(&socket, &source, ["init"]);
+    let mut git_args = vec![
+        os("--socket"),
+        socket.as_os_str().to_owned(),
+        os("-C"),
+        source.as_os_str().to_owned(),
+        os("add"),
+        relative.as_os_str().to_owned(),
+    ];
+    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
+    assert!(
+        output.status.success(),
+        "raw Git add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git_args[5] = link_relative.as_os_str().to_owned();
+    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
+    assert!(
+        output.status.success(),
+        "raw Git symlink add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    daemon.stop_gracefully();
+    daemon.start();
+    wait_for_status(&socket, &mut daemon, CLI_TIMEOUT);
+    git_cli(
+        &socket,
+        &source,
+        [
+            "commit",
+            "-m",
+            "raw path",
+            "--author-name",
+            "Raw Path",
+            "--author-email",
+            "raw@example.test",
+        ],
+    );
+    let bare = temp.path().join("stock.git");
+    let output = Command::new("git")
+        .arg("init")
+        .arg("--bare")
+        .arg(&bare)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let bare_arg = bare.to_str().unwrap();
+    git_cli(&socket, &source, ["push", bare_arg]);
+    git_cli(&socket, &source, ["fetch", bare_arg]);
+    fs::write(source.join(&relative), b"edited bytes").unwrap();
+    fs::remove_file(source.join(&link_relative)).unwrap();
+    git_args[4] = os("restore");
+    git_args[5] = relative.as_os_str().to_owned();
+    git_args.push(link_relative.as_os_str().to_owned());
+    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
+    assert!(
+        output.status.success(),
+        "raw Git restore failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(source.join(&relative)).unwrap(), b"exact bytes");
+    assert_eq!(fs::read_link(source.join(link_relative)).unwrap(), relative);
     daemon.stop_gracefully();
 }
 

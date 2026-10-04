@@ -87,7 +87,9 @@ struct FetchIntent {
     format_version: u16,
     fetch_id: Uuid,
     repository_id: Uuid,
+    #[serde(with = "mb_store::raw_path_bytes")]
     source_path: PathBuf,
+    #[serde(with = "mb_store::raw_path_bytes")]
     source_root: PathBuf,
     refs: Vec<GitGraphRef>,
     objects: Vec<GitGraphObject>,

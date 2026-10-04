@@ -848,6 +848,11 @@
   pass, including rejection of malformed hex. A provisioned local Btrfs
   process test now passes a non-UTF-8 root through `mutualbackup root add`,
   then reads its exact path back from the daemon over the control socket.
+  The same process gate now initializes Git under that root, stages raw-name
+  regular files and symlinks, reopens the daemon, commits, and restores their
+  exact bytes and link target, then pushes and fetches through a local bare
+  Git repository. Git stage/fetch intents and its native object map now encode
+  those local paths losslessly; historical UTF-8 Postcard bytes remain unchanged.
   The privileged node fixture now feeds signed format-6 sectors to a fresh
   same-seed node on disposable Btrfs and runs the production recovery job
   through restore, reanchor, root registration, and reopen/retry. That local

@@ -1585,6 +1585,37 @@ pub mod raw_path_bytes_vec {
 }
 
 #[cfg(target_os = "linux")]
+pub mod raw_path_bytes_option {
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    struct PathRef<'a>(&'a Path);
+
+    impl Serialize for PathRef<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            super::raw_path_bytes::serialize(self.0, serializer)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct OwnedPath(#[serde(with = "super::raw_path_bytes")] PathBuf);
+
+    pub fn serialize<S: Serializer>(
+        path: &Option<PathBuf>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        path.as_deref().map(PathRef).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<PathBuf>, D::Error> {
+        Ok(Option::<OwnedPath>::deserialize(deserializer)?.map(|path| path.0))
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl RawReflinkFileCapturePlanV2 {
     fn from_legacy(plan: ReflinkFileCapturePlan) -> Self {
         Self {
@@ -1902,6 +1933,9 @@ pub struct FileAnchorManifest {
     pub area: StableAnchorAreaLocator,
     #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
     pub source_root_hint: PathBuf,
+    // Git's local object map retains this runtime manifest separately from
+    // the version-2 sealed anchor manifest. UTF-8 Postcard bytes stay stable.
+    #[cfg_attr(target_os = "linux", serde(with = "raw_path_bytes"))]
     pub source_relative_path: PathBuf,
     pub logical_len: u64,
     pub content_hash: [u8; 32],
@@ -5233,6 +5267,15 @@ mod tests {
             #[serde(with = "raw_path_bytes")]
             path: PathBuf,
         }
+        #[derive(Serialize, Deserialize)]
+        struct HistoricalOptional {
+            path: Option<PathBuf>,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct RawOptional {
+            #[serde(with = "raw_path_bytes_option")]
+            path: Option<PathBuf>,
+        }
 
         let path = PathBuf::from("/ordinary/utf8");
         let historical = canonical_bytes(&Historical { path: path.clone() }).unwrap();
@@ -5246,6 +5289,26 @@ mod tests {
         let encoded = canonical_bytes(&Raw { path: raw.clone() }).unwrap();
         assert_eq!(decode_canonical::<Raw>(&encoded).unwrap().path, raw);
         assert!(decode_canonical::<Historical>(&encoded).is_err());
+
+        for path in [None, Some(path)] {
+            let historical = canonical_bytes(&HistoricalOptional { path: path.clone() }).unwrap();
+            assert_eq!(
+                historical,
+                canonical_bytes(&RawOptional { path: path.clone() }).unwrap()
+            );
+            assert_eq!(
+                decode_canonical::<RawOptional>(&historical).unwrap().path,
+                path
+            );
+        }
+        let encoded = canonical_bytes(&RawOptional {
+            path: Some(raw.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            decode_canonical::<RawOptional>(&encoded).unwrap().path,
+            Some(raw)
+        );
     }
 
     #[cfg(target_os = "linux")]

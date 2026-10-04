@@ -113,7 +113,13 @@ impl SourceBackendKind {
         relative_path: impl AsRef<Path>,
     ) -> Result<SourceFileCapturePlan, AnchorError> {
         match self {
-            Self::ReflinkV1 => SourceFileCapturePlan::plan_reflink(source_root, relative_path),
+            Self::ReflinkV1 => {
+                #[cfg(target_os = "linux")]
+                if relative_path.as_ref().to_str().is_none() {
+                    return SourceFileCapturePlan::plan_reflink_raw(source_root, relative_path);
+                }
+                SourceFileCapturePlan::plan_reflink(source_root, relative_path)
+            }
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
                 "Git file staging with guarded link-freeze",
