@@ -2872,7 +2872,7 @@ impl Node {
     pub(crate) fn seed_test_guarded_git_commit(
         &mut self,
         root_id: Uuid,
-        paths: &[&str],
+        paths: &[(&str, u16)],
     ) -> Result<mb_git::GitGraphSource> {
         let root = self.protected_root_by_id(root_id)?;
         let binding = self.guarded_root_mount_binding(&root)?;
@@ -2892,11 +2892,11 @@ impl Node {
                 path: root.path,
             })?,
         )?;
-        for path in paths {
+        for &(path, expected_format) in paths {
             let (_, anchor) = self.stage_registered_guarded_git_file(root_id, Path::new(path))?;
             anyhow::ensure!(
-                anchor.format_version == 2,
-                "test Git stage added a file copy"
+                anchor.format_version == expected_format,
+                "guarded Git stage used an unexpected anchor format for {path}"
             );
         }
         let repository = self.open_guarded_git_repository(root_id)?;

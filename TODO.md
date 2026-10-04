@@ -171,9 +171,10 @@
   guarded root anchor, with no separate blob-owned sector recipes. Broader
   blob-only and edited-file physical-reclamation cases remain. That lab uses
   a format-3 checkpoint. A separate five-peer QUIC fixture now uses the
-  production backup coordinator to pack the same two-blob guarded Git graph
-  into a quorum-signed format-7 checkpoint. It deletes the owner's node state
-  and source, then recovers both raw files and reachable Git objects from a
+  production backup coordinator to pack a guarded Git graph with those two
+  untouched files plus one file edited through FUSE before staging into a
+  quorum-signed format-7 checkpoint. It deletes the owner's node state and
+  source, then recovers all three raw files and reachable Git objects from a
   fresh node on ext4 and disposable Btrfs. The provisioned five-daemon
   topology and its failure-domain/source-loss gate remain open; the QUIC
   fixture runs all five peers in one process. Recovered guarded catalogs now
@@ -188,8 +189,10 @@
   checked stopped-view file stage sequence: it validates a registered catalog
   and raw path before stopping FUSE, transfers the exact capture to a durable
   node pin, remounts, then reconciles and verifies the catalog entry. The
-  two-file format-7 QUIC recovery fixture uses this routine and passes on ext4
-  and disposable local Btrfs; strict workspace Clippy passes. Public guarded
+  mixed three-file format-7 QUIC recovery fixture uses this routine, checks
+  the edited file's format-1 stage anchor and its recovered root-backed
+  virtual blob, and passes on ext4 and disposable local Btrfs; strict workspace
+  Clippy passes. Public guarded
   enrollment, add/checkout, and the provisioned daemon gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,

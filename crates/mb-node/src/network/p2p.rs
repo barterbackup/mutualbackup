@@ -33258,7 +33258,14 @@ mod tests {
         std::fs::set_permissions(&view, std::fs::Permissions::from_mode(0o755)).unwrap();
         let first = b"\r\n\0guarded Git first\n".repeat(8_000);
         let second = b"\n\r\0guarded Git second\r\n".repeat(5_000);
-        for (name, bytes) in [("first", &first), ("second", &second)] {
+        let before_edit = b"guarded Git edited before stage\r\n".repeat(4_000);
+        let mut edited = before_edit.clone();
+        edited[0] = b'E';
+        for (name, bytes) in [
+            ("first", &first),
+            ("second", &second),
+            ("edited", &before_edit),
+        ] {
             std::fs::write(lower.join(name), bytes).unwrap();
             std::fs::set_permissions(lower.join(name), std::fs::Permissions::from_mode(0o644))
                 .unwrap();
@@ -33324,12 +33331,25 @@ mod tests {
             let root = owner
                 .enroll_test_guarded_root(&lower, &view, 65534, 65534)
                 .unwrap();
+            let edit = std::process::Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'E',0); os.fsync(fd); os.close(fd)")
+                .arg(view.join("edited"))
+                .output()
+                .unwrap();
+            assert!(edit.status.success(), "{edit:?}");
+            assert_eq!(std::fs::read(view.join("edited")).unwrap(), edited);
             let graph = owner
-                .seed_test_guarded_git_commit(root.root_id, &["first", "second"])
+                .seed_test_guarded_git_commit(
+                    root.root_id,
+                    &[("first", 2), ("second", 2), ("edited", 1)],
+                )
                 .unwrap();
             (root.root_id, graph)
         };
-        assert_eq!(original_graph.blobs.len(), 2);
+        assert_eq!(original_graph.blobs.len(), 3);
         let owner_id = nodes[1].lock().unwrap().keys().node_id();
         let descriptor = nodes[1]
             .lock()
@@ -33434,6 +33454,7 @@ mod tests {
         assert_eq!(recovered.generation, 1);
         assert_eq!(std::fs::read(restored.join("first")).unwrap(), first);
         assert_eq!(std::fs::read(restored.join("second")).unwrap(), second);
+        assert_eq!(std::fs::read(restored.join("edited")).unwrap(), edited);
         let recovered_graph = recovered_node
             .lock()
             .unwrap()
@@ -33441,7 +33462,7 @@ mod tests {
             .unwrap();
         assert_eq!(recovered_graph.refs, original_graph.refs);
         assert_eq!(recovered_graph.objects, original_graph.objects);
-        assert_eq!(recovered_graph.blobs.len(), 2);
+        assert_eq!(recovered_graph.blobs.len(), 3);
         let mut root_anchor_ids = BTreeSet::new();
         for (recovered_blob, original_blob) in
             recovered_graph.blobs.iter().zip(&original_graph.blobs)
@@ -33528,7 +33549,7 @@ mod tests {
                     .unwrap()
                     >= 4
             );
-            for bytes in [&first, &second] {
+            for bytes in [&first, &second, &edited] {
                 let oid = git2::Oid::hash_object(git2::ObjectType::Blob, bytes).unwrap();
                 assert_eq!(stock.find_blob(oid).unwrap().content(), bytes);
             }
