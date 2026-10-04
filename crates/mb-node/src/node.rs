@@ -24670,6 +24670,28 @@ pub(crate) mod tests {
             .capture_claimed_guarded_view_for_revision(manifest.anchor_id, revision_id)
             .unwrap();
         capture.verify().unwrap();
+        let private = crate::GuardedPrivateMetadataV6::from_capture(&capture, |file| {
+            Ok(file
+                .data_extents
+                .iter()
+                .map(|extent| crate::PrivateDataExtent {
+                    offset: extent.offset,
+                    logical_len: extent.logical_len,
+                    sectors: vec![SectorRef {
+                        id: [7; 32],
+                        root: [8; 32],
+                        logical_len: u32::try_from(extent.logical_len).unwrap(),
+                    }],
+                })
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(private.format_version, 6);
+        assert_eq!(private.root.uid, 65534);
+        assert!(matches!(
+            private.entries.as_slice(),
+            [crate::GuardedPrivateEntryV6::File { path, .. }] if path == b"sample"
+        ));
         assert_eq!(capture.files.len(), 1);
         assert_eq!(capture.files[0].path, b"sample");
         let mut captured_bytes = Vec::new();

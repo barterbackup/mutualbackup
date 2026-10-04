@@ -793,6 +793,13 @@
   and eventual anchor cleanup on ext4 and disposable Btrfs. This operation
   still needs to be called from the signed revision path after the lossless
   private metadata and recovery format are implemented.
+  A version-6 private metadata shape now removes local anchor and inode IDs
+  while preserving raw Unix paths, visible uid/gid, modes, atimes, mtimes,
+  directory lengths, hard-link groups, and sparse sector geometry. It builds
+  from a verified stopped capture, validates decoded bounds and path topology,
+  and round-trips a non-UTF-8 hard-link fixture. The node-level privileged
+  capture probe constructs it from an edited view. Revision signing, seed
+  restore, and recovered-anchor pin transfer still need to consume this shape.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

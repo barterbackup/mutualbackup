@@ -1278,7 +1278,7 @@ fn prepare_git_backup_descriptor(
     Ok(descriptor)
 }
 
-fn validate_file_extents(
+pub(crate) fn validate_file_extents(
     logical_len: u64,
     extents: impl IntoIterator<Item = (u64, u64)>,
 ) -> Result<()> {

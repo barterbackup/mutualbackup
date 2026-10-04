@@ -2,6 +2,8 @@
 
 mod automation;
 mod control;
+#[cfg(target_os = "linux")]
+mod guarded_metadata;
 #[cfg(test)]
 mod lab;
 mod network;
@@ -17,6 +19,8 @@ pub use control::{
     LocalResponse, NodeStatus, ProtectedRoot, UnlockSecret, bind_local_control, local_control_call,
     serve_local_control, serve_local_control_on,
 };
+#[cfg(target_os = "linux")]
+pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6};
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use network::{
     ClaimedTorTransportConfig, DhtRecord, DhtRecoveryResult, ONION_SERVICE_PORT, P2pActiveSession,

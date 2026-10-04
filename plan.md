@@ -606,6 +606,14 @@ Retain MutualBackup's independent content roots and signed revision authority.
   cursors are local catalog state, never portable signed recovery fields.
   Symlink restore and broader portable attributes come later and require an
   explicit policy that prevents path escape.
+- **Milestone 6 guarded private metadata:** keep the existing signed
+  `UserRevision` envelope and encrypt a versioned private format for guarded
+  views. Preserve raw Unix path bytes, visible uid/gid, mode, atime/mtime,
+  directory length, sparse sector extents, and portable hard-link groups.
+  Validate path topology and sector geometry before restore. Keep local inode
+  IDs, mount claims, and source-anchor locators outside the signed format;
+  restore and reanchor from sector bytes without depending on those old IDs.
+  Do not convert guarded entries through the older UTF-8-only private format.
 - **UserRevision:** guild, owner, protected-root ID, root-scoped monotonic
   revision, optional parent in that root's chain, explicit metadata/data
   `SectorRef` lists, suite versions, and owner signature. Milestone 5 keeps
