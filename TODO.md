@@ -903,7 +903,12 @@
   node fixture now decodes the actual signed format-6 sectors, binds them to
   newly restored local inodes, and mounts the resulting guarded view with its
   raw names and virtual directory length. That path passes locally on ext4
-  and disposable Btrfs, including remount. The production recovery job still
+  and disposable Btrfs, including remount. Btrfs recovery exposed a signed
+  atime mismatch after capture. The mount now persists a per-inode first-mount
+  time baseline and presents signed atime/mtime until the lower time changes;
+  a changed directory mtime remains visible after remount. Focused privileged
+  ext4/Btrfs probes cover signed times, a changed directory mtime, and
+  baseline cleanup on retirement. The production recovery job still
   needs a replayable transition from its published restored directory to a
   private lower tree, guarded root registration/backend selection, and a
   non-reflink recovery path before guarded enrollment can be enabled.

@@ -24877,6 +24877,27 @@ pub(crate) mod tests {
             virtual_metadata.clone(),
         )
         .unwrap();
+        let raw_signed = virtual_metadata
+            .entries
+            .iter()
+            .find(|entry| entry.path == raw_path.as_os_str().as_bytes())
+            .unwrap();
+        let raw_visible = fs::metadata(restored_view.join(&raw_path)).unwrap();
+        assert_eq!(raw_visible.atime(), raw_signed.atime_secs);
+        assert_eq!(raw_visible.atime_nsec() as u32, raw_signed.atime_nanos);
+        assert_eq!(raw_visible.mtime(), raw_signed.modified_secs);
+        assert_eq!(raw_visible.mtime_nsec() as u32, raw_signed.modified_nanos);
+        let directory_signed = virtual_metadata
+            .entries
+            .iter()
+            .find(|entry| entry.path == raw_directory.as_bytes())
+            .unwrap();
+        let directory_visible = fs::metadata(restored_view.join(&raw_directory)).unwrap();
+        assert_eq!(directory_visible.atime(), directory_signed.atime_secs);
+        assert_eq!(directory_visible.mtime(), directory_signed.modified_secs);
+        let root_visible = fs::metadata(&restored_view).unwrap();
+        assert_eq!(root_visible.atime(), virtual_metadata.root_atime_secs);
+        assert_eq!(root_visible.mtime(), virtual_metadata.root_modified_secs);
         assert_eq!(
             fs::metadata(restored_view.join(&raw_directory))
                 .unwrap()

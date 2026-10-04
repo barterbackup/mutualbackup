@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::guarded_view_probe::{
     GuardedProbeView, GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
+    GuardedViewTimeBaselineV1,
 };
 use crate::{
     CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedRootCapturePlan,
@@ -28,6 +29,7 @@ use crate::{
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
 const MOUNT_RETIRE_KIND: &str = "guarded-view-mount-retired-v1";
 const VIRTUAL_METADATA_KIND: &str = "guarded-view-virtual-metadata-v1";
+const VIRTUAL_TIME_BASELINE_KIND: &str = "guarded-view-virtual-time-baseline-v1";
 const STOPPED_CAPTURE_KIND: &str = "guarded-view-stopped-capture-v1";
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
 const GUARDED_REVISION_RETIREMENT_KIND: &str = "guarded-view-revision-retirement-v1";
@@ -645,6 +647,7 @@ impl GuardedViewMount {
                 "guarded view remains mounted during retirement"
             );
             control.delete_record(VIRTUAL_METADATA_KIND, id)?;
+            control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
             return Ok(());
         };
         let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
@@ -671,6 +674,7 @@ impl GuardedViewMount {
         }
         control.delete_record_if_value(MOUNT_CLAIM_KIND, id, &claim_bytes)?;
         control.delete_record(VIRTUAL_METADATA_KIND, id)?;
+        control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
         Ok(())
     }
 
@@ -813,6 +817,23 @@ impl GuardedViewMount {
                 })
                 .transpose()?
         };
+        let time_baseline = {
+            let control = control
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            control
+                .get_record(VIRTUAL_TIME_BASELINE_KIND, manifest.anchor_id.as_bytes())?
+                .map(|bytes| {
+                    ensure!(
+                        bytes.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                        "guarded virtual time baseline exceeds its local bound"
+                    );
+                    Ok(mb_core::decode_canonical::<GuardedViewTimeBaselineV1>(
+                        &bytes,
+                    )?)
+                })
+                .transpose()?
+        };
         if let Some(metadata) = &virtual_metadata {
             validate_virtual_metadata_binding(metadata, manifest, &plan)?;
             ensure!(
@@ -825,6 +846,22 @@ impl GuardedViewMount {
             ensure!(
                 requested_metadata.is_none() || existing.is_none(),
                 "cannot add guarded virtual metadata to an existing mount claim"
+            );
+        }
+        if let Some(baseline) = &time_baseline {
+            let metadata = virtual_metadata
+                .as_ref()
+                .or(requested_metadata.as_ref())
+                .context("guarded virtual time baseline has no metadata")?;
+            ensure!(
+                baseline.format_version == 1
+                    && baseline.anchor_id == manifest.anchor_id
+                    && baseline.metadata_hash
+                        == *blake3::hash(&mb_core::canonical_bytes(metadata)?).as_bytes()
+                    && baseline.entries.len() == metadata.entries.len()
+                    && baseline.root.valid()
+                    && baseline.entries.iter().all(|entry| entry.valid()),
+                "guarded virtual time baseline differs from signed metadata"
             );
         }
         if let Some(claim) = &existing {
@@ -899,11 +936,24 @@ impl GuardedViewMount {
             view_uid,
             view_gid,
         )?;
-        if let Some(metadata) = virtual_metadata.as_ref().or(requested_metadata.as_ref()) {
-            view.apply_virtual_metadata(metadata, existing.is_none())?;
-        }
         view.verify_private_lower_ownership()?;
         view.verify_lower_namespace()?;
+        let new_time_baseline = if existing.is_none() && time_baseline.is_none() {
+            virtual_metadata
+                .as_ref()
+                .or(requested_metadata.as_ref())
+                .map(|metadata| view.capture_time_baseline(metadata))
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(metadata) = virtual_metadata.as_ref().or(requested_metadata.as_ref()) {
+            view.apply_virtual_metadata(
+                metadata,
+                time_baseline.as_ref().or(new_time_baseline.as_ref()),
+                existing.is_none(),
+            )?;
+        }
         if existing.is_none() {
             let claim = MountClaim {
                 version: 1,
@@ -944,6 +994,21 @@ impl GuardedViewMount {
                         "guarded virtual metadata changed concurrently"
                     );
                 }
+            }
+            if let Some(baseline) = &new_time_baseline {
+                let encoded_baseline = mb_core::canonical_bytes(baseline)?;
+                ensure!(
+                    encoded_baseline.len() <= STOPPED_CAPTURE_MAX_BYTES,
+                    "guarded virtual time baseline exceeds its local bound"
+                );
+                ensure!(
+                    control.put_record_if_absent(
+                        VIRTUAL_TIME_BASELINE_KIND,
+                        manifest.anchor_id.as_bytes(),
+                        &encoded_baseline,
+                    )?,
+                    "guarded virtual time baseline changed concurrently"
+                );
             }
             ensure!(
                 control.put_record_if_absent(
@@ -2409,6 +2474,8 @@ print('DONE', flush=True)
         metadata.root_mode = 0o750;
         metadata.root_uid = 65533;
         metadata.root_gid = 65533;
+        metadata.root_atime_secs = 1_700_000_000;
+        metadata.root_modified_secs = 1_700_000_000;
         for (entry, captured) in metadata.entries.iter_mut().zip(&manifest.entries) {
             entry.mode = match captured {
                 crate::CapturedEntry::Directory { mode, .. }
@@ -2417,6 +2484,8 @@ print('DONE', flush=True)
             };
             entry.uid = 65533;
             entry.gid = 65533;
+            entry.atime_secs = 1_700_000_000;
+            entry.modified_secs = 1_700_000_000;
             if entry.path == b"nested" {
                 entry.logical_len = 8192;
             }
@@ -2453,6 +2522,7 @@ print('DONE', flush=True)
         .unwrap();
         assert_eq!(fs::metadata(&mountpoint).unwrap().uid(), 65533);
         assert_eq!(fs::metadata(&mountpoint).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(fs::metadata(&mountpoint).unwrap().mtime(), 1_700_000_000);
         assert_eq!(fs::metadata(mountpoint.join("nested")).unwrap().len(), 8192);
         assert_eq!(
             fs::metadata(mountpoint.join("nested")).unwrap().mode() & 0o7777,
@@ -2463,16 +2533,43 @@ print('DONE', flush=True)
             65533
         );
         assert_eq!(
+            fs::metadata(mountpoint.join("nested/file"))
+                .unwrap()
+                .atime(),
+            1_700_000_000
+        );
+        assert_eq!(
             fs::read(mountpoint.join("nested/file")).unwrap(),
             b"raw\r\nbytes\0"
         );
         fs::set_permissions(mountpoint.join("nested"), fs::Permissions::from_mode(0o711)).unwrap();
+        let nested_path = CString::new(mountpoint.join("nested").as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: 1_600_000_000,
+                tv_nsec: 0,
+            },
+        ];
+        // SAFETY: the path is NUL-free and the two-element timespec array is valid.
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, nested_path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
         mount.stop().unwrap();
         let remounted =
             GuardedViewMount::recover_claimed(manifest.anchor_id, Arc::clone(&control)).unwrap();
         assert_eq!(fs::metadata(&mountpoint).unwrap().uid(), 65533);
         assert_eq!(fs::metadata(&mountpoint).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(fs::metadata(&mountpoint).unwrap().mtime(), 1_700_000_000);
         assert_eq!(fs::metadata(mountpoint.join("nested")).unwrap().len(), 8192);
+        assert_eq!(
+            fs::metadata(mountpoint.join("nested")).unwrap().mtime(),
+            1_600_000_000
+        );
         assert_eq!(
             fs::metadata(mountpoint.join("nested")).unwrap().mode() & 0o7777,
             0o711
@@ -2487,6 +2584,15 @@ print('DONE', flush=True)
         assert!(
             store
                 .get_record(super::VIRTUAL_METADATA_KIND, manifest.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_record(
+                    super::VIRTUAL_TIME_BASELINE_KIND,
+                    manifest.anchor_id.as_bytes()
+                )
                 .unwrap()
                 .is_none()
         );

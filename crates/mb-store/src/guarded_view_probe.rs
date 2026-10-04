@@ -1718,6 +1718,7 @@ impl GuardedNamespace {
             );
             let view = GuardedProbeDirectory {
                 attr,
+                virtual_time: None,
                 parent,
                 name,
                 relative_path: path,
@@ -2058,6 +2059,7 @@ fn namespace_parent(
 struct GuardedProbeFile {
     source: File,
     source_attr: Mutex<FileAttr>,
+    virtual_time: Mutex<Option<GuardedVirtualTime>>,
     location: Arc<Mutex<Option<ProbeLocation>>>,
     open_for_write: Option<Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync>>,
 }
@@ -2092,6 +2094,7 @@ struct VerifiedFileGuard {
 #[derive(Clone)]
 struct GuardedProbeDirectory {
     attr: FileAttr,
+    virtual_time: Option<GuardedVirtualTime>,
     parent: INodeNo,
     name: OsString,
     relative_path: PathBuf,
@@ -2113,6 +2116,72 @@ pub struct GuardedViewMetadataV1 {
     pub root_modified_secs: i64,
     pub root_modified_nanos: u32,
     pub entries: Vec<GuardedViewMetadataEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GuardedTimePair {
+    pub atime_secs: i64,
+    pub atime_nanos: u32,
+    pub modified_secs: i64,
+    pub modified_nanos: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GuardedViewTimeBaselineV1 {
+    pub format_version: u16,
+    pub anchor_id: Uuid,
+    pub metadata_hash: [u8; 32],
+    pub root: GuardedTimePair,
+    pub entries: Vec<GuardedTimePair>,
+}
+
+#[derive(Clone, Copy)]
+struct GuardedVirtualTime {
+    signed: GuardedTimePair,
+    baseline: GuardedTimePair,
+}
+
+impl GuardedTimePair {
+    fn from_attr(attr: FileAttr) -> anyhow::Result<Self> {
+        let (atime_secs, atime_nanos) = snapshot_time(attr.atime)?;
+        let (modified_secs, modified_nanos) = snapshot_time(attr.mtime)?;
+        Ok(Self {
+            atime_secs,
+            atime_nanos,
+            modified_secs,
+            modified_nanos,
+        })
+    }
+
+    pub(crate) fn valid(self) -> bool {
+        self.atime_nanos < 1_000_000_000 && self.modified_nanos < 1_000_000_000
+    }
+}
+
+impl GuardedVirtualTime {
+    fn apply(self, attr: &mut FileAttr) -> io::Result<()> {
+        if attr.atime
+            == unix_system_time(
+                self.baseline.atime_secs,
+                i64::from(self.baseline.atime_nanos),
+            )?
+        {
+            attr.atime =
+                unix_system_time(self.signed.atime_secs, i64::from(self.signed.atime_nanos))?;
+        }
+        if attr.mtime
+            == unix_system_time(
+                self.baseline.modified_secs,
+                i64::from(self.baseline.modified_nanos),
+            )?
+        {
+            attr.mtime = unix_system_time(
+                self.signed.modified_secs,
+                i64::from(self.signed.modified_nanos),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2155,6 +2224,7 @@ pub(crate) struct GuardedProbeView {
     root_uid: u32,
     root_gid: u32,
     root_perm: AtomicU16,
+    root_virtual_time: Option<GuardedVirtualTime>,
     virtual_directory_modes: HashMap<u64, u16>,
     poisoned: AtomicBool,
     next_handle: AtomicU64,
@@ -2194,6 +2264,9 @@ impl GuardedProbeFile {
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
         attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
+        if let Some(virtual_time) = *self.virtual_time.lock().unwrap() {
+            virtual_time.apply(&mut attr)?;
+        }
         Ok(*attr)
     }
 
@@ -2248,6 +2321,7 @@ impl GuardedProbeFile {
         Ok(Self {
             source,
             source_attr: Mutex::new(attr),
+            virtual_time: Mutex::new(None),
             location,
             open_for_write: Some(open_for_write),
         })
@@ -2255,6 +2329,51 @@ impl GuardedProbeFile {
 }
 
 impl GuardedProbeView {
+    pub(crate) fn capture_time_baseline(
+        &self,
+        metadata: &GuardedViewMetadataV1,
+    ) -> anyhow::Result<GuardedViewTimeBaselineV1> {
+        let root = GuardedTimePair::from_attr(self.root_attr()?)?;
+        let mut entries = Vec::with_capacity(metadata.entries.len());
+        for (index, entry) in metadata.entries.iter().enumerate() {
+            let inode = u64::try_from(index)?
+                .checked_add(2)
+                .context("guarded virtual inode overflow")?;
+            let attr = match entry.kind {
+                GuardedViewEntryKind::Directory => {
+                    let directory = self
+                        .directories
+                        .get(&inode)
+                        .cloned()
+                        .or_else(|| {
+                            self.dynamic_directories
+                                .lock()
+                                .unwrap()
+                                .get(&inode)
+                                .cloned()
+                        })
+                        .context("guarded virtual baseline lacks a directory")?;
+                    self.directory_attr(&directory)?
+                }
+                GuardedViewEntryKind::File => self
+                    .files
+                    .get(&inode)
+                    .cloned()
+                    .or_else(|| self.dynamic_files.lock().unwrap().get(&inode).cloned())
+                    .context("guarded virtual baseline lacks a file")?
+                    .current_attr()?,
+            };
+            entries.push(GuardedTimePair::from_attr(attr)?);
+        }
+        Ok(GuardedViewTimeBaselineV1 {
+            format_version: 1,
+            anchor_id: metadata.anchor_id,
+            metadata_hash: *blake3::hash(&mb_core::canonical_bytes(metadata)?).as_bytes(),
+            root,
+            entries,
+        })
+    }
+
     /// Apply signed, locally rebound presentation metadata to a freshly
     /// reconstructed view. The mount wrapper first proves that every entry
     /// still belongs to the captured plan. Native file bytes and edit guards
@@ -2262,6 +2381,7 @@ impl GuardedProbeView {
     pub(crate) fn apply_virtual_metadata(
         &mut self,
         metadata: &GuardedViewMetadataV1,
+        baseline: Option<&GuardedViewTimeBaselineV1>,
         initial_mount: bool,
     ) -> anyhow::Result<()> {
         self.root_uid = metadata.root_uid;
@@ -2272,17 +2392,38 @@ impl GuardedProbeView {
             .context("guarded virtual view has no namespace")?
             .root_mode(metadata.root_mode)?;
         self.root_perm.store(root_mode, Ordering::Release);
+        if let Some(baseline) = baseline {
+            self.root_virtual_time = Some(GuardedVirtualTime {
+                signed: GuardedTimePair {
+                    atime_secs: metadata.root_atime_secs,
+                    atime_nanos: metadata.root_atime_nanos,
+                    modified_secs: metadata.root_modified_secs,
+                    modified_nanos: metadata.root_modified_nanos,
+                },
+                baseline: baseline.root,
+            });
+        }
         for (index, entry) in metadata.entries.iter().enumerate() {
             let inode = u64::try_from(index)?
                 .checked_add(2)
                 .context("guarded virtual inode overflow")?;
             let mut present = false;
+            let virtual_time = baseline.map(|baseline| GuardedVirtualTime {
+                signed: GuardedTimePair {
+                    atime_secs: entry.atime_secs,
+                    atime_nanos: entry.atime_nanos,
+                    modified_secs: entry.modified_secs,
+                    modified_nanos: entry.modified_nanos,
+                },
+                baseline: baseline.entries[index],
+            });
             match entry.kind {
                 GuardedViewEntryKind::Directory => {
                     if let Some(directory) = self.directories.get_mut(&inode) {
                         directory.attr.size = entry.logical_len;
                         directory.attr.uid = entry.uid;
                         directory.attr.gid = entry.gid;
+                        directory.virtual_time = virtual_time;
                         present = true;
                     }
                     if let Some(directory) =
@@ -2291,6 +2432,7 @@ impl GuardedProbeView {
                         directory.attr.size = entry.logical_len;
                         directory.attr.uid = entry.uid;
                         directory.attr.gid = entry.gid;
+                        directory.virtual_time = virtual_time;
                         present = true;
                     }
                     if present {
@@ -2302,12 +2444,14 @@ impl GuardedProbeView {
                         let mut attr = file.source_attr.lock().unwrap();
                         attr.uid = entry.uid;
                         attr.gid = entry.gid;
+                        *file.virtual_time.lock().unwrap() = virtual_time;
                         present = true;
                     }
                     if let Some(file) = self.dynamic_files.get_mut().unwrap().get(&inode) {
                         let mut attr = file.source_attr.lock().unwrap();
                         attr.uid = entry.uid;
                         attr.gid = entry.gid;
+                        *file.virtual_time.lock().unwrap() = virtual_time;
                         present = true;
                     }
                 }
@@ -3269,6 +3413,7 @@ impl GuardedProbeView {
                     files.push(GuardedProbeFile {
                         source,
                         source_attr: Mutex::new(attr),
+                        virtual_time: Mutex::new(None),
                         location,
                         open_for_write: Some(open_for_write),
                     });
@@ -3474,6 +3619,7 @@ impl GuardedProbeView {
             root_uid,
             root_gid,
             root_perm: AtomicU16::new(root_perm),
+            root_virtual_time: None,
             virtual_directory_modes: HashMap::new(),
             poisoned: AtomicBool::new(false),
             next_handle: AtomicU64::new(1),
@@ -3508,6 +3654,9 @@ impl GuardedProbeView {
             attr.mtime = metadata.modified()?;
             attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
         }
+        if let Some(virtual_time) = self.root_virtual_time {
+            virtual_time.apply(&mut attr)?;
+        }
         Ok(attr)
     }
 
@@ -3526,6 +3675,9 @@ impl GuardedProbeView {
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
         attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
+        if let Some(virtual_time) = directory.virtual_time {
+            virtual_time.apply(&mut attr)?;
+        }
         attr.perm = self
             .namespace
             .as_ref()
@@ -4327,6 +4479,7 @@ impl Filesystem for GuardedProbeView {
             attr.gid = self.root_gid;
             Ok(GuardedProbeDirectory {
                 attr,
+                virtual_time: None,
                 parent,
                 name: name.to_os_string(),
                 relative_path: target,
@@ -4954,6 +5107,7 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
         // Advertise the original editable mode. The lower inode is frozen;
         // the view must still reject writes until detach.
         source_attr: Mutex::new(probe_file_attr(&source, FILE_INODE, 0o666)?),
+        virtual_time: Mutex::new(None),
         location: Arc::new(Mutex::new(Some(ProbeLocation {
             parent: INodeNo::ROOT,
             relative_path: PathBuf::from("sample"),
@@ -6592,6 +6746,7 @@ mod tests {
             let source = File::open(lower.join("sample")).unwrap();
             let file = GuardedProbeFile {
                 source_attr: Mutex::new(probe_file_attr(&source, FILE_INODE, 0o666).unwrap()),
+                virtual_time: Mutex::new(None),
                 location: Arc::new(Mutex::new(Some(ProbeLocation {
                     parent: INodeNo::ROOT,
                     relative_path: PathBuf::from("sample"),
@@ -6768,6 +6923,7 @@ mod tests {
         advertised.uid = 65534;
         let file = GuardedProbeFile {
             source_attr: Mutex::new(advertised),
+            virtual_time: Mutex::new(None),
             source,
             location,
             open_for_write: Some(open_for_write),
