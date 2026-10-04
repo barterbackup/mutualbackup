@@ -202,6 +202,44 @@ impl GuardedRecoveryHandoff {
         Ok(record.visible)
     }
 
+    /// A retired claim may no longer be used to take a new view snapshot.
+    /// Replay must instead find the already durable, handoff-bound snapshot.
+    pub fn has_prepared_release(&self, control: &ControlStore, anchor_id: Uuid) -> Result<bool> {
+        if control
+            .get_record(HANDOFF_RELEASE_METADATA_KIND, self.handoff_id.as_bytes())?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.release_metadata(control, anchor_id)?;
+        Ok(true)
+    }
+
+    /// Keys to retire atomically with the node's protected-root registration
+    /// after the name and visible metadata have been handed back.
+    pub fn released_record_keys(
+        &self,
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        self.release_metadata(control, anchor_id)?;
+        let bytes = mb_core::canonical_bytes(self)?;
+        ensure!(
+            control.get_record(HANDOFF_KIND, self.handoff_id.as_bytes())? == Some(bytes.clone())
+                && control.get_record(HANDOFF_RELEASE_KIND, self.handoff_id.as_bytes())?
+                    == Some(bytes),
+            "guarded release handoff is not complete"
+        );
+        Ok([
+            HANDOFF_KIND,
+            HANDOFF_RELEASE_KIND,
+            HANDOFF_RELEASE_METADATA_KIND,
+        ]
+        .into_iter()
+        .map(|kind| (kind.to_owned(), self.handoff_id.as_bytes().to_vec()))
+        .collect())
+    }
+
     /// Freeze the stopped view's post-detach visible metadata before the
     /// mount claim can retire. A retry must find the same snapshot; it cannot
     /// substitute newer view state for a release already in progress.
@@ -613,6 +651,10 @@ impl GuardedRecoveryHandoff {
 
     pub fn lower_path(&self) -> PathBuf {
         self.parent_path.join(&self.lower_name)
+    }
+
+    pub fn target_identity(&self) -> NativeFileId {
+        self.target_id
     }
 
     pub fn mountpoint(&self) -> PathBuf {

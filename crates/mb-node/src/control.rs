@@ -404,6 +404,21 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::RemoveGuardedRoot { root_id } => {
+            blocking_node(node, move |node| {
+                #[cfg(target_os = "linux")]
+                {
+                    node.remove_guarded_protected_root(root_id)?;
+                    Ok(LocalResponse::RootRemoved { root_id })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (node, root_id);
+                    anyhow::bail!("guarded roots require Linux")
+                }
+            })
+            .await
+        }
         LocalRequest::GitInit { path } => {
             blocking_node(node, move |node| {
                 node.git_init(&path)

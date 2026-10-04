@@ -128,6 +128,9 @@ const GUARDED_ENROLLMENT_KIND: &str = "guarded-root-enrollment-v1";
 const GUARDED_IN_PLACE_KIND: &str = "guarded-in-place-enrollment-v1";
 
 #[cfg(target_os = "linux")]
+const GUARDED_RELEASE_KIND: &str = "guarded-protected-root-release-v1";
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct GuardedEnrollmentIntentV1 {
     format_version: u16,
@@ -211,6 +214,33 @@ impl GuardedInPlaceIntentV1 {
                 .any(|entry| entry.uid != self.presentation.root_uid)
         {
             anyhow::bail!("invalid guarded in-place enrollment intent");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedReleaseIntentV1 {
+    format_version: u16,
+    root: ProtectedRoot,
+    anchor_id: Uuid,
+    handoff_hash: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedReleaseIntentV1 {
+    fn validate(&self, record_id: &[u8]) -> Result<()> {
+        if self.format_version != 1
+            || self.root.format_version != 4
+            || self.root.root_id.is_nil()
+            || record_id != self.root.root_id.as_bytes()
+            || !self.root.path.is_absolute()
+            || self.root.filesystem_id == 0
+            || self.root.root_inode == 0
+            || self.anchor_id.is_nil()
+        {
+            anyhow::bail!("invalid guarded protected-root release intent");
         }
         Ok(())
     }
@@ -1414,10 +1444,20 @@ impl Node {
         volumes.reconcile(&control)?;
         let volume_readers = Arc::new(RwLock::new(volumes.reader_configs()));
         #[cfg(target_os = "linux")]
+        let pending_guarded_releases = Self::pending_guarded_releases(&control)?;
+        #[cfg(target_os = "linux")]
         let guarded_mounts = if GuardedViewMount::has_claims(&control)? {
-            GuardedViewMount::recover_all_claimed(Arc::new(Mutex::new(
-                ControlStore::open_with_key(data_dir.join("control.db"), &control_database_key)?,
-            )))?
+            let excluded = pending_guarded_releases
+                .iter()
+                .map(|(intent, _)| intent.anchor_id)
+                .collect();
+            GuardedViewMount::recover_all_claimed_except(
+                Arc::new(Mutex::new(ControlStore::open_with_key(
+                    data_dir.join("control.db"),
+                    &control_database_key,
+                )?)),
+                &excluded,
+            )?
         } else {
             Vec::new()
         };
@@ -1433,6 +1473,8 @@ impl Node {
             volume_readers,
             membership_history_cache: Mutex::new(None),
         };
+        #[cfg(target_os = "linux")]
+        node.reconcile_guarded_releases(&pending_guarded_releases)?;
         node.backfill_checkpoint_generation_index()?;
         node.reconcile_certified_writer_head()?;
         #[cfg(target_os = "linux")]
@@ -1452,6 +1494,9 @@ impl Node {
     pub fn check_guarded_mounts(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
+            if !self.control.records(GUARDED_RELEASE_KIND)?.is_empty() {
+                anyhow::bail!("guarded protected-root release is unfinished");
+            }
             let claimed = GuardedViewMount::claimed_anchor_ids(&self.control)?
                 .into_iter()
                 .collect::<BTreeSet<_>>();
@@ -1727,10 +1772,47 @@ impl Node {
     /// The mount retirement and anchor GC repeat their own pin checks after
     /// this read-only gate; this is not a substitute for those fences.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // The removal command will call this before its first mutation.
     fn guarded_release_preflight(&self, root_id: Uuid) -> Result<mb_store::GuardedViewBinding> {
         let root = self.protected_root_by_id(root_id)?;
         let binding = self.guarded_root_mount_binding(&root)?;
+        let handoff = GuardedRecoveryHandoff::load(&self.control, root_id)?
+            .context("guarded root has no in-place name handoff")?;
+        if handoff.mountpoint() != root.path
+            || handoff.lower_path() != binding.lower_root
+            || handoff.target_identity() != binding.lower_id
+        {
+            anyhow::bail!("guarded release handoff differs from its mounted root");
+        }
+        let backend: SourceBackendBinding = decode_canonical(
+            &self
+                .control
+                .get_record("source-backend", root_id.as_bytes())?
+                .context("guarded release lost its source backend")?,
+        )?;
+        if !backend.is_supported_guarded_for(root_id, root.filesystem_id, root.root_inode) {
+            anyhow::bail!("guarded release source backend changed");
+        }
+        if !self.control.records(GUARDED_RELEASE_KIND)?.is_empty() {
+            anyhow::bail!("finish the pending guarded release before starting another");
+        }
+        self.require_guarded_release_unpinned(root_id, binding.anchor_id, &root.path)?;
+        Ok(binding)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_guarded_release_unpinned(
+        &self,
+        root_id: Uuid,
+        anchor_id: Uuid,
+        root_path: &Path,
+    ) -> Result<()> {
+        if self
+            .automatic_backup_state(unix_seconds())?
+            .in_flight_root_id
+            == Some(root_id)
+        {
+            anyhow::bail!("automatic backup of guarded root is in progress");
+        }
         if self
             .control
             .get_record("git-repository", root_id.as_bytes())?
@@ -1738,7 +1820,7 @@ impl Node {
         {
             anyhow::bail!("guarded root still owns a Git repository");
         }
-        if git_prune_capture_pending(&self.control, root_id, &root.path)? {
+        if git_prune_capture_pending(&self.control, root_id, root_path)? {
             anyhow::bail!("guarded root has an unfinished source capture");
         }
         if !self.control.records("restore-job")?.is_empty() {
@@ -1760,11 +1842,224 @@ impl Node {
                 anyhow::bail!("guarded root has an unfinished backup job");
             }
         }
-        GuardedViewMount::require_release_unpinned(binding.anchor_id, &self.control)?;
-        if git_prune_recipe_anchor_ids(&self.control)?.contains(&binding.anchor_id) {
+        for (id, bytes) in self.control.records("user-revision")? {
+            let revision: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+            if id != revision.value.revision_id.as_bytes() {
+                anyhow::bail!("durable user revision ID is invalid");
+            }
+            if revision.value.owner == self.keys.node_id()
+                && revision.value.protected_root_id == root_id
+            {
+                anyhow::bail!("guarded root has a retained signed revision");
+            }
+        }
+        for bytes in self.control.checkpoint_head_certificates()? {
+            let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+            checkpoint.verify()?;
+            if checkpoint.checkpoint.revisions.iter().any(|revision| {
+                revision.value.owner == self.keys.node_id()
+                    && revision.value.protected_root_id == root_id
+            }) {
+                anyhow::bail!("guarded root remains in a retained checkpoint");
+            }
+        }
+        GuardedViewMount::require_release_unpinned(anchor_id, &self.control)?;
+        if git_prune_recipe_anchor_ids(&self.control)?.contains(&anchor_id) {
             anyhow::bail!("guarded root anchor still serves a local sector recipe");
         }
-        Ok(binding)
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pending_guarded_releases(
+        control: &ControlStore,
+    ) -> Result<Vec<(GuardedReleaseIntentV1, Vec<u8>)>> {
+        let pending = control.records(GUARDED_RELEASE_KIND)?;
+        if pending.len() > 1 {
+            anyhow::bail!("multiple guarded protected-root releases are pending");
+        }
+        pending
+            .into_iter()
+            .map(|(id, bytes)| {
+                let intent: GuardedReleaseIntentV1 = decode_canonical(&bytes)?;
+                intent.validate(&id)?;
+                if control.get_record("protected-root", &id)?
+                    != Some(canonical_bytes(&intent.root)?)
+                {
+                    anyhow::bail!("guarded release lost its protected-root record");
+                }
+                let guarded: GuardedProtectedRootV1 = decode_canonical(
+                    &control
+                        .get_record("guarded-protected-root-v1", &id)?
+                        .context("guarded release lost its anchor binding")?,
+                )?;
+                if guarded.format_version != 1
+                    || guarded.root_id != intent.root.root_id
+                    || guarded.anchor_id != intent.anchor_id
+                {
+                    anyhow::bail!("guarded release anchor binding changed");
+                }
+                let backend: SourceBackendBinding = decode_canonical(
+                    &control
+                        .get_record("source-backend", &id)?
+                        .context("guarded release lost its source backend")?,
+                )?;
+                if !backend.is_supported_guarded_for(
+                    intent.root.root_id,
+                    intent.root.filesystem_id,
+                    intent.root.root_inode,
+                ) {
+                    anyhow::bail!("guarded release source backend changed");
+                }
+                let handoff = GuardedRecoveryHandoff::load(control, intent.root.root_id)?
+                    .context("guarded release lost its name handoff")?;
+                if handoff.mountpoint() != intent.root.path
+                    || handoff.target_identity()
+                        != (NativeFileId {
+                            filesystem_id: intent.root.filesystem_id,
+                            inode: intent.root.root_inode,
+                        })
+                    || *blake3::hash(&canonical_bytes(&handoff)?).as_bytes() != intent.handoff_hash
+                {
+                    anyhow::bail!("guarded release name handoff changed");
+                }
+                if let Some(plan) =
+                    GuardedRootCapturePlan::load_for_retirement(control, intent.anchor_id)?
+                    && plan.source_root() != handoff.lower_path()
+                {
+                    anyhow::bail!("guarded release source plan changed");
+                }
+                Ok((intent, bytes))
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_guarded_releases(
+        &mut self,
+        pending: &[(GuardedReleaseIntentV1, Vec<u8>)],
+    ) -> Result<()> {
+        for (intent, bytes) in pending {
+            self.finish_guarded_release(intent, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Return an in-place guarded root to an ordinary user-owned directory.
+    /// A durable intent precedes stopping the view; startup completes it
+    /// before recovering the remaining claimed views for normal service.
+    #[cfg(target_os = "linux")]
+    pub fn remove_guarded_protected_root(&mut self, root_id: Uuid) -> Result<()> {
+        self.check_guarded_mounts()?;
+        let binding = self.guarded_release_preflight(root_id)?;
+        let root = self.protected_root_by_id(root_id)?;
+        let handoff = GuardedRecoveryHandoff::load(&self.control, root_id)?
+            .context("guarded release lost its name handoff")?;
+        let intent = GuardedReleaseIntentV1 {
+            format_version: 1,
+            root,
+            anchor_id: binding.anchor_id,
+            handoff_hash: *blake3::hash(&canonical_bytes(&handoff)?).as_bytes(),
+        };
+        intent.validate(root_id.as_bytes())?;
+        let bytes = canonical_bytes(&intent)?;
+        if !self
+            .control
+            .put_record_if_absent(GUARDED_RELEASE_KIND, root_id.as_bytes(), &bytes)?
+        {
+            anyhow::bail!("guarded release intent changed concurrently");
+        }
+        self.finish_guarded_release(&intent, &bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_guarded_release(
+        &mut self,
+        intent: &GuardedReleaseIntentV1,
+        bytes: &[u8],
+    ) -> Result<()> {
+        intent.validate(intent.root.root_id.as_bytes())?;
+        if self
+            .control
+            .get_record(GUARDED_RELEASE_KIND, intent.root.root_id.as_bytes())?
+            != Some(bytes.to_vec())
+            || Self::pending_guarded_releases(&self.control)?
+                .first()
+                .map(|(record, _)| record)
+                != Some(intent)
+        {
+            anyhow::bail!("guarded release intent changed before replay");
+        }
+        self.require_guarded_release_unpinned(
+            intent.root.root_id,
+            intent.anchor_id,
+            &intent.root.path,
+        )?;
+        let handoff = GuardedRecoveryHandoff::load(&self.control, intent.root.root_id)?
+            .context("guarded release lost its handoff")?;
+        let parent = PinnedDirectory::open(
+            intent
+                .root
+                .path
+                .parent()
+                .context("guarded release has no parent")?,
+        )?;
+        if GuardedViewMount::claimed_anchor_ids(&self.control)?.contains(&intent.anchor_id) {
+            if let Some(index) = self
+                .guarded_mounts
+                .iter()
+                .position(|mount| mount.anchor_id() == intent.anchor_id)
+            {
+                self.guarded_mounts.swap_remove(index).stop()?;
+            }
+            let control = Arc::new(Mutex::new(ControlStore::open_with_key(
+                self.data_dir.join("control.db"),
+                &self.control_database_key,
+            )?));
+            handoff.prepare_release_metadata(control, &parent, intent.anchor_id)?;
+            GuardedViewMount::retire_claim(intent.anchor_id, &self.control)?;
+        }
+        if !handoff.has_prepared_release(&self.control, intent.anchor_id)? {
+            anyhow::bail!("retired guarded view lost its release metadata");
+        }
+        if let Some(plan) =
+            GuardedRootCapturePlan::load_for_retirement(&self.control, intent.anchor_id)?
+        {
+            plan.discard_unreferenced(&self.control)?;
+        }
+        handoff.release_names(&self.control, &parent, intent.anchor_id)?;
+        handoff.restore_released_metadata(&self.control, &parent, intent.anchor_id)?;
+        let mut automation = self.automatic_backup_state(unix_seconds())?;
+        automation
+            .root_schedules
+            .retain(|schedule| schedule.protected_root_id != intent.root.root_id);
+        automation
+            .root_retries
+            .retain(|retry| retry.protected_root_id != intent.root.root_id);
+        automation.dirty_since_unix_seconds = automation
+            .root_schedules
+            .iter()
+            .map(|schedule| schedule.dirty_since_unix_seconds)
+            .min();
+        let records = vec![(
+            "node-state".to_owned(),
+            b"automatic-backup".to_vec(),
+            canonical_bytes(&automation)?,
+        )];
+        let mut deletions = handoff.released_record_keys(&self.control, intent.anchor_id)?;
+        deletions.extend(
+            [
+                "protected-root",
+                "guarded-protected-root-v1",
+                "source-backend",
+                "root-dirty",
+                GUARDED_RELEASE_KIND,
+            ]
+            .into_iter()
+            .map(|kind| (kind.to_owned(), intent.root.root_id.as_bytes().to_vec())),
+        );
+        self.control.put_records_and_delete(&records, &deletions)?;
+        Ok(())
     }
 
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
@@ -25865,7 +26160,7 @@ pub(crate) mod tests {
         let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
-        for stage in 0..6_u8 {
+        for stage in 0..13_u8 {
             let area = tempfile::Builder::new()
                 .prefix("mb-guarded-in-place-")
                 .tempdir_in(&test_root)
@@ -26181,6 +26476,129 @@ pub(crate) mod tests {
                 assert_eq!(
                     fs::read(target.join("sample")).unwrap(),
                     b"independent released edit"
+                );
+                continue;
+            }
+            if stage >= 6 {
+                node.mark_root_dirty(root_id, "release must clear this root schedule")
+                    .unwrap();
+                assert!(
+                    node.automatic_backup_state(unix_seconds())
+                        .unwrap()
+                        .root_schedules
+                        .iter()
+                        .any(|schedule| schedule.protected_root_id == root_id)
+                );
+                let edited = Command::new("python3")
+                    .uid(65534)
+                    .gid(65534)
+                    .arg("-c")
+                    .arg("import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(b'live\\r\\nedit\\0')")
+                    .arg(target.join("sample"))
+                    .output()
+                    .unwrap();
+                assert!(edited.status.success(), "{edited:?}");
+                let anchor_id = node.guarded_release_preflight(root_id).unwrap().anchor_id;
+                if stage == 6 {
+                    node.remove_guarded_protected_root(root_id).unwrap();
+                } else {
+                    let intent = GuardedReleaseIntentV1 {
+                        format_version: 1,
+                        root: root.clone(),
+                        anchor_id,
+                        handoff_hash: *blake3::hash(&canonical_bytes(&handoff).unwrap()).as_bytes(),
+                    };
+                    node.control
+                        .put_record(
+                            GUARDED_RELEASE_KIND,
+                            root_id.as_bytes(),
+                            &canonical_bytes(&intent).unwrap(),
+                        )
+                        .unwrap();
+                    assert!(node.check_guarded_mounts().is_err());
+                    if stage >= 8 {
+                        node.guarded_mounts.pop().unwrap().stop().unwrap();
+                        let parent = PinnedDirectory::open(area.path()).unwrap();
+                        let control = Arc::new(Mutex::new(
+                            ControlStore::open_with_key(
+                                data_dir.join("control.db"),
+                                &node.control_database_key,
+                            )
+                            .unwrap(),
+                        ));
+                        handoff
+                            .prepare_release_metadata(control, &parent, anchor_id)
+                            .unwrap();
+                        if stage >= 9 {
+                            GuardedViewMount::retire_claim(anchor_id, &node.control).unwrap();
+                        }
+                        if stage >= 10 {
+                            GuardedRootCapturePlan::load_for_retirement(&node.control, anchor_id)
+                                .unwrap()
+                                .unwrap()
+                                .discard_unreferenced(&node.control)
+                                .unwrap();
+                        }
+                        if stage >= 11 {
+                            handoff
+                                .release_names(&node.control, &parent, anchor_id)
+                                .unwrap();
+                        }
+                        if stage >= 12 {
+                            handoff
+                                .restore_released_metadata(&node.control, &parent, anchor_id)
+                                .unwrap();
+                        }
+                    }
+                    drop(node);
+                    node = Node::open(&data_dir, seed.clone()).unwrap();
+                }
+                node.check_guarded_mounts().unwrap();
+                assert!(node.protected_root_by_id(root_id).is_err());
+                assert!(
+                    node.control
+                        .records(GUARDED_RELEASE_KIND)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    node.automatic_backup_state(unix_seconds())
+                        .unwrap()
+                        .root_schedules
+                        .iter()
+                        .all(|schedule| schedule.protected_root_id != root_id)
+                );
+                assert_eq!(
+                    node.automatic_backup_state(unix_seconds())
+                        .unwrap()
+                        .dirty_since_unix_seconds,
+                    None
+                );
+                assert!(
+                    GuardedRecoveryHandoff::load(&node.control, root_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    GuardedRootCapturePlan::load_for_retirement(&node.control, anchor_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(fs::read(target.join("sample")).unwrap(), b"live\r\nedit\0");
+                assert_eq!(
+                    fs::read(target.join("nested/child")).unwrap(),
+                    b"nested\nbytes"
+                );
+                assert_eq!(fs::metadata(&target).unwrap().uid(), 65534);
+                assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o755);
+                assert_eq!(fs::metadata(target.join("sample")).unwrap().uid(), 65534);
+                fs::write(target.join("sample"), b"released independent edit").unwrap();
+                drop(node);
+                let reopened = Node::open(&data_dir, seed).unwrap();
+                reopened.check_guarded_mounts().unwrap();
+                assert_eq!(
+                    fs::read(target.join("sample")).unwrap(),
+                    b"released independent edit"
                 );
                 continue;
             }

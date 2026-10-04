@@ -878,17 +878,19 @@
   through restore, reanchor, root registration, and reopen/retry. That local
   path passes; at that stage it did not cover full network seed-only recovery
   or guarded-view reconstruction without reflinks.
-  Production protected-root removal must retire the claimed view, and guarded
-  Git pins must join this proof before guarded enrollment or Git operations
-  can select the backend.
-  The in-place release probe now also retires the original guarded anchor
-  after stopped-view file detachment and claim retirement, before reversing
-  the name handoff. It reloads the retirement plan from its durable record,
-  repeats retirement after the sealed manifest is gone, and verifies the
-  released tree remains byte-exact and independently editable. The privileged
-  probe passes locally on ext4 and disposable Btrfs. Production removal still
-  needs a durable Node operation and startup reconciliation for every release
-  boundary, followed by protected-root and source-backend record retirement.
+  In-place guarded-root removal now has a `root remove-guarded` control path.
+  It journals a root/anchor/handoff-bound release intent before stopping FUSE,
+  refuses retained Git, signed-revision, checkpoint, recipe, and in-flight
+  pins, then detaches live files, retires the claim and original anchor, returns
+  the original directory name and visible metadata, and atomically removes the
+  protected-root/backend/dirty records and handoff journals. Startup excludes
+  only validated pending releases from mount recovery and finishes them before
+  serving the node. The privileged node probe covers a live ordinary-user edit
+  and restart after each release boundary on ext4 and disposable Btrfs; the
+  request/response schema and CLI command are wired locally. Separate-view
+  guarded removal, an abrupt-process-loss release probe, and guarded Git pin
+  integration remain open before broader guarded enrollment or Git operations
+  can select this backend.
   Guarded root capture now uses a version-2 plan and version-3 sealed manifest
   when an entry has raw Unix path bytes; version-1/2 UTF-8 records keep their
   prior bytes. Directory claims, lower ownership, freeze journals, namespace

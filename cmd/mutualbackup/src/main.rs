@@ -147,6 +147,8 @@ enum RootCommand {
     },
     /// Replace an existing user-owned directory with a guarded view in place.
     AddGuardedHere { path: PathBuf },
+    /// Return an in-place guarded root to an ordinary directory.
+    RemoveGuarded { root_id: Uuid },
 }
 
 #[derive(Debug, Subcommand)]
@@ -591,6 +593,22 @@ async fn main() -> Result<()> {
             };
             println!("guarded root registered: {}", root.path.display());
             println!("root id: {}", root.root_id);
+        }
+        Command::Root {
+            command: RootCommand::RemoveGuarded { root_id },
+        } => {
+            let response = local_control_call(
+                &control_socket,
+                &LocalRequest::RemoveGuardedRoot { root_id },
+            )
+            .await?;
+            let LocalResponse::RootRemoved { root_id: removed } = response else {
+                bail!("daemon returned the wrong response to guarded root removal");
+            };
+            if removed != root_id {
+                bail!("daemon removed a different guarded root");
+            }
+            println!("guarded root released: {root_id}");
         }
         Command::Guild { command } => {
             let request = match command {

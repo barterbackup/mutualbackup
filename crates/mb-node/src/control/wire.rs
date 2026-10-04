@@ -69,6 +69,9 @@ pub enum LocalRequest {
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
+    RemoveGuardedRoot {
+        root_id: Uuid,
+    },
     GitInit {
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
@@ -483,6 +486,9 @@ pub enum LocalResponse {
     StorageReconciled,
     GuildAudited(GuildAuditReport),
     RootAdded(ProtectedRoot),
+    RootRemoved {
+        root_id: Uuid,
+    },
     GitRepositoryInitialized(GitRepositoryInfo),
     GitWorktreeRegistered(GitWorktreeInfo),
     GitWorktrees(Vec<GitWorktreeInfo>),
@@ -676,6 +682,30 @@ mod tests {
         assert!(
             cddl_cat::validate_json_str("local-request-envelope", SCHEMA, INVALID_VERSION).is_err()
         );
+    }
+
+    #[test]
+    fn guarded_root_removal_request_and_response_match_cddl() {
+        let root_id = Uuid::from_bytes([73; 16]);
+        let request = LocalRequestEnvelope {
+            format_version: LOCAL_WIRE_FORMAT_VERSION,
+            request_id: [74; 16],
+            request: LocalRequest::RemoveGuardedRoot { root_id },
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &encoded).unwrap();
+        let decoded: LocalRequestEnvelope<LocalRequest> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+
+        let response = LocalResponseEnvelope {
+            format_version: LOCAL_WIRE_FORMAT_VERSION,
+            request_id: [74; 16],
+            result: Ok(LocalResponse::RootRemoved { root_id }),
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
+        let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
     }
 
     #[cfg(target_os = "linux")]

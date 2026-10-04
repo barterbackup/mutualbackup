@@ -581,6 +581,16 @@ impl GuardedViewMount {
     /// serving requests. A retirement marker wins over an old claim; finish
     /// that retirement instead of remounting a view being released.
     pub fn recover_all_claimed(control: Arc<Mutex<ControlStore>>) -> anyhow::Result<Vec<Self>> {
+        Self::recover_all_claimed_except(control, &BTreeSet::new())
+    }
+
+    /// Leave a node-owned removal intent stopped while recovering unrelated
+    /// views. The node must replay each excluded release before serving work;
+    /// skipping a claim alone is not a completed removal.
+    pub fn recover_all_claimed_except(
+        control: Arc<Mutex<ControlStore>>,
+        release_anchors: &BTreeSet<Uuid>,
+    ) -> anyhow::Result<Vec<Self>> {
         let active = {
             let control = control
                 .lock()
@@ -600,6 +610,11 @@ impl GuardedViewMount {
                 {
                     ensure!(retired == bytes, "guarded mount retirement marker changed");
                     Self::retire_claim(anchor_id, &control)?;
+                } else if release_anchors.contains(&anchor_id) {
+                    ensure!(
+                        pending_stopped_capture_attempts(&control, anchor_id)?.is_empty(),
+                        "guarded release overlaps a prepared revision capture"
+                    );
                 } else {
                     active.push(anchor_id);
                 }
