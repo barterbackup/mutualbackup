@@ -11,6 +11,7 @@ use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
     GIT_CATALOG_MARKER_FILE, PinnedDirectory, SourceBackendKind, git_catalog_marker_bytes,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -65,8 +66,16 @@ use crate::worktree::{
 const INITIALIZATION_INTENT: &str = "repository-intent";
 const INITIALIZATION_MAGIC: &str = "mutualbackup-git-repository-init-v1\n";
 const CATALOG_DATABASE: &str = "catalog.db";
+const SOURCE_BACKEND_KIND: &str = "git-source-backend-v1";
 const TEMP_MARKER_PREFIX: &str = ".repository-staging-";
 const MAX_MARKER_BYTES: u64 = 128;
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GitSourceBackendRecord {
+    format_version: u16,
+    repository_id: Uuid,
+    backend: SourceBackendKind,
+}
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -186,6 +195,7 @@ impl GitRepository {
 
         let path = directory.descriptor_path().join(CATALOG_DATABASE);
         let catalog = ControlStore::open_with_key(&path, catalog_key)?;
+        require_source_backend_binding(&catalog, repository_id, source_backend, true)?;
         directory.sync_all()?;
         publish_marker(&directory, GIT_CATALOG_MARKER_FILE, &ready_bytes)?;
         directory.remove_child_file(INITIALIZATION_INTENT)?;
@@ -307,6 +317,7 @@ impl GitRepository {
         }
         let path = directory.descriptor_path().join(CATALOG_DATABASE);
         let catalog = ControlStore::open_existing_with_key(&path, catalog_key)?;
+        require_source_backend_binding(&catalog, repository_id, source_backend, false)?;
         let repository = Self {
             catalog,
             directory,
@@ -1567,6 +1578,40 @@ fn require_private_catalog(directory: &PinnedDirectory) -> Result<(), Repository
     Ok(())
 }
 
+fn require_source_backend_binding(
+    catalog: &ControlStore,
+    repository_id: Uuid,
+    backend: SourceBackendKind,
+    initializing: bool,
+) -> Result<(), RepositoryError> {
+    let expected = GitSourceBackendRecord {
+        format_version: 1,
+        repository_id,
+        backend,
+    };
+    let encoded = mb_core::canonical_bytes(&expected).map_err(|_| RepositoryError::Conflict)?;
+    let key = repository_id.as_bytes();
+    if let Some(existing) = catalog.get_record(SOURCE_BACKEND_KIND, key)? {
+        let record: GitSourceBackendRecord =
+            mb_core::decode_canonical(&existing).map_err(|_| RepositoryError::Conflict)?;
+        if record != expected || existing != encoded {
+            return Err(RepositoryError::Conflict);
+        }
+        return Ok(());
+    }
+    // Catalogs written before this local binding existed used ReflinkV1.
+    // Do not infer a guarded backend from an unbound legacy catalog.
+    if !initializing && backend != SourceBackendKind::ReflinkV1 {
+        return Err(RepositoryError::Conflict);
+    }
+    if !catalog.put_record_if_absent(SOURCE_BACKEND_KIND, key, &encoded)?
+        && catalog.get_record(SOURCE_BACKEND_KIND, key)?.as_deref() != Some(encoded.as_slice())
+    {
+        return Err(RepositoryError::Conflict);
+    }
+    Ok(())
+}
+
 fn initialization_intent_bytes(repository_id: Uuid) -> Vec<u8> {
     format!("{INITIALIZATION_MAGIC}{repository_id}\n").into_bytes()
 }
@@ -1657,6 +1702,101 @@ mod tests {
         fs::remove_file(catalog.join(CATALOG_DATABASE)).unwrap();
         assert!(GitRepository::open(&root, repository_id, &key).is_err());
         assert!(GitRepository::init(&root, repository_id, &key).is_err());
+    }
+
+    #[test]
+    fn repository_backend_binding_survives_reopen_and_migrates_legacy_reflink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [87_u8; 32];
+        let repo = GitRepository::init(&root, repository_id, &key).unwrap();
+        let binding = repo
+            .catalog
+            .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mb_core::decode_canonical::<GitSourceBackendRecord>(&binding).unwrap(),
+            GitSourceBackendRecord {
+                format_version: 1,
+                repository_id,
+                backend: SourceBackendKind::ReflinkV1,
+            }
+        );
+        repo.catalog
+            .delete_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())
+            .unwrap();
+        drop(repo);
+
+        let reopened = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert_eq!(
+            reopened
+                .catalog
+                .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())
+                .unwrap(),
+            Some(binding)
+        );
+        drop(reopened);
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            GitRepository::open_with_backend(
+                &root,
+                repository_id,
+                &key,
+                SourceBackendKind::GuardedLinkFreezeV1,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_repository_needs_its_explicit_backend_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [88_u8; 32];
+        let repo = GitRepository::init_with_backend(
+            &root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        drop(repo);
+        assert!(
+            GitRepository::open_with_backend(
+                &root,
+                repository_id,
+                &key,
+                SourceBackendKind::ReflinkV1
+            )
+            .is_err()
+        );
+        let repo = GitRepository::open_with_backend(
+            &root,
+            repository_id,
+            &key,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )
+        .unwrap();
+        repo.catalog
+            .delete_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())
+            .unwrap();
+        drop(repo);
+        assert!(
+            GitRepository::open_with_backend(
+                &root,
+                repository_id,
+                &key,
+                SourceBackendKind::GuardedLinkFreezeV1,
+            )
+            .is_err()
+        );
     }
 
     #[test]

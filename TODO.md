@@ -10,7 +10,14 @@
   recovery, and raw Git add/checkout/interoperability gates. Do not treat the
   passing Linux Git or guarded probes as evidence for those platforms. Keep
   signed peer formats independent of backend choice and reject an unsupported
-  capture rather than making an unannounced full copy.
+  capture rather than making an unannounced full copy. The Git catalog now binds
+  its versioned local source backend before publishing its ready marker and
+  checks that binding before replay on reopen. Older unbound reflink catalogs
+  migrate to `ReflinkV1`; an unbound guarded catalog fails closed instead of
+  guessing its anchor semantics. Focused reopen/mismatch tests, 45 normal Git
+  tests, all 62 ignored Git library cases on a fresh disposable local Btrfs
+  image, and strict workspace Clippy pass; the image and mount were removed.
+  The platform and complete backend gates remain open.
 - [ ] **M6 integrate guarded Git anchors and worktrees.** The guarded FUSE view
   can recapture a stopped file and detach it on edit, but `SourceBackendKind`
   still rejects guarded Git stage/checkout and the node rejects operations on
