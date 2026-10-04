@@ -33513,6 +33513,28 @@ mod tests {
                 change.path == b"first" && change.worktree == Some(mb_git::GitChange::Modified)
             }));
             assert!(!owner.git_diff(root_id, false).unwrap().patch.is_empty());
+            let stock_path = run_root.join("stock-git");
+            let stock = git2::Repository::init_bare(&stock_path).unwrap();
+            let branches = owner.git_branches(root_id).unwrap();
+            assert!(
+                owner
+                    .git_export_to_git_repository_with_tags(
+                        root_id,
+                        &restored,
+                        &stock_path,
+                        &branches,
+                        &[],
+                    )
+                    .unwrap()
+                    >= 4
+            );
+            for bytes in [&first, &second] {
+                let oid = git2::Oid::hash_object(git2::ObjectType::Blob, bytes).unwrap();
+                assert_eq!(stock.find_blob(oid).unwrap().content(), bytes);
+            }
+            stock
+                .find_commit(git2::Oid::from_bytes(&original_graph.refs[0].oid).unwrap())
+                .unwrap();
         }
         assert_eq!(
             mb_git::blob_oid_from_anchor(&recovered_graph.blobs[0].anchor)

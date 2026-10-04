@@ -182,8 +182,10 @@
   from the FUSE view. The same ext4/Btrfs QUIC fixture checks that status
   reports the format-7 history as backed up, a later FUSE edit appears in raw
   status/diff without changing the signed blob, and `add` still refuses the
-  guarded root. Enrollment, staging, checkout, and the provisioned daemon gate
-  remain open.
+  guarded root. The recovered graph can now export into a stock Git object
+  database; after the FUSE edit, ext4/Btrfs fixtures verify both exported blob
+  bytes and the commit ID against the signed history. Enrollment, staging,
+  checkout, and the provisioned daemon gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

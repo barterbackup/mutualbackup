@@ -1478,7 +1478,7 @@ impl GitRepository {
         destination: impl AsRef<Path>,
         advertised: &[GitBranchInfo],
     ) -> Result<u32, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(export_graph_to_git_repository(
             &self.catalog,
             self.repository_id,
@@ -1495,7 +1495,7 @@ impl GitRepository {
         advertised_branches: &[GitBranchInfo],
         advertised_tags: &[GitTagInfo],
     ) -> Result<u32, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(export_graph_to_git_repository(
             &self.catalog,
             self.repository_id,

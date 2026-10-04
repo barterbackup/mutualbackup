@@ -3591,7 +3591,7 @@ impl Node {
         destination: &Path,
         advertised: &[GitBranchInfo],
     ) -> Result<u32> {
-        let repository = self.open_git_repository(repository_id)?;
+        let repository = self.open_git_repository_for_inspection(repository_id)?;
         if repository.root() != source_root {
             anyhow::bail!("Git remote root differs from its enrolled repository");
         }
@@ -3608,7 +3608,7 @@ impl Node {
         advertised_branches: &[GitBranchInfo],
         advertised_tags: &[GitTagInfo],
     ) -> Result<u32> {
-        let repository = self.open_git_repository(repository_id)?;
+        let repository = self.open_git_repository_for_inspection(repository_id)?;
         if repository.root() != source_root {
             anyhow::bail!("Git remote root differs from its enrolled repository");
         }
