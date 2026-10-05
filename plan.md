@@ -38,7 +38,10 @@ them as ADRs and test vectors before promising wire compatibility.
   inside our repository or require Git-specific behavior from other guild members.
 - The Git-compatible frontend preserves tracked file bytes exactly. No command
   automatically fixes line endings or applies another content conversion, even
-  when the host's Git configuration enables one. Git's `text`/`eol` handling
+  when the host's Git configuration enables one. This is a requirement of the
+  adopted Git pivot: implement it at the versioned source-backend boundary,
+  verify it in every Milestone 6 Git slice, and freeze it in Milestone 7 along
+  with the outstanding original requirements. Git's `text`/`eol` handling
   can normalize line endings on its own; a configured `filter.<name>.clean`
   command is a separate, arbitrary transformation. Disable both directions of
   both mechanisms rather than assuming that disabling CRLF normalization also
@@ -728,6 +731,11 @@ Proactive background repair comes later.
   content byte-for-byte; a backend that cannot do so rejects the operation.
   For a staged file with source bytes `B`, its immutable anchor, Git blob
   payload, exported Git blob, and an unedited checkout must all contain `B`.
+  If the working file subsequently changes, preserve its new bytes separately
+  from the staged or committed blob. Backup and seed-only recovery must retain
+  both states when protected; recovering history must not overwrite an unstaged
+  edit to make the worktree match its Git blob. Share verified native anchors
+  when the bytes match, and retain distinct sources when the bytes differ.
   A Git blob imported from an ordinary repository becomes the authoritative
   `B` for our checkout, regardless of that repository's attributes or the
   other client's worktree presentation. Reflinks or guarded hard links may
@@ -3829,6 +3837,9 @@ Use these concrete acceptance cases throughout implementation:
 - Change only CRLF to LF in a tracked file. `status` and `diff` must expose the
   change; an explicit `add` and `commit` must retain a different blob, and
   checkout of either commit must restore that commit's exact line endings.
+  Also back up that edit without staging it, remove all owner-local source and
+  anchor data, and recover from a seed. The working file must retain LF while
+  the index and committed blob retain CRLF, with the edit still reported dirty.
 - Configure clean, smudge, and process filters that would visibly change bytes
   and record invocation. Exercise supported file-touching commands and verify
   that our binary never invokes them, including during replay after a crash.
@@ -4067,8 +4078,10 @@ closes only when all Git, original source-backend, and platform gates above pass
 - Freeze the documented Git-command subset, byte-exact file policy, Git object
   and transport interoperability, source-backend versions, branch/reflog
   retention, and prune semantics only after cross-version migration and
-  source-loss recovery gates pass. Measure both logical and physical Btrfs
-  space across add, checkout, branch retention, import/export, and prune.
+  source-loss recovery gates pass. Cross-version replay and migration must not
+  enable content conversion or silently restage a dirty worktree. Measure both
+  logical and physical Btrfs space across add, checkout, branch retention,
+  import/export, and prune.
 - Finish migrations, observability and actionable status, install/service and
   upgrade/rollback paths, backup/restore operator documentation, and independent
   cryptographic/protocol/security review. Freeze wire and storage compatibility
