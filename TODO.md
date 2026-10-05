@@ -1,6 +1,562 @@
 # Product TODO
 
-## Milestone 6 active implementation gates
+## Milestone 6 corrected production plan — 2026-10-05
+
+FUSE-backed guarded storage was added in error and is removed from the target
+architecture. The source still contains that implementation; these are planning
+changes, not a claim that code has been deleted or bugs have been fixed. Stop
+FUSE feature work, including retained-descriptor recapture isolation, guarded
+Git enrollment/checkout, metadata fidelity, edit guards, and mount qualification.
+Their earlier work and test evidence are archived below, with unfinished work
+marked canceled rather than completed. Implement removal through R1, then close
+the non-FUSE correctness, capacity, operations, and release gates below.
+
+The supported design continues to use native immutable capture/clone facilities,
+with Linux reflink as the implemented backend and Windows NTFS/VSS and macOS
+clone backends still planned. Reject unsupported filesystems explicitly; do not
+replace FUSE with a new mounted view or silently copy full file payloads. Keep
+exact Git bytes, recoverable retention/prune, seed-only recovery where promised,
+and versioned local/wire compatibility as production requirements. Historical
+passing tests below apply only to their recorded source and exercised cases.
+
+- [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
+  behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
+  supervision code, daemon startup/replay hooks, root enrollment/removal and Git
+  control/CLI paths, recovery integration, acceptance scripts, packaging, and
+  documentation. Remove those product paths and stop advertising or accepting
+  new guarded roots. Inventory existing guarded roots, captures, Git catalogs,
+  pins, pending intents, and signed revisions before choosing an upgrade policy.
+  Implement a verified export/migration path to a supported native backend, or
+  explicitly reject an unsupported existing state before mutation with an
+  actionable recovery/export procedure. Preserve all user bytes, anchors, Git
+  history, revision pins, and signed protection until replacement is verified;
+  deleting code never authorizes deletion of protected data or mount-backed
+  directories. Do not reinterpret a guarded catalog as reflink. Retain minimal
+  legacy decoding or an isolated export reader wherever needed to identify and
+  recover historical formats; keep enum discriminants and serialized identities
+  stable rather than renumbering them after removing variants. Shared code stays
+  only where a supported native path requires it. Acceptance: fresh installations
+  expose no FUSE enrollment, mount, or runtime dependency; upgrade fixtures with
+  live/history-only Git data, interrupted intents, and retained revisions either
+  export/migrate exact bytes and history durably or fail before any mutation.
+  Restart and source-loss recovery exercise the stated legacy policy. Replace
+  useful generic recovery/prune coverage from deleted FUSE fixtures under R7.
+
+- [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
+  `crates/mb-git/src/history.rs` admits up to 64 MiB of graph metadata, while
+  `GitBackupDescriptor::validate` in `crates/mb-git/src/backup.rs` caps the encoded
+  descriptor at `V1_MAX_CATALOG_BYTES` (32 MiB), including refs, object records,
+  blob sector references, and serialization overhead. A locally accepted graph
+  can therefore be unprotectable. Define one versioned budget covering the full
+  reachable descriptor and its enclosing revision metadata. Preflight commands
+  that can grow it, including commits, refs/pins, merge, and import/fetch, before
+  publishing catalog mutations; backup and recovery must enforce that same
+  contract. Preserve existing oversized local history and give a precise status
+  and migration/export remedy rather than trimming or claiming it is protected.
+  Coordinate with R3 if the descriptor is split into authenticated pages; simply
+  setting both constants to the same number does not account for overhead.
+  Acceptance: just-below/at/above-budget histories, large refs/trees and blob
+  geometry, import, and crash/reopen show every accepted protectable graph can
+  produce a signed backup descriptor and recover exact refs, IDs, and bytes.
+  Rejected mutations preserve the prior catalog and anchors.
+
+- [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
+  production catalog design.** `crates/mb-node/src/snapshot.rs` permits 39,488
+  data-sector references at 64 KiB each: about 2.41 GiB of represented sector
+  data, with sparse extents, shared inodes, and per-file rounding affecting
+  effective capacity. This is a deliberate current bound, not evidence of
+  corruption, but it is too small for general-purpose production backup. Define
+  supported dataset/file/history limits and replace flat per-revision metadata
+  with bounded, authenticated, versioned catalog pages or another explicit
+  scalable design. Bound each page/frame, traversal memory, and incremental
+  capture work; cover signing, packing, replay, retention, and recovery together.
+  Preserve old catalog decode and define migration; do not just raise constants
+  and move the failure into another parser or allocation. Until migration is
+  implemented, validate and report the existing limit before claiming protection.
+  Acceptance: dense files, sparse extents, hard-link sharing, many small files,
+  retained Git history, and datasets above the old ceiling meet the declared
+  limits with bounded memory; interrupted backup, prune, and seed-only recovery
+  preserve exact data and old supported revisions remain readable.
+
+- [ ] **R4 / P1 — Complete variable-profile disk evacuation.**
+  `ParityStore::first_ready_object` in `crates/mb-store/src/database.rs` selects
+  only format-1 READY objects. `StorageVolumes::migrate_draining` in
+  `crates/mb-node/src/volume.rs` correctly refuses retirement while format-2
+  objects or coding reservations remain (the completed M5-144 safety fix), but
+  cannot finish evacuating such a volume. Add bounded enumeration and durable
+  cross-volume transfer for variable information/parity shards, preserving the
+  group/profile/root/assignment identity. Reserve destination headroom, verify
+  and commit it, publish its receipt with replayable source cleanup, and only
+  then retire the source copy. Define how in-flight STAGED objects and coding
+  reservations finish, abort, or transfer; keep safe refusal until all ownership
+  and cleanup obligations are settled. Acceptance: mixed formats, information
+  and parity, full/offline destinations, pending reservations, concurrent GC,
+  and interruption at each publication boundary converge after reopen; the
+  evacuated disk can be removed while reads/reconstruction still succeed.
+
+- [ ] **R6 / P2 — Package ordinary Git as an explicit runtime dependency.**
+  `crates/mb-git/src/stock_git.rs` invokes stock `git cat-file --batch`, but
+  `flake.nix` does not supply Git to the product runtime. Provide a pinned
+  ordinary-Git executable through the package closure/wrapper or an explicit
+  configured executable path, and declare it for other distribution formats.
+  Preserve discovery when the optional `mutualgit`-as-`git` alias comes first on
+  PATH, including daemon/service execution. Acceptance: the installed artifact
+  imports/fetches packed objects and completes the documented local stock-Git
+  bridge flow in a clean environment without an ambient Git installation, both
+  with and without the alias; missing dependencies produce actionable errors.
+
+- [ ] **R7 / P1 — Automate mandatory validation for the exact release artifact.**
+  Nix `checks` currently point at build artifacts with `doCheck = false`;
+  successful builds do not run the required ordinary or privileged suites.
+  `.github/workflows/ci.yml` already runs format, strict Clippy, locked workspace
+  tests, Docker safety, reflink/network acceptance, port-mapping, and private-Tor
+  recovery. Preserve those jobs and keep the build-only Nix sandbox distinction;
+  add the missing complete `scripts/git-linux-acceptance.sh` CI gate, packaged
+  runtime smoke, and required upgrade/multi-volume regression coverage. Qualify
+  the exact release artifact through native-filesystem, topology, and source-loss
+  scenarios, rather than equating a build or source-tree test pass with packaged
+  behavior. Run R1-R6 regressions on one recorded source and its release candidate.
+  Port the generic Git-history retention, grace-window prune, remote coded-data
+  reclamation, and repeated seed-recovery assertions currently embedded in
+  guarded fixtures to the native backend before those fixtures are removed;
+  prior FUSE test passes do not qualify the replacement. Preserve exact-byte
+  Git interop and no-duplicate-payload checks. Bound test timeouts, retain
+  per-peer diagnostics, and independently audit mount/image/loop/network cleanup.
+  Acceptance: a failing or omitted required job blocks release; every supported
+  backend passes its native capture/edit/restore, crash, retention/prune, and
+  source-loss matrix on the release source. Record repeated topology evidence
+  for R5 rather than interpreting one rerun as a reliability fix.
+
+- [ ] **M6 finish the versioned native source-backend boundary across platforms.**
+  Keep Linux reflink capture records and Git catalog backend binding, and finish
+  the planned Windows NTFS/VSS and macOS clone backends, portable metadata and
+  watcher behavior, and application-consistent capture hooks. Each supported
+  platform requires local capture/edit/restore, source-loss recovery, and raw
+  Git add/checkout/interoperability acceptance. Passing Linux probes do not
+  qualify another platform. Keep signed peer formats independent of the local
+  backend; reject unsupported capture instead of making an unannounced full
+  copy. Older unbound reflink catalogs may migrate to `ReflinkV1` under the
+  existing verified rules; existing guarded catalogs follow R1's explicit
+  legacy/export policy. Retain the normal catalog reopen/mismatch regressions.
+  Any narrower first release must explicitly defer additional platforms in its
+  support matrix, not silently mark their gates completed.
+
+- [ ] **R5 / P1 — Resolve the existing M6 topology/signature liveness gate.**
+  The original provisioned backup stall after relay-only storage recovery remains
+  open. Trace the exact missing signer, durable signature lock/event hash,
+  authoritative endpoint generation, connection/circuit state, and retry progress
+  together; distinguish an offline/quorum-blocked operation from a live but
+  stalled retry. Correct the demonstrated cause without weakening signatures or
+  declaring backup success prematurely. Acceptance: deterministic coverage of
+  the diagnosed path plus repeated provisioned endpoint-replacement, relay-only
+  recovery, partitions, and interrupted-retry runs on the exact release source
+  either commit verified protection or expose an actionable blocked state with
+  durable retry. Keep the historical evidence below; later successes do not
+  explain the original 5,400-second outlier.
+
+  Existing investigation and validation record:
+
+  A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
+  extent checks, node Git/recovery tests, and stock-Git bridge, then timed out
+  after 5,400 seconds in the five-daemon topology `backup --wait`. All members
+  remained at guild event sequence 36; the coordinator reported one coding Add
+  with only four of five signatures. The recovered storage peer exchanged relay
+  traffic while other nodes repeatedly dialed its obsolete loopback endpoint. A
+  separate direct smoke run passed. The failed run cleaned its temporary Btrfs
+  image, daemons, namespaces, and firewall rules. Identify the missing signer
+  and whether it is a transport failure or a conflicting signature lock,
+  correct the cause, and repeat the full gate on exact committed source.
+  `202aa44` promotes per-signer failures to warning logs. Two subsequent
+  isolated smoke runs and the complete Git acceptance script passed on
+  `31018a0` with stricter diagnostic backup timeouts (900/600 seconds), but
+  did not reproduce the failure. The complete provisioned reflink script also
+  passed on `6caeb11` with the 600-second diagnostic timeout. The expanded
+  reflink script passed again on `d53b4be` with that timeout; one transient
+  coding-activation request failure recovered before the topology completed.
+  `31018a0` preserves relevant signer warnings in future timeout output. Keep this
+  reliability issue open until the missing-signer path is explained and
+  corrected. The full local Git gate passed again on `1d961d5`; during its
+  five-daemon run, logs still showed transient four-of-five coding signatures
+  and failed dials to obsolete loopback addresses before recovery completed.
+  Source tracing found that coding and catch-up retries repeatedly add durable
+  roster endpoints to the learned cache, while Identify can add further hints.
+  Those hints could reintroduce an old direct address after a newer signed
+  endpoint set replaced it. The current correction makes signed endpoint sets,
+  including an empty withdrawal, authoritative over roster and Identify hints
+  until expiry. The focused endpoint-cache and direct-to-relay regressions,
+  130 other P2P tests, and strict workspace Clippy passed. The complete local
+  Git acceptance script passed on exact commit `d49a0bf`, including all 62
+  Btrfs Git cases and the five-daemon test (1,617.54 seconds); its disposable
+  mount, daemons, namespaces, and firewall rules were cleaned up. Loopback
+  retries and transient short signature quorums still appeared during topology
+  transitions. The gate pass establishes recovery in this run, but not the
+  cause of the original intermittent missing-signer stall; keep this item open
+  until that path is explained and corrected.
+  Source tracing found two further stale-address paths: persistent bootstrap
+  and attempt-scoped recovery hints were still unioned with a newer signed
+  endpoint set, and an in-flight dial to a withdrawn direct endpoint counted
+  as evidence that the direct tier remained available. The current correction
+  lets the signed set supersede those hints, moves tier selection to a current
+  endpoint or healthy connection, and retries queued requests after replacement.
+  A focused regression holds the obsolete direct dial pending while installing
+  a signed relay endpoint, then checks relay selection and signed empty-set
+  withdrawal. A subsequent same-tier correction binds each policy dial to the
+  address set it started with. Replacing signed addresses supersedes the old
+  attempt, allows a new dial immediately, and prevents a late old-dial failure
+  from advancing transport fallback. A focused test holds the old direct dial
+  pending while replacing it with another direct endpoint. The dial comparison
+  normalizes the optional trailing peer ID, preserving relay-circuit dialing.
+  Both signed-endpoint tests, four fallback tests, three selected-connection
+  tests, and the relay-circuit test pass locally; strict workspace Clippy
+  passes. Two long tests that failed amid broad parallel P2P execution pass
+  individually. The broader missing-signer reliability gate remains open.
+  The complete provisioned Git gate passed on exact commit `b69ce33`: all 62
+  Btrfs Git cases, extent and node/recovery tests, stock-Git remote helper,
+  and the five-daemon test (1,503.94 seconds). Its disposable mount, image,
+  daemons, namespaces, links, and firewall chains were removed. The topology
+  run nevertheless reproduced temporary four-of-five signatures at guild
+  event sequence 36 and old loopback retries. Read-only status showed all four
+  peers active, including increasing RelayFallback traffic to the recovered
+  storage peer; read-only state copies showed the same proposed-event-37 lock
+  prefix on all five members. The guild later advanced to event 42 and the
+  backup committed. Thus stale loopback retries alone do not explain the
+  missing response in this run. Identify the failing signer/request path and
+  distinguish transport loss from signature collection or lock handling;
+  plain lifecycle signer failures are currently logged only at debug level.
+  The next source correction retains individually verified guild signatures in
+  a versioned local record bound to the coordinator's durable proposal lock,
+  guild, and event sequence. Plain lifecycle and bound coding Add retries reuse
+  those signatures, contact only missing signers, and atomically retire the
+  partial record when the event installs. A focused test proves accumulation
+  across reopen and rejection of an invalid signature or changed proposal;
+  existing guild administration and coding lifecycle tests, core guild tests,
+  the locked all-target workspace suite (313 passing `mb-node` tests), and
+  strict workspace Clippy pass. Plain lifecycle signer failures now name
+  the member and sequence at warning level. This addresses the observed
+  same-event partial-quorum loss. The complete provisioned Git gate passed on
+  exact source `9f3bee0`, including all 62 Btrfs Git cases and the five-daemon
+  test in 1,547.13 seconds; disposable Btrfs and network resources were
+  removed. During that run, one recovered signer temporarily exhausted its
+  transport tiers and then rejected event 27 while its guild state lagged;
+  another topology pass had two transport-exhausted signers at event 39. The
+  coordinator advanced through those partial quorums and the backup committed.
+  Keep this reliability item open until the historical 5,400-second stall is
+  excluded by stronger repeated topology evidence or its remaining response
+  path is corrected; this one passing gate does not prove that every missing
+  signer will eventually become reachable.
+  The same-tier dial correction passed its exact-source local provisioned Git
+  gate on `702fe63`. Clippy, 62 Btrfs Git cases, extent measurement, node Git
+  and seed-recovery checks, and the stock-Git bridge passed first. The network
+  script initially stopped before namespace setup because this shell omitted
+  `/usr/sbin` from PATH; rerunning that final stage with the installed
+  `iptables` on PATH passed the five-daemon topology/recovery test in 1,536.31
+  seconds. The coordinator advanced past transient event-41 missing signatures
+  and the recovered-topology backup committed. Old direct-address failures
+  still occurred. Both disposable Btrfs mounts, images, daemon processes,
+  namespaces, and firewall chains were removed. One more successful run does
+  not exclude the intermittent long stall, so this reliability gate stays open.
+  A source-level scheduling correction separates signed endpoint exchange from
+  the peer-exchange loop's guild-tail request, which can wait up to 90 seconds
+  for a slow advancing peer on every pass. Endpoint exchange can now circulate
+  current signed addresses without waiting for that tail, while recovery-key
+  and coding lifecycle proposals still follow the tail catch-up pass. Validate
+  this change with the provisioned topology and keep the intermittent gate open
+  until the missing-signer path is explained or repeatedly excluded. Formatting,
+  strict workspace Clippy, the focused tail-selection test, and the provisioned
+  five-node multi-owner QUIC/recovery test pass; the latter completed in 535.02
+  seconds on a disposable local Btrfs image, which was unmounted and removed.
+  The exact-commit `b25ae06` isolated five-daemon topology/recovery test passed
+  in 1,637.58 seconds. Its relay-only transition again showed one signer
+  exhausting transport tiers and then returning the generic guild-transition
+  authorization rejection for event 28; a later event-29 request also exhausted
+  tiers. During the final `backup --wait`, all active guild views reached event
+  36 and the owner remained dirty for over five minutes despite an active
+  RelayFallback path to the recovered storage peer. The job later advanced,
+  committed, and seed recovery passed. The test removed its Btrfs image,
+  mount, daemons, namespaces, and firewall chains. This run confirms eventual
+  progress but does not explain or exclude the earlier 5,400-second stall.
+  Source tracing found another diagnostic gap: the coordinator can wait for
+  variable coding coverage while pending durable coding work exists, and that
+  loop exposed the missing coverage only at debug level. A 60-second progress
+  warning now names the checkpoint, guild event sequence, and coverage error;
+  the coordinator's fetch, writer-key, packing, and lane-queue stages and the
+  coding worker's four sequential steps also warn if any one stays pending for
+  60 seconds. The warnings do not cancel work or change quorum decisions.
+  Use the next local topology run to identify the stage behind a long pause.
+  On exact commit `d0dddcb`, the isolated five-daemon topology/recovery test
+  passed in 1,647.75 seconds with each topology backup bounded to 900 seconds.
+  Its coding-coverage warnings showed the first recovered-topology checkpoint
+  advancing from event 30 to 37 and the relay-only checkpoint from event 40 to
+  43; no individual coding worker step logged a 60-second wait. Early signers
+  still exhausted transport tiers and temporarily rejected lifecycle requests
+  during recovery. The disposable Btrfs mount/image, daemons, namespaces, and
+  firewall chains were removed. This run distinguishes slow serial group
+  completion from a fixed sequence stall but does not explain the historical
+  5,400-second timeout, so this gate remains open.
+  `e65580f` installs a verified coding Add locally before concurrent peer
+  dissemination and bounds its eager wait to 20 seconds. The focused activation
+  test and strict workspace Clippy pass. The complete local Git acceptance gate
+  passed on this exact commit, including 62 Btrfs Git cases, extent measurement,
+  node/Git recovery, stock-Git exchange, and five-daemon topology/seed recovery
+  in 1,618.57 seconds. Event 43 was reached after transient short lifecycle
+  signature quorums, transport exhaustion, and stale-address dials. No coding
+  dissemination timeout was observed, so this run does not verify that branch
+  or explain the historical 5,400-second missing-signer stall. Keep open.
+  `2b8c248` installs certified plain lifecycle events locally before concurrent
+  peer dissemination with the same 20-second eager bound. A focused test holds
+  one install response open, checks that the local tail is already installed,
+  and exercises the bound; administration and coding activation tests and
+  strict workspace Clippy pass. The isolated five-daemon topology and seed-only
+  recovery test passed on this source in 1,490.34 seconds on fresh local Btrfs;
+  its image, mount, and network namespaces were removed. During the run, a
+  signer exhausted transport tiers and then rejected event 25 because the
+  caller was not its configured coordinator; the guild later advanced.
+  Investigate that pre-certification signer/authorization path separately.
+  Bounded dissemination does not close the historical 5,400-second stall.
+  `1b3f42a` adds recipient-side admission context and a distinct guild-member
+  denial while preserving fail-closed authorization. The focused unrecovered
+  signer and active-administration tests and strict workspace Clippy pass. Its
+  isolated local topology/seed-recovery test passed in 1,428.25 seconds.
+  `b3093a1` also captures warnings from both recovered daemons and includes the
+  recovered relay member's log in timeout diagnostics. The revised isolated
+  topology/seed-recovery test passed on exact commit `b3093a1` in 1,431.81
+  seconds; all disposable Btrfs and network resources were removed. At event
+  27, the recovered member logged `local_phase=None`, `local_sequence=None`,
+  and no locally committed checkpoint before its restore adopted the guild.
+  It correctly refused to sign until recovery completed, then became Active
+  and the guild advanced. This explains that transient authorization rejection.
+  The historical 5,400-second missing-signer stall and transport exhaustion
+  remain unresolved; keep this gate open.
+  `0d5af1d` stops majority-policy lifecycle and coding events as soon as their
+  actual guild certificate verifies, releasing pending minority requests and
+  outbound permits before installation. Its focused five-member majority,
+  administration, coding activation, and slow-install tests pass, with strict
+  workspace Clippy. The isolated five-daemon topology/seed-recovery gate using
+  that network code passed in 1,569.46 seconds; its Btrfs image, mount, daemon
+  processes, and namespaces were removed. Unanimous short quorums and transport
+  exhaustion still appeared before the recovered guild caught up, so this run
+  does not close the historical unanimous stall.
+  A source trace found that a retiring duplicate connection prevented dispatch
+  of every new request to that peer even when a separate healthy selected
+  connection existed. Retirement can wait for unrelated inbound work, so this
+  peer-wide hold could repeatedly delay a missing guild signature despite an
+  active relay path. Exact-connection dispatch now proceeds on the healthy
+  selected session while the short preferred-tier promotion wait remains.
+  A focused P2P regression holds a duplicate in retirement and verifies the
+  request uses the healthy session. The historical topology stall is not yet
+  proven to have this cause; repeat the isolated five-daemon gate on committed
+  source and keep the reliability item open until its response path is clear.
+  The P2P suite also exposed an existing activation-fixture race on the prior
+  committed tree: usable coverage can precede cleanup of the losing receipt,
+  and one activation-worker turn need not process the intended pending job.
+  The fixture now waits with bounds for those separate transitions and reports
+  concise pending-job state on timeout. The full P2P suite passes with 135
+  tests and 2 provisioned tests ignored; strict workspace Clippy passes.
+  The isolated five-daemon topology and seed-recovery test passed on code
+  commit `a870a46` in 1,497.88 seconds. Both recovered-topology backups
+  committed despite transient missing signatures and coverage waits; the
+  second backup advanced through event 43. Its local Btrfs image, mount,
+  daemons, namespaces, and firewall rules were removed. This passing run
+  validates the corrected request path in a real topology but does not prove
+  it caused the historical 5,400-second stall, so this gate remains open.
+  The complete local Git acceptance gate passed on exact committed source
+  `9ec4953`: all 62 provisioned Btrfs Git cases, extent measurement, node
+  recovery, stock-Git exchange, the raw-path CLI/daemon test, and five-daemon
+  topology/seed recovery (1,522.23 seconds). The disposable image, mount,
+  daemons, namespaces, and firewall rules were removed. The coordinator
+  temporarily lacked p4's event-26 signature while its recovered daemon was
+  unreachable, then received authorization denials during guild catch-up;
+  later event-37 requests to two signers exhausted transport tiers, yet
+  coding advanced and the backups committed. This passing run does not explain
+  or exclude the historical long stall; keep the reliability item open.
+  The isolated five-daemon topology and seed-recovery gate passed again on
+  exact source `9f7d35b` in 1,467.50 seconds. The first local harness attempt
+  stopped before daemon setup because its disposable Btrfs mount was root-owned;
+  rerunning with that mount owned by the test user completed. During recovery,
+  the coordinator retried event 25 with four of five signatures while the
+  storage member's old endpoint was unreachable and its replacement caught up.
+  A second short quorum at event 37 coincided with relay restart and missing
+  circuit reservations; the relay-only backup advanced from event 38 through
+  41, committed, and seed recovery passed. The local image, mount, daemons,
+  namespaces, and firewall chains were cleaned up. This run adds successful
+  retry evidence but still does not explain the historical 5,400-second stall.
+  Startup now excludes the local peer ID from a generic bootstrap list before
+  installing addresses or scheduling initial/retry dials. A focused test keeps
+  a remote bootstrap peer while proving the own endpoint creates no policy
+  dial. This removes one observed class of useless dial attempts, but it does
+  not explain the missing remote signer or close this reliability gate.
+
+## Milestone 6 retained native/shared implementation evidence
+
+These completed entries record the implementation and checks at the time.
+References to guarded fixtures below are historical evidence, not renewed FUSE
+requirements. R7 reestablishes their shared recovery/retention coverage on the
+native backend; canceled guarded-only gates do not block production.
+
+- **M6 native source-backend binding — prior validation record.** The Git
+  catalog binds its versioned local backend before publishing its ready marker
+  and checks the binding before replay on reopen. Older unbound reflink catalogs
+  migrate to `ReflinkV1`; unbound guarded catalogs fail closed instead of guessing
+  anchor semantics. The earlier record reports focused reopen/mismatch tests,
+  45 normal Git tests, all 62 ignored Git library cases on a fresh disposable
+  local Btrfs image, and strict workspace Clippy passing; the image and mount
+  were removed. This evidence does not close the remaining native-platform gates.
+
+- [x] **M6 prune expired local Git blobs while unrelated revision GC remains
+  pending.** The blanket `gc-anchor`/`gc-revision`/`gc-sector` gate prevented
+  collection even after a historical blob lost all protection. Prune now uses
+  verified retained graphs and exact sector-recipe anchor pins instead, while
+  keeping capture, restore, and unfinished-backup fences. It also verifies and
+  protects the direct parent checkpoint's graph during the one-generation GC
+  grace window; seed recovery can lack its individual `user-revision` rows.
+  The extended five-peer format-7 fixture commits replacement checkpoints with
+  retention one: at generation 2, both the historical commit metadata and raw
+  native blob survive pruning; at generation 3, expired raw sector recipes are
+  gone, the independent historical anchor is physically removed, and a second
+  prune removes nothing. The ext4 and fresh disposable local Btrfs runs pass
+  in 243.93 and 320.95 seconds. All four guarded Git node probes and the native
+  signed-revision prune test pass on that Btrfs image, as do formatting and
+  strict locked all-target workspace Clippy in the pinned local development
+  shell. The temporary mount and image were removed. Remote coded-data
+  reclamation is a separate gate.
+- [x] **M6 prove remote reclamation of expired Git history.** The five-peer
+  format-7 QUIC fixture now starts the production holder-cleanup workers and
+  verifies that the initial information and parity READY objects actually exist
+  on their assigned holders. After history loses its last ref/pin, checkpoint 2
+  retains its native anchor through the grace window; checkpoint 3 permits
+  local pruning and the peer-reconciliation worker commits Retire/Forget for
+  groups carrying obsolete packed sectors. Checkpoint 4 advances information
+  GC. Direct reads on all five nodes then prove the expired READY information,
+  old-group parity, packed caches, and raw history sectors are absent.
+  The fixture confirms the latest checkpoint's seed-recovery readiness, stops
+  the recovered owner and every task owning it, and removes its node state,
+  source/view, adjacent native anchor/private-lower areas, and stock-Git export.
+  A second fresh seed-only recovery reconstructs generation 4, the surviving
+  graph and exact current files, with the expired blob absent. Its unstaged LF
+  edit remains dirty while the committed CRLF blob retains one independent
+  native anchor; unchanged blobs rebind to verified root files. Both loss
+  simulations now erase adjacent owner payload areas. The final local ext4
+  and disposable Btrfs runs, including the explicit readiness guard, pass in
+  433.23 and 612.91 seconds. Formatting and strict locked all-target workspace
+  Clippy pass in the pinned local shell. The
+  temporary Btrfs mount and image were removed. This closes the local five-peer
+  reclamation gate; the provisioned five-daemon guarded recovery, public guarded
+  file operations, and full platform/backend gates remain open independently.
+- [x] **M6 replace mixed packed coding groups before deleting expired data.**
+  The coordinator now plans surviving packed sectors against verified groups
+  whose non-padding information is all current. It queues replacement through
+  the existing durable launch/verification/activation path while retaining the
+  original group. Fully obsolete groups and ready Forget events run before
+  replacement allocation; insufficient capacity preserves existing coverage.
+  Packed checkpoints stay on the packed renewal path instead of falling through
+  to raw-sector coding when their packed coverage is already complete.
+  The new five-peer QUIC fixture starts with actual READY information and parity,
+  drops a source from the packing catalog, protects its changed boundary sector,
+  and shows that only the unchanged sector still relying on the mixed group
+  needs replacement. After verified activation it commits Retire/Forget, checks
+  physical deletion of old parity, retains obsolete information through the
+  checkpoint GC grace window, then advances a correctly chained catalog and
+  proves those READY information objects are deleted. Distributed reconstruction
+  returns the exact surviving sector. The ext4 and disposable local Btrfs runs
+  pass in 228.62 and 183.40 seconds. The guarded format-7 Git recovery/retention/
+  prune fixture passes on that Btrfs image in 314.86 seconds.
+  Adjacent redundant-group retirement, delayed-holder Forget cleanup, and
+  offline-first-spare renewal regressions, formatting, and strict locked
+  all-target workspace Clippy pass. The temporary Btrfs mount and image were
+  removed. The end-to-end Git remote-reclamation gate is closed above;
+  the provisioned daemon gate remains open.
+- [x] **M6 Git file bytes remain exact under every supported command.**
+  Native add hashes a pinned anchor, status and diff read raw worktree bytes,
+  checkout restores anchor bytes, and the local Btrfs attributes regression
+  now treats an LF-only edit as dirty, shows its raw diff, and restores the
+  original CRLF bytes. A child-process Btrfs regression now runs under confirmed
+  inherited `core.autocrlf`, `core.safecrlf`, environment `core.eol`, an external
+  attributes file with text/filter/ident/encoding rules, configured
+  clean/smudge/process commands, and `merge.renormalize`. Add, status, diff,
+  restore, switch, ordinary-Git fetch/pull/push, and their blob IDs remain raw;
+  no filter marker is created. The expanded local Btrfs regression also covers
+  a system clean filter, a repository filter setting and `info/attributes` on
+  the ordinary-Git side, native content merge, and linked-worktree checkout and
+  merge, combined linked restore, and primary hard reset; its raw merged blob
+  and restored bytes match. The inherited-config regression also checks that a
+  line-ending-only edit blocks tracked `rm`, branch switch, and pull without
+  changing the file or branch; its focused local Btrfs run passes. The
+  command-by-command source trace in [docs/git-byte-audit.md](docs/git-byte-audit.md)
+  covers every supported CLI command, including metadata-only operations and
+  the stock-Git bridge. A fresh local Btrfs
+  stock-Git round trip confirms that a CRLF worktree normalized by stock Git
+  imports as its LF blob, remains clean until edited, restores the exact blob
+  bytes, and exports the same object ID. The CLI help explains this limit.
+  The complete local Git acceptance script passed on exact source `1d961d5`,
+  including all 62 Btrfs Git library cases, extent measurements, node recovery,
+  stock-Git remote helper, and five-daemon smoke. A separate alias-level
+  remote-helper regression now calls `git status` through `mutualgit` under
+  inherited `core.autocrlf`, external attributes, and a configured clean
+  filter. It reports a raw-byte edit as dirty without running that filter;
+  the focused local Btrfs test and strict workspace Clippy pass.
+  The inherited-config Btrfs regression now also selects configured external
+  diff, `textconv`, and merge drivers through attributes and checks that raw
+  diff and built-in content merge do not invoke them. The ordinary-Git bare
+  peer carries the same hostile rules during push/pull. Its focused local run
+  passes with no driver marker created.
+- [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
+  and `mutualgit merge` now route through the selected linked worktree. Their
+  conflict sessions, staged resolutions, status, and checkout replay use a
+  linked namespace while the commit graph and refs stay shared. Local session,
+  schema, CLI, and non-Btrfs Git checks pass. The new ignored Btrfs regression
+  covers fast-forward and divergent clean pull, dirty-file refusal, conflicted
+  merge, abort, resolution, continue, and interruption/reopen after generated
+  blob capture, staged conflict resolution, and checkout publication without
+  changing the primary worktree. Historical primary-keyed linked blob intents
+  replay when their registered worktree still exists; a missing historical
+  worktree now has a force-prune path that discards its private generated blob
+  and retires the intent with its registration. The complete provisioned Git
+  gate passed on `31018a0`, including the linked pull/merge Btrfs regression.
+- [x] **M6 combined Git restore is one recoverable operation.**
+  `mutualgit restore --staged --worktree PATH` now sends one daemon request for
+  primary or linked worktrees. Version 11 checkout intents bind the selected
+  HEAD paths, old worktree content roots, old index digest, and full target
+  index; replay publishes selected worktree bytes before the index transition.
+  Local intent, schema, CLI, and non-Btrfs Git tests pass. The ignored primary
+  and linked Btrfs regressions cover dirty directory preflight, staged additions,
+  unrelated staged bytes, and interruption/reopen before and after index publication.
+  The complete provisioned reflink acceptance script passed on `6caeb11`.
+- [x] **M6 prune duplicate native anchors by physical reachability.** Git
+  prune now distinguishes exact index and local-sector recipe pins from blob
+  IDs and retains one verified source per filesystem for each live blob. It
+  removes surplus mappings with the existing crash-replayable deletion intent.
+  Local decision and recipe-key tests pass. The new ignored Btrfs regression
+  stages identical bytes repeatedly, prunes with and without an exact pin,
+  and checks the remaining catalog after reopen. The node-level Btrfs case now
+  also serves signed backup sectors across a reopen, restores exact worktree
+  bytes, and proves a recipe pin survives revision-record removal until the
+  sector recipe itself retires. The complete provisioned Git gate passed on
+  `31018a0`, including the Btrfs and signed-revision prune regressions.
+- [x] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
+  now carry BLAKE3 roots and lengths for previously unanchored working files;
+  linked worktrees use wrapper version 2. Replay verifies those bytes in the
+  worktree and private staging, and old pending intents without a provable
+  original root fail closed. Local unit tests cover regular files, symlinks,
+  conflicting content, staged-file replay, and primary/linked encoding. The
+  linked Btrfs regression now also interrupts hard reset before file publication
+  and after index publication, then reselects the linked worktree on reopen;
+  its targeted local run passes. A provisioned Btrfs replay fixture now rejects
+  a wrong native anchor behind the expected Git ID and an unverifiable legacy
+  restore intent; its targeted run passes. The reflink acceptance script now
+  includes these checks alongside primary and linked restore and hard reset.
+  The complete provisioned reflink acceptance script passed on exact committed
+  source `d53b4be`, including all new replay cases and the five-daemon smoke.
+  Its disposable Btrfs image, namespaces, and firewall rules were cleaned up.
+
+## Archived FUSE/guarded work — canceled direction, 2026-10-05
+
+This section preserves prior implementation, source findings, and test results
+for compatibility/removal review. It is not an active work queue. FUSE and all
+unfinished guarded feature/fix gates below are canceled and superseded by R1;
+statements such as "remain open," "implement," or "keep gated" describe the
+historical plan only. Completed checkboxes record work performed, not current
+product endorsement. Do not repair recapture isolation or finish guarded Git,
+metadata, enrollment, mount, or edit-guard qualification as production work.
 
 - [x] **M6 retain guarded creator ownership across replay, backup, and release.**
   FUSE file and directory creation now uses the request's UID/GID instead of
@@ -29,7 +585,7 @@
   mount/replay tests. The dedicated ENOSPC probe was outside this ownership
   slice. The Btrfs image, mount, and loop device were independently confirmed
   removed. Compilation and execution were local, with remote builders disabled.
-- [ ] **M6 isolate recaptured files from retained lower descriptors.** Source
+- **Canceled / superseded by R1 — M6 recapture isolation.** Source
   review finds that `GuardedRootCapturePlan::prepare_file_edit_at` restores the
   working inode's original owner after detaching the first anchor, while a later
   `GuardedFileCapturePlan::capture` freezes and hard-links that inode without
@@ -43,23 +599,7 @@
   the user-visible owner. This is a source finding, not a completed runtime
   exploit proof. Keep mixed-owner enrollment and the complete guarded Git
   capture/checkout gate open until it is corrected and verified.
-- [ ] **M6 finish the versioned source-backend boundary across platforms.**
-  The Linux reflink and guarded backends have versioned capture records, but
-  milestone closure still requires the planned Windows NTFS/VSS and macOS clone
-  backends, portable metadata and watcher behavior, application-consistent
-  capture hooks, and each platform's local capture/edit/restore, source-loss
-  recovery, and raw Git add/checkout/interoperability gates. Do not treat the
-  passing Linux Git or guarded probes as evidence for those platforms. Keep
-  signed peer formats independent of backend choice and reject an unsupported
-  capture rather than making an unannounced full copy. The Git catalog now binds
-  its versioned local source backend before publishing its ready marker and
-  checks that binding before replay on reopen. Older unbound reflink catalogs
-  migrate to `ReflinkV1`; an unbound guarded catalog fails closed instead of
-  guessing its anchor semantics. Focused reopen/mismatch tests, 45 normal Git
-  tests, all 62 ignored Git library cases on a fresh disposable local Btrfs
-  image, and strict workspace Clippy pass; the image and mount were removed.
-  The platform and complete backend gates remain open.
-- [ ] **M6 integrate guarded Git anchors and worktrees.** The guarded FUSE view
+- **Canceled / superseded by R1 — M6 guarded Git integration.** The guarded FUSE view
   can recapture a stopped file and detach it on edit, but `SourceBackendKind`
   still rejects ordinary guarded Git add/checkout on a protected root. Bind
   each Git index/object pin to its guarded per-inode capture with a replayable
@@ -298,69 +838,6 @@
   history expiry across replacement checkpoints and remote/physical deletion
   were not covered by that run. File-changing guarded commands and the
   provisioned daemon gate remain open; local expiry is covered below.
-- [x] **M6 prune expired local Git blobs while unrelated revision GC remains
-  pending.** The blanket `gc-anchor`/`gc-revision`/`gc-sector` gate prevented
-  collection even after a historical blob lost all protection. Prune now uses
-  verified retained graphs and exact sector-recipe anchor pins instead, while
-  keeping capture, restore, and unfinished-backup fences. It also verifies and
-  protects the direct parent checkpoint's graph during the one-generation GC
-  grace window; seed recovery can lack its individual `user-revision` rows.
-  The extended five-peer format-7 fixture commits replacement checkpoints with
-  retention one: at generation 2, both the historical commit metadata and raw
-  native blob survive pruning; at generation 3, expired raw sector recipes are
-  gone, the independent historical anchor is physically removed, and a second
-  prune removes nothing. The ext4 and fresh disposable local Btrfs runs pass
-  in 243.93 and 320.95 seconds. All four guarded Git node probes and the native
-  signed-revision prune test pass on that Btrfs image, as do formatting and
-  strict locked all-target workspace Clippy in the pinned local development
-  shell. The temporary mount and image were removed. Remote coded-data
-  reclamation is a separate gate.
-- [x] **M6 prove remote reclamation of expired Git history.** The five-peer
-  format-7 QUIC fixture now starts the production holder-cleanup workers and
-  verifies that the initial information and parity READY objects actually exist
-  on their assigned holders. After history loses its last ref/pin, checkpoint 2
-  retains its native anchor through the grace window; checkpoint 3 permits
-  local pruning and the peer-reconciliation worker commits Retire/Forget for
-  groups carrying obsolete packed sectors. Checkpoint 4 advances information
-  GC. Direct reads on all five nodes then prove the expired READY information,
-  old-group parity, packed caches, and raw history sectors are absent.
-  The fixture confirms the latest checkpoint's seed-recovery readiness, stops
-  the recovered owner and every task owning it, and removes its node state,
-  source/view, adjacent native anchor/private-lower areas, and stock-Git export.
-  A second fresh seed-only recovery reconstructs generation 4, the surviving
-  graph and exact current files, with the expired blob absent. Its unstaged LF
-  edit remains dirty while the committed CRLF blob retains one independent
-  native anchor; unchanged blobs rebind to verified root files. Both loss
-  simulations now erase adjacent owner payload areas. The final local ext4
-  and disposable Btrfs runs, including the explicit readiness guard, pass in
-  433.23 and 612.91 seconds. Formatting and strict locked all-target workspace
-  Clippy pass in the pinned local shell. The
-  temporary Btrfs mount and image were removed. This closes the local five-peer
-  reclamation gate; the provisioned five-daemon guarded recovery, public guarded
-  file operations, and full platform/backend gates remain open independently.
-- [x] **M6 replace mixed packed coding groups before deleting expired data.**
-  The coordinator now plans surviving packed sectors against verified groups
-  whose non-padding information is all current. It queues replacement through
-  the existing durable launch/verification/activation path while retaining the
-  original group. Fully obsolete groups and ready Forget events run before
-  replacement allocation; insufficient capacity preserves existing coverage.
-  Packed checkpoints stay on the packed renewal path instead of falling through
-  to raw-sector coding when their packed coverage is already complete.
-  The new five-peer QUIC fixture starts with actual READY information and parity,
-  drops a source from the packing catalog, protects its changed boundary sector,
-  and shows that only the unchanged sector still relying on the mixed group
-  needs replacement. After verified activation it commits Retire/Forget, checks
-  physical deletion of old parity, retains obsolete information through the
-  checkpoint GC grace window, then advances a correctly chained catalog and
-  proves those READY information objects are deleted. Distributed reconstruction
-  returns the exact surviving sector. The ext4 and disposable local Btrfs runs
-  pass in 228.62 and 183.40 seconds. The guarded format-7 Git recovery/retention/
-  prune fixture passes on that Btrfs image in 314.86 seconds.
-  Adjacent redundant-group retirement, delayed-holder Forget cleanup, and
-  offline-first-spare renewal regressions, formatting, and strict locked
-  all-target workspace Clippy pass. The temporary Btrfs mount and image were
-  removed. The end-to-end Git remote-reclamation gate is closed above;
-  the provisioned daemon gate remains open.
 - [x] **M6 preserve recipe pins during guarded Git prune replay.** A pending
   catalog retirement no longer authorizes deletion of an imported native anchor
   when a retained or restored local-sector recipe names that exact anchor.
@@ -375,319 +852,7 @@
   all four guarded Git node probes pass on Btrfs. Strict locked all-target
   workspace Clippy passes in the pinned local development shell. Broader
   signed-history expiry and remote-sector reclamation remain required.
-- [x] **M6 Git file bytes remain exact under every supported command.**
-  Native add hashes a pinned anchor, status and diff read raw worktree bytes,
-  checkout restores anchor bytes, and the local Btrfs attributes regression
-  now treats an LF-only edit as dirty, shows its raw diff, and restores the
-  original CRLF bytes. A child-process Btrfs regression now runs under confirmed
-  inherited `core.autocrlf`, `core.safecrlf`, environment `core.eol`, an external
-  attributes file with text/filter/ident/encoding rules, configured
-  clean/smudge/process commands, and `merge.renormalize`. Add, status, diff,
-  restore, switch, ordinary-Git fetch/pull/push, and their blob IDs remain raw;
-  no filter marker is created. The expanded local Btrfs regression also covers
-  a system clean filter, a repository filter setting and `info/attributes` on
-  the ordinary-Git side, native content merge, and linked-worktree checkout and
-  merge, combined linked restore, and primary hard reset; its raw merged blob
-  and restored bytes match. The inherited-config regression also checks that a
-  line-ending-only edit blocks tracked `rm`, branch switch, and pull without
-  changing the file or branch; its focused local Btrfs run passes. The
-  command-by-command source trace in [docs/git-byte-audit.md](docs/git-byte-audit.md)
-  covers every supported CLI command, including metadata-only operations and
-  the stock-Git bridge. A fresh local Btrfs
-  stock-Git round trip confirms that a CRLF worktree normalized by stock Git
-  imports as its LF blob, remains clean until edited, restores the exact blob
-  bytes, and exports the same object ID. The CLI help explains this limit.
-  The complete local Git acceptance script passed on exact source `1d961d5`,
-  including all 62 Btrfs Git library cases, extent measurements, node recovery,
-  stock-Git remote helper, and five-daemon smoke. A separate alias-level
-  remote-helper regression now calls `git status` through `mutualgit` under
-  inherited `core.autocrlf`, external attributes, and a configured clean
-  filter. It reports a raw-byte edit as dirty without running that filter;
-  the focused local Btrfs test and strict workspace Clippy pass.
-  The inherited-config Btrfs regression now also selects configured external
-  diff, `textconv`, and merge drivers through attributes and checks that raw
-  diff and built-in content merge do not invoke them. The ordinary-Git bare
-  peer carries the same hostile rules during push/pull. Its focused local run
-  passes with no driver marker created.
-- [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
-  A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
-  extent checks, node Git/recovery tests, and stock-Git bridge, then timed out
-  after 5,400 seconds in the five-daemon topology `backup --wait`. All members
-  remained at guild event sequence 36; the coordinator reported one coding Add
-  with only four of five signatures. The recovered storage peer exchanged relay
-  traffic while other nodes repeatedly dialed its obsolete loopback endpoint. A
-  separate direct smoke run passed. The failed run cleaned its temporary Btrfs
-  image, daemons, namespaces, and firewall rules. Identify the missing signer
-  and whether it is a transport failure or a conflicting signature lock,
-  correct the cause, and repeat the full gate on exact committed source.
-  `202aa44` promotes per-signer failures to warning logs. Two subsequent
-  isolated smoke runs and the complete Git acceptance script passed on
-  `31018a0` with stricter diagnostic backup timeouts (900/600 seconds), but
-  did not reproduce the failure. The complete provisioned reflink script also
-  passed on `6caeb11` with the 600-second diagnostic timeout. The expanded
-  reflink script passed again on `d53b4be` with that timeout; one transient
-  coding-activation request failure recovered before the topology completed.
-  `31018a0` preserves relevant signer warnings in future timeout output. Keep this
-  reliability issue open until the missing-signer path is explained and
-  corrected. The full local Git gate passed again on `1d961d5`; during its
-  five-daemon run, logs still showed transient four-of-five coding signatures
-  and failed dials to obsolete loopback addresses before recovery completed.
-  Source tracing found that coding and catch-up retries repeatedly add durable
-  roster endpoints to the learned cache, while Identify can add further hints.
-  Those hints could reintroduce an old direct address after a newer signed
-  endpoint set replaced it. The current correction makes signed endpoint sets,
-  including an empty withdrawal, authoritative over roster and Identify hints
-  until expiry. The focused endpoint-cache and direct-to-relay regressions,
-  130 other P2P tests, and strict workspace Clippy passed. The complete local
-  Git acceptance script passed on exact commit `d49a0bf`, including all 62
-  Btrfs Git cases and the five-daemon test (1,617.54 seconds); its disposable
-  mount, daemons, namespaces, and firewall rules were cleaned up. Loopback
-  retries and transient short signature quorums still appeared during topology
-  transitions. The gate pass establishes recovery in this run, but not the
-  cause of the original intermittent missing-signer stall; keep this item open
-  until that path is explained and corrected.
-  Source tracing found two further stale-address paths: persistent bootstrap
-  and attempt-scoped recovery hints were still unioned with a newer signed
-  endpoint set, and an in-flight dial to a withdrawn direct endpoint counted
-  as evidence that the direct tier remained available. The current correction
-  lets the signed set supersede those hints, moves tier selection to a current
-  endpoint or healthy connection, and retries queued requests after replacement.
-  A focused regression holds the obsolete direct dial pending while installing
-  a signed relay endpoint, then checks relay selection and signed empty-set
-  withdrawal. A subsequent same-tier correction binds each policy dial to the
-  address set it started with. Replacing signed addresses supersedes the old
-  attempt, allows a new dial immediately, and prevents a late old-dial failure
-  from advancing transport fallback. A focused test holds the old direct dial
-  pending while replacing it with another direct endpoint. The dial comparison
-  normalizes the optional trailing peer ID, preserving relay-circuit dialing.
-  Both signed-endpoint tests, four fallback tests, three selected-connection
-  tests, and the relay-circuit test pass locally; strict workspace Clippy
-  passes. Two long tests that failed amid broad parallel P2P execution pass
-  individually. The broader missing-signer reliability gate remains open.
-  The complete provisioned Git gate passed on exact commit `b69ce33`: all 62
-  Btrfs Git cases, extent and node/recovery tests, stock-Git remote helper,
-  and the five-daemon test (1,503.94 seconds). Its disposable mount, image,
-  daemons, namespaces, links, and firewall chains were removed. The topology
-  run nevertheless reproduced temporary four-of-five signatures at guild
-  event sequence 36 and old loopback retries. Read-only status showed all four
-  peers active, including increasing RelayFallback traffic to the recovered
-  storage peer; read-only state copies showed the same proposed-event-37 lock
-  prefix on all five members. The guild later advanced to event 42 and the
-  backup committed. Thus stale loopback retries alone do not explain the
-  missing response in this run. Identify the failing signer/request path and
-  distinguish transport loss from signature collection or lock handling;
-  plain lifecycle signer failures are currently logged only at debug level.
-  The next source correction retains individually verified guild signatures in
-  a versioned local record bound to the coordinator's durable proposal lock,
-  guild, and event sequence. Plain lifecycle and bound coding Add retries reuse
-  those signatures, contact only missing signers, and atomically retire the
-  partial record when the event installs. A focused test proves accumulation
-  across reopen and rejection of an invalid signature or changed proposal;
-  existing guild administration and coding lifecycle tests, core guild tests,
-  the locked all-target workspace suite (313 passing `mb-node` tests), and
-  strict workspace Clippy pass. Plain lifecycle signer failures now name
-  the member and sequence at warning level. This addresses the observed
-  same-event partial-quorum loss. The complete provisioned Git gate passed on
-  exact source `9f3bee0`, including all 62 Btrfs Git cases and the five-daemon
-  test in 1,547.13 seconds; disposable Btrfs and network resources were
-  removed. During that run, one recovered signer temporarily exhausted its
-  transport tiers and then rejected event 27 while its guild state lagged;
-  another topology pass had two transport-exhausted signers at event 39. The
-  coordinator advanced through those partial quorums and the backup committed.
-  Keep this reliability item open until the historical 5,400-second stall is
-  excluded by stronger repeated topology evidence or its remaining response
-  path is corrected; this one passing gate does not prove that every missing
-  signer will eventually become reachable.
-  The same-tier dial correction passed its exact-source local provisioned Git
-  gate on `702fe63`. Clippy, 62 Btrfs Git cases, extent measurement, node Git
-  and seed-recovery checks, and the stock-Git bridge passed first. The network
-  script initially stopped before namespace setup because this shell omitted
-  `/usr/sbin` from PATH; rerunning that final stage with the installed
-  `iptables` on PATH passed the five-daemon topology/recovery test in 1,536.31
-  seconds. The coordinator advanced past transient event-41 missing signatures
-  and the recovered-topology backup committed. Old direct-address failures
-  still occurred. Both disposable Btrfs mounts, images, daemon processes,
-  namespaces, and firewall chains were removed. One more successful run does
-  not exclude the intermittent long stall, so this reliability gate stays open.
-  A source-level scheduling correction separates signed endpoint exchange from
-  the peer-exchange loop's guild-tail request, which can wait up to 90 seconds
-  for a slow advancing peer on every pass. Endpoint exchange can now circulate
-  current signed addresses without waiting for that tail, while recovery-key
-  and coding lifecycle proposals still follow the tail catch-up pass. Validate
-  this change with the provisioned topology and keep the intermittent gate open
-  until the missing-signer path is explained or repeatedly excluded. Formatting,
-  strict workspace Clippy, the focused tail-selection test, and the provisioned
-  five-node multi-owner QUIC/recovery test pass; the latter completed in 535.02
-  seconds on a disposable local Btrfs image, which was unmounted and removed.
-  The exact-commit `b25ae06` isolated five-daemon topology/recovery test passed
-  in 1,637.58 seconds. Its relay-only transition again showed one signer
-  exhausting transport tiers and then returning the generic guild-transition
-  authorization rejection for event 28; a later event-29 request also exhausted
-  tiers. During the final `backup --wait`, all active guild views reached event
-  36 and the owner remained dirty for over five minutes despite an active
-  RelayFallback path to the recovered storage peer. The job later advanced,
-  committed, and seed recovery passed. The test removed its Btrfs image,
-  mount, daemons, namespaces, and firewall chains. This run confirms eventual
-  progress but does not explain or exclude the earlier 5,400-second stall.
-  Source tracing found another diagnostic gap: the coordinator can wait for
-  variable coding coverage while pending durable coding work exists, and that
-  loop exposed the missing coverage only at debug level. A 60-second progress
-  warning now names the checkpoint, guild event sequence, and coverage error;
-  the coordinator's fetch, writer-key, packing, and lane-queue stages and the
-  coding worker's four sequential steps also warn if any one stays pending for
-  60 seconds. The warnings do not cancel work or change quorum decisions.
-  Use the next local topology run to identify the stage behind a long pause.
-  On exact commit `d0dddcb`, the isolated five-daemon topology/recovery test
-  passed in 1,647.75 seconds with each topology backup bounded to 900 seconds.
-  Its coding-coverage warnings showed the first recovered-topology checkpoint
-  advancing from event 30 to 37 and the relay-only checkpoint from event 40 to
-  43; no individual coding worker step logged a 60-second wait. Early signers
-  still exhausted transport tiers and temporarily rejected lifecycle requests
-  during recovery. The disposable Btrfs mount/image, daemons, namespaces, and
-  firewall chains were removed. This run distinguishes slow serial group
-  completion from a fixed sequence stall but does not explain the historical
-  5,400-second timeout, so this gate remains open.
-  `e65580f` installs a verified coding Add locally before concurrent peer
-  dissemination and bounds its eager wait to 20 seconds. The focused activation
-  test and strict workspace Clippy pass. The complete local Git acceptance gate
-  passed on this exact commit, including 62 Btrfs Git cases, extent measurement,
-  node/Git recovery, stock-Git exchange, and five-daemon topology/seed recovery
-  in 1,618.57 seconds. Event 43 was reached after transient short lifecycle
-  signature quorums, transport exhaustion, and stale-address dials. No coding
-  dissemination timeout was observed, so this run does not verify that branch
-  or explain the historical 5,400-second missing-signer stall. Keep open.
-  `2b8c248` installs certified plain lifecycle events locally before concurrent
-  peer dissemination with the same 20-second eager bound. A focused test holds
-  one install response open, checks that the local tail is already installed,
-  and exercises the bound; administration and coding activation tests and
-  strict workspace Clippy pass. The isolated five-daemon topology and seed-only
-  recovery test passed on this source in 1,490.34 seconds on fresh local Btrfs;
-  its image, mount, and network namespaces were removed. During the run, a
-  signer exhausted transport tiers and then rejected event 25 because the
-  caller was not its configured coordinator; the guild later advanced.
-  Investigate that pre-certification signer/authorization path separately.
-  Bounded dissemination does not close the historical 5,400-second stall.
-  `1b3f42a` adds recipient-side admission context and a distinct guild-member
-  denial while preserving fail-closed authorization. The focused unrecovered
-  signer and active-administration tests and strict workspace Clippy pass. Its
-  isolated local topology/seed-recovery test passed in 1,428.25 seconds.
-  `b3093a1` also captures warnings from both recovered daemons and includes the
-  recovered relay member's log in timeout diagnostics. The revised isolated
-  topology/seed-recovery test passed on exact commit `b3093a1` in 1,431.81
-  seconds; all disposable Btrfs and network resources were removed. At event
-  27, the recovered member logged `local_phase=None`, `local_sequence=None`,
-  and no locally committed checkpoint before its restore adopted the guild.
-  It correctly refused to sign until recovery completed, then became Active
-  and the guild advanced. This explains that transient authorization rejection.
-  The historical 5,400-second missing-signer stall and transport exhaustion
-  remain unresolved; keep this gate open.
-  `0d5af1d` stops majority-policy lifecycle and coding events as soon as their
-  actual guild certificate verifies, releasing pending minority requests and
-  outbound permits before installation. Its focused five-member majority,
-  administration, coding activation, and slow-install tests pass, with strict
-  workspace Clippy. The isolated five-daemon topology/seed-recovery gate using
-  that network code passed in 1,569.46 seconds; its Btrfs image, mount, daemon
-  processes, and namespaces were removed. Unanimous short quorums and transport
-  exhaustion still appeared before the recovered guild caught up, so this run
-  does not close the historical unanimous stall.
-  A source trace found that a retiring duplicate connection prevented dispatch
-  of every new request to that peer even when a separate healthy selected
-  connection existed. Retirement can wait for unrelated inbound work, so this
-  peer-wide hold could repeatedly delay a missing guild signature despite an
-  active relay path. Exact-connection dispatch now proceeds on the healthy
-  selected session while the short preferred-tier promotion wait remains.
-  A focused P2P regression holds a duplicate in retirement and verifies the
-  request uses the healthy session. The historical topology stall is not yet
-  proven to have this cause; repeat the isolated five-daemon gate on committed
-  source and keep the reliability item open until its response path is clear.
-  The P2P suite also exposed an existing activation-fixture race on the prior
-  committed tree: usable coverage can precede cleanup of the losing receipt,
-  and one activation-worker turn need not process the intended pending job.
-  The fixture now waits with bounds for those separate transitions and reports
-  concise pending-job state on timeout. The full P2P suite passes with 135
-  tests and 2 provisioned tests ignored; strict workspace Clippy passes.
-  The isolated five-daemon topology and seed-recovery test passed on code
-  commit `a870a46` in 1,497.88 seconds. Both recovered-topology backups
-  committed despite transient missing signatures and coverage waits; the
-  second backup advanced through event 43. Its local Btrfs image, mount,
-  daemons, namespaces, and firewall rules were removed. This passing run
-  validates the corrected request path in a real topology but does not prove
-  it caused the historical 5,400-second stall, so this gate remains open.
-  The complete local Git acceptance gate passed on exact committed source
-  `9ec4953`: all 62 provisioned Btrfs Git cases, extent measurement, node
-  recovery, stock-Git exchange, the raw-path CLI/daemon test, and five-daemon
-  topology/seed recovery (1,522.23 seconds). The disposable image, mount,
-  daemons, namespaces, and firewall rules were removed. The coordinator
-  temporarily lacked p4's event-26 signature while its recovered daemon was
-  unreachable, then received authorization denials during guild catch-up;
-  later event-37 requests to two signers exhausted transport tiers, yet
-  coding advanced and the backups committed. This passing run does not explain
-  or exclude the historical long stall; keep the reliability item open.
-  The isolated five-daemon topology and seed-recovery gate passed again on
-  exact source `9f7d35b` in 1,467.50 seconds. The first local harness attempt
-  stopped before daemon setup because its disposable Btrfs mount was root-owned;
-  rerunning with that mount owned by the test user completed. During recovery,
-  the coordinator retried event 25 with four of five signatures while the
-  storage member's old endpoint was unreachable and its replacement caught up.
-  A second short quorum at event 37 coincided with relay restart and missing
-  circuit reservations; the relay-only backup advanced from event 38 through
-  41, committed, and seed recovery passed. The local image, mount, daemons,
-  namespaces, and firewall chains were cleaned up. This run adds successful
-  retry evidence but still does not explain the historical 5,400-second stall.
-  Startup now excludes the local peer ID from a generic bootstrap list before
-  installing addresses or scheduling initial/retry dials. A focused test keeps
-  a remote bootstrap peer while proving the own endpoint creates no policy
-  dial. This removes one observed class of useless dial attempts, but it does
-  not explain the missing remote signer or close this reliability gate.
-- [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
-  and `mutualgit merge` now route through the selected linked worktree. Their
-  conflict sessions, staged resolutions, status, and checkout replay use a
-  linked namespace while the commit graph and refs stay shared. Local session,
-  schema, CLI, and non-Btrfs Git checks pass. The new ignored Btrfs regression
-  covers fast-forward and divergent clean pull, dirty-file refusal, conflicted
-  merge, abort, resolution, continue, and interruption/reopen after generated
-  blob capture, staged conflict resolution, and checkout publication without
-  changing the primary worktree. Historical primary-keyed linked blob intents
-  replay when their registered worktree still exists; a missing historical
-  worktree now has a force-prune path that discards its private generated blob
-  and retires the intent with its registration. The complete provisioned Git
-  gate passed on `31018a0`, including the linked pull/merge Btrfs regression.
-- [x] **M6 combined Git restore is one recoverable operation.**
-  `mutualgit restore --staged --worktree PATH` now sends one daemon request for
-  primary or linked worktrees. Version 11 checkout intents bind the selected
-  HEAD paths, old worktree content roots, old index digest, and full target
-  index; replay publishes selected worktree bytes before the index transition.
-  Local intent, schema, CLI, and non-Btrfs Git tests pass. The ignored primary
-  and linked Btrfs regressions cover dirty directory preflight, staged additions,
-  unrelated staged bytes, and interruption/reopen before and after index publication.
-  The complete provisioned reflink acceptance script passed on `6caeb11`.
-- [x] **M6 prune duplicate native anchors by physical reachability.** Git
-  prune now distinguishes exact index and local-sector recipe pins from blob
-  IDs and retains one verified source per filesystem for each live blob. It
-  removes surplus mappings with the existing crash-replayable deletion intent.
-  Local decision and recipe-key tests pass. The new ignored Btrfs regression
-  stages identical bytes repeatedly, prunes with and without an exact pin,
-  and checks the remaining catalog after reopen. The node-level Btrfs case now
-  also serves signed backup sectors across a reopen, restores exact worktree
-  bytes, and proves a recipe pin survives revision-record removal until the
-  sector recipe itself retires. The complete provisioned Git gate passed on
-  `31018a0`, including the Btrfs and signed-revision prune regressions.
-- [x] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
-  now carry BLAKE3 roots and lengths for previously unanchored working files;
-  linked worktrees use wrapper version 2. Replay verifies those bytes in the
-  worktree and private staging, and old pending intents without a provable
-  original root fail closed. Local unit tests cover regular files, symlinks,
-  conflicting content, staged-file replay, and primary/linked encoding. The
-  linked Btrfs regression now also interrupts hard reset before file publication
-  and after index publication, then reselects the linked worktree on reopen;
-  its targeted local run passes. A provisioned Btrfs replay fixture now rejects
-  a wrong native anchor behind the expected Git ID and an unverifiable legacy
-  restore intent; its targeted run passes. The reflink acceptance script now
-  includes these checks alongside primary and linked restore and hard reset.
-  The complete provisioned reflink acceptance script passed on exact committed
-  source `d53b4be`, including all new replay cases and the five-daemon smoke.
-  Its disposable Btrfs image, namespaces, and firewall rules were cleaned up.
-- [ ] **M6 guarded edit guard.** The store now has replayable per-file and
+- **Canceled / superseded by R1 — M6 guarded edit guard.** The store now has replayable per-file and
   whole-root sparse detaches. Ordinary `root add` still selects the reflink
   backend; explicit `root add-guarded` now begins a guarded enrollment from a
   separate private lower tree and empty view, while `root add-guarded-here`

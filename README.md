@@ -9,9 +9,12 @@ state through Kademlia, and recover a lost member from its offline seed.
 Peer traffic uses authenticated QUIC with Identify, circuit relay v2,
 AutoNAT/DCUtR hole punching, optional gateway port mapping, and embedded Arti
 onion services. Every path authenticates the same recovery-string-derived
-identity. Guarded non-reflink capture is available as an incremental Linux
-path; its full enrollment and removal gate, membership changes, and cross-user
-packing remain later work. Do not entrust unique data to this prototype.
+identity. Current native source capture uses Linux on qualified reflink
+filesystems; native Windows and macOS backends remain planned. The experimental
+guarded/FUSE backend has been withdrawn from the roadmap; its source is still
+present pending removal and safe handling of existing guarded state. Do not
+enroll new guarded roots. See [`plan.md`](plan.md) for the removal and remaining
+production gates. Do not entrust unique data to this prototype.
 
 ## Programs
 
@@ -59,8 +62,6 @@ Routine operations go through the daemon:
 mutualbackup status
 mutualbackup unlock [--seed-stdin|--seed-file FILE]
 mutualbackup root add PATH
-mutualbackup root add-guarded LOWER VIEW --view-uid UID --view-gid GID
-mutualbackup root add-guarded-here PATH
 mutualbackup guild create|invite|join|finalize|status
 mutualbackup backup --wait
 mutualbackup snapshot list
@@ -71,27 +72,18 @@ mutualbackup audit [--repair]
 mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 ```
 
-On Linux, `root add-guarded` starts the guarded source backend from an existing
-lower directory and a separate, empty view directory on the same filesystem.
-`root add-guarded-here` replaces an existing user-owned directory with its
-guarded view at the same path, retaining its visible ownership, modes, times,
-and file bytes through a durable private-name handoff. Every file in this
-initial in-place path must belong to the directory owner.
-New files and directories use their creator's UID/GID, inherit the parent group
-in setgid directories, and retain that ownership through remount and backup
-restore. The hidden lower tree remains private to the daemon.
-Both commands require a privileged daemon. For `add-guarded`, the view
-placeholder must be owned by a different user than `UID` and must not be
-group- or world-writable. Enrollment
-privately isolates the lower tree, mounts the editable view, and marks the new
-root dirty for its first signed backup. The daemon resumes interrupted
-enrollment on reopen. This is an incremental Milestone 6 path; data-preserving
-root removal and the full guarded failure and metadata gates are still pending.
+`root add` probes the reflink lifecycle and rejects unsupported source
+filesystems. Existing guarded roots and their retained history require the
+data-preserving retirement or compatibility path specified in [`plan.md`](plan.md)
+before the guarded implementation is deleted.
 
 Parity may span several configured filesystems. Each volume has a signed UUID,
 an independently wrapped SQLCipher key, a byte budget and repair headroom.
-`storage drain` stops new placement; `storage migrate` copies and verifies each
-object before retiring its source. A retired volume remains retired across
+`storage drain` stops new placement; `storage migrate` currently copies and
+verifies format-1 objects before retiring their source. Migration refuses to
+retire a volume while variable-profile objects or coding reservations remain,
+preserving their receipts and readable source. Full variable-profile evacuation
+is an open production gate. A retired volume remains retired across
 daemon restarts even if its path stays configured; `storage reactivate UUID`
 explicitly returns an attached retired volume to service. Interrupted writes
 and moves are reconciled from durable control receipts, while an absent disk

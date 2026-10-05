@@ -37,4 +37,6 @@ The local Btrfs Git acceptance suite covers mixed line endings, NUL bytes,
 symlinks, linked worktrees, merge, restore/reset, stock-Git exchange, and
 conversion-inducing config and attributes. This source audit covers the
 remaining command mapping; the full milestone gate still requires its exact
-source local acceptance and the separate guarded/platform gates in `plan.md`.
+source local acceptance and the non-FUSE production gates in `plan.md`.
+Guarded/FUSE work is withdrawn and scheduled for removal; the remaining source
+does not add a requirement to complete Git-on-FUSE.

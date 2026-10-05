@@ -4,6 +4,18 @@ Working plan based on `mutual-p2p-backup-design.md` and the older Rust code in
 `/home/user/barterbackup/rust`. Protocol choices below are provisional: record
 them as ADRs and test vectors before promising wire compatibility.
 
+**Scope correction — 2026-10-05:** remove the experimental FUSE-backed guarded
+source backend and its product integration. Protected folders remain ordinary
+native filesystem directories. FUSE completion, guarded Git integration, and
+the guarded recapture bug are canceled work; the removal and existing-state
+transition replace them. This is a plan change, not a claim that the source has
+already been deleted. Historical guarded implementation reports below remain
+evidence only and do not authorize continued development. The current removal
+contract is in section 4; the remaining non-FUSE corrections and release gates
+are in section 8 and `TODO.md`. Native Windows/macOS, metadata, watchers,
+application-consistent capture, and the Git byte-preservation requirements
+remain in scope.
+
 ## 1. Direction and first decisions
 
 - Continue the layered Rust workspace; transplant small proven utilities rather
@@ -17,8 +29,9 @@ them as ADRs and test vectors before promising wire compatibility.
 - The implemented first usable prototype baseline is Linux and
   **reflink-only**. Probe the complete COW lifecycle when a root is added and
   reject the root if reflinks are not safe there. Never silently fall back to
-  an eager full copy. Guarded
-  link-freeze, VSS, FUSE, and other source backends come after the prototype.
+  an eager full copy. Remove the experimental FUSE-backed guarded path; do not
+  replace it with hard-link freezing or another interception layer. Future
+  Windows and macOS backends must use qualified native capture facilities.
 - Build the Milestone 6 Git-compatible frontend on native immutable source
   anchors, not a second persistent Git payload store. Reuse a maintained Git
   implementation for object IDs, object formats, refs, index, and pack/protocol
@@ -31,7 +44,7 @@ them as ADRs and test vectors before promising wire compatibility.
   `.mutualbackup`, while ordinary Git communicates through object/pack exchange
   rather than opening that directory as `.git`.
   This Git pivot is an addition to the original roadmap: implement it through
-  the versioned source-backend boundary alongside the outstanding guarded-source,
+  the versioned source-backend boundary alongside the outstanding native
   platform, metadata, watcher, and application-capture work. Milestone 6 must
   deliver both sets of requirements; Milestone 7 freezes their compatibility
   together. Git compatibility must not add a second permanent payload copy
@@ -618,27 +631,17 @@ Retain MutualBackup's independent content roots and signed revision authority.
   cursors are local catalog state, never portable signed recovery fields.
   Symlink restore and broader portable attributes come later and require an
   explicit policy that prevents path escape.
-- **Milestone 6 guarded private metadata:** keep the existing signed
-  `UserRevision` envelope and encrypt a versioned private format for guarded
-  views. Preserve raw Unix path bytes, visible uid/gid, mode, atime/mtime,
-  directory length, sparse sector extents, and portable hard-link groups.
-  Validate path topology and sector geometry before restore. Keep local inode
-  IDs, mount claims, and source-anchor locators outside the signed format;
-  restore and reanchor from sector bytes without depending on those old IDs.
-  Do not convert guarded entries through the older UTF-8-only private format.
-  Keep non-Git guarded revisions on private format 6. Use private format 7
-  for Git-backed guarded revisions: it binds that same raw namespace to a
-  validated Git graph descriptor and the protected-root ID. Do not emit
-  format 7 until capture, pinning, catalog rebuild, and seed-only recovery
-  of its graph pass together. Restore format 7 into a private staging tree
-  with a guarded-bound Git catalog, then verify that catalog and the signed
-  namespace before supervised mount publication and sector-recipe rebind.
-  The staging verifier must bind the exact marked catalog directory, permit
-  only its known private files, compare its reachable refs, objects, HEAD,
-  and native blob bytes against the signed graph and data-sector catalog, and
-  reject every visible path outside the signed guarded namespace. Keep this
-  verification separate from publication until recovered sector recipes and
-  the guarded mount claim are durably replayable together.
+- **Portable private metadata and legacy guarded records:** native backends
+  must preserve raw path bytes, supported ownership/mode/timestamps, sparse
+  extents, and hard-link relationships under an explicit portable policy.
+  Validate namespace topology and sector geometry before publishing a restore.
+  Keep native inode IDs and anchor locators local. Guarded private formats 6/7
+  are existing-state compatibility inputs, not a reason to retain a FUSE
+  publication path or add new guarded features. Preserve their decoding and
+  authenticated restore/export where required by the removal contract in
+  section 4. Unsupported conversion must leave the original state intact with
+  an actionable error; never reinterpret a legacy backend or discard its Git
+  graph, ownership metadata, or retained sector recipes silently.
 - **UserRevision:** guild, owner, protected-root ID, root-scoped monotonic
   revision, optional parent in that root's chain, explicit metadata/data
   `SectorRef` lists, suite versions, and owner signature. Milestone 5 keeps
@@ -738,7 +741,7 @@ Proactive background repair comes later.
   when the bytes match, and retain distinct sources when the bytes differ.
   A Git blob imported from an ordinary repository becomes the authoritative
   `B` for our checkout, regardless of that repository's attributes or the
-  other client's worktree presentation. Reflinks or guarded hard links may
+  other client's worktree presentation. Native reflinks or clones may
   share physical extents, but no Git index, object database, pack cache, or
   worktree may retain a second permanent copy merely for compatibility.
   Git line-ending normalization and a configured clean filter are separate
@@ -755,11 +758,11 @@ Proactive background repair comes later.
   the restored bytes before replacing a worktree file. A mismatch is an
   operation failure, never a reason to normalize line endings or run a Git
   filter to make the file match an expected blob. This contract also applies
-  to guarded link-freeze and future Windows and macOS backends.
+  to future native Windows and macOS backends.
   Keep blocking filesystem work in bounded workers and keep the signed guild
   protocol independent of backend choice.
   The existing reflink root is the first implementation; Git history consumes
-  that boundary, and guarded link-freeze/platform capture later implement it.
+  that boundary, and native platform capture later implements it.
 - `init` associates each Git repository with a stable protected-root ID and
   working-tree location, enrolling and probing a source backend before claiming
   backup protection. Keep the repository marker and Git-facing metadata in an
@@ -768,10 +771,8 @@ Proactive background repair comes later.
   file scans and protect its reachable graph through encrypted revision metadata
   instead of recursively capturing itself. Reject initialization if that
   protection backend is unavailable; adding a worktree does not silently enroll
-  its uncommitted edits. For a guarded FUSE worktree, pin the marked catalog in
-  its verified private lower root and hide it from the editable view; the FUSE
-  mount does not provide the remount-stable filesystem identity required by
-  native catalog and anchor operations.
+  its uncommitted edits. Bind catalogs and anchors to their native filesystem
+  identities and verify those bindings before replay.
   Treat a pre-existing `.git` directory as a separate stock-Git repository,
   never as native history or a file tree to stage recursively. Any takeover of
   that worktree must be an explicit import with one catalog writer: import the
@@ -786,9 +787,8 @@ Proactive background repair comes later.
   satisfy `.git/objects`. A later edit to the working file cannot change the
   staged bytes. Detect concurrent source changes during capture and fail or
   retry rather than recording mixed bytes. An unavailable reflink fails this
-  capture path explicitly; the later guarded link-freeze backend must meet its
-  own safety probe before offering a hard-link alternative. Preserve sparse
-  extents and file identity where the backend supports them. The index records
+  capture path explicitly. Preserve sparse extents and file identity where the
+  backend supports them. The index records
   the raw captured blob ID: Git configuration and attributes cannot normalize
   line endings or run a clean filter between capture and staging. On Btrfs,
   prove that the staged anchor initially shares physical extents with the
@@ -798,15 +798,6 @@ Proactive background repair comes later.
   anchor or checkout is a distinct file sharing the original extents, with
   new payload allocation on later writes through COW. Measure initial extent
   sharing and later isolation; do not require zero metadata allocation.
-  For an unchanged guarded file already frozen by a root anchor, map the Git
-  stage to that verified root file with a distinct local object-map ID. Do not
-  add a third hard link: the guarded edit journal must retain its exact
-  two-link invariant until it detaches the working inode. Keep the root pinned
-  for as long as any such Git mapping needs its bytes, and rebind the mapping
-  only through a verified backend transition after source-loss recovery. On
-  reopen, reconcile guarded stage pins and catalog receipts in both directions;
-  a catalog mapping without its node-owned protection must stop startup rather
-  than let root retirement or stage replay guess its owner.
   A failed conversion-requesting command must leave the captured anchor,
   index, and working file unchanged; an inert repository attribute or config
   setting alone is not a reason to reject raw staging.
@@ -824,22 +815,12 @@ Proactive background repair comes later.
   read/hash pass and bounded transient pack buffers are acceptable; verify
   both Git object IDs and MutualBackup content roots, and reject an ID alias
   whose bytes disagree.
-  Metadata-only guarded index/ref changes validate the backend's pending
-  operations against the private catalog; they must not enter a reflink
-  checkout transition or require a native filesystem UUID from the FUSE view
-  just to change local metadata. Branches, tags, and explicit commit pins use
-  this path, with mutations fenced during catalog retirement and a durable
-  dirty marker scheduling protection of the new graph. A same-tree branch
-  switch may update HEAD without touching staged or working bytes; a switch
-  requiring file replacement remains gated by guarded checkout readiness.
 - For checkout or a second worktree, restore verified anchor bytes by reflink
   on a capable same-filesystem destination, preserving the exact blob bytes.
   Do not run a smudge filter, line-ending conversion, or encoding conversion
   while publishing a worktree file, including after a merge, reset, or pull.
   Never hard-link an editable worktree file directly to an immutable anchor:
-  writing through that link would mutate the committed blob. A backend may use
-  hard links only if its guard first makes the shared inode safely immutable
-  and editing detaches it without changing the anchor.
+  writing through that link would mutate the committed blob.
   Make any unavoidable cross-filesystem copy explicit and bounded, and do not
   confuse checkout copy policy with the no-silent-copy capture rule. Protect
   dirty or untracked worktree files from destructive checkout. Keep per-worktree
@@ -853,83 +834,72 @@ Proactive background repair comes later.
   durable until a signed backup revision and checkpoint cover its graph; status
   must distinguish local history from guild-protected, seed-recoverable history.
   Recovery reconstructs the Git graph, refs, object map, and checked-out view
-  from authenticated backup data without a cached local catalog. Guarded
-  format-6 private metadata has no signed Git graph descriptor, so its signing
-  path refuses a Git registration or matching graph intent. A registered
-  guarded Git root instead captures a durable graph intent before stopping
-  the view and signs format-7 private metadata; a private catalog marker with
-  no matching registration fails before capture. The guarded stage pin and
-  signed sector recipes retain its native anchors across this handoff. Keep
-  guarded Git enrollment, file operations, and milestone closure gated until
-  format-7 checkpoint protection, source-loss recovery, and virtual-locator
-  rebind pass the complete five-member network gate.
+  from authenticated backup data without a cached local catalog.
   On a non-reflink recovery filesystem, stream verified Git blob sectors
   directly into one native anchor and preserve sparse zero ranges; do not
   require a temporary worktree payload and a reflink just to rebuild history.
-  After a guarded root capture, rebind any recovered Git blob whose signed
-  bytes match a retained root file to that verified root anchor through a
-  guarded virtual mapping, then retire its temporary imported anchor. Preserve
-  the root file's two-link edit invariant; blobs absent from the visible tree
-  retain independent native anchors. Prove this handoff survives a crash and
-  does not leave a second permanent payload copy on ext4 or Btrfs.
+  Restoring or exporting files onto a non-reflink destination does not qualify
+  that filesystem for continuing capture. Re-enrollment requires a supported
+  native backend and its complete probe.
 - Represent explicit commit protection pins as namespaced Git refs so graph
   export, signed backup, and recovery retain their ancestry without another
   object format. Removing a branch or pin only changes reachability; physical
   deletion waits for the prune/GC gate and every retained revision. The local
   frontend has no implicit reflog protection until a durable reflog is defined.
 
-### Deferred source backends and platform work
+### Remove the FUSE-backed guarded backend (R1)
 
-- **Guarded link-freeze** creates a private same-filesystem hard link to the
-  working inode, records its exact original mode/ACL, uses a short platform
-  guard to exclude pre-opened writers and writable mappings, then removes normal
-  write/append/truncate permission. A hard link alone is not a snapshot. The
-  protection is user-reversible and defends against ordinary accidental
-  modification, not a malicious process with the user's authority.
-- On Linux, make the long-lived edit guard a versioned FUSE worktree view over
-  an inaccessible private source directory on the same filesystem. The
-  short-lived lease/fanotify freeze remains the enrollment barrier; the FUSE
-  view is the path ordinary applications use afterward. Read-only opens may
-  use kernel FUSE passthrough to the frozen source inode. Before returning a
-  writable handle, accepting a shared writable mapping, or applying a
-  pathname truncate, allocation, or owner `chmod`, the view must run and
-  durably finish the existing sparse-detach journal, then pass through only
-  the independent editable inode. All simultaneous passthrough handles for a
-  FUSE inode must share one live kernel backing registration, including when a
-  read-only handle predates detach; keep each handle's source descriptor for
-  handle-based truncate and allocation. Rename and unlink preserve the immutable
-  anchor without detaching. New files are editable independent inodes, and
-  their publication must be replayable across a crash. Atomic replacement must
-  keep the replaced file's immutable anchor intact. File `fsync`/`fdatasync`
-  must sync the retained inode even after rename, unlink, or replacement;
-  directory handles must pin an identity-checked inode so sync still reaches
-  it after rename or removal. Propagate storage errors. A mount/daemon failure
-  must make the view fail closed, never expose the private source path or
-  silently resume through it.
-  Probe the mount, passthrough capability, and inaccessible lower path locally
-  before guarded enrollment; lack of any required capability is an explicit
-  unsupported-backend result. See the [kernel FUSE passthrough design](https://docs.kernel.org/filesystems/fuse/fuse-passthrough.html)
-  and [FUSE I/O modes](https://docs.kernel.org/filesystems/fuse/fuse-io.html).
-- Before enabling that backend, extend the root probe through hard-link →
-  guard/freeze → reject in-place mutation → allow rename/unlink/atomic
-  replacement while the anchor survives → sparse detach → exact permission
-  restore/edit. If an inode has unaccounted aliases, enroll the whole link group
-  explicitly or reject it rather than changing permissions on unknown paths.
-  Exercise writes through descriptors and shared writable mappings opened
-  before the freeze, truncate and allocation through those handles, and races
-  through every known hard-link alias. Record the guard's required privileges
-  and fail closed when they are unavailable; an open-time notification or
-  permission change alone is not evidence that pre-opened writers are blocked.
-- For an in-place edit, use the recoverable local sequence
-  `SHARED_FROZEN → COPY_STAGING → PRIVATE_COPY_READY → UNLOCK_PENDING → EDITABLE`.
-  Under the guard, make and verify a sparse independent anchor, fsync and install
-  it, detach the old hard link, and only then restore the working inode's exact
-  permissions. Failure or `ENOSPC` leaves the working inode frozen.
-- Evaluate persistent NTFS VSS only after testing service authorization,
-  batching, diff-area headroom and eviction, and missing-snapshot reconciliation.
-  Native macOS support, portable ACL/xattr handling, and independently chunked
-  local packing are also post-prototype work. The Linux FUSE guard above is a
-  Milestone 6 requirement for guarded link-freeze enrollment.
+The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
+implementation, enrollment and recovery publication paths, guarded Git
+operations, backend-specific control commands, tests/probes, and `fuser`
+dependency. Remove link-freeze/fanotify machinery used only by that backend;
+retain unrelated native capture code and generally applicable safety checks.
+Update CLI help, schemas, fixtures, acceptance scripts, packaging, and guides
+with the code removal. Do not replace FUSE with another interception mechanism
+or make chmod/hard-link freezing a fallback on unsupported filesystems.
+
+Before deleting runtime paths, inventory existing root bindings, mount claims,
+private formats 6/7, Git catalogs and pins, sector recipes, and pending capture,
+release, recovery, and retirement intents. Provide a verified export or durable
+migration to a supported native backend for existing protected data, or reject
+unsupported state before mutation with an actionable recovery procedure. An
+ordinary restore destination need not support continued capture. Keep user
+files, staged/working differences, reachable Git history, and retained backup
+anchors intact; retire them only under their existing reachability obligations.
+Never assume a guarded anchor is trustworthy merely because it is readable:
+verify retained bytes against authenticated content roots or reconstruct them
+from peers before converting protected history.
+
+Do not silently relabel `GuardedLinkFreezeV1` as `ReflinkV1`, renumber serialized
+enum variants, or reinterpret old journals. Retain only the decoding and
+offline recovery/export compatibility needed for old data; it must not mount a
+view or authorize new guarded captures. Interrupted migration/export must be
+replayable and preserve the original state until destination verification and
+durable publication complete. If safe migration is unavailable, fail closed
+without deleting the old data or automatically running the known-unsafe path.
+
+Acceptance: ordinary native roots and Git still pass their existing gates;
+new builds contain no FUSE runtime/dependency or guarded enrollment commands;
+legacy-state fixtures either recover/export exact files and history without a
+mount or stop before any mutation with a documented error. Include interrupted
+handoff, retained revisions and pins, pending jobs, and no-space failures.
+The retained-descriptor recapture defect and other canceled guarded features
+are not separate implementation tasks; these checks protect existing data
+during removal, rather than complete the withdrawn backend.
+
+### Native source backends and platform work
+
+- Linux uses qualified reflink capture with explicit rejection when the full
+  immutable capture/edit/restore probe fails. Unsupported filesystems do not
+  gain an unannounced eager-copy or hard-link fallback.
+- Implement and qualify native Windows NTFS capture, including VSS where
+  appropriate. Test service authorization, batching, diff-area headroom and
+  eviction, and missing-snapshot reconciliation before relying on snapshots.
+- Implement and qualify native macOS cloning, platform watchers, portable
+  ownership/ACL/xattr handling, sparse files, and application-consistent hooks.
+- Each supported backend must pass byte-exact Git and source-loss recovery
+  gates as well as local capture/edit/restore and crash replay. Metadata and
+  application consistency remain required even though FUSE is removed.
 
 ### Prototype databases
 
@@ -1171,8 +1141,8 @@ object lifecycle is:
 `staged → uploaded → verified/receipted → committed/active → superseded → grace period → GC`
 
 GC removes only objects and anchors unreachable from every retained revision
-after in-flight transitions finish. Link-freeze permission restoration must be
-journaled before collecting its last anchor. Virtual-zero ranges may be omitted
+after in-flight transitions finish. Native source and catalog retirement must
+remain replayable. Virtual-zero ranges may be omitted
 only when authenticated state proves that all `k` information roles, and thus
 all linear parity roles, are exactly zero. Secure physical erasure cannot be
 proved on remote hosts, COW filesystems, or SSDs; deletion ends the obligation
@@ -1274,20 +1244,48 @@ uses that same live node rather than a parallel replacement. Pause for a focused
 source, runtime, security, and usability review at every gate before committing
 the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 have passed. The final Milestone 5
-gate passed on exact committed source `53ec2ec`; its earlier review and gate
-records below are historical. Milestone 6 is underway: Git-compatible local
-history and interoperability share the work queue with the original
-source-backend and platform deliverables. The byte-exact Git policy above and
-the complete Milestone 6 gates below remain requirements for closure. Iterate
-through the Git command slices while keeping the original backend deliverables
-in scope: a command is complete only when its raw-byte, crash/reopen, and
-native-anchor storage checks pass; the milestone still requires protected graph
-recovery, physical prune, guarded link-freeze, and platform backends.
-Before closing the Git phase, re-audit commands implemented before the
-byte-exact policy was adopted. Their earlier functional gates do not establish
-that add, checkout, merge, restore, pull, and import/export ignore inherited
-conversion settings and attributes on every file-content path.
+**Current position (2026-10-05):** Milestones 0 through 5 have recorded passing
+gates; Milestone 6 remains open. The accepted direction removes FUSE-backed
+guarded capture and Git integration. Prior milestone passes do not close the
+new non-FUSE production findings below. Continue native Git, source-backend,
+platform, metadata, watcher, and application-consistency work; each content
+operation still requires exact bytes, crash/reopen safety, and native-anchor
+storage evidence. Complete graph recovery and physical pruning alongside those
+requirements. The recorded implementation and runtime results that follow the
+current correction queue are historical, including any superseded statements
+that guarded completion is required.
+
+### Production corrections from the 2026-10-05 source review
+
+These are planned corrections, not completed fixes or new runtime evidence.
+`TODO.md` owns their open status and evidence. Retain existing passing safety
+checks while adding the specific missing behavior.
+
+| Priority / task | Required change | Acceptance evidence |
+| --- | --- | --- |
+| R1 — remove FUSE | Execute the removal and existing-state contract in section 4. Cancel guarded recapture repair, guarded Git completion, and FUSE platform probes. | No FUSE runtime/dependency/enrollment path; native regressions pass; legacy data is verified and preserved or rejected before mutation. |
+| R2 — Git and backup capacity consistency | Replace the separate 64 MiB Git graph and 32 MiB serialized-backup assumptions with one end-to-end budget, or versioned bounded metadata chunking. Count refs, tree/commit/tag bytes, blob recipes, surrounding private metadata, and checkpoint/transport constraints. Preflight graph-changing operations before publishing refs, index state, or a protection claim. | Just-below/above boundary tests for commit, fetch, merge, tags and pins; rejected operations leave visible state intact; accepted graphs serialize, back up, and recover with exact bytes and IDs. Reopen and retry preserve the same decision. |
+| R3 — snapshot scale | Treat 39,488 data-sector references at 64 KiB (about 2.41 GiB of full sectors) as the current v1 bound. Define supported production dataset/history sizes beyond this prototype ceiling, then implement versioned authenticated paged/chunked catalogs or another explicit scalable design with bounded traversal. Keep early diagnostics for the current bound until migration is available; do not merely raise constants. | Dense, sparse, hard-linked, many-small-file, and multi-revision/Git-history cases above the old ceiling and at the declared limit; just-over-limit rejection before publication; bounded memory, encoding and recovery; old-format migration and seed-only restore after any format change. |
+| R4 — complete volume evacuation | Extend format-1-only migration to variable-profile READY information/parity and safe settlement of staged objects and reservations. Preserve copy, verify, durable receipt, then source retirement ordering. | Mixed-format volumes evacuate and remain retired after reopen; interruption at each object/receipt boundary, full/offline destinations, duplicate resume, and retained pins never remove the last verified copy. Pending reservations keep a visible blocking reason. |
+| R5 — backup/signature progress | Keep the existing relay-only recovered-peer/missing-signer issue open. Correlate each job, event, signer, proposal lock, and selected connection; diagnose remaining response and catch-up paths. Preserve verified partial signatures through retry/reopen and provide bounded waits with actionable blocked status. | Deterministic regressions for identified failure paths plus repeated exact-source provisioned topology runs with stale direct endpoints, relay-only recovery, lagging signers, partition/heal, and restarts. One passing rerun does not establish the old stall's cause. |
+| R6 — ordinary Git runtime dependency | Make stock Git available to the daemon's import subprocess in the Nix package/service environment; declare and check it for standalone binaries. Keep discovery safe when `mutualgit` is installed as `git`. | Import loose and packed blobs and exercise both bridge directions from an isolated packaged environment without host Git leakage; alias-first PATH works; missing dependency yields a clear error before publication. |
+| R7 — release validation | Preserve existing CI jobs for formatting, Clippy, locked tests, reflink/topology, port mapping, and private Tor. Add the complete provisioned `git-linux-acceptance.sh` gate and qualification of the actual packaged binaries and runtime dependencies. | Required checks identify exact source/artifacts and include raw-byte Git, recovery, extent sharing, prune, migration and cleanup evidence. Nix build-only checks cannot stand in for these tests; unsupported privileged environments cannot silently count as passes. |
+
+Start with R1 and the R2 acceptance mismatch. R3 capacity design and R4
+migration can proceed independently; R5 diagnosis and repeated topology
+validation should continue alongside them. R6 packaging is independently
+fixable and feeds R7 artifact validation. Complete all applicable corrections
+before Milestone 7 compatibility freeze. Native Windows/macOS work remains in
+the roadmap; a narrower production platform scope requires an explicit product
+decision rather than treating missing platform support as complete.
+
+### Historical implementation and validation record (before scope correction)
+
+The following record preserves prior code and test evidence. References to
+future guarded/FUSE work in this record are superseded by R1 and are not active
+requirements. Current work is defined by the correction queue and the revised
+Milestone 6/7 gates below.
+
 The local Btrfs attribute regression now also verifies that an LF-only edit
 is dirty, appears as raw bytes in `diff`, and restores the original CRLF bytes;
 a child-process Btrfs regression also verifies raw add, status, diff, restore,
@@ -3743,21 +3741,22 @@ Milestone 5.
   member add/remove/replacement during interrupted work, key rotation across
   retained revisions, and bounded storage/network amplification.
 
-### Milestone 6 — Git-compatible local history and additional source backends and platforms
+### Milestone 6 — native Git history, FUSE removal, and native platform backends
 
 Use this decision map when choosing the next implementation slice. These are
-requirements of the Git pivot and the original roadmap, not completion claims;
+requirements of the corrected Git/native-backend roadmap, not completion claims;
 `TODO.md` records their current status and remaining blockers.
 
 | Requirement | Plan location and acceptance |
 | --- | --- |
 | Git-style command frontend and library reuse | Section 1 and this milestone: a separate binary using the daemon's single writer and a maintained Git implementation with native object storage |
 | Byte-for-byte files | Sections 3 and 4 and this milestone: raw capture, stage, checkout, recovery, and object exchange; line-ending handling and all content filters stay disabled |
-| No second permanent Git payload store | Section 4: native anchors supply blobs; prove Btrfs extent sharing and COW isolation, and guarded hard-link safety separately |
+| No second permanent Git payload store | Section 4: native anchors supply blobs; prove native extent sharing and COW isolation |
 | Branches and multiple worktrees | Section 4 and this milestone: shared immutable history with separate worktree state and safe optimized checkout |
 | Ordinary Git interoperability | This milestone: two-way object/pack exchange and a stock-Git transport bridge, preserving exchanged blob bytes and IDs |
 | History pruning that releases data | Section 5 and this milestone: reachability and retention protect live data; durable cleanup releases eligible local anchors and backed-up sectors |
-| Outstanding original work | Section 4 and this milestone: finish guarded capture/edit, Windows/macOS backends, metadata, watchers, and application-consistency gates alongside Git work |
+| FUSE removal and production corrections | Section 4 and the R1–R7 queue: remove the withdrawn backend safely and close the non-FUSE integrity, capacity, migration, progress, packaging, and validation gaps |
+| Outstanding native platform work | Section 4 and this milestone: finish Windows/macOS backends, metadata, watchers, and application-consistency gates alongside Git work |
 
 Implement the Git pivot through the versioned source-backend boundary alongside
 the outstanding original work. The native `.mutualbackup` catalog owns local
@@ -3769,9 +3768,10 @@ continue to use the existing signed revision and checkpoint protocol.
 
 At the start of each implementation iteration, reconcile `TODO.md` against all
 closure gates below: Git commands, protected graph recovery, ordinary-Git
-exchange, physical reclamation, guarded capture/edit, platform backends,
-metadata, watchers, and application-consistent capture. Select an open item
-whose prerequisites are ready and record its completion evidence in `TODO.md`.
+exchange, physical reclamation, FUSE removal, non-FUSE corrections, native
+platform backends, metadata, watchers, and application-consistent capture.
+Select an open item whose prerequisites are ready and record its completion
+evidence in `TODO.md`.
 After each slice, keep every unfinished original item in the queue; completing
 the Git command set alone does not finish Milestone 6.
 
@@ -3779,7 +3779,7 @@ For each command or backend that touches content, verify byte identity through
 capture, staging, history, checkout, object exchange, backup, and recovery on
 the current source. A line-ending-only edit is a real content change. No
 configuration, attribute, filter, or compatibility option may silently convert
-it. Apply this gate to both Git work and the original guarded/platform work,
+it. Apply this gate to Git work and each supported native platform backend,
 together with their crash/recovery and native-anchor storage checks.
 
 Track Milestone 6 against these separate closure gates when iterating over this
@@ -3799,8 +3799,10 @@ plan; passing a Git command gate does not close a source-backend or platform gat
 - Make Git-facing prune release unreachable native anchors and backed-up
   sectors while respecting every live ref, index entry, worktree, protection
   pin, retained signed revision, and in-flight operation.
-- Complete guarded link-freeze with its long-lived Linux edit guard and
-  privileged capture/edit/restore and crash-recovery probes.
+- Remove FUSE-backed guarded capture and Git integration under R1, including
+  the explicit compatibility/export or fail-closed treatment of existing data.
+- Close the R2–R7 production corrections with their acceptance evidence;
+  existing successful Git command tests do not close these separate gaps.
 - Complete Windows and macOS source backends, portable metadata, watchers,
   and application-consistent capture hooks with their platform-specific gates.
   On both platforms, stage and restore mixed-line-ending files byte-for-byte
@@ -3840,8 +3842,8 @@ Use these concrete acceptance cases throughout implementation:
   at the transport boundary; our checkout preserves those bytes, even when
   the external client's worktree has a different presentation.
 
-Keep these byte-policy checks beside the existing Btrfs extent-sharing,
-guarded hard-link isolation, reachable-history recovery, and physical-prune
+Keep these byte-policy checks beside native extent-sharing and COW isolation,
+reachable-history recovery, and physical-prune
 checks. Byte equality alone does not prove efficient storage or safe deletion.
 
 - First extract and version the source-backend boundary from section 4 without
@@ -3862,7 +3864,7 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   commit DAG, refs, and safe worktree operations over the daemon's single-writer
   catalog. Stage exact file
   bytes in durable reflink anchors and reflink checkouts on capable same-
-  filesystem destinations; use guarded link-freeze only after its own gate.
+  filesystem destinations; explicitly reject unsupported capture backends.
   A requested merge may create new content; capture its exact resulting bytes
   as new blobs, and make conflicts/abort recoverable without normalization.
   Pull and merge from a linked worktree must use that worktree's selected
@@ -3945,30 +3947,6 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   the expired blob must be absent, current files must be exact, and an unstaged
   edit must survive independently of its unchanged committed Git blob. Keep
   this five-peer QUIC proof distinct from the provisioned five-daemon gate.
-  For a guarded repository, enumerate catalog candidates and their stage
-  receipts without mutation, then durably fence the exact candidate set in
-  node control before deleting any catalog mapping. Replay that fence before
-  normal pin/catalog reconciliation; retire each receipt with its mapping,
-  release its node-owned file/root pin only after the catalog retirement is
-  durable, and finish physical cleanup idempotently. Recheck current exact
-  anchor pins on every replay, even after the catalog mappings are gone: a
-  retained or restored sector recipe must keep its source anchor intact and
-  the node retirement fence pending. The imported-history-blob regression
-  covers this boundary through failed startup and eventual deletion after
-  recipe retirement on ext4 and disposable Btrfs. A version-2 virtual
-  mapping releases its root pin but never unlinks the root file as if it owned
-  a separate payload. A live guarded mount claim still owns a per-file anchor:
-  remove its Git mapping and pin, retain a durable deferred-cleanup obligation,
-  and delete the physical anchor only after the claim is retired. Provide an
-  explicit safe repository-retirement operation that removes an empty private
-  Git catalog before guarded-root release. This now uses the explicit
-  `mutualgit deinit <repository-id>` command, an exact native-file fence in
-  node control, and pre-mount replay; the guarded root remains enrolled until
-  its separate release gate passes. The release handoff now has ext4 and Btrfs
-  interruption probes with deferred per-file cleanup for separate and in-place
-  views; verify that coverage remains valid as guarded Git operations expand.
-  A catalog receipt with no node pin must still fail closed unless it belongs
-  to an authenticated retirement fence.
   Prune is a real data-deletion operation: once no such protection remains,
   it must release unreachable native anchors, retire their backed-up sectors
   through the existing remote cleanup path, and make the removed history
@@ -3982,28 +3960,6 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   `pin`, `unpin`, and pin listing in the local command set, and document that
   the current frontend has no implicit reflog retention. Report
   reclaimable logical bytes separately from physically freed shared extents.
-- Then implement the already planned guarded link-freeze backend, including its
-  atomic sparse private-copy transition when the user needs to edit the
-  original inode. Preserve file IDs, paths, and metadata without freezing
-  directory names or removal. Implement the long-lived Linux FUSE view above
-  before selecting this backend for any root; include read-only passthrough,
-  writable-open and shared-mapping detach, `chmod` and pathname truncate,
-  rename/unlink, replayable new-file creation, atomic replacement, and remount
-  recovery. Make enrollment a durable, restartable transition from a private
-  lower tree to a supervised view. Separate lower/view and original-path
-  handoffs are operational slices; complete the original-path metadata and
-  failure gate and data-preserving root removal before closing the guarded
-  backend gate. Before removal restores
-  ordinary ownership, detach every live lower file from immutable anchors
-  under a stopped-view fence, then durably hand its current namespace and
-  visible metadata back to the user. Never expose a raw hard
-  link between an editable worktree and an immutable anchor.
-  Preserve each new file or directory's creator UID/GID in durable virtual
-  metadata, including setgid-parent group inheritance and directory setgid
-  propagation. Require that ownership before creation replay publishes a name;
-  verify it through rename, remount, signed backup/restore, and root release
-  while the lower inodes stay private. This creator-ownership slice does not
-  substitute for mixed-owner initial enrollment or the remaining ACL/xattr gate.
 - Then validate the already planned native Windows NTFS capture, including VSS
   where appropriate, macOS cloning, platform watchers, portable metadata/ACL
   policy, and explicit application-consistent capture hooks. Each enrolled root
@@ -4043,45 +3999,29 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   blob: the imported blob and object ID remain LF, the worktree remains CRLF
   until an explicit user operation, and no `.git` payload is copied into native
   anchors or backed-up as user files.
-- Close guarded link-freeze separately with its full atomic edit/failure and
-  anchor-recovery probe, including `ENOSPC`, unknown hard-link aliases, and
-  restart at each permission and sparse-detach transition. Before enabling a
-  long-lived edit guard, prove that ordinary reads do not trigger eager detach
-  while every write path remains blocked until a private anchor is durable,
-  including after owner `chmod`, pathname truncate, and a daemon restart.
-  A pre-opened read-only descriptor to a user-owned lower inode can call
-  `fchmod` and reopen `/proc/self/fd` for writing after the short capture guard
-  ends; hiding the lower pathname is insufficient. Before enrollment, make
-  all lower inodes inaccessible to that owner through retained descriptors,
-  including directories and new files, while preserving user-visible modes
-  and ownership in protected virtual metadata. Prove the anchor remains exact
-  through pre-opened file and directory descriptors, permission changes,
-  writable reopen attempts, edit detach, crash, and remount.
-  Repeat that retained-descriptor proof after the first edit and every later
-  stopped-view recapture: restoring a detached working inode's original owner
-  must not let a subsequent freeze share a user-mutable inode with a new
-  immutable anchor. Each recapture must durably isolate its frozen inode, keep
-  its visible ownership independent of the lower inode, and replay detach and
-  release without losing the original owner.
-  Linux `FAN_PRE_ACCESS` reports both read and write access with a byte range;
-  that event alone does not identify an edit. Keep enrollment gated until the
-  full access decision and failure behavior pass a privileged local probe.
 - Close each listed platform backend only after its own capture/edit/restore,
   metadata fidelity, application-consistency, source-loss recovery, and raw Git
   add/checkout/interoperability gate under conversion-inducing host settings.
-  Milestone 6 closes only after the Git, guarded-link-freeze, and listed
-  platform gates.
+  Milestone 6 closes only after Git, R1–R7 corrections, and the listed native
+  platform gates pass.
 
 Use this dependency order for the Git work: versioned source boundary and native
 Git object access; byte-exact local history and worktrees; encrypted graph
 protection and recovery; ordinary-Git exchange in both directions; reachability-
-based expiry and physical reclamation. Continue guarded link-freeze and the
-listed platform backends whenever their prerequisites are ready, rather than
-deferring their open `TODO.md` items until every Git slice is closed. Keep the
-Git byte-policy and relevant crash/recovery checks in each slice. Milestone 6
-closes only when all Git, original source-backend, and platform gates above pass.
+based expiry and physical reclamation. Execute R1 removal and the non-FUSE
+corrections in the section 8 dependency order, alongside native platform work
+whose prerequisites are ready. Keep Git byte-policy and crash/recovery checks
+in each slice. Milestone 6 closes only when Git, removal, production corrections,
+and native platform gates above pass.
 
 ### Milestone 7 — release candidate and compatibility freeze
+
+Entry requires the R1–R7 corrections and the revised Milestone 6 gates. FUSE
+completion and its canceled bug fixes are excluded. Record supported scale,
+platform/filesystem capabilities, Git command/transport limits, and ordinary
+Git runtime dependencies in the release contract; existing local Git exchange
+does not imply SSH/HTTPS support. Keep package builds distinct from successful
+execution of required tests on the release source and artifacts.
 
 - Fuzz every parser and state machine; property-test recovery and authorization;
   test partitions, malicious peers, corruption, remounts, clock changes, huge

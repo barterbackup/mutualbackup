@@ -33,19 +33,47 @@ and selects an ordinary folder.
 ## Local filesystem and UX
 
 The protected source remains an ordinary NTFS/ext4/APFS/etc. folder. The
-system should not require FUSE, a custom filesystem, a virtual mounted
-disk, or a kernel driver.
+system must not require FUSE, a custom filesystem, a virtual mounted
+disk, or a kernel driver. The experimental FUSE/guarded backend in the
+current implementation is a design deviation scheduled for removal,
+not a production backend to complete. Existing enrolled roots and
+retained backup/history records need an explicit safe transition before
+their support is removed; a backend identifier must never be silently
+reinterpreted as a different capture method.
 
 The client scans ordinary files and maintains an internal mapping from
 protected sectors to local `(file, offset, length)` ranges.
 
-Where useful, the client tries reflinks first so immutable snapshots can
-share physical blocks with ordinary files. If reflinks are unavailable,
-it may copy while preserving sparse extents and optionally compress
-where useful.
+Source capture uses qualified native filesystem clone or snapshot
+facilities to produce immutable anchors while ordinary files remain
+editable. Linux capture currently requires a successful reflink/COW
+lifecycle probe. Planned Windows NTFS/VSS and macOS native clone/snapshot
+backends must independently prove their capture, retention, crash, and
+recovery semantics before enrollment is enabled. An unavailable or
+unsafe capture facility fails explicitly; capture must not silently
+fall back to a full payload copy. This supersedes the original optional
+copy fallback. Explicit restore, checkout, or export copy policies are
+separate from source capture.
+
+The earlier hard-link-and-freeze proposal is not an accepted alternative
+for ordinary editable files: a hard link alone does not isolate a saved
+revision from later writes. Removing FUSE does not revive that proposal
+or prescribe a replacement write-interception mechanism. Shared native
+capture, immutable-anchor, and Git-history interfaces remain useful
+without the experimental guarded implementation.
 
 Parity is foreign data and must occupy local storage. It can be stored
 as ordinary files/objects.
+
+Production qualification is tracked in [plan.md](plan.md) and
+[TODO.md](TODO.md). In addition to backend removal and native capture
+qualification, release gates must cover revision capacity and Git graph
+backup-size consistency, disk evacuation for every supported stored
+object format, and recovery followed by continued backup progress under
+missing-signature and relay-only conditions. Package runtime dependencies
+and execute the required acceptance checks against the release artifact;
+successful builds or historical test reports alone do not close these
+gates.
 
 ## Identity, recovery, and DHT discovery
 
