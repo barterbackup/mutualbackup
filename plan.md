@@ -786,6 +786,10 @@ Proactive background repair comes later.
   prove that the staged anchor initially shares physical extents with the
   source file and that a later source edit changes neither the anchor's bytes
   nor its Git blob ID. Equal logical sizes alone do not establish sharing.
+  On Btrfs, separate logical file sizes from allocated physical extents: an
+  anchor or checkout is a distinct file sharing the original extents, with
+  new payload allocation on later writes through COW. Measure initial extent
+  sharing and later isolation; do not require zero metadata allocation.
   For an unchanged guarded file already frozen by a root anchor, map the Git
   stage to that verified root file with a distinct local object-map ID. Do not
   add a third hard link: the guarded edit journal must retain its exact
@@ -3732,6 +3736,20 @@ Milestone 5.
   retained revisions, and bounded storage/network amplification.
 
 ### Milestone 6 — Git-compatible local history and additional source backends and platforms
+
+Use this decision map when choosing the next implementation slice. These are
+requirements of the Git pivot and the original roadmap, not completion claims;
+`TODO.md` records their current status and remaining blockers.
+
+| Requirement | Plan location and acceptance |
+| --- | --- |
+| Git-style command frontend and library reuse | Section 1 and this milestone: a separate binary using the daemon's single writer and a maintained Git implementation with native object storage |
+| Byte-for-byte files | Sections 3 and 4 and this milestone: raw capture, stage, checkout, recovery, and object exchange; line-ending handling and all content filters stay disabled |
+| No second permanent Git payload store | Section 4: native anchors supply blobs; prove Btrfs extent sharing and COW isolation, and guarded hard-link safety separately |
+| Branches and multiple worktrees | Section 4 and this milestone: shared immutable history with separate worktree state and safe optimized checkout |
+| Ordinary Git interoperability | This milestone: two-way object/pack exchange and a stock-Git transport bridge, preserving exchanged blob bytes and IDs |
+| History pruning that releases data | Section 5 and this milestone: reachability and retention protect live data; durable cleanup releases eligible local anchors and backed-up sectors |
+| Outstanding original work | Section 4 and this milestone: finish guarded capture/edit, Windows/macOS backends, metadata, watchers, and application-consistency gates alongside Git work |
 
 The Git pivot adds local history and interoperability to this milestone; its
 original source-backend and platform deliverables remain required. Review each
