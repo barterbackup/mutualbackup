@@ -196,8 +196,19 @@
   share a checked node routine: a private catalog created before registration
   can be registered after node restart, and repeated init preserves the same
   identity. The privileged registration replay probe passes on ext4 and disposable
-  Btrfs; the format-7 QUIC fixture passes with this init path on ext4. Public
-  guarded enrollment, add/checkout, and the provisioned daemon gate remain open.
+  Btrfs; the format-7 QUIC fixture passes with this init path on ext4 and
+  Btrfs. Public guarded enrollment, add/checkout, and the provisioned daemon
+  gate remain open.
+  A node-owned initialization intent now precedes any private catalog creation.
+  Startup verifies its protected root, guarded claim and backend, completes a
+  partial Git catalog before remounting FUSE, registers the repository, then
+  clears the intent. An unmarked `.mutualbackup` directory without that intent
+  is refused before mutation. The focused crash probe covers an unmarked
+  directory with Git's partial init marker, refusal of root removal while the
+  intent is pending, daemon reopen, exact-byte stage, and idempotent init on
+  ext4 and disposable Btrfs. The mixed three-file
+  format-7 five-peer QUIC fixture passes on both filesystems with the journal;
+  the provisioned five-daemon gate remains open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

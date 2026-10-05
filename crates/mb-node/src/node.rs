@@ -150,6 +150,32 @@ const GUARDED_GIT_PRUNE_READY_KIND: &str = "guarded-git-prune-catalog-ready-v1";
 const GUARDED_GIT_FILE_GC_KIND: &str = "guarded-git-deferred-file-gc-v1";
 
 #[cfg(target_os = "linux")]
+const GUARDED_GIT_INIT_KIND: &str = "guarded-git-init-v1";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuardedGitInitIntentV1 {
+    format_version: u16,
+    repository_id: Uuid,
+    root_anchor_id: Uuid,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedGitInitIntentV1 {
+    fn validate(&self, record_id: &[u8], bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            self.format_version == 1
+                && !self.repository_id.is_nil()
+                && !self.root_anchor_id.is_nil()
+                && self.repository_id.as_bytes() == record_id
+                && canonical_bytes(self)? == bytes,
+            "guarded Git initialization intent is invalid"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct GuardedGitDeferredFileGcV1 {
     format_version: u16,
@@ -1518,7 +1544,20 @@ impl Node {
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
         #[cfg(target_os = "linux")]
+        for (id, _) in control.records(GUARDED_GIT_INIT_KIND)? {
+            anyhow::ensure!(
+                control.get_record(GUARDED_GIT_RETIRE_KIND, &id)?.is_none()
+                    && control.get_record(GUARDED_RELEASE_KIND, &id)?.is_none()
+                    && control
+                        .get_record(GUARDED_SEPARATE_RELEASE_KIND, &id)?
+                        .is_none(),
+                "guarded Git initialization conflicts with root or repository retirement"
+            );
+        }
+        #[cfg(target_os = "linux")]
         Self::reconcile_guarded_git_repository_retirements(&control, &keys)?;
+        #[cfg(target_os = "linux")]
+        Self::reconcile_guarded_git_initializations(&control, &keys)?;
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
         volumes.reconcile(&control)?;
         let volume_readers = Arc::new(RwLock::new(volumes.reader_configs()));
@@ -1937,6 +1976,13 @@ impl Node {
             .is_some()
         {
             anyhow::bail!("guarded root still owns a Git repository");
+        }
+        if self
+            .control
+            .get_record(GUARDED_GIT_INIT_KIND, root_id.as_bytes())?
+            .is_some()
+        {
+            anyhow::bail!("guarded root has an unfinished Git initialization");
         }
         if git_prune_capture_pending(&self.control, root_id, root_path)? {
             anyhow::bail!("guarded root has an unfinished source capture");
@@ -2788,11 +2834,120 @@ impl Node {
         self.register_guarded_protected_root(Uuid::new_v4(), manifest.anchor_id)
     }
 
+    #[cfg(target_os = "linux")]
+    fn reconcile_guarded_git_initializations(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+    ) -> Result<()> {
+        for (id, bytes) in control.records(GUARDED_GIT_INIT_KIND)? {
+            let intent: GuardedGitInitIntentV1 = decode_canonical(&bytes)?;
+            intent.validate(&id, &bytes)?;
+            Self::finish_guarded_git_initialization(control, keys, &intent, &bytes)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_guarded_git_initialization(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        intent: &GuardedGitInitIntentV1,
+        intent_bytes: &[u8],
+    ) -> Result<GitRepositoryInfo> {
+        intent.validate(intent.repository_id.as_bytes(), intent_bytes)?;
+        anyhow::ensure!(
+            control.get_record(GUARDED_GIT_INIT_KIND, intent.repository_id.as_bytes())?
+                == Some(intent_bytes.to_vec()),
+            "guarded Git initialization intent changed"
+        );
+        let root_bytes = control
+            .get_record("protected-root", intent.repository_id.as_bytes())?
+            .context("guarded Git init lost its protected root")?;
+        let root: ProtectedRoot = decode_canonical(&root_bytes)?;
+        let binding_bytes = control
+            .get_record("guarded-protected-root-v1", intent.repository_id.as_bytes())?
+            .context("guarded Git init lost its root anchor binding")?;
+        let root_binding: GuardedProtectedRootV1 = decode_canonical(&binding_bytes)?;
+        let binding =
+            GuardedViewMount::claimed_binding_before_mount(intent.root_anchor_id, control)?;
+        anyhow::ensure!(
+            root.format_version == 4
+                && root.root_id == intent.repository_id
+                && root.filesystem_id == binding.lower_id.filesystem_id
+                && root.root_inode == binding.lower_id.inode
+                && root.path == binding.mountpoint
+                && canonical_bytes(&root)? == root_bytes
+                && root_binding.format_version == 1
+                && root_binding.root_id == intent.repository_id
+                && root_binding.anchor_id == intent.root_anchor_id
+                && canonical_bytes(&root_binding)? == binding_bytes,
+            "guarded Git init differs from its protected root"
+        );
+        let backend_bytes = control
+            .get_record("source-backend", intent.repository_id.as_bytes())?
+            .context("guarded Git init lost its source backend")?;
+        let backend: SourceBackendBinding = decode_canonical(&backend_bytes)?;
+        anyhow::ensure!(
+            backend.is_supported_guarded_for(
+                intent.repository_id,
+                root.filesystem_id,
+                root.root_inode,
+            ) && canonical_bytes(&backend)? == backend_bytes,
+            "guarded Git init backend differs from its protected root"
+        );
+        let info = GitRepositoryInfo {
+            format_version: 1,
+            repository_id: intent.repository_id,
+            path: root.path,
+        };
+        let encoded = canonical_bytes(&info)?;
+        if let Some(existing) =
+            control.get_record("git-repository", intent.repository_id.as_bytes())?
+        {
+            anyhow::ensure!(
+                existing == encoded,
+                "guarded Git repository registration conflicts with its root"
+            );
+        }
+        // The FUSE mount may be dead during startup. Catalog initialization
+        // needs only its verified private lower root and guarded backend ID.
+        let repository = GitRepository::init_with_catalog_root(
+            &binding.lower_root,
+            &binding.lower_root,
+            intent.repository_id,
+            &mb_git::catalog_key(keys, intent.repository_id),
+            SourceBackendKind::GuardedLinkFreezeV1,
+        )?;
+        anyhow::ensure!(
+            repository.id() == intent.repository_id,
+            "guarded Git catalog does not match its protected root"
+        );
+        if control
+            .get_record("git-repository", intent.repository_id.as_bytes())?
+            .is_none()
+        {
+            anyhow::ensure!(
+                control.put_record_if_absent(
+                    "git-repository",
+                    intent.repository_id.as_bytes(),
+                    &encoded,
+                )?,
+                "guarded Git repository registration changed"
+            );
+        }
+        control.delete_record_if_value(
+            GUARDED_GIT_INIT_KIND,
+            intent.repository_id.as_bytes(),
+            intent_bytes,
+        )?;
+        Ok(info)
+    }
+
     /// Bind a guarded Git catalog to an already supervised protected root.
-    /// Catalog initialization has its own replayable marker; if the node stops
-    /// before recording registration, retrying this operation completes that
-    /// same catalog. Public guarded Git init remains gated on the full backend
-    /// and provisioned recovery checks.
+    /// A node-owned intent precedes catalog creation so startup can finish a
+    /// partial private directory before it reconstructs the guarded view.
+    /// Public guarded Git init remains gated on the full backend and
+    /// provisioned recovery checks.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     fn init_registered_guarded_git(&mut self, repository_id: Uuid) -> Result<GitRepositoryInfo> {
@@ -2830,31 +2985,60 @@ impl Node {
                 "Git repository registration conflicts with its guarded root"
             );
         }
-        let repository = GitRepository::init_with_catalog_root(
-            &root.path,
-            &binding.lower_root,
-            repository_id,
-            &self.git_catalog_key(repository_id),
-            SourceBackendKind::GuardedLinkFreezeV1,
-        )?;
         anyhow::ensure!(
-            repository.id() == repository_id,
-            "guarded Git catalog does not match its protected root"
+            self.control
+                .get_record(GUARDED_GIT_RETIRE_KIND, repository_id.as_bytes())?
+                .is_none(),
+            "guarded Git repository retirement is unfinished"
         );
-        if self
+        let intent = GuardedGitInitIntentV1 {
+            format_version: 1,
+            repository_id,
+            root_anchor_id: binding.anchor_id,
+        };
+        let intent_bytes = canonical_bytes(&intent)?;
+        if let Some(existing) = self
             .control
-            .get_record("git-repository", repository_id.as_bytes())?
-            .is_none()
+            .get_record(GUARDED_GIT_INIT_KIND, repository_id.as_bytes())?
         {
             anyhow::ensure!(
+                existing == intent_bytes,
+                "guarded Git initialization intent belongs to another root"
+            );
+        } else {
+            let catalog_path = binding.lower_root.join(".mutualbackup");
+            match fs::symlink_metadata(&catalog_path) {
+                Ok(_) => {
+                    anyhow::ensure!(
+                        mb_store::git_catalog_marker(&binding.lower_root)? == Some(repository_id),
+                        "unmarked private directory blocks guarded Git init"
+                    );
+                    GitRepository::open_with_catalog_root(
+                        &root.path,
+                        &binding.lower_root,
+                        repository_id,
+                        &self.git_catalog_key(repository_id),
+                        SourceBackendKind::GuardedLinkFreezeV1,
+                    )?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect guarded Git catalog root"),
+            }
+            anyhow::ensure!(
                 self.control.put_record_if_absent(
-                    "git-repository",
+                    GUARDED_GIT_INIT_KIND,
                     repository_id.as_bytes(),
-                    &encoded,
+                    &intent_bytes,
                 )?,
-                "guarded Git repository registration changed"
+                "guarded Git initialization intent changed"
             );
         }
+        let info = Self::finish_guarded_git_initialization(
+            &self.control,
+            &self.keys,
+            &intent,
+            &intent_bytes,
+        )?;
         self.reconcile_guarded_git_stages()?;
         Ok(info)
     }
@@ -3075,6 +3259,10 @@ impl Node {
 
     #[cfg(target_os = "linux")]
     fn reconcile_guarded_git_stages(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.control.records(GUARDED_GIT_INIT_KIND)?.is_empty(),
+            "guarded Git repository initialization is unfinished"
+        );
         let mut by_repository = BTreeMap::<Uuid, Vec<mb_store::GuardedGitStagePin>>::new();
         for pin in GuardedViewMount::all_git_stage_pins(&self.control)? {
             by_repository
@@ -3221,6 +3409,12 @@ impl Node {
 
     #[cfg(target_os = "linux")]
     fn open_guarded_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
+        anyhow::ensure!(
+            self.control
+                .get_record(GUARDED_GIT_INIT_KIND, repository_id.as_bytes())?
+                .is_none(),
+            "guarded Git repository initialization is unfinished"
+        );
         anyhow::ensure!(
             self.control
                 .get_record(GUARDED_GIT_RETIRE_KIND, repository_id.as_bytes())?
@@ -28339,6 +28533,108 @@ pub(crate) mod tests {
             );
         }
         assert!(fs::symlink_metadata(restored.join(".mutualbackup")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_git_init_finishes_unmarked_catalog_before_mount_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let area = tempfile::Builder::new()
+            .prefix("mb-node-guarded-git-init-")
+            .tempdir_in(test_root)
+            .unwrap();
+        let lower = area.path().join("lower");
+        let view = area.path().join("view");
+        let data_dir = area.path().join("node");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&view).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(lower.join("tracked"), b"exact\r\n\0bytes").unwrap();
+        fs::set_permissions(lower.join("tracked"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let seed = Seed::from_bytes([206; 32]);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let root = node
+            .enroll_test_guarded_root(&lower, &view, 65534, 65534)
+            .unwrap();
+        let binding = node.guarded_root_mount_binding(&root).unwrap();
+        let partial = binding.lower_root.join(".mutualbackup");
+        fs::create_dir(&partial).unwrap();
+        fs::set_permissions(&partial, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(node.init_registered_guarded_git(root.root_id).is_err());
+        assert!(
+            node.control
+                .records(GUARDED_GIT_INIT_KIND)
+                .unwrap()
+                .is_empty()
+        );
+        fs::write(
+            partial.join("repository-intent"),
+            format!("mutualbackup-git-repository-init-v1\n{}\n", root.root_id),
+        )
+        .unwrap();
+        let intent = GuardedGitInitIntentV1 {
+            format_version: 1,
+            repository_id: root.root_id,
+            root_anchor_id: binding.anchor_id,
+        };
+        node.control
+            .put_record(
+                GUARDED_GIT_INIT_KIND,
+                root.root_id.as_bytes(),
+                &canonical_bytes(&intent).unwrap(),
+            )
+            .unwrap();
+        let removal = node
+            .remove_guarded_protected_root(root.root_id)
+            .unwrap_err();
+        assert!(
+            removal
+                .to_string()
+                .contains("unfinished Git initialization"),
+            "{removal:#}"
+        );
+        assert!(
+            mb_store::git_catalog_marker(&binding.lower_root)
+                .unwrap()
+                .is_none()
+        );
+        drop(node);
+
+        let mut reopened = Node::open(&data_dir, seed).unwrap();
+        reopened.check_guarded_mounts().unwrap();
+        assert!(
+            reopened
+                .control
+                .records(GUARDED_GIT_INIT_KIND)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            mb_store::git_catalog_marker(&binding.lower_root).unwrap(),
+            Some(root.root_id)
+        );
+        assert_eq!(
+            reopened.init_registered_guarded_git(root.root_id).unwrap(),
+            GitRepositoryInfo {
+                format_version: 1,
+                repository_id: root.root_id,
+                path: view.clone(),
+            }
+        );
+        assert_eq!(fs::read(view.join("tracked")).unwrap(), b"exact\r\n\0bytes");
+        let (staged, manifest) = reopened
+            .stage_registered_guarded_git_file(root.root_id, Path::new("tracked"))
+            .unwrap();
+        assert_eq!(manifest.format_version, 2);
+        assert_eq!(staged.repository_id, root.root_id);
+        reopened.check_guarded_mounts().unwrap();
     }
 
     #[cfg(target_os = "linux")]

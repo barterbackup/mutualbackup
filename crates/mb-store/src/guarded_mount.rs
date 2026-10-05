@@ -1552,6 +1552,46 @@ impl GuardedViewMount {
         })
     }
 
+    /// Verify the durable claim and source before node-owned metadata recovery
+    /// runs, when its FUSE view may still be a dead mount. The caller must
+    /// match this binding to a protected-root record; normal mount recovery
+    /// subsequently checks the placeholder and complete lower inventory.
+    pub fn claimed_binding_before_mount(
+        anchor_id: Uuid,
+        control: &ControlStore,
+    ) -> anyhow::Result<GuardedViewBinding> {
+        let bytes = control
+            .get_record(MOUNT_CLAIM_KIND, anchor_id.as_bytes())?
+            .context("guarded view has no durable mount claim")?;
+        let claim: MountClaim = mb_core::decode_canonical(&bytes)?;
+        ensure!(
+            claim.version == 1
+                && claim.anchor_id == anchor_id
+                && mb_core::canonical_bytes(&claim)? == bytes
+                && control
+                    .get_record(MOUNT_RETIRE_KIND, anchor_id.as_bytes())?
+                    .is_none(),
+            "guarded mount claim changed before metadata recovery"
+        );
+        let manifest = GuardedRootCapturePlan::load_published_manifest(control, anchor_id)?;
+        let plan = GuardedRootCapturePlan::load_active_for_view(control, &manifest)?;
+        ensure!(
+            claim.lower_root == plan.source_root()
+                && claim.lower_id == plan.source_root_identity()
+                && PinnedDirectory::open(&claim.lower_root)?.identity()? == claim.lower_id,
+            "guarded mount claim differs from its source plan"
+        );
+        Ok(GuardedViewBinding {
+            anchor_id,
+            lower_root: claim.lower_root,
+            lower_id: claim.lower_id,
+            mountpoint: claim.mountpoint,
+            mountpoint_id: claim.mountpoint_id,
+            view_uid: claim.view_uid,
+            view_gid: claim.view_gid,
+        })
+    }
+
     pub fn verify_virtual_metadata(
         &self,
         control: &ControlStore,
