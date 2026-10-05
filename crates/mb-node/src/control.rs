@@ -426,6 +426,12 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitLocate { path } => {
+            blocking_node(node, move |node| {
+                node.git_locate(&path).map(LocalResponse::GitLocated)
+            })
+            .await
+        }
         LocalRequest::GitDeinit { repository_id } => {
             blocking_node(node, move |node| {
                 #[cfg(target_os = "linux")]

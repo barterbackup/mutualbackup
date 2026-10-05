@@ -209,6 +209,16 @@
   ext4 and disposable Btrfs. The mixed three-file
   format-7 five-peer QUIC fixture passes on both filesystems with the journal;
   the provisioned five-daemon gate remains open.
+  `mutualgit` now falls back to a read-only daemon directory lookup when the
+  FUSE worktree hides the private catalog marker. The node verifies the
+  protected-root registration and backend before returning its Git ID; local
+  marker discovery still handles ordinary and linked worktrees. The local
+  control schema covers raw Unix paths, the CLI fallback uses a framed-socket
+  regression, and guarded ext4/Btrfs plus ordinary Btrfs node probes pass. The
+  five-peer format-7 seed-only recovery fixture also locates the hidden-catalog
+  repository on ext4 and disposable Btrfs.
+  This makes recovered guarded history discoverable to the CLI while guarded
+  add/checkout and the provisioned daemon gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

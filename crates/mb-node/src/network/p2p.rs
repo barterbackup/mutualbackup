@@ -33455,6 +33455,7 @@ mod tests {
         assert_eq!(std::fs::read(restored.join("first")).unwrap(), first);
         assert_eq!(std::fs::read(restored.join("second")).unwrap(), second);
         assert_eq!(std::fs::read(restored.join("edited")).unwrap(), edited);
+        assert!(std::fs::symlink_metadata(restored.join(".mutualbackup")).is_err());
         let recovered_graph = recovered_node
             .lock()
             .unwrap()
@@ -33487,6 +33488,9 @@ mod tests {
         assert_eq!(root_anchor_ids.len(), 1);
         {
             let mut recovered_owner = recovered_node.lock().unwrap();
+            let located = recovered_owner.git_locate(&restored).unwrap().unwrap();
+            assert_eq!(located.repository_id, root_id);
+            assert_eq!(located.path, restored);
             let status = recovered_owner.git_status(root_id).unwrap();
             assert!(status.history_backed_up);
             assert_eq!(status.head_oid, Some(original_graph.refs[0].oid));

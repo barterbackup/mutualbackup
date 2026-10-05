@@ -466,6 +466,10 @@ pub enum LocalRequest {
         repository_id: Uuid,
         worktree_id: Uuid,
     },
+    GitLocate {
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -596,6 +600,7 @@ pub enum LocalResponse {
         repository_id: Uuid,
         changed_paths: u32,
     },
+    GitLocated(Option<GitRepositoryInfo>),
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -747,6 +752,9 @@ mod tests {
                 repository_id,
                 path: relative.clone(),
             },
+            LocalRequest::GitLocate {
+                path: target.clone(),
+            },
             LocalRequest::GitWorktreeRestoreBoth {
                 repository_id,
                 worktree_id: Uuid::from_bytes([98; 16]),
@@ -768,6 +776,7 @@ mod tests {
             match decoded.request {
                 LocalRequest::AddRoot { path }
                 | LocalRequest::AddGuardedRootInPlace { path }
+                | LocalRequest::GitLocate { path }
                 | LocalRequest::Recover { target: path }
                 | LocalRequest::SnapshotRestore { target: path, .. } => {
                     assert_eq!(path, target);
@@ -868,6 +877,9 @@ mod tests {
         for request in [
             LocalRequest::GitInit {
                 path: PathBuf::from("/home/user/work"),
+            },
+            LocalRequest::GitLocate {
+                path: PathBuf::from("/home/user/work/subdirectory"),
             },
             LocalRequest::GitDeinit { repository_id },
             LocalRequest::GitWorktreeAdd {
@@ -1269,6 +1281,12 @@ mod tests {
                 repository_id,
                 path: PathBuf::from("/home/user/work"),
             }),
+            LocalResponse::GitLocated(Some(GitRepositoryInfo {
+                format_version: 1,
+                repository_id,
+                path: PathBuf::from("/home/user/work"),
+            })),
+            LocalResponse::GitLocated(None),
             LocalResponse::GitRepositoryRetired { repository_id },
             LocalResponse::GitWorktreeRegistered(GitWorktreeInfo {
                 format_version: 1,

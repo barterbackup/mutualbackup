@@ -3395,6 +3395,39 @@ impl Node {
         Ok(info)
     }
 
+    /// Locate a registered repository by its visible worktree path. Guarded
+    /// catalogs are private below FUSE, so their marker cannot be read from
+    /// the worktree by the Git frontend. Verify the registration and backend
+    /// before returning an ID to that frontend.
+    pub fn git_locate(&self, directory: &Path) -> Result<Option<GitRepositoryInfo>> {
+        let directory = directory
+            .canonicalize()
+            .with_context(|| format!("cannot resolve Git directory {}", directory.display()))?;
+        let Some(root) = self
+            .protected_roots()?
+            .into_iter()
+            .find(|root| directory.starts_with(&root.path))
+        else {
+            return Ok(None);
+        };
+        let Some(encoded) = self
+            .control
+            .get_record("git-repository", root.root_id.as_bytes())?
+        else {
+            return Ok(None);
+        };
+        let info: GitRepositoryInfo = decode_canonical(&encoded)?;
+        anyhow::ensure!(
+            info.format_version == 1
+                && info.repository_id == root.root_id
+                && info.path == root.path
+                && canonical_bytes(&info)? == encoded,
+            "Git repository registration differs from its protected root"
+        );
+        drop(self.open_git_repository_for_inspection(root.root_id)?);
+        Ok(Some(info))
+    }
+
     fn open_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
         self.open_git_repository_with_policy(repository_id, None)
     }
@@ -19017,6 +19050,11 @@ pub(crate) mod tests {
         let mut node = Node::open(data.path(), seed.clone()).unwrap();
         let info = node.git_init(&source_root).unwrap();
         assert_eq!(info.path, source_root);
+        assert_eq!(node.git_locate(&source_root).unwrap(), Some(info.clone()));
+        let nested = source_root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        assert_eq!(node.git_locate(&nested).unwrap(), Some(info.clone()));
+        assert!(node.git_locate(&run_root).unwrap().is_none());
         assert_eq!(
             info.repository_id,
             node.git_init(&source_root).unwrap().repository_id
@@ -28627,6 +28665,14 @@ pub(crate) mod tests {
                 repository_id: root.root_id,
                 path: view.clone(),
             }
+        );
+        assert_eq!(
+            reopened.git_locate(&view).unwrap(),
+            Some(GitRepositoryInfo {
+                format_version: 1,
+                repository_id: root.root_id,
+                path: view.clone(),
+            })
         );
         assert_eq!(fs::read(view.join("tracked")).unwrap(), b"exact\r\n\0bytes");
         let (staged, manifest) = reopened

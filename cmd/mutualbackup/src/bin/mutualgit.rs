@@ -217,7 +217,8 @@ async fn main() -> Result<()> {
             println!("Retired empty guarded Git repository {repository_id}");
         }
         Command::Worktree { command } => {
-            let repository_id = discover_shared_repository(&working_directory)?;
+            let repository_id =
+                discover_shared_repository_with_daemon(&working_directory, &socket).await?;
             match command {
                 WorktreeCommand::Add { path, branch } => {
                     let destination = working_directory.join(path);
@@ -329,7 +330,8 @@ async fn main() -> Result<()> {
             abort_pending,
             paths,
         } => {
-            let (root, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (root, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             for path in paths {
                 let relative = relative_for_add(&root, &working_directory, &path)?;
                 if abort_pending {
@@ -389,7 +391,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Rm { cached, paths } => {
-            let (root, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (root, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             for path in paths {
                 let relative = relative_for_add(&root, &working_directory, &path)?;
                 let request = match (worktree_id, cached) {
@@ -455,7 +458,8 @@ async fn main() -> Result<()> {
             author_name,
             author_email,
         } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             let author_name = author_name
                 .map(Ok)
                 .unwrap_or_else(|| author_field("GIT_AUTHOR_NAME", "user.name"))?;
@@ -491,7 +495,8 @@ async fn main() -> Result<()> {
             );
         }
         Command::Log { limit } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             let request = match worktree_id {
                 Some(worktree_id) => LocalRequest::GitWorktreeLog {
                     repository_id,
@@ -528,7 +533,8 @@ async fn main() -> Result<()> {
             name,
             start_point,
         } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             if let Some(name) = name {
                 if all {
                     bail!("branch -a lists refs; omit -a when changing a branch");
@@ -652,7 +658,8 @@ async fn main() -> Result<()> {
             name,
             start_point,
         } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             if let Some(name) = name {
                 if delete {
                     if start_point.is_some() {
@@ -728,7 +735,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Pin { oid } | Command::Unpin { oid } => {
-            let repository_id = discover_shared_repository(&working_directory)?;
+            let repository_id =
+                discover_shared_repository_with_daemon(&working_directory, &socket).await?;
             let oid: [u8; 20] = git2::Oid::from_str(&oid)?.as_bytes().try_into()?;
             let pinned = pin_action;
             let request = if pinned {
@@ -755,7 +763,8 @@ async fn main() -> Result<()> {
             );
         }
         Command::Pins => {
-            let repository_id = discover_shared_repository(&working_directory)?;
+            let repository_id =
+                discover_shared_repository_with_daemon(&working_directory, &socket).await?;
             let LocalResponse::GitCommitPins {
                 repository_id: listed_repository,
                 oids,
@@ -771,7 +780,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Prune => {
-            let repository_id = discover_shared_repository(&working_directory)?;
+            let repository_id =
+                discover_shared_repository_with_daemon(&working_directory, &socket).await?;
             let LocalResponse::GitPruned(report) =
                 local_control_call(&socket, &LocalRequest::GitPrune { repository_id }).await?
             else {
@@ -792,7 +802,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Switch { name } | Command::Checkout { name } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             let request = match worktree_id {
                 Some(worktree_id) => LocalRequest::GitWorktreeSwitchBranch {
                     repository_id,
@@ -818,7 +829,8 @@ async fn main() -> Result<()> {
             destination,
             refspec,
         } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             let destination = working_directory
                 .join(destination)
                 .canonicalize()
@@ -877,7 +889,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Fetch { source } => {
-            let repository_id = discover_shared_repository(&working_directory)?;
+            let repository_id =
+                discover_shared_repository_with_daemon(&working_directory, &socket).await?;
             let source = working_directory.join(source);
             let LocalResponse::GitFetched {
                 repository_id: returned_id,
@@ -906,7 +919,8 @@ async fn main() -> Result<()> {
             author_name,
             author_email,
         } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             let source = working_directory.join(source);
             let author_name = match author_name {
                 Some(value) => value,
@@ -956,7 +970,8 @@ async fn main() -> Result<()> {
             author_name,
             author_email,
         } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             if abort {
                 let request = match worktree_id {
                     Some(worktree_id) => LocalRequest::GitWorktreeMergeAbort {
@@ -1038,7 +1053,8 @@ async fn main() -> Result<()> {
             println!("Merged '{}' at {}", branch, git2::Oid::from_bytes(&oid)?);
         }
         Command::Diff { cached } => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             let request = match worktree_id {
                 Some(worktree_id) => LocalRequest::GitWorktreeDiff {
                     repository_id,
@@ -1059,7 +1075,8 @@ async fn main() -> Result<()> {
             io::stdout().write_all(&diff.patch)?;
         }
         Command::Status => {
-            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let (_, repository_id, worktree_id) =
+                discover_location_with_daemon(&working_directory, &socket).await?;
             let request = match worktree_id {
                 Some(worktree_id) => LocalRequest::GitWorktreeStatus {
                     repository_id,
@@ -1150,28 +1167,60 @@ fn optional_author_field(environment: &str, config_key: &str) -> Result<Option<S
     }
 }
 
-fn discover_shared_repository(start: &Path) -> Result<Uuid> {
-    Ok(discover_location(start)?.1)
+async fn discover_shared_repository_with_daemon(start: &Path, socket: &Path) -> Result<Uuid> {
+    Ok(discover_location_with_daemon(start, socket).await?.1)
 }
 
-fn discover_location(start: &Path) -> Result<(PathBuf, Uuid, Option<Uuid>)> {
+async fn discover_location_with_daemon(
+    start: &Path,
+    socket: &Path,
+) -> Result<(PathBuf, Uuid, Option<Uuid>)> {
+    if let Some(location) = find_local_location(start)? {
+        return Ok(location);
+    }
+    let LocalResponse::GitLocated(info) = local_control_call(
+        socket,
+        &LocalRequest::GitLocate {
+            path: start.to_path_buf(),
+        },
+    )
+    .await?
+    else {
+        bail!("daemon returned the wrong response to Git repository lookup");
+    };
+    let Some(info) = info else {
+        bail!("no initialized MutualBackup Git repository contains this directory");
+    };
+    if info.format_version != 1 || info.repository_id.is_nil() || !start.starts_with(&info.path) {
+        bail!("daemon returned an invalid Git repository location");
+    }
+    Ok((info.path, info.repository_id, None))
+}
+
+fn find_local_location(start: &Path) -> Result<Option<(PathBuf, Uuid, Option<Uuid>)>> {
     for directory in start.ancestors() {
+        match std::fs::symlink_metadata(directory.join(".mutualbackup")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
         if let Some(scope) = linked_worktree_marker(directory)? {
-            return Ok((
+            return Ok(Some((
                 directory.to_path_buf(),
                 scope.repository_id(),
                 Some(scope.worktree_id()),
-            ));
+            )));
         }
         if let Some(repository_id) = git_catalog_marker(directory)? {
-            return Ok((directory.to_path_buf(), repository_id, None));
+            return Ok(Some((directory.to_path_buf(), repository_id, None)));
         }
     }
-    bail!("no initialized MutualBackup Git repository contains this directory")
+    Ok(None)
 }
 
 async fn reset_index(socket: &Path, working_directory: &Path, paths: Vec<PathBuf>) -> Result<()> {
-    let (root, repository_id, worktree_id) = discover_location(working_directory)?;
+    let (root, repository_id, worktree_id) =
+        discover_location_with_daemon(working_directory, socket).await?;
     let paths = paths
         .iter()
         .map(|path| relative_for_add(&root, working_directory, path))
@@ -1206,7 +1255,8 @@ async fn restore_worktree(
     working_directory: &Path,
     paths: Vec<PathBuf>,
 ) -> Result<()> {
-    let (root, repository_id, worktree_id) = discover_location(working_directory)?;
+    let (root, repository_id, worktree_id) =
+        discover_location_with_daemon(working_directory, socket).await?;
     let paths = paths
         .iter()
         .map(|path| relative_for_add(&root, working_directory, path))
@@ -1237,7 +1287,8 @@ async fn restore_worktree(
 }
 
 async fn restore_both(socket: &Path, working_directory: &Path, paths: Vec<PathBuf>) -> Result<()> {
-    let (root, repository_id, worktree_id) = discover_location(working_directory)?;
+    let (root, repository_id, worktree_id) =
+        discover_location_with_daemon(working_directory, socket).await?;
     let paths = paths
         .iter()
         .map(|path| relative_for_add(&root, working_directory, path))
@@ -1268,7 +1319,8 @@ async fn restore_both(socket: &Path, working_directory: &Path, paths: Vec<PathBu
 }
 
 async fn hard_reset(socket: &Path, working_directory: &Path) -> Result<()> {
-    let (_, repository_id, worktree_id) = discover_location(working_directory)?;
+    let (_, repository_id, worktree_id) =
+        discover_location_with_daemon(working_directory, socket).await?;
     let request = match worktree_id {
         Some(worktree_id) => LocalRequest::GitWorktreeHardReset {
             repository_id,
@@ -1446,9 +1498,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            discover_location(&nested).unwrap(),
+            find_local_location(&nested).unwrap().unwrap(),
             (root, repository_id, Some(worktree_id))
         );
-        assert_eq!(discover_shared_repository(&nested).unwrap(), repository_id);
+        assert_eq!(
+            find_local_location(&nested).unwrap().unwrap().1,
+            repository_id
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_catalog_falls_back_to_daemon_location() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("guarded");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(find_local_location(&nested).unwrap().is_none());
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let repository_id = Uuid::new_v4();
+        let requested = nested.clone();
+        let returned = root.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap() as usize;
+            let mut payload = vec![0; length];
+            stream.read_exact(&mut payload).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                request["request"]["GitLocate"]["path"],
+                requested.to_str().unwrap()
+            );
+            let response = serde_json::json!({
+                "format_version": 2,
+                "request_id": request["request_id"],
+                "result": {"Ok": {"GitLocated": {
+                    "format_version": 1,
+                    "repository_id": repository_id,
+                    "path": returned,
+                }}},
+            });
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream.write_u32(encoded.len() as u32).await.unwrap();
+            stream.write_all(&encoded).await.unwrap();
+        });
+        assert_eq!(
+            discover_location_with_daemon(&nested, &socket)
+                .await
+                .unwrap(),
+            (root, repository_id, None)
+        );
+        server.await.unwrap();
     }
 }
