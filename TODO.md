@@ -254,8 +254,39 @@
   52 normal Git library tests, all 62 provisioned Git library cases on a fresh
   local Btrfs image, the three native node init/linked-worktree/retention
   probes, formatting, and strict all-target workspace Clippy pass. Actual
-  history expiry across replacement checkpoints and remote/physical deletion,
-  file-changing guarded commands, and the provisioned daemon gate remain open.
+  history expiry across replacement checkpoints and remote/physical deletion
+  were not covered by that run. File-changing guarded commands and the
+  provisioned daemon gate remain open; local expiry is covered below.
+- [x] **M6 prune expired local Git blobs while unrelated revision GC remains
+  pending.** The blanket `gc-anchor`/`gc-revision`/`gc-sector` gate prevented
+  collection even after a historical blob lost all protection. Prune now uses
+  verified retained graphs and exact sector-recipe anchor pins instead, while
+  keeping capture, restore, and unfinished-backup fences. It also verifies and
+  protects the direct parent checkpoint's graph during the one-generation GC
+  grace window; seed recovery can lack its individual `user-revision` rows.
+  The extended five-peer format-7 fixture commits replacement checkpoints with
+  retention one: at generation 2, both the historical commit metadata and raw
+  native blob survive pruning; at generation 3, expired raw sector recipes are
+  gone, the independent historical anchor is physically removed, and a second
+  prune removes nothing. The ext4 and fresh disposable local Btrfs runs pass
+  in 243.93 and 320.95 seconds. All four guarded Git node probes and the native
+  signed-revision prune test pass on that Btrfs image, as do formatting and
+  strict locked all-target workspace Clippy in the pinned local development
+  shell. The temporary mount and image were removed. Remote coded-data
+  reclamation is a separate gate.
+- [ ] **M6 prove remote reclamation of expired Git history.** The format-7
+  fixture currently exercises local graph/anchor retention and replacement
+  checkpoints; it does not prove physical deletion of all remote packed and
+  coded data carrying the expired blob. Exercise the production Retire/Forget
+  and holder-cleanup workers, inspect the holders' actual READY objects, and
+  recover the current graph after removing the owner's local state again.
+  Handle a mixed coding group that still supplies the only coverage for a
+  current packed sector: create and verify replacement coverage before retiring
+  it. `variable_group_lifecycle_kind` currently preserves such a group, and
+  `uncovered_packed_sectors` does not request replacement while its coverage is
+  valid. Deleting the obsolete group first would endanger current data.
+  Keep this gate open independently of local anchor reclamation and the
+  provisioned five-daemon guarded recovery gate.
 - [x] **M6 preserve recipe pins during guarded Git prune replay.** A pending
   catalog retirement no longer authorizes deletion of an imported native anchor
   when a retained or restored local-sector recipe names that exact anchor.

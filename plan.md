@@ -3915,6 +3915,12 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   and make any raw worktree-versus-Git-blob difference visible before staging.
 - Define Git-facing history expiry and prune/GC over refs, index, worktrees,
   retained signed revisions, explicit protection pins, and in-flight work.
+  Include the verified direct parent checkpoint's Git graph through the
+  one-generation GC grace window: seed recovery may not have installed its
+  individual `user-revision` records. Missing parent history fails closed.
+  Use retained graphs and exact sector-recipe anchor pins to decide which
+  candidates can be deleted; an unrelated pending revision or root cleanup
+  must not indefinitely block an older, unprotected blob.
   For a guarded repository, enumerate catalog candidates and their stage
   receipts without mutation, then durably fence the exact candidate set in
   node control before deleting any catalog mapping. Replay that fence before

@@ -3162,6 +3162,15 @@ impl Node {
     }
 
     #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_revision_git_descriptor(
+        &self,
+        revision: &SignedRecord<UserRevision>,
+    ) -> Result<mb_git::GitBackupDescriptor> {
+        revision_git_backup(&self.control, &self.keys, revision.value.guild_id, revision)?
+            .context("test revision has no signed Git graph")
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn stop_test_guarded_mount(&mut self, root_id: Uuid) -> Result<()> {
         let root = self.protected_root_by_id(root_id)?;
         let binding = self.guarded_root_mount_binding(&root)?;
@@ -4027,11 +4036,9 @@ impl Node {
 
     pub fn git_prune(&mut self, repository_id: Uuid) -> Result<GitPruneReport> {
         self.reconcile_garbage_collection()?;
-        for kind in ["gc-anchor", "gc-revision", "gc-sector"] {
-            if !self.control.records(kind)?.is_empty() {
-                anyhow::bail!("retained revision cleanup is unfinished; Git prune must wait");
-            }
-        }
+        // Retained revision graphs and exact recipe pins below protect data
+        // through the GC grace window. Unrelated pending cleanup must not
+        // prevent collection of an older, already unprotected Git blob.
         let root = self.protected_root_by_id(repository_id)?;
         if git_prune_capture_pending(&self.control, repository_id, &root.path)?
             || !self.control.records("restore-job")?.is_empty()
@@ -4097,13 +4104,20 @@ impl Node {
                 self.current_checkpoint(installed.certificate.genesis.guild_id)?
         {
             checkpoint.verify()?;
-            if let Some(parent) = checkpoint.checkpoint.parent
-                && self
+            if let Some(parent_hash) = checkpoint.checkpoint.parent {
+                let bytes = self
                     .control
-                    .get_record("guild-checkpoint", &parent)?
-                    .is_none()
-            {
-                anyhow::bail!("checkpoint history is incomplete; Git prune must wait");
+                    .get_record("guild-checkpoint", &parent_hash)?
+                    .context("checkpoint history is incomplete; Git prune must wait")?;
+                let parent: QuorumCheckpoint = decode_canonical(&bytes)?;
+                parent.verify()?;
+                anyhow::ensure!(parent.hash()? == parent_hash, "checkpoint hash mismatch");
+                // Seed recovery need not install a user-revision row for the
+                // certified head. Its graph still owns the one-generation GC
+                // grace window after a replacement checkpoint is installed.
+                for revision in &parent.checkpoint.revisions {
+                    include_revision(revision)?;
+                }
             }
             for revision in &checkpoint.checkpoint.revisions {
                 include_revision(revision)?;

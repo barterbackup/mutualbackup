@@ -51,6 +51,11 @@ files still fails explicitly; ordinary guarded init, add, and file-changing
 checkout remain gated.
 Deleting a branch or pin does not erase history that a retained signed backup
 still needs; history prune keeps those objects until retention releases them.
+Prune also preserves the certified parent checkpoint's graph during the
+one-generation cleanup grace window, including after seed recovery. Unrelated
+pending revision cleanup does not block collection of an older blob once its
+graph protection and exact sector-recipe pins have expired. Missing checkpoint
+history or a pending capture, restore, or backup still prevents unsafe pruning.
 `mutualgit rm PATH` removes a clean tracked file or symlink and stages its
 deletion. It rejects staged or working-tree changes, and replays an interrupted
 unlink before clearing the index. `mutualgit rm --cached PATH` keeps the working

@@ -33763,6 +33763,139 @@ mod tests {
                 .history_backed_up
         );
 
+        let history_sectors = recovered_node
+            .lock()
+            .unwrap()
+            .test_revision_git_descriptor(signed)
+            .unwrap()
+            .blobs
+            .into_iter()
+            .find(|blob| blob.oid == history_oid.as_bytes())
+            .unwrap()
+            .data_extents
+            .into_iter()
+            .flat_map(|extent| extent.sectors)
+            .collect::<Vec<_>>();
+        assert!(!history_sectors.is_empty());
+        peer_exchange_tasks.push(tokio::spawn(run_peer_exchange(
+            recovered_node.clone(),
+            recovery_client.clone(),
+        )));
+        dht_publication_tasks.push(tokio::spawn(run_dht_publications(
+            recovered_node.clone(),
+            recovery_client.clone(),
+        )));
+        coding_tasks.push(tokio::spawn(run_delegated_coding_jobs(
+            recovered_node.clone(),
+            recovery_client.clone(),
+        )));
+        nodes[0].lock().unwrap().configure_retention(1).unwrap();
+        for generation in [2, 3] {
+            eprintln!("guarded Git retention checkpoint {generation}: preparing");
+            let descriptor = {
+                let mut owner = recovered_node.lock().unwrap();
+                owner
+                    .mark_root_dirty(root_id, "advance guarded history retention")
+                    .unwrap();
+                owner.prepare_protected_backup(Some(root_id)).unwrap()
+            };
+            nodes[0]
+                .lock()
+                .unwrap()
+                .enqueue_backup(owner_id, descriptor.clone())
+                .unwrap();
+            let queued = nodes[0]
+                .lock()
+                .unwrap()
+                .claim_backup_job()
+                .unwrap()
+                .unwrap();
+            let checkpoint_hash = tokio::time::timeout(
+                Duration::from_secs(240),
+                commit_backup_job(nodes[0].clone(), &clients[0], &queued),
+            )
+            .await
+            .expect("guarded Git retention backup timed out")
+            .unwrap();
+            nodes[0]
+                .lock()
+                .unwrap()
+                .complete_backup_job(&descriptor, checkpoint_hash)
+                .unwrap();
+            eprintln!("guarded Git retention checkpoint {generation}: committed");
+            let current = recovered_node
+                .lock()
+                .unwrap()
+                .current_checkpoint(genesis.genesis.guild_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.checkpoint.generation, generation);
+            assert_eq!(current.checkpoint.revisions.len(), 1);
+            assert!(
+                current
+                    .checkpoint
+                    .revision_tombstones
+                    .iter()
+                    .any(|tombstone| {
+                        tombstone.protected_root_id == root_id && tombstone.through_sequence >= 1
+                    })
+            );
+            let descriptor = recovered_node
+                .lock()
+                .unwrap()
+                .test_revision_git_descriptor(&current.checkpoint.revisions[0])
+                .unwrap();
+            assert_eq!(descriptor.blobs.len(), 3);
+            assert!(
+                !descriptor
+                    .blobs
+                    .iter()
+                    .any(|blob| blob.oid == history_oid.as_bytes())
+            );
+            assert!(
+                recovered_node
+                    .lock()
+                    .unwrap()
+                    .git_status(root_id)
+                    .unwrap()
+                    .history_backed_up
+            );
+            if generation == 2 {
+                let retained = recovered_node.lock().unwrap().git_prune(root_id).unwrap();
+                assert_eq!(retained.native_anchors_removed, 0);
+                assert_eq!(retained.metadata_objects_removed, 0);
+                assert_eq!(
+                    mb_git::blob_oid_from_anchor(history_anchor).unwrap(),
+                    history_oid
+                );
+            }
+        }
+        for sector in &history_sectors {
+            assert!(
+                recovered_node
+                    .lock()
+                    .unwrap()
+                    .sector_for_guild(&genesis.genesis.guild_id, &sector.id)
+                    .is_err()
+            );
+        }
+        let removed = recovered_node.lock().unwrap().git_prune(root_id).unwrap();
+        assert_eq!(removed.native_anchors_removed, 1);
+        assert_eq!(
+            removed.logical_anchor_bytes_removed,
+            history_only.len() as u64
+        );
+        assert!(history_anchor.open_verified().is_err());
+        assert_eq!(
+            recovered_node
+                .lock()
+                .unwrap()
+                .git_prune(root_id)
+                .unwrap()
+                .native_anchors_removed,
+            0
+        );
+
         recovery_client.shutdown().await.unwrap();
         recovery_task.await.unwrap().unwrap();
         control_task.abort();
@@ -33779,6 +33912,7 @@ mod tests {
             .chain(dht_publication_tasks)
         {
             task.abort();
+            let _ = task.await;
         }
         for client in &clients {
             let _ = client.shutdown().await;
