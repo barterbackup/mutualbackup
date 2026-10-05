@@ -463,6 +463,16 @@ impl GitRepository {
         Ok(())
     }
 
+    fn resume_for_metadata_change(&self) -> Result<(), RepositoryError> {
+        self.resume_for_backend_on_open()?;
+        if self.source_backend == SourceBackendKind::GuardedLinkFreezeV1
+            && self.has_pending_guarded_prune_catalog()?
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        Ok(())
+    }
+
     fn native_source(&self) -> NativeSource<'_> {
         NativeSource {
             root: &self.root,
@@ -1184,17 +1194,17 @@ impl GitRepository {
     }
 
     pub fn commit_pins(&self) -> Result<Vec<[u8; 20]>, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(list_commit_pins(&self.catalog, self.repository_id)?)
     }
 
     pub fn pin_commit(&self, oid: Oid) -> Result<(), RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         Ok(pin_commit(&self.catalog, self.repository_id, oid)?)
     }
 
     pub fn unpin_commit(&self, oid: Oid) -> Result<(), RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         Ok(unpin_commit(&self.catalog, self.repository_id, oid)?)
     }
 
@@ -1252,7 +1262,7 @@ impl GitRepository {
     }
 
     pub fn create_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         self.ensure_no_merge_session()?;
         Ok(create_branch(&self.catalog, self.repository_id, name)?)
     }
@@ -1262,7 +1272,7 @@ impl GitRepository {
         name: &str,
         start_point: &str,
     ) -> Result<GitBranchInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         self.ensure_no_merge_session()?;
         Ok(create_branch_from(
             &self.catalog,
@@ -1282,7 +1292,7 @@ impl GitRepository {
         name: &str,
         start_point: Option<&str>,
     ) -> Result<GitTagInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         self.ensure_no_merge_session()?;
         Ok(create_tag_for_scope(
             &self.catalog,
@@ -1300,7 +1310,7 @@ impl GitRepository {
         tagger_email: &str,
         message: &str,
     ) -> Result<GitTagInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         self.ensure_no_merge_session()?;
         Ok(create_annotated_tag_for_scope(
             &self.catalog,
@@ -1314,13 +1324,13 @@ impl GitRepository {
     }
 
     pub fn delete_tag(&self, name: &str) -> Result<GitTagInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         self.ensure_no_merge_session()?;
         Ok(delete_tag(&self.catalog, self.repository_id, name)?)
     }
 
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<GitBranchInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         self.ensure_no_merge_session()?;
         Ok(delete_branch(
             &self.catalog,
@@ -1331,10 +1341,18 @@ impl GitRepository {
     }
 
     pub fn switch_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_metadata_change()?;
         self.ensure_no_merge_session()?;
         match switch_same_tree_branch(&self.catalog, self.repository_id, name) {
             Ok(info) => Ok(info),
+            Err(HistoryError::CheckoutRequired | HistoryError::NoHead)
+                if self.source_backend == SourceBackendKind::GuardedLinkFreezeV1 =>
+            {
+                Err(
+                    AnchorError::UnsupportedSourceOperation("guarded Git checkout is not enabled")
+                        .into(),
+                )
+            }
             Err(HistoryError::CheckoutRequired | HistoryError::NoHead) => Ok(begin_switch(
                 &self.catalog,
                 self.repository_id,

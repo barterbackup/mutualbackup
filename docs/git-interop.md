@@ -42,6 +42,15 @@ selecting it. Use stock Git separately for the bridge examples below.
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,
 and prune.
+Recovered guarded repositories also support branch and tag creation/deletion,
+commit pins, and branch switches whose committed trees are identical. These
+operations change only the private catalog and schedule a new backup; they
+preserve staged and working bytes, including dirty files. Metadata changes
+wait for pending guarded prune retirement. A branch switch that would replace
+files still fails explicitly; ordinary guarded init, add, and file-changing
+checkout remain gated.
+Deleting a branch or pin does not erase history that a retained signed backup
+still needs; history prune keeps those objects until retention releases them.
 `mutualgit rm PATH` removes a clean tracked file or symlink and stages its
 deletion. It rejects staged or working-tree changes, and replays an interrupted
 unlink before clearing the index. `mutualgit rm --cached PATH` keeps the working

@@ -237,6 +237,25 @@
   workspace Clippy in the pinned development shell pass. Public guarded
   add/checkout, historical-blob physical reclamation, and the provisioned
   five-daemon gate remain open.
+  Branch and tag creation/deletion, explicit commit pins, and same-tree branch
+  switching now use guarded metadata validation instead of reflink checkout
+  replay. A pending catalog retirement blocks those mutations; a switch that
+  would replace file bytes remains explicitly gated. Branch and pin changes
+  durably mark the root dirty for a new backup, including branch edits through
+  a linked reflink worktree. The expanded five-peer format-7 fixture retains
+  its history-only file on an unselected branch, restores that branch and blob
+  from the seed, switches same-tree branches without changing a dirty file,
+  and exercises tags and pins against the recovered private catalog. After
+  removing the historical branch and its pin through the production node and
+  local-control paths, prune removes only a newly created/deleted annotated
+  tag: the retained signed checkpoint still protects the historical commit
+  graph and native blob. The fixture passes locally on ext4 (174.04 seconds)
+  and disposable Btrfs (219.10 seconds); all four guarded Git node probes,
+  52 normal Git library tests, all 62 provisioned Git library cases on a fresh
+  local Btrfs image, the three native node init/linked-worktree/retention
+  probes, formatting, and strict all-target workspace Clippy pass. Actual
+  history expiry across replacement checkpoints and remote/physical deletion,
+  file-changing guarded commands, and the provisioned daemon gate remain open.
 - [x] **M6 preserve recipe pins during guarded Git prune replay.** A pending
   catalog retirement no longer authorizes deletion of an imported native anchor
   when a retained or restored local-sector recipe names that exact anchor.

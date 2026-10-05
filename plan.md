@@ -815,7 +815,11 @@ Proactive background repair comes later.
   Metadata-only guarded index/ref changes validate the backend's pending
   operations against the private catalog; they must not enter a reflink
   checkout transition or require a native filesystem UUID from the FUSE view
-  just to change local metadata.
+  just to change local metadata. Branches, tags, and explicit commit pins use
+  this path, with mutations fenced during catalog retirement and a durable
+  dirty marker scheduling protection of the new graph. A same-tree branch
+  switch may update HEAD without touching staged or working bytes; a switch
+  requiring file replacement remains gated by guarded checkout readiness.
 - For checkout or a second worktree, restore verified anchor bytes by reflink
   on a capable same-filesystem destination, preserving the exact blob bytes.
   Do not run a smudge filter, line-ending conversion, or encoding conversion

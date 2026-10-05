@@ -3436,7 +3436,7 @@ impl Node {
                 && canonical_bytes(&info)? == encoded,
             "Git repository registration differs from its protected root"
         );
-        drop(self.open_git_repository_for_inspection(root.root_id)?);
+        drop(self.open_git_repository_for_metadata(root.root_id)?);
         Ok(Some(info))
     }
 
@@ -3444,7 +3444,7 @@ impl Node {
         self.open_git_repository_with_policy(repository_id, None)
     }
 
-    fn open_git_repository_for_inspection(&self, repository_id: Uuid) -> Result<GitRepository> {
+    fn open_git_repository_for_metadata(&self, repository_id: Uuid) -> Result<GitRepository> {
         #[cfg(target_os = "linux")]
         if self.protected_root_by_id(repository_id)?.format_version == 4 {
             return self.open_guarded_git_repository(repository_id);
@@ -3732,35 +3732,38 @@ impl Node {
     }
 
     pub fn git_worktree_create_branch(
-        &self,
+        &mut self,
         repository_id: Uuid,
         worktree_id: Uuid,
         name: &str,
     ) -> Result<GitBranchInfo> {
+        self.mark_root_dirty(repository_id, "Git branch changed")?;
         self.open_git_repository(repository_id)?
             .linked_create_branch(worktree_id, name)
             .map_err(Into::into)
     }
 
     pub fn git_worktree_create_branch_from(
-        &self,
+        &mut self,
         repository_id: Uuid,
         worktree_id: Uuid,
         name: &str,
         start_point: &str,
     ) -> Result<GitBranchInfo> {
+        self.mark_root_dirty(repository_id, "Git branch changed")?;
         self.open_git_repository(repository_id)?
             .linked_create_branch_from(worktree_id, name, start_point)
             .map_err(Into::into)
     }
 
     pub fn git_worktree_delete_branch(
-        &self,
+        &mut self,
         repository_id: Uuid,
         worktree_id: Uuid,
         name: &str,
         force: bool,
     ) -> Result<GitBranchInfo> {
+        self.mark_root_dirty(repository_id, "Git branch changed")?;
         self.open_git_repository(repository_id)?
             .linked_delete_branch(worktree_id, name, force)
             .map_err(Into::into)
@@ -3849,19 +3852,19 @@ impl Node {
     }
 
     pub fn git_log(&self, repository_id: Uuid, limit: usize) -> Result<Vec<GitLogEntry>> {
-        self.open_git_repository_for_inspection(repository_id)?
+        self.open_git_repository_for_metadata(repository_id)?
             .log(limit)
             .map_err(Into::into)
     }
 
     pub fn git_branches(&self, repository_id: Uuid) -> Result<Vec<GitBranchInfo>> {
-        self.open_git_repository_for_inspection(repository_id)?
+        self.open_git_repository_for_metadata(repository_id)?
             .branches()
             .map_err(Into::into)
     }
 
     pub fn git_tags(&self, repository_id: Uuid) -> Result<Vec<GitTagInfo>> {
-        self.open_git_repository_for_inspection(repository_id)?
+        self.open_git_repository_for_metadata(repository_id)?
             .tags()
             .map_err(Into::into)
     }
@@ -3874,7 +3877,7 @@ impl Node {
         start_point: Option<&str>,
     ) -> Result<GitTagInfo> {
         self.mark_root_dirty(repository_id, "Git tag changed")?;
-        let repository = self.open_git_repository(repository_id)?;
+        let repository = self.open_git_repository_for_metadata(repository_id)?;
         match worktree_id {
             Some(worktree_id) => repository
                 .linked_create_tag(worktree_id, name, start_point)
@@ -3895,7 +3898,7 @@ impl Node {
         message: &str,
     ) -> Result<GitTagInfo> {
         self.mark_root_dirty(repository_id, "Git tag changed")?;
-        let repository = self.open_git_repository(repository_id)?;
+        let repository = self.open_git_repository_for_metadata(repository_id)?;
         match worktree_id {
             Some(worktree_id) => repository
                 .linked_create_annotated_tag(
@@ -3915,7 +3918,7 @@ impl Node {
 
     pub fn git_delete_tag(&mut self, repository_id: Uuid, name: &str) -> Result<GitTagInfo> {
         self.mark_root_dirty(repository_id, "Git tag changed")?;
-        self.open_git_repository(repository_id)?
+        self.open_git_repository_for_metadata(repository_id)?
             .delete_tag(name)
             .map_err(Into::into)
     }
@@ -3927,7 +3930,7 @@ impl Node {
         destination: &Path,
         advertised: &[GitBranchInfo],
     ) -> Result<u32> {
-        let repository = self.open_git_repository_for_inspection(repository_id)?;
+        let repository = self.open_git_repository_for_metadata(repository_id)?;
         if repository.root() != source_root {
             anyhow::bail!("Git remote root differs from its enrolled repository");
         }
@@ -3944,7 +3947,7 @@ impl Node {
         advertised_branches: &[GitBranchInfo],
         advertised_tags: &[GitTagInfo],
     ) -> Result<u32> {
-        let repository = self.open_git_repository_for_inspection(repository_id)?;
+        let repository = self.open_git_repository_for_metadata(repository_id)?;
         if repository.root() != source_root {
             anyhow::bail!("Git remote root differs from its enrolled repository");
         }
@@ -4003,19 +4006,21 @@ impl Node {
     }
 
     pub fn git_commit_pins(&self, repository_id: Uuid) -> Result<Vec<[u8; 20]>> {
-        self.open_git_repository(repository_id)?
+        self.open_git_repository_for_metadata(repository_id)?
             .commit_pins()
             .map_err(Into::into)
     }
 
-    pub fn git_pin_commit(&self, repository_id: Uuid, oid: [u8; 20]) -> Result<()> {
-        self.open_git_repository(repository_id)?
+    pub fn git_pin_commit(&mut self, repository_id: Uuid, oid: [u8; 20]) -> Result<()> {
+        self.mark_root_dirty(repository_id, "Git protection pin changed")?;
+        self.open_git_repository_for_metadata(repository_id)?
             .pin_commit(git2::Oid::from_bytes(&oid)?)
             .map_err(Into::into)
     }
 
-    pub fn git_unpin_commit(&self, repository_id: Uuid, oid: [u8; 20]) -> Result<()> {
-        self.open_git_repository(repository_id)?
+    pub fn git_unpin_commit(&mut self, repository_id: Uuid, oid: [u8; 20]) -> Result<()> {
+        self.mark_root_dirty(repository_id, "Git protection pin changed")?;
+        self.open_git_repository_for_metadata(repository_id)?
             .unpin_commit(git2::Oid::from_bytes(&oid)?)
             .map_err(Into::into)
     }
@@ -4469,8 +4474,9 @@ impl Node {
         Ok(())
     }
 
-    pub fn git_create_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
-        self.open_git_repository(repository_id)?
+    pub fn git_create_branch(&mut self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
+        self.mark_root_dirty(repository_id, "Git branch changed")?;
+        self.open_git_repository_for_metadata(repository_id)?
             .create_branch(name)
             .map_err(Into::into)
     }
@@ -4500,29 +4506,32 @@ impl Node {
     }
 
     pub fn git_create_branch_from(
-        &self,
+        &mut self,
         repository_id: Uuid,
         name: &str,
         start_point: &str,
     ) -> Result<GitBranchInfo> {
-        self.open_git_repository(repository_id)?
+        self.mark_root_dirty(repository_id, "Git branch changed")?;
+        self.open_git_repository_for_metadata(repository_id)?
             .create_branch_from(name, start_point)
             .map_err(Into::into)
     }
 
     pub fn git_delete_branch(
-        &self,
+        &mut self,
         repository_id: Uuid,
         name: &str,
         force: bool,
     ) -> Result<GitBranchInfo> {
-        self.open_git_repository(repository_id)?
+        self.mark_root_dirty(repository_id, "Git branch changed")?;
+        self.open_git_repository_for_metadata(repository_id)?
             .delete_branch(name, force)
             .map_err(Into::into)
     }
 
-    pub fn git_switch_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
-        self.open_git_repository(repository_id)?
+    pub fn git_switch_branch(&mut self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
+        self.mark_root_dirty(repository_id, "Git selected branch changed")?;
+        self.open_git_repository_for_metadata(repository_id)?
             .switch_branch(name)
             .map_err(Into::into)
     }
@@ -4663,13 +4672,13 @@ impl Node {
     }
 
     pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
-        self.open_git_repository_for_inspection(repository_id)?
+        self.open_git_repository_for_metadata(repository_id)?
             .diff(cached)
             .map_err(Into::into)
     }
 
     pub fn git_status(&self, repository_id: Uuid) -> Result<GitStatus> {
-        let repository = self.open_git_repository_for_inspection(repository_id)?;
+        let repository = self.open_git_repository_for_metadata(repository_id)?;
         let mut status = repository.status()?;
         status.history_backed_up = self.git_history_backed_up(repository_id, &repository)?;
         Ok(status)
@@ -29205,6 +29214,14 @@ pub(crate) mod tests {
         repository
             .retire_guarded_prune_catalog(&intent.batch, &protected)
             .unwrap();
+        assert!(matches!(
+            repository.create_branch("blocked-during-prune"),
+            Err(mb_git::RepositoryError::Conflict)
+        ));
+        assert!(matches!(
+            repository.pin_commit(oid),
+            Err(mb_git::RepositoryError::Conflict)
+        ));
         node.control
             .put_record("local-sector", &reference.id, &recipe)
             .unwrap();

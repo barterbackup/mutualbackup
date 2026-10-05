@@ -701,7 +701,7 @@ mod tests {
         let recovered = guild
             .recover(owner_seed, &root.join("recovered-owner"), &restored)
             .unwrap();
-        let node = recovered.lock().unwrap();
+        let mut node = recovered.lock().unwrap();
         let status = node.git_status(repository_id).unwrap();
         assert_eq!(status.branch, "main");
         assert_eq!(status.head_oid, Some(main_oid));

@@ -33346,14 +33346,27 @@ mod tests {
             owner
                 .seed_test_guarded_git_commit(
                     root.root_id,
-                    &[
-                        ("first", 2),
-                        ("second", 2),
-                        ("edited", 1),
-                        ("history-only", 2),
-                    ],
+                    &[("first", 2), ("second", 2), ("edited", 1)],
                 )
                 .unwrap();
+            owner.git_create_branch(root.root_id, "topic").unwrap();
+            owner.git_switch_branch(root.root_id, "topic").unwrap();
+            owner
+                .seed_test_guarded_git_commit(root.root_id, &[("history-only", 2)])
+                .unwrap();
+            let refused = owner.git_switch_branch(root.root_id, "main").unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("guarded Git checkout is not enabled")
+            );
+            assert!(
+                owner
+                    .git_branches(root.root_id)
+                    .unwrap()
+                    .iter()
+                    .any(|branch| { branch.name == "topic" && branch.current })
+            );
             let remove = std::process::Command::new("python3")
                 .uid(65534)
                 .gid(65534)
@@ -33363,14 +33376,17 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(remove.status.success(), "{remove:?}");
-            let graph = owner
+            owner
                 .test_guarded_git_commit_removed_file(
                     root.root_id,
                     std::path::Path::new("history-only"),
                 )
                 .unwrap();
+            owner.git_switch_branch(root.root_id, "main").unwrap();
+            let graph = owner.test_guarded_git_graph(root.root_id).unwrap();
             (root.root_id, graph)
         };
+        assert_eq!(original_graph.refs.len(), 2);
         assert_eq!(original_graph.blobs.len(), 4);
         let owner_id = nodes[1].lock().unwrap().keys().node_id();
         let descriptor = nodes[1]
@@ -33643,6 +33659,108 @@ mod tests {
                 .unwrap()
                 .as_bytes(),
             recovered_graph.blobs[0].oid
+        );
+
+        let history_tip = original_graph
+            .refs
+            .iter()
+            .find(|reference| reference.name == b"refs/heads/topic")
+            .unwrap()
+            .oid;
+        {
+            let mut owner = recovered_node.lock().unwrap();
+            owner
+                .git_create_branch_from(root_id, "scratch", "main")
+                .unwrap();
+            owner.git_switch_branch(root_id, "scratch").unwrap();
+            assert!(
+                owner
+                    .git_status(root_id)
+                    .unwrap()
+                    .changes
+                    .iter()
+                    .any(|change| {
+                        change.path == b"first"
+                            && change.worktree == Some(mb_git::GitChange::Modified)
+                    })
+            );
+            owner.git_switch_branch(root_id, "main").unwrap();
+            owner.git_delete_branch(root_id, "scratch", false).unwrap();
+            owner
+                .git_create_tag(root_id, None, "temporary", None)
+                .unwrap();
+            owner
+                .git_create_annotated_tag(
+                    root_id,
+                    None,
+                    "historical",
+                    Some("topic"),
+                    "Owner",
+                    "owner@example.test",
+                    "retained guarded history",
+                )
+                .unwrap();
+            assert_eq!(owner.git_tags(root_id).unwrap().len(), 2);
+            owner.git_delete_tag(root_id, "temporary").unwrap();
+            owner.git_delete_tag(root_id, "historical").unwrap();
+            owner.git_pin_commit(root_id, history_tip).unwrap();
+            assert_eq!(owner.git_commit_pins(root_id).unwrap(), vec![history_tip]);
+        }
+        let crate::LocalResponse::GitBranchDeleted(deleted) = crate::control::local_control_call(
+            &control_socket,
+            &crate::LocalRequest::GitDeleteBranch {
+                repository_id: root_id,
+                name: "topic".to_owned(),
+                force: true,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("recovered guarded branch deletion is unavailable through local control");
+        };
+        assert_eq!(deleted.oid, history_tip);
+        recovered_node
+            .lock()
+            .unwrap()
+            .git_unpin_commit(root_id, history_tip)
+            .unwrap();
+        let crate::LocalResponse::GitPruned(retained) = crate::control::local_control_call(
+            &control_socket,
+            &crate::LocalRequest::GitPrune {
+                repository_id: root_id,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("recovered guarded prune is unavailable through local control");
+        };
+        assert_eq!(retained.native_anchors_removed, 0);
+        // Only the temporary annotated tag lacks checkpoint protection.
+        assert_eq!(retained.metadata_objects_removed, 1);
+        let local_graph = recovered_node
+            .lock()
+            .unwrap()
+            .test_guarded_git_graph(root_id)
+            .unwrap();
+        assert_eq!(local_graph.refs.len(), 1);
+        assert_eq!(local_graph.blobs.len(), 3);
+        let history_anchor = &recovered_graph
+            .blobs
+            .iter()
+            .find(|blob| blob.oid == history_oid.as_bytes())
+            .unwrap()
+            .anchor;
+        assert_eq!(
+            mb_git::blob_oid_from_anchor(history_anchor).unwrap(),
+            history_oid
+        );
+        assert!(
+            !recovered_node
+                .lock()
+                .unwrap()
+                .git_status(root_id)
+                .unwrap()
+                .history_backed_up
         );
 
         recovery_client.shutdown().await.unwrap();
