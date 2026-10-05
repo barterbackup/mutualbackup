@@ -800,6 +800,10 @@ Proactive background repair comes later.
   read/hash pass and bounded transient pack buffers are acceptable; verify
   both Git object IDs and MutualBackup content roots, and reject an ID alias
   whose bytes disagree.
+  Metadata-only guarded index/ref changes validate the backend's pending
+  operations against the private catalog; they must not enter a reflink
+  checkout transition or require a native filesystem UUID from the FUSE view
+  just to change local metadata.
 - For checkout or a second worktree, restore verified anchor bytes by reflink
   on a capable same-filesystem destination, preserving the exact blob bytes.
   Do not run a smudge filter, line-ending conversion, or encoding conversion

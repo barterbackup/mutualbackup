@@ -225,7 +225,18 @@
   The five-peer format-7 recovery fixture now serves the actual local-control
   listener from the recovered node and confirms hidden-catalog lookup,
   backed-up Git status, and stock-Git object export over its framed socket;
-  the exported commit and three raw blobs pass on ext4 and disposable Btrfs.
+  the exported commits and raw blobs pass on ext4 and disposable Btrfs.
+  The fixture now commits a fourth file, removes its visible name and index
+  entry in a second commit, and retains its bytes through the older commit.
+  Guarded index-only removal uses the backend's pending-operation validation
+  rather than entering reflink checkout replay against the FUSE filesystem.
+  Seed-only recovery keeps the historical blob in a separate native anchor,
+  leaves its name absent from the current view, and exports its exact bytes;
+  the three current blobs still use virtual mappings to one root anchor.
+  The ext4 and disposable-Btrfs runs, 52 normal Git library tests, and strict
+  workspace Clippy in the pinned development shell pass. Public guarded
+  add/checkout, historical-blob physical reclamation, and the provisioned
+  five-daemon gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

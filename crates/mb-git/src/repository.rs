@@ -1094,7 +1094,7 @@ impl GitRepository {
     }
 
     pub fn remove_cached(&self, relative_path: impl AsRef<Path>) -> Result<bool, RepositoryError> {
-        self.resume_checkout()?;
+        self.resume_for_backend_on_open()?;
         Ok(remove_cached(
             &self.catalog,
             self.repository_id,

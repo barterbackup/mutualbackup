@@ -3143,6 +3143,18 @@ impl Node {
     }
 
     #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn test_guarded_git_commit_removed_file(
+        &self,
+        root_id: Uuid,
+        path: &Path,
+    ) -> Result<mb_git::GitGraphSource> {
+        let repository = self.open_guarded_git_repository(root_id)?;
+        anyhow::ensure!(repository.remove_cached(path)?, "Git path was not staged");
+        repository.commit("Owner", "owner@example.test", "remove visible file")?;
+        repository.export_graph_source().map_err(Into::into)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_guarded_git_graph(&self, root_id: Uuid) -> Result<mb_git::GitGraphSource> {
         self.open_guarded_git_repository(root_id)?
             .export_graph_source()

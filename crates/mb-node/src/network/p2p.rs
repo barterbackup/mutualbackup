@@ -33259,12 +33259,14 @@ mod tests {
         let first = b"\r\n\0guarded Git first\n".repeat(8_000);
         let second = b"\n\r\0guarded Git second\r\n".repeat(5_000);
         let before_edit = b"guarded Git edited before stage\r\n".repeat(4_000);
+        let history_only = b"history-only\r\n\0guarded Git blob".repeat(3_000);
         let mut edited = before_edit.clone();
         edited[0] = b'E';
         for (name, bytes) in [
             ("first", &first),
             ("second", &second),
             ("edited", &before_edit),
+            ("history-only", &history_only),
         ] {
             std::fs::write(lower.join(name), bytes).unwrap();
             std::fs::set_permissions(lower.join(name), std::fs::Permissions::from_mode(0o644))
@@ -33341,15 +33343,35 @@ mod tests {
                 .unwrap();
             assert!(edit.status.success(), "{edit:?}");
             assert_eq!(std::fs::read(view.join("edited")).unwrap(), edited);
-            let graph = owner
+            owner
                 .seed_test_guarded_git_commit(
                     root.root_id,
-                    &[("first", 2), ("second", 2), ("edited", 1)],
+                    &[
+                        ("first", 2),
+                        ("second", 2),
+                        ("edited", 1),
+                        ("history-only", 2),
+                    ],
+                )
+                .unwrap();
+            let remove = std::process::Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; os.unlink(sys.argv[1])")
+                .arg(view.join("history-only"))
+                .output()
+                .unwrap();
+            assert!(remove.status.success(), "{remove:?}");
+            let graph = owner
+                .test_guarded_git_commit_removed_file(
+                    root.root_id,
+                    std::path::Path::new("history-only"),
                 )
                 .unwrap();
             (root.root_id, graph)
         };
-        assert_eq!(original_graph.blobs.len(), 3);
+        assert_eq!(original_graph.blobs.len(), 4);
         let owner_id = nodes[1].lock().unwrap().keys().node_id();
         let descriptor = nodes[1]
             .lock()
@@ -33455,6 +33477,7 @@ mod tests {
         assert_eq!(std::fs::read(restored.join("first")).unwrap(), first);
         assert_eq!(std::fs::read(restored.join("second")).unwrap(), second);
         assert_eq!(std::fs::read(restored.join("edited")).unwrap(), edited);
+        assert!(std::fs::symlink_metadata(restored.join("history-only")).is_err());
         assert!(std::fs::symlink_metadata(restored.join(".mutualbackup")).is_err());
         let control_socket = run_root.join("control").join("socket");
         let listener = crate::control::bind_local_control(&control_socket).unwrap();
@@ -33494,21 +33517,27 @@ mod tests {
             .unwrap();
         assert_eq!(recovered_graph.refs, original_graph.refs);
         assert_eq!(recovered_graph.objects, original_graph.objects);
-        assert_eq!(recovered_graph.blobs.len(), 3);
+        assert_eq!(recovered_graph.blobs.len(), 4);
+        let history_oid = git2::Oid::hash_object(git2::ObjectType::Blob, &history_only).unwrap();
         let mut root_anchor_ids = BTreeSet::new();
         for (recovered_blob, original_blob) in
             recovered_graph.blobs.iter().zip(&original_graph.blobs)
         {
             assert_eq!(recovered_blob.oid, original_blob.oid);
-            assert_eq!(recovered_blob.anchor.format_version, 2);
-            root_anchor_ids.insert(
-                recovered_blob
-                    .anchor
-                    .guarded_root_file
-                    .as_ref()
-                    .unwrap()
-                    .root_anchor_id,
-            );
+            if recovered_blob.oid == history_oid.as_bytes() {
+                assert_eq!(recovered_blob.anchor.format_version, 1);
+                assert!(recovered_blob.anchor.guarded_root_file.is_none());
+            } else {
+                assert_eq!(recovered_blob.anchor.format_version, 2);
+                root_anchor_ids.insert(
+                    recovered_blob
+                        .anchor
+                        .guarded_root_file
+                        .as_ref()
+                        .unwrap()
+                        .root_anchor_id,
+                );
+            }
             assert_eq!(
                 mb_git::blob_oid_from_anchor(&recovered_blob.anchor)
                     .unwrap()
@@ -33601,8 +33630,8 @@ mod tests {
             panic!("recovered guarded objects are unavailable through local control");
         };
         assert_eq!(exported_id, root_id);
-        assert!(object_count >= 4);
-        for bytes in [&first, &second, &edited] {
+        assert!(object_count >= 8);
+        for bytes in [&first, &second, &edited, &history_only] {
             let oid = git2::Oid::hash_object(git2::ObjectType::Blob, bytes).unwrap();
             assert_eq!(stock.find_blob(oid).unwrap().content(), bytes);
         }
