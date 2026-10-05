@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::guarded_view_probe::{
     GuardedProbeView, GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
-    GuardedViewTimeBaselineV1, retire_virtual_directory_size_dirty, retire_virtual_time_dirty,
-    virtual_directory_size_dirty_ids, virtual_time_dirty_masks,
+    GuardedViewTimeBaselineV1, retire_created_owners, retire_virtual_directory_size_dirty,
+    retire_virtual_time_dirty, virtual_directory_size_dirty_ids, virtual_time_dirty_masks,
 };
 use crate::{
     CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedFileCapturePlan,
@@ -987,6 +987,7 @@ impl GuardedViewMount {
             control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
             retire_virtual_time_dirty(control, anchor_id)?;
             retire_virtual_directory_size_dirty(control, anchor_id)?;
+            retire_created_owners(control, anchor_id)?;
             return Ok(());
         };
         let claim: MountClaim = mb_core::decode_canonical(&claim_bytes)?;
@@ -1016,6 +1017,7 @@ impl GuardedViewMount {
         control.delete_record(VIRTUAL_TIME_BASELINE_KIND, id)?;
         retire_virtual_time_dirty(control, anchor_id)?;
         retire_virtual_directory_size_dirty(control, anchor_id)?;
+        retire_created_owners(control, anchor_id)?;
         Ok(())
     }
 

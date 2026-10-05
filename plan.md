@@ -3998,6 +3998,12 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   under a stopped-view fence, then durably hand its current namespace and
   visible metadata back to the user. Never expose a raw hard
   link between an editable worktree and an immutable anchor.
+  Preserve each new file or directory's creator UID/GID in durable virtual
+  metadata, including setgid-parent group inheritance and directory setgid
+  propagation. Require that ownership before creation replay publishes a name;
+  verify it through rename, remount, signed backup/restore, and root release
+  while the lower inodes stay private. This creator-ownership slice does not
+  substitute for mixed-owner initial enrollment or the remaining ACL/xattr gate.
 - Then validate the already planned native Windows NTFS capture, including VSS
   where appropriate, macOS cloning, platform watchers, portable metadata/ACL
   policy, and explicit application-consistent capture hooks. Each enrolled root
@@ -4051,6 +4057,12 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   and ownership in protected virtual metadata. Prove the anchor remains exact
   through pre-opened file and directory descriptors, permission changes,
   writable reopen attempts, edit detach, crash, and remount.
+  Repeat that retained-descriptor proof after the first edit and every later
+  stopped-view recapture: restoring a detached working inode's original owner
+  must not let a subsequent freeze share a user-mutable inode with a new
+  immutable anchor. Each recapture must durably isolate its frozen inode, keep
+  its visible ownership independent of the lower inode, and replay detach and
+  release without losing the original owner.
   Linux `FAN_PRE_ACCESS` reports both read and write access with a byte range;
   that event alone does not identify an edit. Keep enrollment gated until the
   full access decision and failure behavior pass a privileged local probe.

@@ -77,6 +77,9 @@ lower directory and a separate, empty view directory on the same filesystem.
 guarded view at the same path, retaining its visible ownership, modes, times,
 and file bytes through a durable private-name handoff. Every file in this
 initial in-place path must belong to the directory owner.
+New files and directories use their creator's UID/GID, inherit the parent group
+in setgid directories, and retain that ownership through remount and backup
+restore. The hidden lower tree remains private to the daemon.
 Both commands require a privileged daemon. For `add-guarded`, the view
 placeholder must be owned by a different user than `UID` and must not be
 group- or world-writable. Enrollment

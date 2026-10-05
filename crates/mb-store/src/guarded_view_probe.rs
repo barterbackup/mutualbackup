@@ -51,9 +51,31 @@ const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
 const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
 const DIRECTORY_MODE_KIND: &str = "guarded-view-directory-mode-v1";
+const CREATED_OWNER_KIND: &str = "guarded-view-created-owner-v1";
 const VIRTUAL_TIME_DIRTY_KIND: &str = "guarded-view-virtual-time-dirty-v1";
 const VIRTUAL_DIRECTORY_SIZE_DIRTY_KIND: &str = "guarded-view-virtual-directory-size-dirty-v1";
 pub(crate) const FILE_GUARD_KIND: &str = "guarded-view-file-guard-v1";
+
+pub(crate) fn retire_created_owners(control: &ControlStore, anchor_id: Uuid) -> anyhow::Result<()> {
+    for (id, bytes) in control.records(CREATED_OWNER_KIND)? {
+        if !id.starts_with(anchor_id.as_bytes()) {
+            continue;
+        }
+        let record: CreatedOwnerRecord = mb_core::decode_canonical(&bytes)?;
+        ensure!(
+            id.len() == 24
+                && record.version == 1
+                && record.anchor_id == anchor_id
+                && record.inode >= 2
+                && id[16..] == record.inode.to_le_bytes()
+                && record.uid != u32::MAX
+                && record.gid != u32::MAX,
+            "invalid guarded creation owner retirement"
+        );
+        control.delete_record_if_value(CREATED_OWNER_KIND, &id, &bytes)?;
+    }
+    Ok(())
+}
 
 pub(crate) fn virtual_directory_size_dirty_ids(
     control: &ControlStore,
@@ -158,7 +180,7 @@ pub(crate) fn verify_retired_namespace_quiescent(
             ensure!(id.len() == 24, "invalid guarded namespace record ID");
             let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
             ensure!(
-                record.version == 1 && record.pending.is_none(),
+                matches!(record.version, 1 | 2) && record.pending.is_none(),
                 "guarded namespace has an unfinished file move during retirement"
             );
         }
@@ -222,7 +244,7 @@ pub(crate) fn captured_file_path_for_retirement(
     };
     let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
     ensure!(
-        record.version == 1
+        matches!(record.version, 1 | 2)
             && record.captured_path == captured_path
             && record.expected == expected
             && record.pending.is_none(),
@@ -251,7 +273,7 @@ pub(crate) fn captured_directory_path_for_retirement(
     };
     let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
     ensure!(
-        record.version == 1 && record.expected == expected,
+        matches!(record.version, 1 | 2) && record.expected == expected,
         "captured directory has a mismatched namespace record"
     );
     record
@@ -292,6 +314,18 @@ struct DirectoryCreateIntent {
     staging_name: String,
     target: Vec<u8>,
     expected: Option<NativeFileId>,
+}
+
+/// Namespace-local presentation ownership. Lower inodes stay daemon-owned;
+/// an identified creation binds this record before publishing its name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CreatedOwnerRecord {
+    version: u16,
+    anchor_id: Uuid,
+    inode: u64,
+    expected: Option<NativeFileId>,
+    uid: u32,
+    gid: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -498,6 +532,54 @@ impl GuardedNamespace {
         id
     }
 
+    fn created_owner_record(
+        &self,
+        control: &ControlStore,
+        inode: u64,
+    ) -> anyhow::Result<Option<CreatedOwnerRecord>> {
+        control
+            .get_record(CREATED_OWNER_KIND, &self.record_id(inode))?
+            .map(|bytes| {
+                let record: CreatedOwnerRecord = mb_core::decode_canonical(&bytes)?;
+                ensure!(
+                    record.version == 1
+                        && record.anchor_id == self.anchor_id
+                        && record.inode == inode
+                        && inode >= 2
+                        && record.uid != u32::MAX
+                        && record.gid != u32::MAX
+                        && record.expected.is_none_or(|id| id.inode != 0),
+                    "invalid guarded creation owner record"
+                );
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    fn created_owner(
+        &self,
+        inode: u64,
+        expected: NativeFileId,
+        historical_owner: (u32, u32),
+        required: bool,
+    ) -> anyhow::Result<(u32, u32)> {
+        let control = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        match self.created_owner_record(&control, inode)? {
+            Some(record) => {
+                ensure!(
+                    record.expected == Some(expected),
+                    "guarded creation owner belongs to another inode"
+                );
+                Ok((record.uid, record.gid))
+            }
+            None if !required => Ok(historical_owner),
+            None => anyhow::bail!("guarded creation lost its owner record"),
+        }
+    }
+
     fn replace_id(&self, operation: Uuid) -> Vec<u8> {
         let mut id = self.anchor_id.as_bytes().to_vec();
         id.extend_from_slice(operation.as_bytes());
@@ -596,21 +678,52 @@ impl GuardedNamespace {
             .map_err(io::Error::other)
     }
 
-    fn store_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
-        let bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
-        let inserted = self
-            .control
-            .lock()
-            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
-            .put_record_if_absent(CREATE_KIND, &self.record_id(inode), &bytes)
-            .map_err(io::Error::other)?;
-        if !inserted {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "guarded create inode already recorded",
+    fn store_create(
+        &self,
+        inode: u64,
+        intent: &CreateIntent,
+        owner: Option<(u32, u32)>,
+    ) -> io::Result<()> {
+        if intent.version != if owner.is_some() { 2 } else { 1 } {
+            return Err(io::Error::other(
+                "guarded file creation owner/version mismatch",
             ));
         }
-        Ok(())
+        let bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        let id = self.record_id(inode);
+        for kind in [CREATE_KIND, NAMESPACE_KIND, CREATED_OWNER_KIND] {
+            if control
+                .get_record(kind, &id)
+                .map_err(io::Error::other)?
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "guarded create inode already recorded",
+                ));
+            }
+        }
+        let mut records = vec![(CREATE_KIND.to_owned(), id.clone(), bytes)];
+        if let Some((uid, gid)) = owner {
+            records.push((
+                CREATED_OWNER_KIND.to_owned(),
+                id,
+                mb_core::canonical_bytes(&CreatedOwnerRecord {
+                    version: 1,
+                    anchor_id: self.anchor_id,
+                    inode,
+                    expected: Some(intent.expected),
+                    uid,
+                    gid,
+                })
+                .map_err(io::Error::other)?,
+            ));
+        }
+        control.put_records(&records).map_err(io::Error::other)
     }
 
     fn store_directory_create_with_mode(
@@ -618,7 +731,13 @@ impl GuardedNamespace {
         inode: u64,
         intent: &DirectoryCreateIntent,
         mode: u16,
+        owner: Option<(u32, u32)>,
     ) -> io::Result<()> {
+        if intent.version != if owner.is_some() { 2 } else { 1 } {
+            return Err(io::Error::other(
+                "guarded directory creation owner/version mismatch",
+            ));
+        }
         let id = self.record_id(inode);
         let intent_bytes = mb_core::canonical_bytes(intent).map_err(io::Error::other)?;
         let mode_bytes = mb_core::canonical_bytes(&DirectoryModeRecord { version: 1, mode })
@@ -639,18 +758,36 @@ impl GuardedNamespace {
                 .get_record(DIRECTORY_KIND, &id)
                 .map_err(io::Error::other)?
                 .is_some()
+            || control
+                .get_record(CREATED_OWNER_KIND, &id)
+                .map_err(io::Error::other)?
+                .is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "guarded directory inode already recorded",
             ));
         }
-        control
-            .put_records(&[
-                (DIRECTORY_CREATE_KIND.to_owned(), id.clone(), intent_bytes),
-                (DIRECTORY_MODE_KIND.to_owned(), id, mode_bytes),
-            ])
-            .map_err(io::Error::other)
+        let mut records = vec![
+            (DIRECTORY_CREATE_KIND.to_owned(), id.clone(), intent_bytes),
+            (DIRECTORY_MODE_KIND.to_owned(), id.clone(), mode_bytes),
+        ];
+        if let Some((uid, gid)) = owner {
+            records.push((
+                CREATED_OWNER_KIND.to_owned(),
+                id,
+                mb_core::canonical_bytes(&CreatedOwnerRecord {
+                    version: 1,
+                    anchor_id: self.anchor_id,
+                    inode,
+                    expected: intent.expected,
+                    uid,
+                    gid,
+                })
+                .map_err(io::Error::other)?,
+            ));
+        }
+        control.put_records(&records).map_err(io::Error::other)
     }
 
     fn advance_directory_create(
@@ -659,17 +796,38 @@ impl GuardedNamespace {
         before: &DirectoryCreateIntent,
         after: &DirectoryCreateIntent,
     ) -> io::Result<()> {
-        let before = mb_core::canonical_bytes(before).map_err(io::Error::other)?;
-        let after = mb_core::canonical_bytes(after).map_err(io::Error::other)?;
-        self.control
+        let expected = after
+            .expected
+            .ok_or_else(|| io::Error::other("guarded directory has no identity"))?;
+        let before_bytes = mb_core::canonical_bytes(before).map_err(io::Error::other)?;
+        let after_bytes = mb_core::canonical_bytes(after).map_err(io::Error::other)?;
+        let control = self
+            .control
             .lock()
-            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
-            .replace_record_if_value(
-                DIRECTORY_CREATE_KIND,
-                &self.record_id(inode),
-                &before,
-                &after,
-            )
+            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+        let id = self.record_id(inode);
+        let mut records = vec![(DIRECTORY_CREATE_KIND.to_owned(), id.clone(), after_bytes)];
+        let owner = self
+            .created_owner_record(&control, inode)
+            .map_err(io::Error::other)?;
+        if before.version == 2 && owner.is_none() {
+            return Err(io::Error::other(
+                "guarded directory creation lost its owner record",
+            ));
+        }
+        if let Some(mut owner) = owner {
+            if owner.expected != before.expected {
+                return Err(io::Error::other("guarded directory owner identity changed"));
+            }
+            owner.expected = Some(expected);
+            records.push((
+                CREATED_OWNER_KIND.to_owned(),
+                id.clone(),
+                mb_core::canonical_bytes(&owner).map_err(io::Error::other)?,
+            ));
+        }
+        control
+            .put_records_and_retire_if_value(&records, DIRECTORY_CREATE_KIND, &id, &before_bytes)
             .map_err(io::Error::other)
     }
 
@@ -681,8 +839,10 @@ impl GuardedNamespace {
         let expected = intent
             .expected
             .ok_or_else(|| io::Error::other("guarded directory identity was not recorded"))?;
+        self.created_owner(inode, expected, (0, 0), intent.version == 2)
+            .map_err(io::Error::other)?;
         let record = DirectoryRecord {
-            version: 1,
+            version: intent.version,
             expected,
             current: Some(intent.target.clone()),
         };
@@ -768,7 +928,8 @@ impl GuardedNamespace {
                 &[(DIRECTORY_KIND.to_owned(), id.clone(), bytes)],
                 &[
                     (DIRECTORY_REMOVE_KIND.to_owned(), id.clone()),
-                    (DIRECTORY_MODE_KIND.to_owned(), id),
+                    (DIRECTORY_MODE_KIND.to_owned(), id.clone()),
+                    (CREATED_OWNER_KIND.to_owned(), id),
                 ],
             )
             .map_err(io::Error::other)
@@ -841,7 +1002,7 @@ impl GuardedNamespace {
             }
         };
         ensure!(
-            record.version == 1
+            matches!(record.version, 1 | 2)
                 && record.expected == intent.expected
                 && record.current.as_deref() == Some(intent.source.as_slice()),
             "guarded directory rename differs from source record"
@@ -909,7 +1070,10 @@ impl GuardedNamespace {
         }
         for (stored_inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
             let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
-            ensure!(record.version == 1, "invalid guarded directory record");
+            ensure!(
+                matches!(record.version, 1 | 2),
+                "invalid guarded directory record"
+            );
             if stored_inode < first_dynamic_inode {
                 ensure!(
                     captured
@@ -943,7 +1107,10 @@ impl GuardedNamespace {
         let mut files = defaults.clone();
         for (stored_inode, bytes) in self.owned_records(NAMESPACE_KIND)? {
             let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
-            ensure!(record.version == 1, "invalid guarded namespace record");
+            ensure!(
+                matches!(record.version, 1 | 2),
+                "invalid guarded namespace record"
+            );
             if stored_inode < first_dynamic_inode {
                 ensure!(
                     defaults.get(&stored_inode).is_some_and(|default| {
@@ -1030,8 +1197,13 @@ impl GuardedNamespace {
             }
         }
         let deletions = replaced
-            .map(|(target_inode, _)| (DIRECTORY_MODE_KIND.to_owned(), self.record_id(target_inode)))
             .into_iter()
+            .flat_map(|(target_inode, _)| {
+                [
+                    (DIRECTORY_MODE_KIND.to_owned(), self.record_id(target_inode)),
+                    (CREATED_OWNER_KIND.to_owned(), self.record_id(target_inode)),
+                ]
+            })
             .collect::<Vec<_>>();
         self.control
             .lock()
@@ -1097,8 +1269,10 @@ impl GuardedNamespace {
     }
 
     fn finish_create(&self, inode: u64, intent: &CreateIntent) -> io::Result<()> {
+        self.created_owner(inode, intent.expected, (0, 0), intent.version == 2)
+            .map_err(io::Error::other)?;
         let record = NamespaceRecord {
-            version: 1,
+            version: intent.version,
             captured_path: PathBuf::new(),
             expected: intent.expected,
             current: Some(intent.target.clone()),
@@ -1218,27 +1392,66 @@ impl GuardedNamespace {
         for record in captured_files.values() {
             add(record.expected)?;
         }
-        for (_, bytes) in self.owned_records(NAMESPACE_KIND)? {
+        for (inode, bytes) in self.owned_records(NAMESPACE_KIND)? {
             let record: NamespaceRecord = mb_core::decode_canonical(&bytes)?;
-            ensure!(record.version == 1, "invalid guarded file namespace record");
+            ensure!(
+                matches!(record.version, 1 | 2),
+                "invalid guarded file namespace record"
+            );
+            self.created_owner(
+                inode,
+                record.expected,
+                (0, 0),
+                record.version == 2 && record.current.is_some(),
+            )?;
             add(record.expected)?;
         }
-        for (_, bytes) in self.owned_records(DIRECTORY_KIND)? {
+        for (inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
             let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
-            ensure!(record.version == 1, "invalid guarded directory record");
+            ensure!(
+                matches!(record.version, 1 | 2),
+                "invalid guarded directory record"
+            );
+            self.created_owner(
+                inode,
+                record.expected,
+                (0, 0),
+                record.version == 2 && record.current.is_some(),
+            )?;
             add(record.expected)?;
         }
-        for (_, bytes) in self.owned_records(CREATE_KIND)? {
+        for (inode, bytes) in self.owned_records(CREATE_KIND)? {
             let intent: CreateIntent = mb_core::decode_canonical(&bytes)?;
-            ensure!(intent.version == 1, "invalid guarded file create intent");
+            ensure!(
+                matches!(intent.version, 1 | 2),
+                "invalid guarded file create intent"
+            );
+            self.created_owner(inode, intent.expected, (0, 0), intent.version == 2)?;
             add(intent.expected)?;
         }
-        for (_, bytes) in self.owned_records(DIRECTORY_CREATE_KIND)? {
+        for (inode, bytes) in self.owned_records(DIRECTORY_CREATE_KIND)? {
             let intent: DirectoryCreateIntent = mb_core::decode_canonical(&bytes)?;
             ensure!(
-                intent.version == 1,
+                matches!(intent.version, 1 | 2),
                 "invalid guarded directory create intent"
             );
+            {
+                let control = self
+                    .control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                let owner = self.created_owner_record(&control, inode)?;
+                ensure!(
+                    intent.version != 2 || owner.is_some(),
+                    "guarded directory creation lost its owner record"
+                );
+                if let Some(owner) = owner {
+                    ensure!(
+                        owner.expected == intent.expected,
+                        "guarded directory creation owner changed identity"
+                    );
+                }
+            }
             if let Some(id) = intent.expected {
                 add(id)?;
             }
@@ -1281,8 +1494,8 @@ impl GuardedNamespace {
             let intent: ReplaceIntent = mb_core::decode_canonical(&bytes)?;
             ensure!(
                 intent.version == 1
-                    && intent.source_before.version == 1
-                    && intent.target_before.version == 1,
+                    && matches!(intent.source_before.version, 1 | 2)
+                    && matches!(intent.target_before.version, 1 | 2),
                 "invalid guarded file replace intent"
             );
             add(intent.source_before.expected)?;
@@ -1428,7 +1641,11 @@ impl GuardedNamespace {
                 "guarded create aliases captured inode"
             );
             let intent: CreateIntent = mb_core::decode_canonical(&bytes)?;
-            ensure!(intent.version == 1, "unsupported guarded create intent");
+            ensure!(
+                matches!(intent.version, 1 | 2),
+                "unsupported guarded create intent"
+            );
+            self.created_owner(inode, intent.expected, (0, 0), intent.version == 2)?;
             ensure!(
                 intent.expected.filesystem_id == lower_root.identity()?.filesystem_id,
                 "guarded create belongs to another filesystem"
@@ -1446,7 +1663,13 @@ impl GuardedNamespace {
                     self.control
                         .lock()
                         .map_err(|_| io::Error::other("guarded control lock is poisoned"))?
-                        .delete_record_if_value(CREATE_KIND, &id, &bytes)?;
+                        .put_records_and_retire_and_delete_if_value(
+                            &[],
+                            &[(CREATED_OWNER_KIND.to_owned(), id.clone())],
+                            CREATE_KIND,
+                            &id,
+                            &bytes,
+                        )?;
                 }
                 _ => anyhow::bail!("guarded create target changed before replay"),
             }
@@ -1469,11 +1692,28 @@ impl GuardedNamespace {
             );
             let intent: DirectoryCreateIntent = mb_core::decode_canonical(&bytes)?;
             ensure!(
-                intent.version == 1
+                matches!(intent.version, 1 | 2)
                     && intent.staging_name.starts_with(PREFIX)
                     && Uuid::parse_str(&intent.staging_name[PREFIX.len()..]).is_ok(),
                 "invalid guarded directory creation intent"
             );
+            {
+                let control = self
+                    .control
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                let owner = self.created_owner_record(&control, inode)?;
+                ensure!(
+                    intent.version != 2 || owner.is_some(),
+                    "guarded directory creation lost its owner record"
+                );
+                if let Some(owner) = owner {
+                    ensure!(
+                        owner.expected == intent.expected,
+                        "guarded directory creation owner changed identity"
+                    );
+                }
+            }
             let (target, _) = namespace_path(&intent.target, directories)?;
             let owned = namespace_parent(lower_root, &target)?;
             let target_parent = owned.as_ref().unwrap_or(lower_root);
@@ -1529,7 +1769,8 @@ impl GuardedNamespace {
                     &[],
                     &[
                         (DIRECTORY_CREATE_KIND.to_owned(), id.clone()),
-                        (DIRECTORY_MODE_KIND.to_owned(), id),
+                        (DIRECTORY_MODE_KIND.to_owned(), id.clone()),
+                        (CREATED_OWNER_KIND.to_owned(), id),
                     ],
                 )?;
             }
@@ -1562,7 +1803,7 @@ impl GuardedNamespace {
             }
             let record = self.directory_record(inode)?;
             ensure!(
-                record.version == 1
+                matches!(record.version, 1 | 2)
                     && record.current.as_deref() == Some(intent.target.as_slice())
                     && record.expected == intent.expected,
                 "guarded directory removal differs from stored directory"
@@ -1768,10 +2009,16 @@ impl GuardedNamespace {
         for (inode, bytes) in self.owned_records(DIRECTORY_KIND)? {
             let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
             ensure!(
-                record.version == 1
+                matches!(record.version, 1 | 2)
                     && record.expected.filesystem_id == lower_root.identity()?.filesystem_id,
                 "invalid guarded directory record"
             );
+            self.created_owner(
+                inode,
+                record.expected,
+                (view_uid, view_gid),
+                record.version == 2 && record.current.is_some(),
+            )?;
             if inode < first_dynamic_inode {
                 ensure!(
                     captured.contains_key(&inode),
@@ -1838,8 +2085,8 @@ impl GuardedNamespace {
                 .directory_mode(inode)?
                 .unwrap_or((lower.as_file().metadata()?.permissions().mode() & 0o7777) as u16);
             let mut attr = probe_directory_attr(lower.as_file(), INodeNo(inode), mode)?;
-            attr.uid = view_uid;
-            attr.gid = view_gid;
+            (attr.uid, attr.gid) =
+                self.created_owner(inode, expected, (view_uid, view_gid), false)?;
             let name = path
                 .file_name()
                 .context("created guarded directory has no name")?
@@ -1911,8 +2158,8 @@ impl GuardedNamespace {
             ensure!(
                 intent.version == 1
                     && intent.source_inode != intent.target_inode
-                    && intent.source_before.version == 1
-                    && intent.target_before.version == 1
+                    && matches!(intent.source_before.version, 1 | 2)
+                    && matches!(intent.target_before.version, 1 | 2)
                     && intent.source_before.pending.is_none()
                     && intent.target_before.pending.is_none()
                     && intent.source_before.expected != intent.target_before.expected,
@@ -2034,11 +2281,17 @@ impl GuardedNamespace {
             },
         };
         ensure!(
-            record.version == 1
+            matches!(record.version, 1 | 2)
                 && record.captured_path == captured_path
                 && record.expected == expected,
             "guarded namespace record does not match capture"
         );
+        self.created_owner(
+            inode,
+            expected,
+            (0, 0),
+            record.version == 2 && record.current.is_some(),
+        )?;
         if let Some(target) = record.pending.clone() {
             let old = record
                 .current
@@ -3061,6 +3314,30 @@ impl GuardedProbeView {
             .or_else(|| self.directories.get(&inode).cloned())
     }
 
+    fn creation_owner(&self, request: &Request, parent: INodeNo) -> io::Result<((u32, u32), bool)> {
+        let attr = if parent == INodeNo::ROOT {
+            self.root_attr()?
+        } else {
+            self.directory_attr(
+                &self
+                    .directory(parent.0)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?,
+            )?
+        };
+        let inherit_group = attr.perm & 0o2000 != 0;
+        Ok((
+            (
+                request.uid(),
+                if inherit_group {
+                    attr.gid
+                } else {
+                    request.gid()
+                },
+            ),
+            inherit_group,
+        ))
+    }
+
     fn rename_directory(
         &self,
         inode: u64,
@@ -3685,7 +3962,12 @@ impl GuardedProbeView {
                 INodeNo(inode),
                 location,
                 plan.source_root(),
-                (view_uid, view_gid),
+                namespace.created_owner(
+                    inode,
+                    record.expected,
+                    (view_uid, view_gid),
+                    record.version == 2,
+                )?,
                 Arc::clone(&control),
                 guard,
             )?);
@@ -4607,7 +4889,7 @@ impl Filesystem for GuardedProbeView {
 
     fn mkdir(
         &self,
-        _request: &Request,
+        request: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -4664,17 +4946,26 @@ impl Filesystem for GuardedProbeView {
             };
         let target = parent_path.join(name);
         let mut intent = DirectoryCreateIntent {
-            version: 1,
+            version: 2,
             staging_name: format!(".guarded-mkdir-{}", Uuid::new_v4()),
             target: target.as_os_str().as_bytes().to_vec(),
             expected: None,
         };
-        let visible_mode = ((mode & !umask) & 0o777) as u16;
+        let (owner, inherit_group) = match self.creation_owner(request, parent) {
+            Ok(owner) => owner,
+            Err(error) => {
+                reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+                return;
+            }
+        };
+        let visible_mode =
+            ((mode & !umask) & 0o1777) as u16 | if inherit_group { 0o2000 } else { 0 };
         if let Err(error) = self.mark_virtual_directory_size_dirty(parent) {
             reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
             return;
         }
-        if let Err(error) = namespace.store_directory_create_with_mode(inode, &intent, visible_mode)
+        if let Err(error) =
+            namespace.store_directory_create_with_mode(inode, &intent, visible_mode, Some(owner))
         {
             reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
             return;
@@ -4709,8 +5000,7 @@ impl Filesystem for GuardedProbeView {
                 .map_err(io::Error::other)?;
             namespace.finish_directory_create(inode, &intent)?;
             let mut attr = probe_directory_attr(staged.as_file(), INodeNo(inode), visible_mode)?;
-            attr.uid = self.root_uid;
-            attr.gid = self.root_gid;
+            (attr.uid, attr.gid) = owner;
             Ok(GuardedProbeDirectory {
                 attr,
                 virtual_time: None,
@@ -4740,7 +5030,7 @@ impl Filesystem for GuardedProbeView {
 
     fn create(
         &self,
-        _request: &Request,
+        request: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -4800,6 +5090,13 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::EEXIST);
             return;
         }
+        let owner = match self.creation_owner(request, parent) {
+            Ok((owner, _)) => owner,
+            Err(error) => {
+                reply.error(Errno::from_i32(error.raw_os_error().unwrap_or(libc::EIO)));
+                return;
+            }
+        };
         let result = (|| -> io::Result<CreatedGuardedFile> {
             let owned = if parent_path.as_os_str().is_empty() {
                 None
@@ -4835,12 +5132,12 @@ impl Filesystem for GuardedProbeView {
                 inode: source.metadata()?.ino(),
             };
             let intent = CreateIntent {
-                version: 1,
+                version: 2,
                 target: relative_path.as_os_str().as_bytes().to_vec(),
                 expected,
             };
             self.mark_virtual_directory_size_dirty(parent)?;
-            namespace.store_create(inode, &intent)?;
+            namespace.store_create(inode, &intent, Some(owner))?;
             if let Err(error) = lower.publish_unlinked_child_file(&source, name, expected) {
                 self.poisoned.store(true, Ordering::Release);
                 return Err(io::Error::other(error));
@@ -4857,7 +5154,7 @@ impl Filesystem for GuardedProbeView {
                     relative_path,
                 },
                 &lower_root.descriptor_path(),
-                (self.root_uid, self.root_gid),
+                owner,
                 Arc::clone(&namespace.control),
                 None,
             )
@@ -5205,7 +5502,7 @@ impl Filesystem for GuardedProbeView {
                 },
                 None => return Err(io::Error::from(io::ErrorKind::NotFound)),
             };
-            if record.version != 1
+            if !matches!(record.version, 1 | 2)
                 || record.expected != directory.native_id
                 || record.current.as_deref() != Some(directory.relative_path.as_os_str().as_bytes())
             {
@@ -5505,6 +5802,219 @@ mod tests {
         GuardedNamespace, GuardedProbeFile, GuardedProbeView, NAMESPACE_KIND, NamespaceRecord,
         ProbeLocation, REPLACE_KIND, pinned_statvfs, probe_file_attr, unix_system_time,
     };
+
+    #[test]
+    fn creation_owner_replays_and_missing_owner_stops_namespace_replay() {
+        for publish in [false, true] {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            fs::create_dir(&lower).unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let source = root.create_unlinked_child_file().unwrap();
+            let expected = crate::NativeFileId {
+                filesystem_id: root.identity().unwrap().filesystem_id,
+                inode: source.metadata().unwrap().ino(),
+            };
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([198; 32]));
+            let database = area.path().join("control.db");
+            let control = Arc::new(Mutex::new(ControlStore::open(&database, &keys).unwrap()));
+            let anchor_id = uuid::Uuid::new_v4();
+            let journal = GuardedNamespace {
+                control,
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let intent = CreateIntent {
+                version: 2,
+                target: b"new".to_vec(),
+                expected,
+            };
+            journal
+                .store_create(2, &intent, Some((65533, 65532)))
+                .unwrap();
+            if publish {
+                root.publish_unlinked_child_file(&source, "new", expected)
+                    .unwrap();
+            }
+            drop(source);
+            drop(journal);
+            let control = Arc::new(Mutex::new(ControlStore::open(&database, &keys).unwrap()));
+            let journal = GuardedNamespace {
+                control,
+                anchor_id,
+                records: Mutex::new(HashMap::new()),
+            };
+            let directories = HashMap::from([(PathBuf::new(), INodeNo::ROOT)]);
+            if publish {
+                let id = journal.record_id(2);
+                let owner = journal
+                    .control
+                    .lock()
+                    .unwrap()
+                    .get_record(super::CREATED_OWNER_KIND, &id)
+                    .unwrap()
+                    .unwrap();
+                journal
+                    .control
+                    .lock()
+                    .unwrap()
+                    .delete_record(super::CREATED_OWNER_KIND, &id)
+                    .unwrap();
+                assert!(
+                    journal
+                        .preflight_known_lower_inodes(&root, &HashMap::new(), &HashMap::new())
+                        .is_err()
+                );
+                assert!(journal.reconcile_creates(&root, &directories, 2).is_err());
+                assert!(lower.join("new").exists());
+                journal
+                    .control
+                    .lock()
+                    .unwrap()
+                    .put_record(super::CREATED_OWNER_KIND, &id, &owner)
+                    .unwrap();
+                let mut foreign: super::CreatedOwnerRecord =
+                    mb_core::decode_canonical(&owner).unwrap();
+                foreign.expected.as_mut().unwrap().inode += 1;
+                journal
+                    .control
+                    .lock()
+                    .unwrap()
+                    .put_record(
+                        super::CREATED_OWNER_KIND,
+                        &id,
+                        &mb_core::canonical_bytes(&foreign).unwrap(),
+                    )
+                    .unwrap();
+                assert!(journal.reconcile_creates(&root, &directories, 2).is_err());
+                journal
+                    .control
+                    .lock()
+                    .unwrap()
+                    .put_record(super::CREATED_OWNER_KIND, &id, &owner)
+                    .unwrap();
+            }
+            journal.reconcile_creates(&root, &directories, 2).unwrap();
+            if publish {
+                assert_eq!(
+                    journal
+                        .created_owner(2, expected, (65534, 65534), true)
+                        .unwrap(),
+                    (65533, 65532)
+                );
+                journal
+                    .preflight_known_lower_inodes(&root, &HashMap::new(), &HashMap::new())
+                    .unwrap();
+            } else {
+                assert!(
+                    journal
+                        .control
+                        .lock()
+                        .unwrap()
+                        .get_record(super::CREATED_OWNER_KIND, &journal.record_id(2))
+                        .unwrap()
+                        .is_none()
+                );
+                journal
+                    .store_create(2, &intent, Some((65534, 65534)))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn directory_creation_binds_owner_with_identity_before_publication() {
+        for identified in [false, true] {
+            let area = tempfile::tempdir().unwrap();
+            let lower = area.path().join("lower");
+            let staging = area.path().join("staging");
+            fs::create_dir(&lower).unwrap();
+            fs::create_dir(&staging).unwrap();
+            let root = PinnedDirectory::open(&lower).unwrap();
+            let staging = PinnedDirectory::open(&staging).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([197; 32]));
+            let control = Arc::new(Mutex::new(
+                ControlStore::open(area.path().join("control.db"), &keys).unwrap(),
+            ));
+            let journal = GuardedNamespace {
+                control,
+                anchor_id: uuid::Uuid::new_v4(),
+                records: Mutex::new(HashMap::new()),
+            };
+            let mut intent = super::DirectoryCreateIntent {
+                version: 2,
+                staging_name: format!(".guarded-mkdir-{}", uuid::Uuid::new_v4()),
+                target: b"new".to_vec(),
+                expected: None,
+            };
+            journal
+                .store_directory_create_with_mode(2, &intent, 0o2750, Some((65533, 65532)))
+                .unwrap();
+            let directory = staging
+                .create_child_directory(&intent.staging_name)
+                .unwrap();
+            let expected = directory.identity().unwrap();
+            if identified {
+                let before = intent.clone();
+                intent.expected = Some(expected);
+                journal
+                    .advance_directory_create(2, &before, &intent)
+                    .unwrap();
+                assert_eq!(
+                    journal
+                        .created_owner(2, expected, (65534, 65534), true)
+                        .unwrap(),
+                    (65533, 65532)
+                );
+            }
+            drop(directory);
+            journal
+                .reconcile_directory_creates(
+                    &root,
+                    &staging,
+                    &HashMap::from([(PathBuf::new(), INodeNo::ROOT)]),
+                    2,
+                )
+                .unwrap();
+            if identified {
+                let directories = journal
+                    .load_directories(&root, &HashMap::new(), 2, 65534, 65534)
+                    .unwrap()
+                    .dynamic;
+                assert_eq!(directories.len(), 1);
+                assert_eq!(
+                    (
+                        directories[0].attr.uid,
+                        directories[0].attr.gid,
+                        directories[0].attr.perm
+                    ),
+                    (65533, 65532, 0o2750)
+                );
+                journal
+                    .control
+                    .lock()
+                    .unwrap()
+                    .delete_record(super::CREATED_OWNER_KIND, &journal.record_id(2))
+                    .unwrap();
+                assert!(
+                    journal
+                        .load_directories(&root, &HashMap::new(), 2, 65534, 65534)
+                        .is_err()
+                );
+            } else {
+                assert!(!lower.join("new").exists());
+                assert!(
+                    journal
+                        .control
+                        .lock()
+                        .unwrap()
+                        .get_record(super::CREATED_OWNER_KIND, &journal.record_id(2))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
 
     #[test]
     fn native_change_time_keeps_nanoseconds_on_both_sides_of_epoch() {
@@ -6010,7 +6520,7 @@ mod tests {
                 expected: None,
             };
             journal
-                .store_directory_create_with_mode(2, &intent, 0o755)
+                .store_directory_create_with_mode(2, &intent, 0o755, None)
                 .unwrap();
             let mut staged = None;
             if phase >= 1 {
@@ -6138,7 +6648,7 @@ mod tests {
                 expected: None,
             };
             journal
-                .store_directory_create_with_mode(2, &intent, 0o755)
+                .store_directory_create_with_mode(2, &intent, 0o755, None)
                 .unwrap();
             let staged = staging.create_child_directory(&stage_name).unwrap();
             if identity_recorded {
@@ -6774,7 +7284,7 @@ mod tests {
                 anchor_id,
                 records: Mutex::new(HashMap::new()),
             };
-            journal.store_create(index, &intent).unwrap();
+            journal.store_create(index, &intent, None).unwrap();
             if published {
                 root.publish_unlinked_child_file(&source, &name, expected)
                     .unwrap();
@@ -6840,6 +7350,7 @@ mod tests {
                     target: b"target".to_vec(),
                     expected,
                 },
+                None,
             )
             .unwrap();
         fs::write(lower.join("target"), b"foreign").unwrap();

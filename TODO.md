@@ -2,6 +2,47 @@
 
 ## Milestone 6 active implementation gates
 
+- [x] **M6 retain guarded creator ownership across replay, backup, and release.**
+  FUSE file and directory creation now uses the request's UID/GID instead of
+  assigning the root's owner. Setgid parents supply the inherited group and
+  setgid bit on new directories. The lower inodes remain daemon-owned, with
+  private directory modes; ownership is user-visible metadata. Version-2
+  namespace/create records require an owner record bound to the view inode,
+  root anchor, and native identity before publication. File intent and owner
+  are recorded atomically; directory identity and owner advance together.
+  Missing or mismatched ownership stops replay before namespace mutation.
+  Historical version-1 records retain their original root-owner semantics.
+  Abandoned directory/file creations and directory removal retire their owner
+  record, and claim retirement clears the remaining ownership records after
+  the release metadata is durable. Normal replay tests cover missing and
+  mismatched owner records, abandoned creations, and directory identity
+  publication. The privileged node regression verifies ordinary and setgid
+  creation by a second user, populated-directory rename, remount, denied access
+  by the root owner, exact CRLF/NUL bytes, signed backup/restore, and release
+  with ownership intact. Mixed-owner initial enrollment, chown/ACL/xattr
+  fidelity, recapture isolation, and full guarded milestone closure remain open.
+  Local validation: all 135 normal store tests, strict locked all-target
+  workspace Clippy, formatting, and diff checks pass. The new creator probe
+  passed on ext4 (7.29 seconds) and a fresh disposable Btrfs image (13.70
+  seconds); the existing 14-stage in-place replay probe passed on both (41.62
+  and 104.03 seconds), as did all 18 privileged FUSE operation tests and nine
+  mount/replay tests. The dedicated ENOSPC probe was outside this ownership
+  slice. The Btrfs image, mount, and loop device were independently confirmed
+  removed. Compilation and execution were local, with remote builders disabled.
+- [ ] **M6 isolate recaptured files from retained lower descriptors.** Source
+  review finds that `GuardedRootCapturePlan::prepare_file_edit_at` restores the
+  working inode's original owner after detaching the first anchor, while a later
+  `GuardedFileCapturePlan::capture` freezes and hard-links that inode without
+  repeating private-owner isolation. A read-only lower descriptor retained
+  before enrollment may therefore regain owner permission to `fchmod` and
+  reopen `/proc/self/fd` for writing after recapture's short guard ends.
+  Add a privileged regression for enrollment, first edit, stopped-view
+  recapture, retained-descriptor writes, crash/reopen, and repeated edits on
+  ext4 and Btrfs. Make each recapture's ownership transition durable and keep
+  its anchor private until detach or retirement; verify normal release restores
+  the user-visible owner. This is a source finding, not a completed runtime
+  exploit proof. Keep mixed-owner enrollment and the complete guarded Git
+  capture/checkout gate open until it is corrected and verified.
 - [ ] **M6 finish the versioned source-backend boundary across platforms.**
   The Linux reflink and guarded backends have versioned capture records, but
   milestone closure still requires the planned Windows NTFS/VSS and macOS clone

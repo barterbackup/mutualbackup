@@ -27516,6 +27516,190 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_creators_keep_ownership_through_reopen_backup_and_release() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        fn actor(uid: u32, path: &Path, script: &str) {
+            let output = Command::new("python3")
+                .uid(uid)
+                .gid(uid)
+                .arg("-c")
+                .arg(script)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+
+        fn verify(tree: &Path) {
+            for (path, owner, group, mode) in [
+                ("", 65534, 65534, 0o755),
+                ("shared", 65534, 65532, 0o2777),
+                ("shared/renamed", 65533, 65532, 0o2700),
+                ("shared/renamed/file", 65533, 65532, 0o600),
+                ("shared/direct", 65533, 65532, 0o640),
+                ("plain", 65534, 65534, 0o777),
+                ("plain/new", 65533, 65533, 0o700),
+                ("plain/new/file", 65533, 65533, 0o600),
+            ] {
+                let metadata = fs::metadata(tree.join(path)).unwrap();
+                assert_eq!(
+                    (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
+                    (owner, group, mode),
+                    "{}",
+                    tree.join(path).display()
+                );
+            }
+            assert_eq!(
+                fs::read(tree.join("shared/renamed/file")).unwrap(),
+                b"creator\r\n\0bytes\nreopened"
+            );
+            assert_eq!(fs::read(tree.join("shared/direct")).unwrap(), b"direct\r\n");
+            assert_eq!(
+                fs::read(tree.join("plain/new/file")).unwrap(),
+                b"plain\0bytes"
+            );
+            assert!(!tree.join("shared/transient").exists());
+        }
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        for backup in [false, true] {
+            let area = tempfile::Builder::new()
+                .prefix("mb-guarded-creators-")
+                .tempdir_in(&test_root)
+                .unwrap();
+            fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let target = area.path().join("work");
+            let data_dir = area.path().join("node");
+            fs::create_dir(&target).unwrap();
+            fs::create_dir(target.join("shared")).unwrap();
+            fs::create_dir(target.join("plain")).unwrap();
+            for (path, group, mode) in [
+                (&target, 65534, 0o755),
+                (&target.join("shared"), 65532, 0o2777),
+                (&target.join("plain"), 65534, 0o777),
+            ] {
+                let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, group) }, 0);
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let seed = Seed::from_bytes([216 + u8::from(backup); 32]);
+            let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+            let root = node.add_guarded_protected_root_in_place(&target).unwrap();
+            let handoff = GuardedRecoveryHandoff::load(&node.control, root.root_id)
+                .unwrap()
+                .unwrap();
+            actor(
+                65533,
+                &target,
+                r#"import os,sys
+root=sys.argv[1]
+os.umask(0)
+os.mkdir(root+'/shared/new', 0o700)
+fd=os.open(root+'/shared/new/file', os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+os.write(fd, b'creator\r\n\0bytes'); os.close(fd)
+fd=os.open(root+'/shared/direct', os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o640)
+os.write(fd, b'direct\r\n'); os.close(fd)
+os.mkdir(root+'/shared/transient', 0o700)
+os.rmdir(root+'/shared/transient')
+os.rename(root+'/shared/new', root+'/shared/renamed')
+os.mkdir(root+'/plain/new', 0o700)
+fd=os.open(root+'/plain/new/file', os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+os.write(fd, b'plain\0bytes'); os.close(fd)
+"#,
+            );
+            for path in [
+                "",
+                "shared",
+                "shared/renamed",
+                "shared/renamed/file",
+                "shared/direct",
+                "plain",
+                "plain/new",
+                "plain/new/file",
+            ] {
+                assert_eq!(
+                    fs::metadata(handoff.lower_path().join(path)).unwrap().uid(),
+                    0
+                );
+            }
+            for path in ["", "shared", "shared/renamed", "plain", "plain/new"] {
+                assert_eq!(
+                    fs::metadata(handoff.lower_path().join(path))
+                        .unwrap()
+                        .mode()
+                        & 0o7777,
+                    0o700
+                );
+            }
+            node.guarded_mounts.pop().unwrap().stop().unwrap();
+            drop(node);
+
+            let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+            actor(
+                65533,
+                &target,
+                "import sys; p=sys.argv[1]+'/shared/renamed/file'; assert open(p,'rb').read()==b'creator\\r\\n\\0bytes'; open(p,'ab').write(b'\\nreopened')",
+            );
+            actor(
+                65534,
+                &target,
+                "import sys\ntry: open(sys.argv[1]+'/shared/renamed/file','rb')\nexcept PermissionError: pass\nelse: raise AssertionError('root owner gained creator access')",
+            );
+            verify(&target);
+            if backup {
+                let guild_id = [225; 32];
+                let revision = node
+                    .prepare_revision(guild_id, root.root_id, &target, 1, None)
+                    .unwrap();
+                assert_eq!(revision.value.format_version, 5);
+                let restored = area.path().join("restored");
+                crate::snapshot::restore_revision_from_source(
+                    &node.control,
+                    &node.keys,
+                    guild_id,
+                    &revision,
+                    &restored,
+                    |id| {
+                        crate::snapshot::render_sector(
+                            &node.control,
+                            &node.keys,
+                            id,
+                            Some(&guild_id),
+                        )
+                    },
+                )
+                .unwrap();
+                verify(&restored);
+                node.guarded_mounts.pop().unwrap().stop().unwrap();
+            } else {
+                node.remove_guarded_protected_root(root.root_id).unwrap();
+                verify(&target);
+                assert!(!handoff.lower_path().exists());
+                assert!(node.protected_roots().unwrap().is_empty());
+                assert!(
+                    node.control
+                        .records("guarded-view-created-owner-v1")
+                        .unwrap()
+                        .is_empty()
+                );
+                drop(node);
+                let reopened = Node::open(&data_dir, seed).unwrap();
+                assert!(reopened.protected_roots().unwrap().is_empty());
+                verify(&target);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn guarded_in_place_enrollment_replays_handoff_plan_and_mount() {
         use std::ffi::CString;
         use std::io::Read;
