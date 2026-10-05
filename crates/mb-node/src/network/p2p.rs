@@ -33456,6 +33456,37 @@ mod tests {
         assert_eq!(std::fs::read(restored.join("second")).unwrap(), second);
         assert_eq!(std::fs::read(restored.join("edited")).unwrap(), edited);
         assert!(std::fs::symlink_metadata(restored.join(".mutualbackup")).is_err());
+        let control_socket = run_root.join("control").join("socket");
+        let listener = crate::control::bind_local_control(&control_socket).unwrap();
+        let control_task = tokio::spawn(crate::control::serve_local_control_on(
+            recovered_node.clone(),
+            recovery_client.clone(),
+            listener,
+        ));
+        let crate::LocalResponse::GitLocated(Some(located)) = crate::control::local_control_call(
+            &control_socket,
+            &crate::LocalRequest::GitLocate {
+                path: restored.clone(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("recovered guarded repository is not locatable through local control");
+        };
+        assert_eq!(located.repository_id, root_id);
+        assert_eq!(located.path, restored);
+        let crate::LocalResponse::GitStatus(control_status) = crate::control::local_control_call(
+            &control_socket,
+            &crate::LocalRequest::GitStatus {
+                repository_id: root_id,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("recovered guarded status is unavailable through local control");
+        };
+        assert!(control_status.history_backed_up);
+        assert_eq!(control_status.head_oid, Some(original_graph.refs[0].oid));
         let recovered_graph = recovered_node
             .lock()
             .unwrap()
@@ -33538,29 +33569,46 @@ mod tests {
                 change.path == b"first" && change.worktree == Some(mb_git::GitChange::Modified)
             }));
             assert!(!owner.git_diff(root_id, false).unwrap().patch.is_empty());
-            let stock_path = run_root.join("stock-git");
-            let stock = git2::Repository::init_bare(&stock_path).unwrap();
-            let branches = owner.git_branches(root_id).unwrap();
-            assert!(
-                owner
-                    .git_export_to_git_repository_with_tags(
-                        root_id,
-                        &restored,
-                        &stock_path,
-                        &branches,
-                        &[],
-                    )
-                    .unwrap()
-                    >= 4
-            );
-            for bytes in [&first, &second, &edited] {
-                let oid = git2::Oid::hash_object(git2::ObjectType::Blob, bytes).unwrap();
-                assert_eq!(stock.find_blob(oid).unwrap().content(), bytes);
-            }
-            stock
-                .find_commit(git2::Oid::from_bytes(&original_graph.refs[0].oid).unwrap())
-                .unwrap();
         }
+        let stock_path = run_root.join("stock-git");
+        let stock = git2::Repository::init_bare(&stock_path).unwrap();
+        let crate::LocalResponse::GitBranches(branches) = crate::control::local_control_call(
+            &control_socket,
+            &crate::LocalRequest::GitBranches {
+                repository_id: root_id,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("recovered guarded branches are unavailable through local control");
+        };
+        let crate::LocalResponse::GitObjectsExported {
+            repository_id: exported_id,
+            object_count,
+        } = crate::control::local_control_call(
+            &control_socket,
+            &crate::LocalRequest::GitExportToGitRepositoryV2 {
+                repository_id: root_id,
+                source_root: restored.clone(),
+                destination: stock_path,
+                advertised_branches: branches,
+                advertised_tags: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("recovered guarded objects are unavailable through local control");
+        };
+        assert_eq!(exported_id, root_id);
+        assert!(object_count >= 4);
+        for bytes in [&first, &second, &edited] {
+            let oid = git2::Oid::hash_object(git2::ObjectType::Blob, bytes).unwrap();
+            assert_eq!(stock.find_blob(oid).unwrap().content(), bytes);
+        }
+        stock
+            .find_commit(git2::Oid::from_bytes(&original_graph.refs[0].oid).unwrap())
+            .unwrap();
         assert_eq!(
             mb_git::blob_oid_from_anchor(&recovered_graph.blobs[0].anchor)
                 .unwrap()
@@ -33570,6 +33618,8 @@ mod tests {
 
         recovery_client.shutdown().await.unwrap();
         recovery_task.await.unwrap().unwrap();
+        control_task.abort();
+        let _ = control_task.await;
         recovered_node
             .lock()
             .unwrap()

@@ -222,6 +222,10 @@
   marker-free view path and verifies the exported bytes. This makes recovered
   guarded history discoverable to both frontends while guarded add/checkout
   and the provisioned daemon gate remain open.
+  The five-peer format-7 recovery fixture now serves the actual local-control
+  listener from the recovered node and confirms hidden-catalog lookup,
+  backed-up Git status, and stock-Git object export over its framed socket;
+  the exported commit and three raw blobs pass on ext4 and disposable Btrfs.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
