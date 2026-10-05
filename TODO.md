@@ -274,18 +274,29 @@
   strict locked all-target workspace Clippy in the pinned local development
   shell. The temporary mount and image were removed. Remote coded-data
   reclamation is a separate gate.
-- [ ] **M6 prove remote reclamation of expired Git history.** The format-7
-  fixture currently exercises local graph/anchor retention and replacement
-  checkpoints; it does not prove physical deletion of all remote packed and
-  coded data carrying the expired blob. Exercise the production Retire/Forget
-  and holder-cleanup workers, inspect the holders' actual READY objects, and
-  recover the current graph after removing the owner's local state again.
-  Mixed coding groups now have a replacement path, covered separately below.
-  Extend the real Git-history fixture through holder cleanup and the next
-  checkpoint-generation information GC window; an expired raw owner recipe or
-  local Git anchor is not evidence that the holders' old coded data is gone.
-  Keep this gate open independently of local anchor reclamation and the
-  provisioned five-daemon guarded recovery gate.
+- [x] **M6 prove remote reclamation of expired Git history.** The five-peer
+  format-7 QUIC fixture now starts the production holder-cleanup workers and
+  verifies that the initial information and parity READY objects actually exist
+  on their assigned holders. After history loses its last ref/pin, checkpoint 2
+  retains its native anchor through the grace window; checkpoint 3 permits
+  local pruning and the peer-reconciliation worker commits Retire/Forget for
+  groups carrying obsolete packed sectors. Checkpoint 4 advances information
+  GC. Direct reads on all five nodes then prove the expired READY information,
+  old-group parity, packed caches, and raw history sectors are absent.
+  The fixture confirms the latest checkpoint's seed-recovery readiness, stops
+  the recovered owner and every task owning it, and removes its node state,
+  source/view, adjacent native anchor/private-lower areas, and stock-Git export.
+  A second fresh seed-only recovery reconstructs generation 4, the surviving
+  graph and exact current files, with the expired blob absent. Its unstaged LF
+  edit remains dirty while the committed CRLF blob retains one independent
+  native anchor; unchanged blobs rebind to verified root files. Both loss
+  simulations now erase adjacent owner payload areas. The final local ext4
+  and disposable Btrfs runs, including the explicit readiness guard, pass in
+  433.23 and 612.91 seconds. Formatting and strict locked all-target workspace
+  Clippy pass in the pinned local shell. The
+  temporary Btrfs mount and image were removed. This closes the local five-peer
+  reclamation gate; the provisioned five-daemon guarded recovery, public guarded
+  file operations, and full platform/backend gates remain open independently.
 - [x] **M6 replace mixed packed coding groups before deleting expired data.**
   The coordinator now plans surviving packed sectors against verified groups
   whose non-padding information is all current. It queues replacement through
@@ -307,8 +318,8 @@
   Adjacent redundant-group retirement, delayed-holder Forget cleanup, and
   offline-first-spare renewal regressions, formatting, and strict locked
   all-target workspace Clippy pass. The temporary Btrfs mount and image were
-  removed. The end-to-end Git remote-reclamation and provisioned daemon gates
-  remain open.
+  removed. The end-to-end Git remote-reclamation gate is closed above;
+  the provisioned daemon gate remains open.
 - [x] **M6 preserve recipe pins during guarded Git prune replay.** A pending
   catalog retirement no longer authorizes deletion of an imported native anchor
   when a retained or restored local-sector recipe names that exact anchor.

@@ -61,6 +61,11 @@ that mix current and expired sectors before retiring them. Parity cleanup
 follows Forget; information shards wait for the checkpoint GC grace window and
 any remaining shared uses. Insufficient replacement capacity delays cleanup
 while keeping current data protected.
+
+Seed-only recovery preserves protected working files independently of the
+committed Git blobs. An unstaged edit remains dirty after recovery, including
+a line-ending-only edit; restoring history does not normalize or restage it.
+
 `mutualgit rm PATH` removes a clean tracked file or symlink and stages its
 deletion. It rejects staged or working-tree changes, and replays an interrupted
 unlink before clearing the index. `mutualgit rm --cached PATH` keeps the working

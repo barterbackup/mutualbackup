@@ -3944,6 +3944,15 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   insufficient capacity defers reclamation while retaining current protection.
   Verify deletion through holder storage reads and reconstruct the surviving sector
   from peers after cleanup.
+  Exercise this through real Git history as well: remove its last ref or pin,
+  advance signed retention checkpoints, prune the native history anchor, and
+  verify deletion of the expired raw sectors, packed caches, and READY shards.
+  After the information GC grace window and confirmed seed-recovery readiness,
+  remove the owner's state and all source/anchor areas again, including any
+  stock-Git export used by the test. Recover the surviving graph from peers;
+  the expired blob must be absent, current files must be exact, and an unstaged
+  edit must survive independently of its unchanged committed Git blob. Keep
+  this five-peer QUIC proof distinct from the provisioned five-daemon gate.
   For a guarded repository, enumerate catalog candidates and their stage
   receipts without mutation, then durably fence the exact candidate set in
   node control before deleting any catalog mapping. Replay that fence before

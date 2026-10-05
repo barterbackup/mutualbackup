@@ -33810,6 +33810,22 @@ mod tests {
             std::path::PathBuf::from(test_root).join(format!("p2p-guarded-git-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&run_root).unwrap();
         std::fs::set_permissions(&run_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Only this fixture's owner enrolls a source root. Its native payload
+        // areas live beside the source, outside the node directory; erase them
+        // too so seed recovery cannot reuse a surviving local anchor.
+        let wipe_owner_payload_areas = || {
+            for entry in std::fs::read_dir(&run_root).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                let name = name.to_str().unwrap();
+                if name.starts_with(".mutualbackup-anchors-")
+                    || name.starts_with(".mutualbackup-guarded-lower-")
+                {
+                    assert!(entry.file_type().unwrap().is_dir());
+                    std::fs::remove_dir_all(entry.path()).unwrap();
+                }
+            }
+        };
         let lower = run_root.join("lower");
         let view = run_root.join("view");
         std::fs::create_dir(&lower).unwrap();
@@ -33872,6 +33888,12 @@ mod tests {
             .cloned()
             .zip(clients.iter().cloned())
             .map(|(node, client)| tokio::spawn(run_delegated_coding_jobs(node, client)))
+            .collect::<Vec<_>>();
+        let mut holder_cleanup_tasks = nodes
+            .iter()
+            .cloned()
+            .zip(clients.iter().cloned())
+            .map(|(node, client)| tokio::spawn(run_coding_holder_cleanup_jobs(node, client)))
             .collect::<Vec<_>>();
         let key_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
@@ -33998,15 +34020,47 @@ mod tests {
                 .len(),
             signed.value.data_sectors.len()
         );
+        let initial_groups = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap()
+            .coding_groups
+            .into_iter()
+            .filter(|retained| retained.retired_at_event.is_none())
+            .map(|retained| retained.group)
+            .collect::<Vec<_>>();
+        assert!(!initial_groups.is_empty());
         let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
-            if nodes
+            let seed_ready = nodes
                 .iter()
-                .all(|node| node.lock().unwrap().seed_recovery_ready().unwrap())
-            {
+                .all(|node| node.lock().unwrap().seed_recovery_ready().unwrap());
+            let shards_ready = initial_groups.iter().all(|group| {
+                group.roles.iter().enumerate().all(|(index, role)| {
+                    if matches!(role, ShardRoleV2::Information(information) if information.sector.virtual_zero) {
+                        return true;
+                    }
+                    nodes.iter().any(|node| {
+                        let node = node.lock().unwrap();
+                        if node.keys().node_id() != variable_shard_holder(role) {
+                            return false;
+                        }
+                        match role {
+                            ShardRoleV2::Information(information) => node.variable_information_for_guild(&genesis.genesis.guild_id, &information.sector.id, index as u16).is_ok(),
+                            ShardRoleV2::Parity(_) => node.variable_parity_for_guild(&genesis.genesis.guild_id, &group.id, index as u16).is_ok(),
+                        }
+                    })
+                })
+            });
+            if seed_ready && shards_ready {
                 break;
             }
-            assert!(tokio::time::Instant::now() < readiness_deadline);
+            assert!(
+                tokio::time::Instant::now() < readiness_deadline,
+                "initial seed/READY readiness timed out"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
@@ -34016,6 +34070,7 @@ mod tests {
             &mut peer_exchange_tasks,
             &mut dht_publication_tasks,
             &mut coding_tasks,
+            &mut holder_cleanup_tasks,
         ] {
             let task = group.remove(1);
             task.abort();
@@ -34031,6 +34086,7 @@ mod tests {
         std::fs::remove_dir_all(run_root.join("node-1")).unwrap();
         std::fs::remove_dir_all(&lower).unwrap();
         std::fs::remove_dir_all(&view).unwrap();
+        wipe_owner_payload_areas();
 
         let restored = run_root.join("restored");
         let recovered_state = run_root.join("recovered-node");
@@ -34337,6 +34393,26 @@ mod tests {
             .flat_map(|extent| extent.sectors)
             .collect::<Vec<_>>();
         assert!(!history_sectors.is_empty());
+        let history_sector_ids = history_sectors
+            .iter()
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        let history_packed_ids = checkpoint
+            .checkpoint
+            .packing_catalog
+            .as_ref()
+            .unwrap()
+            .sectors
+            .iter()
+            .filter(|sector| {
+                sector.slots.iter().any(|slot| {
+                    slot.source()
+                        .is_some_and(|source| history_sector_ids.contains(&source.id.object_id))
+                })
+            })
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        assert!(!history_packed_ids.is_empty());
         peer_exchange_tasks.push(tokio::spawn(run_peer_exchange(
             recovered_node.clone(),
             recovery_client.clone(),
@@ -34349,8 +34425,19 @@ mod tests {
             recovered_node.clone(),
             recovery_client.clone(),
         )));
+        holder_cleanup_tasks.push(tokio::spawn(run_coding_holder_cleanup_jobs(
+            recovered_node.clone(),
+            recovery_client.clone(),
+        )));
+        let all_nodes = nodes
+            .iter()
+            .cloned()
+            .chain(std::iter::once(recovered_node.clone()))
+            .collect::<Vec<_>>();
+        let mut expired_packed_ids = BTreeSet::new();
+        let mut expired_groups = Vec::new();
         nodes[0].lock().unwrap().configure_retention(1).unwrap();
-        for generation in [2, 3] {
+        for generation in [2, 3, 4] {
             eprintln!("guarded Git retention checkpoint {generation}: preparing");
             let descriptor = {
                 let mut owner = recovered_node.lock().unwrap();
@@ -34429,47 +34516,318 @@ mod tests {
                     history_oid
                 );
             }
-        }
-        for sector in &history_sectors {
-            assert!(
-                recovered_node
-                    .lock()
+            if generation == 3 {
+                for sector in &history_sectors {
+                    assert!(
+                        recovered_node
+                            .lock()
+                            .unwrap()
+                            .sector_for_guild(&genesis.genesis.guild_id, &sector.id)
+                            .is_err()
+                    );
+                }
+                let removed = recovered_node.lock().unwrap().git_prune(root_id).unwrap();
+                assert_eq!(removed.native_anchors_removed, 1);
+                assert_eq!(
+                    removed.logical_anchor_bytes_removed,
+                    history_only.len() as u64
+                );
+                assert!(history_anchor.open_verified().is_err());
+                assert_eq!(
+                    recovered_node
+                        .lock()
+                        .unwrap()
+                        .git_prune(root_id)
+                        .unwrap()
+                        .native_anchors_removed,
+                    0
+                );
+                let current_ids = current
+                    .checkpoint
+                    .packing_catalog
+                    .as_ref()
                     .unwrap()
-                    .sector_for_guild(&genesis.genesis.guild_id, &sector.id)
-                    .is_err()
-            );
+                    .sectors
+                    .iter()
+                    .map(|sector| sector.id)
+                    .collect::<BTreeSet<_>>();
+                expired_packed_ids = checkpoint
+                    .checkpoint
+                    .packing_catalog
+                    .as_ref()
+                    .unwrap()
+                    .sectors
+                    .iter()
+                    .map(|sector| sector.id)
+                    .filter(|id| !current_ids.contains(id))
+                    .collect();
+                assert!(history_packed_ids.is_subset(&expired_packed_ids));
+                expired_groups = initial_groups.iter().filter(|group| group.roles.iter().any(|role| {
+                    matches!(role, ShardRoleV2::Information(information) if !information.sector.virtual_zero && expired_packed_ids.contains(&information.sector.id))
+                })).cloned().collect::<Vec<_>>();
+                assert!(!expired_groups.is_empty());
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+                loop {
+                    let pending = all_nodes
+                        .iter()
+                        .map(|node| {
+                            let node = node.lock().unwrap();
+                            node.dynamic_guild_state()
+                                .unwrap()
+                                .unwrap()
+                                .coding_groups
+                                .iter()
+                                .filter(|retained| {
+                                    expired_groups
+                                        .iter()
+                                        .any(|group| group.id == retained.group.id)
+                                })
+                                .count()
+                        })
+                        .collect::<Vec<_>>();
+                    if pending.iter().all(|count| *count == 0) {
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "expired Git coding groups did not reach Forget: {pending:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                eprintln!("guarded Git history: obsolete coding groups forgotten");
+            }
         }
-        let removed = recovered_node.lock().unwrap().git_prune(root_id).unwrap();
-        assert_eq!(removed.native_anchors_removed, 1);
+
+        // Check the actual storage objects, not only absence from the event
+        // tail. Old information waits for a later checkpoint GC generation.
+        let latest = recovered_node
+            .lock()
+            .unwrap()
+            .current_checkpoint(genesis.genesis.guild_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.checkpoint.generation, 4);
+        let latest_ids = latest
+            .checkpoint
+            .packing_catalog
+            .as_ref()
+            .unwrap()
+            .sectors
+            .iter()
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        assert!(expired_packed_ids.is_disjoint(&latest_ids));
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let remaining = all_nodes
+                .iter()
+                .map(|node| {
+                    let node = node.lock().unwrap();
+                    expired_groups
+                        .iter()
+                        .flat_map(|group| {
+                            group
+                                .roles
+                                .iter()
+                                .enumerate()
+                                .map(move |(index, role)| (group, index, role))
+                        })
+                        .filter(|(group, index, role)| match role {
+                            ShardRoleV2::Information(information)
+                                if expired_packed_ids.contains(&information.sector.id) =>
+                            {
+                                node.variable_information_for_guild(
+                                    &genesis.genesis.guild_id,
+                                    &information.sector.id,
+                                    *index as u16,
+                                )
+                                .is_ok()
+                            }
+                            ShardRoleV2::Parity(_) => node
+                                .variable_parity_for_guild(
+                                    &genesis.genesis.guild_id,
+                                    &group.id,
+                                    *index as u16,
+                                )
+                                .is_ok(),
+                            _ => false,
+                        })
+                        .count()
+                })
+                .collect::<Vec<_>>();
+            if remaining.iter().all(|count| *count == 0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < cleanup_deadline,
+                "expired Git READY objects remain: {remaining:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        for node in &all_nodes {
+            let node = node.lock().unwrap();
+            for id in &expired_packed_ids {
+                assert!(
+                    node.sector_for_guild(&genesis.genesis.guild_id, id)
+                        .is_err(),
+                    "expired packed cache still serves data"
+                );
+            }
+            for sector in &history_sectors {
+                assert!(
+                    node.sector_for_guild(&genesis.genesis.guild_id, &sector.id)
+                        .is_err(),
+                    "expired raw Git sector still serves data"
+                );
+            }
+        }
+        eprintln!("guarded Git history: expired packed caches and READY shards deleted");
+        let latest_hash = latest.hash().unwrap();
+        let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let ready = all_nodes.iter().all(|node| {
+                let node = node.lock().unwrap();
+                node.current_checkpoint(genesis.genesis.guild_id)
+                    .unwrap()
+                    .is_some_and(|checkpoint| checkpoint.hash().unwrap() == latest_hash)
+                    && node.seed_recovery_ready().unwrap()
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < readiness_deadline,
+                "post-prune checkpoint did not become seed-recovery-ready"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let latest_graph = recovered_node
+            .lock()
+            .unwrap()
+            .test_guarded_git_graph(root_id)
+            .unwrap();
+        let mut current_first = first.clone();
+        current_first[0] = b'\n';
         assert_eq!(
-            removed.logical_anchor_bytes_removed,
-            history_only.len() as u64
-        );
-        assert!(history_anchor.open_verified().is_err());
-        assert_eq!(
-            recovered_node
-                .lock()
-                .unwrap()
-                .git_prune(root_id)
-                .unwrap()
-                .native_anchors_removed,
-            0
+            std::fs::read(restored.join("first")).unwrap(),
+            current_first
         );
 
-        recovery_client.shutdown().await.unwrap();
-        recovery_task.await.unwrap().unwrap();
+        // Stop every task that owns the first recovered node before erasing
+        // its state and source. The other four peers keep serving generation 4.
+        for group in [
+            &mut peer_exchange_tasks,
+            &mut dht_publication_tasks,
+            &mut coding_tasks,
+            &mut holder_cleanup_tasks,
+        ] {
+            let task = group.pop().unwrap();
+            task.abort();
+            let _ = task.await;
+        }
         control_task.abort();
         let _ = control_task.await;
+        recovery_client.shutdown().await.unwrap();
+        recovery_task.await.unwrap().unwrap();
         recovered_node
             .lock()
             .unwrap()
             .stop_test_guarded_mount(root_id)
             .unwrap();
+        drop(all_nodes);
+        let drop_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&recovered_node) != 1 {
+            assert!(
+                tokio::time::Instant::now() < drop_deadline,
+                "old recovered node still has task owners"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         drop(recovered_node);
+        drop(stock);
+        std::fs::remove_dir_all(run_root.join("stock-git")).unwrap();
+        std::fs::remove_dir_all(&recovered_state).unwrap();
+        std::fs::remove_dir_all(&restored).unwrap();
+        wipe_owner_payload_areas();
+
+        let recovered_again = Arc::new(Mutex::new(
+            Node::open(run_root.join("recovered-again"), seeds[1].clone()).unwrap(),
+        ));
+        let mut configuration = config(recovered_id);
+        configuration.bootstrap_addresses = vec![endpoints[0].parse().unwrap()];
+        let (client_again, loop_again) = build_p2p(recovered_again.clone(), configuration).unwrap();
+        let task_again = tokio::spawn(loop_again.run());
+        let target_again = run_root.join("restored-again");
+        let report = tokio::time::timeout(
+            Duration::from_secs(180),
+            recover_from_dht(recovered_again.clone(), &client_again, &target_again),
+        )
+        .await
+        .expect("post-prune seed-only recovery timed out")
+        .unwrap();
+        assert_eq!(report.generation, 4);
+        assert_eq!(
+            std::fs::read(target_again.join("first")).unwrap(),
+            current_first
+        );
+        assert_eq!(std::fs::read(target_again.join("second")).unwrap(), second);
+        assert_eq!(std::fs::read(target_again.join("edited")).unwrap(), edited);
+        assert!(std::fs::symlink_metadata(target_again.join("history-only")).is_err());
+        let graph_again = recovered_again
+            .lock()
+            .unwrap()
+            .test_guarded_git_graph(root_id)
+            .unwrap();
+        assert_eq!(graph_again.refs, latest_graph.refs);
+        assert_eq!(graph_again.objects, latest_graph.objects);
+        assert_eq!(graph_again.blobs.len(), 3);
+        assert!(
+            !graph_again
+                .blobs
+                .iter()
+                .any(|blob| blob.oid == history_oid.as_bytes())
+        );
+        for bytes in [&first, &second, &edited] {
+            let oid = git2::Oid::hash_object(git2::ObjectType::Blob, bytes).unwrap();
+            let blob = graph_again
+                .blobs
+                .iter()
+                .find(|blob| blob.oid == oid.as_bytes())
+                .unwrap();
+            assert_eq!(mb_git::blob_oid_from_anchor(&blob.anchor).unwrap(), oid);
+            // The unstaged LF edit is the restored working file; Git still
+            // retains the original CRLF blob in one independent native anchor.
+            assert_eq!(
+                blob.anchor.format_version,
+                if bytes == &first { 1 } else { 2 }
+            );
+        }
+        {
+            let owner = recovered_again.lock().unwrap();
+            let status = owner.git_status(root_id).unwrap();
+            assert!(status.history_backed_up);
+            assert!(status.changes.iter().any(|change| change.path == b"first"
+                && change.worktree == Some(mb_git::GitChange::Modified)));
+            assert_eq!(owner.git_branches(root_id).unwrap().len(), 1);
+            assert!(owner.git_tags(root_id).unwrap().is_empty());
+            assert!(owner.git_commit_pins(root_id).unwrap().is_empty());
+        }
+        eprintln!(
+            "guarded Git history: current graph and unstaged bytes recovered after second owner loss"
+        );
+        client_again.shutdown().await.unwrap();
+        task_again.await.unwrap().unwrap();
+        recovered_again
+            .lock()
+            .unwrap()
+            .stop_test_guarded_mount(root_id)
+            .unwrap();
+        drop(recovered_again);
         for task in coding_tasks
             .into_iter()
             .chain(peer_exchange_tasks)
             .chain(dht_publication_tasks)
+            .chain(holder_cleanup_tasks)
         {
             task.abort();
             let _ = task.await;
