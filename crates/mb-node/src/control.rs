@@ -369,55 +369,13 @@ async fn handle_request(
             })
             .await
         }
-        LocalRequest::AddGuardedRoot {
-            lower,
-            view,
-            view_uid,
-            view_gid,
-        } => {
-            blocking_node(node, move |node| {
-                #[cfg(target_os = "linux")]
-                {
-                    node.add_guarded_protected_root(&lower, &view, view_uid, view_gid)
-                        .map(LocalResponse::RootAdded)
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = (node, lower, view, view_uid, view_gid);
-                    anyhow::bail!("guarded roots require Linux")
-                }
-            })
-            .await
-        }
-        LocalRequest::AddGuardedRootInPlace { path } => {
-            blocking_node(node, move |node| {
-                #[cfg(target_os = "linux")]
-                {
-                    node.add_guarded_protected_root_in_place(&path)
-                        .map(LocalResponse::RootAdded)
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = (node, path);
-                    anyhow::bail!("guarded roots require Linux")
-                }
-            })
-            .await
-        }
-        LocalRequest::RemoveGuardedRoot { root_id } => {
-            blocking_node(node, move |node| {
-                #[cfg(target_os = "linux")]
-                {
-                    node.remove_guarded_protected_root(root_id)?;
-                    Ok(LocalResponse::RootRemoved { root_id })
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = (node, root_id);
-                    anyhow::bail!("guarded roots require Linux")
-                }
-            })
-            .await
+        // Keep old request variants decodable so existing clients get an
+        // explicit withdrawal error rather than triggering source mutation.
+        LocalRequest::AddGuardedRoot { .. }
+        | LocalRequest::AddGuardedRootInPlace { .. }
+        | LocalRequest::RemoveGuardedRoot { .. }
+        | LocalRequest::GitDeinit { .. } => {
+            bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND)
         }
         LocalRequest::GitInit { path } => {
             blocking_node(node, move |node| {
@@ -429,21 +387,6 @@ async fn handle_request(
         LocalRequest::GitLocate { path } => {
             blocking_node(node, move |node| {
                 node.git_locate(&path).map(LocalResponse::GitLocated)
-            })
-            .await
-        }
-        LocalRequest::GitDeinit { repository_id } => {
-            blocking_node(node, move |node| {
-                #[cfg(target_os = "linux")]
-                {
-                    node.git_retire_empty_guarded_repository(repository_id)?;
-                    Ok(LocalResponse::GitRepositoryRetired { repository_id })
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = (node, repository_id);
-                    anyhow::bail!("guarded Git repository retirement requires Linux")
-                }
             })
             .await
         }

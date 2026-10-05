@@ -849,6 +849,17 @@ Proactive background repair comes later.
 
 ### Remove the FUSE-backed guarded backend (R1)
 
+The first implementation increment withdraws enrollment/removal CLI commands
+and rejects their legacy control requests. Startup now inspects the existing
+encrypted catalog read-only before rekeying, schema migration, cleanup, or
+replay, and rejects identified guarded roots, bindings, journals, and pending
+capture/recovered-anchor plans. Source-loss recovery refuses guarded enrollment
+before publishing its job. Serialized backend identities remain stable. The
+[preservation procedure](docs/guarded-withdrawal.md) describes rejection and the
+absence of a qualified migration tool. Runtime/dependency deletion, historical
+revision inventory, and verified export remain required; this increment does
+not close R1.
+
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
 implementation, enrollment and recovery publication paths, guarded Git
 operations, backend-specific control commands, tests/probes, and `fuser`

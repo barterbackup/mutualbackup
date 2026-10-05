@@ -38,6 +38,7 @@ impl Node {
     /// Remove only a truly empty guarded Git catalog. The protected source
     /// root stays enrolled; its release has its own signed-revision gates.
     pub fn git_retire_empty_guarded_repository(&mut self, repository_id: Uuid) -> Result<()> {
+        SourceBackendKind::GuardedLinkFreezeV1.require_supported()?;
         self.reconcile_guarded_git_prunes()?;
         self.reconcile_guarded_git_stages()?;
         let root = self.protected_root_by_id(repository_id)?;

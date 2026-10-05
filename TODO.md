@@ -3,8 +3,9 @@
 ## Milestone 6 corrected production plan — 2026-10-05
 
 FUSE-backed guarded storage was added in error and is removed from the target
-architecture. The source still contains that implementation; these are planning
-changes, not a claim that code has been deleted or bugs have been fixed. Stop
+architecture. The first withdrawal step removes enrollment commands and rejects
+identified legacy guarded state before catalog migration or replay. The source
+still contains the runtime pending full removal; R1 remains open. Stop
 FUSE feature work, including retained-descriptor recapture isolation, guarded
 Git enrollment/checkout, metadata fidelity, edit guards, and mount qualification.
 Their earlier work and test evidence are archived below, with unfinished work
@@ -41,6 +42,23 @@ passing tests below apply only to their recorded source and exercised cases.
   export/migrate exact bytes and history durably or fail before any mutation.
   Restart and source-loss recovery exercise the stated legacy policy. Replace
   useful generic recovery/prune coverage from deleted FUSE fixtures under R7.
+
+  - [x] Remove guarded enrollment/removal and guarded-only Git retirement from
+    CLI help; reject their legacy local requests. Inspect existing encrypted
+    catalogs read-only before rekeying, schema migration, operation cleanup,
+    capture replay, or remount. Reject guarded record prefixes, protected-root
+    format 4, backend bindings, and pending capture/recovered-anchor plans.
+    Preserve enum identities and reject guarded source-loss enrollment before
+    publishing a recovery job. Document preservation and current migration
+    limits in [the withdrawal procedure](docs/guarded-withdrawal.md).
+    Validation: locked workspace tests; read-only SQLCipher, startup/admission,
+    legacy capture/recovery-intent, and CLI withdrawal tests; native Btrfs Git
+    reopen/commit, backend reprobe/migration, relocated recovery, encrypted Git
+    history, and legacy intent migration regressions. Format and strict Clippy
+    pass with unrelated pre-existing FUSE test WIP held aside and restored.
+  - [ ] Remove the runtime/dependency, audit history-only catalogs and signed
+    revisions, finish the mount-free export/recovery policy, and replace useful
+    generic acceptance coverage. The admission check is not that complete audit.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
   `crates/mb-git/src/history.rs` admits up to 64 MiB of graph metadata, while

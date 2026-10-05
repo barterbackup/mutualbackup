@@ -64,7 +64,7 @@ pub use link_freeze::{
 };
 pub use source::{
     SourceBackendBinding, SourceBackendKind, SourceBlobImportPlan, SourceCapturePlan,
-    SourceFileCaptureError, SourceFileCapturePlan,
+    SourceFileCaptureError, SourceFileCapturePlan, WITHDRAWN_GUARDED_BACKEND,
 };
 
 pub const SCHEMA_VERSION: u32 = 9;

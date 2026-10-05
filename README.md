@@ -11,9 +11,11 @@ AutoNAT/DCUtR hole punching, optional gateway port mapping, and embedded Arti
 onion services. Every path authenticates the same recovery-string-derived
 identity. Current native source capture uses Linux on qualified reflink
 filesystems; native Windows and macOS backends remain planned. The experimental
-guarded/FUSE backend has been withdrawn from the roadmap; its source is still
-present pending removal and safe handling of existing guarded state. Do not
-enroll new guarded roots. See [`plan.md`](plan.md) for the removal and remaining
+guarded/FUSE backend has been withdrawn. Enrollment commands are removed and
+startup rejects identified guarded state before catalog migration or replay.
+Its implementation remains pending full removal. Follow the
+[withdrawal procedure](docs/guarded-withdrawal.md) for an existing installation.
+See [`plan.md`](plan.md) for the removal and remaining
 production gates. Do not entrust unique data to this prototype.
 
 ## Programs

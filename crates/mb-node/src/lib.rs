@@ -9,6 +9,7 @@ mod lab;
 mod network;
 mod node;
 mod snapshot;
+mod source_policy;
 mod volume;
 mod watcher;
 mod wire;

@@ -59,7 +59,10 @@ use crate::snapshot::{
     resume_restore_publication, retire_revision_anchor_with_recipe_pins, revision_git_backup,
     revision_head_id,
 };
-use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
+use crate::volume::{
+    StorageScrubReport, StorageVolumes, VolumeReaderConfig, inspect_control_store,
+    open_control_store,
+};
 
 #[cfg(target_os = "linux")]
 mod guarded_git_retirement;
@@ -1540,6 +1543,9 @@ impl Node {
     pub fn open_locked(locked: LockedDataDir, seed: Seed) -> Result<Self> {
         let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
+        if let Some(control) = inspect_control_store(&data_dir, &keys)? {
+            crate::source_policy::require_native_source_state(&control)?;
+        }
         let (mut control, control_database_key) = open_control_store(&data_dir, &keys)?;
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
@@ -2117,6 +2123,7 @@ impl Node {
     /// separate-lower layouts journal their name handoff before exposure.
     #[cfg(target_os = "linux")]
     pub fn remove_guarded_protected_root(&mut self, root_id: Uuid) -> Result<()> {
+        SourceBackendKind::GuardedLinkFreezeV1.require_supported()?;
         if GuardedRecoveryHandoff::load(&self.control, root_id)?.is_none() {
             return self.remove_separate_guarded_root(root_id);
         }
@@ -2272,6 +2279,7 @@ impl Node {
         view_uid: u32,
         view_gid: u32,
     ) -> Result<ProtectedRoot> {
+        SourceBackendKind::GuardedLinkFreezeV1.require_supported()?;
         self.check_guarded_mounts()?;
         if !self.control.records(GUARDED_IN_PLACE_KIND)?.is_empty() {
             anyhow::bail!("finish the pending in-place guarded enrollment first");
@@ -2364,6 +2372,7 @@ impl Node {
     /// changes its root owner or mode; each later phase has a durable journal.
     #[cfg(target_os = "linux")]
     pub fn add_guarded_protected_root_in_place(&mut self, source: &Path) -> Result<ProtectedRoot> {
+        SourceBackendKind::GuardedLinkFreezeV1.require_supported()?;
         self.check_guarded_mounts()?;
         let metadata = fs::symlink_metadata(source)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -15665,6 +15674,17 @@ impl Node {
         target: &Path,
     ) -> Result<()> {
         self.require_active_recovery_attempt(guild_id, *checkpoint_hash)?;
+        #[cfg(target_os = "linux")]
+        if crate::snapshot::guarded_private_metadata_for_revision(
+            &self.control,
+            &self.keys,
+            guild_id,
+            revision,
+        )?
+        .is_some()
+        {
+            anyhow::bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
+        }
         let (target, target_name, parent_path, parent) = pinned_recovery_target(target)?;
         let parent_identity = native_id_tuple(parent.identity()?);
         let existing = self.control.get_record("recovery-job", checkpoint_hash)?;

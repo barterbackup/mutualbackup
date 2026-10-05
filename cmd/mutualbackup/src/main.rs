@@ -136,19 +136,6 @@ enum Command {
 enum RootCommand {
     /// Probe and register a reflink-capable directory.
     Add { path: PathBuf },
-    /// Capture a private lower directory behind a separate empty FUSE view.
-    AddGuarded {
-        lower: PathBuf,
-        view: PathBuf,
-        #[arg(long)]
-        view_uid: u32,
-        #[arg(long)]
-        view_gid: u32,
-    },
-    /// Replace an existing user-owned directory with a guarded view in place.
-    AddGuardedHere { path: PathBuf },
-    /// Release a guarded root at its user-facing worktree path.
-    RemoveGuarded { root_id: Uuid },
 }
 
 #[derive(Debug, Subcommand)]
@@ -555,61 +542,6 @@ async fn main() -> Result<()> {
             println!("protected root registered: {}", root.path.display());
             println!("root id: {}", root.root_id);
         }
-        Command::Root {
-            command:
-                RootCommand::AddGuarded {
-                    lower,
-                    view,
-                    view_uid,
-                    view_gid,
-                },
-        } => {
-            let response = local_control_call(
-                &control_socket,
-                &LocalRequest::AddGuardedRoot {
-                    lower,
-                    view,
-                    view_uid,
-                    view_gid,
-                },
-            )
-            .await?;
-            let LocalResponse::RootAdded(root) = response else {
-                bail!("daemon returned the wrong response to guarded-root request");
-            };
-            println!("guarded root registered: {}", root.path.display());
-            println!("root id: {}", root.root_id);
-        }
-        Command::Root {
-            command: RootCommand::AddGuardedHere { path },
-        } => {
-            let response = local_control_call(
-                &control_socket,
-                &LocalRequest::AddGuardedRootInPlace { path },
-            )
-            .await?;
-            let LocalResponse::RootAdded(root) = response else {
-                bail!("daemon returned the wrong response to guarded in-place root request");
-            };
-            println!("guarded root registered: {}", root.path.display());
-            println!("root id: {}", root.root_id);
-        }
-        Command::Root {
-            command: RootCommand::RemoveGuarded { root_id },
-        } => {
-            let response = local_control_call(
-                &control_socket,
-                &LocalRequest::RemoveGuardedRoot { root_id },
-            )
-            .await?;
-            let LocalResponse::RootRemoved { root_id: removed } = response else {
-                bail!("daemon returned the wrong response to guarded root removal");
-            };
-            if removed != root_id {
-                bail!("daemon removed a different guarded root");
-            }
-            println!("guarded root released: {root_id}");
-        }
         Command::Guild { command } => {
             let request = match command {
                 GuildCommand::Create => LocalRequest::GuildCreate,
@@ -956,6 +888,36 @@ fn print_backup_job(job: &mb_node::BackupJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn withdrawn_guarded_commands_are_not_exposed() {
+        for arguments in [
+            vec![
+                "add-guarded",
+                "/lower",
+                "/view",
+                "--view-uid",
+                "1000",
+                "--view-gid",
+                "1000",
+            ],
+            vec!["add-guarded-here", "/source"],
+            vec!["remove-guarded", "00000000-0000-0000-0000-000000000001"],
+        ] {
+            let mut args = vec!["mutualbackup", "root"];
+            args.extend(arguments);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let mut command = Cli::command();
+        command.build();
+        let root = command.find_subcommand("root").unwrap();
+        let commands = root
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<Vec<_>>();
+        assert_eq!(commands, ["add", "help"]);
+    }
 
     #[test]
     fn parses_dynamic_guild_administration_commands() {

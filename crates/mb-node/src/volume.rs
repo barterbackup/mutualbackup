@@ -2003,6 +2003,44 @@ pub(crate) fn reader_coding_capacity(
     device_coding_capacity(control, &devices, shard_size)
 }
 
+/// Read-only inspection uses the existing key without publishing an envelope
+/// or migrating a legacy key. Callers can reject retired backends first.
+pub(crate) fn inspect_control_store(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+) -> Result<Option<ControlStore>> {
+    let database_path = data_dir.join("control.db");
+    match fs::symlink_metadata(&database_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let envelope_path = data_dir.join(CONTROL_KEY_FILE);
+    if envelope_path.exists() {
+        let envelope: WrappedDatabaseKey = read_private_record(&envelope_path)?;
+        let database_key = keys
+            .unwrap_database_key(b"control.db/v2", &envelope)
+            .context("cannot unwrap control database key")?;
+        match ControlStore::open_existing_read_only_with_key(&database_path, &database_key) {
+            Ok(store) => return Ok(Some(store)),
+            Err(error) => {
+                return ControlStore::open_existing_read_only_with_key(
+                    &database_path,
+                    &keys.database_key(b"control.db"),
+                )
+                .map(Some)
+                .with_context(|| format!("control database rejected wrapped key: {error}"));
+            }
+        }
+    }
+    ControlStore::open_existing_read_only_with_key(
+        &database_path,
+        &keys.database_key(b"control.db"),
+    )
+    .map(Some)
+    .map_err(Into::into)
+}
+
 pub(crate) fn open_control_store(
     data_dir: &Path,
     keys: &KeyMaterial,

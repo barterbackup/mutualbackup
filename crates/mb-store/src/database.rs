@@ -93,6 +93,36 @@ impl ControlStore {
         })
     }
 
+    /// Inspect an existing catalog without initialization, migration, rekeying,
+    /// or journal-mode changes. Startup policy must run before write recovery.
+    pub fn open_existing_read_only_with_key(
+        path: impl AsRef<Path>,
+        database_key: &[u8; 32],
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let connection = configure_encrypted_connection(connection, database_key, true)?;
+        if meta_value(&connection, "database_kind")?.as_deref() != Some(b"control") {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        let version = meta_value(&connection, "schema_version")?
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_be_bytes)
+            .ok_or(DatabaseError::IncompatibleSchema)?;
+        validate_control_schema(&connection, version)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -468,11 +498,20 @@ impl ControlStore {
             "SELECT kind, record_id, bytes FROM protocol_records
              WHERE substr(kind, 1, ?1) = ?2 ORDER BY kind, record_id",
         )?;
-        let rows = statement.query_map(params![prefix.len(), prefix], |row| {
+        let rows = statement.query_map(params![prefix.chars().count(), prefix], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
+    }
+
+    /// Check for a record kind without loading its potentially large payload.
+    pub fn has_records_with_kind_prefix(&self, prefix: &str) -> Result<bool, DatabaseError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE substr(kind, 1, ?1) = ?2)",
+            params![prefix.chars().count(), prefix],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn for_each_record_value(
@@ -3444,6 +3483,14 @@ fn configure_encrypted(
     connection: Connection,
     key: &[u8; 32],
 ) -> Result<Connection, DatabaseError> {
+    configure_encrypted_connection(connection, key, false)
+}
+
+fn configure_encrypted_connection(
+    connection: Connection,
+    key: &[u8; 32],
+    read_only: bool,
+) -> Result<Connection, DatabaseError> {
     connection.pragma_update(None, "key", hex::encode(key))?;
     connection.execute_batch(
         "PRAGMA cipher_compatibility = 4;
@@ -3455,11 +3502,17 @@ fn configure_encrypted(
          PRAGMA trusted_schema = OFF;
          PRAGMA foreign_keys = ON;
          PRAGMA temp_store = MEMORY;
-         PRAGMA secure_delete = ON;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;
-         PRAGMA wal_autocheckpoint = 1;",
+         PRAGMA secure_delete = ON;",
     )?;
+    if read_only {
+        connection.pragma_update(None, "query_only", true)?;
+    } else {
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             PRAGMA wal_autocheckpoint = 1;",
+        )?;
+    }
     let cipher_version: Option<String> = connection
         .query_row("PRAGMA cipher_version", [], |row| row.get(0))
         .optional()?;
@@ -3577,6 +3630,73 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn read_only_inspection_preserves_legacy_schema_and_rejects_writes() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let key = [93; 32];
+        {
+            let store = ControlStore::open_with_key(&path, &key).unwrap();
+            store
+                .put_record("guarded-view-mount-v1", b"id", b"legacy")
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                    [8_u32.to_be_bytes().as_slice()],
+                )
+                .unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let store = ControlStore::open_existing_read_only_with_key(&path, &key).unwrap();
+        assert!(store.has_records_with_kind_prefix("guarded-").unwrap());
+        assert!(!store.has_records_with_kind_prefix("guarded_%").unwrap());
+        assert_eq!(
+            meta_value(&store.connection, "schema_version").unwrap(),
+            Some(8_u32.to_be_bytes().to_vec())
+        );
+        assert!(store.put_record("test", b"id", b"mutation").is_err());
+        assert!(store.delete_record("guarded-view-mount-v1", b"id").is_err());
+        drop(store);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(ControlStore::open_existing_read_only_with_key(&path, &[94; 32]).is_err());
+    }
+
+    #[test]
+    fn read_only_inspection_reads_live_wal_without_checkpointing() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let key = [95; 32];
+        let writer = ControlStore::open_with_key(&path, &key).unwrap();
+        writer
+            .connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        writer
+            .put_record("guarded-root-enrollment-v1", b"id", b"pending")
+            .unwrap();
+        let wal = path.with_file_name("control.db-wal");
+        let before = fs::read(&wal).unwrap();
+        let reader = ControlStore::open_existing_read_only_with_key(&path, &key).unwrap();
+        assert_eq!(
+            reader
+                .get_record("guarded-root-enrollment-v1", b"id")
+                .unwrap(),
+            Some(b"pending".to_vec())
+        );
+        drop(reader);
+        assert_eq!(fs::read(wal).unwrap(), before);
+    }
+
+    #[test]
+    fn read_only_inspection_never_creates_a_missing_catalog() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("missing.db");
+        assert!(ControlStore::open_existing_read_only_with_key(&path, &[96; 32]).is_err());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn control_database_is_encrypted_and_reopens() {

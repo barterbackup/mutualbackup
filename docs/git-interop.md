@@ -42,13 +42,12 @@ selecting it. Use stock Git separately for the bridge examples below.
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,
 and prune.
-The guarded/FUSE backend is withdrawn from the roadmap and scheduled for
-removal; its implementation is still present. Existing recovered guarded
-repositories have limited catalog operations, but ordinary guarded init, add,
-and file-changing checkout remain unavailable. Do not enroll new guarded Git
-roots. Safe handling of existing roots and retained history is part of the
-removal plan in [`plan.md`](../plan.md); completing Git-on-FUSE is no longer a
-release requirement.
+The guarded/FUSE backend is withdrawn. Its runtime remains pending removal,
+but enrollment commands are removed and the daemon rejects identified guarded
+state before catalog migration or replay. Existing guarded installations must
+follow the [preservation procedure](guarded-withdrawal.md); this build does not
+provide a qualified migration or historical export tool. The remaining removal
+work is tracked in [`plan.md`](../plan.md).
 Deleting a branch or pin does not erase history that a retained signed backup
 still needs; history prune keeps those objects until retention releases them.
 Prune also preserves the certified parent checkpoint's graph during the

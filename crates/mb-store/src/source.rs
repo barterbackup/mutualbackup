@@ -1,7 +1,7 @@
 //! Versioned, durable dispatch for local source capture.
 //!
 //! The node persists a plan before touching source files. Keep existing enum
-//! variants stable: a pending capture must remain replayable after an upgrade.
+//! variants stable: withdrawn captures must remain identifiable after an upgrade.
 //! Backends return the same stable anchor manifest consumed by sector encoding;
 //! no backend identifier enters signed peer records.
 
@@ -11,6 +11,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+
+/// User-facing rejection shared by admission, startup, and recovery.
+pub const WITHDRAWN_GUARDED_BACKEND: &str = "FUSE-backed guarded capture has been withdrawn; \
+     preserve the old data directory, source trees, Git catalogs and anchors. \
+     This version cannot migrate, replay or mount guarded state. Follow \
+     docs/guarded-withdrawal.md before creating a separate native installation";
 
 use crate::{
     AnchorError, ControlStore, FileAnchorManifest, ImportedBlobCapturePlan, NativeFileId,
@@ -24,12 +30,9 @@ use crate::{
 };
 
 /// Local source capabilities never enter a signed peer record. ReflinkV1
-/// provides byte-exact sparse reflink capture, raw imports, and reflink
-/// checkout. GuardedLinkFreezeV1 provides replayable whole-root capture and
-/// retirement plus explicit root-file and Git-file edit detaches. Node enrollment must not
-/// select it until a live edit guard invokes that detach for every retained
-/// hard link; new Git stage/checkout operations remain unavailable until their
-/// separate source-safety gate is implemented.
+/// provides sparse reflink capture, raw imports, and reflink checkout.
+/// GuardedLinkFreezeV1 is withdrawn; retain its serialized identity so old
+/// bindings and pending captures can be rejected without reinterpretation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceBackendKind {
     ReflinkV1,
@@ -62,8 +65,7 @@ impl SourceBackendBinding {
     }
 
     pub fn is_supported_for(&self, root_id: Uuid, filesystem_id: u64, root_inode: u64) -> bool {
-        // Existing node enrollment only activates the reflink contract. A
-        // guarded binding needs explicit selection and its own reprobe path.
+        // Enrollment only activates the native reflink contract.
         self.format_version == 1
             && self.contract_version == 1
             && self.root_id == root_id
@@ -109,19 +111,28 @@ impl SourceBackendBinding {
 }
 
 impl SourceBackendKind {
-    /// The guarded backend cannot retain Git file anchors until its live
-    /// edit-detach guard is available to every enrolled worktree.
+    /// Keep the legacy variant decodable, but never select it for new work.
+    pub fn require_supported(self) -> Result<(), AnchorError> {
+        match self {
+            Self::ReflinkV1 => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
+                WITHDRAWN_GUARDED_BACKEND,
+            )),
+        }
+    }
+    /// Only the native backend accepts new Git file anchors.
     pub fn supports_git_file_staging(self) -> bool {
         matches!(self, Self::ReflinkV1)
     }
 
-    /// Guarded checkout needs a protected editable hard-link transition;
-    /// publishing a regular file through that backend is still gated.
+    /// Only the native backend accepts new Git checkout publication.
     pub fn supports_git_checkout_file(self) -> bool {
         matches!(self, Self::ReflinkV1)
     }
 
     pub fn probe(self, source_root: impl AsRef<Path>) -> Result<(), AnchorError> {
+        self.require_supported()?;
         match self {
             Self::ReflinkV1 => probe_reflink(source_root),
             #[cfg(target_os = "linux")]
@@ -133,6 +144,7 @@ impl SourceBackendKind {
         self,
         source_root: impl AsRef<Path>,
     ) -> Result<SourceCapturePlan, AnchorError> {
+        self.require_supported()?;
         match self {
             Self::ReflinkV1 => SourceCapturePlan::plan_reflink(source_root),
             #[cfg(target_os = "linux")]
@@ -146,6 +158,7 @@ impl SourceBackendKind {
         source_root: impl AsRef<Path>,
         relative_path: impl AsRef<Path>,
     ) -> Result<SourceFileCapturePlan, AnchorError> {
+        self.require_supported()?;
         match self {
             Self::ReflinkV1 => {
                 #[cfg(target_os = "linux")]

@@ -691,7 +691,25 @@ fn decode_recovery_anchor_intent(bytes: &[u8]) -> Result<(RecoveryAnchorIntent, 
     ))
 }
 
+pub(crate) fn require_native_capture_state(control: &ControlStore) -> Result<()> {
+    control.for_each_record_value("capture-intent", |bytes| {
+        let (intent, _) = decode_capture_intent(bytes)?;
+        if !matches!(intent.plan, SourceCapturePlan::ReflinkV1(_)) {
+            bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
+        }
+        Ok(())
+    })?;
+    control.for_each_record_value(RECOVERY_ANCHOR_INTENT_KIND, |bytes| {
+        let (intent, _) = decode_recovery_anchor_intent(bytes)?;
+        if !matches!(intent.plan, SourceCapturePlan::ReflinkV1(_)) {
+            bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
+        }
+        Ok(())
+    })
+}
+
 pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
+    require_native_capture_state(control)?;
     for (record_id, bytes) in control.records("capture-intent")? {
         let (intent, migrated) = decode_capture_intent(&bytes)?;
         if record_id.as_slice() != intent.revision_id.as_bytes() {
@@ -5505,6 +5523,73 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn withdrawn_capture_and_recovery_intents_are_rejected_without_replay() {
+        // Encode the historical plan layout without invoking its filesystem
+        // probe or creating anchors. This also pins the legacy discriminant.
+        let plan_bytes = canonical_bytes(&(
+            1_u16,
+            Uuid::from_bytes([1; 16]),
+            b"/legacy/source".to_vec(),
+            mb_store::StableAnchorAreaLocator {
+                area_id: Uuid::from_bytes([2; 16]),
+                path_hint: PathBuf::from("/legacy/anchors"),
+                filesystem_id: 3,
+                volume_root_hint: PathBuf::from("/legacy"),
+            },
+            (3_u64, 4_u64, 0_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+            0o755_u32,
+            0_i64,
+            0_u32,
+            Vec::<u8>::new(),
+        ))
+        .unwrap();
+        let plan: mb_store::GuardedRootCapturePlan = decode_canonical(&plan_bytes).unwrap();
+        let plan = SourceCapturePlan::GuardedLinkFreezeV1(plan);
+        assert_eq!(canonical_bytes(&plan).unwrap()[0], 1);
+        let revision_id = Uuid::from_bytes([5; 16]);
+        let capture = CaptureIntent {
+            format_version: 3,
+            guild_id: [6; 32],
+            revision_id,
+            sequence: 1,
+            parent: None,
+            captured_change_sequence: None,
+            requested_source: PathBuf::from("/legacy/source"),
+            plan: plan.clone(),
+        };
+        let recovery = RecoveryAnchorIntent {
+            format_version: 2,
+            guild_id: [6; 32],
+            revision_id,
+            source_root: PathBuf::from("/legacy/source"),
+            plan,
+            replaced_anchor: None,
+        };
+        for (kind, bytes) in [
+            ("capture-intent", canonical_bytes(&capture).unwrap()),
+            (
+                RECOVERY_ANCHOR_INTENT_KIND,
+                canonical_bytes(&recovery).unwrap(),
+            ),
+        ] {
+            let area = tempfile::tempdir().unwrap();
+            let control =
+                ControlStore::open_with_key(area.path().join("control.db"), &[97; 32]).unwrap();
+            control
+                .put_record(kind, revision_id.as_bytes(), &bytes)
+                .unwrap();
+            control.make_query_only().unwrap();
+            let error = reconcile_pending_captures(&control).unwrap_err();
+            assert!(error.to_string().contains("withdrawn"), "{error:#}");
+            assert_eq!(
+                control.get_record(kind, revision_id.as_bytes()).unwrap(),
+                Some(bytes)
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
