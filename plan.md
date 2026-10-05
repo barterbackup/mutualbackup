@@ -1276,9 +1276,9 @@ the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 5 have passed. The final Milestone 5
 gate passed on exact committed source `53ec2ec`; its earlier review and gate
-records below are historical. Milestone 6 is underway: the Git-compatible
-local-history and interoperability slices are being built ahead of the already
-planned source-backend and platform work. The byte-exact Git policy above and
+records below are historical. Milestone 6 is underway: Git-compatible local
+history and interoperability share the work queue with the original
+source-backend and platform deliverables. The byte-exact Git policy above and
 the complete Milestone 6 gates below remain requirements for closure. Iterate
 through the Git command slices while keeping the original backend deliverables
 in scope: a command is complete only when its raw-byte, crash/reopen, and
@@ -3759,36 +3759,28 @@ requirements of the Git pivot and the original roadmap, not completion claims;
 | History pruning that releases data | Section 5 and this milestone: reachability and retention protect live data; durable cleanup releases eligible local anchors and backed-up sectors |
 | Outstanding original work | Section 4 and this milestone: finish guarded capture/edit, Windows/macOS backends, metadata, watchers, and application-consistency gates alongside Git work |
 
-The Git pivot adds local history and interoperability to this milestone; its
-original source-backend and platform deliverables remain required. Review each
-completed Git command against the byte-exact policy and crash/recovery gates
-below, and continue through graph protection, two-way ordinary-Git exchange,
-physical reclamation, guarded link-freeze, and platform backends. These work
-streams may progress together; the open Milestone 6 items in `TODO.md` remain
-part of the closure gate as the plan is iterated. A command being present does
-not by itself close its slice.
-The native `.mutualbackup` catalog, not a `.git` directory, owns local history;
-the same immutable captured bytes serve backup and Git blobs without a second
-persistent payload copy. Git compatibility applies to the supported command
-syntax and object/pack exchange, while this binary's file-content rule is
-strictly byte-for-byte even when stock Git would apply attributes or filters.
-Keep those three conditions together as Git work proceeds, and retain the
-original guarded-source and platform gates in this milestone's closure test.
-At the start of each implementation iteration, reconcile `TODO.md` against the
-Git, source-backend, guarded edit, and platform closure gates below. Select work
-from any open gate whose prerequisites are ready, and record the evidence for a
-closed gate in `TODO.md`; finishing the Git command set alone does not finish
-Milestone 6. For any command or backend that reads or writes file content, check
-byte identity from the user's file through the immutable anchor, Git blob,
-exported object, and restored worktree. A line-ending-only change is a real
-content change; no default, configuration, attribute, filter, or compatibility
-option may silently convert it. Apply this check to both the Git pivot and the
-original guarded and platform backend deliverables.
-Keep the gate list below as the work queue even when a Git slice passes: after
-each slice, check which source-backend, guarded edit, platform, recovery, and
-physical-prune obligations remain open. A Git command's implementation or an
-earlier passing run does not substitute for its byte-exact acceptance on the
-current source.
+Implement the Git pivot through the versioned source-backend boundary alongside
+the outstanding original work. The native `.mutualbackup` catalog owns local
+history, and the same immutable captured bytes serve backup and Git blobs
+without a second persistent payload copy. Git compatibility covers the supported
+command syntax and object/pack exchange; our file-content rule stays strictly
+byte-for-byte even when stock Git would apply attributes or filters. Guild peers
+continue to use the existing signed revision and checkpoint protocol.
+
+At the start of each implementation iteration, reconcile `TODO.md` against all
+closure gates below: Git commands, protected graph recovery, ordinary-Git
+exchange, physical reclamation, guarded capture/edit, platform backends,
+metadata, watchers, and application-consistent capture. Select an open item
+whose prerequisites are ready and record its completion evidence in `TODO.md`.
+After each slice, keep every unfinished original item in the queue; completing
+the Git command set alone does not finish Milestone 6.
+
+For each command or backend that touches content, verify byte identity through
+capture, staging, history, checkout, object exchange, backup, and recovery on
+the current source. A line-ending-only edit is a real content change. No
+configuration, attribute, filter, or compatibility option may silently convert
+it. Apply this gate to both Git work and the original guarded/platform work,
+together with their crash/recovery and native-anchor storage checks.
 
 Track Milestone 6 against these separate closure gates when iterating over this
 plan; passing a Git command gate does not close a source-backend or platform gate:
