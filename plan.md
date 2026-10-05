@@ -3921,6 +3921,18 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   Use retained graphs and exact sector-recipe anchor pins to decide which
   candidates can be deleted; an unrelated pending revision or root cleanup
   must not indefinitely block an older, unprotected blob.
+  For remote reclamation, replace a mixed coding group that still supplies
+  current packed sectors while retaining expired sectors. Plan the surviving
+  sectors against verified coverage from groups containing only current
+  information; padding roles do not count as expired data. Keep the old group
+  and its READY shards until replacement verification and signed activation,
+  then commit Retire/Forget and run durable holder cleanup. Information READY
+  objects also obey the ordinary checkpoint-generation GC grace window and
+  remain pinned while another live group or in-flight attempt needs them.
+  Free wholly obsolete groups before allocating replacement capacity;
+  insufficient capacity defers reclamation while retaining current protection.
+  Verify deletion through holder storage reads and reconstruct the surviving sector
+  from peers after cleanup.
   For a guarded repository, enumerate catalog candidates and their stage
   receipts without mutation, then durably fence the exact candidate set in
   node control before deleting any catalog mapping. Replay that fence before

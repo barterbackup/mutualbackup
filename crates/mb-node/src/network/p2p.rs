@@ -8776,7 +8776,60 @@ async fn reconcile_variable_group_lifecycle_once(
                         && live_sectors.contains(&information.sector.id))
             })
     });
-    if stale_live_placement {
+    let sequence = state
+        .event_sequence
+        .checked_add(1)
+        .context("guild event sequence exhausted")?;
+    let lifecycle = variable_group_lifecycle_kind(&state, &live_sectors, sequence);
+    // Free already obsolete placements before requesting spare capacity for
+    // mixed-group replacement. A group with live information remains intact.
+    let cleanup_ready = match &lifecycle {
+        Some(mb_core::GuildEventKind::ForgetCodingGroup { .. }) => true,
+        Some(mb_core::GuildEventKind::RetireCodingGroup { group_id, .. }) => state
+            .coding_groups
+            .iter()
+            .find(|retained| retained.group.id == *group_id)
+            .is_some_and(|retained| {
+                !retained.group.roles.iter().any(|role| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && live_sectors.contains(&information.sector.id))
+                })
+            }),
+        _ => false,
+    };
+    if cleanup_ready {
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence,
+            parent: state.event_head,
+            kind: lifecycle.context("coding cleanup has no lifecycle event")?,
+        };
+        state.validate_event_proposal(&event)?;
+        return commit_plain_guild_event(node, p2p, state, guild, local_id, event).await;
+    }
+    let mixed_packed_group = checkpoint.checkpoint.packing_catalog.is_some()
+        && state.coding_groups.iter().any(|retained| {
+            if retained.retired_at_event.is_some() {
+                return false;
+            }
+            let mut live = false;
+            let mut obsolete = false;
+            for role in &retained.group.roles {
+                if let ShardRoleV2::Information(information) = role
+                    && !information.sector.virtual_zero
+                {
+                    if live_sectors.contains(&information.sector.id) {
+                        live = true;
+                    } else {
+                        obsolete = true;
+                    }
+                }
+            }
+            live && obsolete
+        });
+    if stale_live_placement || mixed_packed_group {
         let checkpoint_hash = checkpoint.hash()?;
         let pending = node_blocking(node.clone(), move |node| {
             node.coding_checkpoint_has_pending(checkpoint_hash)
@@ -8786,7 +8839,7 @@ async fn reconcile_variable_group_lifecycle_once(
             if let Some(catalog) = &checkpoint.checkpoint.packing_catalog {
                 let descriptors = catalog.sectors.clone();
                 let uncovered = node_blocking(node.clone(), move |node| {
-                    node.uncovered_packed_sectors(&descriptors)
+                    node.packed_sectors_for_group_replacement(&descriptors)
                 })
                 .await?;
                 if !uncovered.is_empty() {
@@ -8827,81 +8880,79 @@ async fn reconcile_variable_group_lifecycle_once(
                     return Ok(());
                 }
             }
-            let active = state
-                .active_members()
-                .map(|member| member.node_id)
-                .collect::<BTreeSet<_>>();
-            let mut replacement = None;
-            for revision in checkpoint.checkpoint.revisions.iter().rev() {
-                if !active.contains(&revision.value.owner) {
-                    continue;
+            if checkpoint.checkpoint.packing_catalog.is_none() {
+                let active = state
+                    .active_members()
+                    .map(|member| member.node_id)
+                    .collect::<BTreeSet<_>>();
+                let mut replacement = None;
+                for revision in checkpoint.checkpoint.revisions.iter().rev() {
+                    if !active.contains(&revision.value.owner) {
+                        continue;
+                    }
+                    let sectors = revision
+                        .value
+                        .metadata_sectors
+                        .iter()
+                        .chain(&revision.value.data_sectors)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let commitments = revision.value.sector_commitments.clone();
+                    let owner = revision.value.owner;
+                    let uncovered = node_blocking(node.clone(), move |node| {
+                        node.uncovered_variable_sectors(owner, &sectors, commitments.as_deref())
+                    })
+                    .await?;
+                    if !uncovered.is_empty() {
+                        replacement = Some((owner, revision.value.revision_id, uncovered));
+                        break;
+                    }
                 }
-                let sectors = revision
-                    .value
-                    .metadata_sectors
-                    .iter()
-                    .chain(&revision.value.data_sectors)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let commitments = revision.value.sector_commitments.clone();
-                let owner = revision.value.owner;
-                let uncovered = node_blocking(node.clone(), move |node| {
-                    node.uncovered_variable_sectors(owner, &sectors, commitments.as_deref())
-                })
-                .await?;
-                if !uncovered.is_empty() {
-                    replacement = Some((owner, revision.value.revision_id, uncovered));
-                    break;
-                }
-            }
-            if let Some((owner, revision_id, uncovered)) = replacement {
-                let coding_peers = reachable_coding_peers(p2p, local_id, &guild.peers).await;
-                if !coding_peers.iter().any(|peer| peer.member.node_id == owner) {
-                    bail!("replacement coding owner is unavailable");
-                }
-                let mut parity_capacity = coding_capacity_by_peer(
-                    node.clone(),
-                    p2p,
-                    local_id,
-                    state.guild_id,
-                    &coding_peers,
-                    V1_SECTOR_SIZE as u32,
-                )
-                .await?;
-                let lanes = build_cross_user_coding_lanes(
-                    node.clone(),
-                    uncovered,
-                    CrossUserCodingContext {
+                if let Some((owner, revision_id, uncovered)) = replacement {
+                    let coding_peers = reachable_coding_peers(p2p, local_id, &guild.peers).await;
+                    if !coding_peers.iter().any(|peer| peer.member.node_id == owner) {
+                        bail!("replacement coding owner is unavailable");
+                    }
+                    let mut parity_capacity = coding_capacity_by_peer(
+                        node.clone(),
                         p2p,
                         local_id,
-                        guild_id: state.guild_id,
-                        revision_id,
-                        current_owner: owner,
-                        retained_revisions: &checkpoint.checkpoint.revisions,
-                        peers: &coding_peers,
-                        parity_capacity: &mut parity_capacity,
-                    },
-                )
-                .await?;
-                queue_variable_coding_lanes(
-                    node,
-                    p2p,
-                    local_id,
-                    checkpoint_hash,
-                    state.membership_epoch,
-                    &coding_peers,
-                    lanes,
-                )
-                .await?;
-                return Ok(());
+                        state.guild_id,
+                        &coding_peers,
+                        V1_SECTOR_SIZE as u32,
+                    )
+                    .await?;
+                    let lanes = build_cross_user_coding_lanes(
+                        node.clone(),
+                        uncovered,
+                        CrossUserCodingContext {
+                            p2p,
+                            local_id,
+                            guild_id: state.guild_id,
+                            revision_id,
+                            current_owner: owner,
+                            retained_revisions: &checkpoint.checkpoint.revisions,
+                            peers: &coding_peers,
+                            parity_capacity: &mut parity_capacity,
+                        },
+                    )
+                    .await?;
+                    queue_variable_coding_lanes(
+                        node,
+                        p2p,
+                        local_id,
+                        checkpoint_hash,
+                        state.membership_epoch,
+                        &coding_peers,
+                        lanes,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         }
     }
-    let sequence = state
-        .event_sequence
-        .checked_add(1)
-        .context("guild event sequence exhausted")?;
-    let Some(kind) = variable_group_lifecycle_kind(&state, &live_sectors, sequence) else {
+    let Some(kind) = lifecycle else {
         return Ok(());
     };
     let event = GuildEvent {
@@ -17743,6 +17794,515 @@ mod tests {
             .map(|(index, peer)| (peer.member.node_id, if index < 3 { 1 } else { 2 }))
             .collect::<BTreeMap<_, _>>();
         assert!(plan_packed_lane_placements([141; 32], &[3, 3], &peers, &infeasible, 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn mixed_packed_group_replacement_reclaims_obsolete_ready_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (211_u8..216)
+            .map(|byte| Seed::from_bytes([byte; 32]))
+            .collect::<Vec<_>>();
+        let nodes = seeds
+            .iter()
+            .enumerate()
+            .map(|(index, seed)| {
+                Arc::new(Mutex::new(
+                    Node::open(temp.path().join(format!("node-{index}")), seed.clone()).unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut clients = Vec::new();
+        let mut network_tasks = Vec::new();
+        for node in &nodes {
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let owner = nodes[0].lock().unwrap().keys().node_id();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[216; 32]);
+        install_coding_test_event(
+            &nodes,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        );
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let guild_id = state.guild_id;
+        let revision_id = Uuid::from_bytes([217; 16]);
+        let root_id = Uuid::from_bytes([218; 16]);
+        let source_id =
+            mb_core::make_sector_id(owner, revision_id, mb_core::SectorPurpose::Metadata, 0);
+        let data_key = nodes[0].lock().unwrap().keys().guild_data_key(&guild_id);
+        let (reference, source_bytes) =
+            mb_core::encrypted_sector(&data_key, source_id, b"current bytes\r\n\0").unwrap();
+        let source_commitment = merkle_commit(&source_bytes).unwrap();
+        let current_input = PackingInput {
+            owner,
+            protected_root: packing_protected_root(root_id),
+            object_id: source_id,
+            source_commitment: Some(source_commitment.clone()),
+            bytes: source_bytes.clone(),
+        };
+        let (_, obsolete_bytes) =
+            mb_core::encrypted_sector(&data_key, [219; 32], b"expired history\r\n\0").unwrap();
+        let profile = PackingProfile {
+            format_version: 1,
+            sector_size: V1_SECTOR_SIZE as u32,
+            slot_size: MERKLE_LEAF_SIZE as u32,
+        };
+        let old = pack_incremental(
+            profile,
+            None,
+            vec![
+                current_input.clone(),
+                PackingInput {
+                    owner,
+                    protected_root: packing_protected_root(Uuid::from_bytes([220; 16])),
+                    object_id: [219; 32],
+                    source_commitment: Some(merkle_commit(&obsolete_bytes).unwrap()),
+                    bytes: obsolete_bytes,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(old.catalog.sectors.len(), 3);
+        let current =
+            pack_incremental(profile, Some(&old.catalog), vec![current_input.clone()]).unwrap();
+        assert_eq!(current.catalog.sectors.len(), 2);
+        let current_descriptor = current
+            .catalog
+            .sectors
+            .iter()
+            .find(|sector| old.catalog.sectors.contains(sector))
+            .unwrap();
+        let live_ids = current
+            .catalog
+            .sectors
+            .iter()
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        let obsolete_ids = old
+            .catalog
+            .sectors
+            .iter()
+            .filter(|sector| !live_ids.contains(&sector.id))
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(obsolete_ids.len(), 2);
+        {
+            let mut node = nodes[0].lock().unwrap();
+            node.install_repaired_information_sector(guild_id, reference.clone(), &source_bytes)
+                .unwrap();
+            for sector in &old.sectors {
+                node.store_packed_sector(guild_id, profile, sector.clone())
+                    .unwrap();
+            }
+        }
+        let peers = nodes[0]
+            .lock()
+            .unwrap()
+            .guild_summary()
+            .unwrap()
+            .unwrap()
+            .peers;
+        let mut capacity = nodes
+            .iter()
+            .map(|node| {
+                let node = node.lock().unwrap();
+                (
+                    node.keys().node_id(),
+                    node.coding_capacity(V1_SECTOR_SIZE as u32).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let lanes = build_packed_coding_lanes(
+            old.catalog.sectors.clone(),
+            PackedCodingContext {
+                guild_id,
+                geometry_id: Uuid::from_bytes([221; 16]),
+                peers: &peers,
+                placement_capacity: &mut capacity,
+            },
+        )
+        .unwrap();
+        assert_eq!(lanes.len(), 1);
+        let mut workers = Vec::new();
+        for (node, client) in nodes.iter().zip(&clients) {
+            workers.push(tokio::spawn(run_delegated_coding_jobs(
+                node.clone(),
+                client.clone(),
+            )));
+            workers.push(tokio::spawn(run_coding_holder_cleanup_jobs(
+                node.clone(),
+                client.clone(),
+            )));
+        }
+        queue_variable_coding_lanes(
+            nodes[0].clone(),
+            &clients[0],
+            owner,
+            [222; 32],
+            state.membership_epoch,
+            &peers,
+            lanes,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let old_group = loop {
+            let groups = nodes
+                .iter()
+                .map(|node| {
+                    node.lock()
+                        .unwrap()
+                        .dynamic_guild_state()
+                        .unwrap()
+                        .unwrap()
+                        .coding_groups
+                })
+                .collect::<Vec<_>>();
+            if groups.iter().all(|groups| groups.len() == 1) {
+                let group = &groups[0][0].group;
+                let ready = group.roles.iter().enumerate().all(|(index, role)| {
+                    nodes.iter().any(|node| {
+                        let node = node.lock().unwrap();
+                        match role {
+                            ShardRoleV2::Information(information)
+                                if !information.sector.virtual_zero =>
+                            {
+                                node.variable_information_for_guild(
+                                    &guild_id,
+                                    &information.sector.id,
+                                    index as u16,
+                                )
+                                .is_ok()
+                            }
+                            ShardRoleV2::Parity(_) => node
+                                .variable_parity_for_guild(&guild_id, &group.id, index as u16)
+                                .is_ok(),
+                            _ => true,
+                        }
+                    })
+                });
+                if ready {
+                    break group.clone();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "initial mixed coding group timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        eprintln!("mixed packed group: original information and parity are READY");
+        // Protect the changed boundary sector normally. The unchanged sector
+        // still relies solely on the old mixed group.
+        let uncovered = {
+            let mut node = nodes[0].lock().unwrap();
+            for sector in &current.sectors {
+                node.store_packed_sector(guild_id, profile, sector.clone())
+                    .unwrap();
+            }
+            node.uncovered_packed_sectors(&current.catalog.sectors)
+                .unwrap()
+        };
+        assert_eq!(uncovered.len(), 1);
+        let mut capacity = nodes
+            .iter()
+            .map(|node| {
+                let node = node.lock().unwrap();
+                (
+                    node.keys().node_id(),
+                    node.coding_capacity(V1_SECTOR_SIZE as u32).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let lanes = build_packed_coding_lanes(
+            uncovered,
+            PackedCodingContext {
+                guild_id,
+                geometry_id: Uuid::from_bytes([223; 16]),
+                peers: &peers,
+                placement_capacity: &mut capacity,
+            },
+        )
+        .unwrap();
+        queue_variable_coding_lanes(
+            nodes[0].clone(),
+            &clients[0],
+            owner,
+            [224; 32],
+            state.membership_epoch,
+            &peers,
+            lanes,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            if nodes.iter().all(|node| {
+                let node = node.lock().unwrap();
+                node.dynamic_guild_state()
+                    .unwrap()
+                    .unwrap()
+                    .coding_groups
+                    .len()
+                    == 2
+                    && node
+                        .uncovered_packed_sectors(&current.catalog.sectors)
+                        .unwrap()
+                        .is_empty()
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "changed packed sector activation timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let mut revision = UserRevision {
+            format_version: 4,
+            guild_id,
+            protected_root_id: root_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![source_commitment]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 7,
+                guild_id,
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 1,
+                parent: None,
+                members: state.active_members().cloned().collect(),
+                writer_fences: vec![mb_core::WriterFence {
+                    owner,
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
+                revision_tombstones: Vec::new(),
+                revisions: vec![
+                    SignedRecord::sign(
+                        mb_core::USER_REVISION_DOMAIN,
+                        revision,
+                        nodes[0].lock().unwrap().keys(),
+                    )
+                    .unwrap(),
+                ],
+                coding_groups: Vec::new(),
+                authority: Some(CheckpointAuthority {
+                    format_version: 1,
+                    membership_epoch: state.membership_epoch,
+                    quorum: state.quorum,
+                }),
+                packing_catalog: Some(current.catalog.clone()),
+            },
+            signatures: Vec::new(),
+        };
+        for node in &nodes {
+            checkpoint.signatures.push(
+                node.lock()
+                    .unwrap()
+                    .sign_checkpoint(&checkpoint.checkpoint)
+                    .unwrap(),
+            );
+        }
+        checkpoint
+            .signatures
+            .sort_by_key(|signature| signature.signer);
+        checkpoint.verify().unwrap();
+        for node in &nodes {
+            node.lock().unwrap().store_checkpoint(&checkpoint).unwrap();
+        }
+        eprintln!("mixed packed group: current checkpoint installed");
+        {
+            let node = nodes[0].lock().unwrap();
+            assert!(
+                node.uncovered_packed_sectors(&current.catalog.sectors)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                node.packed_sectors_for_group_replacement(&current.catalog.sectors)
+                    .unwrap(),
+                vec![current_descriptor.clone()]
+            );
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            assert!(
+                variable_group_lifecycle_kind(&state, &live_ids, state.event_sequence + 1)
+                    .is_none()
+            );
+        }
+        reconcile_variable_group_lifecycle_once(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        assert!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .coding_groups
+                .iter()
+                .any(|retained| retained.group.id == old_group.id
+                    && retained.retired_at_event.is_none())
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            reconcile_variable_group_lifecycle_once(nodes[0].clone(), &clients[0])
+                .await
+                .unwrap();
+            let forgotten = nodes.iter().all(|node| {
+                !node
+                    .lock()
+                    .unwrap()
+                    .dynamic_guild_state()
+                    .unwrap()
+                    .unwrap()
+                    .coding_groups
+                    .iter()
+                    .any(|retained| retained.group.id == old_group.id)
+            });
+            let removed = nodes.iter().all(|node| {
+                let node = node.lock().unwrap();
+                old_group
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .all(|(index, role)| match role {
+                        ShardRoleV2::Parity(_) => node
+                            .variable_parity_for_guild(&guild_id, &old_group.id, index as u16)
+                            .is_err(),
+                        _ => true,
+                    })
+            });
+            if forgotten && removed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mixed coding group replacement/cleanup timed out: forgotten={forgotten}, parity_removed={removed}, worker_states={:?}",
+                workers
+                    .iter()
+                    .map(|task| task.is_finished())
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        eprintln!("mixed packed group: forgotten and obsolete parity deleted");
+        // Information can be shared with other attempts. Ordinary GC retains
+        // it through a checkpoint-generation grace window after Forget.
+        assert!(nodes.iter().any(|node| {
+            let node = node.lock().unwrap();
+            old_group.roles.iter().enumerate().any(|(index, role)| {
+                matches!(role, ShardRoleV2::Information(information)
+                    if obsolete_ids.contains(&information.sector.id)
+                        && node.variable_information_for_guild(&guild_id, &information.sector.id, index as u16).is_ok())
+            })
+        }));
+        checkpoint.checkpoint.parent = Some(checkpoint.hash().unwrap());
+        checkpoint.checkpoint.generation = 2;
+        let advanced =
+            pack_incremental(profile, Some(&current.catalog), vec![current_input]).unwrap();
+        assert_eq!(advanced.catalog.sectors, current.catalog.sectors);
+        checkpoint.checkpoint.packing_catalog = Some(advanced.catalog);
+        checkpoint.signatures.clear();
+        for node in &nodes {
+            checkpoint.signatures.push(
+                node.lock()
+                    .unwrap()
+                    .sign_checkpoint(&checkpoint.checkpoint)
+                    .unwrap(),
+            );
+        }
+        checkpoint
+            .signatures
+            .sort_by_key(|signature| signature.signer);
+        checkpoint.verify().unwrap();
+        for node in &nodes {
+            node.lock().unwrap().store_checkpoint(&checkpoint).unwrap();
+            let node = node.lock().unwrap();
+            for (index, role) in old_group.roles.iter().enumerate() {
+                if let ShardRoleV2::Information(information) = role
+                    && obsolete_ids.contains(&information.sector.id)
+                {
+                    assert!(
+                        node.variable_information_for_guild(
+                            &guild_id,
+                            &information.sector.id,
+                            index as u16
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+        eprintln!("mixed packed group: obsolete information deleted after GC grace");
+        {
+            let node = nodes[0].lock().unwrap();
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            assert_eq!(state.coding_groups.len(), 2);
+            assert!(
+                state
+                    .coding_groups
+                    .iter()
+                    .all(|retained| retained.group.id != old_group.id)
+            );
+            assert!(
+                node.packed_sectors_for_group_replacement(&current.catalog.sectors)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            load_distributed_packed_sector(nodes[0].clone(), &clients[0], current_descriptor)
+                .await
+                .unwrap(),
+            current
+                .sectors
+                .iter()
+                .find(|sector| sector.descriptor.id == current_descriptor.id)
+                .unwrap()
+                .bytes
+        );
+        for task in workers {
+            task.abort();
+            let _ = task.await;
+        }
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks {
+            task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

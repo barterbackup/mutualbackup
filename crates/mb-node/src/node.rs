@@ -12669,10 +12669,41 @@ impl Node {
         let state = self
             .dynamic_guild_state()?
             .context("packed coverage requires dynamic guild state")?;
+        self.uncovered_packed_sectors_in_state(&state, descriptors)
+    }
+
+    pub(crate) fn packed_sectors_for_group_replacement(
+        &self,
+        descriptors: &[PackedSectorDescriptor],
+    ) -> Result<Vec<PackedSectorDescriptor>> {
+        let mut state = self
+            .dynamic_guild_state()?
+            .context("packed replacement requires dynamic guild state")?;
+        let live = descriptors
+            .iter()
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        // This is only a planning view. Keep the actual groups and their READY
+        // shards until a verified replacement is activated and Retire/Forget
+        // is committed. Padding roles do not contain expired user data.
+        state.coding_groups.retain(|retained| {
+            retained.group.roles.iter().all(|role| {
+                !matches!(role, ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero && !live.contains(&information.sector.id))
+            })
+        });
+        self.uncovered_packed_sectors_in_state(&state, descriptors)
+    }
+
+    fn uncovered_packed_sectors_in_state(
+        &self,
+        state: &DynamicGuildState,
+        descriptors: &[PackedSectorDescriptor],
+    ) -> Result<Vec<PackedSectorDescriptor>> {
         descriptors
             .iter()
             .filter_map(|descriptor| {
-                match self.verified_packed_sector_coverage(&state, descriptor, false) {
+                match self.verified_packed_sector_coverage(state, descriptor, false) {
                     Ok(true) => None,
                     Ok(false) => Some(Ok(descriptor.clone())),
                     Err(error) => Some(Err(error)),

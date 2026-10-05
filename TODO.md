@@ -280,13 +280,35 @@
   coded data carrying the expired blob. Exercise the production Retire/Forget
   and holder-cleanup workers, inspect the holders' actual READY objects, and
   recover the current graph after removing the owner's local state again.
-  Handle a mixed coding group that still supplies the only coverage for a
-  current packed sector: create and verify replacement coverage before retiring
-  it. `variable_group_lifecycle_kind` currently preserves such a group, and
-  `uncovered_packed_sectors` does not request replacement while its coverage is
-  valid. Deleting the obsolete group first would endanger current data.
+  Mixed coding groups now have a replacement path, covered separately below.
+  Extend the real Git-history fixture through holder cleanup and the next
+  checkpoint-generation information GC window; an expired raw owner recipe or
+  local Git anchor is not evidence that the holders' old coded data is gone.
   Keep this gate open independently of local anchor reclamation and the
   provisioned five-daemon guarded recovery gate.
+- [x] **M6 replace mixed packed coding groups before deleting expired data.**
+  The coordinator now plans surviving packed sectors against verified groups
+  whose non-padding information is all current. It queues replacement through
+  the existing durable launch/verification/activation path while retaining the
+  original group. Fully obsolete groups and ready Forget events run before
+  replacement allocation; insufficient capacity preserves existing coverage.
+  Packed checkpoints stay on the packed renewal path instead of falling through
+  to raw-sector coding when their packed coverage is already complete.
+  The new five-peer QUIC fixture starts with actual READY information and parity,
+  drops a source from the packing catalog, protects its changed boundary sector,
+  and shows that only the unchanged sector still relying on the mixed group
+  needs replacement. After verified activation it commits Retire/Forget, checks
+  physical deletion of old parity, retains obsolete information through the
+  checkpoint GC grace window, then advances a correctly chained catalog and
+  proves those READY information objects are deleted. Distributed reconstruction
+  returns the exact surviving sector. The ext4 and disposable local Btrfs runs
+  pass in 228.62 and 183.40 seconds. The guarded format-7 Git recovery/retention/
+  prune fixture passes on that Btrfs image in 314.86 seconds.
+  Adjacent redundant-group retirement, delayed-holder Forget cleanup, and
+  offline-first-spare renewal regressions, formatting, and strict locked
+  all-target workspace Clippy pass. The temporary Btrfs mount and image were
+  removed. The end-to-end Git remote-reclamation and provisioned daemon gates
+  remain open.
 - [x] **M6 preserve recipe pins during guarded Git prune replay.** A pending
   catalog retirement no longer authorizes deletion of an imported native anchor
   when a retained or restored local-sector recipe names that exact anchor.

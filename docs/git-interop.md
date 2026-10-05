@@ -56,6 +56,11 @@ one-generation cleanup grace window, including after seed recovery. Unrelated
 pending revision cleanup does not block collection of an older blob once its
 graph protection and exact sector-recipe pins have expired. Missing checkpoint
 history or a pending capture, restore, or backup still prevents unsafe pruning.
+After retention releases history, background cleanup replaces coding groups
+that mix current and expired sectors before retiring them. Parity cleanup
+follows Forget; information shards wait for the checkpoint GC grace window and
+any remaining shared uses. Insufficient replacement capacity delays cleanup
+while keeping current data protected.
 `mutualgit rm PATH` removes a clean tracked file or symlink and stages its
 deletion. It rejects staged or working-tree changes, and replays an interrupted
 unlink before clearing the index. `mutualgit rm --cached PATH` keeps the working
