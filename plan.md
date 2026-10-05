@@ -30,6 +30,12 @@ them as ADRs and test vectors before promising wire compatibility.
   commands through a Git-style local CLI; its native repository is
   `.mutualbackup`, while ordinary Git communicates through object/pack exchange
   rather than opening that directory as `.git`.
+  This Git pivot is an addition to the original roadmap: implement it through
+  the versioned source-backend boundary alongside the outstanding guarded-source,
+  platform, metadata, watcher, and application-capture work. Milestone 6 must
+  deliver both sets of requirements; Milestone 7 freezes their compatibility
+  together. Git compatibility must not add a second permanent payload copy
+  inside our repository or require Git-specific behavior from other guild members.
 - The Git-compatible frontend preserves tracked file bytes exactly. No command
   automatically fixes line endings or applies another content conversion, even
   when the host's Git configuration enables one. Git's `text`/`eol` handling
@@ -731,6 +737,12 @@ Proactive background repair comes later.
   conversion paths; neither may change `B` at this boundary, even when an
   inherited Git setting or repository attribute enables it. The same rule
   applies to checkout, which must publish the stored blob bytes unchanged.
+  Make raw-byte capture, import, and restore explicit operations of the
+  versioned boundary. Keep attribute/configuration interpretation outside that
+  payload path: a Git library adapter must consume the verified anchor bytes
+  directly rather than pass a filename to an API that may apply conversions.
+  New backend versions must preserve this contract, including across replay
+  of an interrupted operation recorded by an older version.
   Verify the captured bytes before publishing an index entry or revision and
   the restored bytes before replacing a worktree file. A mismatch is an
   operation failure, never a reason to normalize line endings or run a Git
@@ -3785,6 +3797,27 @@ CRLF through `core.autocrlf` or `text`/`eol` attributes without a clean filter,
 while a clean filter can change arbitrary bytes. Neither mechanism may run in
 our binary, even under inherited system or global Git configuration. This is
 an unconditional repository invariant, not a configurable compatibility mode.
+
+Use these concrete acceptance cases throughout implementation:
+
+- Stage files containing CRLF, LF, mixed line endings, no final newline, and
+  binary bytes under conversion-inducing Git settings. Assert byte equality
+  through capture, blob export, checkout into another worktree, and seed-only
+  recovery; compare blob IDs with stock Git's raw `hash-object --no-filters`.
+- Change only CRLF to LF in a tracked file. `status` and `diff` must expose the
+  change; an explicit `add` and `commit` must retain a different blob, and
+  checkout of either commit must restore that commit's exact line endings.
+- Configure clean, smudge, and process filters that would visibly change bytes
+  and record invocation. Exercise supported file-touching commands and verify
+  that our binary never invokes them, including during replay after a crash.
+- Exchange commits with stock Git in both directions while that client's
+  worktree conversions are enabled. Compare stored blob bytes and object IDs
+  at the transport boundary; our checkout preserves those bytes, even when
+  the external client's worktree has a different presentation.
+
+Keep these byte-policy checks beside the existing Btrfs extent-sharing,
+guarded hard-link isolation, reachable-history recovery, and physical-prune
+checks. Byte equality alone does not prove efficient storage or safe deletion.
 
 - First extract and version the source-backend boundary from section 4 without
   changing the existing signed peer format. Prove a custom object-store adapter
