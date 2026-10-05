@@ -112,16 +112,22 @@ passing tests below apply only to their recorded source and exercised cases.
   and interruption at each publication boundary converge after reopen; the
   evacuated disk can be removed while reads/reconstruction still succeed.
 
-- [ ] **R6 / P2 — Package ordinary Git as an explicit runtime dependency.**
-  `crates/mb-git/src/stock_git.rs` invokes stock `git cat-file --batch`, but
-  `flake.nix` does not supply Git to the product runtime. Provide a pinned
-  ordinary-Git executable through the package closure/wrapper or an explicit
-  configured executable path, and declare it for other distribution formats.
-  Preserve discovery when the optional `mutualgit`-as-`git` alias comes first on
-  PATH, including daemon/service execution. Acceptance: the installed artifact
-  imports/fetches packed objects and completes the documented local stock-Git
-  bridge flow in a clean environment without an ambient Git installation, both
-  with and without the alias; missing dependencies produce actionable errors.
+- [x] **R6 / P2 — Package ordinary Git as an explicit runtime dependency.**
+  Implemented: the default Nix runtime wraps the CLI, daemon, native Git command,
+  and remote helper with pinned ordinary Git on PATH; the optional alias points
+  to that runtime. Standalone static lab artifacts and Cargo builds declare the
+  daemon's ordinary-Git PATH requirement. Discovery preserves alias skipping and
+  gives an actionable missing-dependency error. `scripts/packaged-git-smoke.py`
+  checks packed import, both bridge directions, binary/CRLF bytes, commit IDs,
+  and absence of a native Git payload mirror with an isolated PATH, both with
+  and without the alias. A dedicated CI job runs this against installed Nix
+  artifacts. Validation: the installed Nix runtime and alias passed all three
+  smoke scenarios on disposable Btrfs, including a raw standalone missing-Git
+  error before visible refs/history changed. Alias discovery/error tests and
+  ordinary Git library tests pass; format and strict workspace Clippy pass with
+  unrelated FUSE test WIP held aside and restored. The runtime closure contains
+  pinned Git 2.55.0. This qualifies the Git dependency slice; broader release
+  artifact and topology qualification remains R7.
 
 - [ ] **R7 / P1 — Automate mandatory validation for the exact release artifact.**
   Nix `checks` currently point at build artifacts with `doCheck = false`;
@@ -129,8 +135,9 @@ passing tests below apply only to their recorded source and exercised cases.
   `.github/workflows/ci.yml` already runs format, strict Clippy, locked workspace
   tests, Docker safety, reflink/network acceptance, port-mapping, and private-Tor
   recovery. Preserve those jobs and keep the build-only Nix sandbox distinction;
-  add the missing complete `scripts/git-linux-acceptance.sh` CI gate, packaged
-  runtime smoke, and required upgrade/multi-volume regression coverage. Qualify
+  add the missing complete `scripts/git-linux-acceptance.sh` CI gate and required
+  upgrade/multi-volume regression coverage. The dedicated packaged Git runtime
+  smoke job now covers the R6 slice. Qualify
   the exact release artifact through native-filesystem, topology, and source-loss
   scenarios, rather than equating a build or source-tree test pass with packaged
   behavior. Run R1-R6 regressions on one recorded source and its release candidate.

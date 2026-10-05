@@ -35,9 +35,36 @@ nix build --no-substitute .#git-command
 For a Cargo build, a symlink named `git` to the locally built `mutualgit`
 binary works the same way. Put that symlink on `PATH` only in shells where you
 want the documented MutualBackup command subset; unsupported Git commands fail
-explicitly. Keep stock Git later on `PATH`: packed-object import and export use
-its raw `cat-file` stream, and the daemon skips the `mutualgit` alias when
-selecting it. Use stock Git separately for the bridge examples below.
+explicitly. The default Nix package supplies pinned ordinary Git in its runtime
+closure and on the programs' PATH, including daemon/service execution. The
+optional alias package uses those same wrapped programs. Cargo builds and the
+standalone `lab-artifacts` binaries require ordinary Git on the daemon's PATH:
+import and export use its raw `cat-file` stream. Discovery skips a `mutualgit`
+alias when selecting it and reports how to supply the dependency if it is
+missing. Use stock Git separately for the bridge examples below.
+
+To qualify the installed Nix programs, build the runtime and alias packages and
+run their smoke test on a disposable qualified reflink filesystem:
+
+```sh
+nix build .#default -o result-runtime
+nix build .#git-command -o result-git
+nix develop
+python3 scripts/packaged-git-smoke.py \
+  --bin-dir "$PWD/result-runtime/bin" \
+  --alias-dir "$PWD/result-git/bin" \
+  --stock-git "$(command -v git)" \
+  --reflink-root "$MUTUALBACKUP_REFLINK_TEST_ROOT"
+```
+
+Ordinary Git is used explicitly to prepare and inspect the stock fixtures. The
+tested programs receive an isolated PATH containing only the package and,
+in the second scenario, its optional alias. The test exercises packed-object
+import and both bridge directions, compares binary/CRLF bytes and commit IDs,
+and checks that the native source has no `.git` payload mirror. Commands and
+daemon startup/shutdown have bounded waits; failed fixtures retain their log.
+A third scenario invokes the raw standalone binaries without Git and checks
+the error, unchanged visible refs/history, and untouched working bytes.
 
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,

@@ -26,7 +26,7 @@ fn executable_in(path: &OsStr) -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "stock Git is required for packed-object streaming; no stock git executable was found on PATH",
+        "stock Git is required for raw object streaming; install ordinary Git on the daemon's PATH (the mutualgit alias cannot replace it)",
     ))
 }
 
@@ -49,5 +49,13 @@ mod tests {
         fs::set_permissions(&stock, fs::Permissions::from_mode(0o755)).unwrap();
         let path = std::env::join_paths([alias_dir.path(), stock_dir.path()]).unwrap();
         assert_eq!(executable_in(&path).unwrap(), stock);
+    }
+
+    #[test]
+    fn missing_dependency_reports_how_to_supply_ordinary_git() {
+        let empty = tempfile::tempdir().unwrap();
+        let error = executable_in(empty.path().as_os_str()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("daemon's PATH"));
     }
 }

@@ -47,6 +47,17 @@
         # mandatory gates.
         doCheck = false;
       };
+      runtimePackage = pkgs.symlinkJoin {
+        name = "mutualbackup-runtime-0.1.0";
+        paths = [ staticBinary ];
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        postBuild = ''
+          for program in mutualbackup mutualbackupd mutualgit git-remote-mutualbackup; do
+            wrapProgram "$out/bin/$program" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+          done
+        '';
+      };
       labArtifacts = pkgs.runCommandNoCC "mutualbackup-lab-artifacts-0.1.0" { } ''
         install -Dm755 ${staticBinary}/bin/mutualbackup \
           $out/mutualbackup-x86_64-linux
@@ -55,16 +66,16 @@
       '';
       gitCommand = pkgs.runCommandNoCC "mutualbackup-git-command-0.1.0" { } ''
         mkdir -p $out/bin
-        ln -s ${staticBinary}/bin/mutualgit $out/bin/git
+        ln -s ${runtimePackage}/bin/mutualgit $out/bin/git
       '';
     in {
       packages.${system} = {
-        default = staticBinary;
+        default = runtimePackage;
         lab-artifacts = labArtifacts;
         git-command = gitCommand;
       };
       checks.${system} = {
-        default = staticBinary;
+        default = runtimePackage;
         lab-artifacts = labArtifacts;
         git-command = gitCommand;
       };
@@ -76,6 +87,7 @@
             cargo
             clang
             gnumake
+            git
             iproute2
             iptables
             openssl

@@ -26,6 +26,46 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
 
+  packaged-git-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Build the installed runtime and optional Git alias
+        run: |
+          nix build .#default -o result-runtime
+          nix build .#git-command -o result-git
+      - name: Provision disposable Btrfs filesystem
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          truncate -s 2G /tmp/mutualbackup-package-ci.btrfs
+          sudo mkfs.btrfs -q -f /tmp/mutualbackup-package-ci.btrfs
+          sudo mkdir -p /mnt/mutualbackup-package-ci
+          sudo mount -o loop,user_subvol_rm_allowed /tmp/mutualbackup-package-ci.btrfs /mnt/mutualbackup-package-ci
+          sudo chown "$USER":"$USER" /mnt/mutualbackup-package-ci
+      - name: Prove packaged Git interoperability without ambient Git
+        run: |
+          nix develop -c bash -c 'python3 scripts/packaged-git-smoke.py \
+            --bin-dir "$PWD/result-runtime/bin" \
+            --alias-dir "$PWD/result-git/bin" \
+            --stock-git "$(command -v git)" \
+            --reflink-root /mnt/mutualbackup-package-ci'
+      - name: Retain failed daemon diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-git-diagnostics
+          path: /mnt/mutualbackup-package-ci/mb-package-git-*/daemon.log
+          if-no-files-found: ignore
+      - name: Unmount disposable filesystem
+        if: always()
+        run: |
+          if mountpoint -q /mnt/mutualbackup-package-ci; then
+            sudo umount /mnt/mutualbackup-package-ci
+          fi
+
   port-mapping-acceptance:
     runs-on: ubuntu-latest
     steps:

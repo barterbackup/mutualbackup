@@ -35,6 +35,9 @@ steps below builds the programs.
 The current prototype has these practical constraints:
 
 - It runs on Linux, and the supplied binaries require an x86-64 machine.
+- Git import/export requires ordinary Git on the daemon's PATH. These standalone
+  static lab binaries do not bundle Git. The default Nix package supplies its
+  pinned Git runtime dependency through wrappers instead.
 - A working guild has exactly five nodes. One daemon is enough to inspect the
   interface, but not to commit a guild backup.
 - Protected data must be on a filesystem that passes the complete reflink COW
