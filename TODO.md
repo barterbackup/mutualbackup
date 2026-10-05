@@ -217,8 +217,11 @@
   regression, and guarded ext4/Btrfs plus ordinary Btrfs node probes pass. The
   five-peer format-7 seed-only recovery fixture also locates the hidden-catalog
   repository on ext4 and disposable Btrfs.
-  This makes recovered guarded history discoverable to the CLI while guarded
-  add/checkout and the provisioned daemon gate remain open.
+  The stock-Git remote helper now uses that lookup for an exact hidden-catalog
+  repository path. Its local Btrfs bridge gate fetches a raw blob through a
+  marker-free view path and verifies the exported bytes. This makes recovered
+  guarded history discoverable to both frontends while guarded add/checkout
+  and the provisioned daemon gate remain open.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression

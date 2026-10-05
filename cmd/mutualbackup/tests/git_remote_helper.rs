@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mb_git::{FetchError, GitRepository, RepositoryError};
-use mb_node::{LocalRequest, LocalResponse, WireError};
+use mb_node::{GitRepositoryInfo, LocalRequest, LocalResponse, WireError};
 use uuid::Uuid;
 
 #[test]
@@ -24,8 +24,10 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
     let run_root = test_root.join(format!("git-remote-helper-{}", Uuid::new_v4()));
     let source_root = run_root.join("source");
     let stock_root = run_root.join("stock");
+    let hidden_root = run_root.join("guarded-view");
     fs::create_dir_all(&source_root).unwrap();
     fs::create_dir_all(&stock_root).unwrap();
+    fs::create_dir_all(&hidden_root).unwrap();
     let payload = b"exact\r\nbytes\0\xff\n";
     fs::write(source_root.join("tracked"), payload).unwrap();
     let repository_id = Uuid::new_v4();
@@ -63,6 +65,7 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
     let stop = Arc::new(AtomicBool::new(false));
     let server_stop = stop.clone();
     let server_root = source_root.clone();
+    let server_hidden_root = hidden_root.clone();
     let server = std::thread::spawn(move || {
         let repository = GitRepository::open(&server_root, repository_id, &key).unwrap();
         while !server_stop.load(Ordering::Relaxed) {
@@ -83,6 +86,14 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
             let request: LocalRequest =
                 serde_json::from_value(envelope["request"].clone()).unwrap();
             let response: Result<LocalResponse, WireError> = match request {
+                LocalRequest::GitLocate { path } => {
+                    assert_eq!(path, server_hidden_root);
+                    Ok(LocalResponse::GitLocated(Some(GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: server_hidden_root.clone(),
+                    })))
+                }
                 LocalRequest::GitBranches {
                     repository_id: requested,
                 } => {
@@ -125,7 +136,7 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
                     advertised_tags,
                 } => {
                     assert_eq!(requested, repository_id);
-                    assert_eq!(source_root, server_root);
+                    assert!(source_root == server_root || source_root == server_hidden_root);
                     let object_count = repository
                         .export_to_git_repository_with_tags(
                             &destination,
@@ -299,6 +310,40 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
         String::from_utf8(output.stdout).unwrap().trim(),
         git2::Oid::from_bytes(&commit.oid).unwrap().to_string()
     );
+    let hidden_stock = run_root.join("hidden-stock");
+    let output = Command::new("git")
+        .args(["init", "-q"])
+        .arg(&hidden_stock)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&hidden_stock)
+        .args(["fetch", "--no-tags"])
+        .arg(format!("mutualbackup::{}", hidden_root.display()))
+        .arg("refs/heads/main:refs/remotes/guarded/main")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&hidden_stock)
+        .args([
+            "cat-file",
+            "blob",
+            &git2::Oid::from_bytes(&staged.oid).unwrap().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, payload);
     for tag in [&lightweight_tag, &annotated_tag] {
         let reference = format!("refs/tags/{}", tag.name);
         let output = Command::new("git")

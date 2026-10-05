@@ -45,7 +45,7 @@ fn read_line(input: &mut impl BufRead) -> Result<Option<String>> {
     }
 }
 
-fn repository_from_url(url: &str) -> Result<(PathBuf, Uuid)> {
+async fn repository_from_url(url: &str, socket: &Path) -> Result<(PathBuf, Uuid)> {
     let path = Path::new(url);
     if !path.is_absolute() {
         bail!("mutualbackup remote URL must be an absolute repository path");
@@ -53,8 +53,23 @@ fn repository_from_url(url: &str) -> Result<(PathBuf, Uuid)> {
     let path = path
         .canonicalize()
         .context("cannot resolve remote repository")?;
-    let repository_id =
-        git_catalog_marker(&path)?.context("remote path is not a MutualBackup Git repository")?;
+    let repository_id = match std::fs::symlink_metadata(path.join(".mutualbackup")) {
+        Ok(_) => git_catalog_marker(&path)?
+            .context("remote path is not a MutualBackup Git repository")?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let LocalResponse::GitLocated(info) =
+                local_control_call(socket, &LocalRequest::GitLocate { path: path.clone() }).await?
+            else {
+                bail!("daemon returned the wrong response to Git repository lookup");
+            };
+            let info = info.context("remote path is not a MutualBackup Git repository")?;
+            if info.format_version != 1 || info.repository_id.is_nil() || info.path != path {
+                bail!("daemon returned an invalid Git repository location");
+            }
+            info.repository_id
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok((path, repository_id))
 }
 
@@ -238,11 +253,11 @@ async fn main() -> Result<()> {
     if arguments.next().is_some() {
         bail!("unexpected Git remote-helper argument");
     }
-    let (source_root, repository_id) = repository_from_url(&url)?;
-    let destination = destination_git_directory()?;
     let socket = env::var_os("MUTUALBACKUP_CONTROL_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(default_control_socket);
+    let (source_root, repository_id) = repository_from_url(&url, &socket).await?;
+    let destination = destination_git_directory()?;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let stdout = io::stdout();
@@ -395,6 +410,51 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hidden_catalog_uses_daemon_registration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("guarded");
+        std::fs::create_dir(&root).unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let repository_id = Uuid::new_v4();
+        let requested = root.clone();
+        let returned = root.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap() as usize;
+            let mut payload = vec![0; length];
+            stream.read_exact(&mut payload).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                request["request"]["GitLocate"]["path"],
+                requested.to_str().unwrap()
+            );
+            let response = serde_json::json!({
+                "format_version": 2,
+                "request_id": request["request_id"],
+                "result": {"Ok": {"GitLocated": {
+                    "format_version": 1,
+                    "repository_id": repository_id,
+                    "path": returned,
+                }}},
+            });
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream.write_u32(encoded.len() as u32).await.unwrap();
+            stream.write_all(&encoded).await.unwrap();
+        });
+        assert_eq!(
+            repository_from_url(root.to_str().unwrap(), &socket)
+                .await
+                .unwrap(),
+            (root, repository_id)
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn fetch_requests_must_match_an_advertised_ref_and_oid() {
