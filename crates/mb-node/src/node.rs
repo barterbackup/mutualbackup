@@ -4261,6 +4261,16 @@ impl Node {
             "guarded Git prune lost its exact node fence"
         );
         let protected = self.git_prune_protected_roots(intent.repository_id)?;
+        // Catalog retirement is replayable after its mappings are gone. A
+        // retained or restored sector recipe must still prevent native deletion.
+        anyhow::ensure!(
+            intent
+                .batch
+                .anchors
+                .iter()
+                .all(|candidate| { !protected.anchor_ids.contains(&candidate.manifest.anchor_id) }),
+            "guarded Git prune waits for retained source recipes"
+        );
         let repository = self.open_guarded_git_repository(intent.repository_id)?;
         let root = self.protected_root_by_id(intent.repository_id)?;
         let root_anchor_id = self.guarded_root_mount_binding(&root)?.anchor_id;
@@ -29094,6 +29104,154 @@ pub(crate) mod tests {
         reopened.guarded_mounts.pop().unwrap().stop().unwrap();
         drop(reopened);
         assert!(Node::open(&data_dir, seed).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_git_imported_blob_prune_rechecks_recipe_pins_after_catalog_retirement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let area = tempfile::Builder::new()
+            .prefix("mb-git-prune-pin-")
+            .tempdir_in(test_root)
+            .unwrap();
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let view = area.path().join("view");
+        let data_dir = area.path().join("node");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&view).unwrap();
+        fs::write(lower.join("current"), b"current guarded bytes").unwrap();
+        fs::set_permissions(lower.join("current"), fs::Permissions::from_mode(0o644)).unwrap();
+        let seed = Seed::from_bytes([207; 32]);
+        let mut node = Node::open(&data_dir, seed.clone()).unwrap();
+        let database_key = node.control_database_key;
+        let root = node
+            .enroll_test_guarded_root(&lower, &view, 65534, 65534)
+            .unwrap();
+        node.init_registered_guarded_git(root.root_id).unwrap();
+        let binding = node.guarded_root_mount_binding(&root).unwrap();
+        let blob_bytes = b"historical Git bytes\r\n\0";
+        let imported = mb_store::SourceBlobImportPlan::plan_direct(
+            &binding.lower_root,
+            blob_bytes.len() as u64,
+        )
+        .unwrap()
+        .capture(std::io::Cursor::new(blob_bytes))
+        .unwrap();
+        let oid = mb_git::blob_oid_from_anchor(&imported).unwrap();
+        let catalog = ControlStore::open_existing_with_key(
+            binding.lower_root.join(".mutualbackup/catalog.db"),
+            &node.git_catalog_key(root.root_id),
+        )
+        .unwrap();
+        catalog
+            .put_record(
+                &format!("git-object-anchor-v1/{}/{oid}", root.root_id),
+                imported.anchor_id.as_bytes(),
+                &canonical_bytes(&imported).unwrap(),
+            )
+            .unwrap();
+        let guild_id = [208; 32];
+        let reference = crate::snapshot::install_test_git_anchor_recipe(
+            &node.control,
+            &node.keys,
+            guild_id,
+            [209; 32],
+            &imported,
+        )
+        .unwrap();
+        let recipe = node
+            .control
+            .get_record("local-sector", &reference.id)
+            .unwrap()
+            .unwrap();
+        let expected = node.sector_for_guild(&guild_id, &reference.id).unwrap();
+        assert_eq!(
+            node.git_prune(root.root_id).unwrap().native_anchors_removed,
+            0
+        );
+        imported.open_verified().unwrap();
+        node.control
+            .delete_record("local-sector", &reference.id)
+            .unwrap();
+        let repository = node.open_guarded_git_repository(root.root_id).unwrap();
+        let protected = node.git_prune_protected_roots(root.root_id).unwrap();
+        let batch = repository
+            .preview_guarded_prune(&protected)
+            .unwrap()
+            .first_batch()
+            .unwrap();
+        assert_eq!(batch.anchors.len(), 1);
+        assert_eq!(batch.anchors[0].manifest, imported);
+        assert!(batch.anchors[0].attempt_id.is_none());
+        let intent = GuardedGitPruneIntentV1 {
+            format_version: 1,
+            repository_id: root.root_id,
+            batch,
+        };
+        let intent_bytes = canonical_bytes(&intent).unwrap();
+        node.control
+            .put_record(
+                GUARDED_GIT_PRUNE_KIND,
+                root.root_id.as_bytes(),
+                &intent_bytes,
+            )
+            .unwrap();
+        repository
+            .retire_guarded_prune_catalog(&intent.batch, &protected)
+            .unwrap();
+        node.control
+            .put_record("local-sector", &reference.id, &recipe)
+            .unwrap();
+        let error = node
+            .resume_guarded_git_prune_intent(&intent, &intent_bytes)
+            .unwrap_err();
+        assert!(error.to_string().contains("retained source recipes"));
+        assert_eq!(
+            node.control
+                .get_record(GUARDED_GIT_PRUNE_KIND, root.root_id.as_bytes())
+                .unwrap(),
+            Some(intent_bytes.clone())
+        );
+        imported.open_verified().unwrap();
+        assert_eq!(
+            node.sector_for_guild(&guild_id, &reference.id).unwrap(),
+            expected
+        );
+        drop(repository);
+        drop(catalog);
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
+        drop(node);
+        assert!(Node::open(&data_dir, seed.clone()).is_err());
+        imported.open_verified().unwrap();
+        let control =
+            ControlStore::open_with_key(data_dir.join("control.db"), &database_key).unwrap();
+        control
+            .delete_record("local-sector", &reference.id)
+            .unwrap();
+        drop(control);
+        let mut node = Node::open(&data_dir, seed).unwrap();
+        assert!(imported.open_verified().is_err());
+        assert!(
+            node.control
+                .get_record(GUARDED_GIT_PRUNE_KIND, root.root_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fs::read(view.join("current")).unwrap(),
+            b"current guarded bytes"
+        );
+        assert_eq!(
+            node.git_prune(root.root_id).unwrap().native_anchors_removed,
+            0
+        );
+        node.guarded_mounts.pop().unwrap().stop().unwrap();
     }
 
     #[cfg(target_os = "linux")]

@@ -3898,7 +3898,12 @@ checks. Byte equality alone does not prove efficient storage or safe deletion.
   node control before deleting any catalog mapping. Replay that fence before
   normal pin/catalog reconciliation; retire each receipt with its mapping,
   release its node-owned file/root pin only after the catalog retirement is
-  durable, and finish physical cleanup idempotently. A version-2 virtual
+  durable, and finish physical cleanup idempotently. Recheck current exact
+  anchor pins on every replay, even after the catalog mappings are gone: a
+  retained or restored sector recipe must keep its source anchor intact and
+  the node retirement fence pending. The imported-history-blob regression
+  covers this boundary through failed startup and eventual deletion after
+  recipe retirement on ext4 and disposable Btrfs. A version-2 virtual
   mapping releases its root pin but never unlinks the root file as if it owned
   a separate payload. A live guarded mount claim still owns a per-file anchor:
   remove its Git mapping and pin, retain a durable deferred-cleanup obligation,

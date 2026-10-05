@@ -2150,6 +2150,30 @@ pub(crate) fn install_inline_recipe(
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn install_test_git_anchor_recipe(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    sector_id: SectorId,
+    anchor: &mb_store::FileAnchorManifest,
+) -> Result<SectorRef> {
+    ensure!(anchor.logical_len > 0 && anchor.logical_len <= V1_SECTOR_SIZE as u64);
+    let mut plaintext = Vec::new();
+    anchor.open_verified()?.read_to_end(&mut plaintext)?;
+    let (reference, _) = encrypted_sector(&keys.guild_data_key(&guild_id), sector_id, &plaintext)?;
+    let recipe = LocalSectorRecipe {
+        guild_id,
+        reference: reference.clone(),
+        source: LocalPlaintextSource::StableAnchorFile {
+            locator: anchor.file_locator(),
+            offset: 0,
+        },
+    };
+    control.put_record("local-sector", &reference.id, &canonical_bytes(&recipe)?)?;
+    Ok(reference)
+}
+
 pub(crate) fn install_recovered_sector_recipe(
     control: &mut ControlStore,
     keys: &KeyMaterial,

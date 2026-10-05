@@ -237,6 +237,20 @@
   workspace Clippy in the pinned development shell pass. Public guarded
   add/checkout, historical-blob physical reclamation, and the provisioned
   five-daemon gate remain open.
+- [x] **M6 preserve recipe pins during guarded Git prune replay.** A pending
+  catalog retirement no longer authorizes deletion of an imported native anchor
+  when a retained or restored local-sector recipe names that exact anchor.
+  The node rechecks current recipe pins before replay cleanup and keeps its
+  retirement fence pending while such a pin exists. The new privileged
+  regression first proves ordinary prune preserves a pinned history-only blob,
+  then interrupts after catalog retirement, restores its recipe, verifies
+  replay and startup fail closed with the anchor and ciphertext intact, and
+  finally retires the recipe and reopens to finish physical deletion.
+  It reproduced the pre-fix failure and passes on ext4 and disposable local
+  Btrfs. The existing stage/pin replay and deferred-cleanup probes pass on ext4;
+  all four guarded Git node probes pass on Btrfs. Strict locked all-target
+  workspace Clippy passes in the pinned local development shell. Broader
+  signed-history expiry and remote-sector reclamation remain required.
 - [x] **M6 Git file bytes remain exact under every supported command.**
   Native add hashes a pinned anchor, status and diff read raw worktree bytes,
   checkout restores anchor bytes, and the local Btrfs attributes regression
