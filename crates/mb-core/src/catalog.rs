@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
+mod privacy;
+
 pub const CATALOG_PAGE_BYTES: usize = 64 * 1024;
 pub const CATALOG_LEAF_BYTES: usize = 60 * 1024;
 pub const CATALOG_FANOUT: usize = 128;
@@ -54,6 +56,15 @@ pub enum CatalogSection {
     Coding,
 }
 
+impl CatalogSection {
+    /// Private page hashes/recipes stay inside owner-encrypted metadata.
+    /// Public source references and guild catalogs remain available to their
+    /// authorized signers and recovery peers without the owner's data key.
+    pub fn is_private(self) -> bool {
+        matches!(self, Self::FileMetadata | Self::GitGraph)
+    }
+}
+
 /// A reference must come from a verified signed root or authenticated parent.
 /// Counts include repeated references: deduplication must not change traversal
 /// order, represented bytes or work bounds.
@@ -85,6 +96,8 @@ pub enum CatalogError {
     Failed,
     #[error(transparent)]
     Model(#[from] ModelError),
+    #[error(transparent)]
+    Content(#[from] crate::ContentError),
 }
 
 #[derive(Debug, Error)]

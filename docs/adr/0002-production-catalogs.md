@@ -1,6 +1,6 @@
 # Bounded authenticated catalogs for the 1 TiB release target
 
-Status: page foundation and local ownership implemented; production admission
+Status: page foundation, local ownership and address/encryption primitives implemented; production admission
 remains disabled until the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
 and their limits continue to apply.
 
@@ -131,9 +131,38 @@ store tests pass; 18 provisioned store tests remain ignored. Formatting and
 strict workspace/all-targets Clippy pass.
 
 This local root is not a signed revision or a protection claim. At-rest storage
-uses SQLCipher; private remote addressing/encryption and public authority checks
-still need implementation. Cancelled intent records remain as small fencing
+uses SQLCipher. Address/encryption primitives are implemented below; daemon
+protocol integration and public authority checks remain open. Cancelled intent records remain as small fencing
 tombstones until an authenticated generation-floor mechanism can retire them.
 Quota/headroom reservation, record codecs, incremental updates and integration
 with capture, packing, checkpoint replay, retention and seed-only recovery
 remain open. Local ownership alone does not enable the 1 TiB target.
+
+Page address/encryption primitives are implemented in
+`crates/mb-core/src/catalog/privacy.rs`. File metadata and Git graph sections
+are private; source references, packing and coding sections are public to their
+authorized peers. A private page's storage ID is a keyed, versioned hash of the
+scope, section and complete authenticated page reference. It can be derived
+from a parent reference and seed-derived identity key before obtaining the
+child's plaintext. Public addresses use a distinct unkeyed domain and private
+sections cannot use that path. Fixed address vectors preserve the version-one
+encoding and domains.
+
+Private sealing first validates the encoded page, then uses the existing
+64 KiB encrypted-sector representation. Opening checks the derived storage ID,
+logical/physical lengths, ciphertext root, canonical zero padding and exact
+authenticated plaintext page. Regeneration preserves ciphertext, flat roots
+and Merkle commitments; missing information pages reconstruct byte-for-byte
+through the existing coding path. Private plaintext page hashes/references must
+stay inside authenticated owner-encrypted metadata; only keyed IDs and signed
+ciphertext/source commitments belong in peer-visible catalogs. Public lookup
+addresses do not supply signature or membership authority by themselves.
+
+Seven new crypto fixtures and all 19 catalog tests pass, including fixed
+vectors, corruption/rehashed corruption, key/scope/section mismatches, sector
+geometry and padding, seed-derived encrypted tree traversal, and missing-page
+reconstruction. All 65 core tests, formatting and strict workspace/all-targets
+Clippy pass. The seed fixture proves cryptographic lookup/traversal, not an
+end-to-end daemon or 1 TiB restore. Signed revision/checkpoint binding, peer
+authorization, page transport, source recipes and runtime consumer migration
+remain open.

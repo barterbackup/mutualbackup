@@ -173,7 +173,19 @@ passing tests below apply only to their recorded source and exercised cases.
     ordinary store tests pass (18 provisioned store tests remain ignored),
     along with formatting and strict workspace/all-targets Clippy. This is
     local catalog ownership, not signed revision or remote protection.
-  - [ ] Add authenticated public/private addressing, quota reservations,
+  - [x] Add context-bound public/private page address and encryption primitives.
+    Private file/Git page IDs are keyed and derivable from an authenticated
+    parent reference, scope and section without fetching the child's plaintext.
+    Public source and guild catalogs use a separate address domain. Sealing
+    verifies the page first; opening checks the expected address, exact sector
+    geometry and ciphertext root, zero padding, plaintext hash and canonical
+    page. Seven crypto fixtures cover domain/test-vector stability, keys,
+    scope, geometry, corruption, seed-derived tree traversal and reconstruction
+    of missing encrypted information pages with exact roots/commitments.
+    All 19 catalog tests and all 65 core tests pass, along with formatting and
+    strict workspace/all-targets Clippy. Protocol authorization and integration
+    with signed revision/source roots remain in the consumer migration gate.
+  - [ ] Add quota reservations,
     bounded record codecs and incremental seek/edit operations. Retire intent
     tombstones only behind a verified generation floor. Qualify
     interruption/reopen, cancellation and small changes to large catalogs.
