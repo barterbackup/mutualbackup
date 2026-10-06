@@ -374,7 +374,24 @@ checked. This exposed and fixes the version-one coding-plan CBOR tuple-length
 bug; signed bytes and CBOR encoding are unchanged, with all three plan versions
 and malformed tuples covered by the codec regression.
 
-Peer-head lookup of a missing revision still requires its owner in the preserved
-genesis roster. Membership replay for owners admitted later, directory discovery,
-complete retained-history conversion, broader variable/relay/Tor qualification
-and the full M6 release gates remain open.
+Peer-head lookup now supports an owner admitted after genesis using authenticated
+membership-event replay. A historical prefix must match the checkpoint's active
+roster, membership epoch and quorum and include the owner in its membership
+history. Retained revisions can be exported after that owner is removed. Peers
+allow historical members to read checkpoint heads/pages and event evidence;
+mutation and live enrollment authorization are unchanged. Replay installs no
+state in the original catalog. Original-genesis owners and available local
+exports avoid the extra membership-history requests.
+
+The later-member increment passes fifteen exporter/recovery, one durable
+membership, eight wire, three checkpoint-sync, four CLI unit tests and the real
+CLI fixture (32 targeted functions). The real new format-6/7 fixture has no local
+checkpoint/revision records and exercises active and removed-member success,
+invalid signed events/parents/admissions and an otherwise valid signed checkpoint
+with an unsupported epoch. Output raw bytes and stock Git opening, unchanged
+original catalog bytes, absent key/parity files and temporary client cleanup are
+checked. Locked workspace/all-targets build, formatting and strict Clippy pass.
+Complete core/store/ordinary Node/Git suites are not rerun for this increment.
+
+Directory discovery, complete retained-history conversion, broader variable/
+relay/Tor qualification and the full M6 release gates remain open.

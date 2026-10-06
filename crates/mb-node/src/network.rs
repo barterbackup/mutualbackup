@@ -678,6 +678,9 @@ fn process_peer_request(
                     if matches!(
                         &request,
                         PeerRequest::GetGuildEventTail { .. }
+                            | PeerRequest::GetCheckpointHead { .. }
+                            | PeerRequest::GetCheckpointPage { .. }
+                            | PeerRequest::GetCheckpointAtGeneration { .. }
                             | PeerRequest::GetCodingTranscript { .. }
                             | PeerRequest::GetCodingTranscriptForEvent { .. }
                             | PeerRequest::GetLegacyCodingAddBinding { .. }

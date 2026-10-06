@@ -175,6 +175,68 @@ impl PeerRecovery {
                 && genesis.hash()? == checkpoint.checkpoint.genesis_hash,
             "preserved guild certificate conflicts with the packed checkpoint"
         );
+        let mut evidence_error = None;
+        let mut recovered = false;
+        let result = self.replay_events(genesis, |state, event| {
+            let Some(event) = event else { return Ok(true); };
+            if let Some((group, expected_hash)) = event.event.kind.coding_group_add()
+                && group.roles.iter().any(|role| matches!(role,
+                    ShardRoleV2::Information(info) if info.sector.id == descriptor.id
+                        && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero)) {
+                let event_hash = event.event.hash()?;
+                for source in &self.peers {
+                    let transcript = match self.try_read(self.client.coding_transcript_for_event(
+                        *source, guild, group.id, event.event.sequence, event_hash,
+                    )) {
+                        Ok(transcript) => transcript,
+                        Err(error) => { evidence_error = Some(error); continue; }
+                    };
+                    let hash = transcript.canonical_hash()?;
+                    let transcript = transcript.into_inner();
+                    if transcript.value.manifest.value.group != *group {
+                        evidence_error = Some(anyhow::anyhow!("coding transcript conflicts with its certified group"));
+                        continue;
+                    }
+                    if let Err(error) = state.validate_attempt_authority(&transcript.value.plan.value) {
+                        evidence_error = Some(anyhow::Error::from(error).context("coding Add transcript has invalid attempt authority"));
+                        continue;
+                    }
+                    let bound = if let Some(expected) = expected_hash { expected == hash }
+                        else {
+                            self.peers.iter().any(|source| {
+                                self.read(self.client.legacy_coding_add_binding(*source, guild, event.event.sequence, event_hash))
+                                    .flatten().is_some_and(|binding| binding.statement.transcript_hash == hash
+                                        && binding.verify(state, event).is_ok())
+                            })
+                        };
+                    if !bound {
+                        evidence_error = Some(anyhow::anyhow!("coding Add lacks its exact transcript hash or preissued quorum binding"));
+                        continue;
+                    }
+                    if !visit(transcript)? { recovered = true; return Ok(false); }
+                }
+            }
+            Ok(true)
+        });
+        if recovered {
+            return result;
+        }
+        if let Some(error) = evidence_error {
+            result?;
+            return Err(error).context("selected peers cannot provide certified coding evidence");
+        }
+        result
+    }
+
+    fn replay_events(
+        &self,
+        genesis: mb_core::QuorumGuildGenesis,
+        mut visit: impl FnMut(
+            &mb_core::DynamicGuildState,
+            Option<&mb_core::QuorumGuildEvent>,
+        ) -> Result<bool>,
+    ) -> Result<()> {
+        let guild = genesis.genesis.guild_id;
         let mut state = mb_core::DynamicGuildState::new(
             guild,
             genesis.hash()?,
@@ -184,7 +246,9 @@ impl PeerRecovery {
             },
             genesis.genesis.members,
         )?;
-        let mut evidence_error = None;
+        if !visit(&state, None)? {
+            return Ok(());
+        }
         loop {
             let mut advanced = false;
             let mut last_error = None;
@@ -218,56 +282,21 @@ impl PeerRecovery {
                 }
                 drop(checked);
                 for event in tail.events {
-                    if let Some((group, expected_hash)) = event.event.kind.coding_group_add()
-                        && group.roles.iter().any(|role| matches!(role,
-                            ShardRoleV2::Information(info) if info.sector.id == descriptor.id
-                                && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero)) {
-                        let event_hash = event.event.hash()?;
-                        for source in &self.peers {
-                            let transcript = match self.try_read(self.client.coding_transcript_for_event(
-                                *source, guild, group.id, event.event.sequence, event_hash,
-                            )) {
-                                Ok(transcript) => transcript,
-                                Err(error) => { evidence_error = Some(error); continue; }
-                            };
-                            let hash = transcript.canonical_hash()?;
-                            let transcript = transcript.into_inner();
-                            if transcript.value.manifest.value.group != *group {
-                                evidence_error = Some(anyhow::anyhow!("coding transcript conflicts with its certified group"));
-                                continue;
-                            }
-                            if let Err(error) = state.validate_attempt_authority(&transcript.value.plan.value) {
-                                evidence_error = Some(anyhow::Error::from(error).context("coding Add transcript has invalid attempt authority"));
-                                continue;
-                            }
-                            let bound = if let Some(expected) = expected_hash { expected == hash }
-                                else {
-                                    self.peers.iter().any(|source| {
-                                        self.read(self.client.legacy_coding_add_binding(*source, guild, event.event.sequence, event_hash))
-                                            .flatten().is_some_and(|binding| binding.statement.transcript_hash == hash
-                                                && binding.verify(&state, &event).is_ok())
-                                    })
-                                };
-                            if !bound {
-                                evidence_error = Some(anyhow::anyhow!("coding Add lacks its exact transcript hash or preissued quorum binding"));
-                                continue;
-                            }
-                            if !visit(transcript)? { return Ok(()); }
-                        }
+                    if !visit(&state, Some(&event))? {
+                        return Ok(());
                     }
                     state.apply_event(&event)?;
+                    if !visit(&state, None)? {
+                        return Ok(());
+                    }
                 }
                 advanced = true;
                 break;
             }
             if !advanced {
-                if let Some(error) = evidence_error {
-                    return Err(error)
-                        .context("selected peers cannot provide certified coding evidence");
-                }
                 if let Some(error) = last_error {
                     return Err(error).context(
-                        "selected peers cannot provide authenticated coding event history",
+                        "selected peers cannot provide authenticated guild event history",
                     );
                 }
                 return Ok(());
@@ -284,14 +313,11 @@ impl PeerRecovery {
         let Some(certificate) = crate::node::preserved_guild_certificate(control)? else {
             return Ok(None);
         };
-        ensure!(
-            certificate
-                .genesis
-                .members
-                .iter()
-                .any(|member| member.node_id == owner),
-            "preserved guild certificate does not authorize the recovering identity"
-        );
+        let original_member = certificate
+            .genesis
+            .members
+            .iter()
+            .any(|member| member.node_id == owner);
         let mut found = None;
         self.checkpoints(
             certificate.genesis.guild_id,
@@ -300,8 +326,24 @@ impl PeerRecovery {
                 if checkpoint.checkpoint.revisions.iter().any(|revision| {
                     revision.value.owner == owner && revision.value.revision_id == revision_id
                 }) {
-                    found = Some(checkpoint);
-                    Ok(false)
+                    let mut authorized = original_member;
+                    if !authorized {
+                        self.replay_events(certificate.clone(), |state, _| {
+                            authorized = state
+                                .members
+                                .iter()
+                                .any(|member| member.member.node_id == owner)
+                                && crate::node::checkpoint_matches_dynamic_authority(
+                                    &checkpoint.checkpoint,
+                                    state,
+                                );
+                            Ok(!authorized)
+                        })?;
+                    }
+                    if authorized {
+                        found = Some(checkpoint);
+                    }
+                    Ok(!authorized)
                 } else {
                     Ok(true)
                 }

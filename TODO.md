@@ -376,11 +376,26 @@ passing tests below apply only to their recorded source and exercised cases.
     Formatting and strict locked workspace/all-targets Clippy pass. This qualifies
     the exercised variable peer profile, not every geometry or relay/Tor route;
     complete ordinary Node/Git, provisioned and full M6 release gates remain open.
-  - [ ] Find missing revision records for members admitted after genesis using
-    authenticated membership-event replay. Current peer-head lookup requires
-    the owner in the original genesis roster even when a later admitted member
-    has a retained signed revision. Verify active and removed-member historical
-    export policy without authorizing live enrollment or weakening owner checks.
+  - [x] Find missing revision records for members admitted after genesis using
+    authenticated membership-event replay. Match a historical active roster,
+    membership epoch and quorum to the selected checkpoint, and require the
+    recovering owner in that prefix's membership history. Stream and verify each
+    complete event page before using its prefixes; install no replay state.
+    Original-genesis owners and available local exports avoid extra history RPCs.
+    Removed members may read retained checkpoint heads/pages and event evidence;
+    live enrollment and mutation authorization still require their own checks.
+    A real peer fixture covers active and removed later members for formats 6/7
+    with both original checkpoint and revision metadata absent. Corrupt event
+    signatures, broken parent links, changed admissions and a valid signed
+    checkpoint with an unsupported membership epoch reject without publication.
+    Cached ciphertext isolates metadata authority from reconstruction. Successful
+    output verifies raw namespace bytes and opens stock Git history; all attempts
+    preserve original catalog bytes and leave key/parity files absent.
+    Validation: all fifteen exporter/recovery, one durable membership, eight wire,
+    three checkpoint-sync, four CLI unit and the real CLI fixture pass (32 unique
+    targeted functions). Locked workspace/all-targets build, formatting and strict
+    Clippy pass. This increment does not rerun complete core/store/ordinary Node/
+    Git suites or full M6 platform/release gates.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

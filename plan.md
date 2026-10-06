@@ -887,6 +887,13 @@ the complete verified transcript and group, or a historical unbound Add requires
 a preissued quorum binding from its original signers. Attempt authority, packed
 descriptor commitments, reconstructed codewords and owner-signed output remain
 mandatory; no replay state or evidence is installed in the original catalog.
+For a missing revision owned by a member admitted after genesis, replay signed
+membership pages and require a historical prefix whose active roster, membership
+epoch and quorum match the selected checkpoint. Membership records at that prefix
+must include the owner; retained history remains exportable after removal. Removed
+members may read checkpoint heads/pages and event evidence, but cannot use this
+path to enroll or authorize mutations. Original-genesis owners and available local
+exports do not require an extra membership-history round trip.
 Recovery-directory discovery and complete retained-history/upgrade qualification
 remain required.
 

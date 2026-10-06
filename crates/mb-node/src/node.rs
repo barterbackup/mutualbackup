@@ -14627,6 +14627,345 @@ pub(crate) mod tests {
         legacy_export_peer_recovery_fixture(true).await;
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_export_peer_metadata_requires_certified_later_membership() {
+        use crate::{P2pConfig, build_p2p};
+        use std::os::unix::ffi::OsStringExt;
+        for format in [6, 7] {
+            let ((owner, revision, sectors), identities, _, mut checkpoint) =
+                crate::legacy_export::tests::fixed_checkpoint_fixture(format);
+            let replacement = KeyMaterial::from_seed(&Seed::from_bytes([75; 32]));
+            let owner_member = checkpoint
+                .checkpoint
+                .members
+                .iter()
+                .find(|m| m.node_id == owner.node_id())
+                .unwrap()
+                .clone();
+            let mut initial = checkpoint.checkpoint.members.clone();
+            initial.retain(|m| m.node_id != owner.node_id());
+            initial.push(Member {
+                node_id: replacement.node_id(),
+                recovery_public_key: replacement.recovery_public_key(),
+                failure_domain: "domain-replacement".into(),
+            });
+            initial.sort_by_key(|m| m.node_id);
+            let genesis = GuildGenesis {
+                format_version: 1,
+                guild_id: revision.value.guild_id,
+                coordinator: initial[0].node_id,
+                members: initial,
+            };
+            let initial_keys: Vec<_> = identities
+                .iter()
+                .filter(|k| k.node_id() != owner.node_id())
+                .chain(std::iter::once(&replacement))
+                .collect();
+            let mut certificate = QuorumGuildGenesis {
+                signatures: initial_keys
+                    .iter()
+                    .map(|k| genesis.member_signature(k).unwrap())
+                    .collect(),
+                genesis,
+            };
+            certificate.signatures.sort_by_key(|s| s.signer);
+            certificate.verify().unwrap();
+            let mut state = DynamicGuildState::new(
+                revision.value.guild_id,
+                certificate.hash().unwrap(),
+                QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Unanimous,
+                },
+                certificate.genesis.members.clone(),
+            )
+            .unwrap();
+            let add = GuildEvent {
+                format_version: 1,
+                guild_id: state.guild_id,
+                sequence: 1,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::AddMember {
+                    member: owner_member,
+                },
+            };
+            let mut signatures: Vec<_> = initial_keys
+                .iter()
+                .map(|k| sign_guild_event(&add, k).unwrap())
+                .collect();
+            signatures.sort_by_key(|s| s.signer);
+            let add = QuorumGuildEvent {
+                event: add,
+                signatures,
+            };
+            state.apply_event(&add).unwrap();
+            checkpoint.checkpoint.format_version = 5;
+            checkpoint.checkpoint.genesis_hash = certificate.hash().unwrap();
+            checkpoint.checkpoint.members = state.active_members().cloned().collect();
+            checkpoint.checkpoint.authority = Some(mb_core::CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: state.membership_epoch,
+                quorum: state.quorum,
+            });
+            checkpoint.signatures.clear();
+            for key in identities.iter().chain(std::iter::once(&replacement)) {
+                checkpoint.add_signature(key).unwrap();
+            }
+            checkpoint.verify().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let original = temp.path().join("withdrawn");
+            fs::create_dir(&original).unwrap();
+            let mut store = ControlStore::open(original.join("control.db"), &owner).unwrap();
+            store
+                .put_record(
+                    "guild-installed",
+                    b"primary",
+                    &canonical_bytes(&InstalledGuild {
+                        format_version: 2,
+                        certificate: certificate.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            store
+                .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
+                .unwrap();
+            for (index, reference) in revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+                .enumerate()
+            {
+                store
+                    .stage_recovery_shard(
+                        &[81; 32],
+                        &revision.value.guild_id,
+                        &[index as u8; 32],
+                        0,
+                        &reference.root,
+                        &sectors[&reference.id],
+                    )
+                    .unwrap();
+            }
+            drop(store);
+            let original_bytes = fs::read(original.join("control.db")).unwrap();
+            let peer_path = temp.path().join("peer");
+            let mut node = Node::open(&peer_path, Seed::from_bytes([72; 32])).unwrap();
+            node.adopt_recovered_guild(
+                certificate.clone(),
+                certificate
+                    .genesis
+                    .members
+                    .iter()
+                    .map(|member| GuildPeer {
+                        member: member.clone(),
+                        endpoints: vec![],
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            node.control
+                .commit_checkpoint(
+                    &state.guild_id,
+                    1,
+                    None,
+                    &checkpoint.hash().unwrap(),
+                    &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                    &canonical_bytes(&checkpoint).unwrap(),
+                    false,
+                )
+                .unwrap();
+            node.control
+                .put_record(
+                    "guild-event",
+                    &1u64.to_be_bytes(),
+                    &canonical_bytes(&add).unwrap(),
+                )
+                .unwrap();
+            node.control
+                .put_record(
+                    "guild-dynamic-state",
+                    b"primary",
+                    &canonical_bytes(&state).unwrap(),
+                )
+                .unwrap();
+            let peer_id = node.keys().node_id();
+            let node = Arc::new(Mutex::new(node));
+            let (client, mut event_loop) = build_p2p(
+                node.clone(),
+                P2pConfig {
+                    listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+                    external_addresses: vec![],
+                    bootstrap_addresses: vec![],
+                    relay_reservation_addresses: vec![],
+                    enable_dht_maintenance: false,
+                    enable_relay_server: false,
+                    enable_hole_punching: false,
+                    enable_port_mapping: false,
+                    public_endpoint: String::new(),
+                    failure_domain: String::new(),
+                    configure_failure_domain: false,
+                    max_connections: 8,
+                    tor_mode: crate::TorMode::DisableTor,
+                },
+            )
+            .unwrap();
+            let startup = event_loop.take_startup_receiver().unwrap();
+            let task = tokio::spawn(event_loop.run());
+            startup.await.unwrap().unwrap();
+            let endpoint = format!(
+                "{}/p2p/{}",
+                client.status().await.unwrap().listen_addresses[0],
+                peer_id.libp2p_peer_id().unwrap()
+            );
+            let selected = format!("{peer_id}={endpoint}")
+                .parse::<crate::LegacyExportPeer>()
+                .unwrap();
+            for case in 0..6 {
+                let mut current = state.clone();
+                let mut event = add.clone();
+                if case == 1 {
+                    let remove = GuildEvent {
+                        format_version: 1,
+                        guild_id: state.guild_id,
+                        sequence: 2,
+                        parent: state.event_head,
+                        kind: mb_core::GuildEventKind::RemoveMember {
+                            node_id: owner.node_id(),
+                        },
+                    };
+                    let mut signatures: Vec<_> = identities
+                        .iter()
+                        .chain(std::iter::once(&replacement))
+                        .map(|k| sign_guild_event(&remove, k).unwrap())
+                        .collect();
+                    signatures.sort_by_key(|s| s.signer);
+                    let remove = QuorumGuildEvent {
+                        event: remove,
+                        signatures,
+                    };
+                    current.apply_event(&remove).unwrap();
+                    node.lock()
+                        .unwrap()
+                        .control
+                        .put_record(
+                            "guild-event",
+                            &2u64.to_be_bytes(),
+                            &canonical_bytes(&remove).unwrap(),
+                        )
+                        .unwrap();
+                } else {
+                    node.lock()
+                        .unwrap()
+                        .control
+                        .delete_record("guild-event", &2u64.to_be_bytes())
+                        .unwrap();
+                }
+                if case == 2 {
+                    event.signatures[0].signature[0] ^= 1;
+                }
+                if case == 3 {
+                    event.event.parent = [0; 32];
+                }
+                if case == 4 {
+                    event.event.kind = mb_core::GuildEventKind::AddMember {
+                        member: Member {
+                            node_id: replacement.node_id(),
+                            recovery_public_key: replacement.recovery_public_key(),
+                            failure_domain: "wrong".into(),
+                        },
+                    };
+                }
+                {
+                    let node = node.lock().unwrap();
+                    node.control
+                        .put_record(
+                            "guild-event",
+                            &1u64.to_be_bytes(),
+                            &canonical_bytes(&event).unwrap(),
+                        )
+                        .unwrap();
+                    node.control
+                        .put_record(
+                            "guild-dynamic-state",
+                            b"primary",
+                            &canonical_bytes(&current).unwrap(),
+                        )
+                        .unwrap();
+                    if case == 1 {
+                        assert!(
+                            node.authorize_member(&state.guild_id, owner.node_id())
+                                .is_err()
+                        );
+                    }
+                }
+                if case == 5 {
+                    let mut conflict = checkpoint.clone();
+                    conflict
+                        .checkpoint
+                        .authority
+                        .as_mut()
+                        .unwrap()
+                        .membership_epoch += 1;
+                    conflict.signatures.clear();
+                    for key in identities.iter().chain(std::iter::once(&replacement)) {
+                        conflict.add_signature(key).unwrap();
+                    }
+                    conflict.verify().unwrap();
+                    let node = node.lock().unwrap();
+                    node.control
+                        .put_record(
+                            "guild-checkpoint",
+                            &conflict.hash().unwrap(),
+                            &canonical_bytes(&conflict).unwrap(),
+                        )
+                        .unwrap();
+                    node.database_shell_statement(None, &format!("UPDATE checkpoint_heads SET checkpoint_hash=X'{}', checkpoint_bytes=X'{}' WHERE guild_id=X'{}'", hex::encode(conflict.hash().unwrap()), hex::encode(canonical_bytes(&conflict).unwrap()), hex::encode(state.guild_id)), true).unwrap();
+                }
+                let output = temp.path().join(format!("export-{case}"));
+                let result = crate::export_withdrawn_revision_from_catalog_over_network(
+                    Seed::from_bytes([49; 32]),
+                    original.clone(),
+                    revision.value.revision_id,
+                    output.clone(),
+                    vec![],
+                    vec![],
+                    vec![selected.clone()],
+                )
+                .await;
+                if case < 2 {
+                    let report = result.unwrap();
+                    assert_eq!(report.private_format, format);
+                    if format == 7 {
+                        git2::Repository::open_bare(output.join("history.git")).unwrap();
+                    }
+                    assert_eq!(
+                        &fs::read(
+                            output
+                                .join("namespace")
+                                .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec()))
+                        )
+                        .unwrap()[1000..1003],
+                        b"raw"
+                    );
+                } else {
+                    assert!(result.is_err(), "case {case}");
+                    assert!(!output.exists());
+                }
+                assert_eq!(
+                    fs::read(original.join("control.db")).unwrap(),
+                    original_bytes
+                );
+                assert!(!original.join("control.key").exists());
+                assert!(!original.join("parity.db").exists());
+            }
+            client.shutdown().await.unwrap();
+            task.await.unwrap().unwrap();
+        }
+    }
+
     async fn legacy_export_peer_recovery_fixture(history: bool) {
         use crate::{P2pConfig, build_p2p};
         for format in [6, 7] {
