@@ -236,7 +236,7 @@ passing tests below apply only to their recorded source and exercised cases.
     namespaces, loop devices, or fixture firewall rules. Workflow syntax and the diagnostic log-copy
     step were checked locally; the hosted CI job has not been run here.
 
-  - [ ] Qualify topology log archival on the provisioned five-daemon scenario.
+  - [x] Qualify topology log archival on the provisioned five-daemon scenario.
     Implemented: `MUTUALBACKUP_TEST_LOG_ROOT` selects a separate private artifact
     directory. Both process and private-Tor fixtures archive named daemon logs
     after stopping daemons and before successful cleanup, and on failure unwind.
@@ -246,7 +246,15 @@ passing tests below apply only to their recorded source and exercised cases.
     failures. All 15 ordinary process-acceptance tests pass, including successful
     cleanup, failure unwind, privacy/filtering, and copy-error preservation;
     workflow syntax, format, and strict workspace/all-target Clippy pass.
-    Confirm the real topology archive survives disposable mount/image cleanup.
+    The provisioned scenario passed on `b27b030` (1,817.77 seconds), including
+    source/storage loss, direct and punched paths, relay fallback, and final
+    verified backup. All eight named daemon logs survived fixture removal and
+    disposable image cleanup with 0700 directories and 0600 files. Recorded
+    source and binary hashes matched after the run; independent audits found no
+    fixture namespace, loop, or firewall resources. Coordinator and recovered
+    peer status snapshots are retained beside the logs. Transient four-of-five
+    signatures occurred during recovery and transport replacement; this passing
+    run does not resolve R5's original stall.
 
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
