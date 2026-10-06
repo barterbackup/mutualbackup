@@ -13,6 +13,7 @@ use super::*;
 const VALIDATION: &str = "catalog-native-validation-v1";
 const VALIDATION_BYTES: usize = 2048;
 const LINK_BYTES: usize = 128;
+const BUNDLE_LINK: &str = "catalog-native-bundle-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogNativeValidation {
@@ -42,6 +43,42 @@ impl CatalogNativeValidation {
             return Err(CatalogError::Bounds.into());
         }
         Ok(())
+    }
+
+    /// Namespace/recipe/source roles, bound to this validation identity. Every
+    /// stream retains its own durable intent; the validation ID is the bundle ID.
+    pub fn as_local_bundle(
+        self,
+        intents: [CatalogIntent; 3],
+    ) -> Result<CatalogBundle, CatalogStoreError> {
+        self.validate()?;
+        let expected_sections = [
+            CatalogSection::FileMetadata,
+            CatalogSection::FileMetadata,
+            CatalogSection::SectorReferences,
+        ];
+        let roots = [
+            self.files.namespace.records.page,
+            self.files.recipes.records.page,
+            self.sources.records.page,
+        ];
+        for (intent, expected) in intents.iter().zip(expected_sections) {
+            if intent.scope != self.scope || intent.section != expected {
+                return Err(DatabaseError::Conflict.into());
+            }
+        }
+        let bundle = CatalogBundle {
+            id: self.id,
+            scope: self.scope,
+            roots: intents
+                .into_iter()
+                .zip(roots)
+                .map(|(intent, root)| CatalogBundleRoot { intent, root })
+                .collect(),
+            descriptor: canonical_bytes(&self)?,
+        };
+        bundle.validate()?;
+        Ok(bundle)
     }
 }
 
@@ -111,6 +148,82 @@ fn require_verified(
         return Err(DatabaseError::Conflict.into());
     }
     Ok(record)
+}
+
+/// A published native bundle must cancel its validation and roots together.
+pub(super) fn require_unpublished_validation(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<(), CatalogStoreError> {
+    if bounded_record(connection, BUNDLE_LINK, id.as_bytes(), 16)?.is_some() {
+        return Err(DatabaseError::Conflict.into());
+    }
+    Ok(())
+}
+
+fn cancel_validation(connection: &Connection, id: Uuid) -> Result<(), CatalogStoreError> {
+    let mut record = read_validation(connection, id)?.ok_or(DatabaseError::NotReady)?;
+    if record.state != CatalogNativeValidationState::Cancelled {
+        record.state = CatalogNativeValidationState::Cancelled;
+        let written = connection.execute(
+            "UPDATE protocol_records SET bytes = ?2 WHERE kind = ?1 AND record_id = ?3",
+            params![VALIDATION, canonical_bytes(&record)?, id.as_bytes()],
+        )?;
+        if written != 1 {
+            return Err(DatabaseError::Conflict.into());
+        }
+    }
+    Ok(())
+}
+
+fn native_snapshot(
+    connection: &Connection,
+    id: Uuid,
+    expected_scope: CatalogScope,
+) -> Result<Option<(CatalogNativeValidation, CatalogBundleState)>, CatalogStoreError> {
+    expected_scope.validate(CatalogSection::FileMetadata)?;
+    let Some((bundle, state)) = super::bundle::bundle_snapshot(connection, id)? else {
+        if bounded_record(connection, BUNDLE_LINK, id.as_bytes(), 16)?.is_some() {
+            return Err(DatabaseError::Integrity.into());
+        }
+        return Ok(None);
+    };
+    if bundle.scope != expected_scope
+        || bundle.roots.len() != 3
+        || bundle.descriptor.len() > VALIDATION_BYTES
+    {
+        return Err(DatabaseError::Conflict.into());
+    }
+    let manifest: CatalogNativeValidation = decode_canonical(&bundle.descriptor)?;
+    let intents = [
+        bundle.roots[0].intent,
+        bundle.roots[1].intent,
+        bundle.roots[2].intent,
+    ];
+    if manifest.as_local_bundle(intents)? != bundle {
+        return Err(DatabaseError::Integrity.into());
+    }
+    let validation = read_validation(connection, id)?.ok_or(DatabaseError::Integrity)?;
+    if validation.manifest != manifest {
+        return Err(DatabaseError::Integrity.into());
+    }
+    match state {
+        CatalogBundleState::Published => {
+            if validation.state != CatalogNativeValidationState::Verified
+                || bounded_record(connection, BUNDLE_LINK, id.as_bytes(), 16)?.as_deref()
+                    != Some(id.as_bytes())
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+        }
+        CatalogBundleState::Cancelled => {
+            if validation.state != CatalogNativeValidationState::Cancelled {
+                return Err(DatabaseError::Integrity.into());
+            }
+            require_unpublished_validation(connection, id)?;
+        }
+    }
+    Ok(Some((manifest, state)))
 }
 
 fn read_link(
@@ -222,6 +335,71 @@ fn finish_file(
 }
 
 impl ControlStore {
+    /// Atomically bind a completed native validation to exactly its namespace,
+    /// recipe and source roots and their retained pins. This is local durable
+    /// publication; protocol signing and ciphertext protection remain external.
+    pub fn publish_native_file_catalog(
+        &self,
+        manifest: CatalogNativeValidation,
+        intents: [CatalogIntent; 3],
+    ) -> Result<(), CatalogStoreError> {
+        let bundle = manifest.as_local_bundle(intents)?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if require_verified(&transaction, manifest.id)?.manifest != manifest {
+            return Err(DatabaseError::Conflict.into());
+        }
+        super::bundle::publish_bundle(&transaction, &bundle)?;
+        insert_exact(
+            &transaction,
+            BUNDLE_LINK,
+            manifest.id.as_bytes(),
+            manifest.id.as_bytes(),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Consistent typed publication/validation snapshot. Traversal and recovery
+    /// still check actual page/ciphertext bytes; this is not a bitrot certificate.
+    pub fn native_file_catalog(
+        &self,
+        id: Uuid,
+        expected_scope: CatalogScope,
+    ) -> Result<Option<(CatalogNativeValidation, CatalogBundleState)>, CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let snapshot = native_snapshot(&transaction, id, expected_scope)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Fence the validation index and every member intent in one transaction
+    /// before bounded index/pin/page cleanup. Individual cancellation is blocked.
+    pub fn cancel_native_file_catalog(
+        &self,
+        id: Uuid,
+        expected_scope: CatalogScope,
+    ) -> Result<(), CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let (_, state) =
+            native_snapshot(&transaction, id, expected_scope)?.ok_or(DatabaseError::NotReady)?;
+        if state != CatalogBundleState::Cancelled {
+            cancel_validation(&transaction, id)?;
+            super::bundle::cancel_bundle(&transaction, id)?;
+            let removed = transaction.execute(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+                params![BUNDLE_LINK, id.as_bytes(), id.as_bytes()],
+            )?;
+            if removed != 1 {
+                return Err(DatabaseError::Conflict.into());
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Derive disk-backed source/group lookup rows from the three verified
     /// streams. A single writer transaction commits only after authenticated
     /// EOFs, exact recipe/source joins, matching group attributes/recipes and
@@ -449,17 +627,8 @@ impl ControlStore {
     pub fn cancel_native_file_catalog_validation(&self, id: Uuid) -> Result<(), CatalogStoreError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut record = read_validation(&transaction, id)?.ok_or(DatabaseError::NotReady)?;
-        if record.state != CatalogNativeValidationState::Cancelled {
-            record.state = CatalogNativeValidationState::Cancelled;
-            let written = transaction.execute(
-                "UPDATE protocol_records SET bytes = ?2 WHERE kind = ?1 AND record_id = ?3",
-                params![VALIDATION, canonical_bytes(&record)?, id.as_bytes()],
-            )?;
-            if written != 1 {
-                return Err(DatabaseError::Conflict.into());
-            }
-        }
+        require_unpublished_validation(&transaction, id)?;
+        cancel_validation(&transaction, id)?;
         transaction.commit()?;
         Ok(())
     }
@@ -555,12 +724,12 @@ mod tests {
         }
     }
 
-    fn stage(
+    fn stage_owned(
         store: &ControlStore,
         entries: &[CatalogFileRecord],
         recipes: &[Recipe],
         source_records: &[CatalogSectorRecord],
-    ) -> CatalogNativeValidation {
+    ) -> (CatalogNativeValidation, [CatalogIntent; 3]) {
         let intents = [
             CatalogSection::FileMetadata,
             CatalogSection::FileMetadata,
@@ -609,7 +778,7 @@ mod tests {
             sources.push(source, &mut sink).unwrap();
         }
         let sources = sources.finish(&mut sink).unwrap();
-        CatalogNativeValidation {
+        let manifest = CatalogNativeValidation {
             id: Uuid::new_v4(),
             scope: scope(),
             files: CatalogNativeFileRoot {
@@ -618,12 +787,22 @@ mod tests {
                 recipes,
             },
             sources,
-        }
+        };
+        (manifest, intents)
     }
 
-    fn fixture(store: &ControlStore) -> CatalogNativeValidation {
+    fn stage(
+        store: &ControlStore,
+        entries: &[CatalogFileRecord],
+        recipes: &[Recipe],
+        source_records: &[CatalogSectorRecord],
+    ) -> CatalogNativeValidation {
+        stage_owned(store, entries, recipes, source_records).0
+    }
+
+    fn fixture_owned(store: &ControlStore) -> (CatalogNativeValidation, [CatalogIntent; 3]) {
         let sector = source(1).sector;
-        stage(
+        stage_owned(
             store,
             &[
                 entry(
@@ -672,6 +851,10 @@ mod tests {
             ],
             &[source(1)],
         )
+    }
+
+    fn fixture(store: &ControlStore) -> CatalogNativeValidation {
+        fixture_owned(store).0
     }
 
     fn assert_no_index(store: &ControlStore, manifest: CatalogNativeValidation) {
@@ -1163,5 +1346,298 @@ mod tests {
             3200
         );
         assert!(store.records(&unresolved(manifest.id)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_native_publication_reopens_exact_roles_and_cancels_index_and_roots_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([8; 32]));
+        let store = ControlStore::open(&path, &keys).unwrap();
+        let (manifest, intents) = fixture_owned(&store);
+        assert!(
+            store
+                .publish_native_file_catalog(manifest, intents)
+                .is_err()
+        );
+        assert!(
+            store
+                .native_file_catalog(manifest.id, manifest.scope)
+                .unwrap()
+                .is_none()
+        );
+        store.validate_native_file_catalog(manifest).unwrap();
+        store
+            .publish_native_file_catalog(manifest, intents)
+            .unwrap();
+        store
+            .publish_native_file_catalog(manifest, intents)
+            .unwrap();
+        drop(store);
+        let store = ControlStore::open(&path, &keys).unwrap();
+        assert_eq!(
+            store
+                .native_file_catalog(manifest.id, manifest.scope)
+                .unwrap(),
+            Some((manifest, CatalogBundleState::Published))
+        );
+        let bundle = manifest.as_local_bundle(intents).unwrap();
+        assert_eq!(
+            store.catalog_bundle(manifest.id).unwrap(),
+            Some((bundle.clone(), CatalogBundleState::Published))
+        );
+        for member in &bundle.roots {
+            assert_eq!(
+                store.catalog_intent_state(member.intent).unwrap(),
+                CatalogIntentState::Published(member.root)
+            );
+            assert!(store.cancel_catalog(member.intent).is_err());
+            assert!(!store.release_catalog_pin(member.intent).unwrap());
+        }
+        assert!(store.cancel_catalog_bundle(manifest.id).is_err());
+        assert!(
+            store
+                .cancel_native_file_catalog_validation(manifest.id)
+                .is_err()
+        );
+        let wrong_scope = CatalogScope::Dataset {
+            guild_id: [9; 32],
+            owner: NodeId([2; 32]),
+            protected_root_id: Uuid::from_bytes([3; 16]),
+        };
+        assert!(store.native_file_catalog(manifest.id, wrong_scope).is_err());
+        assert!(
+            store
+                .cancel_native_file_catalog(manifest.id, wrong_scope)
+                .is_err()
+        );
+        store
+            .cancel_native_file_catalog(manifest.id, manifest.scope)
+            .unwrap();
+        drop(store);
+        let mut store = ControlStore::open(&path, &keys).unwrap();
+        store
+            .cancel_native_file_catalog(manifest.id, manifest.scope)
+            .unwrap();
+        assert_eq!(
+            store
+                .native_file_catalog(manifest.id, manifest.scope)
+                .unwrap(),
+            Some((manifest, CatalogBundleState::Cancelled))
+        );
+        assert!(
+            store
+                .native_file_catalog_source(manifest.id, source(1).sector.id)
+                .is_err()
+        );
+        assert!(store.native_file_catalog_link(manifest.id, 7).is_err());
+        assert!(store.validate_native_file_catalog(manifest).is_err());
+        assert!(
+            store
+                .publish_native_file_catalog(manifest, intents)
+                .is_err()
+        );
+        for intent in intents {
+            assert_eq!(
+                store.catalog_intent_state(intent).unwrap(),
+                CatalogIntentState::Cancelled
+            );
+            assert!(
+                store
+                    .stage_catalog_page(intent, bundle.roots[0].root, b"stale")
+                    .is_err()
+            );
+            while store.release_catalog_pin(intent).unwrap() {
+                drop(store);
+                store = ControlStore::open(&path, &keys).unwrap();
+            }
+        }
+        let mut removed = 0;
+        while store
+            .release_native_file_validation_record(manifest.id)
+            .unwrap()
+        {
+            removed += 1;
+            drop(store);
+            store = ControlStore::open(&path, &keys).unwrap();
+        }
+        assert_eq!(removed, 2);
+        while store.collect_catalog_page().unwrap() {
+            drop(store);
+            store = ControlStore::open(&path, &keys).unwrap();
+        }
+        assert!(store.records(PAGE).unwrap().is_empty());
+        assert_eq!(
+            store
+                .native_file_catalog(manifest.id, manifest.scope)
+                .unwrap(),
+            Some((manifest, CatalogBundleState::Cancelled))
+        );
+        assert!(
+            store
+                .publish_native_file_catalog(manifest, intents)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_native_publication_rejects_manifest_role_ownership_and_untyped_substitution() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([8; 32]));
+        let store = ControlStore::open(directory.path().join("control.db"), &keys).unwrap();
+        let (manifest, intents) = fixture_owned(&store);
+        store.validate_native_file_catalog(manifest).unwrap();
+        let mut changed = intents;
+        changed[2].section = CatalogSection::FileMetadata;
+        assert!(manifest.as_local_bundle(changed).is_err());
+        let mut changed = intents;
+        changed[0].scope = CatalogScope::Guild { guild_id: [1; 32] };
+        assert!(manifest.as_local_bundle(changed).is_err());
+        let mut changed = intents;
+        changed[1] = changed[0];
+        assert!(manifest.as_local_bundle(changed).is_err());
+        let mut changed = intents;
+        changed.swap(0, 1);
+        assert!(
+            store
+                .publish_native_file_catalog(manifest, changed)
+                .is_err()
+        );
+        assert!(
+            store
+                .native_file_catalog(manifest.id, manifest.scope)
+                .unwrap()
+                .is_none()
+        );
+        for intent in intents {
+            assert_eq!(
+                store.catalog_intent_state(intent).unwrap(),
+                CatalogIntentState::Building
+            );
+        }
+        // The generic opaque API can retain the correct trees in an arbitrary
+        // role order. Typed loading rejects a descriptor/manifest substitution.
+        let mut substituted = manifest.as_local_bundle(intents).unwrap();
+        substituted.roots.swap(0, 1);
+        store.publish_catalog_bundle(&substituted).unwrap();
+        assert!(
+            store
+                .native_file_catalog(manifest.id, manifest.scope)
+                .is_err()
+        );
+        assert!(
+            store
+                .publish_native_file_catalog(manifest, intents)
+                .is_err()
+        );
+        store.cancel_catalog_bundle(manifest.id).unwrap();
+        store
+            .cancel_native_file_catalog_validation(manifest.id)
+            .unwrap();
+    }
+
+    #[test]
+    fn catalog_native_publication_sql_failures_roll_back_the_joint_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([8; 32]));
+        let store = ControlStore::open(&path, &keys).unwrap();
+        let (manifest, intents) = fixture_owned(&store);
+        store.validate_native_file_catalog(manifest).unwrap();
+        for trigger in [
+            "CREATE TEMP TRIGGER fail_native BEFORE INSERT ON protocol_records WHEN NEW.kind = 'catalog-native-bundle-v1' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            "CREATE TEMP TRIGGER fail_native BEFORE INSERT ON protocol_records WHEN NEW.kind = 'catalog-native-bundle-v1' BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TEMP TRIGGER fail_native BEFORE UPDATE ON protocol_records WHEN NEW.kind = 'catalog-intent-v1' BEGIN SELECT RAISE(IGNORE); END",
+        ] {
+            store.connection.execute_batch(trigger).unwrap();
+            assert!(
+                store
+                    .publish_native_file_catalog(manifest, intents)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .native_file_catalog(manifest.id, manifest.scope)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .native_file_catalog_validation(manifest.id)
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                CatalogNativeValidationState::Verified
+            );
+            for intent in intents {
+                assert_eq!(
+                    store.catalog_intent_state(intent).unwrap(),
+                    CatalogIntentState::Building
+                );
+            }
+            store
+                .connection
+                .execute_batch("DROP TRIGGER fail_native")
+                .unwrap();
+        }
+        drop(store);
+        let store = ControlStore::open(&path, &keys).unwrap();
+        store
+            .publish_native_file_catalog(manifest, intents)
+            .unwrap();
+        for trigger in [
+            "CREATE TEMP TRIGGER fail_native BEFORE UPDATE ON protocol_records WHEN NEW.kind = 'catalog-native-validation-v1' BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TEMP TRIGGER fail_native BEFORE UPDATE ON protocol_records WHEN NEW.kind = 'catalog-intent-v1' BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TEMP TRIGGER fail_native BEFORE UPDATE ON protocol_records WHEN NEW.kind = 'catalog-bundle-v1' BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TEMP TRIGGER fail_native BEFORE DELETE ON protocol_records WHEN OLD.kind = 'catalog-native-bundle-v1' BEGIN SELECT RAISE(IGNORE); END",
+        ] {
+            store.connection.execute_batch(trigger).unwrap();
+            assert!(
+                store
+                    .cancel_native_file_catalog(manifest.id, manifest.scope)
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .native_file_catalog(manifest.id, manifest.scope)
+                    .unwrap(),
+                Some((manifest, CatalogBundleState::Published))
+            );
+            assert_eq!(
+                store
+                    .native_file_catalog_validation(manifest.id)
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                CatalogNativeValidationState::Verified
+            );
+            assert_eq!(
+                store
+                    .native_file_catalog_source(manifest.id, source(1).sector.id)
+                    .unwrap(),
+                Some(source(1))
+            );
+            for member in manifest.as_local_bundle(intents).unwrap().roots {
+                assert_eq!(
+                    store.catalog_intent_state(member.intent).unwrap(),
+                    CatalogIntentState::Published(member.root)
+                );
+            }
+            store
+                .connection
+                .execute_batch("DROP TRIGGER fail_native")
+                .unwrap();
+        }
+        drop(store);
+        let store = ControlStore::open(&path, &keys).unwrap();
+        store
+            .cancel_native_file_catalog(manifest.id, manifest.scope)
+            .unwrap();
+        assert_eq!(
+            store
+                .native_file_catalog(manifest.id, manifest.scope)
+                .unwrap(),
+            Some((manifest, CatalogBundleState::Cancelled))
+        );
     }
 }

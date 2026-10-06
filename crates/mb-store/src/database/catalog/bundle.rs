@@ -149,6 +149,101 @@ pub(super) fn require_unbundled(
     Ok(())
 }
 
+pub(super) fn publish_bundle(
+    connection: &Connection,
+    bundle: &CatalogBundle,
+) -> Result<(), CatalogStoreError> {
+    bundle.validate()?;
+    let existing = read_bundle(connection, bundle.id)?;
+    if existing.as_ref().is_some_and(|record| {
+        record.state != CatalogBundleState::Published || record.bundle != *bundle
+    }) {
+        return Err(DatabaseError::Conflict.into());
+    }
+    for member in &bundle.roots {
+        if existing.is_some() {
+            require_link(connection, member.intent, bundle.id)?;
+        } else if bounded_record(connection, LINK, member.intent.id.as_bytes(), 16)?.is_some() {
+            return Err(DatabaseError::Conflict.into());
+        }
+        publish_root(connection, member.intent, member.root)?;
+        insert_exact(
+            connection,
+            LINK,
+            member.intent.id.as_bytes(),
+            bundle.id.as_bytes(),
+        )?;
+    }
+    let record = BundleRecord {
+        format_version: 1,
+        bundle: bundle.clone(),
+        state: CatalogBundleState::Published,
+    };
+    let bytes = canonical_bytes(&record)?;
+    if bytes.len() > BUNDLE_RECORD_BYTES {
+        return Err(DatabaseError::Integrity.into());
+    }
+    insert_exact(connection, BUNDLE, bundle.id.as_bytes(), &bytes)?;
+    Ok(())
+}
+
+pub(super) fn bundle_snapshot(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<Option<(CatalogBundle, CatalogBundleState)>, CatalogStoreError> {
+    let Some(record) = read_bundle(connection, id)? else {
+        return Ok(None);
+    };
+    for member in &record.bundle.roots {
+        let intent = read_intent(connection, member.intent)?;
+        match record.state {
+            CatalogBundleState::Published => {
+                require_link(connection, member.intent, id)?;
+                if intent.state != CatalogIntentState::Published(member.root) {
+                    return Err(DatabaseError::Integrity.into());
+                }
+            }
+            CatalogBundleState::Cancelled if intent.state != CatalogIntentState::Cancelled => {
+                return Err(DatabaseError::Integrity.into());
+            }
+            CatalogBundleState::Cancelled => require_unbundled(connection, member.intent)?,
+        }
+    }
+    Ok(Some((record.bundle, record.state)))
+}
+
+pub(super) fn cancel_bundle(connection: &Connection, id: Uuid) -> Result<(), CatalogStoreError> {
+    let mut record = read_bundle(connection, id)?.ok_or(DatabaseError::NotReady)?;
+    if record.state == CatalogBundleState::Cancelled {
+        return Ok(());
+    }
+    for member in &record.bundle.roots {
+        require_link(connection, member.intent, id)?;
+        let mut intent = read_intent(connection, member.intent)?;
+        if intent.state != CatalogIntentState::Published(member.root) {
+            return Err(DatabaseError::Integrity.into());
+        }
+        intent.state = CatalogIntentState::Cancelled;
+        write_intent(connection, &intent)?;
+        let removed = connection.execute(
+            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![LINK, member.intent.id.as_bytes(), id.as_bytes()],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict.into());
+        }
+    }
+    record.state = CatalogBundleState::Cancelled;
+    let written = connection.execute(
+        "UPDATE protocol_records SET bytes = ?3 WHERE kind = ?1 AND record_id = ?2",
+        params![BUNDLE, id.as_bytes(), canonical_bytes(&record)?],
+    )?;
+    if written != 1 {
+        return Err(DatabaseError::Conflict.into());
+    }
+    Ok(())
+}
+
 impl ControlStore {
     /// Publish all root pins and the immutable descriptor in one writer
     /// transaction. Retries must match every byte; cancelled IDs never resume.
@@ -156,37 +251,7 @@ impl ControlStore {
         bundle.validate()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let existing = read_bundle(&transaction, bundle.id)?;
-        if existing.as_ref().is_some_and(|record| {
-            record.state != CatalogBundleState::Published || record.bundle != *bundle
-        }) {
-            return Err(DatabaseError::Conflict.into());
-        }
-        for member in &bundle.roots {
-            if existing.is_some() {
-                require_link(&transaction, member.intent, bundle.id)?;
-            } else if bounded_record(&transaction, LINK, member.intent.id.as_bytes(), 16)?.is_some()
-            {
-                return Err(DatabaseError::Conflict.into());
-            }
-            publish_root(&transaction, member.intent, member.root)?;
-            insert_exact(
-                &transaction,
-                LINK,
-                member.intent.id.as_bytes(),
-                bundle.id.as_bytes(),
-            )?;
-        }
-        let record = BundleRecord {
-            format_version: 1,
-            bundle: bundle.clone(),
-            state: CatalogBundleState::Published,
-        };
-        let bytes = canonical_bytes(&record)?;
-        if bytes.len() > BUNDLE_RECORD_BYTES {
-            return Err(DatabaseError::Integrity.into());
-        }
-        insert_exact(&transaction, BUNDLE, bundle.id.as_bytes(), &bytes)?;
+        publish_bundle(&transaction, bundle)?;
         transaction.commit()?;
         Ok(())
     }
@@ -200,26 +265,9 @@ impl ControlStore {
     ) -> Result<Option<(CatalogBundle, CatalogBundleState)>, CatalogStoreError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let Some(record) = read_bundle(&transaction, id)? else {
-            return Ok(None);
-        };
-        for member in &record.bundle.roots {
-            let intent = read_intent(&transaction, member.intent)?;
-            match record.state {
-                CatalogBundleState::Published => {
-                    require_link(&transaction, member.intent, id)?;
-                    if intent.state != CatalogIntentState::Published(member.root) {
-                        return Err(DatabaseError::Integrity.into());
-                    }
-                }
-                CatalogBundleState::Cancelled if intent.state != CatalogIntentState::Cancelled => {
-                    return Err(DatabaseError::Integrity.into());
-                }
-                CatalogBundleState::Cancelled => require_unbundled(&transaction, member.intent)?,
-            }
-        }
+        let snapshot = bundle_snapshot(&transaction, id)?;
         transaction.commit()?;
-        Ok(Some((record.bundle, record.state)))
+        Ok(snapshot)
     }
 
     /// Fence every member before bounded pin/page cleanup can start. Individual
@@ -227,35 +275,8 @@ impl ControlStore {
     pub fn cancel_catalog_bundle(&self, id: Uuid) -> Result<(), CatalogStoreError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut record = read_bundle(&transaction, id)?.ok_or(DatabaseError::NotReady)?;
-        if record.state == CatalogBundleState::Cancelled {
-            transaction.commit()?;
-            return Ok(());
-        }
-        for member in &record.bundle.roots {
-            require_link(&transaction, member.intent, id)?;
-            let mut intent = read_intent(&transaction, member.intent)?;
-            if intent.state != CatalogIntentState::Published(member.root) {
-                return Err(DatabaseError::Integrity.into());
-            }
-            intent.state = CatalogIntentState::Cancelled;
-            write_intent(&transaction, &intent)?;
-            let removed = transaction.execute(
-                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
-                params![LINK, member.intent.id.as_bytes(), id.as_bytes()],
-            )?;
-            if removed != 1 {
-                return Err(DatabaseError::Conflict.into());
-            }
-        }
-        record.state = CatalogBundleState::Cancelled;
-        let written = transaction.execute(
-            "UPDATE protocol_records SET bytes = ?3 WHERE kind = ?1 AND record_id = ?2",
-            params![BUNDLE, id.as_bytes(), canonical_bytes(&record)?],
-        )?;
-        if written != 1 {
-            return Err(DatabaseError::Conflict.into());
-        }
+        super::native_validation::require_unpublished_validation(&transaction, id)?;
+        cancel_bundle(&transaction, id)?;
         transaction.commit()?;
         Ok(())
     }

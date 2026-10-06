@@ -322,9 +322,20 @@ passing tests below apply only to their recorded source and exercised cases.
     ciphertext verification, root ownership, typed publication and runtime
     scheduling/activation remain required. Validation currently scans complete
     streams in one writer transaction; incremental update scheduling remains open.
-  - [ ] Implement complete legacy private metadata conversion and typed durable
-    publication; migrate native capture/restore consumers before enabling the
-    new format.
+  - [x] Publish validated native catalogs with exact typed root ownership.
+    Namespace, recipe and source intents bind to the immutable validation
+    manifest in one publication transaction. Typed reopen checks scope,
+    descriptor, ordered roles/roots and consistent validation/member/link
+    states. Independent index/bundle/member cancellation is rejected while
+    published; typed cancellation fences the index and all roots together
+    before bounded cleanup. Three new fixtures cover reopen, every cleanup
+    boundary, scope/role/ownership substitution and injected SQL abort/ignore
+    rollback. All 91 ordinary store and 72 ordinary Git tests pass (18 store
+    and 62 Git provisioned tests remain ignored), with formatting and strict
+    workspace/all-targets Clippy. Local publication does not establish signed
+    activation, ciphertext protection, runtime support or production capacity.
+  - [ ] Implement complete legacy private metadata conversion and migrate
+    native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

@@ -486,3 +486,32 @@ workspace suite passes 96 tests (two provisioned tests remain ignored). All 88
 ordinary store tests pass (18 provisioned store tests remain ignored), with
 formatting and strict workspace/all-targets Clippy. These fixtures establish
 local metadata joins; no real payload or 1 TiB qualification is claimed.
+
+Typed native publication now binds a completed validation manifest to its exact
+namespace, recipe and source roots in `native_validation.rs`. The validation ID
+is also the bundle ID. Construction checks the expected dataset scope, role
+sections and unique intent ownership; publication checks the immutable completed
+manifest inside the same writer transaction that publishes all retained root
+pins and the native bundle link. Reopen validates canonical descriptor bytes,
+every ordered role/root, bundle member state, validation state and native link in
+one read transaction. A generic opaque bundle with substituted role order does
+not become a valid typed native publication.
+
+Published native bundles reject independent cancellation of their validation
+index, generic bundle or member intents. Typed cancellation fences the index and
+all three roots and removes their links atomically before bounded index/pin/page
+cleanup. A retry must observe a consistent cancelled snapshot; the cancelled
+bundle and validation IDs remain fenced after page reclamation. Existing generic
+bundle logic is factored into transaction-local helpers so these related changes
+share the transaction. Serialized bundle/validation/page formats and the control
+schema remain unchanged. This is local publication; protocol signing, ciphertext
+protection, legacy private metadata conversion and runtime migration remain open.
+
+Three new publication fixtures cover exact typed reopen, independent-cancellation
+fences, stale retries, each index/pin/page cleanup boundary, wrong scope/role/
+ownership, generic descriptor/manifest substitution and injected SQL abort/ignore
+rollback during joint publication and cancellation. All 91 ordinary store tests
+and 72 ordinary Git tests pass (18 store and 62 Git provisioned tests remain
+ignored), with formatting and strict workspace/all-targets Clippy. These checks
+qualify local ownership/validation consistency rather than signed activation or
+real 1 TiB payload/retained-history capacity.
