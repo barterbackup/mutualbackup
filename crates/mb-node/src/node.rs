@@ -5504,6 +5504,33 @@ impl Node {
         Ok((reference, bytes))
     }
 
+    /// Stage one authenticated private catalog page as a regenerable source.
+    /// This local API does not publish a signed revision or claim protection.
+    pub fn stage_private_catalog_page_source(
+        &self,
+        intent: mb_store::CatalogIntent,
+        page: mb_core::CatalogPageRef,
+        encoded: &[u8],
+    ) -> Result<(SectorRef, mb_core::MerkleCommitment)> {
+        // Reject foreign scopes before creating a durable construction intent.
+        let mb_core::CatalogScope::Dataset { owner, .. } = intent.scope else {
+            anyhow::bail!("private catalog page requires dataset scope");
+        };
+        anyhow::ensure!(
+            owner == self.keys.node_id() && intent.section.is_private(),
+            "private catalog source belongs to another owner or a public section"
+        );
+        page.verify_page(intent.scope, intent.section, encoded)?;
+        match self.control.begin_catalog(intent)? {
+            mb_store::CatalogIntentState::Building => {
+                self.control.stage_catalog_page(intent, page, encoded)?
+            }
+            mb_store::CatalogIntentState::Published(root) if root == page => {}
+            _ => anyhow::bail!("catalog page source intent conflicts with its published root"),
+        }
+        crate::snapshot::install_catalog_page_recipe(&self.control, &self.keys, intent, page)
+    }
+
     pub fn sector(&self, sector_id: &SectorId) -> Result<Vec<u8>> {
         render_sector(&self.control, &self.keys, sector_id, None)
     }
@@ -11760,6 +11787,10 @@ impl Node {
                 }
             }
         }
+        // One indexed recipe-pin visit and one bounded page GC step per
+        // checkpoint cleanup pass; active recipes retain their page closure.
+        self.control.sweep_catalog_source_pin()?;
+        self.control.collect_catalog_page()?;
         Ok(())
     }
 
@@ -14576,6 +14607,99 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn private_catalog_page_source_runs_through_live_sector_renderer_and_reopens() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("node");
+        let node = Node::open(&path, Seed::from_bytes([67; 32])).unwrap();
+        let scope = mb_core::CatalogScope::Dataset {
+            guild_id: [1; 32],
+            owner: node.keys().node_id(),
+            protected_root_id: Uuid::from_bytes([2; 16]),
+        };
+        let intent = mb_store::CatalogIntent {
+            id: Uuid::from_bytes([3; 16]),
+            scope,
+            section: mb_core::CatalogSection::GitGraph,
+        };
+        let mut encoded = vec![];
+        let mut sink = |_, bytes| {
+            encoded = bytes;
+            Ok::<_, &'static str>(())
+        };
+        let mut builder = mb_core::CatalogBuilder::new(scope, intent.section).unwrap();
+        builder
+            .push(b"private exact Git metadata", &mut sink)
+            .unwrap();
+        let page = builder.finish(&mut sink).unwrap();
+        let (reference, commitment) = node
+            .stage_private_catalog_page_source(intent, page, &encoded)
+            .unwrap();
+        assert_eq!(
+            node.stage_private_catalog_page_source(intent, page, &encoded)
+                .unwrap(),
+            (reference.clone(), commitment.clone())
+        );
+        let (expected_ref, ciphertext) = page
+            .seal_private_page(
+                &node.keys().guild_content_id_key(&[1; 32]),
+                &node.keys().guild_data_key(&[1; 32]),
+                scope,
+                intent.section,
+                &encoded,
+            )
+            .unwrap();
+        assert_eq!(reference, expected_ref);
+        assert_eq!(
+            node.sector_for_guild(&[1; 32], &reference.id).unwrap(),
+            ciphertext
+        );
+        assert_eq!(merkle_commit(&ciphertext).unwrap(), commitment);
+        assert!(node.sector_for_guild(&[9; 32], &reference.id).is_err());
+        assert!(node.control.cancel_catalog(intent).is_err());
+        assert_eq!(
+            node.control.sweep_catalog_source_pin().unwrap(),
+            mb_store::CatalogSourceSweep::Retained(reference.id)
+        );
+        let foreign = mb_store::CatalogIntent {
+            id: Uuid::from_bytes([4; 16]),
+            scope: mb_core::CatalogScope::Dataset {
+                guild_id: [1; 32],
+                owner: NodeId([9; 32]),
+                protected_root_id: Uuid::from_bytes([2; 16]),
+            },
+            section: intent.section,
+        };
+        assert!(
+            node.stage_private_catalog_page_source(foreign, page, &encoded)
+                .is_err()
+        );
+        assert!(node.control.catalog_intent_state(foreign).is_err());
+        drop(node);
+        let node = Node::open(&path, Seed::from_bytes([67; 32])).unwrap();
+        assert_eq!(node.sector(&reference.id).unwrap(), ciphertext);
+        // Installing the same seed-restored page regenerates the same address,
+        // root and commitment without an inline page payload recipe.
+        assert_eq!(
+            node.stage_private_catalog_page_source(intent, page, &encoded)
+                .unwrap(),
+            (reference.clone(), commitment)
+        );
+        node.control
+            .delete_record("local-sector", &reference.id)
+            .unwrap();
+        assert_eq!(
+            node.control.sweep_catalog_source_pin().unwrap(),
+            mb_store::CatalogSourceSweep::Retired(reference.id)
+        );
+        assert!(node.control.collect_catalog_page().unwrap());
+        assert!(
+            node.stage_private_catalog_page_source(intent, page, &encoded)
+                .is_err()
+        );
+        assert!(node.sector(&reference.id).is_err());
+    }
 
     #[test]
     fn membership_history_cache_rebuilds_after_event_and_reopen() {

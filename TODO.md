@@ -478,6 +478,33 @@ passing tests below apply only to their recorded source and exercised cases.
     with formatting and strict workspace/all-targets Clippy. Unsupported legacy
     shapes retain their existing recovery path; this does not activate a new
     format or complete historical migration.
+  - [x] Connect private catalog pages to live local-sector regeneration with
+    durable recipe ownership. A new append-only source variant references one
+    authenticated page instead of embedding its plaintext in an Inline recipe.
+    The Node staging API verifies owner, scope, section and page, derives the
+    private sector address, ciphertext root and Merkle commitment, and publishes
+    its bounded recipe with a dedicated page-root pin in one writer transaction.
+    Active recipe pins cannot be cancelled independently or attached to descriptor
+    bundles. They retain shared descendants after the original builder is
+    cancelled. An indexed cursor visits one source pin per cleanup step; deletion
+    or replacement of its exact source record permits atomic fencing and release.
+    Checkpoint cleanup performs one such visit and one bounded page-GC step.
+    Existing source variants keep their discriminants and render unchanged.
+    Rendering now rejects a mismatched recipe key or oversized logical length
+    before reading/allocating file payloads. Five new fixtures cover shared-page
+    closure, reopen, per-step cursor work, SQL ignore rollback, exact live Node
+    rendering, owner/guild/reference/page substitution and legacy Inline bytes.
+    This is a live source adapter, not a signed paged revision or production
+    capture/packing/retention/seed-recovery migration. Current revision/private
+    metadata formats and limits remain; withdrawn private versions 6/7 are not
+    reinterpreted. Full R2/R3 admission and 1 TiB qualification remain open.
+    Validation: all 96 core, 96 ordinary store, 87 ordinary Git, 362 ordinary
+    Node and 16 CLI-library tests pass. All 62 provisioned Git and all eight
+    provisioned snapshot regressions pass on disposable Btrfs, with verified
+    mount/image/loop cleanup. Formatting and strict workspace/all-targets Clippy
+    pass. Ordinary suites retain 18 store, 62 Git and 20 Node provisioned cases;
+    the Git and snapshot cases above ran separately. This is source integration
+    and legacy regression qualification, not the complete M6 production gate.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

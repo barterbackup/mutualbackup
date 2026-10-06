@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::*;
 
 const BUNDLE: &str = "catalog-bundle-v1";
-const LINK: &str = "catalog-intent-bundle-v1";
+pub(super) const LINK: &str = "catalog-intent-bundle-v1";
 const BUNDLE_RECORD_BYTES: usize = 8 * 1024;
 pub const CATALOG_BUNDLE_ROOTS: usize = 16;
 pub const CATALOG_BUNDLE_DESCRIPTOR_BYTES: usize = 4096;
@@ -143,6 +143,7 @@ pub(super) fn require_unbundled(
     connection: &Connection,
     intent: CatalogIntent,
 ) -> Result<(), CatalogStoreError> {
+    super::source::require_unlinked_source(connection, intent)?;
     if bounded_record(connection, LINK, intent.id.as_bytes(), 16)?.is_some() {
         return Err(DatabaseError::Conflict.into());
     }
@@ -161,6 +162,7 @@ pub(super) fn publish_bundle(
         return Err(DatabaseError::Conflict.into());
     }
     for member in &bundle.roots {
+        super::source::require_unlinked_source(connection, member.intent)?;
         if existing.is_some() {
             require_link(connection, member.intent, bundle.id)?;
         } else if bounded_record(connection, LINK, member.intent.id.as_bytes(), 16)?.is_some() {

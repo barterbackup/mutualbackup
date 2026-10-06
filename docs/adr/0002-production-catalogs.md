@@ -752,3 +752,42 @@ Both native capture regressions pass. Disposable Btrfs mount/image/loop cleanup,
 formatting and strict workspace/all-targets Clippy are verified. The ordinary
 snapshot suite retains eight provisioned cases; the two capture cases ran
 separately. This does not replace the complete M6 release gates.
+
+Private catalog pages now have a live local-sector source adapter. The append-only
+`CatalogPage` source variant stores scope, section and an authenticated page
+reference, preserving the existing source discriminants. Node staging verifies
+owner/scope/section and page before deriving the private sector ID, ciphertext
+root and Merkle commitment. Its recipe is at most 1 KiB and references SQLCipher
+page storage rather than duplicating the plaintext as an Inline source. The live
+sector renderer regenerates the exact existing 64 KiB information-sector bytes
+and rejects source ID/length, owner/guild or page substitution before use.
+
+A dedicated one-page catalog intent publishes its exact local-sector recipe,
+root pin and immutable ownership link in one writer transaction. An active
+source pin cannot be cancelled independently or linked to a descriptor bundle;
+its lifecycle follows that exact local recipe. Its root retains the page closure
+even when original builder ownership is cancelled. A durable indexed cursor
+visits one source pin per step, comparing a potentially larger replacement
+recipe in SQLite without allocating it. Once the owner record is deleted or
+replaced, one transaction fences the old intent and releases its pin; stale
+writers cannot resurrect its cancelled ID. SQL ignore faults roll back the whole
+publication or release. Checkpoint cleanup schedules one pin visit and one
+bounded page collection step. Pending cancelled IDs still require a future
+verified generation floor before tombstone retirement.
+
+Five new fixtures cover shared-page closure, publication/retirement reopen,
+bounded cursor work, injected SQL ignore failures, live Node rendering with
+identical IDs/roots/commitments across reopen, owner/guild/reference/page
+substitution and legacy Inline bytes. This adapter does not authenticate a
+signed revision, enable a paged capture format or qualify 1 TiB capacity.
+Capture/admission, packing/coding, retention and seed-only recovery still need
+consumer migration. Existing signed revision/private metadata formats and bounds
+remain; withdrawn private metadata 6/7 are not reinterpreted.
+
+All 96 core, 96 ordinary store, 87 ordinary Git, 362 ordinary Node and 16
+CLI-library tests pass. All 62 provisioned Git and all eight provisioned
+snapshot regressions pass on disposable Btrfs with verified mount/image/loop
+cleanup. Formatting and strict workspace/all-targets Clippy pass. The ordinary
+suites retain 18 store, 62 Git and 20 Node provisioned cases; the Git and snapshot
+cases above ran separately. This source integration and legacy regression
+qualification does not replace the complete M6 production gates.

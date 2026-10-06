@@ -13,11 +13,11 @@ use fs2::FileExt;
 #[cfg(test)]
 use mb_core::make_sector_id;
 use mb_core::{
-    KeyMaterial, MerkleCommitment, SectorId, SectorPurpose, SectorRef, SignedRecord,
-    USER_REVISION_DOMAIN, UserRevision, V1_CIPHER_PROFILE, V1_MAX_CATALOG_BYTES,
-    V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, canonical_bytes_bounded,
-    canonical_size_bounded, crypt_sector, decode_canonical, encrypted_sector,
-    make_content_sector_id, merkle_commit, sector_root,
+    CatalogPageRef, CatalogScope, CatalogSection, KeyMaterial, MerkleCommitment, SectorId,
+    SectorPurpose, SectorRef, SignedRecord, USER_REVISION_DOMAIN, UserRevision, V1_CIPHER_PROFILE,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes,
+    canonical_bytes_bounded, canonical_size_bounded, crypt_sector, decode_canonical,
+    encrypted_sector, make_content_sector_id, merkle_commit, sector_root,
 };
 use mb_git::{
     GitBackupBlob, GitBackupDescriptor, GitDataExtent, GitGraphObject, GitGraphRef, GitGraphSource,
@@ -28,9 +28,9 @@ use mb_store::ImportedBlobCapturePlan;
 #[cfg(test)]
 use mb_store::ReflinkAnchor;
 use mb_store::{
-    AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
-    ReflinkCapturePlan, SourceBackendKind, SourceCapturePlan, StableAnchorFileLocator,
-    git_catalog_marker,
+    AnchorFileLocator, CapturedEntry, CatalogIntent, ControlStore, FileExtent, NativeFileId,
+    PinnedDirectory, ReflinkCapturePlan, SourceBackendKind, SourceCapturePlan,
+    StableAnchorFileLocator, git_catalog_marker,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -305,6 +305,12 @@ enum LocalPlaintextSource {
     StableAnchorFile {
         locator: StableAnchorFileLocator,
         offset: u64,
+    },
+    // Append-only discriminant: legacy variants 0/1/2 retain exact wire bytes.
+    CatalogPage {
+        scope: CatalogScope,
+        section: CatalogSection,
+        page: CatalogPageRef,
     },
 }
 
@@ -1604,6 +1610,55 @@ fn checked_metadata_length(revision: &SignedRecord<UserRevision>) -> Result<usiz
         })
 }
 
+fn private_page_guild(
+    keys: &KeyMaterial,
+    scope: CatalogScope,
+    section: CatalogSection,
+) -> Result<[u8; 32]> {
+    scope.validate(section)?;
+    let CatalogScope::Dataset {
+        guild_id, owner, ..
+    } = scope
+    else {
+        bail!("private catalog page requires dataset scope");
+    };
+    ensure!(
+        owner == keys.node_id() && section.is_private(),
+        "private catalog page source belongs to another owner or a public section"
+    );
+    Ok(guild_id)
+}
+
+pub(crate) fn install_catalog_page_recipe(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    intent: CatalogIntent,
+    page: CatalogPageRef,
+) -> Result<(SectorRef, MerkleCommitment)> {
+    let guild_id = private_page_guild(keys, intent.scope, intent.section)?;
+    let encoded = control.catalog_page(intent.scope, intent.section, page)?;
+    let (reference, ciphertext) = page.seal_private_page(
+        &keys.guild_content_id_key(&guild_id),
+        &keys.guild_data_key(&guild_id),
+        intent.scope,
+        intent.section,
+        &encoded,
+    )?;
+    let commitment = merkle_commit(&ciphertext)?;
+    let recipe = LocalSectorRecipe {
+        guild_id,
+        reference: reference.clone(),
+        source: LocalPlaintextSource::CatalogPage {
+            scope: intent.scope,
+            section: intent.section,
+            page,
+        },
+    };
+    let bytes = canonical_bytes_bounded(&recipe, mb_store::CATALOG_SECTOR_RECIPE_BYTES)?;
+    control.publish_catalog_sector_recipe(intent, page, reference.id, &bytes)?;
+    Ok((reference, commitment))
+}
+
 pub(crate) fn install_inline_recipe(
     control: &mut ControlStore,
     guild_id: [u8; 32],
@@ -2678,6 +2733,11 @@ fn render_sector_with_hint_update(
     if expected_guild.is_some_and(|guild_id| recipe.guild_id != *guild_id) {
         bail!("local sector does not belong to the requested guild");
     }
+    ensure!(
+        recipe.reference.id == *sector_id
+            && recipe.reference.logical_len as usize <= V1_SECTOR_SIZE,
+        "local sector recipe has an invalid source ID or length"
+    );
     let plaintext = match &recipe.source {
         LocalPlaintextSource::AnchorFile { locator, offset } => {
             let mut file = locator.open().context("open source anchor")?;
@@ -2707,6 +2767,30 @@ fn render_sector_with_hint_update(
             plaintext
         }
         LocalPlaintextSource::Inline(bytes) => bytes.clone(),
+        LocalPlaintextSource::CatalogPage {
+            scope,
+            section,
+            page,
+        } => {
+            let guild_id = private_page_guild(keys, *scope, *section)?;
+            ensure!(
+                guild_id == recipe.guild_id,
+                "catalog page source has a conflicting guild scope"
+            );
+            let encoded = control.catalog_page(*scope, *section, *page)?;
+            let (reference, ciphertext) = page.seal_private_page(
+                &keys.guild_content_id_key(&guild_id),
+                &keys.guild_data_key(&guild_id),
+                *scope,
+                *section,
+                &encoded,
+            )?;
+            ensure!(
+                reference == recipe.reference,
+                "catalog page no longer matches the committed sector reference"
+            );
+            return Ok(ciphertext);
+        }
     };
     let (actual_reference, ciphertext) = encrypted_sector(
         &keys.guild_data_key(&recipe.guild_id),
@@ -4140,6 +4224,104 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn private_catalog_page_source_rejects_scope_reference_and_page_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([67; 32]));
+        let scope = CatalogScope::Dataset {
+            guild_id: [1; 32],
+            owner: keys.node_id(),
+            protected_root_id: Uuid::from_bytes([2; 16]),
+        };
+        let intent = CatalogIntent {
+            id: Uuid::from_bytes([3; 16]),
+            scope,
+            section: CatalogSection::FileMetadata,
+        };
+        let mut encoded = vec![];
+        control.begin_catalog(intent).unwrap();
+        let mut sink = |reference, bytes: Vec<u8>| {
+            control
+                .stage_catalog_page(intent, reference, &bytes)
+                .unwrap();
+            encoded = bytes;
+            Ok::<_, &'static str>(())
+        };
+        let mut builder = mb_core::CatalogBuilder::new(scope, intent.section).unwrap();
+        builder.push(b"private paths", &mut sink).unwrap();
+        let page = builder.finish(&mut sink).unwrap();
+        let (reference, _) = install_catalog_page_recipe(&control, &keys, intent, page).unwrap();
+        let original = control
+            .get_record("local-sector", &reference.id)
+            .unwrap()
+            .unwrap();
+        let recipe: LocalSectorRecipe = decode_canonical(&original).unwrap();
+        assert!(canonical_bytes(&recipe.source).unwrap().starts_with(&[3]));
+        for changed in 0..4 {
+            let mut corrupted = recipe.clone();
+            match changed {
+                0 => corrupted.reference.id = [9; 32],
+                1 => corrupted.reference.logical_len = u32::MAX,
+                2 => corrupted.guild_id = [8; 32],
+                _ => {
+                    corrupted.source = LocalPlaintextSource::CatalogPage {
+                        scope: CatalogScope::Dataset {
+                            guild_id: [1; 32],
+                            owner: mb_core::NodeId([8; 32]),
+                            protected_root_id: Uuid::from_bytes([2; 16]),
+                        },
+                        section: intent.section,
+                        page,
+                    }
+                }
+            }
+            control
+                .put_record(
+                    "local-sector",
+                    &reference.id,
+                    &canonical_bytes(&corrupted).unwrap(),
+                )
+                .unwrap();
+            assert!(render_sector(&control, &keys, &reference.id, None).is_err());
+        }
+        control
+            .put_record("local-sector", &reference.id, &original)
+            .unwrap();
+        let mut damaged = encoded;
+        *damaged.last_mut().unwrap() ^= 1;
+        control
+            .put_record("catalog-page-v1", &page.hash, &damaged)
+            .unwrap();
+        assert!(render_sector(&control, &keys, &reference.id, Some(&[1; 32])).is_err());
+        assert!(control.cancel_catalog(intent).is_err());
+        assert_eq!(
+            canonical_bytes(&LocalPlaintextSource::Inline(b"old".to_vec())).unwrap(),
+            b"\x01\x03old"
+        );
+        // Existing source records still render identically, including after the
+        // appended page-source variant has been introduced.
+        let (legacy_ref, ciphertext) =
+            encrypted_sector(&keys.guild_data_key(&[1; 32]), [7; 32], b"old").unwrap();
+        let legacy = LocalSectorRecipe {
+            guild_id: [1; 32],
+            reference: legacy_ref.clone(),
+            source: LocalPlaintextSource::Inline(b"old".to_vec()),
+        };
+        control
+            .put_record(
+                "local-sector",
+                &legacy_ref.id,
+                &canonical_bytes(&legacy).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            render_sector(&control, &keys, &legacy_ref.id, Some(&[1; 32])).unwrap(),
+            ciphertext
+        );
+    }
 
     #[test]
     fn bounded_backup_admission_includes_native_git_envelope_overhead() {

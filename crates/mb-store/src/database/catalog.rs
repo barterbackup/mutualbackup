@@ -14,6 +14,7 @@ use super::{ControlStore, DatabaseError};
 
 mod bundle;
 mod native_validation;
+mod source;
 pub use bundle::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
     CatalogBundleState,
@@ -21,6 +22,7 @@ pub use bundle::{
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };
+pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSourceSweep};
 
 const INTENT: &str = "catalog-intent-v1";
 const PAGE: &str = "catalog-page-v1";
