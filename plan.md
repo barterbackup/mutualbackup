@@ -1294,6 +1294,14 @@ before Milestone 7 compatibility freeze. Native Windows/macOS work remains in
 the roadmap; a narrower production platform scope requires an explicit product
 decision rather than treating missing platform support as complete.
 
+The user selected **1 TiB per protected dataset, including retained history**
+as R3's first-release capacity target on 2026-10-06. This target applies to
+the end-to-end capture, Git history, signing, packing, replay, retention and
+seed-only recovery acceptance gates. It does not raise the current flat-catalog
+limits or establish support before those gates pass. The catalog design must
+also declare file/entry/history limits and memory/work bounds; a dataset byte
+target alone does not bound the number of names, extents or references.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

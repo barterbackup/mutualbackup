@@ -129,7 +129,10 @@ passing tests below apply only to their recorded source and exercised cases.
   Rejected mutations preserve the prior catalog and anchors.
 
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
-  production catalog design.** `crates/mb-node/src/snapshot.rs` permits 39,488
+  production catalog design.** The first-release acceptance target is **1 TiB
+  per protected dataset, including retained history**, selected by the user on
+  2026-10-06. This is a required target, not current supported capacity.
+  `crates/mb-node/src/snapshot.rs` permits 39,488
   data-sector references at 64 KiB each: about 2.41 GiB of represented sector
   data, with sparse extents, shared inodes, and per-file rounding affecting
   effective capacity. This is a deliberate current bound, not evidence of
@@ -195,6 +198,9 @@ passing tests below apply only to their recorded source and exercised cases.
     packed partial-upload network retry/reopen fixtures pass. Formatting and
     strict workspace/all-targets Clippy pass. The locked workspace binary build
     and CLI/daemon executable smoke checks pass.
+    The complete locked workspace run on committed `28cae0e` also passes:
+    637 passed, zero failed, 105 ignored. The privileged volume headroom case
+    among those ignored tests was separately provisioned and passed above.
 
 - [x] **R6 / P2 — Package ordinary Git as an explicit runtime dependency.**
   Implemented: the default Nix runtime wraps the CLI, daemon, native Git command,
