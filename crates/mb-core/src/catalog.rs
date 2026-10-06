@@ -9,6 +9,11 @@ use uuid::Uuid;
 use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
 mod privacy;
+mod records;
+pub use records::{
+    CATALOG_MAX_RECORDS, CATALOG_RECORD_BYTES, CatalogRecordBuilder, CatalogRecordReader,
+    CatalogRecordRoot,
+};
 
 pub const CATALOG_PAGE_BYTES: usize = 64 * 1024;
 pub const CATALOG_LEAF_BYTES: usize = 60 * 1024;

@@ -166,3 +166,21 @@ Clippy pass. The seed fixture proves cryptographic lookup/traversal, not an
 end-to-end daemon or 1 TiB restore. Signed revision/checkpoint binding, peer
 authorization, page transport, source recipes and runtime consumer migration
 remain open.
+
+Bounded record framing is implemented in
+`crates/mb-core/src/catalog/records.rs`. A versioned stream header precedes
+length-prefixed records of at most 48 KiB. The root binds the declared record
+count and authenticated page reference; an enclosing signed or owner-encrypted
+root must authenticate both together. The builder serializes into a fixed
+buffer and rejects oversized values before publication. The reader handles
+headers and payloads crossing leaf boundaries, bounds each allocation, and
+checks final EOF before returning the final declared record. Any storage,
+fetch or framing failure fences continued use.
+
+Five new fixtures cover encoded size boundaries, cross-page framing, empty
+streams, malformed/truncated/oversized/trailing frames and failure fencing.
+All 24 catalog tests and all 70 core tests pass, along with formatting and
+strict workspace/all-targets Clippy. Records returned by this reader are raw
+bounded bytes: schema-specific decoders must still bound nested collections
+and validate canonical encoding and semantics. Typed record fragments,
+incremental seek/edit, quota reservation and runtime integration remain open.

@@ -185,6 +185,15 @@ passing tests below apply only to their recorded source and exercised cases.
     All 19 catalog tests and all 65 core tests pass, along with formatting and
     strict workspace/all-targets Clippy. Protocol authorization and integration
     with signed revision/source roots remain in the consumer migration gate.
+  - [x] Add bounded version-one record framing over authenticated pages.
+    Serialization uses a fixed 48 KiB buffer; traversal returns one bounded
+    frame and rejects malformed lengths, truncation, excess records and trailing
+    bytes. Frames may cross leaf boundaries. Storage/fetch failures fence
+    continuation and publication. Five new framing fixtures, all 24 catalog
+    tests and all 70 core tests pass, with formatting and strict
+    workspace/all-targets Clippy. Schema-specific nested collection bounds,
+    typed records and runtime consumers remain open; framing alone does not
+    enable production capacity.
   - [ ] Add quota reservations,
     bounded record codecs and incremental seek/edit operations. Retire intent
     tombstones only behind a verified generation floor. Qualify
