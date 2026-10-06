@@ -407,3 +407,34 @@ overflow/storage/fetch failures. All 86 core tests and 84 catalog-filtered
 workspace tests pass (two provisioned tests remain ignored), with formatting and
 strict workspace/all-targets Clippy. A synthetic 1 TiB sparse length exercises
 recipe geometry; it does not qualify payload backup, restore or retained usage.
+
+`crates/mb-core/src/catalog/native_files.rs` binds the namespace and recipe roots
+in a fixed-field, canonical container of at most 1 KiB. Both streams share the
+existing aggregate metadata/page-occurrence bounds and must agree on file count
+and logical file bytes. Local publication must retain the two trees together;
+an opaque container leaf alone does not create page-store child ownership.
+
+The joined reader interleaves namespace entries with the corresponding recipe
+header and bounded extent/sector fragments. Each file's exact namespace ordinal
+and length must match its recipe before the file entry is returned. Directory
+and hard-link alias entries have no independent recipe. Only the pending recipe
+header and existing bounded reader buffers are retained. Missing, extra,
+incomplete or substituted recipes fail, including substitutions which preserve
+both streams' total counts and bytes. Both authenticated EOFs are checked before
+yielding the final combined event, including catalogs ending in a directory,
+alias, empty file or all-hole file. All failures fence continuation.
+
+This establishes the namespace/recipe key and length join. Hard-link group
+consistency, signed source-reference authority, typed durable publication,
+legacy private metadata conversion and native capture/restore migration remain
+activation requirements. The container does not claim physical quota, protection
+or production capacity.
+
+Seven fixtures cover interleaving across both trees' page boundaries, every
+entry/recipe ending, exact key/length substitution despite matching summaries,
+missing/extra/incomplete streams, page corruption, terminal fetch failure,
+canonical encoding and aggregate metadata/page-occurrence boundaries. All 93
+core tests and 91 catalog-filtered workspace tests pass (two provisioned tests
+remain ignored), with formatting and strict workspace/all-targets Clippy.
+These are structural join checks, not payload/retained-history
+capacity qualification or signed activation evidence.

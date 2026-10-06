@@ -294,10 +294,20 @@ passing tests below apply only to their recorded source and exercised cases.
     suite passes 84 tests with two provisioned tests ignored. Formatting and
     strict workspace/all-targets Clippy pass. Sparse logical lengths in these
     fixtures do not qualify real payload or retained-history capacity.
-  - [ ] Join file namespace and recipes by exact keys/lengths, validate hard-link
-    identities and signed source references, implement complete legacy private
-    metadata conversion and typed durable publication, and migrate native
-    capture/restore consumers before enabling the new format.
+  - [x] Bind native namespace and recipe roots and join exact file keys/lengths.
+    A canonical container of at most 1 KiB shares one aggregate metadata/page
+    budget across both trees. The joined reader retains one pending header and
+    interleaves each entry with its bounded recipe fragments. Missing, extra,
+    incomplete or substituted recipes reject, even when total counts/bytes
+    match. Both EOFs are verified before the final combined event is returned;
+    failures fence continuation. Seven fixtures exercise all entry endings,
+    substitutions, corruption, interruption, aggregate bounds and both trees'
+    page boundaries. All 93 core tests and 91 catalog-filtered workspace tests
+    pass (two provisioned tests remain ignored), with formatting and strict
+    workspace/all-targets Clippy.
+  - [ ] Validate hard-link identities and signed source references. Implement
+    complete legacy private metadata conversion and typed durable publication;
+    migrate native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

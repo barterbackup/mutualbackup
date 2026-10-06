@@ -442,6 +442,12 @@ pub struct CatalogFileRecipeReader {
 }
 
 impl CatalogFileRecipeReader {
+    /// Used by the joined namespace reader to interleave entries and recipes
+    /// without reading ahead into the following file or retaining its payload.
+    pub(super) fn file_complete(&self) -> bool {
+        !self.failed && self.state.finish_file().is_ok()
+    }
+
     pub fn new(scope: CatalogScope, root: CatalogFileRecipeRoot) -> Result<Self, CatalogError> {
         root.validate()?;
         Ok(Self {

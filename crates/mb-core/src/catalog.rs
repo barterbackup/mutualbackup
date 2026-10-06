@@ -10,6 +10,7 @@ use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
 mod file_recipes;
 mod files;
+mod native_files;
 mod privacy;
 mod records;
 mod sectors;
@@ -21,6 +22,10 @@ pub use files::{
     CATALOG_FILE_PATH_BYTES, CATALOG_FILE_RECORD_BYTES, CatalogFileBuilder, CatalogFileKind,
     CatalogFileReader, CatalogFileRecord, CatalogFileRoot, CatalogFileStat,
     catalog_file_path_order,
+};
+pub use native_files::{
+    CATALOG_NATIVE_FILE_ROOT_BYTES, CatalogFileEvent, CatalogNativeFileReader,
+    CatalogNativeFileRoot,
 };
 pub use records::{
     CATALOG_MAX_RECORDS, CATALOG_RECORD_BYTES, CatalogRecordBuilder, CatalogRecordReader,

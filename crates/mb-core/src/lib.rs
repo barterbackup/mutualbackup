@@ -29,14 +29,15 @@ pub use attempt::{
 pub use catalog::{
     CATALOG_FANOUT, CATALOG_FILE_PATH_BYTES, CATALOG_FILE_RECORD_BYTES, CATALOG_FILE_SECTOR_REFS,
     CATALOG_LEAF_BYTES, CATALOG_MAX_HEIGHT, CATALOG_MAX_PAGE_OCCURRENCES, CATALOG_MAX_RECORDS,
-    CATALOG_MAX_STREAM_BYTES, CATALOG_PAGE_BYTES, CATALOG_RECORD_BYTES,
-    CATALOG_SECTOR_RECORD_BYTES, CatalogBuilder, CatalogError, CatalogFileBuilder,
-    CatalogFileExtent, CatalogFileKind, CatalogFileReader, CatalogFileRecipeBuilder,
-    CatalogFileRecipeReader, CatalogFileRecipeRecord, CatalogFileRecipeRoot, CatalogFileRecord,
-    CatalogFileRoot, CatalogFileStat, CatalogPageContents, CatalogPageRef, CatalogReader,
-    CatalogRecordBuilder, CatalogRecordReader, CatalogRecordRoot, CatalogScope, CatalogSection,
-    CatalogSectorBuilder, CatalogSectorReader, CatalogSectorRecord, CatalogSectorRoot,
-    CatalogStreamError, catalog_file_path_order,
+    CATALOG_MAX_STREAM_BYTES, CATALOG_NATIVE_FILE_ROOT_BYTES, CATALOG_PAGE_BYTES,
+    CATALOG_RECORD_BYTES, CATALOG_SECTOR_RECORD_BYTES, CatalogBuilder, CatalogError,
+    CatalogFileBuilder, CatalogFileEvent, CatalogFileExtent, CatalogFileKind, CatalogFileReader,
+    CatalogFileRecipeBuilder, CatalogFileRecipeReader, CatalogFileRecipeRecord,
+    CatalogFileRecipeRoot, CatalogFileRecord, CatalogFileRoot, CatalogFileStat,
+    CatalogNativeFileReader, CatalogNativeFileRoot, CatalogPageContents, CatalogPageRef,
+    CatalogReader, CatalogRecordBuilder, CatalogRecordReader, CatalogRecordRoot, CatalogScope,
+    CatalogSection, CatalogSectorBuilder, CatalogSectorReader, CatalogSectorRecord,
+    CatalogSectorRoot, CatalogStreamError, catalog_file_path_order,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
