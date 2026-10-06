@@ -134,6 +134,9 @@ enum Command {
         /// Explicit surviving peer NODE-ID=MULTIADDR; repeat for retained history.
         #[arg(long)]
         peer: Vec<mb_node::LegacyExportPeer>,
+        /// Identity-bound Kademlia bootstrap NODE-ID=MULTIADDR for read-only discovery.
+        #[arg(long)]
+        bootstrap_peer: Vec<mb_node::LegacyExportPeer>,
         #[arg(long)]
         seed_file: Option<PathBuf>,
         #[arg(long, conflicts_with = "seed_file")]
@@ -162,6 +165,9 @@ enum Command {
         /// Explicit surviving peer NODE-ID=MULTIADDR; repeat to combine peers.
         #[arg(long, requires = "data_dir", conflicts_with_all = ["revision_file", "sectors_dir"])]
         peer: Vec<mb_node::LegacyExportPeer>,
+        /// Identity-bound Kademlia bootstrap NODE-ID=MULTIADDR for discovery.
+        #[arg(long, requires = "data_dir", conflicts_with_all = ["revision_file", "sectors_dir"])]
+        bootstrap_peer: Vec<mb_node::LegacyExportPeer>,
         /// New export package outside the input directories; parent must exist.
         #[arg(long)]
         destination: PathBuf,
@@ -271,12 +277,13 @@ async fn main() -> Result<()> {
         Command::LegacyList {
             data_dir,
             peer,
+            bootstrap_peer,
             seed_file,
             seed_stdin,
         } => {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             let seed = derive_seed(&recovery).await?;
-            let report = if peer.is_empty() {
+            let report = if peer.is_empty() && bootstrap_peer.is_empty() {
                 tokio::task::spawn_blocking(move || {
                     mb_node::inventory_withdrawn_revisions_from_catalog(
                         &KeyMaterial::from_seed(&seed),
@@ -286,7 +293,12 @@ async fn main() -> Result<()> {
                 .await??
             } else {
                 mb_node::inventory_withdrawn_revisions_from_catalog_over_network(
-                    seed, data_dir, peer,
+                    seed,
+                    data_dir,
+                    mb_node::LegacyPeerSources {
+                        peers: peer,
+                        bootstrap_peers: bootstrap_peer,
+                    },
                 )
                 .await?
             };
@@ -301,6 +313,7 @@ async fn main() -> Result<()> {
             anchor_area,
             parity_volume,
             peer,
+            bootstrap_peer,
             destination,
             seed_file,
             seed_stdin,
@@ -308,7 +321,7 @@ async fn main() -> Result<()> {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             let seed = derive_seed(&recovery).await?;
             let report =
-                if !peer.is_empty() {
+                if !peer.is_empty() || !bootstrap_peer.is_empty() {
                     mb_node::export_withdrawn_revision_from_catalog_over_network(
                         seed,
                         data_dir.context("peer recovery requires a preserved catalog")?,
@@ -316,7 +329,10 @@ async fn main() -> Result<()> {
                         destination,
                         anchor_area,
                         parity_volume,
-                        peer,
+                        mb_node::LegacyPeerSources {
+                            peers: peer,
+                            bootstrap_peers: bootstrap_peer,
+                        },
                     )
                     .await?
                 } else {
@@ -1198,6 +1214,28 @@ fn legacy_export_requires_complete_exclusive_input_modes_before_recovery() {
         ])
         .is_err()
     );
+    assert!(
+        parse(&[
+            "--data-dir",
+            "original",
+            "--revision-id",
+            id,
+            "--bootstrap-peer",
+            &endpoint
+        ])
+        .is_ok()
+    );
+    assert!(
+        parse(&[
+            "--revision-file",
+            "revision",
+            "--sectors-dir",
+            "sectors",
+            "--bootstrap-peer",
+            &endpoint
+        ])
+        .is_err()
+    );
     let cli = parse(&[
         "--data-dir",
         "original",
@@ -1252,6 +1290,8 @@ fn legacy_list_requires_catalog_and_excludes_export_arguments() {
         peer.libp2p_peer_id().unwrap()
     );
     assert!(parse(&["--data-dir", "original", "--peer", &endpoint]).is_ok());
+    assert!(parse(&["--data-dir", "original", "--bootstrap-peer", &endpoint]).is_ok());
+    assert!(parse(&["--data-dir", "original", "--bootstrap-peer", "invalid"]).is_err());
     for args in [
         vec!["--data-dir", "original", "--destination", "export"],
         vec![

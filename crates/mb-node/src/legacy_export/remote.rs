@@ -39,6 +39,23 @@ impl FromStr for LegacyExportPeer {
     }
 }
 
+/// Explicit survivors and identity-bound Kademlia bootstrap endpoints. Bootstrap
+/// peers are queried for directory data; they are not automatically survivors.
+#[derive(Clone, Debug, Default)]
+pub struct LegacyPeerSources {
+    pub peers: Vec<LegacyExportPeer>,
+    pub bootstrap_peers: Vec<LegacyExportPeer>,
+}
+
+impl From<Vec<LegacyExportPeer>> for LegacyPeerSources {
+    fn from(peers: Vec<LegacyExportPeer>) -> Self {
+        Self {
+            peers,
+            bootstrap_peers: vec![],
+        }
+    }
+}
+
 pub(super) struct PeerRecovery {
     pub(super) client: P2pClient,
     pub(super) runtime: tokio::runtime::Handle,
@@ -483,7 +500,7 @@ pub async fn export_withdrawn_revision_from_catalog_over_network(
     target: PathBuf,
     anchor_areas: Vec<PathBuf>,
     parity_volumes: Vec<PathBuf>,
-    peers: Vec<LegacyExportPeer>,
+    peers: impl Into<LegacyPeerSources>,
 ) -> Result<LegacyExportReport> {
     let protected_inputs = anchor_areas
         .iter()
@@ -494,7 +511,7 @@ pub async fn export_withdrawn_revision_from_catalog_over_network(
         seed,
         data_dir,
         protected_inputs,
-        peers,
+        peers.into(),
         move |keys, data_dir, remote| {
             super::export_catalog(
                 &keys,
@@ -514,21 +531,41 @@ pub(super) async fn with_peer_recovery<T: Send + 'static>(
     seed: Seed,
     data_dir: PathBuf,
     protected_inputs: Vec<PathBuf>,
-    peers: Vec<LegacyExportPeer>,
+    sources: LegacyPeerSources,
     operation: impl FnOnce(KeyMaterial, PathBuf, PeerRecovery) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     ensure!(
-        !peers.is_empty() && peers.len() <= 64,
-        "select between one and 64 peer endpoints"
+        (!sources.peers.is_empty() || !sources.bootstrap_peers.is_empty())
+            && sources.peers.len() <= 64
+            && sources.bootstrap_peers.len() <= 64,
+        "select one to 64 survivor or bootstrap endpoints per source"
     );
     let keys = KeyMaterial::from_seed(&seed);
-    for peer in &peers {
+    for peer in sources.peers.iter().chain(&sources.bootstrap_peers) {
         crate::network::validate_published_endpoint(peer.node_id, &peer.address.to_string())?;
         ensure!(
             peer.node_id != keys.node_id(),
             "select surviving peers, not the recovering identity"
         );
     }
+    let discovery_guild = if sources.bootstrap_peers.is_empty() {
+        None
+    } else {
+        let preserved = data_dir.clone();
+        let original_seed = seed.clone();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                let keys = KeyMaterial::from_seed(&original_seed);
+                let control = crate::volume::inspect_control_store(&preserved, &keys)?
+                    .context("original control catalog is unavailable")?;
+                let certificate = crate::node::preserved_guild_certificate(&control)?.context(
+                    "directory discovery requires the preserved signed guild certificate",
+                )?;
+                Ok::<_, anyhow::Error>(certificate.genesis.guild_id)
+            })
+            .await??,
+        )
+    };
     let parent = scratch_parent(&std::env::temp_dir(), &data_dir, &protected_inputs, &[])?;
     let scratch = tempfile::Builder::new()
         .prefix("mutualbackup-legacy-peer-client-")
@@ -541,7 +578,11 @@ pub(super) async fn with_peer_recovery<T: Send + 'static>(
         P2pConfig {
             listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse()?],
             external_addresses: vec![],
-            bootstrap_addresses: vec![],
+            bootstrap_addresses: sources
+                .bootstrap_peers
+                .iter()
+                .map(|peer| peer.address.clone())
+                .collect(),
             relay_reservation_addresses: vec![],
             enable_dht_maintenance: false,
             enable_relay_server: false,
@@ -563,9 +604,25 @@ pub(super) async fn with_peer_recovery<T: Send + 'static>(
             .context("temporary recovery client stopped during startup")?
             .map_err(anyhow::Error::msg)?;
         let mut selected = BTreeSet::new();
-        for peer in peers {
+        for peer in sources.peers {
             selected.insert(peer.node_id);
             client.add_peer_address(peer.node_id, peer.address).await?;
+        }
+        if let Some(guild) = discovery_guild {
+            let discovered = tokio::time::timeout(
+                Duration::from_secs(60),
+                discover_peers(&client, &keys, guild),
+            )
+            .await
+            .context("legacy recovery directory discovery timed out")??;
+            for peer in discovered {
+                selected.insert(peer.node_id);
+                ensure!(
+                    selected.len() <= 64,
+                    "discovered survivor identities exceed the recovery bound"
+                );
+                client.add_peer_address(peer.node_id, peer.address).await?;
+            }
         }
         let remote = PeerRecovery {
             client: recovery_client,
@@ -593,6 +650,65 @@ pub(super) async fn with_peer_recovery<T: Send + 'static>(
         tracing::warn!(?stopped, "temporary recovery client stopped with an error");
     }
     result
+}
+
+async fn discover_peers(
+    client: &P2pClient,
+    keys: &KeyMaterial,
+    guild: [u8; 32],
+) -> Result<Vec<LegacyExportPeer>> {
+    use futures::{StreamExt, stream};
+    loop {
+        let providers = match client
+            .get_providers(crate::network::recovery_mailbox_key(keys.node_id()))
+            .await
+        {
+            Ok(providers) => providers,
+            Err(error) => {
+                tracing::debug!(%error, "legacy recovery directory lookup is not ready");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+        ensure!(
+            providers.len() <= 64,
+            "recovery directory provider bound exceeded"
+        );
+        let mut queries = stream::iter(providers.into_iter().map(|provider| async move {
+            let key = crate::network::recovery_bundle_key(keys.node_id(), &provider);
+            (provider, client.get_record(key).await)
+        }))
+        .buffer_unordered(4);
+        let mut peers = Vec::new();
+        while let Some((provider, records)) = queries.next().await {
+            let locator = match records.and_then(|records| {
+                crate::network::preserved_recovery_locator(keys, &provider, guild, records)
+            }) {
+                Ok(Some(locator)) => locator,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(%provider, %error, "ignored invalid legacy recovery directory candidate");
+                    continue;
+                }
+            };
+            if locator.publisher == keys.node_id() {
+                continue;
+            }
+            for endpoint in locator.endpoints {
+                peers.push(LegacyExportPeer {
+                    node_id: locator.publisher,
+                    address: crate::network::validate_published_endpoint(
+                        locator.publisher,
+                        &endpoint,
+                    )?,
+                });
+            }
+        }
+        if !peers.is_empty() {
+            return Ok(peers);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 #[cfg(test)]

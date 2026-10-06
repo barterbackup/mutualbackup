@@ -27,8 +27,8 @@ pub use control::{
 pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6};
 #[cfg(target_os = "linux")]
 pub use legacy_export::{
-    LegacyExportPeer, LegacyExportReport, LegacyPeerInventoryCoverage, LegacyRevisionInventory,
-    LegacyRevisionInventoryEntry, export_withdrawn_revision_from_catalog,
+    LegacyExportPeer, LegacyExportReport, LegacyPeerInventoryCoverage, LegacyPeerSources,
+    LegacyRevisionInventory, LegacyRevisionInventoryEntry, export_withdrawn_revision_from_catalog,
     export_withdrawn_revision_from_catalog_over_network,
     export_withdrawn_revision_from_catalog_with_anchor_areas,
     export_withdrawn_revision_from_catalog_with_preserved_sources,

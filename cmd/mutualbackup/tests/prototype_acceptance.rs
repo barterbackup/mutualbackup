@@ -3440,6 +3440,21 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             .contains("peer inventory requires the preserved signed guild certificate")
     );
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
+    let mut discovery_args = list_args.clone();
+    discovery_args.extend([os("--bootstrap-peer"), os(&extra_endpoint)]);
+    let discovery_refused = run_output(
+        env!("CARGO_BIN_EXE_mutualbackup"),
+        &discovery_args,
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    assert!(!discovery_refused.status.success());
+    assert!(discovery_refused.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&discovery_refused.stderr)
+            .contains("directory discovery requires the preserved signed guild certificate")
+    );
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     let catalog_args = vec![
         os("legacy-export"),
         os("--peer"),

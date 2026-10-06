@@ -10895,6 +10895,53 @@ fn decode_recovery_candidate(
     })
 }
 
+/// Read-only discovery: a signed locator supplies routing hints, not membership
+/// or checkpoint authority. Selection rejects same-sequence equivocation and
+/// uses the highest live signed bundle without writing durable observations.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn preserved_recovery_locator(
+    keys: &mb_core::KeyMaterial,
+    provider_peer_id: &str,
+    guild_id: [u8; 32],
+    records: Vec<DhtRecord>,
+) -> Result<Option<mb_core::RecoveryLocator>> {
+    if records.len() > MAX_DHT_RECORDS_PER_QUERY
+        || records
+            .iter()
+            .any(|record| record.value.len() > V1_CATALOG_PAGE_BYTES)
+    {
+        bail!("legacy discovery recovery records exceed their bounded metadata budget");
+    }
+    let Some(bundle) = select_recovery_bundle(provider_peer_id, keys.node_id(), records)? else {
+        return Ok(None);
+    };
+    let plaintext = match (bundle.value.format_version, &bundle.value.key_envelope) {
+        (1, None) => mb_core::open_recovery_record(keys, &bundle.value.sealed)?,
+        (2, Some(envelope))
+            if envelope.subject == keys.node_id() && envelope.guild_id == guild_id =>
+        {
+            mb_core::open_recovery_key_envelope(keys, envelope)?
+                .open_record(&bundle.value.sealed)?
+        }
+        _ => bail!("discovery recovery bundle has an invalid key envelope"),
+    };
+    let locator: SignedRecord<mb_core::RecoveryLocator> = decode_canonical(&plaintext)?;
+    locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
+    if canonical_bytes(&locator)? != plaintext
+        || locator.signer != bundle.value.publisher
+        || locator.value.format_version != 1
+        || locator.value.subject != keys.node_id()
+        || locator.value.publisher != bundle.value.publisher
+        || locator.value.guild_id != guild_id
+        || locator.value.checkpoint_generation == 0
+        || locator.value.expires_at_unix_seconds != bundle.value.expires_at_unix_seconds
+        || !valid_endpoint_values(locator.value.publisher, &locator.value.endpoints)
+    {
+        bail!("discovery locator conflicts with its signed bundle or preserved guild");
+    }
+    Ok(Some(locator.value))
+}
+
 fn select_recovery_bundle(
     provider_peer_id: &str,
     subject: NodeId,
@@ -24374,6 +24421,396 @@ mod tests {
         assert!(
             select_endpoint_record(publisher, vec![make(4, 5), make(3, 3), make(3, 4)]).is_err()
         );
+    }
+
+    #[test]
+    fn legacy_discovery_locator_checks_signed_encrypted_context_and_equivocation() {
+        let subject = KeyMaterial::from_seed(&Seed::from_bytes([49; 32]));
+        let publisher = KeyMaterial::from_seed(&Seed::from_bytes([72; 32]));
+        let provider = publisher.node_id().libp2p_peer_id().unwrap().to_string();
+        let guild = [50; 32];
+        let make = |version, case| {
+            let expires = if case == 1 {
+                unix_seconds() - 1
+            } else {
+                unix_seconds() + 3600
+            };
+            let mut locator = mb_core::RecoveryLocator {
+                format_version: 1,
+                subject: subject.node_id(),
+                publisher: publisher.node_id(),
+                guild_id: guild,
+                checkpoint_hash: [90; 32],
+                checkpoint_generation: 1,
+                subject_endpoint_sequence_floor: 0,
+                endpoints: vec![format!("/ip4/127.0.0.1/udp/9/quic-v1/p2p/{provider}")],
+                expires_at_unix_seconds: expires,
+            };
+            if case == 2 {
+                locator.guild_id = [51; 32];
+            }
+            if case == 3 {
+                locator.endpoints[0] = format!(
+                    "/ip4/127.0.0.1/udp/9/quic-v1/p2p/{}",
+                    subject.node_id().libp2p_peer_id().unwrap()
+                );
+            }
+            let mut locator =
+                SignedRecord::sign(RECOVERY_LOCATOR_DOMAIN, locator, &publisher).unwrap();
+            if case == 4 {
+                locator.signature[0] ^= 1;
+            }
+            let envelope = (version == 2).then(|| {
+                mb_core::create_recovery_key_envelope(
+                    &subject,
+                    if case == 5 { [51; 32] } else { guild },
+                    2,
+                )
+                .unwrap()
+                .0
+            });
+            let recipient = envelope
+                .as_ref()
+                .map(|e| e.public_key)
+                .unwrap_or(subject.recovery_public_key());
+            let mut sealed =
+                mb_core::seal_recovery_record(recipient, &canonical_bytes(&locator).unwrap())
+                    .unwrap();
+            if case == 6 {
+                sealed.ciphertext[0] ^= 1;
+            }
+            let bundle = mb_core::RecoveryBundle {
+                format_version: version,
+                subject: subject.node_id(),
+                publisher: publisher.node_id(),
+                sequence: 1,
+                expires_at_unix_seconds: expires,
+                key_envelope: envelope,
+                sealed,
+            };
+            let mut bundle =
+                SignedRecord::sign(b"mutualbackup/recovery-bundle/v1", bundle, &publisher).unwrap();
+            if case == 7 {
+                bundle.signature[0] ^= 1;
+            }
+            DhtRecord {
+                publisher: None,
+                value: canonical_bytes(&bundle).unwrap(),
+            }
+        };
+        assert!(
+            preserved_recovery_locator(
+                &subject,
+                &provider,
+                guild,
+                vec![DhtRecord {
+                    publisher: None,
+                    value: vec![0; V1_CATALOG_PAGE_BYTES + 1]
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            preserved_recovery_locator(
+                &subject,
+                &provider,
+                guild,
+                (0..=MAX_DHT_RECORDS_PER_QUERY)
+                    .map(|_| make(1, 0))
+                    .collect()
+            )
+            .is_err()
+        );
+        for version in [1, 2] {
+            assert!(
+                preserved_recovery_locator(&subject, &provider, guild, vec![make(version, 0)])
+                    .unwrap()
+                    .is_some()
+            );
+            for case in [1, 2, 3, 4, 6, 7] {
+                assert!(
+                    !matches!(
+                        preserved_recovery_locator(
+                            &subject,
+                            &provider,
+                            guild,
+                            vec![make(version, case)]
+                        ),
+                        Ok(Some(_))
+                    ),
+                    "version {version}, case {case}"
+                );
+            }
+            assert!(
+                preserved_recovery_locator(
+                    &subject,
+                    &provider,
+                    guild,
+                    vec![make(version, 0), make(version, 0)]
+                )
+                .is_err()
+            );
+            assert!(
+                preserved_recovery_locator(
+                    &subject,
+                    &subject.node_id().libp2p_peer_id().unwrap().to_string(),
+                    guild,
+                    vec![make(version, 0)]
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(preserved_recovery_locator(&subject, &provider, guild, vec![make(2, 5)]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_discovery_uses_real_kademlia_for_inventory_and_export_without_enrollment() {
+        for (format, version) in [(6, 1), (7, 1), (6, 2), (7, 2)] {
+            let ((owner, revision, sectors), identities, _, mut checkpoint) =
+                crate::legacy_export::tests::fixed_checkpoint_fixture(format);
+            let genesis = mb_core::GuildGenesis {
+                format_version: 1,
+                guild_id: revision.value.guild_id,
+                coordinator: checkpoint.checkpoint.members[0].node_id,
+                members: checkpoint.checkpoint.members.clone(),
+            };
+            let mut certificate = QuorumGuildGenesis {
+                signatures: identities
+                    .iter()
+                    .map(|key| genesis.member_signature(key).unwrap())
+                    .collect(),
+                genesis,
+            };
+            certificate
+                .signatures
+                .sort_by_key(|signature| signature.signer);
+            certificate.verify().unwrap();
+            checkpoint.checkpoint.genesis_hash = certificate.hash().unwrap();
+            checkpoint.signatures.clear();
+            for key in &identities {
+                checkpoint.add_signature(key).unwrap();
+            }
+            checkpoint.verify().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let original = temp.path().join("withdrawn");
+            std::fs::create_dir(&original).unwrap();
+            let mut store =
+                mb_store::ControlStore::open(original.join("control.db"), &owner).unwrap();
+            #[derive(serde::Serialize)]
+            struct Installed {
+                format_version: u16,
+                certificate: QuorumGuildGenesis,
+            }
+            store
+                .put_record(
+                    "guild-installed",
+                    b"primary",
+                    &canonical_bytes(&Installed {
+                        format_version: 2,
+                        certificate: certificate.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            store
+                .put_record("guarded-view-mount-v1", b"legacy", b"preserve")
+                .unwrap();
+            for (index, reference) in revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+                .enumerate()
+            {
+                store
+                    .stage_recovery_shard(
+                        &[81; 32],
+                        &revision.value.guild_id,
+                        &[index as u8; 32],
+                        0,
+                        &reference.root,
+                        &sectors[&reference.id],
+                    )
+                    .unwrap();
+            }
+            drop(store);
+            let original_bytes = std::fs::read(original.join("control.db")).unwrap();
+            assert!(Node::open(&original, Seed::from_bytes([49; 32])).is_err());
+            let hub_seed = Seed::from_bytes([75; 32]);
+            let hub_id = KeyMaterial::from_seed(&hub_seed).node_id();
+            let hub = Arc::new(Mutex::new(
+                Node::open(temp.path().join("directory"), hub_seed).unwrap(),
+            ));
+            let mut hub_config = config(hub_id);
+            hub_config.enable_dht_maintenance = false;
+            hub_config.configure_failure_domain = false;
+            hub_config.enable_relay_server = false;
+            let (hub_client, mut hub_loop) = build_p2p(hub, hub_config).unwrap();
+            let startup = hub_loop.take_startup_receiver().unwrap();
+            let hub_task = tokio::spawn(hub_loop.run());
+            startup.await.unwrap().unwrap();
+            let hub_address: Multiaddr = format!(
+                "{}/p2p/{}",
+                hub_client.status().await.unwrap().listen_addresses[0],
+                hub_id.libp2p_peer_id().unwrap()
+            )
+            .parse()
+            .unwrap();
+            let mut survivor =
+                Node::open(temp.path().join("survivor"), Seed::from_bytes([72; 32])).unwrap();
+            survivor
+                .adopt_recovered_guild(
+                    certificate.clone(),
+                    certificate
+                        .genesis
+                        .members
+                        .iter()
+                        .map(|member| GuildPeer {
+                            member: member.clone(),
+                            endpoints: vec![],
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            crate::volume::open_control_store(
+                &temp.path().join("survivor"),
+                &KeyMaterial::from_seed(&Seed::from_bytes([72; 32])),
+            )
+            .unwrap()
+            .0
+            .commit_checkpoint(
+                &revision.value.guild_id,
+                1,
+                None,
+                &checkpoint.hash().unwrap(),
+                &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                &canonical_bytes(&checkpoint).unwrap(),
+                false,
+            )
+            .unwrap();
+            let publisher_keys = KeyMaterial::from_seed(&Seed::from_bytes([72; 32]));
+            let publisher = publisher_keys.node_id();
+            let survivor = Arc::new(Mutex::new(survivor));
+            let mut survivor_config = config(publisher);
+            survivor_config.enable_dht_maintenance = false;
+            survivor_config.configure_failure_domain = false;
+            survivor_config.enable_relay_server = false;
+            survivor_config.bootstrap_addresses = vec![hub_address.clone()];
+            let (client, mut event_loop) = build_p2p(survivor, survivor_config).unwrap();
+            let startup = event_loop.take_startup_receiver().unwrap();
+            let task = tokio::spawn(event_loop.run());
+            startup.await.unwrap().unwrap();
+            client.profile(hub_id).await.unwrap();
+            let provider = publisher.libp2p_peer_id().unwrap().to_string();
+            let endpoint = format!(
+                "{}/p2p/{provider}",
+                client.status().await.unwrap().listen_addresses[0]
+            );
+            let expires = unix_seconds() + 3600;
+            let locator = SignedRecord::sign(
+                RECOVERY_LOCATOR_DOMAIN,
+                mb_core::RecoveryLocator {
+                    format_version: 1,
+                    subject: owner.node_id(),
+                    publisher,
+                    guild_id: revision.value.guild_id,
+                    checkpoint_hash: checkpoint.hash().unwrap(),
+                    checkpoint_generation: 1,
+                    subject_endpoint_sequence_floor: 0,
+                    endpoints: vec![endpoint],
+                    expires_at_unix_seconds: expires,
+                },
+                &publisher_keys,
+            )
+            .unwrap();
+            let envelope = (version == 2).then(|| {
+                mb_core::create_recovery_key_envelope(&owner, revision.value.guild_id, 2)
+                    .unwrap()
+                    .0
+            });
+            let recipient = envelope
+                .as_ref()
+                .map(|e| e.public_key)
+                .unwrap_or(owner.recovery_public_key());
+            let bundle = SignedRecord::sign(
+                b"mutualbackup/recovery-bundle/v1",
+                mb_core::RecoveryBundle {
+                    format_version: version,
+                    subject: owner.node_id(),
+                    publisher,
+                    sequence: 1,
+                    expires_at_unix_seconds: expires,
+                    key_envelope: envelope,
+                    sealed: mb_core::seal_recovery_record(
+                        recipient,
+                        &canonical_bytes(&locator).unwrap(),
+                    )
+                    .unwrap(),
+                },
+                &publisher_keys,
+            )
+            .unwrap();
+            client
+                .put_record(
+                    recovery_bundle_key(owner.node_id(), &provider),
+                    canonical_bytes(&bundle).unwrap(),
+                )
+                .await
+                .unwrap();
+            client
+                .start_providing(recovery_mailbox_key(owner.node_id()))
+                .await
+                .unwrap();
+            let sources = crate::LegacyPeerSources {
+                peers: vec![],
+                bootstrap_peers: vec![crate::LegacyExportPeer {
+                    node_id: hub_id,
+                    address: hub_address,
+                }],
+            };
+            let inventory = crate::inventory_withdrawn_revisions_from_catalog_over_network(
+                Seed::from_bytes([49; 32]),
+                original.clone(),
+                sources.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(inventory.revisions.len(), 1);
+            assert_eq!(
+                inventory.revisions[0].revision_id,
+                revision.value.revision_id
+            );
+            assert!(inventory.revisions[0].peer_checkpoint);
+            assert_eq!(inventory.peer_coverage.unwrap().selected_peers, 1);
+            let output = temp.path().join("export");
+            let report = crate::export_withdrawn_revision_from_catalog_over_network(
+                Seed::from_bytes([49; 32]),
+                original.clone(),
+                revision.value.revision_id,
+                output.clone(),
+                vec![],
+                vec![],
+                sources,
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.private_format, format);
+            if format == 7 {
+                git2::Repository::open_bare(output.join("history.git")).unwrap();
+            }
+            assert_eq!(
+                std::fs::read(original.join("control.db")).unwrap(),
+                original_bytes
+            );
+            assert!(!original.join("control.key").exists());
+            assert!(!original.join("parity.db").exists());
+            client.shutdown().await.unwrap();
+            hub_client.shutdown().await.unwrap();
+            task.await.unwrap().unwrap();
+            hub_task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

@@ -127,7 +127,37 @@ resolved before declaring a complete retained-history inventory. Traversal keeps
 one checkpoint plus bounded head cursors, caps visits at the existing one-million
 recovery work bound, and uses a private temporary client outside the original
 installation. It issues only authenticated reads and installs no peer evidence,
-replay state or keys in the original catalog. Endpoint discovery is still explicit.
+replay state or keys in the original catalog. Bootstrap directory contacts remain explicitly selected.
+
+If survivor addresses are unknown, select a production Kademlia bootstrap endpoint:
+
+```sh
+mutualbackup legacy-list \
+  --data-dir /preserved/installation \
+  --bootstrap-peer NODE-ID=MULTIADDR \
+  --seed-file /preserved/recovery.txt
+```
+
+`legacy-export` accepts the same repeatable `--bootstrap-peer` in catalog mode;
+combine it with `--revision-id` and `--destination`. Explicit `--peer` survivors
+may be combined with bootstrap endpoints. Bootstrap identities are directory
+contacts, not automatically authorized survivors. Discovery queries this owner's
+recovery mailbox and live signed/encrypted recovery bundles using the production
+Kademlia protocol. It checks provider identity, subject/guild, signatures, expiry,
+endpoint identity and same-sequence equivocation before learning routes. Original
+and seed-wrapped rotated recovery keys can open routing locators. A locator grants
+no membership, current-key, enrollment, shard or checkpoint authority: subsequent
+signed checkpoint and membership checks remain mandatory.
+
+Discovery has a 60-second deadline, up to four bundle lookups in flight, existing
+64-provider/64-record query bounds, a 64 KiB encoded bundle-record limit and at
+most 64 selected survivor identities. It creates no directory publication, recovery
+attempt, durable observation or original-state update. Preserved signed genesis
+is required before directory discovery, and temporary client state stays outside
+all preserved inputs. Missing or invalid directory evidence fails discovery;
+keep the explicit-peer fallback and preserve all source/history inputs. The real
+fixture below exercises direct QUIC; relay/Tor discovery qualification remains
+part of the full release gates.
 
 The report's `signed_format` describes the public revision format, not private
 namespace format 6/7. `retained_history_complete` is false: local metadata cannot
@@ -465,3 +495,16 @@ replay; unsupported checkpoint epochs report unmatched owner authority. The CLI
 rejects absent preserved genesis without partial JSON. Original catalogs and
 absent key/parity files are preserved and temporary clients are cleaned up.
 Complete ordinary core/store/Node/Git suites and full M6 gates remain open.
+
+The Kademlia discovery increment passes two discovery, seventeen exporter/
+inventory, one membership, eight wire, three checkpoint-sync, five CLI unit tests
+and the real CLI fixture (37 distinct functions), plus the final discovery rerun,
+locked workspace/all-targets build, formatting and strict Clippy. The real direct-
+QUIC fixture gives the recovering client only a directory address; signed bundles
+supply the survivor endpoint for inventory and export of formats 6/7, including
+original and rotated-key locators. The directory contact is not selected as a
+survivor. Cryptographic cases reject expired, wrong-context/identity, invalidly
+signed, tampered and equivocal evidence and oversized records/query counts. CLI
+parsing and absent-genesis rejection pass. Original catalog bytes, absent key/
+parity files and temporary client cleanup are checked. Full ordinary/provisioned/
+platform suites, relay/Tor discovery and all M6 release gates remain open.

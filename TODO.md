@@ -444,6 +444,37 @@ passing tests below apply only to their recorded source and exercised cases.
     Locked workspace/all-targets build, formatting and strict Clippy pass. Temporary
     client cleanup is checked. Complete ordinary core/store/Node/Git suites and
     full M6/platform gates remain open.
+  - [x] Discover legacy inventory/export survivors through production Kademlia
+    with repeatable `--bootstrap-peer NODE-ID=MULTIADDR`. Bootstrap contacts are
+    directory routes rather than automatically selected shard/checkpoint peers.
+    Require preserved signed guild genesis before discovery. Query this owner's
+    mailbox and bounded provider/bundle records; validate provider/subject/guild,
+    signatures, live expiry, sealed locator context and identity-bound endpoints.
+    Reject same-sequence signed equivocation. Open original or seed-wrapped rotated
+    recovery key locators only as routing hints; they do not adopt key/membership
+    state or authorize enrollment, repairs or checkpoint contents. Keep subsequent
+    checkpoint/hash/quorum and later-member replay checks mandatory. A 60-second
+    deadline, four bundle queries in flight, 64-provider/64-record query bounds,
+    64 KiB encoded record limit and at most 64 survivor identities bound discovery.
+    No publication, durable observation, recovery attempt or original-state
+    writes occur.
+    Full retained-history reconciliation/conversion and broader relay/Tor/platform
+    release qualification remain open.
+    Validation: a real directory/survivor Kademlia fixture discovers the survivor
+    without supplying its endpoint, inventories peer-only revision metadata and
+    exports private formats 6/7 under original and rotated-key bundles. The
+    directory contact is not counted as a selected survivor. Catalog bytes and
+    absent key/parity files remain unchanged. Cryptographic cases reject expired,
+    wrong-guild/provider/endpoint, invalid locator/bundle signatures, tampered
+    ciphertext, wrong envelopes, same-sequence conflicts and oversized record
+    counts/payloads. CLI parsing accepts bootstrap input in catalog mode only,
+    and the real CLI rejects absent preserved genesis with no partial output.
+    Two discovery, seventeen exporter/inventory, one membership, eight wire,
+    three checkpoint-sync, five CLI unit tests and the real CLI fixture pass
+    (37 unique functions). The final platform-gated helper also passes its two
+    discovery cases. Locked workspace/all-targets build, formatting and strict
+    Clippy pass; temporary client cleanup is verified. Full ordinary/provisioned/
+    platform/release qualification remains open.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

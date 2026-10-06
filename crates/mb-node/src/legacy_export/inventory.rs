@@ -60,11 +60,17 @@ pub fn inventory_withdrawn_revisions_from_catalog(
 pub async fn inventory_withdrawn_revisions_from_catalog_over_network(
     seed: mb_core::Seed,
     data_dir: std::path::PathBuf,
-    peers: Vec<super::LegacyExportPeer>,
+    peers: impl Into<super::LegacyPeerSources>,
 ) -> Result<LegacyRevisionInventory> {
-    super::remote::with_peer_recovery(seed, data_dir, vec![], peers, |keys, data_dir, remote| {
-        inventory_catalog(&keys, &data_dir, V1_MAX_CATALOG_BYTES, Some(&remote))
-    })
+    super::remote::with_peer_recovery(
+        seed,
+        data_dir,
+        vec![],
+        peers.into(),
+        |keys, data_dir, remote| {
+            inventory_catalog(&keys, &data_dir, V1_MAX_CATALOG_BYTES, Some(&remote))
+        },
+    )
     .await
 }
 

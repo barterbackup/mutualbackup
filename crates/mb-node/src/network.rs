@@ -49,6 +49,8 @@ mod p2p;
 mod port_mapping;
 mod tor;
 mod wire;
+#[cfg(target_os = "linux")]
+pub(crate) use p2p::preserved_recovery_locator;
 pub(crate) use p2p::validate_published_endpoint;
 pub use p2p::{
     DhtRecord, DhtRecoveryResult, P2pActiveSession, P2pClient, P2pConfig, P2pEventLoop, P2pPath,

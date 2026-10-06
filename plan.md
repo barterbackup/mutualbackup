@@ -908,7 +908,16 @@ bound recovery work. No peer evidence is installed in preserved state.
 Its completeness flag remains false until remote history and preserved root/Git
 catalogs, pins and pending intents can be reconciled; missing private metadata
 must not be inferred from public signed revision formats.
-Recovery-directory discovery and complete retained-history/upgrade qualification
+Read-only recovery-directory discovery uses production Kademlia mailboxes and
+live signed/encrypted bundles through explicitly selected `--bootstrap-peer`
+contacts. Validate provider/subject/guild identity, signatures, expiry, encrypted
+locator context, identity-bound endpoints and same-sequence conflicts. Treat
+locators only as routes; checkpoint and membership authorization remains separate.
+Support original and seed-wrapped rotated recovery keys without adopting key or
+membership state. Directory queries have a 60-second deadline and existing
+provider/record bounds, with at most 64 selected survivor identities. There is no
+publication, enrollment, repair, durable observation or preserved-state mutation.
+Complete retained-history/upgrade and broader relay/Tor discovery qualification
 remain required.
 
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view

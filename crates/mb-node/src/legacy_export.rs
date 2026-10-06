@@ -10,7 +10,7 @@ pub use inventory::{
     inventory_withdrawn_revisions_from_catalog_over_network,
 };
 pub use remote::{
-    LegacyExportPeer, LegacyPeerInventoryCoverage,
+    LegacyExportPeer, LegacyPeerInventoryCoverage, LegacyPeerSources,
     export_withdrawn_revision_from_catalog_over_network,
 };
 
