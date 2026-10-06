@@ -15,6 +15,7 @@ mod privacy;
 mod range;
 mod records;
 mod sectors;
+mod splice;
 pub use file_recipes::{
     CATALOG_FILE_SECTOR_REFS, CatalogFileExtent, CatalogFileRecipeBuilder, CatalogFileRecipeReader,
     CatalogFileRecipeRecord, CatalogFileRecipeRoot,

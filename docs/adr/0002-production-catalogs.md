@@ -821,3 +821,44 @@ pinned across reopen. All 99 core and 97 ordinary store tests pass, with 18
 provisioned store cases still ignored, plus formatting and strict workspace/
 all-targets Clippy. Native source-backend and topology qualification were not
 rerun for this reader addition. R3 and the full M6 release gates remain open.
+
+### Path-copying splices and durable successors (2026-10-06)
+
+`CatalogPageRef::splice` replaces an authenticated byte range with at most one
+60 KiB leaf of replacement bytes. It supports insertion and deletion without
+repaging the untouched suffix. Only boundary paths are fetched; deleted
+subtrees are skipped using authenticated summaries. New pages are emitted
+child first, while untouched subtrees keep their addresses. Repeated page
+occurrences remain independent through their stream offsets. Equal edits do
+not emit unchanged pages. An empty no-op returns the original root directly.
+
+The edit retains bounded leaf buffers and at most fanout-plus-one references
+per active height. Index overflow splits parents and may grow the root.
+Stream, occurrence and height bounds remain mandatory. Excessively fragmented
+trees can require rebalancing before a growing edit fits; this operation fails
+rather than producing an out-of-format tree. General rebalancing/compaction,
+stable typed-record indexing, typed validation and multi-edit scheduling remain
+open. A byte splice does not certify the meaning of a record stream, validate
+skipped pages or supply root authority.
+
+`ControlStore::stage_catalog_splice` uses a Building successor intent and the
+existing child-first page/link transactions. Even an unchanged result acquires
+successor root ownership before returning. The caller holds the original root
+pinned until successor staging completes. Publication is explicit and separate.
+An interrupted or failed edit may leave pending pages, which remain available
+for deterministic retry or cancellation; no failed edit returns a publishable
+root. Published and cancelled intent fences continue to reject later staging.
+
+Five core fixtures cover boundary combinations, insertion/deletion/replacement,
+parent splitting, repeated occurrences, no-op writes, storage/corruption faults,
+stream/height limits and original-root preservation. Small edits and deletion
+of nearly the entire exact 16 GiB catalog stream fetch at most two boundary
+paths. That fixture uses a repeated authenticated tree, not real 1 TiB dataset
+data. Two reopened SQLCipher fixtures cover successor publication/cancellation,
+shared-closure reclamation and retry after a parent INSERT failure with new
+leaves already durable. All 104 core and 99 ordinary store tests pass, retaining
+18 ignored provisioned store cases, plus formatting and strict workspace/
+all-targets Clippy. Native source-backend and topology gates were not rerun for
+this API addition. Quota admission, signed paged revisions and production
+capture/packing/replay/retention/recovery migration remain required; R3 and M6
+are still open.

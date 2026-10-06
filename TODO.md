@@ -523,6 +523,30 @@ passing tests below apply only to their recorded source and exercised cases.
     Validation: all 99 core and 97 ordinary store tests pass (18 provisioned
     store cases remain ignored), with formatting and strict workspace/all-targets
     Clippy. No native source-backend or topology behavior changed in this step.
+  - [x] Add bounded path-copying byte splices and durable successor staging.
+    `CatalogPageRef::splice` inserts, deletes or replaces a byte range with at
+    most 60 KiB of replacement bytes, fetching only boundary paths and reusing
+    untouched subtree addresses. It skips fully deleted subtrees and emits new
+    pages child first. Repeated page occurrences remain independent by offset;
+    unchanged pages produce no sink writes. Root splits preserve page bounds;
+    edits exceeding stream or height geometry fail without returning a root.
+    `ControlStore::stage_catalog_splice` stages a successor under a Building
+    intent, including root ownership for no-op edits. Publication stays explicit;
+    failed edits leave durable pending pages for retry or cancellation while
+    the original root remains pinned. Five core fixtures cover insertion,
+    deletion, replacement, boundary combinations, parent splitting, repeated
+    occurrences, no-ops, corruption/fetch/sink failures and geometry rejection.
+    Small edits and nearly complete deletion at the exact 16 GiB catalog-stream
+    bound use at most two boundary paths, using repeated authenticated subtrees
+    rather than real dataset data. Two SQLCipher fixtures cover staged/published/
+    cancelled reopen, shared-closure reclamation and retry after an injected
+    parent-insert failure with leaves already durable. Typed-record indexing,
+    multi-edit scheduling, general tree rebalancing/compaction, quota admission
+    and production capture/recovery integration remain open. This does not
+    change current snapshot limits or qualify the 1 TiB release target.
+    Validation: all 104 core and 99 ordinary store tests pass (18 provisioned
+    store cases remain ignored), with formatting and strict workspace/all-targets
+    Clippy. Native source-backend and topology gates were not rerun for this API.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

@@ -399,6 +399,39 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Stage a path-copying byte splice under a pending successor intent.
+    /// The caller keeps the authenticated original root pinned throughout.
+    /// New pages and their links become durable child first. A failed edit may
+    /// leave staged pages for retry/cancellation, but does not publish a root.
+    /// Even an unchanged result acquires successor ownership before returning.
+    pub fn stage_catalog_splice(
+        &self,
+        intent: CatalogIntent,
+        original: CatalogPageRef,
+        range: std::ops::Range<u64>,
+        replacement: &[u8],
+    ) -> Result<CatalogPageRef, CatalogStoreError> {
+        if self.catalog_intent_state(intent)? != CatalogIntentState::Building {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let root = original
+            .splice(
+                intent.scope,
+                intent.section,
+                range,
+                replacement,
+                &mut |reference| self.catalog_page(intent.scope, intent.section, reference),
+                &mut |reference, bytes| self.stage_catalog_page(intent, reference, &bytes),
+            )
+            .map_err(|error| match error {
+                mb_core::CatalogStreamError::Catalog(error) => CatalogStoreError::Page(error),
+                mb_core::CatalogStreamError::Storage(error) => error,
+            })?;
+        let bytes = self.catalog_page(intent.scope, intent.section, root)?;
+        self.stage_catalog_page(intent, root, &bytes)?;
+        Ok(root)
+    }
+
     /// Atomically fence stale page writers/publication before dropping any pin.
     pub fn cancel_catalog(&self, intent: CatalogIntent) -> Result<(), CatalogStoreError> {
         let transaction =
@@ -572,6 +605,179 @@ mod tests {
             bytes.extend(leaf);
         }
         bytes
+    }
+
+    #[test]
+    fn catalog_splices_reopen_publish_and_reclaim_only_unshared_pages() {
+        let (bytes, root, pages) = graph();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([89; 32]));
+        for publish in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open(&path, &keys).unwrap();
+            let original = intent(7);
+            let successor = intent(8);
+            store.begin_catalog(original).unwrap();
+            for (reference, encoded) in &pages {
+                store
+                    .stage_catalog_page(original, *reference, encoded)
+                    .unwrap();
+            }
+            store.publish_catalog(original, root).unwrap();
+            while store.release_catalog_pin(original).unwrap() {}
+            store.begin_catalog(successor).unwrap();
+            let start = CATALOG_LEAF_BYTES as u64 - 1;
+            let next = store
+                .stage_catalog_splice(successor, root, start..start + 2, b"new contents")
+                .unwrap();
+            assert_eq!(read(&store, original, root), bytes);
+            drop(store);
+            let store = ControlStore::open(&path, &keys).unwrap();
+            assert_eq!(
+                store.catalog_intent_state(successor).unwrap(),
+                CatalogIntentState::Building
+            );
+            assert_eq!(
+                store
+                    .stage_catalog_splice(successor, root, start..start + 2, b"new contents")
+                    .unwrap(),
+                next
+            );
+            if publish {
+                store.publish_catalog(successor, next).unwrap();
+            } else {
+                store.cancel_catalog(successor).unwrap();
+            }
+            drop(store);
+            let store = ControlStore::open(&path, &keys).unwrap();
+            if publish {
+                store.cancel_catalog(original).unwrap();
+                while store.release_catalog_pin(original).unwrap() {}
+                while store.release_catalog_pin(successor).unwrap() {}
+                let mut expected = bytes.clone();
+                expected.splice(
+                    start as usize..start as usize + 2,
+                    b"new contents".iter().copied(),
+                );
+                while store.collect_catalog_page().unwrap() {
+                    assert_eq!(read(&store, successor, next), expected);
+                }
+                assert!(
+                    store
+                        .catalog_page(original.scope, original.section, root)
+                        .is_err()
+                );
+                // The untouched final leaf remains byte-exact and shared.
+                assert_eq!(
+                    store
+                        .catalog_page(original.scope, original.section, pages[2].0)
+                        .unwrap(),
+                    pages[2].1
+                );
+                assert!(
+                    store
+                        .stage_catalog_splice(successor, next, 0..0, b"x")
+                        .is_err()
+                );
+            } else {
+                while store.release_catalog_pin(successor).unwrap() {}
+                while store.collect_catalog_page().unwrap() {
+                    assert_eq!(read(&store, original, root), bytes);
+                }
+                assert!(
+                    store
+                        .catalog_page(successor.scope, successor.section, next)
+                        .is_err()
+                );
+                assert!(
+                    store
+                        .stage_catalog_splice(successor, root, 0..0, b"x")
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_splices_retry_after_partial_sql_failure_without_publishing() {
+        let (bytes, root, pages) = graph();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([88; 32]));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open(&path, &keys).unwrap();
+        let original = intent(5);
+        let successor = intent(6);
+        store.begin_catalog(original).unwrap();
+        for (reference, encoded) in &pages {
+            store
+                .stage_catalog_page(original, *reference, encoded)
+                .unwrap();
+        }
+        store.publish_catalog(original, root).unwrap();
+        store.begin_catalog(successor).unwrap();
+        // Compute the root without storing it, then fail that parent's staging
+        // only after new leaves have become durable.
+        let planned = root
+            .splice(
+                original.scope,
+                original.section,
+                1..1,
+                b"x",
+                &mut |reference| store.catalog_page(original.scope, original.section, reference),
+                &mut |_, _| Ok::<_, CatalogStoreError>(()),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_splice_parent BEFORE INSERT ON protocol_records
+             WHEN NEW.kind = 'catalog-page-v1' AND NEW.record_id = X'{}'
+             BEGIN SELECT RAISE(ABORT, 'injected parent failure'); END;",
+                hex::encode(planned.hash)
+            ))
+            .unwrap();
+        assert!(
+            store
+                .stage_catalog_splice(successor, root, 1..1, b"x")
+                .is_err()
+        );
+        assert_eq!(
+            store.catalog_intent_state(successor).unwrap(),
+            CatalogIntentState::Building
+        );
+        assert!(
+            read_intent(&store.connection, successor)
+                .unwrap()
+                .owned_pages
+                > 0
+        );
+        assert_eq!(read(&store, original, root), bytes);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_splice_parent")
+            .unwrap();
+        drop(store);
+        let store = ControlStore::open(&path, &keys).unwrap();
+        let next = store
+            .stage_catalog_splice(successor, root, 1..1, b"x")
+            .unwrap();
+        store.publish_catalog(successor, next).unwrap();
+        let mut expected = bytes;
+        expected.insert(1, b'x');
+        assert_eq!(read(&store, successor, next), expected);
+        // A no-op successor must still own its root before the previous owner
+        // can be cancelled and collected.
+        let same = intent(4);
+        store.begin_catalog(same).unwrap();
+        assert_eq!(
+            store.stage_catalog_splice(same, next, 0..0, b"").unwrap(),
+            next
+        );
+        store.publish_catalog(same, next).unwrap();
+        store.cancel_catalog(successor).unwrap();
+        while store.release_catalog_pin(successor).unwrap() {}
+        while store.collect_catalog_page().unwrap() {}
+        assert_eq!(read(&store, same, next), expected);
     }
 
     #[test]
