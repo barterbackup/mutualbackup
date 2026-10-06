@@ -8036,6 +8036,7 @@ async fn commit_verified_coding_group(
         },
     };
     state.validate_event_proposal(&event)?;
+    let event_hash = hex::encode(event.hash()?);
     let local_event = event.clone();
     let local_transcript = transcript.clone();
     let local_signature = node_blocking(node.clone(), move |node| {
@@ -8096,7 +8097,17 @@ async fn commit_verified_coding_group(
                 }
             }
             Err(error) => {
-                tracing::warn!(%signer, %error, "guild member did not sign coding-group event");
+                tracing::warn!(
+                    %signer,
+                    guild_id = %hex::encode(event.guild_id),
+                    sequence = event.sequence,
+                    %event_hash,
+                    group_id = %hex::encode(group.id),
+                    attempt_id = %hex::encode(transcript.value.plan.value.attempt_id),
+                    signatures = signatures.len(),
+                    %error,
+                    "guild member did not sign coding-group event"
+                );
             }
         }
     }
@@ -8133,6 +8144,7 @@ async fn commit_verified_coding_group(
     wait_for_guild_event_dissemination(
         installs,
         certified.event.sequence,
+        &event_hash,
         "coding-group",
         GUILD_EVENT_DISSEMINATION_WAIT,
     )
@@ -8143,6 +8155,7 @@ async fn commit_verified_coding_group(
 async fn wait_for_guild_event_dissemination<F>(
     mut installs: FuturesUnordered<F>,
     sequence: u64,
+    event_hash: &str,
     kind: &'static str,
     wait: Duration,
 ) where
@@ -8152,7 +8165,7 @@ async fn wait_for_guild_event_dissemination<F>(
     while !installs.is_empty() {
         match tokio::time::timeout_at(deadline, installs.next()).await {
             Ok(Some((peer, Err(error)))) => {
-                tracing::debug!(%peer, %error, sequence, kind, "guild event dissemination deferred to tail sync");
+                tracing::debug!(%peer, %error, sequence, event_hash, kind, "guild event dissemination deferred to tail sync");
             }
             Ok(Some((_, Ok(())))) => {}
             Ok(None) => break,
@@ -8160,6 +8173,7 @@ async fn wait_for_guild_event_dissemination<F>(
                 tracing::warn!(
                     pending = installs.len(),
                     sequence,
+                    event_hash,
                     kind,
                     "guild event dissemination is waiting for peer tail sync"
                 );
@@ -9045,6 +9059,7 @@ async fn commit_plain_guild_event(
     local_id: NodeId,
     event: GuildEvent,
 ) -> Result<()> {
+    let event_hash = hex::encode(event.hash()?);
     let local_event = event.clone();
     let local_signature = node_blocking(node.clone(), move |node| {
         node.sign_guild_event_proposal(&local_event)
@@ -9097,7 +9112,15 @@ async fn commit_plain_guild_event(
                 }
             }
             Err(error) => {
-                tracing::warn!(%signer, sequence = event.sequence, %error, "guild member did not sign lifecycle event");
+                tracing::warn!(
+                    %signer,
+                    guild_id = %hex::encode(event.guild_id),
+                    sequence = event.sequence,
+                    %event_hash,
+                    signatures = signatures.len(),
+                    %error,
+                    "guild member did not sign lifecycle event"
+                );
             }
         }
     }
@@ -9120,6 +9143,7 @@ async fn commit_plain_guild_event(
     wait_for_guild_event_dissemination(
         installs,
         certified.event.sequence,
+        &event_hash,
         "lifecycle",
         GUILD_EVENT_DISSEMINATION_WAIT,
     )

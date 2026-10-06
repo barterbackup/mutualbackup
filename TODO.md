@@ -330,6 +330,17 @@ passing tests below apply only to their recorded source and exercised cases.
 
   Existing investigation and validation record:
 
+  Added correlated event diagnostics to signature failures and dissemination:
+  guild/sequence/event hash, signer, partial signature count, and coding
+  group/attempt identity. Rejected transition admission reports the requested
+  hash and verified local proposal-lock hash or lock validation error. Durable
+  lock creation/reuse/conflicts and partial-signature persistence identify the
+  same event, including the remaining signer set at debug level. Strict
+  workspace/all-targets Clippy passes; the reopen/signature-isolation,
+  majority-with-slow-minority, bounded dissemination, and unrecovered-member
+  admission fixtures pass. This improves future diagnosis; connection/endpoint
+  correlation and reproduction of the original stall remain open.
+
   The 2026-10-06 withdrawal-audit workspace run, overlapping native artifact
   compilation, failed `mixed_packed_group_replacement_reclaims_obsolete_ready_shards`
   with fewer than two reachable coding coordinators and

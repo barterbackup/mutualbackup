@@ -784,20 +784,39 @@ fn process_peer_request(
                     .and_then(|guild_id| node_guard.authorize_member(&guild_id, caller).err())
                     .map(|error| format!("{error:#}"));
                 let local_guild = node_guard.guild_summary().ok().flatten();
-                let requested_sequence = match &request {
+                let requested_event = match &request {
                     PeerRequest::SignGuildEvent { event }
-                    | PeerRequest::SignCodingGroupEvent { event, .. } => Some(event.sequence),
+                    | PeerRequest::SignCodingGroupEvent { event, .. } => Some(event.as_ref()),
                     PeerRequest::InstallGuildEvent { certified }
                     | PeerRequest::InstallCodingGroupEvent { certified, .. } => {
-                        Some(certified.event.sequence)
+                        Some(&certified.event)
                     }
                     _ => None,
+                };
+                let requested_sequence = requested_event.map(|event| event.sequence);
+                let requested_event_hash = requested_event
+                    .and_then(|event| event.hash().ok())
+                    .map(hex::encode);
+                let (locked_event_hash, proposal_lock_error) = match requested_sequence
+                    .map(|sequence| node_guard.locked_guild_event_proposal(sequence))
+                    .transpose()
+                {
+                    Ok(lock) => (
+                        lock.flatten()
+                            .and_then(|event| event.hash().ok())
+                            .map(hex::encode),
+                        None,
+                    ),
+                    Err(error) => (None, Some(format!("{error:#}"))),
                 };
                 tracing::warn!(
                     %caller,
                     operation = mutation_kind.unwrap_or("guild-transition"),
                     ?guild_id,
                     ?requested_sequence,
+                    ?requested_event_hash,
+                    ?locked_event_hash,
+                    ?proposal_lock_error,
                     local_sequence = ?local_guild.as_ref().and_then(|guild| guild.event_sequence),
                     local_phase = ?local_guild.as_ref().map(|guild| &guild.phase),
                     ?membership_error,

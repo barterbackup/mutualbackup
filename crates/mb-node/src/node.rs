@@ -4093,8 +4093,24 @@ impl Node {
         {
             let lock: GuildEventSignatureLock = decode_canonical(&bytes)?;
             if lock.format_version != 1 || lock.event_hash != event_hash || lock.event != *event {
+                tracing::warn!(
+                    signer = %self.keys.node_id(),
+                    guild_id = %hex::encode(event.guild_id),
+                    sequence = event.sequence,
+                    event_hash = %hex::encode(event_hash),
+                    locked_event_hash = %hex::encode(lock.event_hash),
+                    locked_guild_id = %hex::encode(lock.event.guild_id),
+                    "guild proposal conflicts with durable signature lock"
+                );
                 anyhow::bail!("local seed has already signed a conflicting guild event");
             }
+            tracing::debug!(
+                signer = %self.keys.node_id(),
+                guild_id = %hex::encode(event.guild_id),
+                sequence = event.sequence,
+                event_hash = %hex::encode(event_hash),
+                "reusing durable guild event signature"
+            );
             return Ok(lock.signature);
         }
         let state = self
@@ -4121,6 +4137,13 @@ impl Node {
         )? {
             anyhow::bail!("local seed has already signed a guild event at this sequence");
         }
+        tracing::debug!(
+            signer = %self.keys.node_id(),
+            guild_id = %hex::encode(event.guild_id),
+            sequence = event.sequence,
+            event_hash = %hex::encode(event_hash),
+            "persisted guild event signature lock"
+        );
         Ok(signature)
     }
 
@@ -4185,6 +4208,16 @@ impl Node {
             &id,
             &canonical_bytes(&pending)?,
         )?;
+        tracing::debug!(
+            guild_id = %hex::encode(event.guild_id),
+            sequence = event.sequence,
+            event_hash = %hex::encode(event.hash()?),
+            signatures = pending.signatures.len(),
+            missing_signers = ?active.iter().filter(|signer| {
+                !pending.signatures.iter().any(|signature| signature.signer == **signer)
+            }).collect::<Vec<_>>(),
+            "persisted verified partial guild signatures"
+        );
         Ok(pending.signatures)
     }
 
