@@ -146,21 +146,20 @@ passing tests below apply only to their recorded source and exercised cases.
   limits with bounded memory; interrupted backup, prune, and seed-only recovery
   preserve exact data and old supported revisions remain readable.
 
-- [ ] **R4 / P1 — Complete variable-profile disk evacuation.**
-  `ParityStore::first_ready_object` in `crates/mb-store/src/database.rs` selects
-  only format-1 READY objects. `StorageVolumes::migrate_draining` in
-  `crates/mb-node/src/volume.rs` correctly refuses retirement while format-2
-  objects or coding reservations remain (the completed M5-144 safety fix), but
-  cannot finish evacuating such a volume. Add bounded enumeration and durable
-  cross-volume transfer for variable information/parity shards, preserving the
-  group/profile/root/assignment identity. Reserve destination headroom, verify
-  and commit it, publish its receipt with replayable source cleanup, and only
-  then retire the source copy. Define how in-flight STAGED objects and coding
-  reservations finish, abort, or transfer; keep safe refusal until all ownership
-  and cleanup obligations are settled. Acceptance: mixed formats, information
-  and parity, full/offline destinations, pending reservations, concurrent GC,
-  and interruption at each publication boundary converge after reopen; the
-  evacuated disk can be removed while reads/reconstruction still succeed.
+- [x] **R4 / P1 — Complete variable-profile disk evacuation.**
+  Implemented bounded READY enumeration and durable local transfers for variable
+  information/parity shards alongside legacy objects. Destination writes count
+  reservations and headroom, preserve attempt/receipt/verification evidence,
+  and verify exact bytes before publishing the location. The source remains
+  readable until the destination is READY; conditional source cleanup and
+  transfer retirement replay after reopen. Authoritative repair copies retain
+  their own evidence. GC and abort durably cancel unfinished transfers and keep
+  offline copies owned until cleanup; successor attempts remain intact.
+  In-flight uploads can finish on a draining source or abort. STAGED objects,
+  physical reservations, and control-only coding/retirement obligations block
+  final retirement. Each source's retirement is persisted before the next
+  source can fail. Qualification is recorded below; broader release-artifact
+  and platform validation remains R7.
 
   - [x] Repair interrupted coding-upload reservation retirement. A retry after
     receipt publication now verifies the physical STAGED/READY shard and the
@@ -170,7 +169,7 @@ passing tests below apply only to their recorded source and exercised cases.
     passes 39 ordinary tests (one privileged test remains ignored). The packed
     partial-upload network retry/reopen fixture passes, as do formatting and
     strict workspace/all-targets Clippy. This fixes a pending-ownership replay
-    boundary; variable-profile disk evacuation remains open.
+    boundary separately from the transfer integration below.
 
   - [x] Add the verified READY transfer primitives. The store enumerates one
     variable shard in a consistent snapshot, carrying its original attempt,
@@ -179,8 +178,23 @@ passing tests below apply only to their recorded source and exercised cases.
     conditional source deletion rejects different attempt/root/verification
     evidence. Three targeted corruption, pending-ownership, capacity, replay,
     and reopen fixtures pass, along with all 51 database tests, formatting, and
-    strict workspace/all-targets Clippy. These local primitives do not yet
-    implement cross-volume publication or evacuation.
+    strict workspace/all-targets Clippy. Transfer publication and evacuation
+    are qualified separately below.
+
+  - [x] Integrate and qualify cross-volume evacuation. Fifteen new volume
+    fixtures cover information and parity, all five transfer publication
+    boundaries plus source retirement, full/offline destinations, logical and
+    physical headroom, malformed/corrupt evidence, reused repairs, successor
+    protection, pending upload completion/abort, control-only reservations,
+    mixed formats, and GC/abort interleavings including interrupted GC and
+    offline cleanup. The complete volume suite passes 54 ordinary tests; its
+    remaining privileged headroom fixture also passes on disposable Btrfs,
+    with mount/image/loop cleanup verified. The Node detach fixture passes
+    live-reader access, missing-shard reconstruction, exact bytes after reopen,
+    and rejection of another guild. Existing full coding activation/replay and
+    packed partial-upload network retry/reopen fixtures pass. Formatting and
+    strict workspace/all-targets Clippy pass. The locked workspace binary build
+    and CLI/daemon executable smoke checks pass.
 
 - [x] **R6 / P2 — Package ordinary Git as an explicit runtime dependency.**
   Implemented: the default Nix runtime wraps the CLI, daemon, native Git command,

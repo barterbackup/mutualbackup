@@ -81,12 +81,15 @@ Verified historical export and retirement remain open in R1 of [`plan.md`](plan.
 
 Parity may span several configured filesystems. Each volume has a signed UUID,
 an independently wrapped SQLCipher key, a byte budget and repair headroom.
-`storage drain` stops new placement; `storage migrate` currently copies and
-verifies format-1 objects before retiring their source. Migration refuses to
-retire a volume while variable-profile objects or coding reservations remain,
-preserving their receipts and readable source. Full variable-profile evacuation
-is an open production gate. A retired volume remains retired across
-daemon restarts even if its path stays configured; `storage reactivate UUID`
+`storage drain` stops new placement; `storage migrate` copies and verifies
+legacy and variable-profile READY shards before retiring their source. Variable
+transfers preserve activation evidence and publish the verified destination
+receipt before source cleanup. Durable transfer records resume after a restart;
+GC and abort cancel unfinished transfers before deleting their copies. Pending
+uploads can finish on a draining volume or abort, and retirement waits for
+STAGED objects, reservations, and control cleanup obligations to settle. Full
+or offline destinations preserve a readable source. Completed retirement
+persists across daemon restarts even if its path stays configured; `storage reactivate UUID`
 explicitly returns an attached retired volume to service. Interrupted writes
 and moves are reconciled from durable control receipts, while an absent disk
 remains visibly offline. `storage list` reports logical use, physical database

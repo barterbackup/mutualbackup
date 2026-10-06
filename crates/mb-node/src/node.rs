@@ -19591,6 +19591,138 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn variable_volume_evacuation_preserves_live_reads_and_reconstruction_after_detach() {
+        let data = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([231; 32]);
+        let mut node = Node::open(data.path(), seed.clone()).unwrap();
+        node.configure_storage_volumes(&[source.path().to_path_buf()], 1024, 0)
+            .unwrap();
+        let profile = mb_core::CodingProfile::new(3, 2, 64);
+        let shards =
+            mb_core::encode(profile, vec![vec![232; 64], vec![233; 64], vec![234; 64]]).unwrap();
+        let guild = [235; 32];
+        let group = [236; 32];
+        let information = [237; 32];
+        let attempt = [238; 16];
+        let verification = [239; 32];
+        let mut stored = Vec::new();
+        // Local information uses a sector key; parity uses the coding-group key.
+        for index in [0, 3, 4] {
+            let object = VariableParityObject {
+                format_version: 2,
+                guild_id: guild,
+                group_id: if index == 0 { information } else { group },
+                shard_index: index as u16,
+                commitment: merkle_commit(&shards[index]).unwrap(),
+                bytes: shards[index].clone(),
+            };
+            let receipt = node
+                .volumes
+                .stage_attempt(&node.control, &attempt, &object, b"signed shard receipt")
+                .unwrap();
+            node.volumes
+                .activate_attempt_object(
+                    &node.control,
+                    &attempt,
+                    &object.group_id,
+                    object.shard_index,
+                    &object.commitment,
+                    &verification,
+                )
+                .unwrap();
+            stored.push((object, receipt));
+        }
+        node.volumes
+            .finalize_attempt(&node.control, &attempt)
+            .unwrap();
+        node.configure_storage_volumes(
+            &[
+                source.path().to_path_buf(),
+                destination.path().to_path_buf(),
+            ],
+            1024,
+            0,
+        )
+        .unwrap();
+        let reader = node.reader_config().open().unwrap();
+        for (object, _) in &stored {
+            assert_eq!(
+                reader
+                    .ready_variable_object(&object.group_id, object.shard_index)
+                    .unwrap(),
+                *object
+            );
+        }
+        let source_id = stored[0].1.volume_id;
+        assert!(
+            stored
+                .iter()
+                .all(|(_, receipt)| receipt.volume_id == source_id)
+        );
+        node.drain_storage_volume(source_id).unwrap();
+        assert_eq!(node.migrate_draining_volumes().unwrap(), 3);
+        fs::remove_dir_all(source.path()).unwrap();
+        for (object, _) in &stored {
+            assert_eq!(
+                reader
+                    .ready_variable_object(&object.group_id, object.shard_index)
+                    .unwrap(),
+                *object
+            );
+        }
+        let mut recovered = vec![None; 5];
+        for (object, _) in &stored {
+            recovered[usize::from(object.shard_index)] = Some(
+                reader
+                    .ready_variable_object(&object.group_id, object.shard_index)
+                    .unwrap()
+                    .bytes,
+            );
+        }
+        mb_core::reconstruct(profile, &mut recovered).unwrap();
+        assert_eq!(
+            recovered,
+            shards.iter().cloned().map(Some).collect::<Vec<_>>()
+        );
+        drop(reader);
+        drop(node);
+        let node = Node::open(data.path(), seed).unwrap();
+        let fresh_reader = node.reader_config().open().unwrap();
+        for (object, _) in &stored {
+            assert_eq!(
+                fresh_reader
+                    .ready_variable_object(&object.group_id, object.shard_index)
+                    .unwrap(),
+                *object
+            );
+            let actual = if object.shard_index == 0 {
+                node.variable_information_for_guild(&guild, &information, 0)
+                    .unwrap()
+            } else {
+                node.variable_parity_for_guild(&guild, &group, object.shard_index)
+                    .unwrap()
+            };
+            assert_eq!(actual, *object);
+            assert!(
+                node.variable_parity_for_guild(&[240; 32], &object.group_id, object.shard_index)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            node.storage_status()
+                .unwrap()
+                .into_iter()
+                .find(|v| v.volume_id == source_id)
+                .unwrap()
+                .state,
+            crate::StorageVolumeState::Retired
+        );
+        assert!(!source.path().exists());
+    }
+
+    #[test]
     fn live_reader_releases_a_retired_volume_before_detach() {
         let temp = tempfile::tempdir().unwrap();
         let first = tempfile::tempdir().unwrap();

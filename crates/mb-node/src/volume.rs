@@ -12,7 +12,7 @@ use mb_core::{
 };
 use mb_store::{
     ControlStore, DatabaseError, DatabaseShellResult, ParityObject, ParityStore,
-    VariableParityObject,
+    ReadyVariableObject, VariableParityObject,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,11 @@ pub(crate) enum VolumeInterruption {
     GarbageReceiptRetired,
     AttemptObjectActivated,
     CodingUploadReceiptStored,
+    VariableMigrationIntentStored,
+    VariableMigrationDestinationReady,
+    VariableMigrationReceiptStored,
+    VariableMigrationSourceRemoved,
+    VariableMigrationIntentRetired,
 }
 
 #[cfg(test)]
@@ -176,6 +181,81 @@ struct AttemptVolumeRecord {
     format_version: u16,
     attempt_id: [u8; 16],
     receipt: VolumeReceipt,
+}
+
+const VARIABLE_MIGRATION_KIND: &str = "volume-variable-migration-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct VariableVolumeMigration {
+    format_version: u16,
+    source_volume_id: Uuid,
+    destination: VolumeReceipt,
+    attempt_id: [u8; 16],
+    verification_hash: [u8; 32],
+    commitment: MerkleCommitment,
+    staged_receipt_hash: [u8; 32],
+    destination_attempt_id: [u8; 16],
+    destination_receipt_hash: [u8; 32],
+    cancelled: bool,
+}
+
+fn validate_variable_migration(record_id: &[u8], intent: &VariableVolumeMigration) -> Result<()> {
+    validate_receipt(&intent.destination)?;
+    validate_volume_object_record_id(record_id, &intent.destination)?;
+    intent.commitment.validate()?;
+    if intent.format_version != 1
+        || intent.destination.format_version != 2
+        || intent.source_volume_id.is_nil()
+        || intent.source_volume_id == intent.destination.volume_id
+        || intent.attempt_id == [0; 16]
+        || intent.verification_hash == [0; 32]
+        || intent.commitment.root != intent.destination.root
+        || intent.staged_receipt_hash == [0; 32]
+        || intent.destination_attempt_id == [0; 16]
+        || intent.destination_receipt_hash == [0; 32]
+        || intent.commitment.byte_len > mb_core::MAX_PROFILE_SHARD_SIZE
+    {
+        bail!("invalid variable volume migration intent");
+    }
+    Ok(())
+}
+
+fn ensure_variable_migration_source(
+    intent: &VariableVolumeMigration,
+    ready: &ReadyVariableObject,
+) -> Result<()> {
+    let object = &ready.object;
+    if object.format_version != 2
+        || object.guild_id != intent.destination.guild_id
+        || object.group_id != intent.destination.group_id
+        || object.shard_index != u16::from(intent.destination.shard_index)
+        || object.commitment != intent.commitment
+        || ready.attempt_id != intent.attempt_id
+        || ready.verification_hash != intent.verification_hash
+        || *blake3::hash(&ready.staged_receipt).as_bytes() != intent.staged_receipt_hash
+    {
+        bail!("variable migration object conflicts with its durable intent");
+    }
+    Ok(())
+}
+
+fn ensure_variable_migration_destination(
+    intent: &VariableVolumeMigration,
+    ready: &ReadyVariableObject,
+) -> Result<()> {
+    let object = &ready.object;
+    if object.format_version != 2
+        || object.guild_id != intent.destination.guild_id
+        || object.group_id != intent.destination.group_id
+        || object.shard_index != u16::from(intent.destination.shard_index)
+        || object.commitment != intent.commitment
+        || ready.attempt_id != intent.destination_attempt_id
+        || ready.verification_hash != intent.verification_hash
+        || *blake3::hash(&ready.staged_receipt).as_bytes() != intent.destination_receipt_hash
+    {
+        bail!("variable migration destination conflicts with its durable evidence");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -673,6 +753,7 @@ impl StorageVolumes {
         attempt: Option<(&[u8; 16], &[u8; 32])>,
     ) -> Result<bool> {
         let record_id = volume_object_id(group_id, shard_index);
+        self.cancel_variable_migration_for_gc(control, &record_id, root, attempt)?;
         let receipt_volume = self
             .receipt(control, group_id, shard_index)?
             .map(|receipt| receipt.volume_id);
@@ -734,10 +815,11 @@ impl StorageVolumes {
                     };
                     let key = attempt_volume_object_id(&stored_attempt, group_id, shard_index);
                     let bytes = canonical_bytes(&retirement)?;
+                    // Migration may temporarily hold this attempt on two disks.
+                    // Keep one retirement record until every tracked copy is gone.
                     if let Some(existing) = control.get_record("volume-attempt-retirement", &key)? {
                         let existing: AttemptRetirement = decode_canonical(&existing)?;
-                        if existing.volume_id != retirement.volume_id
-                            || existing.attempt_id != retirement.attempt_id
+                        if existing.attempt_id != retirement.attempt_id
                             || existing.group_id != retirement.group_id
                             || existing.shard_index != retirement.shard_index
                             || existing.cleanup_verification_hash.is_some()
@@ -767,8 +849,7 @@ impl StorageVolumes {
                 let bytes = canonical_bytes(&retirement)?;
                 if let Some(existing) = control.get_record("volume-attempt-retirement", &key)? {
                     let existing: AttemptRetirement = decode_canonical(&existing)?;
-                    if existing.volume_id != retirement.volume_id
-                        || existing.attempt_id != retirement.attempt_id
+                    if existing.attempt_id != retirement.attempt_id
                         || existing.group_id != retirement.group_id
                         || existing.shard_index != retirement.shard_index
                     {
@@ -801,6 +882,19 @@ impl StorageVolumes {
             control.delete_record("volume-receipt", &record_id)?;
             control.delete_record("volume-write-intent", &record_id)?;
             volume_interruption(VolumeInterruption::GarbageReceiptRetired)?;
+        }
+        if complete
+            && cleanup_volumes.is_empty()
+            && let Some(bytes) = control.get_record(VARIABLE_MIGRATION_KIND, &record_id)?
+        {
+            let intent: VariableVolumeMigration = decode_canonical(&bytes)?;
+            validate_variable_migration(&record_id, &intent)?;
+            if intent.cancelled
+                && intent.destination.root == *root
+                && attempt.is_none_or(|(_, hash)| *hash == intent.verification_hash)
+            {
+                control.delete_record_if_value(VARIABLE_MIGRATION_KIND, &record_id, &bytes)?;
+            }
         }
         // A newer READY copy does not make an old active receipt valid. Keep
         // the holder cleanup obligation until activation publishes that copy's
@@ -1348,6 +1442,42 @@ impl StorageVolumes {
                 complete = false;
                 continue;
             }
+            let object_id = volume_object_id(group_id, shard_index);
+            let migration = control
+                .get_record(VARIABLE_MIGRATION_KIND, &object_id)?
+                .map(|bytes| -> Result<VariableVolumeMigration> {
+                    let intent = decode_canonical(&bytes)?;
+                    validate_variable_migration(&object_id, &intent)?;
+                    Ok(intent)
+                })
+                .transpose()?;
+            let mut copies_remain = false;
+            for (id, volume) in &self.volumes {
+                match volume.store.as_ref() {
+                    Some(store) => {
+                        if store
+                            .object_attempt_state(group_id, shard_index)?
+                            .is_some_and(|state| state.attempt_id == Some(retirement.attempt_id))
+                        {
+                            copies_remain = true;
+                        }
+                    }
+                    None if migration.as_ref().is_some_and(|intent| {
+                        (*id == intent.source_volume_id
+                            && intent.attempt_id == retirement.attempt_id)
+                            || (*id == intent.destination.volume_id
+                                && intent.destination_attempt_id == retirement.attempt_id)
+                    }) =>
+                    {
+                        copies_remain = true
+                    }
+                    None => {}
+                }
+            }
+            if copies_remain {
+                complete = false;
+                continue;
+            }
             self.finalize_attempt_object(control, &retirement.attempt_id, group_id, shard_index)?;
             control.delete_record("volume-attempt-retirement", &key)?;
         }
@@ -1361,6 +1491,24 @@ impl StorageVolumes {
         preserve_ready: &BTreeSet<([u8; 32], u16)>,
     ) -> Result<bool> {
         let mut required_volumes = BTreeSet::new();
+        let mut cancelled_migrations = Vec::new();
+        for (id, bytes) in control.records(VARIABLE_MIGRATION_KIND)? {
+            let mut intent: VariableVolumeMigration = decode_canonical(&bytes)?;
+            validate_variable_migration(&id, &intent)?;
+            if intent.attempt_id != *attempt_id
+                || preserve_ready.contains(&(
+                    intent.destination.group_id,
+                    u16::from(intent.destination.shard_index),
+                ))
+            {
+                continue;
+            }
+            intent.cancelled = true;
+            control.put_record(VARIABLE_MIGRATION_KIND, &id, &canonical_bytes(&intent)?)?;
+            required_volumes.insert(intent.source_volume_id);
+            required_volumes.insert(intent.destination.volume_id);
+            cancelled_migrations.push((id, intent));
+        }
         let mut attempt_records = Vec::new();
         for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
             for (record_id, bytes) in control.records(kind)? {
@@ -1432,6 +1580,17 @@ impl StorageVolumes {
                 .is_some()
             {
                 control.delete_record("volume-attempt-reservation", &record_id)?;
+            }
+        }
+        if complete {
+            for (id, intent) in cancelled_migrations {
+                control.delete_record_if_value(
+                    VARIABLE_MIGRATION_KIND,
+                    &id,
+                    &canonical_bytes(&intent)?,
+                )?;
+                self.remove_cleanup_volume(control, &id, intent.source_volume_id)?;
+                self.remove_cleanup_volume(control, &id, intent.destination.volume_id)?;
             }
         }
         Ok(complete)
@@ -1651,6 +1810,23 @@ impl StorageVolumes {
     }
 
     pub(crate) fn reconcile(&mut self, control: &ControlStore) -> Result<()> {
+        for (record_id, bytes) in control.records(VARIABLE_MIGRATION_KIND)? {
+            let intent: VariableVolumeMigration = decode_canonical(&bytes)?;
+            validate_variable_migration(&record_id, &intent)?;
+            if intent.cancelled {
+                continue;
+            }
+            let result = self.resume_variable_migration(control, &record_id, &intent);
+            if let Some(source) = self.volumes.get_mut(&intent.source_volume_id) {
+                source.record.last_error = match result {
+                    Ok(true) => None,
+                    Ok(false) => {
+                        Some("variable migration is waiting for an unavailable volume".to_owned())
+                    }
+                    Err(error) => Some(truncated_error(&error)),
+                };
+            }
+        }
         for (record_id, bytes) in control.records("volume-write-intent")? {
             let intent: VolumeWriteIntent = decode_canonical(&bytes)?;
             validate_receipt(&intent.receipt)?;
@@ -1830,6 +2006,35 @@ impl StorageVolumes {
                 volume_interruption(VolumeInterruption::MigrationReceiptStored)?;
                 moved += 1;
             }
+            for (id, bytes) in control.records(VARIABLE_MIGRATION_KIND)? {
+                let intent: VariableVolumeMigration = decode_canonical(&bytes)?;
+                validate_variable_migration(&id, &intent)?;
+                if intent.source_volume_id == source_id {
+                    if !self.resume_variable_migration(control, &id, &intent)? {
+                        bail!(
+                            "variable migration is waiting for an unavailable volume; source remains draining"
+                        );
+                    }
+                    moved += 1;
+                }
+            }
+            loop {
+                let object = self
+                    .volumes
+                    .get(&source_id)
+                    .and_then(|volume| volume.store.as_ref())
+                    .context("draining volume became unavailable")?
+                    .first_ready_variable_object()?;
+                let Some(object) = object else {
+                    break;
+                };
+                if !self.migrate_variable_object(control, source_id, &object)? {
+                    bail!(
+                        "variable migration is waiting for an unavailable volume; source remains draining"
+                    );
+                }
+                moved += 1;
+            }
             let remaining = self
                 .volumes
                 .get(&source_id)
@@ -1841,16 +2046,384 @@ impl StorageVolumes {
                     "draining volume still contains {remaining} variable-profile objects or reservations"
                 );
             }
+            self.ensure_no_attempt_volume_obligations(control, source_id)?;
             self.settle_empty_volume_location_evidence(control, source_id)?;
             let source = self.volumes.get_mut(&source_id).expect("source exists");
             source.record.configured = false;
             source.record.state = StorageVolumeState::Retired;
             source.record.last_error = Some("drain completed; safe to remove volume".to_owned());
             source.store = None;
+            self.persist(control)?;
+            volume_interruption(VolumeInterruption::MigrationStateStored)?;
         }
-        self.persist(control)?;
-        volume_interruption(VolumeInterruption::MigrationStateStored)?;
         Ok(moved)
+    }
+
+    fn migrate_variable_object(
+        &mut self,
+        control: &ControlStore,
+        source_id: Uuid,
+        ready: &ReadyVariableObject,
+    ) -> Result<bool> {
+        let object = &ready.object;
+        let shard = u8::try_from(object.shard_index).context("invalid variable shard index")?;
+        let record_id = volume_object_id(&object.group_id, shard);
+        let intent = if let Some(bytes) = control.get_record(VARIABLE_MIGRATION_KIND, &record_id)? {
+            let intent: VariableVolumeMigration = decode_canonical(&bytes)?;
+            validate_variable_migration(&record_id, &intent)?;
+            ensure_variable_migration_source(&intent, ready)?;
+            if intent.source_volume_id != source_id {
+                bail!("variable migration is already owned by another source volume");
+            }
+            intent
+        } else {
+            let active = self
+                .receipt(control, &object.group_id, shard)?
+                .context("variable migration requires an active volume receipt")?;
+            if active.format_version != 2
+                || active.guild_id != object.guild_id
+                || active.root != object.commitment.root
+            {
+                bail!("variable migration source conflicts with its active receipt");
+            }
+            let destination = if active.volume_id != source_id {
+                active.clone()
+            } else {
+                let physical =
+                    physical_write_reservation(object.bytes.len(), ready.staged_receipt.len());
+                let destination_id = self
+                    .volumes
+                    .iter()
+                    .filter_map(|(id, volume)| {
+                        if *id == source_id || volume.record.state != StorageVolumeState::Online {
+                            return None;
+                        }
+                        let store = volume.store.as_ref()?;
+                        let used = store.used_bytes().ok()?;
+                        let writable = volume
+                            .record
+                            .budget_bytes
+                            .saturating_sub(volume.record.headroom_bytes);
+                        let available = fs2::available_space(&volume.record.path).ok()?;
+                        let physical = physical
+                            .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
+                        (used.saturating_add(object.bytes.len() as u64) <= writable
+                            && physical <= available.saturating_sub(volume.record.headroom_bytes))
+                        .then_some((*id, used))
+                    })
+                    .min_by_key(|(id, used)| (*used, *id))
+                    .map(|(id, _)| id)
+                    .ok_or(DatabaseError::CapacityExceeded)?;
+                VolumeReceipt {
+                    volume_id: destination_id,
+                    ..active.clone()
+                }
+            };
+            let destination_ready = if destination.volume_id != active.volume_id
+                || active.volume_id == source_id
+            {
+                ready.clone()
+            } else {
+                let repaired = self
+                    .volumes
+                    .get(&destination.volume_id)
+                    .and_then(|volume| volume.store.as_ref())
+                    .context("authoritative variable migration destination is offline")?
+                    .load_ready_variable_object(&object.group_id, object.shard_index)?;
+                if repaired.object != *object
+                    || repaired.verification_hash != ready.verification_hash
+                {
+                    bail!("authoritative variable migration destination conflicts with its source");
+                }
+                repaired
+            };
+            if destination_ready.attempt_id != ready.attempt_id {
+                let attempt_key =
+                    attempt_volume_object_id(&ready.attempt_id, &object.group_id, shard);
+                for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
+                    if control.get_record(kind, &attempt_key)?.is_some() {
+                        bail!(
+                            "finalize the original attempt before evacuating to a repaired destination"
+                        );
+                    }
+                }
+            }
+            let intent = VariableVolumeMigration {
+                format_version: 1,
+                source_volume_id: source_id,
+                destination,
+                attempt_id: ready.attempt_id,
+                verification_hash: ready.verification_hash,
+                commitment: object.commitment.clone(),
+                staged_receipt_hash: *blake3::hash(&ready.staged_receipt).as_bytes(),
+                destination_attempt_id: destination_ready.attempt_id,
+                destination_receipt_hash: *blake3::hash(&destination_ready.staged_receipt)
+                    .as_bytes(),
+                cancelled: false,
+            };
+            validate_variable_migration(&record_id, &intent)?;
+            let mut cleanup = self.cleanup_volumes(control, &object.group_id, shard)?;
+            cleanup.insert(source_id);
+            cleanup.insert(intent.destination.volume_id);
+            control.put_records_and_delete(
+                &[
+                    (
+                        VARIABLE_MIGRATION_KIND.to_owned(),
+                        record_id.clone(),
+                        canonical_bytes(&intent)?,
+                    ),
+                    (
+                        "volume-copy-cleanup".to_owned(),
+                        record_id.clone(),
+                        canonical_bytes(&cleanup.into_iter().collect::<Vec<_>>())?,
+                    ),
+                ],
+                &[],
+            )?;
+            volume_interruption(VolumeInterruption::VariableMigrationIntentStored)?;
+            intent
+        };
+        self.resume_variable_migration(control, &record_id, &intent)
+    }
+
+    fn resume_variable_migration(
+        &mut self,
+        control: &ControlStore,
+        record_id: &[u8],
+        intent: &VariableVolumeMigration,
+    ) -> Result<bool> {
+        validate_variable_migration(record_id, intent)?;
+        if intent.cancelled {
+            bail!("cancelled variable migration is awaiting garbage or abort cleanup");
+        }
+        let destination_id = intent.destination.volume_id;
+        let group = &intent.destination.group_id;
+        let shard = intent.destination.shard_index;
+        let active = self
+            .receipt(control, group, shard)?
+            .context("variable migration active receipt is unavailable")?;
+        if active != intent.destination
+            && active
+                != (VolumeReceipt {
+                    volume_id: intent.source_volume_id,
+                    ..intent.destination.clone()
+                })
+        {
+            bail!("variable migration conflicts with changed active ownership");
+        }
+        let Some(destination) = self
+            .volumes
+            .get(&destination_id)
+            .and_then(|volume| volume.store.as_ref())
+        else {
+            return Ok(false);
+        };
+        let ready = match destination.load_ready_variable_object(group, shard.into()) {
+            Ok(ready) => {
+                ensure_variable_migration_destination(intent, &ready)?;
+                ready
+            }
+            Err(DatabaseError::NotReady) => {
+                let Some(source) = self
+                    .volumes
+                    .get(&intent.source_volume_id)
+                    .and_then(|volume| volume.store.as_ref())
+                else {
+                    return Ok(false);
+                };
+                let ready = source.load_ready_variable_object(group, shard.into())?;
+                ensure_variable_migration_source(intent, &ready)?;
+                let volume = self
+                    .volumes
+                    .get_mut(&destination_id)
+                    .expect("destination checked");
+                if volume.record.state != StorageVolumeState::Online {
+                    bail!("variable migration destination is no longer online");
+                }
+                let store = volume.store.as_mut().expect("destination checked");
+                let physical = physical_write_reservation(
+                    ready.object.bytes.len(),
+                    ready.staged_receipt.len(),
+                )
+                .saturating_add(shared_checkpoint_reservation(control, store)?);
+                let available = fs2::available_space(&volume.record.path)?;
+                if physical > available.saturating_sub(volume.record.headroom_bytes) {
+                    bail!("variable migration destination has insufficient physical headroom");
+                }
+                store.copy_ready_variable_object(
+                    &ready,
+                    volume
+                        .record
+                        .budget_bytes
+                        .saturating_sub(volume.record.headroom_bytes),
+                )?;
+                let stored = store.load_ready_variable_object(group, shard.into())?;
+                if stored != ready {
+                    bail!("variable migration destination verification failed");
+                }
+                ready
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure_variable_migration_destination(intent, &ready)?;
+        volume_interruption(VolumeInterruption::VariableMigrationDestinationReady)?;
+        if let Some(source) = self
+            .volumes
+            .get(&intent.source_volume_id)
+            .and_then(|volume| volume.store.as_ref())
+            && let Some(state) = source.object_attempt_state(group, shard)?
+            && (!state.ready
+                || state.attempt_id != Some(intent.attempt_id)
+                || state.verification_hash != Some(intent.verification_hash))
+        {
+            bail!("variable migration source was replaced by another attempt");
+        }
+        // Pending coding operations must follow the copy before source cleanup.
+        let attempt_key = attempt_volume_object_id(&intent.attempt_id, group, shard);
+        let mut publish = vec![(
+            "volume-receipt".to_owned(),
+            record_id.to_vec(),
+            canonical_bytes(&intent.destination)?,
+        )];
+        for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
+            if let Some(bytes) = control.get_record(kind, &attempt_key)? {
+                let mut record: AttemptVolumeRecord = decode_canonical(&bytes)?;
+                validate_attempt_volume_record(&record)?;
+                if record.attempt_id != intent.attempt_id
+                    || record.receipt.guild_id != intent.destination.guild_id
+                    || record.receipt.group_id != *group
+                    || record.receipt.shard_index != shard
+                    || record.receipt.root != intent.destination.root
+                    || ![intent.source_volume_id, destination_id]
+                        .contains(&record.receipt.volume_id)
+                {
+                    bail!("variable migration conflicts with a pending attempt receipt");
+                }
+                record.receipt = intent.destination.clone();
+                publish.push((
+                    kind.to_owned(),
+                    attempt_key.clone(),
+                    canonical_bytes(&record)?,
+                ));
+            }
+        }
+        let reservation_key = attempt_reservation_id(&intent.attempt_id, shard);
+        let mut retire = Vec::new();
+        if let Some(bytes) = control.get_record("volume-attempt-reservation", &reservation_key)? {
+            let reservation: AttemptReservationRecord = decode_canonical(&bytes)?;
+            validate_attempt_reservation_record(&reservation)?;
+            if reservation.attempt_id != intent.attempt_id
+                || reservation.volume_id != intent.source_volume_id
+                || reservation.guild_id != intent.destination.guild_id
+                || reservation.shard_index != shard
+                || reservation.byte_length != intent.commitment.byte_len
+            {
+                bail!("variable migration conflicts with a pending reservation");
+            }
+            retire.push(("volume-attempt-reservation".to_owned(), reservation_key));
+        }
+        if let Some(source) = self
+            .volumes
+            .get_mut(&intent.source_volume_id)
+            .and_then(|volume| volume.store.as_mut())
+        {
+            if source.object_attempt_state(group, shard)?.is_some() {
+                source.finish_coding_attempt_upload(
+                    &intent.attempt_id,
+                    group,
+                    shard.into(),
+                    &intent.commitment,
+                )?;
+            }
+        } else if !retire.is_empty() {
+            return Ok(false);
+        }
+        control.put_records_and_delete(&publish, &retire)?;
+        volume_interruption(VolumeInterruption::VariableMigrationReceiptStored)?;
+        let Some(source) = self
+            .volumes
+            .get_mut(&intent.source_volume_id)
+            .and_then(|volume| volume.store.as_mut())
+        else {
+            return Ok(false);
+        };
+        source.remove_ready_variable_object(
+            group,
+            shard.into(),
+            &intent.destination.root,
+            &intent.attempt_id,
+            &intent.verification_hash,
+        )?;
+        volume_interruption(VolumeInterruption::VariableMigrationSourceRemoved)?;
+        let mut cleanup = self.cleanup_volumes(control, group, shard)?;
+        cleanup.remove(&intent.source_volume_id);
+        cleanup.remove(&destination_id);
+        let replacements = if cleanup.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                "volume-copy-cleanup".to_owned(),
+                record_id.to_vec(),
+                canonical_bytes(&cleanup.into_iter().collect::<Vec<_>>())?,
+            )]
+        };
+        let deletes = if replacements.is_empty() {
+            vec![("volume-copy-cleanup".to_owned(), record_id.to_vec())]
+        } else {
+            Vec::new()
+        };
+        control.put_records_and_retire_and_delete_if_value(
+            &replacements,
+            &deletes,
+            VARIABLE_MIGRATION_KIND,
+            record_id,
+            &canonical_bytes(intent)?,
+        )?;
+        volume_interruption(VolumeInterruption::VariableMigrationIntentRetired)?;
+        Ok(true)
+    }
+
+    fn cancel_variable_migration_for_gc(
+        &self,
+        control: &ControlStore,
+        record_id: &[u8],
+        root: &[u8; 32],
+        attempt: Option<(&[u8; 16], &[u8; 32])>,
+    ) -> Result<()> {
+        let Some(bytes) = control.get_record(VARIABLE_MIGRATION_KIND, record_id)? else {
+            return Ok(());
+        };
+        let mut intent: VariableVolumeMigration = decode_canonical(&bytes)?;
+        validate_variable_migration(record_id, &intent)?;
+        if intent.destination.root != *root
+            || attempt.is_some_and(|(_, hash)| *hash != intent.verification_hash)
+        {
+            return Ok(());
+        }
+        let mut cleanup = self.cleanup_volumes(
+            control,
+            &intent.destination.group_id,
+            intent.destination.shard_index,
+        )?;
+        cleanup.insert(intent.source_volume_id);
+        cleanup.insert(intent.destination.volume_id);
+        intent.cancelled = true;
+        control.put_records_and_delete(
+            &[
+                (
+                    "volume-copy-cleanup".to_owned(),
+                    record_id.to_vec(),
+                    canonical_bytes(&cleanup.into_iter().collect::<Vec<_>>())?,
+                ),
+                (
+                    VARIABLE_MIGRATION_KIND.to_owned(),
+                    record_id.to_vec(),
+                    canonical_bytes(&intent)?,
+                ),
+            ],
+            &[],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn reactivate(&mut self, control: &ControlStore, volume_id: Uuid) -> Result<()> {
@@ -1956,6 +2529,36 @@ impl StorageVolumes {
                 record_id,
                 &canonical_bytes(&volumes.iter().copied().collect::<Vec<_>>())?,
             )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_no_attempt_volume_obligations(
+        &self,
+        control: &ControlStore,
+        volume_id: Uuid,
+    ) -> Result<()> {
+        for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
+            for (_, bytes) in control.records(kind)? {
+                let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
+                validate_attempt_volume_record(&record)?;
+                if record.receipt.volume_id == volume_id {
+                    bail!("draining volume still owns a pending coding attempt");
+                }
+            }
+        }
+        for (_, bytes) in control.records("volume-attempt-reservation")? {
+            let record: AttemptReservationRecord = decode_canonical(&bytes)?;
+            validate_attempt_reservation_record(&record)?;
+            if record.volume_id == volume_id {
+                bail!("draining volume still owns a coding reservation");
+            }
+        }
+        for (_, bytes) in control.records("volume-attempt-retirement")? {
+            let record: AttemptRetirement = decode_canonical(&bytes)?;
+            if record.volume_id == volume_id {
+                bail!("draining volume still owns attempt retirement evidence");
+            }
         }
         Ok(())
     }
@@ -4744,8 +5347,1114 @@ mod tests {
         );
     }
 
+    struct VariableDrainFixture {
+        data: TempDir,
+        source: TempDir,
+        destination: TempDir,
+        keys: Arc<KeyMaterial>,
+        control: ControlStore,
+        volumes: StorageVolumes,
+        object: VariableParityObject,
+        source_receipt: VolumeReceipt,
+        attempt: [u8; 16],
+        verification: [u8; 32],
+    }
+
+    impl VariableDrainFixture {
+        fn new(shard: u16) -> Self {
+            let data = TempDir::new().unwrap();
+            let source = TempDir::new().unwrap();
+            let destination = TempDir::new().unwrap();
+            let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([211; 32])));
+            let attempt = [212; 16];
+            let verification = [213; 32];
+            let bytes = vec![214; 64];
+            let object = VariableParityObject {
+                format_version: 2,
+                guild_id: [215; 32],
+                group_id: [216; 32],
+                shard_index: shard,
+                commitment: mb_core::merkle_commit(&bytes).unwrap(),
+                bytes,
+            };
+            let (control, _) = open_control_store(data.path(), &keys).unwrap();
+            let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+            volumes
+                .configure(&control, &[source.path().to_path_buf()], 1024, 0)
+                .unwrap();
+            let source_receipt = volumes
+                .stage_attempt(&control, &attempt, &object, b"signed original receipt")
+                .unwrap();
+            volumes
+                .activate_attempt_object(
+                    &control,
+                    &attempt,
+                    &object.group_id,
+                    shard,
+                    &object.commitment,
+                    &verification,
+                )
+                .unwrap();
+            volumes
+                .configure(
+                    &control,
+                    &[
+                        source.path().to_path_buf(),
+                        destination.path().to_path_buf(),
+                    ],
+                    1024,
+                    0,
+                )
+                .unwrap();
+            volumes
+                .mark_draining(&control, source_receipt.volume_id)
+                .unwrap();
+            Self {
+                data,
+                source,
+                destination,
+                keys,
+                control,
+                volumes,
+                object,
+                source_receipt,
+                attempt,
+                verification,
+            }
+        }
+
+        fn destination_id(&self) -> Uuid {
+            self.volumes
+                .volumes
+                .values()
+                .find(|v| v.record.path == self.destination.path())
+                .unwrap()
+                .record
+                .volume_id
+        }
+
+        fn reopen(self) -> Self {
+            let Self {
+                data,
+                source,
+                destination,
+                keys,
+                control,
+                volumes,
+                object,
+                source_receipt,
+                attempt,
+                verification,
+            } = self;
+            drop(volumes);
+            drop(control);
+            let (control, _) = open_control_store(data.path(), &keys).unwrap();
+            let volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+            Self {
+                data,
+                source,
+                destination,
+                keys,
+                control,
+                volumes,
+                object,
+                source_receipt,
+                attempt,
+                verification,
+            }
+        }
+
+        fn assert_readable(&self) {
+            assert_eq!(
+                self.volumes
+                    .load_ready_variable(
+                        &self.control,
+                        &self.object.group_id,
+                        self.object.shard_index
+                    )
+                    .unwrap(),
+                self.object
+            );
+        }
+    }
+
     #[test]
-    fn draining_volume_with_variable_ready_shard_keeps_receipt_and_source() {
+    fn variable_migration_converges_after_every_publication_boundary() {
+        for shard in [0, 4] {
+            for point in [
+                VolumeInterruption::VariableMigrationIntentStored,
+                VolumeInterruption::VariableMigrationDestinationReady,
+                VolumeInterruption::VariableMigrationReceiptStored,
+                VolumeInterruption::VariableMigrationSourceRemoved,
+                VolumeInterruption::VariableMigrationIntentRetired,
+                VolumeInterruption::MigrationStateStored,
+            ] {
+                let mut f = VariableDrainFixture::new(shard);
+                let original = f.volumes.volumes[&f.source_receipt.volume_id]
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .load_ready_variable_object(&f.object.group_id, shard)
+                    .unwrap();
+                interrupt_next_volume_transition(point);
+                assert!(
+                    f.volumes
+                        .migrate_draining(&f.control)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("injected interruption"),
+                    "{point:?}"
+                );
+                f.assert_readable();
+                f = f.reopen();
+                f.volumes.reconcile(&f.control).unwrap();
+                f.volumes.migrate_draining(&f.control).unwrap();
+                f.assert_readable();
+                assert_eq!(
+                    f.volumes.volumes[&f.source_receipt.volume_id].record.state,
+                    StorageVolumeState::Retired
+                );
+                let receipt = f
+                    .volumes
+                    .receipt(&f.control, &f.object.group_id, shard as u8)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(receipt.volume_id, f.source_receipt.volume_id);
+                assert_eq!(
+                    f.volumes.volumes[&receipt.volume_id]
+                        .store
+                        .as_ref()
+                        .unwrap()
+                        .load_ready_variable_object(&f.object.group_id, shard)
+                        .unwrap(),
+                    original
+                );
+                assert!(
+                    f.control
+                        .records(VARIABLE_MIGRATION_KIND)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(f.control.records("volume-copy-cleanup").unwrap().is_empty());
+                let pending: AttemptVolumeRecord = decode_canonical(
+                    &f.control
+                        .get_record(
+                            "volume-attempt-receipt",
+                            &attempt_volume_object_id(&f.attempt, &f.object.group_id, shard as u8),
+                        )
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(pending.receipt, receipt);
+                f.volumes.finalize_attempt(&f.control, &f.attempt).unwrap();
+                fs::remove_dir_all(f.source.path()).unwrap();
+                f = f.reopen();
+                f.assert_readable();
+            }
+        }
+    }
+
+    #[test]
+    fn variable_migration_preserves_source_when_destination_is_full_or_offline() {
+        for offline in [false, true] {
+            let mut f = VariableDrainFixture::new(4);
+            let id = f.destination_id();
+            if offline {
+                f.volumes.volumes.get_mut(&id).unwrap().store = None;
+            } else {
+                f.volumes
+                    .volumes
+                    .get_mut(&id)
+                    .unwrap()
+                    .store
+                    .as_mut()
+                    .unwrap()
+                    .reserve_coding_attempt(&[217; 16], &f.object.guild_id, 9, 1024, 1024)
+                    .unwrap();
+            }
+            assert!(f.volumes.migrate_draining(&f.control).is_err());
+            f.assert_readable();
+            assert_eq!(
+                f.volumes
+                    .receipt(&f.control, &f.object.group_id, 4)
+                    .unwrap(),
+                Some(f.source_receipt.clone())
+            );
+            assert!(
+                f.control
+                    .records(VARIABLE_MIGRATION_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+            if !offline {
+                f = f.reopen();
+                assert!(f.volumes.migrate_draining(&f.control).is_err());
+                f.assert_readable();
+                f.volumes
+                    .volumes
+                    .get_mut(&id)
+                    .unwrap()
+                    .store
+                    .as_mut()
+                    .unwrap()
+                    .discard_uncommitted_attempt(&[217; 16])
+                    .unwrap();
+                assert_eq!(f.volumes.migrate_draining(&f.control).unwrap(), 1);
+                f.assert_readable();
+            }
+        }
+    }
+
+    #[test]
+    fn variable_migration_gc_cancels_each_boundary_without_resurrection() {
+        for point in [
+            VolumeInterruption::VariableMigrationIntentStored,
+            VolumeInterruption::VariableMigrationDestinationReady,
+            VolumeInterruption::VariableMigrationReceiptStored,
+            VolumeInterruption::VariableMigrationSourceRemoved,
+        ] {
+            let mut f = VariableDrainFixture::new(4);
+            interrupt_next_volume_transition(point);
+            assert!(f.volumes.migrate_draining(&f.control).is_err());
+            assert!(
+                f.volumes
+                    .remove_unreachable_for_attempt(
+                        &f.control,
+                        &f.attempt,
+                        &f.verification,
+                        &f.object.group_id,
+                        4,
+                        &f.object.commitment.root
+                    )
+                    .unwrap(),
+                "{point:?}"
+            );
+            f = f.reopen();
+            f.volumes.reconcile(&f.control).unwrap();
+            f.volumes.migrate_draining(&f.control).unwrap();
+            assert!(
+                f.volumes
+                    .load_ready_variable(&f.control, &f.object.group_id, 4)
+                    .is_err()
+            );
+            assert!(
+                f.control
+                    .records(VARIABLE_MIGRATION_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(f.control.records("volume-copy-cleanup").unwrap().is_empty());
+            assert!(
+                f.control
+                    .records("volume-attempt-retirement")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                f.control
+                    .records("volume-attempt-receipt")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn variable_migration_abort_cancels_copies_and_preserves_information() {
+        for preserve in [false, true] {
+            for point in [
+                VolumeInterruption::VariableMigrationIntentStored,
+                VolumeInterruption::VariableMigrationDestinationReady,
+                VolumeInterruption::VariableMigrationReceiptStored,
+                VolumeInterruption::VariableMigrationSourceRemoved,
+            ] {
+                let mut f = VariableDrainFixture::new(0);
+                interrupt_next_volume_transition(point);
+                assert!(f.volumes.migrate_draining(&f.control).is_err());
+                let retained = if preserve {
+                    BTreeSet::from([(f.object.group_id, 0)])
+                } else {
+                    BTreeSet::new()
+                };
+                assert!(
+                    f.volumes
+                        .discard_attempt(&f.control, &f.attempt, &retained)
+                        .unwrap()
+                );
+                f = f.reopen();
+                f.volumes.reconcile(&f.control).unwrap();
+                f.volumes.migrate_draining(&f.control).unwrap();
+                assert!(
+                    f.control
+                        .records(VARIABLE_MIGRATION_KIND)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(f.control.records("volume-copy-cleanup").unwrap().is_empty());
+                if preserve {
+                    f.assert_readable();
+                } else {
+                    assert!(
+                        f.volumes
+                            .load_ready_variable(&f.control, &f.object.group_id, 0)
+                            .is_err()
+                    );
+                    assert!(f.control.records("volume-receipt").unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn variable_migration_reuses_authoritative_repair_without_replacing_its_evidence() {
+        let mut f = VariableDrainFixture::new(4);
+        f.volumes.finalize_attempt(&f.control, &f.attempt).unwrap();
+        let repair = [218; 16];
+        let destination = f
+            .volumes
+            .stage_attempt(&f.control, &repair, &f.object, b"new repaired receipt")
+            .unwrap();
+        f.volumes
+            .activate_attempt_object(
+                &f.control,
+                &repair,
+                &f.object.group_id,
+                4,
+                &f.object.commitment,
+                &f.verification,
+            )
+            .unwrap();
+        f.volumes.finalize_attempt(&f.control, &repair).unwrap();
+        let original = f.volumes.volumes[&destination.volume_id]
+            .store
+            .as_ref()
+            .unwrap()
+            .load_ready_variable_object(&f.object.group_id, 4)
+            .unwrap();
+        f.volumes
+            .volumes
+            .get_mut(&destination.volume_id)
+            .unwrap()
+            .record
+            .budget_bytes = 64;
+        assert_eq!(f.volumes.migrate_draining(&f.control).unwrap(), 1);
+        assert_eq!(
+            f.volumes
+                .receipt(&f.control, &f.object.group_id, 4)
+                .unwrap(),
+            Some(destination.clone())
+        );
+        assert_eq!(
+            f.volumes.volumes[&destination.volume_id]
+                .store
+                .as_ref()
+                .unwrap()
+                .load_ready_variable_object(&f.object.group_id, 4)
+                .unwrap(),
+            original
+        );
+        f = f.reopen();
+        f.assert_readable();
+    }
+
+    #[test]
+    fn variable_migration_cancelled_offline_copy_remains_owned_until_reopen_cleanup() {
+        for garbage in [false, true] {
+            for source_offline in [false, true] {
+                let mut f = VariableDrainFixture::new(4);
+                interrupt_next_volume_transition(
+                    VolumeInterruption::VariableMigrationDestinationReady,
+                );
+                assert!(f.volumes.migrate_draining(&f.control).is_err());
+                let offline = if source_offline {
+                    f.source_receipt.volume_id
+                } else {
+                    f.destination_id()
+                };
+                f.volumes.volumes.get_mut(&offline).unwrap().store = None;
+                if garbage {
+                    assert!(
+                        !f.volumes
+                            .remove_unreachable_for_attempt(
+                                &f.control,
+                                &f.attempt,
+                                &f.verification,
+                                &f.object.group_id,
+                                4,
+                                &f.object.commitment.root
+                            )
+                            .unwrap()
+                    );
+                } else {
+                    assert!(
+                        !f.volumes
+                            .discard_attempt(&f.control, &f.attempt, &BTreeSet::new())
+                            .unwrap()
+                    );
+                }
+                let record = f
+                    .control
+                    .records(VARIABLE_MIGRATION_KIND)
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                let intent: VariableVolumeMigration = decode_canonical(&record.1).unwrap();
+                assert!(intent.cancelled);
+                f = f.reopen();
+                f.volumes.reconcile(&f.control).unwrap();
+                assert!(f.volumes.migrate_draining(&f.control).is_err());
+                if garbage {
+                    assert!(
+                        f.volumes
+                            .remove_unreachable_for_attempt(
+                                &f.control,
+                                &f.attempt,
+                                &f.verification,
+                                &f.object.group_id,
+                                4,
+                                &f.object.commitment.root
+                            )
+                            .unwrap()
+                    );
+                } else {
+                    assert!(
+                        f.volumes
+                            .discard_attempt(&f.control, &f.attempt, &BTreeSet::new())
+                            .unwrap()
+                    );
+                }
+                f.volumes.migrate_draining(&f.control).unwrap();
+                assert!(
+                    f.control
+                        .records(VARIABLE_MIGRATION_KIND)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(f.control.records("volume-copy-cleanup").unwrap().is_empty());
+                assert!(
+                    f.volumes
+                        .load_ready_variable(&f.control, &f.object.group_id, 4)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn variable_migration_rejects_replaced_source_and_old_gc_preserves_successor() {
+        let mut f = VariableDrainFixture::new(4);
+        interrupt_next_volume_transition(VolumeInterruption::VariableMigrationDestinationReady);
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        let source = f
+            .volumes
+            .volumes
+            .get_mut(&f.source_receipt.volume_id)
+            .unwrap()
+            .store
+            .as_mut()
+            .unwrap();
+        source
+            .remove_ready_variable_object(
+                &f.object.group_id,
+                4,
+                &f.object.commitment.root,
+                &f.attempt,
+                &f.verification,
+            )
+            .unwrap();
+        source
+            .stage_attempt(&[220; 16], &f.object, b"successor signed receipt", 1024)
+            .unwrap();
+        source
+            .activate_attempt_object(
+                &[220; 16],
+                &f.object.group_id,
+                4,
+                &f.object.commitment,
+                &[221; 32],
+            )
+            .unwrap();
+        let successor = source
+            .load_ready_variable_object(&f.object.group_id, 4)
+            .unwrap();
+        f = f.reopen();
+        f.volumes.reconcile(&f.control).unwrap();
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        assert_eq!(
+            f.volumes
+                .receipt(&f.control, &f.object.group_id, 4)
+                .unwrap(),
+            Some(f.source_receipt.clone())
+        );
+        assert_eq!(
+            f.volumes.volumes[&f.source_receipt.volume_id]
+                .store
+                .as_ref()
+                .unwrap()
+                .load_ready_variable_object(&f.object.group_id, 4)
+                .unwrap(),
+            successor
+        );
+        assert!(
+            f.volumes
+                .remove_unreachable_for_attempt(
+                    &f.control,
+                    &f.attempt,
+                    &f.verification,
+                    &f.object.group_id,
+                    4,
+                    &f.object.commitment.root
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            f.volumes.volumes[&f.source_receipt.volume_id]
+                .store
+                .as_ref()
+                .unwrap()
+                .load_ready_variable_object(&f.object.group_id, 4)
+                .unwrap(),
+            successor
+        );
+        assert!(
+            f.control
+                .records(VARIABLE_MIGRATION_KIND)
+                .unwrap()
+                .is_empty()
+        );
+        f.assert_readable();
+    }
+
+    #[test]
+    fn variable_migration_waits_for_staged_and_control_only_reservations() {
+        for staged in [false, true] {
+            let mut f = VariableDrainFixture::new(4);
+            let pending_attempt = [222; 16];
+            let pending_group = [223; 32];
+            let pending_object = VariableParityObject {
+                group_id: pending_group,
+                shard_index: 5,
+                ..f.object.clone()
+            };
+            let source = f
+                .volumes
+                .volumes
+                .get_mut(&f.source_receipt.volume_id)
+                .unwrap()
+                .store
+                .as_mut()
+                .unwrap();
+            if staged {
+                source
+                    .stage_attempt(
+                        &pending_attempt,
+                        &pending_object,
+                        b"pending staged receipt",
+                        1024,
+                    )
+                    .unwrap();
+                let record = AttemptVolumeRecord {
+                    format_version: 1,
+                    attempt_id: pending_attempt,
+                    receipt: VolumeReceipt {
+                        group_id: pending_group,
+                        shard_index: 5,
+                        ..f.source_receipt.clone()
+                    },
+                };
+                f.control
+                    .put_record(
+                        "volume-attempt-receipt",
+                        &attempt_volume_object_id(&pending_attempt, &pending_group, 5),
+                        &canonical_bytes(&record).unwrap(),
+                    )
+                    .unwrap();
+            } else {
+                // Physical completion/abort can precede control retirement.
+                let record = AttemptReservationRecord {
+                    format_version: 1,
+                    attempt_id: pending_attempt,
+                    volume_id: f.source_receipt.volume_id,
+                    guild_id: f.object.guild_id,
+                    shard_index: 5,
+                    byte_length: 64,
+                };
+                f.control
+                    .put_record(
+                        "volume-attempt-reservation",
+                        &attempt_reservation_id(&pending_attempt, 5),
+                        &canonical_bytes(&record).unwrap(),
+                    )
+                    .unwrap();
+            }
+            assert!(f.volumes.migrate_draining(&f.control).is_err());
+            assert_eq!(
+                f.volumes.volumes[&f.source_receipt.volume_id].record.state,
+                StorageVolumeState::Draining
+            );
+            f.assert_readable();
+            f = f.reopen();
+            assert!(f.volumes.migrate_draining(&f.control).is_err());
+            assert!(
+                f.volumes
+                    .discard_attempt(&f.control, &pending_attempt, &BTreeSet::new())
+                    .unwrap()
+            );
+            f.volumes.migrate_draining(&f.control).unwrap();
+            assert_eq!(
+                f.volumes.volumes[&f.source_receipt.volume_id].record.state,
+                StorageVolumeState::Retired
+            );
+            f.assert_readable();
+        }
+    }
+    #[test]
+    fn variable_migration_refuses_headroom_and_invalid_intent_before_publication() {
+        for physical in [false, true] {
+            let mut f = VariableDrainFixture::new(4);
+            let id = f.destination_id();
+            let volume = f.volumes.volumes.get_mut(&id).unwrap();
+            if physical {
+                volume.record.budget_bytes = u64::MAX;
+                volume.record.headroom_bytes = fs2::available_space(&volume.record.path)
+                    .unwrap()
+                    .saturating_add(1);
+            } else {
+                volume.record.budget_bytes = 64;
+                volume.record.headroom_bytes = 1;
+            }
+            assert!(f.volumes.migrate_draining(&f.control).is_err());
+            f.assert_readable();
+            assert!(
+                f.control
+                    .records(VARIABLE_MIGRATION_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let mut f = VariableDrainFixture::new(4);
+        interrupt_next_volume_transition(VolumeInterruption::VariableMigrationIntentStored);
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        let (id, original) = f
+            .control
+            .records(VARIABLE_MIGRATION_KIND)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut invalid: VariableVolumeMigration = decode_canonical(&original).unwrap();
+        invalid.source_volume_id = invalid.destination.volume_id;
+        let bytes = canonical_bytes(&invalid).unwrap();
+        f.control
+            .put_record(VARIABLE_MIGRATION_KIND, &id, &bytes)
+            .unwrap();
+        f = f.reopen();
+        assert!(f.volumes.reconcile(&f.control).is_err());
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        assert_eq!(
+            f.control.get_record(VARIABLE_MIGRATION_KIND, &id).unwrap(),
+            Some(bytes)
+        );
+        assert_eq!(
+            f.volumes
+                .receipt(&f.control, &f.object.group_id, 4)
+                .unwrap(),
+            Some(f.source_receipt.clone())
+        );
+        f.assert_readable();
+        assert!(
+            f.volumes.volumes[&f.destination_id()]
+                .store
+                .as_ref()
+                .unwrap()
+                .first_ready_variable_object()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn variable_migration_copies_mixed_formats_and_reads_after_source_removal() {
+        let mut f = VariableDrainFixture::new(4);
+        let fixed = parity_object(224, 3);
+        // Add a format-1 shard to the same source, representing a mixed-volume upgrade.
+        f.volumes
+            .volumes
+            .get_mut(&f.source_receipt.volume_id)
+            .unwrap()
+            .record
+            .state = StorageVolumeState::Online;
+        let destination = f.destination_id();
+        f.volumes
+            .volumes
+            .get_mut(&destination)
+            .unwrap()
+            .record
+            .state = StorageVolumeState::Failed;
+        let source = f
+            .volumes
+            .volumes
+            .get_mut(&f.source_receipt.volume_id)
+            .unwrap();
+        source.record.budget_bytes = (V1_SECTOR_SIZE * 2) as u64;
+        assert_eq!(
+            f.volumes
+                .store(&f.control, &fixed, b"fixed signed acknowledgement")
+                .unwrap()
+                .volume_id,
+            f.source_receipt.volume_id
+        );
+        f.volumes
+            .volumes
+            .get_mut(&destination)
+            .unwrap()
+            .record
+            .state = StorageVolumeState::Online;
+        f.volumes
+            .volumes
+            .get_mut(&destination)
+            .unwrap()
+            .record
+            .budget_bytes = (V1_SECTOR_SIZE * 2) as u64;
+        f.volumes
+            .mark_draining(&f.control, f.source_receipt.volume_id)
+            .unwrap();
+        assert_eq!(f.volumes.migrate_draining(&f.control).unwrap(), 2);
+        f.assert_readable();
+        assert_eq!(
+            f.volumes
+                .load_ready(&fixed.group_id, fixed.shard_index)
+                .unwrap(),
+            fixed
+        );
+        assert_eq!(
+            f.volumes.volumes[&destination]
+                .store
+                .as_ref()
+                .unwrap()
+                .load_stored_acknowledgement(&fixed.group_id, fixed.shard_index)
+                .unwrap(),
+            b"fixed signed acknowledgement"
+        );
+        fs::remove_dir_all(f.source.path()).unwrap();
+        f = f.reopen();
+        f.assert_readable();
+        assert_eq!(
+            f.volumes
+                .load_ready(&fixed.group_id, fixed.shard_index)
+                .unwrap(),
+            fixed
+        );
+        assert_eq!(
+            f.volumes.volumes[&f.source_receipt.volume_id].record.state,
+            StorageVolumeState::Retired
+        );
+    }
+    #[test]
+    fn variable_migration_persists_retirement_before_another_source_fails() {
+        let data = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([225; 32])));
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[first.path().to_path_buf(), second.path().to_path_buf()],
+                1024,
+                0,
+            )
+            .unwrap();
+        let ids = volumes
+            .volumes
+            .iter()
+            .filter(|(_, v)| v.record.configured)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        for id in &ids {
+            volumes.mark_draining(&control, *id).unwrap();
+        }
+        let reservation = AttemptReservationRecord {
+            format_version: 1,
+            attempt_id: [226; 16],
+            volume_id: ids[1],
+            guild_id: [227; 32],
+            shard_index: 4,
+            byte_length: 64,
+        };
+        control
+            .put_record(
+                "volume-attempt-reservation",
+                &attempt_reservation_id(&reservation.attempt_id, 4),
+                &canonical_bytes(&reservation).unwrap(),
+            )
+            .unwrap();
+        assert!(volumes.migrate_draining(&control).is_err());
+        assert_eq!(
+            volumes.volumes[&ids[0]].record.state,
+            StorageVolumeState::Retired
+        );
+        drop(volumes);
+        drop(control);
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let volumes = StorageVolumes::open(data.path(), keys, &control).unwrap();
+        assert_eq!(
+            volumes.volumes[&ids[0]].record.state,
+            StorageVolumeState::Retired
+        );
+        assert_eq!(
+            volumes.volumes[&ids[1]].record.state,
+            StorageVolumeState::Draining
+        );
+        assert!(
+            control
+                .get_record(
+                    "volume-attempt-reservation",
+                    &attempt_reservation_id(&reservation.attempt_id, 4)
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn variable_migration_allows_pending_upload_to_finish_on_draining_source() {
+        let mut f = VariableDrainFixture::new(4);
+        let attempt = [228; 16];
+        let group = [229; 32];
+        let shard = 5;
+        let bytes = vec![230; 64];
+        let commitment = mb_core::merkle_commit(&bytes).unwrap();
+        f.volumes
+            .volumes
+            .get_mut(&f.source_receipt.volume_id)
+            .unwrap()
+            .store
+            .as_mut()
+            .unwrap()
+            .reserve_coding_attempt(&attempt, &f.object.guild_id, shard.into(), 64, 1024)
+            .unwrap();
+        let reservation = AttemptReservationRecord {
+            format_version: 1,
+            attempt_id: attempt,
+            volume_id: f.source_receipt.volume_id,
+            guild_id: f.object.guild_id,
+            shard_index: shard,
+            byte_length: 64,
+        };
+        f.control
+            .put_record(
+                "volume-attempt-reservation",
+                &attempt_reservation_id(&attempt, shard),
+                &canonical_bytes(&reservation).unwrap(),
+            )
+            .unwrap();
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        f = f.reopen();
+        f.volumes
+            .write_attempt_range(&f.control, &attempt, shard.into(), 0, &bytes)
+            .unwrap();
+        f.volumes
+            .finish_attempt_upload(&f.control, &attempt, group, shard.into(), &commitment)
+            .unwrap();
+        f.volumes
+            .attach_attempt_receipt(
+                &f.control,
+                &attempt,
+                &group,
+                shard.into(),
+                b"completed pending receipt",
+            )
+            .unwrap();
+        f.volumes
+            .activate_attempt_object(
+                &f.control,
+                &attempt,
+                &group,
+                shard.into(),
+                &commitment,
+                &[231; 32],
+            )
+            .unwrap();
+        assert_eq!(f.volumes.migrate_draining(&f.control).unwrap(), 1);
+        assert_eq!(
+            f.volumes
+                .load_ready_variable(&f.control, &group, shard.into())
+                .unwrap()
+                .bytes,
+            bytes
+        );
+        f.assert_readable();
+        assert_eq!(
+            f.volumes.volumes[&f.source_receipt.volume_id].record.state,
+            StorageVolumeState::Retired
+        );
+    }
+
+    #[test]
+    fn variable_migration_keeps_source_active_until_corrupt_destination_is_repaired() {
+        let mut f = VariableDrainFixture::new(4);
+        interrupt_next_volume_transition(VolumeInterruption::VariableMigrationDestinationReady);
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        let id = f.destination_id();
+        f.volumes
+            .database_shell_statement(id, "UPDATE parity_objects SET bytes = zeroblob(64)", false)
+            .unwrap();
+        f = f.reopen();
+        f.volumes.reconcile(&f.control).unwrap();
+        assert!(
+            f.volumes.volumes[&f.source_receipt.volume_id]
+                .record
+                .last_error
+                .is_some()
+        );
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        assert_eq!(
+            f.volumes
+                .receipt(&f.control, &f.object.group_id, 4)
+                .unwrap(),
+            Some(f.source_receipt.clone())
+        );
+        f.assert_readable();
+        assert_eq!(f.control.records(VARIABLE_MIGRATION_KIND).unwrap().len(), 1);
+        f.volumes
+            .database_shell_statement(
+                id,
+                &format!(
+                    "UPDATE parity_objects SET bytes = x'{}'",
+                    hex::encode(&f.object.bytes)
+                ),
+                false,
+            )
+            .unwrap();
+        f.volumes.reconcile(&f.control).unwrap();
+        f.volumes.migrate_draining(&f.control).unwrap();
+        f.assert_readable();
+        assert!(
+            f.control
+                .records(VARIABLE_MIGRATION_KIND)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn variable_migration_waits_for_offline_source_cleanup_after_publishing_verified_destination() {
+        let mut f = VariableDrainFixture::new(4);
+        interrupt_next_volume_transition(VolumeInterruption::VariableMigrationDestinationReady);
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        f.volumes
+            .volumes
+            .get_mut(&f.source_receipt.volume_id)
+            .unwrap()
+            .store = None;
+        f.volumes.reconcile(&f.control).unwrap();
+        f.assert_readable();
+        assert_eq!(f.control.records(VARIABLE_MIGRATION_KIND).unwrap().len(), 1);
+        assert!(f.volumes.migrate_draining(&f.control).is_err());
+        assert_eq!(
+            f.volumes.volumes[&f.source_receipt.volume_id].record.state,
+            StorageVolumeState::Draining
+        );
+        f = f.reopen();
+        f.volumes.reconcile(&f.control).unwrap();
+        f.volumes.migrate_draining(&f.control).unwrap();
+        f.assert_readable();
+        assert!(
+            f.control
+                .records(VARIABLE_MIGRATION_KIND)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(f.control.records("volume-copy-cleanup").unwrap().is_empty());
+    }
+
+    #[test]
+    fn variable_migration_gc_interruption_reopens_without_recreating_a_removed_copy() {
+        for point in [
+            VolumeInterruption::GarbageObjectRemoved,
+            VolumeInterruption::GarbageReceiptRetired,
+        ] {
+            let mut f = VariableDrainFixture::new(4);
+            interrupt_next_volume_transition(VolumeInterruption::VariableMigrationDestinationReady);
+            assert!(f.volumes.migrate_draining(&f.control).is_err());
+            interrupt_next_volume_transition(point);
+            assert!(
+                f.volumes
+                    .remove_unreachable_for_attempt(
+                        &f.control,
+                        &f.attempt,
+                        &f.verification,
+                        &f.object.group_id,
+                        4,
+                        &f.object.commitment.root
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected interruption")
+            );
+            let counts = f
+                .volumes
+                .volumes
+                .iter()
+                .filter_map(|(id, volume)| {
+                    volume
+                        .store
+                        .as_ref()
+                        .map(|store| (*id, store.ready_object_count().unwrap()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            f = f.reopen();
+            f.volumes.reconcile(&f.control).unwrap();
+            for (id, count) in counts {
+                assert_eq!(
+                    f.volumes.volumes[&id]
+                        .store
+                        .as_ref()
+                        .unwrap()
+                        .ready_object_count()
+                        .unwrap(),
+                    count
+                );
+            }
+            assert!(
+                f.volumes
+                    .remove_unreachable_for_attempt(
+                        &f.control,
+                        &f.attempt,
+                        &f.verification,
+                        &f.object.group_id,
+                        4,
+                        &f.object.commitment.root
+                    )
+                    .unwrap()
+            );
+            f.volumes.migrate_draining(&f.control).unwrap();
+            assert!(
+                f.volumes
+                    .load_ready_variable(&f.control, &f.object.group_id, 4)
+                    .is_err()
+            );
+            assert!(
+                f.control
+                    .records(VARIABLE_MIGRATION_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                f.control
+                    .records("volume-attempt-retirement")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(f.control.records("volume-copy-cleanup").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn draining_variable_shard_with_full_destination_keeps_receipt_and_source() {
         let data = TempDir::new().unwrap();
         let source = TempDir::new().unwrap();
         let destination = TempDir::new().unwrap();
@@ -4787,7 +6496,7 @@ mod tests {
                     source.path().to_path_buf(),
                     destination.path().to_path_buf(),
                 ],
-                1024 * 1024,
+                1,
                 0,
             )
             .unwrap();
@@ -4826,7 +6535,7 @@ mod tests {
                     source.path().to_path_buf(),
                     destination.path().to_path_buf(),
                 ],
-                1024 * 1024,
+                1,
                 0,
             )
             .unwrap();
