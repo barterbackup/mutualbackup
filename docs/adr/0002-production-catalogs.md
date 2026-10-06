@@ -687,3 +687,26 @@ workspace/all-targets Clippy pass. The targeted admission run also passes both
 existing SQL writer/fault fixtures. Eight provisioned snapshot cases remain
 ignored in the ordinary suite; the two named capture cases ran separately.
 This is targeted mutation/replay qualification, not the complete M6 release gate.
+
+Backup graph reconstruction now rechecks its empty metadata/ref/index/HEAD
+destination and anchor-record conflicts under the same writer lock used to
+publish object mappings, metadata, refs and the clean index/HEAD. Validation
+still checks the descriptor's actual encoded sparse sector recipes and verifies
+exact native blob IDs before publication. It does not substitute dense mutation
+geometry for a valid recovered legacy descriptor. The caller must authenticate
+the enclosing signed revision before this local import API is used.
+
+Two new fixtures inject competing writes into each destination namespace and
+anchor mapping before publication, preserve competing state on rejection and
+reopen, then recover exact refs, IDs, index and anchor bytes after repair.
+Libgit2-valid descriptors immediately below, at and above the inclusive 32 MiB
+bound prove exact accepted imports on reopen and unchanged empty rejected
+catalogs. Full enclosing admission budgets, oversized-history status/export,
+incremental scheduling and production-capacity qualification remain open.
+
+All 85 ordinary Git library tests and 28 ordinary snapshot regressions pass.
+Provisioned annotated-tag backup import/reopen and both native capture
+regressions pass on disposable Btrfs with verified mount/image/loop cleanup.
+Formatting and strict workspace/all-targets Clippy pass. The ordinary suites
+retain 62 provisioned Git and eight snapshot cases; the one Git import case
+and two capture cases were run separately for this increment.

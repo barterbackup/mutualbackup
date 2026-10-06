@@ -211,6 +211,26 @@ passing tests below apply only to their recorded source and exercised cases.
     passes both existing SQL writer/fault fixtures. Eight provisioned snapshot
     cases remain ignored in the ordinary suite; the two named native capture
     cases ran separately. This is not the complete M6 release gate.
+  - [x] Guard backup graph reconstruction against competing catalog writes.
+    Import validates the descriptor's real encoded sparse recipes and exact native
+    blob IDs before preparing metadata, then rechecks an empty metadata/ref/index/
+    HEAD destination and any anchor-record conflicts under its publication writer
+    lock. Object mappings, metadata, refs and clean index/HEAD publish together;
+    competing state remains intact. Recovery keeps the descriptor's original
+    recipe geometry rather than applying a prospective dense mutation estimate.
+    Two new fixtures inject competing writes in each destination namespace and
+    anchor mapping, preserve them across reopen, then recover exact refs, IDs,
+    index and anchor bytes after repair. Real libgit2-valid descriptors immediately
+    below, at and above 32 MiB prove accepted imports reopen exactly and rejected
+    imports leave the catalog empty. Caller authentication of enclosing signed
+    revisions remains required; these fixtures do not claim end-to-end capacity
+    qualification or complete the shared enclosing R2 budget.
+    Validation: all 85 ordinary Git library tests and 28 ordinary snapshot
+    regressions pass, as do provisioned annotated-tag backup import/reopen and
+    both native capture regressions on disposable Btrfs, with verified mount/
+    image/loop cleanup. Formatting and strict workspace/all-targets Clippy pass.
+    The ordinary suites retain 62 provisioned Git and eight snapshot cases;
+    the one Git import case and two capture cases were run separately here.
 
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
   production catalog design.** The first-release acceptance target is **1 TiB

@@ -1922,6 +1922,38 @@ fn catalog_blob_length(
     Ok(len)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_BACKUP_IMPORT_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn run_before_backup_import_publication_hook() {
+    #[cfg(test)]
+    BEFORE_BACKUP_IMPORT_PUBLICATION.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+fn require_empty_backup_destination(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<(), HistoryError> {
+    for kind in [
+        metadata_kind(repository_id),
+        ref_kind(repository_id),
+        index_kind(repository_id),
+        head_kind(repository_id),
+    ] {
+        if !control.records(&kind)?.is_empty() {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+    }
+    Ok(())
+}
+
 /// Rebuild an empty local catalog from a signed Git descriptor and already
 /// captured native blob anchors. The object map, committed metadata, refs,
 /// and a clean HEAD index become visible in one encrypted SQL transaction.
@@ -1935,16 +1967,7 @@ pub fn import_graph_backup(
         return Err(HistoryError::IncompatibleRecord);
     }
     let symlink_blobs = descriptor.symlink_blob_oids()?;
-    for kind in [
-        metadata_kind(repository_id),
-        ref_kind(repository_id),
-        index_kind(repository_id),
-        head_kind(repository_id),
-    ] {
-        if !control.records(&kind)?.is_empty() {
-            return Err(HistoryError::IncompatibleRecord);
-        }
-    }
+    require_empty_backup_destination(control, repository_id)?;
     let mut by_oid = HashMap::new();
     for anchor in anchors {
         let oid = blob_oid_from_anchor(anchor)?;
@@ -2055,7 +2078,22 @@ pub fn import_graph_backup(
             }
         }
     }
-    control.put_records_and_delete(&records, &[])?;
+    run_before_backup_import_publication_hook();
+    control.put_records_and_delete_checked(&records, &[], || {
+        // The signed descriptor was validated with its actual sparse sector
+        // recipes above. Recovery must not replace that geometry with dense
+        // admission estimates and reject otherwise valid legacy history.
+        require_empty_backup_destination(control, repository_id)?;
+        for (kind, key, value) in &records {
+            if control
+                .get_record(kind, key)?
+                .is_some_and(|existing| existing != *value)
+            {
+                return Err(HistoryError::IncompatibleRecord);
+            }
+        }
+        Ok::<_, HistoryError>(())
+    })?;
     Ok(())
 }
 
@@ -2067,6 +2105,252 @@ mod tests {
 
     use super::*;
     use crate::{GitBackupBlob, GitGraphObject, GitGraphRef};
+
+    #[test]
+    fn backup_import_rechecks_empty_destination_and_anchor_collisions_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let anchor = SourceBlobImportPlan::plan_direct(&source, 5)
+            .unwrap()
+            .capture(&b"exact"[..])
+            .unwrap();
+        let git = Repository::init_bare(directory.path().join("git")).unwrap();
+        let blob_oid = git.blob(b"exact").unwrap();
+        let mut builder = git.treebuilder(None).unwrap();
+        builder.insert("tracked", blob_oid, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("Author", "a@example.test").unwrap();
+        let oid = git
+            .commit(None, &signature, &signature, "small", &tree, &[])
+            .unwrap();
+        let repository_id = Uuid::new_v4();
+        let descriptor = GitBackupDescriptor {
+            format_version: 4,
+            repository_id,
+            head_branch: "main".to_owned(),
+            refs: vec![GitGraphRef {
+                name: MAIN_REF.to_vec(),
+                oid: oid.as_bytes().try_into().unwrap(),
+            }],
+            objects: [(1, oid), (2, tree_oid)]
+                .into_iter()
+                .map(|(kind, oid)| GitGraphObject {
+                    kind,
+                    oid: oid.as_bytes().try_into().unwrap(),
+                    bytes: git.odb().unwrap().read(oid).unwrap().data().to_vec(),
+                })
+                .collect(),
+            blobs: vec![GitBackupBlob {
+                oid: blob_oid.as_bytes().try_into().unwrap(),
+                logical_len: 5,
+                data_extents: vec![crate::GitDataExtent {
+                    offset: 0,
+                    logical_len: 5,
+                    sectors: vec![mb_core::SectorRef {
+                        id: [1; 32],
+                        root: [2; 32],
+                        logical_len: 5,
+                    }],
+                }],
+            }],
+        };
+        descriptor.validate().unwrap();
+        let imported_kinds = [
+            metadata_kind(repository_id),
+            ref_kind(repository_id),
+            index_kind(repository_id),
+            head_kind(repository_id),
+            object_kind(repository_id, blob_oid),
+        ];
+        for (iteration, kind) in imported_kinds.iter().enumerate() {
+            let database = directory.path().join(format!("control-{iteration}.db"));
+            let control = ControlStore::open_with_key(&database, &[7; 32]).unwrap();
+            let key = if iteration == 4 {
+                anchor.anchor_id.as_bytes().to_vec()
+            } else {
+                b"competing".to_vec()
+            };
+            let hook_database = database.clone();
+            let hook_kind = kind.clone();
+            let hook_key = key.clone();
+            BEFORE_BACKUP_IMPORT_PUBLICATION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let competing =
+                        ControlStore::open_existing_with_key(hook_database, &[7; 32]).unwrap();
+                    competing
+                        .put_record(&hook_kind, &hook_key, b"preserve competing state")
+                        .unwrap();
+                }))
+            });
+            assert!(matches!(
+                import_graph_backup(
+                    &control,
+                    repository_id,
+                    &descriptor,
+                    std::slice::from_ref(&anchor)
+                ),
+                Err(HistoryError::IncompatibleRecord)
+            ));
+            for candidate in &imported_kinds {
+                if candidate == kind {
+                    assert_eq!(
+                        control.records(candidate).unwrap(),
+                        vec![(key.clone(), b"preserve competing state".to_vec())]
+                    );
+                } else {
+                    assert!(control.records(candidate).unwrap().is_empty());
+                }
+            }
+            drop(control);
+            let reopened = ControlStore::open_existing_with_key(&database, &[7; 32]).unwrap();
+            assert_eq!(
+                reopened.get_record(kind, &key).unwrap(),
+                Some(b"preserve competing state".to_vec())
+            );
+            reopened.delete_record(kind, &key).unwrap();
+            import_graph_backup(
+                &reopened,
+                repository_id,
+                &descriptor,
+                std::slice::from_ref(&anchor),
+            )
+            .unwrap();
+            assert_eq!(
+                head_oid_for_scope(&reopened, GitWorktreeScope::primary(repository_id)).unwrap(),
+                Some(oid)
+            );
+            assert_eq!(
+                staged_entries_for_scope(&reopened, GitWorktreeScope::primary(repository_id))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            drop(reopened);
+            let recovered = ControlStore::open_existing_with_key(&database, &[7; 32]).unwrap();
+            let graph = export_graph_source(&recovered, repository_id).unwrap();
+            assert_eq!(graph.refs, descriptor.refs);
+            assert_eq!(graph.blobs.len(), 1);
+            assert_eq!(graph.blobs[0].anchor, anchor);
+            assert_eq!(
+                blob_oid_from_anchor(&graph.blobs[0].anchor).unwrap(),
+                blob_oid
+            );
+        }
+    }
+
+    #[test]
+    fn backup_import_enforces_signed_descriptor_size_at_the_exact_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_id = Uuid::new_v4();
+        let git = Repository::init_bare(directory.path().join("git")).unwrap();
+        let tree_oid = git.treebuilder(None).unwrap().write().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("Author", "a@example.test").unwrap();
+        let mut raw = git
+            .commit_create_buffer(&signature, &signature, "message", &tree, &[])
+            .unwrap()
+            .to_vec();
+        raw.resize(V1_MAX_CATALOG_BYTES, b'x');
+        let mut descriptor = GitBackupDescriptor {
+            format_version: 4,
+            repository_id,
+            head_branch: "main".to_owned(),
+            refs: vec![GitGraphRef {
+                name: MAIN_REF.to_vec(),
+                oid: [0; 20],
+            }],
+            objects: vec![
+                GitGraphObject {
+                    kind: 1,
+                    oid: [0; 20],
+                    bytes: raw,
+                },
+                GitGraphObject {
+                    kind: 2,
+                    oid: tree_oid.as_bytes().try_into().unwrap(),
+                    bytes: vec![],
+                },
+            ],
+            blobs: vec![],
+        };
+        let overhead = mb_core::canonical_size_bounded(&descriptor, usize::MAX).unwrap()
+            - descriptor.objects[0].bytes.len();
+        descriptor.objects[0]
+            .bytes
+            .truncate(V1_MAX_CATALOG_BYTES - overhead - 1);
+        for (iteration, expected_size) in [
+            V1_MAX_CATALOG_BYTES - 1,
+            V1_MAX_CATALOG_BYTES,
+            V1_MAX_CATALOG_BYTES + 1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let oid = Oid::hash_object(ObjectType::Commit, &descriptor.objects[0].bytes).unwrap();
+            descriptor.objects[0].oid = oid.as_bytes().try_into().unwrap();
+            descriptor.refs[0].oid = descriptor.objects[0].oid;
+            assert_eq!(
+                mb_core::canonical_size_bounded(&descriptor, usize::MAX).unwrap(),
+                expected_size
+            );
+            let path = directory.path().join(format!("control-{iteration}.db"));
+            let control = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let result = import_graph_backup(&control, repository_id, &descriptor, &[]);
+            if expected_size <= V1_MAX_CATALOG_BYTES {
+                result.unwrap();
+                assert_eq!(
+                    head_oid_for_scope(&control, GitWorktreeScope::primary(repository_id)).unwrap(),
+                    Some(oid)
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(HistoryError::Backup(GitBackupError::TooLarge))
+                ));
+                for kind in [
+                    metadata_kind(repository_id),
+                    ref_kind(repository_id),
+                    index_kind(repository_id),
+                    head_kind(repository_id),
+                ] {
+                    assert!(control.records(&kind).unwrap().is_empty());
+                }
+            }
+            drop(control);
+            let reopened = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            if expected_size <= V1_MAX_CATALOG_BYTES {
+                let graph = export_graph_source(&reopened, repository_id).unwrap();
+                assert_eq!(graph.refs, descriptor.refs);
+                let mut expected_objects: Vec<_> = descriptor.objects.iter().collect();
+                expected_objects.sort_by_key(|object| object.oid);
+                assert_eq!(graph.objects.len(), expected_objects.len());
+                for (actual, expected) in graph.objects.iter().zip(expected_objects) {
+                    assert!(
+                        actual == expected,
+                        "recovered object {} differs",
+                        Oid::from_bytes(&expected.oid).unwrap()
+                    );
+                }
+                assert_eq!(selected_branch(&reopened, repository_id).unwrap(), "main");
+            } else {
+                assert!(
+                    reopened
+                        .records(&metadata_kind(repository_id))
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    reopened
+                        .records(&ref_kind(repository_id))
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            descriptor.objects[0].bytes.push(b'x');
+        }
+    }
 
     #[test]
     fn git_admission_rejects_generated_merge_before_anchor_capture() {
