@@ -127,12 +127,18 @@ enum Command {
     Restore { target: PathBuf },
     /// Export an authenticated withdrawn revision without opening a daemon or mounting a view.
     #[cfg(target_os = "linux")]
+    #[command(group(clap::ArgGroup::new("legacy_input").required(true).multiple(false).args(["revision_file", "data_dir"])))]
     LegacyExport {
-        #[arg(long)]
-        revision_file: PathBuf,
+        #[arg(long, requires = "sectors_dir", conflicts_with_all = ["data_dir", "revision_id"])]
+        revision_file: Option<PathBuf>,
         /// Directory of exact ciphertext sectors named <sector-id-hex>.bin.
-        #[arg(long)]
-        sectors_dir: PathBuf,
+        #[arg(long, requires = "revision_file", conflicts_with = "data_dir")]
+        sectors_dir: Option<PathBuf>,
+        /// Preserved installation inspected read-only, without daemon startup.
+        #[arg(long, requires = "revision_id", conflicts_with_all = ["revision_file", "sectors_dir"])]
+        data_dir: Option<PathBuf>,
+        #[arg(long, requires = "data_dir", conflicts_with = "revision_file")]
+        revision_id: Option<Uuid>,
         /// New export package outside the input directories; parent must exist.
         #[arg(long)]
         destination: PathBuf,
@@ -242,6 +248,8 @@ async fn main() -> Result<()> {
         Command::LegacyExport {
             revision_file,
             sectors_dir,
+            data_dir,
+            revision_id,
             destination,
             seed_file,
             seed_stdin,
@@ -249,12 +257,26 @@ async fn main() -> Result<()> {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             let seed = derive_seed(&recovery).await?;
             let report = tokio::task::spawn_blocking(move || {
-                mb_node::export_withdrawn_revision_from_files(
-                    &KeyMaterial::from_seed(&seed),
-                    &revision_file,
-                    &sectors_dir,
-                    &destination,
-                )
+                let keys = KeyMaterial::from_seed(&seed);
+                match (revision_file, sectors_dir, data_dir, revision_id) {
+                    (Some(revision), Some(sectors), None, None) => {
+                        mb_node::export_withdrawn_revision_from_files(
+                            &keys,
+                            &revision,
+                            &sectors,
+                            &destination,
+                        )
+                    }
+                    (None, None, Some(data), Some(id)) => {
+                        mb_node::export_withdrawn_revision_from_catalog(
+                            &keys,
+                            &data,
+                            id,
+                            &destination,
+                        )
+                    }
+                    _ => bail!("select revision-file/sectors-dir or data-dir/revision-id inputs"),
+                }
             })
             .await??;
             println!(

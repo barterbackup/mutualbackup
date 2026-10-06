@@ -3365,4 +3365,86 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         signed
     );
     assert!(!inputs.join("control.db").exists());
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let mut store = mb_store::ControlStore::open(catalog.join("control.db"), &keys).unwrap();
+    store
+        .put_record("user-revision", revision_id.as_bytes(), &signed)
+        .unwrap();
+    store
+        .put_record("guarded-view-mount-v1", b"legacy", b"preserve")
+        .unwrap();
+    for (index, reference) in revision
+        .value
+        .metadata_sectors
+        .iter()
+        .chain(&revision.value.data_sectors)
+        .enumerate()
+    {
+        let bytes = if reference.id == metadata_id {
+            &metadata_bytes
+        } else {
+            &data_bytes
+        };
+        store
+            .stage_recovery_shard(
+                &[80; 32],
+                &guild,
+                &[index as u8; 32],
+                0,
+                &reference.root,
+                bytes,
+            )
+            .unwrap();
+    }
+    drop(store);
+    let original = fs::read(catalog.join("control.db")).unwrap();
+    let catalog_target = temp.path().join("catalog-export");
+    let catalog_args = vec![
+        os("legacy-export"),
+        os("--data-dir"),
+        catalog.clone().into_os_string(),
+        os("--revision-id"),
+        os(revision_id.to_string()),
+        os("--destination"),
+        catalog_target.clone().into_os_string(),
+        os("--seed-file"),
+        seed_file.clone().into_os_string(),
+    ];
+    let output = run_output(
+        env!("CARGO_BIN_EXE_mutualbackup"),
+        &catalog_args,
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(
+            catalog_target
+                .join("namespace")
+                .join(OsString::from_vec(b"payload-\xff".to_vec()))
+        )
+        .unwrap(),
+        b"offline payload"
+    );
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
+    assert!(!catalog.join("control.key").exists());
+    let invalid = run_output(
+        env!("CARGO_BIN_EXE_mutualbackup"),
+        &[
+            os("legacy-export"),
+            os("--data-dir"),
+            catalog.into_os_string(),
+            os("--destination"),
+            temp.path().join("invalid").into_os_string(),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("--revision-id"));
 }

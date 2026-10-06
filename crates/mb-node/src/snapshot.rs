@@ -2755,6 +2755,41 @@ pub(crate) fn render_sector(
     render_sector_with_hint_update(control, keys, sector_id, expected_guild, true)
 }
 
+/// The offline legacy exporter must never open an old anchor/view or update a
+/// source hint. Only already recovered Inline plaintext is eligible here.
+#[cfg(target_os = "linux")]
+pub(crate) fn recovered_inline_sector_for_export(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    reference: &SectorRef,
+) -> Result<Option<Vec<u8>>> {
+    let Some(encoded) =
+        control.get_record_bounded("local-sector", &reference.id, V1_SECTOR_SIZE + 4096)?
+    else {
+        return Ok(None);
+    };
+    let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
+    ensure!(
+        recipe.guild_id == guild_id && recipe.reference == *reference,
+        "legacy source recipe differs from its signed sector"
+    );
+    let LocalPlaintextSource::Inline(bytes) = recipe.source else {
+        return Ok(None);
+    };
+    ensure!(
+        bytes.len() == reference.logical_len as usize && bytes.len() <= V1_SECTOR_SIZE,
+        "legacy Inline source has invalid length"
+    );
+    let (actual, ciphertext) =
+        encrypted_sector(&keys.guild_data_key(&guild_id), reference.id, &bytes)?;
+    ensure!(
+        actual == *reference,
+        "legacy Inline source differs from its signed root"
+    );
+    Ok(Some(ciphertext))
+}
+
 fn render_sector_with_hint_update(
     control: &ControlStore,
     keys: &KeyMaterial,

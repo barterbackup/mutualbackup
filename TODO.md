@@ -123,7 +123,7 @@ passing tests below apply only to their recorded source and exercised cases.
     sparse/ownership/timestamp checks, exact Git refs/objects, stock Git strict
     fsck, unchanged inputs, missing/corrupt/changing sources, input symlinks,
     wrong blob length/OID, nonempty destinations and absent daemon socket.
-    Input extraction directly from original encrypted catalogs or peer recovery,
+    Peer recovery and original-anchor extraction,
     complete retained-revision conversion and legacy upgrade/source-loss gates
     remain open. Export alone does not certify replacement protection or safe
     retirement; absent legacy ACL/xattr metadata cannot be reconstructed.
@@ -136,6 +136,27 @@ passing tests below apply only to their recorded source and exercised cases.
     Ordinary suites retain 18 store, 62 Git and 20 Node provisioned cases; only
     the eight snapshot cases above ran separately. Full M6 release gates remain
     open, including real historical upgrade/source-loss and all retained history.
+  - [x] Add read-only original-catalog input to Linux `legacy-export` using
+    `--data-dir` and `--revision-id`. Existing seed-derived or wrapped database
+    keys locate saved revision rows, legacy/scoped recovery heads or certified
+    checkpoint history. Bounded SQL reads reject oversized records before payload
+    allocation. Available recovered Inline sources and authenticated cached shards
+    supply ciphertext without reading anchors, replaying journals, migrating
+    schemas, wrapping keys, updating hints or retiring source records. File and
+    catalog input modes are exclusive. Missing/invalid inputs fail before target
+    publication. This does not inventory all retained history or recover absent
+    sectors; peer/packed reconstruction and original-anchor extraction remain open.
+    Validation: two new catalog fixtures cover legacy/wrapped keys, legacy/scoped
+    recovery heads, certified history, mixed Inline/cache sources, unchanged
+    database/key/journal bytes, preserved schema and failure without publication.
+    Two store fixtures reject oversized records/keys and damaged recovery rows
+    before visiting/allocating payloads. The actual offline CLI fixture covers
+    both input modes and incomplete catalog arguments. All 104 core, 103 ordinary
+    store, 87 ordinary Git, 370 ordinary Node and 26 CLI unit tests pass, plus the
+    real export CLI fixture and eight provisioned snapshot regressions (699 unique
+    cases). Disposable Btrfs mount/image/loop cleanup, formatting and strict locked
+    workspace/all-targets Clippy pass. The 18 store, 62 Git and other 12 Node
+    provisioned cases were not run by this slice; full M6 release gates remain open.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

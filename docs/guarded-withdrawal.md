@@ -28,7 +28,7 @@ Ordinary and linked-worktree stage journals are inspected even when their backen
 binding is absent; neither initialization nor reopening can migrate them first.
 Automatic migration remains disabled. The Linux `legacy-export` command can
 export an owner/writer-signed historical revision from available ciphertext
-files without opening the original installation or mounting a guarded view.
+files or a read-only original control catalog without mounting a guarded view.
 Offline Git catalogs and revision metadata not yet downloaded during seed
 recovery cannot be classified by the startup check. Recovery admission must
 classify the downloaded metadata before publishing a restore job or enrolling
@@ -71,10 +71,10 @@ filesystems are rejected; withdrawal does not introduce a copy or mount fallback
 Provide an owner/writer-signed `SignedRecord<UserRevision>` in canonical Postcard
 encoding and every metadata/data ciphertext sector it references. Each ciphertext
 file must be exactly 64 KiB and named `<sector-id-hex>.bin`. These inputs must come
-from preserved authenticated recovery/export data. The command does not extract
-keys or records from the original encrypted installation, reconstruct unavailable
-parity or download missing sectors. Obtaining those inputs directly from original
-catalogs and remote recovery is still required for the complete R1 procedure.
+from preserved authenticated recovery/export data. The file-input mode accepts previously extracted inputs. The catalog-input mode
+below reads available recovered inputs from the preserved encrypted installation.
+Neither mode reconstructs unavailable parity or downloads missing sectors; remote
+recovery is still required for the complete R1 procedure.
 
 Create the destination's parent outside the revision and ciphertext input
 directories, then run:
@@ -86,6 +86,27 @@ mutualbackup legacy-export \
   --destination /exports/revision-001 \
   --seed-file /preserved/recovery.txt
 ```
+
+Alternatively, select a revision from a preserved installation:
+
+```sh
+mutualbackup legacy-export \
+  --data-dir /preserved/installation \
+  --revision-id REVISION-UUID \
+  --destination /exports/revision-001 \
+  --seed-file /preserved/recovery.txt
+```
+
+This mode opens the control catalog read-only, using its existing wrapped key or
+legacy seed-derived key. It searches saved revisions, recovery heads and certified
+checkpoint history, then uses recovered Inline sources or verified cached recovery
+shards. The destination's parent must be outside the installation. It performs no
+key wrapping, schema migration, journal replay, source-hint update or cache
+retirement. It never opens original anchor files or a guarded view. Revisions
+requiring unavailable ciphertext, uncached packed reconstruction or original
+anchor extraction still fail while preserving their original state. The command
+exports the requested revision only; it does not inventory all retained history.
+File inputs and catalog inputs are mutually exclusive.
 
 The destination must not already exist. Recovery input may instead come from
 `--seed-stdin` or the existing non-echo prompt. No daemon socket or mount is
@@ -115,17 +136,22 @@ claim protection or authorize deletion of original history. If metadata or
 sectors are unavailable, keep the original state and peer-held data for the
 remaining recovery procedure; do not delete backend markers to bypass admission.
 
-Validation for the available-input export: four library fixtures and one actual
+Validation for the available-input export: six library fixtures and one actual
 CLI fixture cover formats 6/7, raw paths, sparse files, hard links, recorded
 ownership/modes/times, exact stock Git objects/refs/HEAD and strict Git fsck.
 They reject missing/corrupt/changing inputs, unauthorized and oversized revisions,
 input symlinks, wrong blob lengths/OIDs and nonempty destinations. The actual CLI
 runs without a daemon and leaves signed revision, ciphertext and recovery-string
-inputs unchanged. All 104 core, 101 ordinary store, 87 ordinary Git, 368 ordinary
+inputs unchanged. Catalog fixtures cover legacy/wrapped keys, both recovery-head
+key layouts, certified checkpoint history, mixed Inline/cache sources, unchanged
+database/key/journal state and preserved legacy schema. Two store fixtures check
+bounded payload/key reads and damaged recovery-cache rows. All 104 core, 103
+ordinary store, 87 ordinary Git, 370 ordinary
 Node and 16 CLI-library tests pass, plus three CLI and seven mutualgit unit tests.
 All eight provisioned snapshot regressions pass on disposable Btrfs with verified
 mount/image/loop cleanup, along with formatting and strict workspace/all-targets
 Clippy. Ordinary suites retain 18 store, 62 Git and 20 Node provisioned cases;
-only the eight snapshot cases ran separately. This is available-input export
-qualification; it does not close original-catalog/remote extraction, complete
+only the eight snapshot cases ran separately. The actual CLI also exercises
+catalog extraction and rejects incomplete catalog flags. This is available-input export
+qualification; it does not close remote/anchor extraction, complete
 retained-history conversion or the full M6 upgrade/source-loss/platform gates.

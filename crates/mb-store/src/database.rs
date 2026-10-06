@@ -63,6 +63,14 @@ pub struct ControlStore {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryShardLocator {
+    pub checkpoint_hash: [u8; 32],
+    pub group_id: [u8; 32],
+    pub shard_index: u8,
+    pub root: [u8; 32],
+}
+
 impl ControlStore {
     pub fn open(path: impl AsRef<Path>, keys: &KeyMaterial) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
@@ -498,6 +506,59 @@ impl ControlStore {
             )
             .optional()
             .map_err(DatabaseError::from)
+    }
+
+    /// Bound payload allocation inside SQLite, including damaged records.
+    pub fn get_record_bounded(
+        &self,
+        kind: &str,
+        record_id: &[u8],
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, DatabaseError> {
+        let limit = i64::try_from(limit).map_err(|_| DatabaseError::Integrity)?;
+        let row: Option<Option<Vec<u8>>> = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN length(bytes) <= ?3 THEN bytes END
+             FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                params![kind, record_id, limit],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some(Some(bytes)) => Ok(Some(bytes)),
+            Some(None) => Err(DatabaseError::Integrity),
+        }
+    }
+
+    /// Visit one bounded key/payload at a time, stopping when the callback
+    /// returns false. No complete history or unbounded damaged row is loaded.
+    pub fn for_each_record_bounded(
+        &self,
+        kind: &str,
+        key_limit: usize,
+        payload_limit: usize,
+        mut visit: impl FnMut(&[u8], &[u8]) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        let key_limit = i64::try_from(key_limit).map_err(|_| DatabaseError::Integrity)?;
+        let payload_limit = i64::try_from(payload_limit).map_err(|_| DatabaseError::Integrity)?;
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN length(record_id) <= ?2 THEN record_id END,
+                    CASE WHEN length(bytes) <= ?3 THEN bytes END
+             FROM protocol_records WHERE kind = ?1 ORDER BY record_id",
+        )?;
+        let mut rows = statement.query(params![kind, key_limit, payload_limit])?;
+        while let Some(row) = rows.next()? {
+            let key: Option<Vec<u8>> = row.get(0)?;
+            let bytes: Option<Vec<u8>> = row.get(1)?;
+            let key = key.ok_or(DatabaseError::Integrity)?;
+            let bytes = bytes.ok_or(DatabaseError::Integrity)?;
+            if !visit(&key, &bytes)? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub fn delete_record(&self, kind: &str, record_id: &[u8]) -> Result<bool, DatabaseError> {
@@ -946,7 +1007,7 @@ impl ControlStore {
         let row = self
             .connection
             .query_row(
-                "SELECT bytes FROM recovery_shards
+                "SELECT CASE WHEN length(bytes) = 65536 THEN bytes END FROM recovery_shards
                  WHERE checkpoint_hash = ?1 AND guild_id = ?2
                    AND group_id = ?3 AND shard_index = ?4 AND root = ?5",
                 params![
@@ -956,14 +1017,52 @@ impl ControlStore {
                     shard_index,
                     root.as_slice(),
                 ],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| row.get::<_, Option<Vec<u8>>>(0),
             )
             .optional()?
-            .ok_or(DatabaseError::NotReady)?;
+            .ok_or(DatabaseError::NotReady)?
+            .ok_or(DatabaseError::Integrity)?;
         if row.len() != V1_SECTOR_SIZE || sector_root(&row) != *root {
             return Err(DatabaseError::Integrity);
         }
         Ok(row)
+    }
+
+    /// Scan fixed-size recovery locators without materializing shard payloads.
+    /// Callers can retain only roots requested by an authenticated revision and
+    /// fetch matching payloads using the existing primary-key lookup.
+    pub fn for_each_recovery_shard_locator(
+        &self,
+        guild_id: &[u8; 32],
+        mut visit: impl FnMut(RecoveryShardLocator) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN length(checkpoint_hash) = 32 THEN checkpoint_hash END,
+                    CASE WHEN length(group_id) = 32 THEN group_id END,
+                    CASE WHEN shard_index BETWEEN 0 AND 4 THEN shard_index END,
+                    CASE WHEN length(root) = 32 THEN root END
+             FROM recovery_shards WHERE guild_id = ?1
+             ORDER BY checkpoint_hash, group_id, shard_index",
+        )?;
+        let mut rows = statement.query([guild_id.as_slice()])?;
+        while let Some(row) = rows.next()? {
+            let fixed = |index| -> Result<[u8; 32], DatabaseError> {
+                let bytes: Option<Vec<u8>> = row.get(index)?;
+                bytes
+                    .ok_or(DatabaseError::Integrity)?
+                    .try_into()
+                    .map_err(|_| DatabaseError::Integrity)
+            };
+            visit(RecoveryShardLocator {
+                checkpoint_hash: fixed(0)?,
+                group_id: fixed(1)?,
+                shard_index: row
+                    .get::<_, Option<u8>>(2)?
+                    .ok_or(DatabaseError::Integrity)?,
+                root: fixed(3)?,
+            })?;
+        }
+        Ok(())
     }
 
     pub fn clear_recovery_shards(
@@ -4414,6 +4513,100 @@ mod tests {
         assert_eq!(
             store.get_record("job", b"one").unwrap().unwrap(),
             b"changed"
+        );
+    }
+
+    #[test]
+    fn bounded_record_reads_reject_oversize_keys_and_payloads_before_visiting() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([30; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        store.put_record("bounded", b"a", b"ok").unwrap();
+        store.put_record("bounded", b"b", &[0; 1024]).unwrap();
+        assert_eq!(
+            store
+                .get_record_bounded("bounded", b"a", 2)
+                .unwrap()
+                .unwrap(),
+            b"ok"
+        );
+        assert!(
+            store
+                .get_record_bounded("bounded", b"missing", 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store.get_record_bounded("bounded", b"b", 2),
+            Err(DatabaseError::Integrity)
+        ));
+        let mut visited = 0;
+        store
+            .for_each_record_bounded("bounded", 1, 2, |key, bytes| {
+                assert_eq!((key, bytes), (b"a".as_slice(), b"ok".as_slice()));
+                visited += 1;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(visited, 1);
+        assert!(
+            store
+                .for_each_record_bounded("bounded", 1, 2, |_, _| Ok(true))
+                .is_err()
+        );
+        store.put_record("long-key", &[0; 1024], b"ok").unwrap();
+        assert!(
+            store
+                .for_each_record_bounded("long-key", 1, 2, |_, _| panic!("oversized key visited"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_locator_scan_avoids_payloads_and_bounded_lookup_rejects_damage() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([30; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let bytes = vec![42; V1_SECTOR_SIZE];
+        let root = sector_root(&bytes);
+        store
+            .stage_recovery_shard(&[1; 32], &[2; 32], &[3; 32], 0, &root, &bytes)
+            .unwrap();
+        store
+            .stage_recovery_shard(&[4; 32], &[5; 32], &[6; 32], 0, &root, &bytes)
+            .unwrap();
+        store.connection.execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE recovery_shards SET bytes = zeroblob(1048576) WHERE checkpoint_hash = X'0101010101010101010101010101010101010101010101010101010101010101';").unwrap();
+        let mut locators = Vec::new();
+        store
+            .for_each_recovery_shard_locator(&[2; 32], |locator| {
+                locators.push(locator);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            locators,
+            vec![RecoveryShardLocator {
+                checkpoint_hash: [1; 32],
+                group_id: [3; 32],
+                shard_index: 0,
+                root
+            }]
+        );
+        assert!(matches!(
+            store.recovery_shard(&[1; 32], &[2; 32], &[3; 32], 0, &root),
+            Err(DatabaseError::Integrity)
+        ));
+        assert_eq!(
+            store
+                .recovery_shard(&[4; 32], &[5; 32], &[6; 32], 0, &root)
+                .unwrap(),
+            bytes
+        );
+        store.connection.execute_batch("UPDATE recovery_shards SET group_id = zeroblob(1048576) WHERE checkpoint_hash = X'0101010101010101010101010101010101010101010101010101010101010101';").unwrap();
+        assert!(
+            store
+                .for_each_recovery_shard_locator(&[2; 32], |_| panic!("damaged locator visited"))
+                .is_err()
         );
     }
 

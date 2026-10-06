@@ -1,5 +1,5 @@
 //! Offline, mount-free export of authenticated withdrawn private formats.
-//! No original control catalog, native anchor or backend binding is opened.
+//! Original catalogs are inspected read-only; native anchors and views stay unopened.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -20,8 +20,8 @@ use crate::guarded_metadata::{
     GuardedGitPrivateMetadataV7, GuardedPrivateEntryV6, GuardedPrivateMetadataV6,
 };
 use crate::snapshot::{
-    RecoveredGitBlobReader, checked_metadata_length, decrypt_reference, restore_guarded_entries,
-    validate_restore_revision,
+    RecoveredGitBlobReader, checked_metadata_length, decrypt_reference,
+    recovered_inline_sector_for_export, restore_guarded_entries, validate_restore_revision,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -293,6 +293,153 @@ pub fn export_withdrawn_revision_from_files(
     })
 }
 
+/// Export available recovered ciphertext directly from an existing installation
+/// inspected read-only. No key wrapping, migration, journal replay, source-hint
+/// update, native-anchor/view access or recovery-cache retirement is performed.
+pub fn export_withdrawn_revision_from_catalog(
+    keys: &KeyMaterial,
+    data_dir: &Path,
+    revision_id: Uuid,
+    target: &Path,
+) -> Result<LegacyExportReport> {
+    let data_dir = data_dir.canonicalize()?;
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()?;
+    ensure!(
+        !parent.starts_with(&data_dir),
+        "export destination must be outside the original installation"
+    );
+    let control = crate::volume::inspect_control_store(&data_dir, keys)?
+        .context("original control catalog is unavailable")?;
+    let mut selected = control
+        .get_record_bounded(
+            "user-revision",
+            revision_id.as_bytes(),
+            V1_MAX_CATALOG_BYTES,
+        )?
+        .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
+        .transpose()?;
+    if selected.is_none() {
+        control.for_each_record_bounded(
+            "user-revision-head",
+            48,
+            V1_MAX_CATALOG_BYTES,
+            |key, bytes| {
+                let revision: SignedRecord<UserRevision> = decode_canonical(bytes)?;
+                if revision.value.revision_id != revision_id
+                    || revision.value.owner != keys.node_id()
+                {
+                    return Ok(true);
+                }
+                let mut scoped = revision.value.guild_id.to_vec();
+                scoped.extend(revision.value.protected_root_id.as_bytes());
+                ensure!(
+                    key == scoped || key == revision.value.guild_id,
+                    "legacy revision head has a conflicting scope"
+                );
+                selected = Some(revision);
+                Ok(false)
+            },
+        )?;
+    }
+    if selected.is_none() {
+        control.for_each_record_bounded(
+            "guild-checkpoint",
+            32,
+            V1_MAX_CATALOG_BYTES,
+            |key, bytes| {
+                let checkpoint: mb_core::QuorumCheckpoint = decode_canonical(bytes)?;
+                let Some(revision) = checkpoint.checkpoint.revisions.iter().find(|revision| {
+                    revision.value.revision_id == revision_id
+                        && revision.value.owner == keys.node_id()
+                }) else {
+                    return Ok(true);
+                };
+                ensure!(
+                    canonical_bytes_bounded(&checkpoint, V1_MAX_CATALOG_BYTES)? == bytes,
+                    "legacy checkpoint is not canonical"
+                );
+                checkpoint.verify()?;
+                ensure!(
+                    key == checkpoint.hash()?,
+                    "legacy checkpoint record has a conflicting hash"
+                );
+                selected = Some(revision.clone());
+                Ok(false)
+            },
+        )?;
+    }
+    let revision =
+        selected.context("requested signed revision is unavailable in the preserved catalog")?;
+    ensure!(
+        revision.value.revision_id == revision_id,
+        "legacy revision record has a conflicting ID"
+    );
+    checked_metadata_length(&revision)?;
+    canonical_bytes_bounded(&revision, V1_MAX_CATALOG_BYTES)?;
+    validate_restore_revision(keys, revision.value.guild_id, &revision)?;
+    let references: BTreeMap<_, _> = revision
+        .value
+        .metadata_sectors
+        .iter()
+        .chain(&revision.value.data_sectors)
+        .map(|reference| (reference.id, reference))
+        .collect();
+    let guild = revision.value.guild_id;
+    let mut missing = BTreeSet::new();
+    for reference in references.values() {
+        if !recovered_inline_sector_for_export(&control, keys, guild, reference)
+            .is_ok_and(|bytes| bytes.is_some())
+        {
+            missing.insert(reference.root);
+        }
+    }
+    let mut recovered = BTreeMap::new();
+    if !missing.is_empty() {
+        // One bounded-memory locator scan, then indexed payload lookups.
+        // Only requested roots are retained. A corrupt duplicate cannot hide
+        // another exact, authenticated copy in the recovery cache.
+        control.for_each_recovery_shard_locator(&guild, |locator| {
+            if missing.contains(&locator.root)
+                && !recovered.contains_key(&locator.root)
+                && control
+                    .recovery_shard(
+                        &locator.checkpoint_hash,
+                        &guild,
+                        &locator.group_id,
+                        locator.shard_index,
+                        &locator.root,
+                    )
+                    .is_ok()
+            {
+                recovered.insert(locator.root, locator);
+            }
+            Ok(())
+        })?;
+    }
+    export_withdrawn_revision_from_source(keys, &revision, target, |id| {
+        let reference = references
+            .get(id)
+            .context("unsigned legacy sector requested")?;
+        if let Ok(Some(bytes)) =
+            recovered_inline_sector_for_export(&control, keys, guild, reference)
+        {
+            return Ok(bytes);
+        }
+        let locator = recovered.get(&reference.root).context("legacy sector has no available recovered Inline/cache ciphertext; original anchors and journals remain preserved")?;
+        Ok(control.recovery_shard(
+            &locator.checkpoint_hash,
+            &guild,
+            &locator.group_id,
+            locator.shard_index,
+            &locator.root,
+        )?)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +619,255 @@ mod tests {
         };
         descriptor.validate().unwrap();
         descriptor
+    }
+
+    #[test]
+    fn legacy_export_catalog_sources_preserve_database_keys_and_journals() {
+        for mode in 0..4 {
+            let (keys, revision, sectors) = fixture(if mode == 3 { 7 } else { 6 });
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("original");
+            fs::create_dir(&data).unwrap();
+            let mut store = if mode == 0 {
+                mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap()
+            } else {
+                crate::volume::open_control_store(&data, &keys).unwrap().0
+            };
+            let signed = canonical_bytes(&revision).unwrap();
+            match mode {
+                0 => store
+                    .put_record(
+                        "user-revision",
+                        revision.value.revision_id.as_bytes(),
+                        &signed,
+                    )
+                    .unwrap(),
+                1 | 2 => {
+                    let mut key = revision.value.guild_id.to_vec();
+                    if mode == 2 {
+                        key.extend(revision.value.protected_root_id.as_bytes());
+                    }
+                    store
+                        .put_record("user-revision-head", &key, &signed)
+                        .unwrap();
+                }
+                _ => {
+                    let mut checkpoint = mb_core::QuorumCheckpoint {
+                        checkpoint: mb_core::GuildCheckpoint {
+                            format_version: 4,
+                            guild_id: revision.value.guild_id,
+                            genesis_hash: [99; 32],
+                            generation: 1,
+                            parent: None,
+                            members: vec![mb_core::Member {
+                                node_id: keys.node_id(),
+                                recovery_public_key: keys.recovery_public_key(),
+                                failure_domain: "fixture".into(),
+                            }],
+                            writer_fences: vec![mb_core::WriterFence {
+                                owner: keys.node_id(),
+                                epoch: 1,
+                                public_key: revision.value.writer_public_key,
+                            }],
+                            revision_tombstones: vec![],
+                            revisions: vec![revision.clone()],
+                            coding_groups: vec![],
+                            authority: None,
+                            packing_catalog: None,
+                        },
+                        signatures: vec![],
+                    };
+                    checkpoint.add_signature(&keys).unwrap();
+                    checkpoint.verify().unwrap();
+                    store
+                        .put_record(
+                            "guild-checkpoint",
+                            &checkpoint.hash().unwrap(),
+                            &canonical_bytes(&checkpoint).unwrap(),
+                        )
+                        .unwrap();
+                }
+            }
+            store
+                .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
+                .unwrap();
+            for (index, reference) in revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+                .enumerate()
+            {
+                if mode < 2 || index == 0 {
+                    let plaintext = decrypt_reference(
+                        &keys.guild_data_key(&revision.value.guild_id),
+                        reference,
+                        &mut |id| Ok(sectors[id].clone()),
+                    )
+                    .unwrap();
+                    crate::snapshot::install_inline_recipe(
+                        &mut store,
+                        revision.value.guild_id,
+                        reference.clone(),
+                        plaintext,
+                    )
+                    .unwrap();
+                } else {
+                    store
+                        .stage_recovery_shard(
+                            &[61; 32],
+                            &revision.value.guild_id,
+                            &[index as u8; 32],
+                            0,
+                            &reference.root,
+                            &sectors[&reference.id],
+                        )
+                        .unwrap();
+                }
+            }
+            // Extraction must not perform even an otherwise valid schema migration.
+            store
+                .database_shell_statement(
+                    "UPDATE meta SET value = X'00000008' WHERE key = 'schema_version'",
+                    false,
+                )
+                .unwrap();
+            drop(store);
+            let db = fs::read(data.join("control.db")).unwrap();
+            let envelope = fs::read(data.join("control.key")).ok();
+            let target = temp.path().join("export");
+            let report = export_withdrawn_revision_from_catalog(
+                &keys,
+                &data,
+                revision.value.revision_id,
+                &target,
+            )
+            .unwrap();
+            assert_eq!(report.private_format, if mode == 3 { 7 } else { 6 });
+            let content = fs::read(
+                target
+                    .join("namespace")
+                    .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec())),
+            )
+            .unwrap();
+            assert_eq!(content.len(), 1024 * 1024);
+            assert_eq!(&content[1000..1003], b"raw");
+            assert_eq!(
+                fs::read(target.join("signed-revision.postcard")).unwrap(),
+                signed
+            );
+            assert_eq!(fs::read(data.join("control.db")).unwrap(), db);
+            assert_eq!(fs::read(data.join("control.key")).ok(), envelope);
+            let inspected = crate::volume::inspect_control_store(&data, &keys)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                inspected
+                    .get_record("guarded-view-mount-v1", b"legacy")
+                    .unwrap()
+                    .unwrap(),
+                b"must-not-replay"
+            );
+            for reference in revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+            {
+                assert!(
+                    recovered_inline_sector_for_export(
+                        &inspected,
+                        &keys,
+                        revision.value.guild_id,
+                        reference
+                    )
+                    .unwrap()
+                    .is_some()
+                        || mode >= 2
+                );
+            }
+            assert!(
+                export_withdrawn_revision_from_catalog(
+                    &keys,
+                    &data,
+                    revision.value.revision_id,
+                    &data.join("unsafe-export")
+                )
+                .is_err()
+            );
+            assert!(!data.join("unsafe-export").exists());
+        }
+    }
+
+    #[test]
+    fn legacy_export_catalog_invalid_or_unavailable_inputs_never_publish() {
+        for mode in 0..5 {
+            let (keys, mut revision, sectors) = fixture(6);
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("original");
+            fs::create_dir(&data).unwrap();
+            let mut store = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+            if mode == 1 {
+                revision.signature[0] ^= 1;
+            }
+            if mode != 0 {
+                store
+                    .put_record(
+                        "user-revision",
+                        revision.value.revision_id.as_bytes(),
+                        &canonical_bytes(&revision).unwrap(),
+                    )
+                    .unwrap();
+            }
+            if mode != 2 {
+                for (index, reference) in revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .enumerate()
+                {
+                    store
+                        .stage_recovery_shard(
+                            &[61; 32],
+                            &if mode == 3 {
+                                [62; 32]
+                            } else {
+                                revision.value.guild_id
+                            },
+                            &[index as u8; 32],
+                            0,
+                            &reference.root,
+                            &sectors[&reference.id],
+                        )
+                        .unwrap();
+                }
+            }
+            if mode == 4 {
+                store
+                    .put_record(
+                        "user-revision",
+                        revision.value.revision_id.as_bytes(),
+                        b"malformed",
+                    )
+                    .unwrap();
+            }
+            drop(store);
+            let original = fs::read(data.join("control.db")).unwrap();
+            let target = temp.path().join("export");
+            assert!(
+                export_withdrawn_revision_from_catalog(
+                    &keys,
+                    &data,
+                    revision.value.revision_id,
+                    &target
+                )
+                .is_err()
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read(data.join("control.db")).unwrap(), original);
+            assert!(!data.join("control.key").exists());
+        }
     }
 
     #[test]
