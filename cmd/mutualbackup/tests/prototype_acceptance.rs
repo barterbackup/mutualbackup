@@ -3225,3 +3225,144 @@ fn deterministic_bytes(length: usize, salt: usize) -> Vec<u8> {
 fn set_private(path: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
+    use mb_core::{
+        SectorPurpose, USER_REVISION_DOMAIN, UserRevision, V1_CIPHER_PROFILE, encrypted_sector,
+        make_sector_id, merkle_commit,
+    };
+    use mb_node::{
+        GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6, PrivateDataExtent,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let inputs = temp.path().join("original");
+    fs::create_dir(&inputs).unwrap();
+    let sectors = inputs.join("ciphertexts");
+    fs::create_dir(&sectors).unwrap();
+    let recovery = Seed::generate_recovery_string().unwrap();
+    let seed = Seed::from_recovery_string(&recovery).unwrap();
+    let keys = KeyMaterial::from_seed(&seed);
+    let seed_file = inputs.join("recovery.txt");
+    mutualbackup::write_seed(&seed_file, &recovery).unwrap();
+    let revision_id = Uuid::new_v4();
+    let guild = [78; 32];
+    let encryption = keys.guild_data_key(&guild);
+    let data_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, 0);
+    let (data, data_bytes) = encrypted_sector(&encryption, data_id, b"offline payload").unwrap();
+    let stat = GuardedPrivateStatV6 {
+        mode: 0o700,
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        atime_secs: 1_700_000_000,
+        atime_nanos: 0,
+        modified_secs: 1_700_000_001,
+        modified_nanos: 0,
+    };
+    let metadata = GuardedPrivateMetadataV6 {
+        format_version: 6,
+        root: stat.clone(),
+        entries: vec![GuardedPrivateEntryV6::File {
+            path: b"payload-\xff".to_vec(),
+            stat,
+            logical_len: 15,
+            link_group: 0,
+            data_extents: vec![PrivateDataExtent {
+                offset: 0,
+                logical_len: 15,
+                sectors: vec![data.clone()],
+            }],
+        }],
+    };
+    let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
+    let (metadata_sector, metadata_bytes) = encrypted_sector(
+        &encryption,
+        metadata_id,
+        &canonical_bytes(&metadata).unwrap(),
+    )
+    .unwrap();
+    let mut body = UserRevision {
+        format_version: 5,
+        guild_id: guild,
+        protected_root_id: Uuid::new_v4(),
+        cipher_profile: V1_CIPHER_PROFILE,
+        revision_id,
+        owner: keys.node_id(),
+        writer_epoch: 1,
+        writer_public_key: keys.node_id().0,
+        writer_signature: Vec::new(),
+        sequence: 1,
+        parent: None,
+        metadata_sectors: vec![metadata_sector],
+        data_sectors: vec![data],
+        sector_commitments: Some(vec![
+            merkle_commit(&metadata_bytes).unwrap(),
+            merkle_commit(&data_bytes).unwrap(),
+        ]),
+    };
+    body.writer_signature = keys
+        .sign(
+            b"mutualbackup/writer-revision/v1",
+            &canonical_bytes(&body).unwrap(),
+        )
+        .to_vec();
+    let revision = SignedRecord::sign(USER_REVISION_DOMAIN, body, &keys).unwrap();
+    let signed = canonical_bytes(&revision).unwrap();
+    let revision_file = inputs.join("revision.postcard");
+    fs::write(&revision_file, &signed).unwrap();
+    let data_file = sectors.join(format!("{}.bin", hex::encode(data_id)));
+    let metadata_file = sectors.join(format!("{}.bin", hex::encode(metadata_id)));
+    fs::write(&data_file, &data_bytes).unwrap();
+    fs::write(&metadata_file, &metadata_bytes).unwrap();
+    let target = temp
+        .path()
+        .join(OsString::from_vec(b"export-\xfe".to_vec()));
+    let args = vec![
+        os("--socket"),
+        temp.path().join("absent-daemon.sock").into_os_string(),
+        os("legacy-export"),
+        os("--revision-file"),
+        revision_file.clone().into_os_string(),
+        os("--sectors-dir"),
+        sectors.clone().into_os_string(),
+        os("--destination"),
+        target.clone().into_os_string(),
+        os("--seed-file"),
+        seed_file.clone().into_os_string(),
+    ];
+    let output = run_output(env!("CARGO_BIN_EXE_mutualbackup"), &args, CLI_TIMEOUT).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("exported revision"));
+    assert_eq!(
+        fs::read(
+            target
+                .join("namespace")
+                .join(OsString::from_vec(b"payload-\xff".to_vec()))
+        )
+        .unwrap(),
+        b"offline payload"
+    );
+    assert_eq!(
+        fs::read(target.join("signed-revision.postcard")).unwrap(),
+        signed
+    );
+    assert_eq!(fs::read(&revision_file).unwrap(), signed);
+    assert_eq!(fs::read(&metadata_file).unwrap(), metadata_bytes);
+    assert_eq!(fs::read(&data_file).unwrap(), data_bytes);
+    assert_eq!(
+        fs::read_to_string(&seed_file).unwrap().trim(),
+        recovery.as_str()
+    );
+    let retry = run_output(env!("CARGO_BIN_EXE_mutualbackup"), &args, CLI_TIMEOUT).unwrap();
+    assert!(!retry.status.success());
+    assert_eq!(
+        fs::read(target.join("signed-revision.postcard")).unwrap(),
+        signed
+    );
+    assert!(!inputs.join("control.db").exists());
+}

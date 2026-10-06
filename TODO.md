@@ -106,6 +106,36 @@ passing tests below apply only to their recorded source and exercised cases.
     losses and physical history reclamation. The final binding-key hardening is
     covered by the ordinary Git preservation fixture; format and strict
     workspace/all-target Clippy pass. The disposable mount and image were removed.
+  - [x] Add a mount-free Linux export for available authenticated historical
+    private formats 6/7. `mutualbackup legacy-export` reads a canonical signed
+    revision and exact ciphertext sector files, authenticates owner/writer,
+    roots/commitments and complete private-to-signed data joins before creating
+    output. It preserves recorded raw paths, sparse file lengths/gaps, hard
+    links, ownership, modes and timestamps in a separate namespace. Format 7
+    also streams and hash-verifies every reachable blob/object into a stock Git
+    bare repository with all refs and primary HEAD. It records signed provenance
+    and an export report, flushes output, and publishes the package using a
+    no-replace rename. Original control catalogs, bindings, journals, native
+    anchors and peer-held history are not opened or retired. Missing/corrupt
+    metadata or sectors fail; failed construction leaves no published target.
+    Crash staging remains private for inspection. Four library fixtures and
+    one actual offline CLI fixture pass, including raw paths, hard links,
+    sparse/ownership/timestamp checks, exact Git refs/objects, stock Git strict
+    fsck, unchanged inputs, missing/corrupt/changing sources, input symlinks,
+    wrong blob length/OID, nonempty destinations and absent daemon socket.
+    Input extraction directly from original encrypted catalogs or peer recovery,
+    complete retained-revision conversion and legacy upgrade/source-loss gates
+    remain open. Export alone does not certify replacement protection or safe
+    retirement; absent legacy ACL/xattr metadata cannot be reconstructed.
+    Validation: all 104 core, 101 ordinary store, 87 ordinary Git, 368 ordinary
+    Node and 16 CLI-library tests pass, plus three CLI and seven mutualgit unit
+    tests and the real offline export CLI fixture. All eight provisioned snapshot
+    regressions pass on disposable Btrfs with verified mount/image/loop cleanup.
+    Formatting and strict workspace/all-targets Clippy pass. The final export
+    guard rejects oversized revision bodies before signature encoding/fetch.
+    Ordinary suites retain 18 store, 62 Git and 20 Node provisioned cases; only
+    the eight snapshot cases above ran separately. Full M6 release gates remain
+    open, including real historical upgrade/source-loss and all retained history.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

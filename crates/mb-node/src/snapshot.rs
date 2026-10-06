@@ -1581,7 +1581,7 @@ fn validate_capture_sector_budget(manifest: &mb_store::StableAnchorManifest) -> 
     Ok(())
 }
 
-fn checked_metadata_length(revision: &SignedRecord<UserRevision>) -> Result<usize> {
+pub(crate) fn checked_metadata_length(revision: &SignedRecord<UserRevision>) -> Result<usize> {
     if revision.value.metadata_sectors.is_empty()
         || revision.value.metadata_sectors.len() > MAX_METADATA_SECTORS
         || revision
@@ -3077,7 +3077,7 @@ pub(crate) fn resume_restore_publication(
     Ok(true)
 }
 
-fn validate_restore_revision(
+pub(crate) fn validate_restore_revision(
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
@@ -3465,7 +3465,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
-struct RecoveredGitBlobReader<'a, F> {
+pub(crate) struct RecoveredGitBlobReader<'a, F> {
     blob: &'a GitBackupBlob,
     encryption_key: &'a [u8; 32],
     load_ciphertext: &'a mut F,
@@ -3481,7 +3481,7 @@ impl<'a, F> RecoveredGitBlobReader<'a, F>
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
-    fn new(
+    pub(crate) fn new(
         blob: &'a GitBackupBlob,
         encryption_key: &'a [u8; 32],
         load_ciphertext: &'a mut F,
@@ -3879,7 +3879,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn restore_guarded_entries<F>(
+pub(crate) fn restore_guarded_entries<F>(
     staging: &PinnedDirectory,
     metadata: &GuardedPrivateMetadataV6,
     encryption_key: &[u8; 32],
@@ -4184,7 +4184,7 @@ where
     Ok(())
 }
 
-fn decrypt_reference<F>(
+pub(crate) fn decrypt_reference<F>(
     encryption_key: &[u8; 32],
     reference: &SectorRef,
     load_ciphertext: &mut F,

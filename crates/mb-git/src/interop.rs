@@ -14,11 +14,14 @@ use crate::GitAnchorError;
 use crate::history::{
     GitBranchInfo, GitGraphSource, GitTagInfo, HistoryError, export_graph_source,
 };
+use crate::{GitBackupBlob, GitBackupDescriptor};
 use mb_store::{ControlStore, FileAnchorManifest};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum GitInteropError {
+    #[error("Git backup metadata cannot be exported: {0}")]
+    Backup(#[from] crate::GitBackupError),
     #[error("Git history cannot be exported: {0}")]
     History(#[from] HistoryError),
     #[error("native Git blob is unavailable or corrupt: {0}")]
@@ -49,6 +52,110 @@ pub enum GitInteropError {
     IncompatibleGraph,
     #[error("Git refs changed since the remote helper advertised them")]
     StaleAdvertisement,
+}
+
+impl GitBackupDescriptor {
+    /// Export authenticated backup metadata and streamed blob bytes to an
+    /// existing empty stock Git bare repository, without native anchor capture.
+    /// Every blob's length and Git object ID are checked before refs are set.
+    /// The caller authenticates the enclosing signed revision and supplies the
+    /// blob bytes; failed external writes do not authorize source retirement.
+    pub fn export_to_bare<F>(
+        &self,
+        destination: &Path,
+        mut write_blob: F,
+    ) -> Result<u32, GitInteropError>
+    where
+        F: FnMut(&GitBackupBlob, &mut dyn Write) -> std::io::Result<()>,
+    {
+        self.validate()?;
+        let destination_path = destination.canonicalize()?;
+        let repository = Repository::open_bare(&destination_path)?;
+        if !repository.is_bare()
+            || repository.path().canonicalize()? != destination_path
+            || repository.object_format() != ObjectFormat::Sha1
+        {
+            return Err(GitInteropError::UnsupportedDestination);
+        }
+        if repository.references()?.next().transpose()?.is_some() {
+            return Err(GitInteropError::DestinationNotEmpty);
+        }
+        let mut transaction = repository.transaction()?;
+        transaction.lock_ref("HEAD")?;
+        for reference in &self.refs {
+            let name = std::str::from_utf8(&reference.name)
+                .map_err(|_| GitInteropError::IncompatibleGraph)?;
+            transaction.lock_ref(name)?;
+        }
+        if repository.references()?.next().transpose()?.is_some() {
+            return Err(GitInteropError::DestinationNotEmpty);
+        }
+        let odb = repository.odb()?;
+        for blob in &self.blobs {
+            let length = usize::try_from(blob.logical_len)
+                .map_err(|_| GitInteropError::IncompatibleGraph)?;
+            let mut writer = odb.writer(length, ObjectType::Blob)?;
+            let mut bounded = ExactBlobWriter {
+                inner: &mut writer,
+                remaining: blob.logical_len,
+            };
+            write_blob(blob, &mut bounded)?;
+            if bounded.remaining != 0 {
+                return Err(GitInteropError::ObjectConflict);
+            }
+            if writer.finalize()? != Oid::from_bytes(&blob.oid)? {
+                return Err(GitInteropError::ObjectConflict);
+            }
+        }
+        for object in &self.objects {
+            publish_object(
+                &repository,
+                Oid::from_bytes(&object.oid)?,
+                object_type(object.kind)?,
+                object.bytes.len() as u64,
+                object.bytes.as_slice(),
+            )?;
+        }
+        for reference in &self.refs {
+            let name = std::str::from_utf8(&reference.name)
+                .map_err(|_| GitInteropError::IncompatibleGraph)?;
+            transaction.set_target(
+                name,
+                Oid::from_bytes(&reference.oid)?,
+                None,
+                "export authenticated backup",
+            )?;
+        }
+        transaction.set_symbolic_target(
+            "HEAD",
+            &format!("refs/heads/{}", self.head_branch),
+            None,
+            "export authenticated backup HEAD",
+        )?;
+        transaction.commit()?;
+        u32::try_from(self.objects.len() + self.blobs.len())
+            .map_err(|_| GitInteropError::IncompatibleGraph)
+    }
+}
+
+struct ExactBlobWriter<'a> {
+    inner: &'a mut dyn Write,
+    remaining: u64,
+}
+
+impl Write for ExactBlobWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(std::io::Error::other("Git blob exceeds its signed length"));
+        }
+        let written = self.inner.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn object_type(kind: u8) -> Result<ObjectType, GitInteropError> {

@@ -6,6 +6,8 @@ mod control;
 mod guarded_metadata;
 #[cfg(test)]
 mod lab;
+#[cfg(target_os = "linux")]
+mod legacy_export;
 mod native_catalog;
 mod network;
 mod node;
@@ -23,6 +25,10 @@ pub use control::{
 };
 #[cfg(target_os = "linux")]
 pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6};
+#[cfg(target_os = "linux")]
+pub use legacy_export::{
+    LegacyExportReport, export_withdrawn_revision_from_files, export_withdrawn_revision_from_source,
+};
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use native_catalog::{NativeCatalogStream, NativeCatalogWriteError};
 pub use network::{

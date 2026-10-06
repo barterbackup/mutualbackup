@@ -125,6 +125,22 @@ enum Command {
     },
     /// Restore this identity's latest revision through the recovery-mode daemon.
     Restore { target: PathBuf },
+    /// Export an authenticated withdrawn revision without opening a daemon or mounting a view.
+    #[cfg(target_os = "linux")]
+    LegacyExport {
+        #[arg(long)]
+        revision_file: PathBuf,
+        /// Directory of exact ciphertext sectors named <sector-id-hex>.bin.
+        #[arg(long)]
+        sectors_dir: PathBuf,
+        /// New export package outside the input directories; parent must exist.
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "seed_file")]
+        seed_stdin: bool,
+    },
     /// List or restore committed snapshots owned by this node.
     Snapshot {
         #[command(subcommand)]
@@ -222,6 +238,37 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let control_socket = cli.socket.clone().unwrap_or_else(default_control_socket);
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Command::LegacyExport {
+            revision_file,
+            sectors_dir,
+            destination,
+            seed_file,
+            seed_stdin,
+        } => {
+            let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
+            let seed = derive_seed(&recovery).await?;
+            let report = tokio::task::spawn_blocking(move || {
+                mb_node::export_withdrawn_revision_from_files(
+                    &KeyMaterial::from_seed(&seed),
+                    &revision_file,
+                    &sectors_dir,
+                    &destination,
+                )
+            })
+            .await??;
+            println!(
+                "exported revision {} (private format {})",
+                report.revision_id, report.private_format
+            );
+            println!("namespace entries: {}", report.namespace_entries);
+            if let Some(count) = report.git_objects {
+                println!("stock Git objects: {count}");
+            }
+            println!(
+                "Preserve the original installation and retained revisions until replacement history is independently verified and protected."
+            );
+        }
         Command::Init {
             data_dir,
             seed_file,

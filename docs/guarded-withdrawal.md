@@ -26,7 +26,9 @@ link-freeze machinery, and `fuser` dependency have been removed. Minimal histori
 record decoding and marker recognition remain for rejection and preservation.
 Ordinary and linked-worktree stage journals are inspected even when their backend
 binding is absent; neither initialization nor reopening can migrate them first.
-There is no supported automatic migration or offline export tool in this build.
+Automatic migration remains disabled. The Linux `legacy-export` command can
+export an owner/writer-signed historical revision from available ciphertext
+files without opening the original installation or mounting a guarded view.
 Offline Git catalogs and revision metadata not yet downloaded during seed
 recovery cannot be classified by the startup check. Recovery admission must
 classify the downloaded metadata before publishing a restore job or enrolling
@@ -54,10 +56,76 @@ history has been converted.
    files, exact Git objects/refs, and retained revisions have been independently
    verified and durably protected. Native enrollment of a copied working tree
    alone does not establish that replacement.
-4. Historical export and retirement remain blocked pending the verified
-   mount-free recovery procedure tracked in R1 of [TODO.md](../TODO.md).
-   Preserve the original installation for that procedure; this release cannot
-   certify conversion or safe retirement of its protected history.
+4. Export available authenticated revisions with the procedure below. Keep all
+   unavailable revisions, original catalogs, anchors, keys and peer recovery
+   data. Exporting one revision does not certify conversion of every retained
+   revision or safe retirement of the original installation. Full upgrade and
+   seed-recovery qualification remains tracked in R1 of [TODO.md](../TODO.md).
 
 Fresh native installations continue to use reflink capture. Unsupported source
 filesystems are rejected; withdrawal does not introduce a copy or mount fallback.
+
+
+## Offline export of available signed revisions (Linux)
+
+Provide an owner/writer-signed `SignedRecord<UserRevision>` in canonical Postcard
+encoding and every metadata/data ciphertext sector it references. Each ciphertext
+file must be exactly 64 KiB and named `<sector-id-hex>.bin`. These inputs must come
+from preserved authenticated recovery/export data. The command does not extract
+keys or records from the original encrypted installation, reconstruct unavailable
+parity or download missing sectors. Obtaining those inputs directly from original
+catalogs and remote recovery is still required for the complete R1 procedure.
+
+Create the destination's parent outside the revision and ciphertext input
+directories, then run:
+
+```sh
+mutualbackup legacy-export \
+  --revision-file /preserved/inputs/revision.postcard \
+  --sectors-dir /preserved/inputs/ciphertexts \
+  --destination /exports/revision-001 \
+  --seed-file /preserved/recovery.txt
+```
+
+The destination must not already exist. Recovery input may instead come from
+`--seed-stdin` or the existing non-echo prompt. No daemon socket or mount is
+required. The export package contains `namespace/`, preserving the raw paths,
+file lengths/sparse gaps, hard links, ownership, modes and timestamps recorded
+by private format 6. Format 7 also creates `history.git/`, a stock Git bare
+repository containing every recorded ref, reachable object and selected HEAD.
+`export.json` identifies the revision and counts; `signed-revision.postcard`
+retains the signed provenance. Legacy ACLs/xattrs or other attributes absent
+from the signed format cannot be reconstructed by this command.
+
+All required sector roots and commitments are checked before output begins and
+again when used. Missing metadata, unavailable sectors, mismatched signatures,
+unsafe paths, ownership-setting failures or corrupt Git objects fail the export.
+The package is built privately and published with a no-replace rename after
+its files/directories are flushed. Failed construction never publishes the target.
+A process crash can leave a private `.mutualbackup-legacy-export-*` staging
+folder in the destination parent; preserve it for inspection rather than
+changing the original installation to force a retry.
+
+Export each retained signed revision separately. Independently compare exported
+files and every Git ref/object against the preserved history, and run
+`git --git-dir /exports/revision-001/history.git fsck --strict` where applicable.
+Then enroll a separate qualified native source and verify durable replacement
+protection. This command does not migrate original catalogs, enroll a root,
+claim protection or authorize deletion of original history. If metadata or
+sectors are unavailable, keep the original state and peer-held data for the
+remaining recovery procedure; do not delete backend markers to bypass admission.
+
+Validation for the available-input export: four library fixtures and one actual
+CLI fixture cover formats 6/7, raw paths, sparse files, hard links, recorded
+ownership/modes/times, exact stock Git objects/refs/HEAD and strict Git fsck.
+They reject missing/corrupt/changing inputs, unauthorized and oversized revisions,
+input symlinks, wrong blob lengths/OIDs and nonempty destinations. The actual CLI
+runs without a daemon and leaves signed revision, ciphertext and recovery-string
+inputs unchanged. All 104 core, 101 ordinary store, 87 ordinary Git, 368 ordinary
+Node and 16 CLI-library tests pass, plus three CLI and seven mutualgit unit tests.
+All eight provisioned snapshot regressions pass on disposable Btrfs with verified
+mount/image/loop cleanup, along with formatting and strict workspace/all-targets
+Clippy. Ordinary suites retain 18 store, 62 Git and 20 Node provisioned cases;
+only the eight snapshot cases ran separately. This is available-input export
+qualification; it does not close original-catalog/remote extraction, complete
+retained-history conversion or the full M6 upgrade/source-loss/platform gates.
