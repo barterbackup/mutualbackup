@@ -323,6 +323,25 @@ pub fn export_withdrawn_revision_from_catalog_with_anchor_areas(
     target: &Path,
     anchor_areas: &[std::path::PathBuf],
 ) -> Result<LegacyExportReport> {
+    export_withdrawn_revision_from_catalog_with_preserved_sources(
+        keys,
+        data_dir,
+        revision_id,
+        target,
+        anchor_areas,
+        &[],
+    )
+}
+
+/// Explicit preserved sources are inspected without daemon startup or mutation.
+pub fn export_withdrawn_revision_from_catalog_with_preserved_sources(
+    keys: &KeyMaterial,
+    data_dir: &Path,
+    revision_id: Uuid,
+    target: &Path,
+    anchor_areas: &[std::path::PathBuf],
+    parity_volumes: &[std::path::PathBuf],
+) -> Result<LegacyExportReport> {
     let data_dir = data_dir.canonicalize()?;
     let parent = target
         .parent()
@@ -417,6 +436,21 @@ pub fn export_withdrawn_revision_from_catalog_with_anchor_areas(
         );
         areas.push(area);
     }
+    let mut volumes = Vec::new();
+    let mut volume_ids = BTreeSet::new();
+    for path in parity_volumes {
+        ensure!(
+            !parent.starts_with(path.canonicalize()?),
+            "export destination must be outside preserved parity volumes"
+        );
+        let volume = crate::PreservedParityVolume::open(path, keys)
+            .with_context(|| format!("open preserved parity volume {}", path.display()))?;
+        ensure!(
+            volume_ids.insert(volume.volume_id()),
+            "preserved parity volume ID supplied more than once"
+        );
+        volumes.push(volume);
+    }
     let references: BTreeMap<_, _> = revision
         .value
         .metadata_sectors
@@ -472,7 +506,9 @@ pub fn export_withdrawn_revision_from_catalog_with_anchor_areas(
             Err(error) => Some(error),
         };
         let Some(locator) = recovered.get(&reference.root) else {
-            if let Some(bytes) = checkpoint_recovery.load(&control, &revision, reference)? {
+            if let Some(bytes) =
+                checkpoint_recovery.load(&control, &revision, reference, &volumes)?
+            {
                 return Ok(bytes);
             }
             if let Some(error) = local_error {
@@ -674,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_export_unpacks_certified_cached_sectors_with_split_object_chunks() {
+    fn legacy_export_unpacks_certified_cached_and_volume_sectors_with_split_object_chunks() {
         for format in [6, 7] {
             let (keys, revision, ciphertexts) = fixture(format);
             let profile = mb_core::PackingProfile {
@@ -713,10 +749,12 @@ mod tests {
                 let source = slot.source().unwrap();
                 (source.id.chunk_index, source.id.object_id)
             });
-            packing.sectors.truncate(slots.len() / 4);
+            let slots_per_sector = (profile.sector_size / profile.slot_size) as usize;
+            packing.sectors.truncate(slots.len() / slots_per_sector);
             packing.catalog.sectors.truncate(packing.sectors.len());
             for (index, sector) in packing.sectors.iter_mut().enumerate() {
-                sector.descriptor.slots = slots[index * 4..index * 4 + 4].to_vec();
+                sector.descriptor.slots =
+                    slots[index * slots_per_sector..(index + 1) * slots_per_sector].to_vec();
                 sector.bytes.clear();
                 for slot in &sector.descriptor.slots {
                     let source = slot.source().unwrap();
@@ -771,7 +809,7 @@ mod tests {
             };
             checkpoint.add_signature(&keys).unwrap();
             checkpoint.verify().unwrap();
-            for case in 0..7 {
+            for case in 0..23 {
                 let temp = tempfile::tempdir().unwrap();
                 let data = temp.path().join("original");
                 fs::create_dir(&data).unwrap();
@@ -790,8 +828,20 @@ mod tests {
                 store
                     .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
                     .unwrap();
+                let volume = temp.path().join("preserved-volume");
+                if case >= 7 {
+                    fs::create_dir(&volume).unwrap();
+                    preserve_variable_export_inputs(
+                        &store,
+                        &keys,
+                        &checkpoint,
+                        &packing.sectors,
+                        &volume,
+                        case,
+                    );
+                }
                 for (index, sector) in packing.sectors.iter().enumerate() {
-                    if case == 1 && index == 0 {
+                    if (case == 1 && index == 0) || (case >= 7 && case != 22) {
                         continue;
                     }
                     let mut record = crate::node::PackedSectorRecord {
@@ -808,6 +858,9 @@ mod tests {
                             _ => {}
                         }
                     }
+                    if case == 22 {
+                        record.sector.bytes[0] ^= 1;
+                    }
                     let key: Vec<_> = revision
                         .value
                         .guild_id
@@ -821,14 +874,29 @@ mod tests {
                 }
                 drop(store);
                 let original = fs::read(data.join("control.db")).unwrap();
-                let target = temp.path().join("export");
-                let result = export_withdrawn_revision_from_catalog(
+                let volume_before = fs::read(volume.join("parity.db")).ok();
+                let target = if case == 19 {
+                    volume.join("export")
+                } else {
+                    temp.path().join("export")
+                };
+                let mut volume_paths = if case >= 7 {
+                    vec![volume.clone()]
+                } else {
+                    vec![]
+                };
+                if case == 18 {
+                    volume_paths.push(volume.clone());
+                }
+                let result = export_withdrawn_revision_from_catalog_with_preserved_sources(
                     &keys,
                     &data,
                     revision.value.revision_id,
                     &target,
+                    &[],
+                    &volume_paths,
                 );
-                if case == 0 {
+                if case == 0 || (7..13).contains(&case) || (20..23).contains(&case) {
                     let report = result.unwrap();
                     assert_eq!(report.private_format, format);
                     assert_eq!(
@@ -848,7 +916,148 @@ mod tests {
                     assert!(!target.exists());
                 }
                 assert_eq!(fs::read(data.join("control.db")).unwrap(), original);
+                assert_eq!(fs::read(volume.join("parity.db")).ok(), volume_before);
+                assert!(!volume.join(".mutualbackup-volume").exists());
                 assert!(!data.join("control.key").exists());
+            }
+        }
+    }
+
+    fn preserve_variable_export_inputs(
+        store: &mb_store::ControlStore,
+        owner: &KeyMaterial,
+        checkpoint: &mb_core::QuorumCheckpoint,
+        sectors: &[mb_core::PackedSector],
+        volume: &Path,
+        case: usize,
+    ) {
+        use mb_core::{
+            CODING_ATTEMPT_PLAN_DOMAIN, CodingAttemptPlan, CodingPlanGeometry, InformationRoleV2,
+            ParityPlacementV2, RangeSectorRef,
+        };
+        let identities: Vec<_> = [49, 71, 72, 73]
+            .into_iter()
+            .map(|marker| KeyMaterial::from_seed(&Seed::from_bytes([marker; 32])))
+            .collect();
+        let id = Uuid::from_bytes(
+            blake3::hash(&owner.node_id().0).as_bytes()[..16]
+                .try_into()
+                .unwrap(),
+        );
+        let mut parity =
+            mb_store::ParityStore::open(volume.join("parity.db"), id.as_bytes(), owner).unwrap();
+        let subsets = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+        for (ordinal, sector) in sectors.iter().enumerate() {
+            let profile = mb_core::CodingProfile::new(2, 2, sector.bytes.len() as u32);
+            let filler = if case == 20 {
+                vec![0; sector.bytes.len()]
+            } else {
+                vec![88; sector.bytes.len()]
+            };
+            let shards = mb_core::encode(profile, vec![sector.bytes.clone(), filler]).unwrap();
+            let plan = CodingAttemptPlan {
+                format_version: 1,
+                attempt_id: [ordinal as u8 + 1; 16],
+                checkpoint_hash: checkpoint.hash().unwrap(),
+                membership_epoch: 1,
+                geometry: CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: checkpoint.checkpoint.guild_id,
+                    profile,
+                    information: shards[..2]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, bytes)| InformationRoleV2 {
+                            owner: identities[index].node_id(),
+                            failure_domain: format!("site-{index}"),
+                            sector: RangeSectorRef {
+                                id: if index == 0 {
+                                    sector.descriptor.id
+                                } else {
+                                    [ordinal as u8 + 90; 32]
+                                },
+                                commitment: mb_core::merkle_commit(bytes).unwrap(),
+                                logical_len: profile.shard_size,
+                                virtual_zero: index == 1 && case == 20,
+                            },
+                        })
+                        .collect(),
+                    parity: (0..2)
+                        .map(|row| ParityPlacementV2 {
+                            holder: identities[row + 2].node_id(),
+                            failure_domain: format!("site-{}", row + 2),
+                            row: row as u16,
+                        })
+                        .collect(),
+                },
+                delegator: identities[0].node_id(),
+                coding_coordinator: identities[1].node_id(),
+                verification_coordinator: identities[3].node_id(),
+                expires_at_unix_seconds: 2_000_000_000,
+                information_roots: None,
+            };
+            let plan =
+                SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &identities[0]).unwrap();
+            let mut transcript =
+                crate::node::tests::test_coding_transcript(plan, &shards, &identities);
+            let group = transcript.value.manifest.value.group.clone();
+            if case == 14 {
+                transcript.signature[0] ^= 1;
+            }
+            if case != 21 {
+                store
+                    .put_record(
+                        "coding-group-transcript",
+                        &group.id,
+                        &canonical_bytes(&transcript).unwrap(),
+                    )
+                    .unwrap();
+            }
+            let positions: &[usize] = match case {
+                7..=12 => &subsets[case - 7],
+                13 => &[3],
+                20 => &[2],
+                21 => &[0],
+                _ => &[2, 3],
+            };
+            for &index in positions {
+                let mut bytes = shards[index].clone();
+                if case == 17 {
+                    bytes[0] ^= 1;
+                }
+                let object = mb_store::VariableParityObject {
+                    format_version: 2,
+                    guild_id: if case == 16 { [98; 32] } else { group.guild_id },
+                    group_id: if index < 2 {
+                        transcript.value.plan.value.geometry.information[index]
+                            .sector
+                            .id
+                    } else {
+                        group.id
+                    },
+                    shard_index: index as u16,
+                    commitment: mb_core::merkle_commit(&bytes).unwrap(),
+                    bytes,
+                };
+                parity
+                    .stage_attempt(
+                        &[ordinal as u8 + 1; 16],
+                        &object,
+                        b"retained receipt",
+                        16 * V1_SECTOR_SIZE as u64,
+                    )
+                    .unwrap();
+                if case != 15 {
+                    parity
+                        .activate_attempt_object(
+                            &[ordinal as u8 + 1; 16],
+                            &object.group_id,
+                            object.shard_index,
+                            &object.commitment,
+                            &[96; 32],
+                        )
+                        .unwrap();
+                }
             }
         }
     }
@@ -1013,7 +1222,7 @@ mod tests {
             {
                 assert_eq!(
                     decoder
-                        .load(&inspected, &revision, reference)
+                        .load(&inspected, &revision, reference, &[])
                         .unwrap()
                         .unwrap(),
                     sectors[&reference.id],

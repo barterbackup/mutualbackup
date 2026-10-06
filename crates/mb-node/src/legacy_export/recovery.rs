@@ -1,5 +1,6 @@
 //! Read-only reconstruction from preserved, certified checkpoint data.
 
+use crate::PreservedParityVolume;
 use anyhow::{Context, Result, bail, ensure};
 use mb_core::{
     CodingProfile, PackedSlot, QuorumCheckpoint, SectorRef, ShardRole, SignedRecord, UserRevision,
@@ -27,6 +28,7 @@ impl CheckpointRecovery {
         control: &ControlStore,
         revision: &SignedRecord<UserRevision>,
         reference: &SectorRef,
+        volumes: &[PreservedParityVolume],
     ) -> Result<Option<Vec<u8>>> {
         let mut last_error = None;
         if let Some((hash, checkpoint)) = &self.checkpoint {
@@ -37,6 +39,7 @@ impl CheckpointRecovery {
                 revision,
                 reference,
                 &mut self.codeword,
+                volumes,
             ) {
                 Ok(bytes) => return Ok(Some(bytes)),
                 Err(error) => last_error = Some(error),
@@ -78,6 +81,7 @@ impl CheckpointRecovery {
                     revision,
                     reference,
                     &mut self.codeword,
+                    volumes,
                 ) {
                     Ok(bytes) => {
                         found = Some(bytes);
@@ -108,14 +112,11 @@ fn recover(
     revision: &SignedRecord<UserRevision>,
     reference: &SectorRef,
     decoded: &mut Option<DecodedCodeword>,
+    volumes: &[PreservedParityVolume],
 ) -> Result<Vec<u8>> {
-    if let Some(catalog) = &checkpoint.checkpoint.packing_catalog {
+    if checkpoint.checkpoint.packing_catalog.is_some() {
         return recover_packed(
-            control,
-            checkpoint.checkpoint.guild_id,
-            catalog,
-            revision,
-            reference,
+            control, checkpoint, revision, reference, hash, decoded, volumes,
         );
     }
     for group in &checkpoint.checkpoint.coding_groups {
@@ -136,6 +137,7 @@ fn recover(
                 ShardRole::Parity(parity) => parity.root,
             })
             .collect();
+        *decoded = None;
         let mut shards: Vec<_> = roots
             .iter()
             .enumerate()
@@ -143,6 +145,13 @@ fn recover(
                 control
                     .recovery_shard(&hash, &group.guild_id, &group.id, index as u8, root)
                     .ok()
+                    .or_else(|| {
+                        volumes.iter().find_map(|volume| {
+                            volume
+                                .load_fixed(&group.guild_id, &group.id, index as u8, root)
+                                .ok()
+                        })
+                    })
             })
             .collect();
         // Historical filler positions may be zero-length. Infer their bytes
@@ -183,11 +192,19 @@ fn recover(
 
 fn recover_packed(
     control: &ControlStore,
-    guild: [u8; 32],
-    catalog: &mb_core::PackedCatalog,
+    checkpoint: &QuorumCheckpoint,
     revision: &SignedRecord<UserRevision>,
     reference: &SectorRef,
+    checkpoint_hash: [u8; 32],
+    decoded: &mut Option<DecodedCodeword>,
+    volumes: &[PreservedParityVolume],
 ) -> Result<Vec<u8>> {
+    let guild = checkpoint.checkpoint.guild_id;
+    let catalog = checkpoint
+        .checkpoint
+        .packing_catalog
+        .as_ref()
+        .context("checkpoint has no packing catalog")?;
     let owner = revision.value.owner;
     let root = packing_protected_root(revision.value.protected_root_id);
     let matches = |source: &mb_core::PackedSourceChunk| {
@@ -220,17 +237,35 @@ fn recover_packed(
                 .checked_add(catalog.profile.sector_size as usize + 64)
                 .context("packed record size overflow")?;
             let key: Vec<_> = guild.iter().chain(&descriptor.id).copied().collect();
-            let encoded = control
-                .get_record_bounded("packed-sector", &key, limit)?
-                .context("certified packed sector is unavailable")?;
-            let record: crate::node::PackedSectorRecord = decode_canonical(&encoded)?;
-            ensure!(
-                record.format_version == 1
-                    && record.guild_id == guild
-                    && record.sector.descriptor == *descriptor,
-                "preserved packed record differs from its certified descriptor"
-            );
-            record.sector.bytes
+            let cached = (|| -> Result<Vec<u8>> {
+                let encoded = control
+                    .get_record_bounded("packed-sector", &key, limit)?
+                    .context("certified packed sector is unavailable")?;
+                let record: crate::node::PackedSectorRecord = decode_canonical(&encoded)?;
+                ensure!(
+                    record.format_version == 1
+                        && record.guild_id == guild
+                        && record.sector.descriptor == *descriptor,
+                    "preserved packed record differs from its certified descriptor"
+                );
+                ensure!(
+                    merkle_commit(&record.sector.bytes)? == descriptor.commitment,
+                    "preserved packed payload failed its certified commitment"
+                );
+                Ok(record.sector.bytes)
+            })();
+            match cached {
+                Ok(bytes) => bytes,
+                Err(error) if volumes.is_empty() => return Err(error),
+                Err(_) => recover_variable(
+                    control,
+                    guild,
+                    checkpoint_hash,
+                    descriptor,
+                    decoded,
+                    volumes,
+                )?,
+            }
         };
         ensure!(
             bytes.len() == catalog.profile.sector_size as usize
@@ -278,4 +313,137 @@ fn recover_packed(
         "unpacked ciphertext conflicts with its owner-signed sector"
     );
     Ok(output)
+}
+
+fn recover_variable(
+    control: &ControlStore,
+    guild: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    descriptor: &mb_core::PackedSectorDescriptor,
+    decoded: &mut Option<DecodedCodeword>,
+    volumes: &[PreservedParityVolume],
+) -> Result<Vec<u8>> {
+    // An intact information copy needs only the certified descriptor. Its
+    // position can change between retained groups, but its storage key cannot.
+    for index in 0..mb_core::MAX_CODING_SHARDS {
+        for volume in volumes {
+            if let Ok(bytes) =
+                volume.load_variable(&guild, &descriptor.id, index, &descriptor.commitment)
+            {
+                return Ok(bytes);
+            }
+        }
+    }
+    let mut found = None;
+    let mut last_error = None;
+    control.for_each_record_bounded(
+        "coding-group-transcript",
+        32,
+        V1_MAX_CATALOG_BYTES,
+        |key, encoded| {
+            let transcript: SignedRecord<mb_core::CodingVerificationTranscript> =
+                decode_canonical(encoded)?;
+            let group = &transcript.value.manifest.value.group;
+            if group.guild_id != guild {
+                return Ok(true);
+            }
+            let Some(wanted) = group.roles.iter().position(|role| matches!(role,
+            mb_core::ShardRoleV2::Information(info) if info.sector.id == descriptor.id
+                && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero
+        )) else { return Ok(true); };
+            let attempt = (|| -> Result<Vec<u8>> {
+                ensure!(
+                    key == group.id
+                        && canonical_bytes_bounded(&transcript, V1_MAX_CATALOG_BYTES)? == encoded,
+                    "preserved coding transcript has a conflicting identity or encoding"
+                );
+                ensure!(
+                    mb_core::replay_coding_transcript(&transcript)?
+                        == mb_core::CodingReplayFinding::Verified,
+                    "preserved coding transcript did not verify"
+                );
+                if let Some(cached) = decoded.as_ref().filter(|cached| {
+                    cached.checkpoint == checkpoint_hash && cached.group == group.id
+                }) {
+                    return Ok(cached.shards[wanted].clone());
+                }
+                // Drop the previous codeword before allocating the next one. All
+                // geometry comes from the verified transcript, never local defaults.
+                *decoded = None;
+                let mut shards = Vec::with_capacity(group.profile.total_shards()?);
+                let mut commitments = Vec::with_capacity(group.roles.len());
+                for (index, role) in group.roles.iter().enumerate() {
+                    let (storage_key, commitment, zero) = match role {
+                        mb_core::ShardRoleV2::Information(info) => (
+                            info.sector.id,
+                            &info.sector.commitment,
+                            info.sector.virtual_zero,
+                        ),
+                        mb_core::ShardRoleV2::Parity(parity) => {
+                            (group.id, &parity.commitment, false)
+                        }
+                    };
+                    let bytes = if zero {
+                        Some(vec![0; group.profile.shard_size as usize])
+                    } else {
+                        volumes
+                            .iter()
+                            .find_map(|volume| {
+                                volume
+                                    .load_variable(&guild, &storage_key, index as u16, commitment)
+                                    .ok()
+                            })
+                            .or_else(|| {
+                                transcript
+                                    .value
+                                    .manifest
+                                    .value
+                                    .information_bytes
+                                    .as_ref()
+                                    .and_then(|bytes| bytes.get(index))
+                                    .cloned()
+                                    .flatten()
+                            })
+                    };
+                    shards.push(bytes);
+                    commitments.push(commitment);
+                }
+                mb_core::reconstruct(group.profile, &mut shards)
+                    .context("not enough authenticated preserved variable shards")?;
+                let shards: Vec<Vec<u8>> = shards
+                    .into_iter()
+                    .map(|bytes| bytes.context("variable reconstruction left a missing position"))
+                    .collect::<Result<_>>()?;
+                for (bytes, commitment) in shards.iter().zip(commitments) {
+                    ensure!(
+                        merkle_commit(bytes)? == *commitment,
+                        "reconstructed variable codeword conflicts with its signed commitment"
+                    );
+                }
+                verify_codeword(group.profile, &shards)?;
+                let bytes = shards[wanted].clone();
+                *decoded = Some(DecodedCodeword {
+                    checkpoint: checkpoint_hash,
+                    group: group.id,
+                    shards,
+                });
+                Ok(bytes)
+            })();
+            match attempt {
+                Ok(bytes) => {
+                    found = Some(bytes);
+                    Ok(false)
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    Ok(true)
+                }
+            }
+        },
+    )?;
+    found.ok_or_else(|| {
+        last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("certified packed sector has no available verified variable placement")
+        })
+    })
 }

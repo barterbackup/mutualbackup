@@ -224,8 +224,8 @@ passing tests below apply only to their recorded source and exercised cases.
     the ordinary runtime readers. Normal volume opening now also rejects a
     manifest whose signer differs from its declared owner. Missing databases,
     symlinks, wrong keys/volume IDs and foreign manifests fail without creation.
-    This is the reader foundation; `legacy-export` does not yet accept parity
-    volume inputs or reconstruct variable-profile codewords from them. Peer
+    This increment supplied the reader foundation; the following increment
+    connects it to `legacy-export` and variable-profile reconstruction. Peer
     downloads, retained-history conversion and the full R1 release gates remain
     open.
     Validation: all 108 ordinary store tests, 56 ordinary volume tests, ten
@@ -237,6 +237,33 @@ passing tests below apply only to their recorded source and exercised cases.
     Formatting and strict locked workspace/all-targets Clippy pass. Complete
     ordinary Node/Git suites, provisioned cases and the full M6 platform/release
     gates were not rerun by this reader increment.
+  - [x] Connect explicitly selected preserved local parity volumes to Linux
+    `legacy-export --parity-volume` (repeatable in catalog mode). Existing
+    read-only readers supply fixed shards alongside scoped cache inputs, or
+    intact packed variable information by its certified ID/commitment. Missing
+    packed payloads use bounded canonical group transcripts that replay as
+    verified, the recorded variable geometry and information/parity storage keys.
+    Reconstruction checks every shard commitment and the full codeword before
+    checking the certified descriptor, chunk joins and owner-signed ciphertext.
+    Authenticated virtual-zero positions need no payload; a corrupt packed cache
+    can fall back to preserved volumes. One decoded codeword is retained, with
+    its predecessor dropped before allocating another. Duplicate volume IDs and
+    output parents inside selected volumes fail before publication. Existing
+    catalogs, keys, manifests and shard bytes are not migrated, rekeyed, rewritten
+    or retired. This does not download remote shards, decrypt foreign identities'
+    volume images, inventory/convert all history or claim replacement protection.
+    Validation: formats 6/7 exercise all six two-of-four subsets, intact
+    information without a transcript, authenticated virtual zeros, corrupt-cache
+    fallback, and rejection of insufficient, STAGED, foreign-guild, damaged and
+    invalidly signed inputs. Duplicate-volume and in-volume destination cases
+    fail without publication; catalog/parity database bytes remain unchanged.
+    The real offline CLI combines a cached information position with preserved
+    fixed parity positions while both original information objects are absent.
+    All 104 core, 108 ordinary store, ten targeted exporter/range tests, two
+    preserved-volume reader tests, four CLI unit tests and the real offline CLI
+    fixture pass (229 unique cases). Formatting and strict locked workspace/
+    all-targets Clippy pass. Complete ordinary Node/Git suites, provisioned cases
+    and full M6 upgrade/platform/release qualification were not rerun.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

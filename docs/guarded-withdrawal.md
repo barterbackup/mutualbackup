@@ -111,7 +111,8 @@ File inputs and catalog inputs are mutually exclusive.
 When a requested sector is not directly available, catalog mode can reconstruct
 it from preserved checkpoint data. The checkpoint must be canonical, carry the
 exact owner/writer-signed revision and verify its quorum signatures under its
-recorded hash. For historical fixed 3+2 groups, any three valid cached positions
+recorded hash. For historical fixed 3+2 groups, any three valid positions from
+the recovery cache or explicitly selected preserved parity volumes
 can recover the codeword; every reconstructed shard root and the coding relation
 are checked. Zero-length filler positions are inferred only when their certified
 full-sector root authenticates all-zero bytes. Cache rows from another checkpoint,
@@ -121,13 +122,38 @@ For packed checkpoints, cached `packed-sector` records supply one authenticated
 payload at a time. Descriptor identity, guild, roots/commitments and source chunk
 hashes are checked; chunks from multiple packed sectors join into the exact
 64 KiB ciphertext referenced by the signed revision. Missing, oversized or corrupt
-records fail without publishing an export. The reader caches one certified
-checkpoint and one decoded fixed codeword, and reads one packed payload at a time, rather than an
+records require another authenticated input or fail without publishing an export.
+The reader caches one certified
+checkpoint and one decoded codeword, and reads one packed payload at a time, rather than an
 installation-wide payload map. It can try another certified checkpoint containing
 the exact same signed revision if the first cannot reconstruct a sector.
-This does not download peer data or reconstruct variable-profile parity from
-original parity volumes. Keep those volumes, coding transcripts and peer-held
-history for the remaining recovery procedure.
+Preserved local parity volumes can also supply intact variable information
+positions. If those are absent, canonical `coding-group-transcript` records
+must replay as verified and describe the exact certified packed sector ID and
+commitment. Recovery uses the recorded variable geometry and storage keys,
+authenticates each READY input, infers only authenticated virtual zeros, checks
+every reconstructed commitment and the complete coding relation, and then
+checks the certified packed descriptor and owner-signed output sector. A damaged
+cached packed copy can fall back to those volumes. No transcript activates a
+group or authorizes retirement during export.
+
+Repeat `--parity-volume` for distinct local volumes encrypted by this recovery
+identity. Each existing database is inspected without schema migration, rekeying,
+registry reconciliation, shard writes or retirement. The destination must be
+outside every selected volume. For example:
+
+```sh
+mutualbackup legacy-export \
+  --data-dir /preserved/installation \
+  --revision-id REVISION-UUID \
+  --parity-volume /preserved/parity-1 \
+  --parity-volume /preserved/parity-2 \
+  --destination /exports/revision-001 \
+  --seed-file /preserved/recovery.txt
+```
+
+This does not download peer data or unlock other identities' volume databases.
+Keep coding transcripts and peer-held history for the remaining recovery work.
 
 If a signed sector is available only in preserved anchor files, supply its area
 explicitly. Repeat `--anchor-area` for distinct areas:
@@ -230,6 +256,18 @@ seed-derived or wrapped SQLCipher keys, including an interrupted key-wrap
 transition. It validates supported historical schemas without upgrading them,
 requires an owner-signed volume manifest when present, and returns only READY
 fixed/variable payloads matching the supplied guild and root/commitment. Reads
-bound damaged database fields before allocation. This does not yet add parity
-volume arguments to `legacy-export` or implement variable-codeword reconstruction;
-preserve those volumes for the remaining recovery work.
+bound damaged database fields before allocation. `legacy-export --parity-volume`
+now uses this reader for the recovery paths described above. Complete retained
+history conversion and remote extraction remain open.
+
+The parity-volume export increment passes 104 core and 108 ordinary store tests,
+ten targeted exporter/range tests, two preserved-volume reader tests, four CLI
+unit tests and the real offline CLI fixture (229 unique cases). Formats 6/7
+exercise all six two-of-four subsets, intact information without a transcript,
+authenticated zero positions, damaged-cache fallback, rejected insufficient,
+STAGED, foreign, damaged or invalidly signed inputs, duplicate volume IDs and
+destinations inside selected volumes. The real CLI combines a cached information
+position with preserved fixed parity while both original information objects
+are absent. Catalog and parity database bytes remain unchanged. Formatting and
+strict workspace/all-targets Clippy pass. This increment does not rerun complete
+ordinary Node/Git suites, provisioned cases or the full M6 release requirements.

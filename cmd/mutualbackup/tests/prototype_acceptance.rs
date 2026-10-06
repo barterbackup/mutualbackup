@@ -3621,8 +3621,31 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             &canonical_bytes(&checkpoint).unwrap(),
         )
         .unwrap();
+    let parity_volume = temp.path().join("preserved-parity");
+    fs::create_dir(&parity_volume).unwrap();
+    let volume_id = Uuid::from_bytes(
+        blake3::hash(&keys.node_id().0).as_bytes()[..16]
+            .try_into()
+            .unwrap(),
+    );
+    let mut parity_store =
+        mb_store::ParityStore::open(parity_volume.join("parity.db"), volume_id.as_bytes(), &keys)
+            .unwrap();
     for (group, shards) in groups {
         for index in [2, 3, 4] {
+            if index >= 3 {
+                parity_store
+                    .stage_and_publish(&mb_store::ParityObject {
+                        format_version: 1,
+                        guild_id: guild,
+                        group_id: group.id,
+                        shard_index: index as u8,
+                        root: mb_core::sector_root(&shards[index]),
+                        bytes: shards[index].clone(),
+                    })
+                    .unwrap();
+                continue;
+            }
             store
                 .stage_recovery_shard(
                     &hash,
@@ -3635,6 +3658,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
                 .unwrap();
         }
     }
+    drop(parity_store);
+    let original_parity = fs::read(parity_volume.join("parity.db")).unwrap();
     drop(store);
     let original = fs::read(catalog.join("control.db")).unwrap();
     let coded_target = temp.path().join("coded-export");
@@ -3646,6 +3671,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             catalog.clone().into_os_string(),
             os("--revision-id"),
             os(revision_id.to_string()),
+            os("--parity-volume"),
+            parity_volume.clone().into_os_string(),
             os("--destination"),
             coded_target.clone().into_os_string(),
             os("--seed-file"),
@@ -3669,6 +3696,11 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         b"offline payload"
     );
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
+    assert_eq!(
+        fs::read(parity_volume.join("parity.db")).unwrap(),
+        original_parity
+    );
+    assert!(!parity_volume.join(".mutualbackup-volume").exists());
     assert!(!catalog.join("control.key").exists());
     let invalid = run_output(
         env!("CARGO_BIN_EXE_mutualbackup"),

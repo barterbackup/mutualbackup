@@ -868,8 +868,11 @@ Available-input legacy export now reads signed files, preserved control catalogs
 explicit anchor areas and certified cached fixed/packed checkpoint data. A
 separate read-only parity-volume reader validates historical schemas, existing
 keys, owner signatures and bounded READY payloads without migration or rekeying.
-Connecting parity-volume inputs to export, variable-profile reconstruction, peer
-downloads and complete retained-history/upgrade qualification remain required.
+Explicit `--parity-volume` inputs now supply fixed shards and variable information
+or parity positions. Replay-verified transcripts bind variable geometry; all
+reconstructed commitments, the coding equation, certified packed descriptors
+and owner-signed output sectors are checked before publication. Peer downloads
+and complete retained-history/upgrade qualification remain required.
 
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
 implementation, enrollment and recovery publication paths, guarded Git

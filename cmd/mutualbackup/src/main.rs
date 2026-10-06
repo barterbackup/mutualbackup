@@ -142,6 +142,9 @@ enum Command {
         /// Explicit preserved anchor area; repeat for multiple areas. No mount discovery.
         #[arg(long, requires = "data_dir", conflicts_with_all = ["revision_file", "sectors_dir"])]
         anchor_area: Vec<PathBuf>,
+        /// Explicit preserved local parity volume; repeat for multiple volumes.
+        #[arg(long, requires = "data_dir", conflicts_with_all = ["revision_file", "sectors_dir"])]
+        parity_volume: Vec<PathBuf>,
         /// New export package outside the input directories; parent must exist.
         #[arg(long)]
         destination: PathBuf,
@@ -254,6 +257,7 @@ async fn main() -> Result<()> {
             data_dir,
             revision_id,
             anchor_area,
+            parity_volume,
             destination,
             seed_file,
             seed_stdin,
@@ -272,12 +276,13 @@ async fn main() -> Result<()> {
                         )
                     }
                     (None, None, Some(data), Some(id)) => {
-                        mb_node::export_withdrawn_revision_from_catalog_with_anchor_areas(
+                        mb_node::export_withdrawn_revision_from_catalog_with_preserved_sources(
                             &keys,
                             &data,
                             id,
                             &destination,
                             &anchor_area,
+                            &parity_volume,
                         )
                     }
                     _ => bail!("select revision-file/sectors-dir or data-dir/revision-id inputs"),
@@ -1062,6 +1067,15 @@ fn legacy_export_requires_complete_exclusive_input_modes_before_recovery() {
         vec!["--data-dir", "original"],
         vec!["--revision-id", id],
         vec!["--anchor-area", "area"],
+        vec!["--parity-volume", "volume"],
+        vec![
+            "--revision-file",
+            "revision",
+            "--sectors-dir",
+            "sectors",
+            "--parity-volume",
+            "volume",
+        ],
         vec![
             "--revision-file",
             "revision",
@@ -1097,13 +1111,29 @@ fn legacy_export_requires_complete_exclusive_input_modes_before_recovery() {
         "first",
         "--anchor-area",
         "second",
+        "--parity-volume",
+        "volume-first",
+        "--parity-volume",
+        "volume-second",
     ])
     .unwrap();
-    let Command::LegacyExport { anchor_area, .. } = cli.command else {
+    let Command::LegacyExport {
+        anchor_area,
+        parity_volume,
+        ..
+    } = cli.command
+    else {
         panic!("wrong command");
     };
     assert_eq!(
         anchor_area,
         vec![PathBuf::from("first"), PathBuf::from("second")]
+    );
+    assert_eq!(
+        parity_volume,
+        vec![
+            PathBuf::from("volume-first"),
+            PathBuf::from("volume-second")
+        ]
     );
 }
