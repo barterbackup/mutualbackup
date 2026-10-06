@@ -277,7 +277,7 @@ passing tests below apply only to their recorded source and exercised cases.
     Invalid/identity-mismatched peer arguments fail before recovery-string input.
     The canonical temporary parent must be outside all selected preserved inputs;
     a confined `TMPDIR` is rejected before creating client state.
-    Missing peer discovery, checkpoints/events/transcripts and retained-history
+    Missing peer discovery, older checkpoints/events/transcripts and retained-history
     inventory/conversion remain open; this does not unlock foreign volume images.
     Validation: a real authenticated three-survivor fixture exports formats 6/7
     while normal owner startup rejects the withdrawn catalog, including raw file
@@ -293,6 +293,27 @@ passing tests below apply only to their recorded source and exercised cases.
     locked workspace/all-targets Clippy pass. This does not rerun complete ordinary
     Node/Git suites, provisioned cases, real variable/relay/Tor peer export
     qualification or the full M6 upgrade/platform/release requirements.
+  - [x] Recover missing checkpoint certificates from explicitly selected peer
+    heads without writing the preserved installation. Bounded pages, canonical
+    encoding, page/full hashes, announced generation and quorum certificates
+    are checked. Reconstruction requires the exact saved owner-signed revision.
+    If that revision is also missing, the preserved signed installed-guild
+    certificate binds the guild/genesis for finding it in a peer head. Bad copies
+    are skipped so another selected peer can supply the certificate; downloaded
+    records remain in memory. This searches heads only: older generations,
+    recovery-directory discovery, events/transcripts and inventory/conversion
+    of all retained history remain open.
+    Validation: the real three-survivor format-6/7 fixture also exports with
+    no local checkpoint, then with neither a revision nor checkpoint record.
+    A corrupt peer certificate falls back to another copy. A conflicting signed
+    genesis, absent guild certificate, unknown revision and different valid
+    signed record with the same ID reject without publication. Original database
+    bytes and absent key/parity files remain unchanged in every attempt.
+    All 104 core, 108 ordinary store, twelve exporter/recovery, two preserved-volume
+    reader, one frame-bound, three shared checkpoint-sync regression, four CLI unit
+    tests and the real CLI fixture pass (235 unique cases). Formatting and strict
+    locked workspace/all-targets Clippy pass. Complete ordinary Node/Git suites,
+    provisioned cases and full M6 platform/release qualification were not rerun.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

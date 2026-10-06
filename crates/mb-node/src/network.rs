@@ -60,8 +60,8 @@ pub use p2p::{
     validate_bootstrap_addresses, validate_local_advertised_endpoints,
 };
 pub(crate) use p2p::{
-    GuildAdministration, commit_guild_administration, is_retryable_p2p_request_error,
-    restore_snapshot_with_p2p,
+    GuildAdministration, commit_guild_administration, fetch_p2p_checkpoint,
+    is_retryable_p2p_request_error, restore_snapshot_with_p2p,
 };
 pub use port_mapping::{run_port_mapping, validate_port_mapping_listeners};
 pub use tor::{

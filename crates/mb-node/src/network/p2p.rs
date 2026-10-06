@@ -3104,6 +3104,17 @@ impl P2pClient {
         Ok(head)
     }
 
+    pub(crate) async fn preserved_checkpoint_head(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+    ) -> Result<Option<(u64, [u8; 32])>> {
+        Ok(self
+            .checkpoint_head(peer, guild_id)
+            .await?
+            .map(|head| (head.generation, head.hash)))
+    }
+
     async fn checkpoint_at_generation(
         &self,
         peer: NodeId,
@@ -11145,7 +11156,7 @@ fn next_sequence_floor(highest: Option<u64>) -> Result<u64> {
         .context("DHT publication sequence is exhausted")
 }
 
-async fn fetch_p2p_checkpoint(
+pub(crate) async fn fetch_p2p_checkpoint(
     p2p: &P2pClient,
     publisher: NodeId,
     guild_id: [u8; 32],
@@ -11178,6 +11189,9 @@ async fn fetch_p2p_checkpoint(
         bytes.extend_from_slice(&page);
     }
     let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+    if mb_core::canonical_bytes_bounded(&checkpoint, V1_MAX_CATALOG_BYTES)? != bytes {
+        bail!("assembled checkpoint is not canonical");
+    }
     checkpoint.verify()?;
     if checkpoint.hash()? != checkpoint_hash {
         bail!("assembled checkpoint has the wrong hash");

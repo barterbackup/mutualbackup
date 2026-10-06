@@ -29,6 +29,15 @@ struct DecodedCodeword {
 }
 
 impl CheckpointRecovery {
+    pub(super) fn with_checkpoint(checkpoint: Option<QuorumCheckpoint>) -> Result<Self> {
+        Ok(Self {
+            checkpoint: checkpoint
+                .map(|checkpoint| -> Result<_> { Ok((checkpoint.hash()?, checkpoint)) })
+                .transpose()?,
+            codeword: None,
+        })
+    }
+
     pub(super) fn load(
         &mut self,
         control: &ControlStore,
@@ -101,6 +110,50 @@ impl CheckpointRecovery {
                 }
             },
         )?;
+        if found.is_none()
+            && let Some(remote) = inputs.remote
+        {
+            let origin = crate::node::preserved_guild_certificate(control)?
+                .map(|certificate| -> Result<_> {
+                    ensure!(
+                        certificate.genesis.guild_id == revision.value.guild_id,
+                        "preserved guild certificate conflicts with the requested revision"
+                    );
+                    Ok(certificate.hash()?)
+                })
+                .transpose()?;
+            remote.checkpoints(revision.value.guild_id, origin, |checkpoint| {
+                let hash = checkpoint.hash()?;
+                if previous == Some(hash)
+                    || !checkpoint
+                        .checkpoint
+                        .revisions
+                        .iter()
+                        .any(|candidate| candidate == revision)
+                {
+                    return Ok(true);
+                }
+                match recover(
+                    control,
+                    hash,
+                    &checkpoint,
+                    revision,
+                    reference,
+                    &mut self.codeword,
+                    inputs,
+                ) {
+                    Ok(bytes) => {
+                        found = Some(bytes);
+                        self.checkpoint = Some((hash, checkpoint));
+                        Ok(false)
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        Ok(true)
+                    }
+                }
+            })?;
+        }
         if found.is_some() {
             return Ok(found);
         }

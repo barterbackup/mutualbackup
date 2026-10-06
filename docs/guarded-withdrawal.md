@@ -172,10 +172,20 @@ apply. Direct information-sector copies also require their owner-signed root.
 An unavailable unused peer does not postpone a locally or remotely available
 quorum. Existing peer guild authorization remains enforced.
 
-This does not discover peers through the recovery directory, fetch missing
-checkpoint/event/transcript history, unlock other identities' volume databases
-or inventory/convert all retained revisions. Keep missing historical metadata,
-coding transcripts and peer-held history for the remaining recovery work.
+When the preserved checkpoint is missing, the client can fetch a selected
+peer's announced checkpoint through bounded, hash-checked pages. The complete
+certificate must verify and contain the exact owner-signed revision. If the
+revision record is also missing, a preserved signed installed-guild certificate
+provides the guild and genesis identity for searching those peer heads. A
+conflicting genesis, generation or hash is rejected; a bad peer copy does not
+prevent trying another selected peer. Downloaded records stay in memory and
+are not installed in the original catalog.
+
+This searches announced heads only. It does not discover peers through the
+recovery directory, traverse older checkpoint generations, fetch event or
+coding-transcript history, unlock other identities' volume databases or
+inventory/convert all retained revisions. Keep historical metadata, coding
+transcripts and peer-held history for the remaining recovery work.
 
 If a signed sector is available only in preserved anchor files, supply its area
 explicitly. Repeat `--anchor-area` for distinct areas:
@@ -307,3 +317,14 @@ with cached inputs and confined `TMPDIR` rejection also pass. Formatting and
 strict workspace/all-targets Clippy pass. Real variable/relay/Tor peer export,
 complete ordinary Node/Git suites, provisioned cases and full M6 qualification
 remain open.
+
+The checkpoint-head metadata increment also passes three shared checkpoint-sync
+regressions (235 unique cases with the suites above), formatting and strict
+workspace/all-targets Clippy. The live format-6/7 fixture exports with a missing
+checkpoint, then with both revision and checkpoint records missing. A corrupt
+peer certificate falls back to another copy. Conflicting signed genesis, absent
+guild certificate, unknown revision and a different valid signed revision with
+the same ID fail without publication. Each attempt preserves the original
+database bytes and leaves key/parity files absent. This does not qualify older
+checkpoint traversal, event/transcript fetching or complete retained-history
+conversion, and the full M6 release gates remain open.

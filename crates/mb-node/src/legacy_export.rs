@@ -434,6 +434,21 @@ fn export_catalog(
             },
         )?;
     }
+    let mut downloaded_checkpoint = None;
+    if selected.is_none()
+        && let Some(remote) = remote
+        && let Some(checkpoint) = remote.find_revision(&control, keys.node_id(), revision_id)?
+    {
+        selected = checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .find(|revision| {
+                revision.value.revision_id == revision_id && revision.value.owner == keys.node_id()
+            })
+            .cloned();
+        downloaded_checkpoint = Some(checkpoint);
+    }
     let revision =
         selected.context("requested signed revision is unavailable in the preserved catalog")?;
     ensure!(
@@ -517,7 +532,8 @@ fn export_catalog(
             Ok(())
         })?;
     }
-    let mut checkpoint_recovery = recovery::CheckpointRecovery::default();
+    let mut checkpoint_recovery =
+        recovery::CheckpointRecovery::with_checkpoint(downloaded_checkpoint)?;
     let inputs = recovery::RecoveryInputs {
         volumes: &volumes,
         remote,

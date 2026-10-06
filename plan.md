@@ -874,8 +874,12 @@ reconstructed commitments, the coding equation, certified packed descriptors
 and owner-signed output sectors are checked before publication. Explicit peer
 inputs now reuse authenticated read requests through a separate temporary client,
 preserving the withdrawn installation and requesting a decoding quorum after
-local inputs. Recovery-directory discovery, unavailable historical metadata and
-complete retained-history/upgrade qualification remain required.
+local inputs. Missing checkpoint certificates can now be read from selected
+peer heads; missing revision records require the preserved signed guild genesis
+and a matching certified head. Paging, hashes, quorum and exact signed revision
+checks apply without installing downloaded records. Recovery-directory discovery,
+older checkpoint traversal, event/transcript fetching and complete retained-history/
+upgrade qualification remain required.
 
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
 implementation, enrollment and recovery publication paths, guarded Git

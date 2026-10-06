@@ -14,6 +14,7 @@ use mb_core::{
     CodingGroup, CodingGroupV2, KeyMaterial, NodeId, SectorRef, Seed, ShardRole, ShardRoleV2,
     V1_SECTOR_SIZE, sector_root,
 };
+use mb_store::ControlStore;
 
 use super::LegacyExportReport;
 use crate::{Node, P2pClient, P2pConfig, TorMode, build_p2p};
@@ -71,6 +72,72 @@ impl PeerRecovery {
                 .ok()?
                 .ok()
         })
+    }
+
+    pub(super) fn checkpoints(
+        &self,
+        guild: [u8; 32],
+        origin: Option<[u8; 32]>,
+        mut visit: impl FnMut(mb_core::QuorumCheckpoint) -> Result<bool>,
+    ) -> Result<()> {
+        for peer in &self.peers {
+            let Some(Some((generation, hash))) =
+                self.read(self.client.preserved_checkpoint_head(*peer, guild))
+            else {
+                continue;
+            };
+            let Some(checkpoint) = self.read(crate::network::fetch_p2p_checkpoint(
+                &self.client,
+                *peer,
+                guild,
+                hash,
+            )) else {
+                continue;
+            };
+            if checkpoint.checkpoint.guild_id == guild
+                && checkpoint.checkpoint.generation == generation
+                && origin.is_none_or(|hash| checkpoint.checkpoint.genesis_hash == hash)
+                && !visit(checkpoint)?
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn find_revision(
+        &self,
+        control: &ControlStore,
+        owner: NodeId,
+        revision_id: uuid::Uuid,
+    ) -> Result<Option<mb_core::QuorumCheckpoint>> {
+        let Some(certificate) = crate::node::preserved_guild_certificate(control)? else {
+            return Ok(None);
+        };
+        ensure!(
+            certificate
+                .genesis
+                .members
+                .iter()
+                .any(|member| member.node_id == owner),
+            "preserved guild certificate does not authorize the recovering identity"
+        );
+        let mut found = None;
+        self.checkpoints(
+            certificate.genesis.guild_id,
+            Some(certificate.hash()?),
+            |checkpoint| {
+                if checkpoint.checkpoint.revisions.iter().any(|revision| {
+                    revision.value.owner == owner && revision.value.revision_id == revision_id
+                }) {
+                    found = Some(checkpoint);
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            },
+        )?;
+        Ok(found)
     }
 
     pub(super) fn sector(&self, guild: [u8; 32], reference: &SectorRef) -> Option<Vec<u8>> {

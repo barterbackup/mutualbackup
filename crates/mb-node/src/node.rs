@@ -13764,6 +13764,15 @@ fn decode_installed_guild(bytes: &[u8]) -> Result<InstalledGuild> {
     Ok(installed)
 }
 
+pub(crate) fn preserved_guild_certificate(
+    control: &ControlStore,
+) -> Result<Option<QuorumGuildGenesis>> {
+    control
+        .get_record_bounded("guild-installed", b"primary", mb_core::V1_MAX_CATALOG_BYTES)?
+        .map(|bytes| decode_installed_guild(&bytes).map(|installed| installed.certificate))
+        .transpose()
+}
+
 fn containing_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -14612,25 +14621,11 @@ pub(crate) mod tests {
     async fn legacy_export_peer_recovery_reads_real_survivors_without_opening_withdrawn_node() {
         use crate::{P2pConfig, build_p2p};
         for format in [6, 7] {
-            let ((keys, revision, _), identities, groups, checkpoint) =
+            let ((keys, revision, _), identities, groups, mut checkpoint) =
                 crate::legacy_export::tests::fixed_checkpoint_fixture(format);
             let temp = tempfile::tempdir().unwrap();
             let original = temp.path().join("withdrawn");
             fs::create_dir(&original).unwrap();
-            let store = ControlStore::open(original.join("control.db"), &keys).unwrap();
-            store
-                .put_record(
-                    "guild-checkpoint",
-                    &checkpoint.hash().unwrap(),
-                    &canonical_bytes(&checkpoint).unwrap(),
-                )
-                .unwrap();
-            store
-                .put_record("guarded-view-mount-v1", b"legacy", b"must not replay")
-                .unwrap();
-            drop(store);
-            let catalog_before = fs::read(original.join("control.db")).unwrap();
-            assert!(Node::open(&original, Seed::from_bytes([49; 32])).is_err());
             let genesis = GuildGenesis {
                 format_version: 1,
                 guild_id: revision.value.guild_id,
@@ -14648,6 +14643,44 @@ pub(crate) mod tests {
                 .signatures
                 .sort_by_key(|signature| signature.signer);
             certificate.verify().unwrap();
+            checkpoint.checkpoint.genesis_hash = certificate.hash().unwrap();
+            checkpoint.signatures = identities
+                .iter()
+                .map(|key| checkpoint.checkpoint.member_signature(key).unwrap())
+                .collect();
+            checkpoint
+                .signatures
+                .sort_by_key(|signature| signature.signer);
+            checkpoint.verify().unwrap();
+            let store = ControlStore::open(original.join("control.db"), &keys).unwrap();
+            store
+                .put_record(
+                    "guild-checkpoint",
+                    &checkpoint.hash().unwrap(),
+                    &canonical_bytes(&checkpoint).unwrap(),
+                )
+                .unwrap();
+            store
+                .put_record("guarded-view-mount-v1", b"legacy", b"must not replay")
+                .unwrap();
+            store
+                .put_record(
+                    "guild-installed",
+                    b"primary",
+                    &canonical_bytes(&InstalledGuild {
+                        format_version: 2,
+                        certificate: certificate.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            drop(store);
+            let catalog_before = fs::read(original.join("control.db")).unwrap();
+            assert!(Node::open(&original, Seed::from_bytes([49; 32])).is_err());
+            assert_eq!(
+                fs::read(original.join("control.db")).unwrap(),
+                catalog_before
+            );
             let peers: Vec<_> = certificate
                 .genesis
                 .members
@@ -14679,6 +14712,17 @@ pub(crate) mod tests {
                     };
                     node.volumes.store_repair(&node.control, &object).unwrap();
                 }
+                node.control
+                    .commit_checkpoint(
+                        &checkpoint.checkpoint.guild_id,
+                        checkpoint.checkpoint.generation,
+                        checkpoint.checkpoint.parent.as_ref(),
+                        &checkpoint.hash().unwrap(),
+                        &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                        &canonical_bytes(&checkpoint).unwrap(),
+                        false,
+                    )
+                    .unwrap();
                 let node_id = node.keys().node_id();
                 let node = Arc::new(Mutex::new(node));
                 peer_nodes.push(node.clone());
@@ -14717,7 +14761,87 @@ pub(crate) mod tests {
                 );
                 clients.push(client);
             }
-            for case in 0..5 {
+            for case in [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 4] {
+                // Fixture edits precede the read-only export. Every export must
+                // preserve the exact input bytes at its own starting point.
+                if case == 5 || case == 6 {
+                    let store = ControlStore::open(original.join("control.db"), &keys).unwrap();
+                    store
+                        .delete_record("guild-checkpoint", &checkpoint.hash().unwrap())
+                        .unwrap();
+                    if case == 5 {
+                        store
+                            .put_record(
+                                "user-revision",
+                                revision.value.revision_id.as_bytes(),
+                                &canonical_bytes(&revision).unwrap(),
+                            )
+                            .unwrap();
+                    } else {
+                        store
+                            .delete_record("user-revision", revision.value.revision_id.as_bytes())
+                            .unwrap();
+                    }
+                }
+                if case == 7 {
+                    // One peer still announces the head, but its copy is
+                    // corrupt. Another peer must provide the same certificate.
+                    let peer = peer_nodes[0].lock().unwrap();
+                    peer.control
+                        .put_record("guild-checkpoint", &checkpoint.hash().unwrap(), b"corrupt")
+                        .unwrap();
+                }
+                if matches!(case, 9 | 10 | 11 | 4) {
+                    let store = ControlStore::open(original.join("control.db"), &keys).unwrap();
+                    let mut installed = certificate.clone();
+                    if case == 9 {
+                        // Same guild and signers, different certified genesis.
+                        installed.genesis.coordinator = installed.genesis.members[1].node_id;
+                        installed.signatures = identities
+                            .iter()
+                            .map(|key| installed.genesis.member_signature(key).unwrap())
+                            .collect();
+                        installed
+                            .signatures
+                            .sort_by_key(|signature| signature.signer);
+                        installed.verify().unwrap();
+                        assert_ne!(installed.hash().unwrap(), certificate.hash().unwrap());
+                    }
+                    store
+                        .put_record(
+                            "guild-installed",
+                            b"primary",
+                            &canonical_bytes(&InstalledGuild {
+                                format_version: 2,
+                                certificate: installed,
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    if case == 10 {
+                        store.delete_record("guild-installed", b"primary").unwrap();
+                    }
+                    if case == 11 {
+                        // A valid owner signature with the same revision ID is
+                        // insufficient: the complete record must match the head.
+                        let mut different = revision.value.clone();
+                        different.metadata_sectors[0].root = [11; 32];
+                        let different =
+                            SignedRecord::sign(USER_REVISION_DOMAIN, different, &keys).unwrap();
+                        store
+                            .put_record(
+                                "user-revision",
+                                revision.value.revision_id.as_bytes(),
+                                &canonical_bytes(&different).unwrap(),
+                            )
+                            .unwrap();
+                    } else {
+                        store
+                            .delete_record("user-revision", revision.value.revision_id.as_bytes())
+                            .unwrap();
+                    }
+                }
+                let catalog_before = fs::read(original.join("control.db")).unwrap();
                 let target = temp.path().join(format!("export-{case}"));
                 let mut endpoints = selected.clone();
                 if case == 1 {
@@ -14758,14 +14882,18 @@ pub(crate) mod tests {
                 let result = crate::export_withdrawn_revision_from_catalog_over_network(
                     recovery_seed,
                     original.clone(),
-                    revision.value.revision_id,
+                    if case == 8 {
+                        Uuid::new_v4()
+                    } else {
+                        revision.value.revision_id
+                    },
                     target.clone(),
                     vec![],
                     vec![],
                     endpoints,
                 )
                 .await;
-                if case == 0 || case == 3 {
+                if matches!(case, 0 | 3 | 5 | 6 | 7) {
                     assert_eq!(result.unwrap().private_format, format);
                     use std::os::unix::ffi::OsStringExt;
                     assert_eq!(
