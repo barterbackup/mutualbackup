@@ -547,6 +547,29 @@ passing tests below apply only to their recorded source and exercised cases.
     Validation: all 104 core and 99 ordinary store tests pass (18 provisioned
     store cases remain ignored), with formatting and strict workspace/all-targets
     Clippy. Native source-backend and topology gates were not rerun for this API.
+  - [x] Repair damaged private catalog page payloads through the live recovered
+    information-sector installer. A bounded active source descriptor ties the
+    page to its exact local recipe and published pin. Node verifies the recovered
+    sector reference, guild/owner/scope, private address, ciphertext root,
+    canonical padding and page before repair. One writer transaction rechecks
+    recipe ownership, immutable page metadata and immediate child links, then
+    restores only the payload. A parent can be repaired while a child's payload
+    is missing; each child remains independently authenticated and repaired.
+    No Inline conversion or pin retirement occurs for an active page source.
+    Replacement/deletion of the recipe and retired intents fence stale repairs;
+    SQL IGNORE faults are rejected by affected-row checks. Two store and two
+    live Node fixtures cover corruption, missing payloads, reopen, stale recipe
+    snapshots, SQL ignore, retirement, independent parent/child repair and
+    guild/reference/ciphertext substitution, preserving recipe bytes, sector
+    ciphertext and commitments. This repairs existing local page ownership;
+    seed-only reconstruction of absent descriptors/ownership, signed paged
+    revision authority and production capture/recovery migration remain open.
+    Validation: all 104 core, 101 ordinary store, 364 ordinary Node and 16
+    CLI-library tests pass, plus all eight provisioned snapshot regressions on
+    disposable Btrfs with verified mount/image/loop cleanup. Formatting and
+    strict workspace/all-targets Clippy pass. Ordinary suites retain 18 store
+    and 20 Node provisioned cases; the eight snapshot cases ran separately.
+    This does not qualify complete seed-only paged recovery or the M6 topology.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

@@ -1687,6 +1687,42 @@ pub(crate) fn install_recovered_sector_recipe(
     {
         bail!("recovered information shard does not match its descriptor");
     }
+    if let Some(source) = control.catalog_sector_source(reference.id)? {
+        let recipe: LocalSectorRecipe = decode_canonical(&source.recipe)?;
+        ensure!(
+            recipe.guild_id == guild_id
+                && recipe.reference == reference
+                && canonical_bytes_bounded(&recipe, mb_store::CATALOG_SECTOR_RECIPE_BYTES)?
+                    == source.recipe,
+            "recovered catalog sector differs from its pinned source recipe"
+        );
+        let LocalPlaintextSource::CatalogPage {
+            scope,
+            section,
+            page,
+        } = recipe.source
+        else {
+            bail!("pinned catalog sector has another source kind");
+        };
+        ensure!(
+            scope == source.intent.scope && section == source.intent.section && page == source.page,
+            "recovered catalog page differs from its pinned source descriptor"
+        );
+        ensure!(
+            private_page_guild(keys, scope, section)? == guild_id,
+            "recovered catalog page belongs to another guild"
+        );
+        let encoded = page.open_private_page(
+            &keys.guild_content_id_key(&guild_id),
+            &keys.guild_data_key(&guild_id),
+            scope,
+            section,
+            &reference,
+            ciphertext,
+        )?;
+        control.repair_catalog_sector_page(reference.id, &source.recipe, &encoded)?;
+        return Ok(());
+    }
     if render_sector(control, keys, &reference.id, Some(&guild_id))
         .is_ok_and(|existing| existing == ciphertext)
     {

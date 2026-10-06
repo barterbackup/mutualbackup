@@ -14609,6 +14609,191 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn private_catalog_page_repair_restores_live_tree_without_inline_conversion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("node");
+        let seed = Seed::from_bytes([66; 32]);
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        let scope = mb_core::CatalogScope::Dataset {
+            guild_id: [1; 32],
+            owner: node.keys().node_id(),
+            protected_root_id: Uuid::from_bytes([2; 16]),
+        };
+        let section = mb_core::CatalogSection::FileMetadata;
+        let input = [
+            vec![8; mb_core::CATALOG_LEAF_BYTES],
+            vec![9; mb_core::CATALOG_LEAF_BYTES],
+            vec![10; 17],
+        ]
+        .concat();
+        let mut pages = Vec::new();
+        let mut sink = |reference, encoded| {
+            pages.push((reference, encoded));
+            Ok::<_, &'static str>(())
+        };
+        let mut builder = mb_core::CatalogBuilder::new(scope, section).unwrap();
+        builder.push(&input, &mut sink).unwrap();
+        let root = builder.finish(&mut sink).unwrap();
+        let mut sectors = Vec::new();
+        for (page, encoded) in &pages {
+            let intent = mb_store::CatalogIntent {
+                id: Uuid::new_v4(),
+                scope,
+                section,
+            };
+            let (reference, commitment) = node
+                .stage_private_catalog_page_source(intent, *page, encoded)
+                .unwrap();
+            let ciphertext = node.sector_for_guild(&[1; 32], &reference.id).unwrap();
+            let source = node
+                .control
+                .catalog_sector_source(reference.id)
+                .unwrap()
+                .unwrap();
+            sectors.push((
+                intent,
+                *page,
+                reference,
+                commitment,
+                ciphertext,
+                source.recipe,
+            ));
+        }
+        let parent = sectors.last().unwrap();
+        assert_eq!(parent.1, root);
+        node.control
+            .put_record("catalog-page-v1", &root.hash, &vec![0; parent.4.len()])
+            .unwrap();
+        node.control
+            .delete_record("catalog-page-v1", &sectors[0].1.hash)
+            .unwrap();
+        assert!(node.sector(&parent.2.id).is_err());
+        // The parent can be repaired while a descendant payload is missing:
+        // ownership and authenticated child links remain intact.
+        node.install_repaired_information_sector([1; 32], parent.2.clone(), &parent.4)
+            .unwrap();
+        assert_eq!(node.sector(&parent.2.id).unwrap(), parent.4);
+        let leaf = &sectors[0];
+        assert!(node.sector(&leaf.2.id).is_err());
+        node.install_repaired_information_sector([1; 32], leaf.2.clone(), &leaf.4)
+            .unwrap();
+        for (intent, page, reference, commitment, ciphertext, recipe) in &sectors {
+            node.install_repaired_information_sector([1; 32], reference.clone(), ciphertext)
+                .unwrap();
+            assert_eq!(
+                node.control
+                    .get_record("local-sector", &reference.id)
+                    .unwrap()
+                    .unwrap(),
+                *recipe
+            );
+            assert_eq!(node.sector(&reference.id).unwrap(), *ciphertext);
+            assert_eq!(merkle_commit(ciphertext).unwrap(), *commitment);
+            assert!(node.control.cancel_catalog(*intent).is_err());
+            assert_eq!(
+                node.control
+                    .catalog_sector_source(reference.id)
+                    .unwrap()
+                    .unwrap()
+                    .page,
+                *page
+            );
+        }
+        drop(node);
+        let node = Node::open(&path, seed).unwrap();
+        let mut reader = mb_core::CatalogReader::new(scope, section, root).unwrap();
+        let mut actual = Vec::new();
+        while let Some(bytes) = reader
+            .next_leaf(&mut |page| node.control.catalog_page(scope, section, page))
+            .unwrap()
+        {
+            actual.extend(bytes);
+        }
+        assert_eq!(actual, input);
+        for (_, _, reference, _, ciphertext, recipe) in sectors {
+            assert_eq!(node.sector(&reference.id).unwrap(), ciphertext);
+            assert_eq!(
+                node.control
+                    .get_record("local-sector", &reference.id)
+                    .unwrap()
+                    .unwrap(),
+                recipe
+            );
+        }
+    }
+
+    #[test]
+    fn private_catalog_page_repair_rejects_guild_reference_and_ciphertext_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path(), Seed::from_bytes([65; 32])).unwrap();
+        let scope = mb_core::CatalogScope::Dataset {
+            guild_id: [1; 32],
+            owner: node.keys().node_id(),
+            protected_root_id: Uuid::from_bytes([2; 16]),
+        };
+        let intent = mb_store::CatalogIntent {
+            id: Uuid::new_v4(),
+            scope,
+            section: mb_core::CatalogSection::GitGraph,
+        };
+        let mut encoded = Vec::new();
+        let mut sink = |_, bytes| {
+            encoded = bytes;
+            Ok::<_, &'static str>(())
+        };
+        let mut builder = mb_core::CatalogBuilder::new(scope, intent.section).unwrap();
+        builder.push(b"private graph", &mut sink).unwrap();
+        let page = builder.finish(&mut sink).unwrap();
+        let (reference, _) = node
+            .stage_private_catalog_page_source(intent, page, &encoded)
+            .unwrap();
+        let ciphertext = node.sector(&reference.id).unwrap();
+        let source = node
+            .control
+            .catalog_sector_source(reference.id)
+            .unwrap()
+            .unwrap();
+        let id = reference.id;
+        let damaged = vec![0; encoded.len()];
+        node.control
+            .put_record("catalog-page-v1", &page.hash, &damaged)
+            .unwrap();
+        for case in 0..4 {
+            let mut reference = reference.clone();
+            let mut ciphertext = ciphertext.clone();
+            let guild = if case == 0 { [9; 32] } else { [1; 32] };
+            if case == 1 {
+                reference.logical_len -= 1;
+            }
+            if case == 2 {
+                ciphertext[0] ^= 1;
+            }
+            if case == 3 {
+                ciphertext[0] ^= 1;
+                reference.root = mb_core::sector_root(&ciphertext);
+            }
+            assert!(
+                node.install_repaired_information_sector(guild, reference, &ciphertext)
+                    .is_err()
+            );
+            assert_eq!(
+                node.control
+                    .get_record("catalog-page-v1", &page.hash)
+                    .unwrap()
+                    .unwrap(),
+                damaged
+            );
+            assert_eq!(
+                node.control.catalog_sector_source(id).unwrap().unwrap(),
+                source
+            );
+        }
+        node.install_repaired_information_sector([1; 32], reference.clone(), &ciphertext)
+            .unwrap();
+        assert_eq!(node.sector(&reference.id).unwrap(), ciphertext);
+    }
+
+    #[test]
     fn private_catalog_page_source_runs_through_live_sector_renderer_and_reopens() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("node");

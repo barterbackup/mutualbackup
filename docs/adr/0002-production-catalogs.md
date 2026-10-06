@@ -862,3 +862,43 @@ all-targets Clippy. Native source-backend and topology gates were not rerun for
 this API addition. Quota admission, signed paged revisions and production
 capture/packing/replay/retention/recovery migration remain required; R3 and M6
 are still open.
+
+### Repair page payloads while retaining source ownership (2026-10-06)
+
+The shared recovered information-sector installer now recognizes an active
+private catalog source before considering Inline fallback. The bounded source
+descriptor comes from the exact live recipe and its published page pin. Node
+checks the recovered sector reference and recipe bytes, dataset guild/owner,
+scope/section, keyed private address, ciphertext root, padding and canonical
+page. It then restores the authenticated page payload rather than replacing
+the recipe with Inline bytes and leaving the page tree damaged.
+
+The SQLCipher repair transaction rechecks the exact recipe and published
+ownership, immutable page metadata and immediate child links under a writer
+lock. It changes only the bounded payload, including reinserting a missing
+payload when ownership and metadata remain intact. A parent's payload can be
+repaired before a missing descendant payload: existing authenticated child
+metadata and links are required, but each descendant's payload is independently
+verified and repaired. Missing/damaged ownership metadata or links are not
+reconstructed by this operation. Recipe replacement/deletion or source
+retirement rejects stale page repairs. Affected-row checks reject SQL IGNORE
+faults. The repaired source keeps its original recipe, pin and encrypted sector
+identity; ordinary cleanup continues to retain its closure.
+
+Two store fixtures cover oversized corrupt and missing payloads, reopened
+ownership, stale recipe snapshots, SQL ignore rollback and retired intent
+fences. Two live Node fixtures cover independent parent/child repair and reopen
+with exact recipe bytes, ciphertext and Merkle commitments, plus guild/reference/
+ciphertext substitution. This extends local repair under existing source
+ownership. It does not recover page descriptors/pins from an empty control
+store, establish signed paged revision authority or migrate normal capture,
+packing/checkpoint/retention and seed-only recovery. Those R3 gates and the real
+1 TiB dataset qualification remain open.
+
+Validation for this repair step: all 104 core, 101 ordinary store, 364 ordinary
+Node and 16 CLI-library tests pass. All eight provisioned snapshot regressions
+pass on disposable Btrfs, including native/Git source-loss reanchoring, with
+verified mount/image/loop cleanup. Formatting and strict workspace/all-targets
+Clippy pass. Ordinary suites retain 18 store and 20 Node provisioned cases; the
+eight snapshot cases ran separately. Full paged seed-only recovery and the M6
+topology/platform release gates remain unqualified.

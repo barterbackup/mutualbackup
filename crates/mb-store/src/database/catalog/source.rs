@@ -18,6 +18,13 @@ pub enum CatalogSourceSweep {
     Retired([u8; 32]),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogSectorSource {
+    pub intent: CatalogIntent,
+    pub page: CatalogPageRef,
+    pub recipe: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct SourcePin {
     format_version: u16,
@@ -47,6 +54,75 @@ fn delete_exact(connection: &Connection, kind: &str, key: &[u8]) -> Result<(), C
 }
 
 impl ControlStore {
+    /// Return a bounded source descriptor only while its exact live recipe is
+    /// still pinned. Repair must recheck ownership in its writer transaction.
+    pub fn catalog_sector_source(
+        &self,
+        sector_id: [u8; 32],
+    ) -> Result<Option<CatalogSectorSource>, CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let source = read_source(&transaction, sector_id)?;
+        transaction.commit()?;
+        Ok(source)
+    }
+
+    /// Replace a damaged or missing payload for an existing pinned page.
+    /// The caller authenticates recovered ciphertext and its sector reference;
+    /// this transaction rechecks the exact recipe, pin, immutable page metadata
+    /// and child links. It changes only the payload, preserving source lifetime.
+    pub fn repair_catalog_sector_page(
+        &self,
+        sector_id: [u8; 32],
+        expected_recipe: &[u8],
+        encoded: &[u8],
+    ) -> Result<(), CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let source = read_source(&transaction, sector_id)?.ok_or(DatabaseError::Conflict)?;
+        if source.recipe != expected_recipe {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let contents =
+            source
+                .page
+                .verify_page(source.intent.scope, source.intent.section, encoded)?;
+        let expected = PageMetadata {
+            format_version: 1,
+            scope: source.intent.scope,
+            section: source.intent.section,
+            reference: source.page,
+        };
+        if metadata(&transaction, source.page.hash)? != expected {
+            return Err(DatabaseError::Integrity.into());
+        }
+        if let CatalogPageContents::Index(children) = contents {
+            for child in children {
+                if metadata(&transaction, child.hash)?
+                    != (PageMetadata {
+                        reference: child,
+                        ..expected
+                    })
+                    || bounded_record(&transaction, &parents(child.hash), &source.page.hash, 0)?
+                        .as_deref()
+                        != Some(&[])
+                {
+                    return Err(DatabaseError::Integrity.into());
+                }
+            }
+        }
+        if transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            params![PAGE, source.page.hash, encoded],
+        )? != 1
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Publish one private page's source recipe and its immutable root pin in
     /// one writer transaction. The caller verifies sector address/encryption.
     /// This dedicated intent must own exactly this one page; existing parents
@@ -188,6 +264,53 @@ impl ControlStore {
     }
 }
 
+fn read_source(
+    connection: &Connection,
+    id: [u8; 32],
+) -> Result<Option<CatalogSectorSource>, CatalogStoreError> {
+    let Some(pin_bytes) = bounded_record(connection, PIN, &id, RECORD_BYTES)? else {
+        return Ok(None);
+    };
+    let pin: SourcePin = decode_canonical(&pin_bytes)?;
+    if pin.format_version != 1
+        || canonical_bytes(&pin)? != pin_bytes
+        || !pin.intent.section.is_private()
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    pin.page.validate()?;
+    let recipe = bounded_record(connection, SNAPSHOT, &id, CATALOG_SECTOR_RECIPE_BYTES)?
+        .ok_or(DatabaseError::Integrity)?;
+    let record = read_intent(connection, pin.intent)?;
+    if recipe.is_empty()
+        || bounded_record(connection, LINK, pin.intent.id.as_bytes(), 32)?.as_deref() != Some(&id)
+        || record.state != CatalogIntentState::Published(pin.page)
+        || record.owned_pages != 1
+        || record.owned_bytes != u64::from(pin.page.encoded_len)
+        || bounded_record(connection, &owners(pin.intent), &pin.page.hash, 0)?.as_deref()
+            != Some(&[])
+        || bounded_record(
+            connection,
+            &pins(pin.page.hash),
+            pin.intent.id.as_bytes(),
+            0,
+        )?
+        .as_deref()
+            != Some(&[])
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    let retained: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind = 'local-sector' AND record_id = ?1 AND bytes = ?2)",
+        params![id, recipe], |row| row.get(0),
+    )?;
+    Ok(retained.then_some(CatalogSectorSource {
+        intent: pin.intent,
+        page: pin.page,
+        recipe,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +334,161 @@ mod tests {
         let mut builder = CatalogBuilder::new(intent.scope, intent.section).unwrap();
         builder.push(bytes, &mut sink).unwrap();
         builder.finish(&mut sink).unwrap()
+    }
+
+    #[test]
+    fn catalog_source_repair_restores_corrupt_and_missing_payload_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[6; 32]).unwrap();
+        let source = operation(7);
+        let page = stage(&store, source, b"private paths");
+        let encoded = store
+            .catalog_page(source.scope, source.section, page)
+            .unwrap();
+        let id = [8; 32];
+        let recipe = b"bounded source recipe";
+        store
+            .publish_catalog_sector_recipe(source, page, id, recipe)
+            .unwrap();
+        for missing in [false, true] {
+            if missing {
+                store.delete_record(PAGE, &page.hash).unwrap();
+            } else {
+                store
+                    .put_record(PAGE, &page.hash, &vec![9; CATALOG_PAGE_BYTES * 2])
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .catalog_page(source.scope, source.section, page)
+                    .is_err()
+            );
+            let descriptor = store.catalog_sector_source(id).unwrap().unwrap();
+            assert_eq!(
+                descriptor,
+                CatalogSectorSource {
+                    intent: source,
+                    page,
+                    recipe: recipe.to_vec()
+                }
+            );
+            store
+                .repair_catalog_sector_page(id, recipe, &encoded)
+                .unwrap();
+            assert_eq!(
+                store
+                    .catalog_page(source.scope, source.section, page)
+                    .unwrap(),
+                encoded
+            );
+            assert_eq!(
+                store.get_record("local-sector", &id).unwrap().unwrap(),
+                recipe
+            );
+            assert_eq!(
+                store.sweep_catalog_source_pin().unwrap(),
+                CatalogSourceSweep::Retained(id)
+            );
+        }
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[6; 32]).unwrap();
+        assert_eq!(
+            store
+                .catalog_page(source.scope, source.section, page)
+                .unwrap(),
+            encoded
+        );
+        assert!(store.cancel_catalog(source).is_err());
+        assert!(!store.collect_catalog_page().unwrap());
+    }
+
+    #[test]
+    fn catalog_source_repair_fences_recipe_changes_ignored_sql_and_retired_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[5; 32]).unwrap();
+        let source = operation(8);
+        let page = stage(&store, source, b"private paths");
+        let encoded = store
+            .catalog_page(source.scope, source.section, page)
+            .unwrap();
+        let id = [9; 32];
+        let recipe = b"bounded source recipe";
+        store
+            .publish_catalog_sector_recipe(source, page, id, recipe)
+            .unwrap();
+        let damaged = vec![0; encoded.len()];
+        store.put_record(PAGE, &page.hash, &damaged).unwrap();
+        assert!(
+            store
+                .repair_catalog_sector_page(id, b"another recipe", &encoded)
+                .is_err()
+        );
+        assert!(
+            store
+                .repair_catalog_sector_page(id, recipe, &damaged)
+                .is_err()
+        );
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER ignore_page_repair BEFORE UPDATE ON protocol_records
+             WHEN NEW.kind = 'catalog-page-v1' BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .repair_catalog_sector_page(id, recipe, &encoded)
+                .is_err()
+        );
+        assert_eq!(
+            store.get_record(PAGE, &page.hash).unwrap().unwrap(),
+            damaged
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER ignore_page_repair")
+            .unwrap();
+        // Simulate a writer replacing the recipe after the repair descriptor
+        // was read. The replacement may be large: equality stays inside SQL.
+        store
+            .put_record("local-sector", &id, &vec![1; CATALOG_PAGE_BYTES])
+            .unwrap();
+        assert!(store.catalog_sector_source(id).unwrap().is_none());
+        assert!(
+            store
+                .repair_catalog_sector_page(id, recipe, &encoded)
+                .is_err()
+        );
+        assert_eq!(
+            store.get_record(PAGE, &page.hash).unwrap().unwrap(),
+            damaged
+        );
+        store.put_record("local-sector", &id, recipe).unwrap();
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[5; 32]).unwrap();
+        store
+            .repair_catalog_sector_page(id, recipe, &encoded)
+            .unwrap();
+        store.delete_record("local-sector", &id).unwrap();
+        assert_eq!(
+            store.sweep_catalog_source_pin().unwrap(),
+            CatalogSourceSweep::Retired(id)
+        );
+        while store.collect_catalog_page().unwrap() {}
+        assert!(
+            store
+                .repair_catalog_sector_page(id, recipe, &encoded)
+                .is_err()
+        );
+        assert!(store.catalog_sector_source(id).unwrap().is_none());
+        assert!(
+            store
+                .catalog_page(source.scope, source.section, page)
+                .is_err()
+        );
+        assert!(store.begin_catalog(source).is_err());
     }
 
     #[test]

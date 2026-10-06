@@ -22,7 +22,7 @@ pub use bundle::{
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };
-pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSourceSweep};
+pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSectorSource, CatalogSourceSweep};
 
 const INTENT: &str = "catalog-intent-v1";
 const PAGE: &str = "catalog-page-v1";
