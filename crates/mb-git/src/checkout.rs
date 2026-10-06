@@ -28,7 +28,8 @@ use crate::head::{
 };
 use crate::history::{
     GitBranchInfo, HistoryError, MergeIdentity, commit_descends_from, create_pathwise_merge_commit,
-    fetched_ref_record, list_branches_for_scope, merge_commit_parents, ref_kind, ref_oid,
+    fetched_ref_record, list_branches_for_scope, merge_commit_parents,
+    preflight_graph_with_blob_lengths, ref_kind, ref_oid,
 };
 use crate::merge::{
     MergeBlobError, MergeSession, load_merge_session_for_scope, session_key,
@@ -2171,13 +2172,21 @@ fn begin_checkout_to_for_scope(
         old_index_hash: None,
     };
     validate_intent(&intent, repository_id)?;
-    if !control.put_record_if_absent(
-        &intent_kind_for_scope(scope),
-        INTENT_KEY,
-        &encode_intent_for_scope(scope, root.identity()?, &intent)?,
-    )? {
-        return Err(CheckoutError::IncompatibleIntent);
-    }
+    let records = vec![(
+        intent_kind_for_scope(scope),
+        INTENT_KEY.to_vec(),
+        encode_intent_for_scope(scope, root.identity()?, &intent)?,
+    )];
+    control.put_records_and_delete_checked(&records, &[], || {
+        if control
+            .get_record(&intent_kind_for_scope(scope), INTENT_KEY)?
+            .is_some()
+        {
+            return Err(CheckoutError::IncompatibleIntent);
+        }
+        check_checkout_target(control, scope, &intent)?;
+        preflight_checkout_graph(control, scope, &intent)
+    })?;
     apply_intent(
         control,
         scope,
@@ -2686,6 +2695,96 @@ fn partial_restore_target(
     Ok(files)
 }
 
+// Validate the original branch and target again under the publication writer
+// lock; replay also uses this before staging any worktree changes.
+fn check_checkout_target(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    intent: &CheckoutIntent,
+) -> Result<(), CheckoutError> {
+    if branch_selected_elsewhere(control, scope, &intent.new_branch)? {
+        return Err(CheckoutError::BranchCheckedOutElsewhere);
+    }
+    let branches = list_branches_for_scope(control, scope)?;
+    let (old_current, target_available) = if matches!(intent.format_version, 7..=11) {
+        let current = target_branch_is_current(control, scope, intent)?;
+        (current, current)
+    } else if intent.advance_ref {
+        let local_ref = format!("refs/heads/{}", intent.old_branch);
+        let remote_ref = format!("refs/remotes/origin/{}", intent.new_branch);
+        let target_ref = intent
+            .target_ref
+            .as_deref()
+            .unwrap_or(remote_ref.as_bytes());
+        let old = ref_oid(control, intent.repository_id, local_ref.as_bytes())?;
+        let expected_old = if intent.old_oid == [0; 20] {
+            None
+        } else {
+            Some(Oid::from_bytes(&intent.old_oid)?)
+        };
+        let expected_target = if intent.format_version == 6 {
+            let (first, second) = merge_commit_parents(
+                control,
+                intent.repository_id,
+                Oid::from_bytes(&intent.new_oid)?,
+            )?;
+            if Some(first) != expected_old {
+                return Err(CheckoutError::IncompatibleIntent);
+            }
+            second
+        } else {
+            Oid::from_bytes(&intent.new_oid)?
+        };
+        (
+            selected_branch_for_scope(control, scope)? == intent.old_branch && old == expected_old,
+            ref_oid(control, intent.repository_id, target_ref)? == Some(expected_target),
+        )
+    } else if intent.format_version == 5 {
+        let old_ref = format!("refs/heads/{}", intent.old_branch);
+        (
+            selected_branch_for_scope(control, scope)? == intent.old_branch
+                && ref_oid(control, intent.repository_id, old_ref.as_bytes())?.is_none(),
+            branches
+                .iter()
+                .any(|branch| branch.name == intent.new_branch && branch.oid == intent.new_oid),
+        )
+    } else {
+        (
+            branches.iter().any(|branch| {
+                branch.current && branch.name == intent.old_branch && branch.oid == intent.old_oid
+            }),
+            branches
+                .iter()
+                .any(|branch| branch.name == intent.new_branch && branch.oid == intent.new_oid),
+        )
+    };
+    if !old_current || !target_available {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
+    Ok(())
+}
+
+fn preflight_checkout_graph(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    intent: &CheckoutIntent,
+) -> Result<(), CheckoutError> {
+    // Restore formats do not grow the graph or change its selected HEAD.
+    if intent.format_version > 6 {
+        return Ok(());
+    }
+    let mut records = vec![selected_branch_record_for_scope(scope, &intent.new_branch)?];
+    if intent.advance_ref {
+        records.push((
+            ref_kind(intent.repository_id),
+            format!("refs/heads/{}", intent.new_branch).into_bytes(),
+            fetched_ref_record(intent.new_oid)?,
+        ));
+    }
+    preflight_graph_with_blob_lengths(control, intent.repository_id, &records, &[])?;
+    Ok(())
+}
+
 fn apply_intent(
     control: &ControlStore,
     scope: GitWorktreeScope,
@@ -2713,6 +2812,10 @@ fn apply_intent(
     } else {
         None
     };
+    if intent.phase != Phase::Cleanup && intent.format_version <= 6 {
+        check_checkout_target(control, scope, intent)?;
+        preflight_checkout_graph(control, scope, intent)?;
+    }
     let existing_staging = catalog.open_child_directory(&intent.staging_name)?;
     if intent.phase == Phase::Preparing && !source_backend.supports_git_checkout_file() {
         for (index, entry) in intent.entries.iter().enumerate() {
@@ -2851,68 +2954,7 @@ fn apply_intent(
         save_intent(control, scope, root.identity()?, intent)?;
     }
     if intent.phase == Phase::Applying {
-        if branch_selected_elsewhere(control, scope, &intent.new_branch)? {
-            return Err(CheckoutError::BranchCheckedOutElsewhere);
-        }
-        let branches = list_branches_for_scope(control, scope)?;
-        let (old_current, target_available) = if matches!(intent.format_version, 7..=11) {
-            let current = target_branch_is_current(control, scope, intent)?;
-            (current, current)
-        } else if intent.advance_ref {
-            let local_ref = format!("refs/heads/{}", intent.old_branch);
-            let remote_ref = format!("refs/remotes/origin/{}", intent.new_branch);
-            let target_ref = intent
-                .target_ref
-                .as_deref()
-                .unwrap_or(remote_ref.as_bytes());
-            let old = ref_oid(control, intent.repository_id, local_ref.as_bytes())?;
-            let expected_old = if intent.old_oid == [0; 20] {
-                None
-            } else {
-                Some(Oid::from_bytes(&intent.old_oid)?)
-            };
-            let expected_target = if intent.format_version == 6 {
-                let (first, second) = merge_commit_parents(
-                    control,
-                    intent.repository_id,
-                    Oid::from_bytes(&intent.new_oid)?,
-                )?;
-                if Some(first) != expected_old {
-                    return Err(CheckoutError::IncompatibleIntent);
-                }
-                second
-            } else {
-                Oid::from_bytes(&intent.new_oid)?
-            };
-            (
-                selected_branch_for_scope(control, scope)? == intent.old_branch
-                    && old == expected_old,
-                ref_oid(control, intent.repository_id, target_ref)? == Some(expected_target),
-            )
-        } else if intent.format_version == 5 {
-            let old_ref = format!("refs/heads/{}", intent.old_branch);
-            (
-                selected_branch_for_scope(control, scope)? == intent.old_branch
-                    && ref_oid(control, intent.repository_id, old_ref.as_bytes())?.is_none(),
-                branches
-                    .iter()
-                    .any(|branch| branch.name == intent.new_branch && branch.oid == intent.new_oid),
-            )
-        } else {
-            (
-                branches.iter().any(|branch| {
-                    branch.current
-                        && branch.name == intent.old_branch
-                        && branch.oid == intent.old_oid
-                }),
-                branches
-                    .iter()
-                    .any(|branch| branch.name == intent.new_branch && branch.oid == intent.new_oid),
-            )
-        };
-        if !old_current || !target_available {
-            return Err(CheckoutError::IncompatibleIntent);
-        }
+        check_checkout_target(control, scope, intent)?;
         let target_files = if matches!(intent.format_version, 7 | 9) {
             let staged = staged_entries_for_scope(control, scope)?
                 .into_iter()
@@ -3198,6 +3240,7 @@ fn apply_intent(
                     fetched_ref_record(intent.new_oid)?,
                 ));
             }
+            let previous_intent = encode_intent_for_scope(scope, root.identity()?, intent)?;
             intent.phase = Phase::Cleanup;
             records.push((
                 intent_kind_for_scope(scope),
@@ -3205,7 +3248,7 @@ fn apply_intent(
                 encode_intent_for_scope(scope, root.identity()?, intent)?,
             ));
             let merge_session = load_merge_session_for_scope(control, scope)?;
-            if let Some((session, encoded)) = merge_session {
+            if let Some((session, _)) = &merge_session {
                 let (first, second) = merge_commit_parents(
                     control,
                     intent.repository_id,
@@ -3230,16 +3273,25 @@ fn apply_intent(
                 {
                     return Err(CheckoutError::IncompatibleIntent);
                 }
-                control.put_records_and_retire_and_delete_if_value(
-                    &records,
-                    &deletions,
-                    &session_kind_for_scope(scope),
-                    session_key(),
-                    &encoded,
-                )?;
-            } else {
-                control.put_records_and_delete(&records, &deletions)?;
+                deletions.push((session_kind_for_scope(scope), session_key().to_vec()));
             }
+            control.put_records_and_delete_checked(&records, &deletions, || {
+                if control.get_record(&intent_kind_for_scope(scope), INTENT_KEY)?
+                    != Some(previous_intent.clone())
+                {
+                    return Err(CheckoutError::IncompatibleIntent);
+                }
+                let expected_session = merge_session.as_ref().map(|(_, encoded)| encoded);
+                if control
+                    .get_record(&session_kind_for_scope(scope), session_key())?
+                    .as_ref()
+                    != expected_session
+                {
+                    return Err(CheckoutError::IncompatibleIntent);
+                }
+                check_checkout_target(control, scope, intent)?;
+                preflight_checkout_graph(control, scope, intent)
+            })?;
         }
         run_after_checkout_commit_hook();
     }
@@ -3301,6 +3353,123 @@ fn apply_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_admission_rejects_oversized_checkout_replay_before_staging() {
+        use crate::history::{metadata_kind, object_record};
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let catalog = directory.path().join("catalog");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&catalog).unwrap();
+        fs::write(source.join("untouched"), b"original").unwrap();
+        let database = directory.path().join("control.db");
+        let control = ControlStore::open_with_key(&database, &[7; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let scope = GitWorktreeScope::primary(repository_id);
+        let git = git2::Repository::init_bare(directory.path().join("git")).unwrap();
+        let tree_oid = git.treebuilder(None).unwrap().write().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Author", "a@example.test").unwrap();
+        let mut raw = git
+            .commit_create_buffer(&signature, &signature, "message", &tree, &[])
+            .unwrap()
+            .to_vec();
+        raw.resize(mb_core::V1_MAX_CATALOG_BYTES, b'x');
+        let oid = Oid::hash_object(ObjectType::Commit, &raw).unwrap();
+        let records = vec![
+            (
+                metadata_kind(repository_id),
+                tree_oid.as_bytes().to_vec(),
+                object_record(ObjectType::Tree, vec![]).unwrap(),
+            ),
+            (
+                metadata_kind(repository_id),
+                oid.as_bytes().to_vec(),
+                object_record(ObjectType::Commit, raw).unwrap(),
+            ),
+            (
+                ref_kind(repository_id),
+                b"refs/heads/main".to_vec(),
+                fetched_ref_record(oid.as_bytes().try_into().unwrap()).unwrap(),
+            ),
+        ];
+        control.put_records_and_delete(&records, &[]).unwrap();
+        drop(records);
+        let root = PinnedDirectory::open(&source).unwrap();
+        let catalog = PinnedDirectory::open(&catalog).unwrap();
+        let mut intent = CheckoutIntent {
+            format_version: 2,
+            repository_id,
+            old_branch: "main".to_owned(),
+            new_branch: "main".to_owned(),
+            old_oid: oid.as_bytes().try_into().unwrap(),
+            new_oid: oid.as_bytes().try_into().unwrap(),
+            advance_ref: false,
+            target_ref: None,
+            staging_name: format!("checkout-{}", Uuid::new_v4()),
+            staging_id: None,
+            phase: Phase::Preparing,
+            entries: vec![],
+            directories: vec![],
+            removed_directories: vec![],
+            selected_paths: vec![],
+            target_index: vec![],
+            old_index_hash: None,
+        };
+        let encoded = encode_intent_for_scope(scope, root.identity().unwrap(), &intent).unwrap();
+        control
+            .put_record(&intent_kind_for_scope(scope), INTENT_KEY, &encoded)
+            .unwrap();
+        assert!(matches!(
+            apply_intent(
+                &control,
+                scope,
+                &mut intent,
+                &root,
+                &catalog,
+                SourceBackendKind::ReflinkV1
+            ),
+            Err(CheckoutError::History(HistoryError::GraphTooLarge))
+        ));
+        assert!(
+            catalog
+                .open_child_directory(&intent.staging_name)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(source.join("untouched")).unwrap(), b"original");
+        assert_eq!(intent.phase, Phase::Preparing);
+        assert_eq!(
+            control
+                .get_record(&intent_kind_for_scope(scope), INTENT_KEY)
+                .unwrap(),
+            Some(encoded.clone())
+        );
+        for version in 7..=11 {
+            intent.format_version = version;
+            preflight_checkout_graph(&control, scope, &intent).unwrap();
+        }
+        drop(control);
+        let reopened = ControlStore::open_existing_with_key(&database, &[7; 32]).unwrap();
+        assert_eq!(
+            reopened
+                .get_record(&intent_kind_for_scope(scope), INTENT_KEY)
+                .unwrap(),
+            Some(encoded)
+        );
+        assert_eq!(
+            ref_oid(&reopened, repository_id, b"refs/heads/main").unwrap(),
+            Some(oid)
+        );
+        assert_eq!(
+            reopened
+                .records(&metadata_kind(repository_id))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     fn unanchored_restore_intent(
         repository_id: Uuid,

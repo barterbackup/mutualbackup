@@ -184,6 +184,33 @@ passing tests below apply only to their recorded source and exercised cases.
     with verified disposable Btrfs cleanup, formatting and strict workspace/
     all-targets Clippy. Eight provisioned snapshot cases remain ignored in the
     ordinary suite; the two named capture cases ran separately.
+  - [x] Preflight generated merges and checkout descriptor growth. Merge builds
+    its bounded generated blobs in a disposable memory backend, checks the whole
+    candidate graph before capturing anchors, then rechecks branch/HEAD and size
+    under the metadata publication writer lock. Branch-switch sizing includes
+    the prospective primary HEAD name; linked HEADs remain independent. Fresh
+    checkout checks admission before persisting an intent; replay checks before
+    staging/moving files. Final index/HEAD/ref publication and merge-session
+    retirement recheck intent ownership, branch/target and size atomically.
+    Same-tree branch selection uses the same writer-locked budget. Restore
+    operations and already-published cleanup do not acquire a growth restriction.
+    Rejected fresh merges preserve existing anchors and history; a rejected
+    pending checkout preserves its immutable journal for repair. Later failures
+    after successful initial admission can retain captured pending anchors or
+    partially applied worktrees under their existing replay journals.
+    Four new fixtures cover proposed HEAD validation, generated merge rejection
+    before anchor capture, HEAD-name growth at the descriptor boundary, and
+    oversized checkout replay without staging, including preserved history on
+    reopen. Full enclosing native/revision budgets, signed backup reconstruction,
+    oversized-history status/export and incremental scheduling remain open;
+    this descriptor admission increment does not close R2 or enable 1 TiB support.
+    Validation: all 83 ordinary and 62 provisioned Git library tests, 28 ordinary
+    snapshot regressions and both native Git capture/restore and rejected-capture
+    repair pass, with verified disposable Btrfs mount/image/loop cleanup. Formatting
+    and strict workspace/all-targets Clippy pass. The targeted admission run also
+    passes both existing SQL writer/fault fixtures. Eight provisioned snapshot
+    cases remain ignored in the ordinary suite; the two named native capture
+    cases ran separately. This is not the complete M6 release gate.
 
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
   production catalog design.** The first-release acceptance target is **1 TiB

@@ -55,7 +55,27 @@ pub(crate) fn selected_branch_for_scope(
     let Some(encoded) = control.get_record(&head_kind_for_scope(scope), HEAD_KEY)? else {
         return Ok("main".to_owned());
     };
-    let record: HeadRecord = decode_canonical(&encoded)?;
+    decode_selected_branch(&encoded)
+}
+
+pub(crate) fn proposed_selected_branch(
+    control: &ControlStore,
+    repository_id: Uuid,
+    changes: &[(String, Vec<u8>, Vec<u8>)],
+) -> Result<String, HeadError> {
+    let namespace = head_kind(repository_id);
+    if let Some((_, _, encoded)) = changes
+        .iter()
+        .rev()
+        .find(|(kind, key, _)| *kind == namespace && key == HEAD_KEY)
+    {
+        return decode_selected_branch(encoded);
+    }
+    selected_branch(control, repository_id)
+}
+
+fn decode_selected_branch(encoded: &[u8]) -> Result<String, HeadError> {
+    let record: HeadRecord = decode_canonical(encoded)?;
     if record.format_version != 1
         || record.branch.len() > 1024
         || !Branch::name_is_valid(&record.branch)?
@@ -190,6 +210,48 @@ pub(crate) fn selected_branch_record_for_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposed_head_uses_last_primary_change_and_validates_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(directory.path().join("catalog.db"), &[1; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let linked = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        store_selected_branch(&control, repository_id, "main").unwrap();
+        let mut changes = vec![selected_branch_record_for_scope(linked, "linked").unwrap()];
+        assert_eq!(
+            proposed_selected_branch(&control, repository_id, &changes).unwrap(),
+            "main"
+        );
+        changes.push(selected_branch_record(repository_id, "first").unwrap());
+        changes.push(selected_branch_record(repository_id, "last").unwrap());
+        assert_eq!(
+            proposed_selected_branch(&control, repository_id, &changes).unwrap(),
+            "last"
+        );
+        for (format_version, branch) in [
+            (2, "valid".to_owned()),
+            (1, "bad..name".to_owned()),
+            (1, "x".repeat(1025)),
+        ] {
+            changes.push((
+                head_kind(repository_id),
+                HEAD_KEY.to_vec(),
+                canonical_bytes(&HeadRecord {
+                    format_version,
+                    branch,
+                })
+                .unwrap(),
+            ));
+            assert!(matches!(
+                proposed_selected_branch(&control, repository_id, &changes),
+                Err(HeadError::IncompatibleRecord)
+            ));
+            changes.pop();
+        }
+        assert_eq!(selected_branch(&control, repository_id).unwrap(), "main");
+    }
 
     #[test]
     fn linked_head_is_independent_and_primary_key_is_stable() {

@@ -1,6 +1,6 @@
 //! Local Git tree/commit metadata over the encrypted catalog. Libgit2 builds
-//! canonical objects in a disposable metadata-only repository; file blobs never
-//! enter that repository or a Git object directory.
+//! canonical objects using disposable memory backends. Generated merge blobs
+//! stay bounded in memory; file payloads never enter a Git object directory.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
@@ -16,9 +16,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::head::{
-    HeadError, branch_selected_elsewhere, head_kind, linked_selected_branches, selected_branch,
-    selected_branch_for_scope, selected_branch_record, selected_ref_for_scope,
-    store_selected_branch_for_scope,
+    HeadError, branch_selected_elsewhere, head_kind, linked_selected_branches,
+    proposed_selected_branch, selected_branch, selected_branch_for_scope, selected_branch_record,
+    selected_branch_record_for_scope, selected_ref_for_scope,
 };
 use crate::merge::{
     GeneratedBlob, MergeBlobError, MergeFileInput, MergeFileInputs, capture_generated_blob,
@@ -1143,7 +1143,24 @@ pub(crate) fn switch_same_tree_branch_for_scope(
     if current_tree != target_tree {
         return Err(HistoryError::CheckoutRequired);
     }
-    store_selected_branch_for_scope(control, scope, name)?;
+    let previous_branch = selected_branch_for_scope(control, scope)?;
+    let records = vec![selected_branch_record_for_scope(scope, name)?];
+    control.put_records_and_delete_checked(&records, &[], || {
+        if branch_selected_elsewhere(control, scope, name)? {
+            return Err(HistoryError::BranchCheckedOutElsewhere);
+        }
+        if selected_branch_for_scope(control, scope)? != previous_branch
+            || head_oid_for_scope(control, scope)? != Some(current)
+            || ref_oid(
+                control,
+                repository_id,
+                format!("refs/heads/{name}").as_bytes(),
+            )? != Some(Oid::from_bytes(&target.oid)?)
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        preflight_graph_changes(control, repository_id, &records)
+    })?;
     Ok(GitBranchInfo {
         current: true,
         ..target
@@ -1420,12 +1437,21 @@ pub(crate) fn create_pathwise_merge_commit(
             }
         }
     }
-    for (path, inputs, blob) in &generated {
-        capture_generated_blob(control, scope, source, path, *inputs, blob)?;
+    let mut generated_lengths = BTreeMap::new();
+    for (_, _, blob) in &generated {
+        let oid: [u8; 20] = blob.oid.as_bytes().try_into().expect("SHA-1 OID");
+        if generated_lengths
+            .insert(oid, blob.bytes.len() as u64)
+            .is_some_and(|previous| previous != blob.bytes.len() as u64)
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
     }
-
     let mut anchors = Vec::new();
     for (oid, _) in merged.values() {
+        if generated_lengths.contains_key(oid) {
+            continue;
+        }
         let anchor = anchors_for_oid(control, repository_id, Oid::from_bytes(oid)?)?
             .into_iter()
             .next()
@@ -1434,6 +1460,14 @@ pub(crate) fn create_pathwise_merge_commit(
     }
     let native_odb = NativeOdb::from_anchors(anchors)?;
     let _metadata_pack = native_odb.odb().add_new_mempack_backend(1000)?;
+    // Generated text is already bounded by the per-file and aggregate merge
+    // limits. Only this disposable memory backend sees it before admission;
+    // no anchor or writable Git object directory is created for the candidate.
+    for (_, _, blob) in &generated {
+        if native_odb.odb().write(ObjectType::Blob, &blob.bytes)? != blob.oid {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+    }
     repository.set_odb(native_odb.odb())?;
     load_metadata(control, repository_id, &repository)?;
     let mut index = Index::new()?;
@@ -1505,7 +1539,28 @@ pub(crate) fn create_pathwise_merge_commit(
             return Err(HistoryError::IncompatibleRecord);
         }
     }
-    control.put_records_and_delete(&published, &[])?;
+    let branch = selected_branch_for_scope(control, scope)?;
+    let mut proposed = published;
+    let metadata_count = proposed.len();
+    proposed.push((
+        ref_kind(repository_id),
+        selected_ref_for_scope(control, scope)?,
+        fetched_ref_record(commit_oid.as_bytes().try_into().expect("SHA-1 OID"))?,
+    ));
+    let lengths: Vec<_> = generated_lengths.into_iter().collect();
+    let check = || {
+        if selected_branch_for_scope(control, scope)? != branch
+            || head_oid_for_scope(control, scope)? != Some(ours)
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        preflight_graph_with_blob_lengths(control, repository_id, &proposed, &lengths)
+    };
+    control.put_records_and_delete_checked(&[], &[], check)?;
+    for (path, inputs, blob) in &generated {
+        capture_generated_blob(control, scope, source, path, *inputs, blob)?;
+    }
+    control.put_records_and_delete_checked(&proposed[..metadata_count], &[], check)?;
     Ok(commit_oid)
 }
 
@@ -1835,7 +1890,7 @@ pub(crate) fn preflight_graph_with_blob_lengths(
         &graph.refs,
         &graph.objects,
         &blobs,
-        &selected_branch(control, repository_id)?,
+        &proposed_selected_branch(control, repository_id, changes)?,
         V1_MAX_CATALOG_BYTES,
     )
     .map_err(|error| match error {
@@ -2012,6 +2067,224 @@ mod tests {
 
     use super::*;
     use crate::{GitBackupBlob, GitGraphObject, GitGraphRef};
+
+    #[test]
+    fn git_admission_rejects_generated_merge_before_anchor_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let git = Repository::init_bare(directory.path().join("git")).unwrap();
+        let signature = Signature::now("Author", "a@example.test").unwrap();
+        let mut objects = Vec::new();
+        let mut anchor_kinds = Vec::new();
+        let mut commit = |bytes: &[u8], parent: Option<Oid>| {
+            let anchor = SourceBlobImportPlan::plan_direct(&source, bytes.len() as u64)
+                .unwrap()
+                .capture(bytes)
+                .unwrap();
+            let blob = git.blob(bytes).unwrap();
+            let kind = object_kind(repository_id, blob);
+            control
+                .put_record(
+                    &kind,
+                    anchor.anchor_id.as_bytes(),
+                    &canonical_bytes(&anchor).unwrap(),
+                )
+                .unwrap();
+            anchor_kinds.push(kind);
+            let mut builder = git.treebuilder(None).unwrap();
+            builder.insert("tracked", blob, 0o100644).unwrap();
+            let tree_oid = builder.write().unwrap();
+            let tree = git.find_tree(tree_oid).unwrap();
+            let parents: Vec<_> = parent
+                .into_iter()
+                .map(|oid| git.find_commit(oid).unwrap())
+                .collect();
+            let parent_refs: Vec<_> = parents.iter().collect();
+            let oid = git
+                .commit(None, &signature, &signature, "small", &tree, &parent_refs)
+                .unwrap();
+            for (kind, oid) in [(ObjectType::Tree, tree_oid), (ObjectType::Commit, oid)] {
+                objects.push((
+                    metadata_kind(repository_id),
+                    oid.as_bytes().to_vec(),
+                    object_record(kind, git.odb().unwrap().read(oid).unwrap().data().to_vec())
+                        .unwrap(),
+                ));
+            }
+            oid
+        };
+        let base = commit(b"first\nsecond\nthird\nfourth\nfifth\n", None);
+        let ours = commit(b"our first\nsecond\nthird\nfourth\nfifth\n", Some(base));
+        let theirs = commit(b"first\nsecond\nthird\nfourth\ntheir fifth\n", Some(base));
+        objects.push((
+            ref_kind(repository_id),
+            MAIN_REF.to_vec(),
+            fetched_ref_record(ours.as_bytes().try_into().unwrap()).unwrap(),
+        ));
+        objects.push((
+            ref_kind(repository_id),
+            b"refs/remotes/origin/main".to_vec(),
+            fetched_ref_record(theirs.as_bytes().try_into().unwrap()).unwrap(),
+        ));
+        control.put_records_and_delete(&objects, &[]).unwrap();
+        let before_metadata = control.records(&metadata_kind(repository_id)).unwrap();
+        let before_refs = control.records(&ref_kind(repository_id)).unwrap();
+        let before_files = std::fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        let scope = GitWorktreeScope::primary(repository_id);
+        assert!(matches!(
+            create_pathwise_merge_commit(
+                &control,
+                scope,
+                NativeSource {
+                    root: &source,
+                    backend: mb_store::SourceBackendKind::ReflinkV1
+                },
+                ours,
+                theirs,
+                MergeIdentity {
+                    name: "Author",
+                    email: "a@example.test",
+                    message: &"x".repeat(V1_MAX_CATALOG_BYTES)
+                },
+                None,
+            ),
+            Err(HistoryError::GraphTooLarge)
+        ));
+        assert_eq!(
+            control.records(&metadata_kind(repository_id)).unwrap(),
+            before_metadata
+        );
+        assert_eq!(
+            control.records(&ref_kind(repository_id)).unwrap(),
+            before_refs
+        );
+        assert_eq!(
+            std::fs::read_dir(&source)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>(),
+            before_files
+        );
+        assert!(!crate::merge::has_pending_merge_blob(&control, repository_id).unwrap());
+        for kind in &anchor_kinds {
+            assert_eq!(control.records(kind).unwrap().len(), 1);
+        }
+        drop(control);
+        let reopened = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(head_oid_for_scope(&reopened, scope).unwrap(), Some(ours));
+        assert_eq!(
+            export_graph_source(&reopened, repository_id)
+                .unwrap()
+                .blobs
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn git_admission_rejects_same_tree_head_growth_without_changing_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let git = Repository::init_bare(directory.path().join("git")).unwrap();
+        let tree_oid = git.treebuilder(None).unwrap().write().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("Author", "a@example.test").unwrap();
+        let mut raw = git
+            .commit_create_buffer(&signature, &signature, "message", &tree, &[])
+            .unwrap()
+            .to_vec();
+        raw.resize(V1_MAX_CATALOG_BYTES, b'x');
+        let long_branch = "x".repeat(200);
+        let mut refs = vec![
+            GitGraphRef {
+                name: MAIN_REF.to_vec(),
+                oid: [0; 20],
+            },
+            GitGraphRef {
+                name: format!("refs/heads/{long_branch}").into_bytes(),
+                oid: [0; 20],
+            },
+        ];
+        let mut objects = vec![
+            GitGraphObject {
+                kind: 1,
+                oid: [0; 20],
+                bytes: raw,
+            },
+            GitGraphObject {
+                kind: 2,
+                oid: tree_oid.as_bytes().try_into().unwrap(),
+                bytes: vec![],
+            },
+        ];
+        let overhead = crate::backup_size::dense_backup_size(
+            repository_id,
+            &refs,
+            &objects,
+            &[],
+            "main",
+            usize::MAX,
+        )
+        .unwrap()
+            - objects[0].bytes.len();
+        objects[0]
+            .bytes
+            .truncate(V1_MAX_CATALOG_BYTES - overhead - 1);
+        let oid = Oid::hash_object(ObjectType::Commit, &objects[0].bytes).unwrap();
+        objects[0].oid = oid.as_bytes().try_into().unwrap();
+        for reference in &mut refs {
+            reference.oid = objects[0].oid;
+        }
+        let mut records: Vec<_> = objects
+            .iter()
+            .map(|object| {
+                (
+                    metadata_kind(repository_id),
+                    object.oid.to_vec(),
+                    object_record(object_type(object.kind).unwrap(), object.bytes.clone()).unwrap(),
+                )
+            })
+            .collect();
+        records.extend(refs.iter().map(|reference| {
+            (
+                ref_kind(repository_id),
+                reference.name.clone(),
+                fetched_ref_record(reference.oid).unwrap(),
+            )
+        }));
+        control.put_records_and_delete(&records, &[]).unwrap();
+        drop(records);
+        drop(objects);
+        assert!(matches!(
+            switch_same_tree_branch(&control, repository_id, &long_branch),
+            Err(HistoryError::GraphTooLarge)
+        ));
+        assert_eq!(selected_branch(&control, repository_id).unwrap(), "main");
+        assert_eq!(control.records(&ref_kind(repository_id)).unwrap().len(), 2);
+        drop(control);
+        let reopened = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(selected_branch(&reopened, repository_id).unwrap(), "main");
+        let graph = export_graph_source(&reopened, repository_id).unwrap();
+        GitBackupDescriptor {
+            format_version: 4,
+            repository_id,
+            refs: graph.refs,
+            objects: graph.objects,
+            blobs: vec![],
+            head_branch: "main".to_owned(),
+        }
+        .validate()
+        .unwrap();
+    }
 
     #[test]
     fn git_admission_rejects_large_commit_before_publishing_objects_or_ref() {

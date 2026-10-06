@@ -651,3 +651,39 @@ regressions pass, with verified disposable Btrfs mount/image/loop cleanup,
 formatting and strict workspace/all-targets Clippy. The ordinary snapshot suite
 retains eight ignored provisioned cases; the two named capture tests ran
 separately. This is targeted mutation/replay qualification, not the full M6 gate.
+
+Generated merges now build their candidate tree/commit and bounded text blobs
+in disposable memory backends before capturing native anchors. Admission counts
+the entire prospective reachable graph with generated blob lengths, then checks
+branch/HEAD and size again under the metadata publication writer lock. No file
+payload is written to a Git object directory. A rejected initial admission
+preserves existing history and anchors; subsequent interrupted capture retains
+its existing owned journals for replay.
+
+Descriptor sizing now reads the prospective primary HEAD record, including its
+name length. Linked-worktree HEAD records do not replace that primary backup
+HEAD. Same-tree branch selection checks the current branch, old and target refs,
+branch reservations and budget under its publication writer lock. Fresh checkout
+checks before publishing an intent; replay checks before staging/moving files.
+Final index/HEAD/ref publication and merge-session retirement recheck the exact
+journal, branch/target and budget in one writer transaction. Restore formats do
+not grow the graph, and cleanup of already-published operations can proceed
+without a new descriptor growth restriction. A capacity failure on a pending
+checkout preserves its journal for repair. Worktree moves remain replayable;
+this SQL publication check does not make filesystem moves transactional.
+
+Four new fixtures exercise proposed HEAD validation, oversized generated merges
+before anchor capture, HEAD-name growth at the descriptor boundary, and oversized
+checkout replay without staging, including unchanged prior history on reopen.
+The full enclosing native/revision contract, signed backup reconstruction,
+oversized-history status/export policy, incremental scheduling and end-to-end
+capacity qualification remain open. This increment does not enable production
+admission or the declared 1 TiB target.
+
+All 83 ordinary and 62 provisioned Git library tests, 28 ordinary snapshot
+regressions and both native Git capture/restore and rejected-capture repair pass.
+Disposable Btrfs mount/image/loop cleanup is verified; formatting and strict
+workspace/all-targets Clippy pass. The targeted admission run also passes both
+existing SQL writer/fault fixtures. Eight provisioned snapshot cases remain
+ignored in the ordinary suite; the two named capture cases ran separately.
+This is targeted mutation/replay qualification, not the complete M6 release gate.
