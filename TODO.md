@@ -264,6 +264,35 @@ passing tests below apply only to their recorded source and exercised cases.
     fixture pass (229 unique cases). Formatting and strict locked workspace/
     all-targets Clippy pass. Complete ordinary Node/Git suites, provisioned cases
     and full M6 upgrade/platform/release qualification were not rerun.
+  - [x] Add explicit authenticated peer inputs to Linux catalog export using
+    repeatable `--peer NODE-ID=MULTIADDR`. A separate private temporary client
+    workspace supplies transport credentials without starting the withdrawn
+    installation. Only read requests are issued; there is no DHT publication,
+    repair, enrollment, source migration or retirement. Local shard/zero inputs
+    are collected first; remaining fixed/variable positions prefer selected
+    assigned holders and then emergency copies, stopping once a decoding quorum
+    is present. Root/commitment, full-codeword and owner-signed output checks
+    remain mandatory. Existing guild authorization and frame bounds apply.
+    Direct information copies can also supply exact owner-signed sectors.
+    Invalid/identity-mismatched peer arguments fail before recovery-string input.
+    The canonical temporary parent must be outside all selected preserved inputs;
+    a confined `TMPDIR` is rejected before creating client state.
+    Missing peer discovery, checkpoints/events/transcripts and retained-history
+    inventory/conversion remain open; this does not unlock foreign volume images.
+    Validation: a real authenticated three-survivor fixture exports formats 6/7
+    while normal owner startup rejects the withdrawn catalog, including raw file
+    bytes and stock Git history. Too few survivors, a wrong recovery identity and
+    a peer serving internally valid bytes with the wrong certified root reject
+    without publication. An unused unavailable peer does not delay the available
+    quorum. Original database bytes, absent key/parity files and temporary-client
+    cleanup are checked. The real CLI exercises peer mode with cached inputs and
+    rejects a confined `TMPDIR` without creating entries in the preserved catalog.
+    All 104 core, 108 ordinary store, twelve targeted exporter/recovery tests,
+    two preserved-volume reader tests, one frame-bound test, four CLI unit tests
+    and the real CLI fixture pass (232 unique cases). Formatting and strict
+    locked workspace/all-targets Clippy pass. This does not rerun complete ordinary
+    Node/Git suites, provisioned cases, real variable/relay/Tor peer export
+    qualification or the full M6 upgrade/platform/release requirements.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

@@ -1,7 +1,9 @@
-//! Offline, mount-free export of authenticated withdrawn private formats.
+//! Mount-free export of authenticated withdrawn private formats.
 //! Original catalogs and explicitly selected preserved anchors are read-only.
 
 mod recovery;
+mod remote;
+pub use remote::{LegacyExportPeer, export_withdrawn_revision_from_catalog_over_network};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -342,6 +344,26 @@ pub fn export_withdrawn_revision_from_catalog_with_preserved_sources(
     anchor_areas: &[std::path::PathBuf],
     parity_volumes: &[std::path::PathBuf],
 ) -> Result<LegacyExportReport> {
+    export_catalog(
+        keys,
+        data_dir,
+        revision_id,
+        target,
+        anchor_areas,
+        parity_volumes,
+        None,
+    )
+}
+
+fn export_catalog(
+    keys: &KeyMaterial,
+    data_dir: &Path,
+    revision_id: Uuid,
+    target: &Path,
+    anchor_areas: &[std::path::PathBuf],
+    parity_volumes: &[std::path::PathBuf],
+    remote: Option<&remote::PeerRecovery>,
+) -> Result<LegacyExportReport> {
     let data_dir = data_dir.canonicalize()?;
     let parent = target
         .parent()
@@ -496,6 +518,10 @@ pub fn export_withdrawn_revision_from_catalog_with_preserved_sources(
         })?;
     }
     let mut checkpoint_recovery = recovery::CheckpointRecovery::default();
+    let inputs = recovery::RecoveryInputs {
+        volumes: &volumes,
+        remote,
+    };
     export_withdrawn_revision_from_source(keys, &revision, target, |id| {
         let reference = references
             .get(id)
@@ -506,10 +532,17 @@ pub fn export_withdrawn_revision_from_catalog_with_preserved_sources(
             Err(error) => Some(error),
         };
         let Some(locator) = recovered.get(&reference.root) else {
-            if let Some(bytes) =
-                checkpoint_recovery.load(&control, &revision, reference, &volumes)?
-            {
+            let checkpoint_error =
+                match checkpoint_recovery.load(&control, &revision, reference, &inputs) {
+                    Ok(Some(bytes)) => return Ok(bytes),
+                    Ok(None) => None,
+                    Err(error) => Some(error),
+                };
+            if let Some(bytes) = remote.and_then(|peer| peer.sector(guild, reference)) {
                 return Ok(bytes);
+            }
+            if let Some(error) = checkpoint_error {
+                return Err(error);
             }
             if let Some(error) = local_error {
                 return Err(error).context("legacy source could not be authenticated; original anchors and journals remain preserved");
@@ -529,7 +562,7 @@ pub fn export_withdrawn_revision_from_catalog_with_preserved_sources(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{GuardedPrivateStatV6, PrivateDataExtent};
     use ed25519_dalek::SigningKey;
@@ -1062,13 +1095,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn legacy_export_reconstructs_every_cached_three_of_five_codeword_without_mutation() {
+    pub(crate) type FixedFixture = (
+        Fixture,
+        Vec<KeyMaterial>,
+        Vec<(mb_core::CodingGroup, [Vec<u8>; 5])>,
+        mb_core::QuorumCheckpoint,
+    );
+
+    pub(crate) fn fixed_checkpoint_fixture(format: u16) -> FixedFixture {
         use mb_core::{
             CodingGroup, GuildCheckpoint, InformationRole, Member, ParityRole, QuorumCheckpoint,
             ShardRole, WriterFence,
         };
-        let (keys, revision, sectors) = fixture(6);
+        let (keys, revision, sectors) = fixture(format);
         let members: Vec<_> = [49, 71, 72, 73, 74]
             .into_iter()
             .map(|byte| KeyMaterial::from_seed(&Seed::from_bytes([byte; 32])))
@@ -1166,6 +1205,12 @@ mod tests {
             checkpoint.add_signature(member).unwrap();
         }
         checkpoint.verify().unwrap();
+        ((keys, revision, sectors), members, groups, checkpoint)
+    }
+
+    #[test]
+    fn legacy_export_reconstructs_every_cached_three_of_five_codeword_without_mutation() {
+        let ((keys, revision, sectors), members, groups, checkpoint) = fixed_checkpoint_fixture(6);
         let hash = checkpoint.hash().unwrap();
         let combinations = [
             [0, 1, 2],
@@ -1222,7 +1267,12 @@ mod tests {
             {
                 assert_eq!(
                     decoder
-                        .load(&inspected, &revision, reference, &[])
+                        .load(
+                            &inspected,
+                            &revision,
+                            reference,
+                            &recovery::RecoveryInputs::default()
+                        )
                         .unwrap()
                         .unwrap(),
                     sectors[&reference.id],

@@ -2280,7 +2280,7 @@ impl P2pClient {
         Ok(bytes)
     }
 
-    async fn variable_shard(
+    pub(crate) async fn variable_shard(
         &self,
         peer: NodeId,
         group: &CodingGroupV2,
@@ -2313,7 +2313,7 @@ impl P2pClient {
         Ok(bytes)
     }
 
-    async fn variable_emergency_shard(
+    pub(crate) async fn variable_emergency_shard(
         &self,
         peer: NodeId,
         group: &CodingGroupV2,

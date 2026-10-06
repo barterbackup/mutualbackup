@@ -152,8 +152,30 @@ mutualbackup legacy-export \
   --seed-file /preserved/recovery.txt
 ```
 
-This does not download peer data or unlock other identities' volume databases.
-Keep coding transcripts and peer-held history for the remaining recovery work.
+Unavailable inputs can also come from explicitly selected surviving peers.
+Repeat `--peer NODE-ID=MULTIADDR` in catalog mode; the multiaddress must end in
+the peer ID belonging to that node identity. For example, add
+`--peer NODE-ID=/ip4/ADDRESS/udp/PORT/quic-v1/p2p/PEER-ID` to the command above.
+The client uses a separate private temporary workspace and the recovered
+identity's authenticated transport. It never starts the original installation,
+publishes recovery state, repairs shards, enrolls a root or retires source data.
+Original catalog, key and selected local volume state remain read-only.
+`TMPDIR` must resolve outside the preserved installation and selected anchor/
+parity areas; otherwise peer mode rejects it before creating any client state.
+
+Local shards and authenticated zeros are considered first. If insufficient,
+the client requests only the remaining positions needed for reconstruction,
+preferring explicitly selected assigned holders before emergency copies.
+Fixed reads check exact length/flat roots; variable reads check the transcript's
+commitments. The full decoded codeword and final signed output checks still
+apply. Direct information-sector copies also require their owner-signed root.
+An unavailable unused peer does not postpone a locally or remotely available
+quorum. Existing peer guild authorization remains enforced.
+
+This does not discover peers through the recovery directory, fetch missing
+checkpoint/event/transcript history, unlock other identities' volume databases
+or inventory/convert all retained revisions. Keep missing historical metadata,
+coding transcripts and peer-held history for the remaining recovery work.
 
 If a signed sector is available only in preserved anchor files, supply its area
 explicitly. Repeat `--anchor-area` for distinct areas:
@@ -271,3 +293,17 @@ position with preserved fixed parity while both original information objects
 are absent. Catalog and parity database bytes remain unchanged. Formatting and
 strict workspace/all-targets Clippy pass. This increment does not rerun complete
 ordinary Node/Git suites, provisioned cases or the full M6 release requirements.
+
+The explicit-peer increment passes 104 core and 108 ordinary store tests,
+twelve targeted exporter/recovery tests, two preserved-volume reader tests,
+one wire frame-bound test, four CLI unit tests and the real CLI fixture
+(232 unique cases). Real authenticated survivors recover formats 6/7 while
+normal startup rejects the withdrawn owner catalog. Insufficient survivors,
+a wrong recovery identity and valid stored peer bytes with a conflicting
+certified root fail without publication. An unused unavailable peer does not
+delay an available quorum. Original catalog bytes and absent key/parity files
+are preserved, and temporary client directories are cleaned up. CLI peer mode
+with cached inputs and confined `TMPDIR` rejection also pass. Formatting and
+strict workspace/all-targets Clippy pass. Real variable/relay/Tor peer export,
+complete ordinary Node/Git suites, provisioned cases and full M6 qualification
+remain open.

@@ -145,6 +145,9 @@ enum Command {
         /// Explicit preserved local parity volume; repeat for multiple volumes.
         #[arg(long, requires = "data_dir", conflicts_with_all = ["revision_file", "sectors_dir"])]
         parity_volume: Vec<PathBuf>,
+        /// Explicit surviving peer NODE-ID=MULTIADDR; repeat to combine peers.
+        #[arg(long, requires = "data_dir", conflicts_with_all = ["revision_file", "sectors_dir"])]
+        peer: Vec<mb_node::LegacyExportPeer>,
         /// New export package outside the input directories; parent must exist.
         #[arg(long)]
         destination: PathBuf,
@@ -258,15 +261,29 @@ async fn main() -> Result<()> {
             revision_id,
             anchor_area,
             parity_volume,
+            peer,
             destination,
             seed_file,
             seed_stdin,
         } => {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             let seed = derive_seed(&recovery).await?;
-            let report = tokio::task::spawn_blocking(move || {
-                let keys = KeyMaterial::from_seed(&seed);
-                match (revision_file, sectors_dir, data_dir, revision_id) {
+            let report =
+                if !peer.is_empty() {
+                    mb_node::export_withdrawn_revision_from_catalog_over_network(
+                        seed,
+                        data_dir.context("peer recovery requires a preserved catalog")?,
+                        revision_id.context("peer recovery requires a revision ID")?,
+                        destination,
+                        anchor_area,
+                        parity_volume,
+                        peer,
+                    )
+                    .await?
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        let keys = KeyMaterial::from_seed(&seed);
+                        match (revision_file, sectors_dir, data_dir, revision_id) {
                     (Some(revision), Some(sectors), None, None) => {
                         mb_node::export_withdrawn_revision_from_files(
                             &keys,
@@ -287,8 +304,9 @@ async fn main() -> Result<()> {
                     }
                     _ => bail!("select revision-file/sectors-dir or data-dir/revision-id inputs"),
                 }
-            })
-            .await??;
+                    })
+                    .await??
+                };
             println!(
                 "exported revision {} (private format {})",
                 report.revision_id, report.private_format
@@ -1068,6 +1086,7 @@ fn legacy_export_requires_complete_exclusive_input_modes_before_recovery() {
         vec!["--revision-id", id],
         vec!["--anchor-area", "area"],
         vec!["--parity-volume", "volume"],
+        vec!["--peer", "invalid"],
         vec![
             "--revision-file",
             "revision",
@@ -1102,6 +1121,44 @@ fn legacy_export_requires_complete_exclusive_input_modes_before_recovery() {
     }
     assert!(parse(&["--revision-file", "revision", "--sectors-dir", "sectors"]).is_ok());
     assert!(parse(&["--data-dir", "original", "--revision-id", id]).is_ok());
+    let peer = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
+    let endpoint = format!(
+        "{peer}=/ip4/127.0.0.1/udp/9/quic-v1/p2p/{}",
+        peer.libp2p_peer_id().unwrap()
+    );
+    assert!(
+        parse(&[
+            "--data-dir",
+            "original",
+            "--revision-id",
+            id,
+            "--peer",
+            &endpoint
+        ])
+        .is_ok()
+    );
+    assert!(
+        parse(&[
+            "--data-dir",
+            "original",
+            "--revision-id",
+            id,
+            "--peer",
+            "invalid"
+        ])
+        .is_err()
+    );
+    assert!(
+        parse(&[
+            "--revision-file",
+            "revision",
+            "--sectors-dir",
+            "sectors",
+            "--peer",
+            &endpoint
+        ])
+        .is_err()
+    );
     let cli = parse(&[
         "--data-dir",
         "original",

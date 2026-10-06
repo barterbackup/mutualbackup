@@ -11,6 +11,12 @@ use mb_core::{
 use mb_store::ControlStore;
 
 #[derive(Default)]
+pub(super) struct RecoveryInputs<'a> {
+    pub(super) volumes: &'a [PreservedParityVolume],
+    pub(super) remote: Option<&'a super::remote::PeerRecovery>,
+}
+
+#[derive(Default)]
 pub(super) struct CheckpointRecovery {
     checkpoint: Option<([u8; 32], QuorumCheckpoint)>,
     codeword: Option<DecodedCodeword>,
@@ -28,7 +34,7 @@ impl CheckpointRecovery {
         control: &ControlStore,
         revision: &SignedRecord<UserRevision>,
         reference: &SectorRef,
-        volumes: &[PreservedParityVolume],
+        inputs: &RecoveryInputs<'_>,
     ) -> Result<Option<Vec<u8>>> {
         let mut last_error = None;
         if let Some((hash, checkpoint)) = &self.checkpoint {
@@ -39,7 +45,7 @@ impl CheckpointRecovery {
                 revision,
                 reference,
                 &mut self.codeword,
-                volumes,
+                inputs,
             ) {
                 Ok(bytes) => return Ok(Some(bytes)),
                 Err(error) => last_error = Some(error),
@@ -81,7 +87,7 @@ impl CheckpointRecovery {
                     revision,
                     reference,
                     &mut self.codeword,
-                    volumes,
+                    inputs,
                 ) {
                     Ok(bytes) => {
                         found = Some(bytes);
@@ -112,11 +118,11 @@ fn recover(
     revision: &SignedRecord<UserRevision>,
     reference: &SectorRef,
     decoded: &mut Option<DecodedCodeword>,
-    volumes: &[PreservedParityVolume],
+    inputs: &RecoveryInputs<'_>,
 ) -> Result<Vec<u8>> {
     if checkpoint.checkpoint.packing_catalog.is_some() {
         return recover_packed(
-            control, checkpoint, revision, reference, hash, decoded, volumes,
+            control, checkpoint, revision, reference, hash, decoded, inputs,
         );
     }
     for group in &checkpoint.checkpoint.coding_groups {
@@ -146,7 +152,7 @@ fn recover(
                     .recovery_shard(&hash, &group.guild_id, &group.id, index as u8, root)
                     .ok()
                     .or_else(|| {
-                        volumes.iter().find_map(|volume| {
+                        inputs.volumes.iter().find_map(|volume| {
                             volume
                                 .load_fixed(&group.guild_id, &group.id, index as u8, root)
                                 .ok()
@@ -164,6 +170,18 @@ fn recover(
                 if info.sector.logical_len == 0 && info.sector.root == zero_root)
             {
                 shards[index] = Some(zero.clone());
+            }
+        }
+        if let Some(remote) = inputs.remote {
+            for assigned_only in [true, false] {
+                for position in (0..shards.len()).rev() {
+                    if shards.iter().flatten().count() >= usize::from(group.data_shards) {
+                        break;
+                    }
+                    if shards[position].is_none() {
+                        shards[position] = remote.fixed(group, position, assigned_only);
+                    }
+                }
             }
         }
         reconstruct_3_2(&mut shards)
@@ -197,7 +215,7 @@ fn recover_packed(
     reference: &SectorRef,
     checkpoint_hash: [u8; 32],
     decoded: &mut Option<DecodedCodeword>,
-    volumes: &[PreservedParityVolume],
+    inputs: &RecoveryInputs<'_>,
 ) -> Result<Vec<u8>> {
     let guild = checkpoint.checkpoint.guild_id;
     let catalog = checkpoint
@@ -256,15 +274,12 @@ fn recover_packed(
             })();
             match cached {
                 Ok(bytes) => bytes,
-                Err(error) if volumes.is_empty() => return Err(error),
-                Err(_) => recover_variable(
-                    control,
-                    guild,
-                    checkpoint_hash,
-                    descriptor,
-                    decoded,
-                    volumes,
-                )?,
+                Err(error) if inputs.volumes.is_empty() && inputs.remote.is_none() => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    recover_variable(control, guild, checkpoint_hash, descriptor, decoded, inputs)?
+                }
             }
         };
         ensure!(
@@ -321,12 +336,12 @@ fn recover_variable(
     checkpoint_hash: [u8; 32],
     descriptor: &mb_core::PackedSectorDescriptor,
     decoded: &mut Option<DecodedCodeword>,
-    volumes: &[PreservedParityVolume],
+    inputs: &RecoveryInputs<'_>,
 ) -> Result<Vec<u8>> {
     // An intact information copy needs only the certified descriptor. Its
     // position can change between retained groups, but its storage key cannot.
     for index in 0..mb_core::MAX_CODING_SHARDS {
-        for volume in volumes {
+        for volume in inputs.volumes {
             if let Ok(bytes) =
                 volume.load_variable(&guild, &descriptor.id, index, &descriptor.commitment)
             {
@@ -386,7 +401,8 @@ fn recover_variable(
                     let bytes = if zero {
                         Some(vec![0; group.profile.shard_size as usize])
                     } else {
-                        volumes
+                        inputs
+                            .volumes
                             .iter()
                             .find_map(|volume| {
                                 volume
@@ -407,6 +423,20 @@ fn recover_variable(
                     };
                     shards.push(bytes);
                     commitments.push(commitment);
+                }
+                if let Some(remote) = inputs.remote {
+                    for assigned_only in [true, false] {
+                        for position in (0..shards.len()).rev() {
+                            if shards.iter().flatten().count()
+                                >= usize::from(group.profile.data_shards)
+                            {
+                                break;
+                            }
+                            if shards[position].is_none() {
+                                shards[position] = remote.variable(group, position, assigned_only);
+                            }
+                        }
+                    }
                 }
                 mb_core::reconstruct(group.profile, &mut shards)
                     .context("not enough authenticated preserved variable shards")?;

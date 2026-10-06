@@ -14608,6 +14608,204 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_export_peer_recovery_reads_real_survivors_without_opening_withdrawn_node() {
+        use crate::{P2pConfig, build_p2p};
+        for format in [6, 7] {
+            let ((keys, revision, _), identities, groups, checkpoint) =
+                crate::legacy_export::tests::fixed_checkpoint_fixture(format);
+            let temp = tempfile::tempdir().unwrap();
+            let original = temp.path().join("withdrawn");
+            fs::create_dir(&original).unwrap();
+            let store = ControlStore::open(original.join("control.db"), &keys).unwrap();
+            store
+                .put_record(
+                    "guild-checkpoint",
+                    &checkpoint.hash().unwrap(),
+                    &canonical_bytes(&checkpoint).unwrap(),
+                )
+                .unwrap();
+            store
+                .put_record("guarded-view-mount-v1", b"legacy", b"must not replay")
+                .unwrap();
+            drop(store);
+            let catalog_before = fs::read(original.join("control.db")).unwrap();
+            assert!(Node::open(&original, Seed::from_bytes([49; 32])).is_err());
+            let genesis = GuildGenesis {
+                format_version: 1,
+                guild_id: revision.value.guild_id,
+                coordinator: checkpoint.checkpoint.members[0].node_id,
+                members: checkpoint.checkpoint.members.clone(),
+            };
+            let mut certificate = QuorumGuildGenesis {
+                signatures: identities
+                    .iter()
+                    .map(|key| genesis.member_signature(key).unwrap())
+                    .collect(),
+                genesis,
+            };
+            certificate
+                .signatures
+                .sort_by_key(|signature| signature.signer);
+            certificate.verify().unwrap();
+            let peers: Vec<_> = certificate
+                .genesis
+                .members
+                .iter()
+                .map(|member| GuildPeer {
+                    member: member.clone(),
+                    endpoints: vec![],
+                })
+                .collect();
+            let mut clients = Vec::new();
+            let mut tasks = Vec::new();
+            let mut selected = Vec::new();
+            let mut peer_nodes = Vec::new();
+            for (index, marker) in [(2, 72), (3, 73), (4, 74)] {
+                let peer_path = temp.path().join(format!("peer-{index}"));
+                let mut node = Node::open(&peer_path, Seed::from_bytes([marker; 32])).unwrap();
+                node.adopt_recovered_guild(certificate.clone(), peers.clone())
+                    .unwrap();
+                node.configure_storage_volumes(&[peer_path], 16 * V1_SECTOR_SIZE as u64, 0)
+                    .unwrap();
+                for (group, shards) in &groups {
+                    let object = ParityObject {
+                        format_version: 1,
+                        guild_id: group.guild_id,
+                        group_id: group.id,
+                        shard_index: index as u8,
+                        root: sector_root(&shards[index]),
+                        bytes: shards[index].clone(),
+                    };
+                    node.volumes.store_repair(&node.control, &object).unwrap();
+                }
+                let node_id = node.keys().node_id();
+                let node = Arc::new(Mutex::new(node));
+                peer_nodes.push(node.clone());
+                let (client, mut event_loop) = build_p2p(
+                    node,
+                    P2pConfig {
+                        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+                        external_addresses: vec![],
+                        bootstrap_addresses: vec![],
+                        relay_reservation_addresses: vec![],
+                        enable_dht_maintenance: false,
+                        enable_relay_server: false,
+                        enable_hole_punching: false,
+                        enable_port_mapping: false,
+                        public_endpoint: String::new(),
+                        failure_domain: String::new(),
+                        configure_failure_domain: false,
+                        max_connections: 8,
+                        tor_mode: crate::TorMode::DisableTor,
+                    },
+                )
+                .unwrap();
+                let startup = event_loop.take_startup_receiver().unwrap();
+                tasks.push(tokio::spawn(event_loop.run()));
+                startup.await.unwrap().unwrap();
+                let status = client.status().await.unwrap();
+                let endpoint = format!(
+                    "{}/p2p/{}",
+                    status.listen_addresses[0],
+                    node_id.libp2p_peer_id().unwrap()
+                );
+                selected.push(
+                    format!("{node_id}={endpoint}")
+                        .parse::<crate::LegacyExportPeer>()
+                        .unwrap(),
+                );
+                clients.push(client);
+            }
+            for case in 0..5 {
+                let target = temp.path().join(format!("export-{case}"));
+                let mut endpoints = selected.clone();
+                if case == 1 {
+                    endpoints.remove(0);
+                }
+                if case == 3 {
+                    let unavailable = identities[1].node_id();
+                    endpoints.push(
+                        format!(
+                            "{unavailable}=/ip4/127.0.0.1/udp/9/quic-v1/p2p/{}",
+                            unavailable.libp2p_peer_id().unwrap()
+                        )
+                        .parse()
+                        .unwrap(),
+                    );
+                }
+                if case == 4 {
+                    let peer = peer_nodes[0].lock().unwrap();
+                    let volume_id = peer.storage_status().unwrap()[0].volume_id;
+                    let zeros = vec![0; V1_SECTOR_SIZE];
+                    peer.database_shell_statement(
+                        Some(volume_id),
+                        &format!(
+                            "UPDATE parity_objects SET bytes=zeroblob(65536), root=X'{}'",
+                            hex::encode(sector_root(&zeros))
+                        ),
+                        true,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        peer.parity_for_guild(&groups[0].0.guild_id, &groups[0].0.id, 2)
+                            .unwrap(),
+                        zeros
+                    );
+                }
+                let started = std::time::Instant::now();
+                let recovery_seed = Seed::from_bytes([if case == 2 { 75 } else { 49 }; 32]);
+                let result = crate::export_withdrawn_revision_from_catalog_over_network(
+                    recovery_seed,
+                    original.clone(),
+                    revision.value.revision_id,
+                    target.clone(),
+                    vec![],
+                    vec![],
+                    endpoints,
+                )
+                .await;
+                if case == 0 || case == 3 {
+                    assert_eq!(result.unwrap().private_format, format);
+                    use std::os::unix::ffi::OsStringExt;
+                    assert_eq!(
+                        &fs::read(
+                            target
+                                .join("namespace")
+                                .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec()))
+                        )
+                        .unwrap()[1000..1003],
+                        b"raw"
+                    );
+                    if format == 7 {
+                        assert!(git2::Repository::open_bare(target.join("history.git")).is_ok());
+                    }
+                    if case == 3 {
+                        assert!(
+                            started.elapsed() < std::time::Duration::from_secs(10),
+                            "unused unavailable peer delayed an available quorum"
+                        );
+                    }
+                } else {
+                    assert!(result.is_err());
+                    assert!(!target.exists());
+                }
+                assert_eq!(
+                    fs::read(original.join("control.db")).unwrap(),
+                    catalog_before
+                );
+                assert!(!original.join("control.key").exists());
+                assert!(!original.join("parity.db").exists());
+            }
+            for client in &clients {
+                client.shutdown().await.unwrap();
+            }
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
+        }
+    }
+
     #[test]
     fn private_catalog_page_repair_restores_live_tree_without_inline_conversion() {
         let temp = tempfile::tempdir().unwrap();

@@ -3400,8 +3400,15 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     drop(store);
     let original = fs::read(catalog.join("control.db")).unwrap();
     let catalog_target = temp.path().join("catalog-export");
+    let extra_peer = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
+    let extra_endpoint = format!(
+        "{extra_peer}=/ip4/127.0.0.1/udp/9/quic-v1/p2p/{}",
+        extra_peer.libp2p_peer_id().unwrap()
+    );
     let catalog_args = vec![
         os("legacy-export"),
+        os("--peer"),
+        os(extra_endpoint),
         os("--data-dir"),
         catalog.clone().into_os_string(),
         os("--revision-id"),
@@ -3433,6 +3440,32 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     assert!(!catalog.join("control.key").exists());
+    let mut confined_args = catalog_args.clone();
+    let destination_index = confined_args
+        .iter()
+        .position(|argument| argument == "--destination")
+        .unwrap()
+        + 1;
+    let confined_target = temp.path().join("rejected-tmpdir-export");
+    confined_args[destination_index] = confined_target.clone().into_os_string();
+    let entries_before = fs::read_dir(&catalog).unwrap().count();
+    let child = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+        .args(&confined_args)
+        .env("TMPDIR", &catalog)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let rejected = wait_for_output(child, CLI_TIMEOUT).unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("temporary client directory must be outside preserved inputs")
+    );
+    assert!(!confined_target.exists());
+    assert_eq!(fs::read_dir(&catalog).unwrap().count(), entries_before);
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     let area_id = Uuid::new_v4();
     let anchor_id = Uuid::new_v4();
     let area = temp.path().join("preserved-area");

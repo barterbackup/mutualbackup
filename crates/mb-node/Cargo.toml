@@ -41,10 +41,10 @@ tor-llcrypto.workspace = true
 tor-proto.workspace = true
 tor-rtcompat.workspace = true
 tracing.workspace = true
+tempfile.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 cddl-cat.workspace = true
-tempfile.workspace = true
