@@ -758,72 +758,74 @@ pub(crate) mod tests {
         descriptor
     }
 
+    pub(crate) fn split_packed_fixture(format: u16) -> (Fixture, mb_core::PackingResult) {
+        let (keys, revision, ciphertexts) = fixture(format);
+        let profile = mb_core::PackingProfile {
+            format_version: 1,
+            sector_size: V1_SECTOR_SIZE as u32,
+            slot_size: 16 * 1024,
+        };
+        let inputs = revision
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&revision.value.data_sectors)
+            .enumerate()
+            .map(|(index, reference)| mb_core::PackingInput {
+                owner: keys.node_id(),
+                protected_root: mb_core::packing_protected_root(revision.value.protected_root_id),
+                object_id: reference.id,
+                source_commitment: Some(
+                    revision.value.sector_commitments.as_ref().unwrap()[index].clone(),
+                ),
+                bytes: ciphertexts[&reference.id].clone(),
+            })
+            .collect();
+        let mut packing = mb_core::pack_incremental(profile, None, inputs).unwrap();
+        // Split both signed objects across the packed sectors.
+        let mut slots: Vec<_> = packing
+            .catalog
+            .sectors
+            .iter()
+            .flat_map(|sector| sector.slots.clone())
+            .filter(|slot| slot.source().is_some())
+            .collect();
+        slots.sort_by_key(|slot| {
+            let source = slot.source().unwrap();
+            (source.id.chunk_index, source.id.object_id)
+        });
+        let slots_per_sector = (profile.sector_size / profile.slot_size) as usize;
+        packing.sectors.truncate(slots.len() / slots_per_sector);
+        packing.catalog.sectors.truncate(packing.sectors.len());
+        for (index, sector) in packing.sectors.iter_mut().enumerate() {
+            sector.descriptor.slots =
+                slots[index * slots_per_sector..(index + 1) * slots_per_sector].to_vec();
+            sector.bytes.clear();
+            for slot in &sector.descriptor.slots {
+                let source = slot.source().unwrap();
+                let start = source.source_offset as usize;
+                sector.bytes.extend_from_slice(
+                    &ciphertexts[&source.id.object_id][start..start + source.logical_len as usize],
+                );
+            }
+            sector.descriptor.commitment = merkle_commit(&sector.bytes).unwrap();
+            sector.descriptor.flat_root = if packing.catalog.format_version >= 3 {
+                sector.descriptor.commitment.root
+            } else {
+                sector_root(&sector.bytes)
+            };
+            sector.descriptor.id = sector.descriptor.calculate_id(profile).unwrap();
+            packing.catalog.sectors[index] = sector.descriptor.clone();
+        }
+        packing.catalog.id = packing.catalog.calculate_id().unwrap();
+        packing.catalog.validate().unwrap();
+        ((keys, revision, ciphertexts), packing)
+    }
+
     #[test]
     fn legacy_export_unpacks_certified_cached_and_volume_sectors_with_split_object_chunks() {
         for format in [6, 7] {
-            let (keys, revision, ciphertexts) = fixture(format);
-            let profile = mb_core::PackingProfile {
-                format_version: 1,
-                sector_size: V1_SECTOR_SIZE as u32,
-                slot_size: 16 * 1024,
-            };
-            let inputs = revision
-                .value
-                .metadata_sectors
-                .iter()
-                .chain(&revision.value.data_sectors)
-                .enumerate()
-                .map(|(index, reference)| mb_core::PackingInput {
-                    owner: keys.node_id(),
-                    protected_root: mb_core::packing_protected_root(
-                        revision.value.protected_root_id,
-                    ),
-                    object_id: reference.id,
-                    source_commitment: Some(
-                        revision.value.sector_commitments.as_ref().unwrap()[index].clone(),
-                    ),
-                    bytes: ciphertexts[&reference.id].clone(),
-                })
-                .collect();
-            let mut packing = mb_core::pack_incremental(profile, None, inputs).unwrap();
-            // Split both signed objects across the packed sectors.
-            let mut slots: Vec<_> = packing
-                .catalog
-                .sectors
-                .iter()
-                .flat_map(|sector| sector.slots.clone())
-                .filter(|slot| slot.source().is_some())
-                .collect();
-            slots.sort_by_key(|slot| {
-                let source = slot.source().unwrap();
-                (source.id.chunk_index, source.id.object_id)
-            });
-            let slots_per_sector = (profile.sector_size / profile.slot_size) as usize;
-            packing.sectors.truncate(slots.len() / slots_per_sector);
-            packing.catalog.sectors.truncate(packing.sectors.len());
-            for (index, sector) in packing.sectors.iter_mut().enumerate() {
-                sector.descriptor.slots =
-                    slots[index * slots_per_sector..(index + 1) * slots_per_sector].to_vec();
-                sector.bytes.clear();
-                for slot in &sector.descriptor.slots {
-                    let source = slot.source().unwrap();
-                    let start = source.source_offset as usize;
-                    sector.bytes.extend_from_slice(
-                        &ciphertexts[&source.id.object_id]
-                            [start..start + source.logical_len as usize],
-                    );
-                }
-                sector.descriptor.commitment = merkle_commit(&sector.bytes).unwrap();
-                sector.descriptor.flat_root = if packing.catalog.format_version >= 3 {
-                    sector.descriptor.commitment.root
-                } else {
-                    sector_root(&sector.bytes)
-                };
-                sector.descriptor.id = sector.descriptor.calculate_id(profile).unwrap();
-                packing.catalog.sectors[index] = sector.descriptor.clone();
-            }
-            packing.catalog.id = packing.catalog.calculate_id().unwrap();
-            packing.catalog.validate().unwrap();
+            let ((keys, revision, _), packing) = split_packed_fixture(format);
             let mut checkpoint = mb_core::QuorumCheckpoint {
                 checkpoint: mb_core::GuildCheckpoint {
                     format_version: 7,

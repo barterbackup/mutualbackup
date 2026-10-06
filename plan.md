@@ -881,8 +881,14 @@ checks apply without installing downloaded records. If the head does not contain
 the requested record or placement, the reader follows certified parent hashes,
 checking the same guild/genesis and exact preceding generation, and retries
 missing/corrupt links across selected peers. History is streamed without storing
-it in the preserved catalog. Recovery-directory discovery, event/transcript
-fetching and complete retained-history/upgrade qualification remain required.
+it in the preserved catalog. Missing packed coding transcripts can now be read
+through signed event-page replay from the preserved genesis. The Add event binds
+the complete verified transcript and group, or a historical unbound Add requires
+a preissued quorum binding from its original signers. Attempt authority, packed
+descriptor commitments, reconstructed codewords and owner-signed output remain
+mandatory; no replay state or evidence is installed in the original catalog.
+Recovery-directory discovery and complete retained-history/upgrade qualification
+remain required.
 
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
 implementation, enrollment and recovery publication paths, guarded Git

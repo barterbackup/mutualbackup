@@ -188,11 +188,26 @@ other selected peers. The search streams one certificate at a time, keeping
 only a cursor for each selected head; it installs no history or progress state
 in the preserved catalog. It checks available heads before walking history.
 
-This does not discover peers through the recovery directory, fetch event or
-coding-transcript history, unlock other identities' volume databases or
-inventory/convert all retained revisions. Missing parent links cannot be
-invented or skipped. Keep historical metadata, coding transcripts and peer-held
-history for the remaining recovery work.
+If packed reconstruction needs a missing coding transcript, the preserved
+signed guild genesis also anchors event-page replay from selected peers. Each
+complete page must verify before its Add events are used. Event pages and
+transcripts use the existing peer frame bounds; replayed state is capped at
+32 MiB and the search at one million events. The client retains replay state
+and one page rather than a complete event-history vector.
+
+The transcript must verify, match the certified group and its attempt authority,
+and cover the exact packed descriptor/commitment. A bound Add supplies its
+canonical transcript hash. A legacy unbound Add requires an existing quorum
+binding from the original signers; recovery never requests new attestations.
+Missing or corrupt event/transcript copies are retried across selected peers.
+Verified geometry drives variable-shard reads and complete-codeword checking.
+These records remain in memory and do not enroll or restore live guild state.
+
+This does not discover peers through the recovery directory, unlock other
+identities' volume databases or inventory/convert all retained revisions.
+Missing parent/event links and missing legacy quorum bindings cannot be
+invented or skipped. Keep historical metadata and peer-held history for the
+remaining recovery work.
 
 If a signed sector is available only in preserved anchor files, supply its area
 explicitly. Repeat `--anchor-area` for distinct areas:
@@ -345,3 +360,21 @@ parent fail without publication or original-catalog changes. The strengthened
 two-link fixture was also rerun separately. Formatting and strict workspace/
 all-targets Clippy pass. Event/transcript fetching, retained-history inventory/
 conversion and full M6 platform/release qualification remain required.
+
+The event/transcript increment passes fourteen exporter/recovery cases, the real
+CLI fixture and 104 core, 108 ordinary store, two reader, one frame-bound, three
+sync, eight wire and four CLI unit tests (245 unique cases), formatting and strict
+workspace/all-targets Clippy. Real format-6/7 survivors serve 2+2 variable parity
+at 64 KiB with both information positions absent and no local ciphertexts or
+transcripts. Both bound and legacy unbound Add evidence work; corrupt event
+sources fall back. Too few survivors, corrupt transcripts, invalid event
+signatures and missing legacy bindings fail without publication. Missing original
+checkpoint/revision records also recover. Original inputs and client cleanup are
+checked. This exposed and fixes the version-one coding-plan CBOR tuple-length
+bug; signed bytes and CBOR encoding are unchanged, with all three plan versions
+and malformed tuples covered by the codec regression.
+
+Peer-head lookup of a missing revision still requires its owner in the preserved
+genesis roster. Membership replay for owners admitted later, directory discovery,
+complete retained-history conversion, broader variable/relay/Tor qualification
+and the full M6 release gates remain open.

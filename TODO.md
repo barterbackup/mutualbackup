@@ -338,6 +338,49 @@ passing tests below apply only to their recorded source and exercised cases.
     two-link fixture was rerun separately. Formatting and strict locked workspace/
     all-targets Clippy pass. Complete ordinary Node/Git suites, provisioned cases,
     real variable/relay/Tor peer export and full M6 release gates remain open.
+  - [x] Fetch missing packed coding evidence through selected peers' certified
+    event history, replaying from the preserved signed genesis in memory. Validate
+    complete pages before using their Add events; use existing frame limits, a
+    32 MiB replay-state bound and the existing one-million-event recovery work
+    bound. Retry unavailable/corrupt event and transcript copies across selected
+    peers. Require replay-verified transcripts, complete certified group equality,
+    attempt authority and exact packed descriptor/commitment matches. Bound Adds
+    name the canonical transcript hash; legacy unbound Adds need an existing
+    quorum binding from original signers. Issue no sign/attestation requests.
+    Share variable reconstruction with preserved local evidence: authenticated
+    geometry, commitments, complete coding equation and owner-signed output
+    remain checked. Write no event/transcript/replay state into original inputs.
+    Recovery-directory discovery, inventory/conversion of all retained history
+    and full upgrade/source-loss/platform qualification remain open.
+    Validation: real three-survivor fixtures recover split packed ciphertexts
+    for private formats 6/7 under both bound and historical unbound Add events.
+    Both information positions and all original ciphertext/cache/anchor inputs
+    are absent; the event transcripts also contain no information bytes. Two
+    READY variable parity positions (2+2, 64 KiB) supply the decoding quorum.
+    A broken event source falls back to another survivor. Insufficient survivors,
+    corrupt event-bound transcripts, invalid event signatures and absent legacy
+    quorum bindings reject without publication. A final case also removes the
+    original checkpoint and revision records. Original database bytes and absent
+    key/parity files stay unchanged, raw namespace/Git output is verified and
+    temporary client directories are cleaned up.
+    The fixture exposed a CBOR decoder bug: version-one plans serialize nine
+    fields but their versioned visitor hints ten. The local cbor4ii 0.3.3 decoder
+    patch accepts shorter definite tuples only when the typed visitor consumes
+    every encoded field. Encoding and canonical signed bytes stay unchanged;
+    missing required fields, extra fields and malformed fixed arrays reject.
+    A signed request/response regression covers plan versions 1/2/3 over both
+    transports, plus all existing wire vectors/budget tests.
+    All 104 core, 108 ordinary store, fourteen exporter/recovery, two preserved-
+    volume reader, one frame-bound, three checkpoint-sync regression, eight wire,
+    four CLI unit tests and the real CLI fixture pass (245 unique cases).
+    Formatting and strict locked workspace/all-targets Clippy pass. This qualifies
+    the exercised variable peer profile, not every geometry or relay/Tor route;
+    complete ordinary Node/Git, provisioned and full M6 release gates remain open.
+  - [ ] Find missing revision records for members admitted after genesis using
+    authenticated membership-event replay. Current peer-head lookup requires
+    the owner in the original genesis roster even when a later admitted member
+    has a retained signed revision. Verify active and removed-member historical
+    export policy without authorizing live enrollment or weakening owner checks.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

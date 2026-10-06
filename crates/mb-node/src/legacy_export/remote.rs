@@ -66,11 +66,14 @@ fn scratch_parent(
 
 impl PeerRecovery {
     fn read<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Option<T> {
+        self.try_read(future).ok()
+    }
+
+    fn try_read<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         self.runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(10), future)
                 .await
-                .ok()?
-                .ok()
+                .context("selected legacy peer read timed out")?
         })
     }
 
@@ -152,6 +155,124 @@ impl PeerRecovery {
             && checkpoint.checkpoint.generation == generation
             && origin.is_none_or(|hash| checkpoint.checkpoint.genesis_hash == hash))
         .then_some(checkpoint)
+    }
+
+    pub(super) fn transcripts(
+        &self,
+        control: &ControlStore,
+        checkpoint: &mb_core::QuorumCheckpoint,
+        descriptor: &mb_core::PackedSectorDescriptor,
+        mut visit: impl FnMut(
+            mb_core::SignedRecord<mb_core::CodingVerificationTranscript>,
+        ) -> Result<bool>,
+    ) -> Result<()> {
+        let Some(genesis) = crate::node::preserved_guild_certificate(control)? else {
+            return Ok(());
+        };
+        let guild = checkpoint.checkpoint.guild_id;
+        ensure!(
+            genesis.genesis.guild_id == guild
+                && genesis.hash()? == checkpoint.checkpoint.genesis_hash,
+            "preserved guild certificate conflicts with the packed checkpoint"
+        );
+        let mut state = mb_core::DynamicGuildState::new(
+            guild,
+            genesis.hash()?,
+            mb_core::QuorumPolicy {
+                format_version: 1,
+                rule: mb_core::QuorumRule::Unanimous,
+            },
+            genesis.genesis.members,
+        )?;
+        let mut evidence_error = None;
+        loop {
+            let mut advanced = false;
+            let mut last_error = None;
+            for peer in &self.peers {
+                let tail = match self.try_read(self.client.guild_event_tail(
+                    *peer,
+                    guild,
+                    state.event_sequence,
+                    state.event_head,
+                )) {
+                    Ok(tail) => tail,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                if tail.events.is_empty() {
+                    continue;
+                }
+                // Validate the complete page before using its Add events. Do
+                // not retain an event-history vector or install replayed state.
+                let mut checked = state.clone();
+                if let Err(error) = checked.apply_tail(&tail) {
+                    last_error = Some(error.into());
+                    continue;
+                }
+                if mb_core::canonical_size_bounded(&checked, mb_core::V1_MAX_CATALOG_BYTES).is_err()
+                    || checked.event_sequence > 1_000_000
+                {
+                    continue;
+                }
+                drop(checked);
+                for event in tail.events {
+                    if let Some((group, expected_hash)) = event.event.kind.coding_group_add()
+                        && group.roles.iter().any(|role| matches!(role,
+                            ShardRoleV2::Information(info) if info.sector.id == descriptor.id
+                                && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero)) {
+                        let event_hash = event.event.hash()?;
+                        for source in &self.peers {
+                            let transcript = match self.try_read(self.client.coding_transcript_for_event(
+                                *source, guild, group.id, event.event.sequence, event_hash,
+                            )) {
+                                Ok(transcript) => transcript,
+                                Err(error) => { evidence_error = Some(error); continue; }
+                            };
+                            let hash = transcript.canonical_hash()?;
+                            let transcript = transcript.into_inner();
+                            if transcript.value.manifest.value.group != *group {
+                                evidence_error = Some(anyhow::anyhow!("coding transcript conflicts with its certified group"));
+                                continue;
+                            }
+                            if let Err(error) = state.validate_attempt_authority(&transcript.value.plan.value) {
+                                evidence_error = Some(anyhow::Error::from(error).context("coding Add transcript has invalid attempt authority"));
+                                continue;
+                            }
+                            let bound = if let Some(expected) = expected_hash { expected == hash }
+                                else {
+                                    self.peers.iter().any(|source| {
+                                        self.read(self.client.legacy_coding_add_binding(*source, guild, event.event.sequence, event_hash))
+                                            .flatten().is_some_and(|binding| binding.statement.transcript_hash == hash
+                                                && binding.verify(&state, &event).is_ok())
+                                    })
+                                };
+                            if !bound {
+                                evidence_error = Some(anyhow::anyhow!("coding Add lacks its exact transcript hash or preissued quorum binding"));
+                                continue;
+                            }
+                            if !visit(transcript)? { return Ok(()); }
+                        }
+                    }
+                    state.apply_event(&event)?;
+                }
+                advanced = true;
+                break;
+            }
+            if !advanced {
+                if let Some(error) = evidence_error {
+                    return Err(error)
+                        .context("selected peers cannot provide certified coding evidence");
+                }
+                if let Some(error) = last_error {
+                    return Err(error).context(
+                        "selected peers cannot provide authenticated coding event history",
+                    );
+                }
+                return Ok(());
+            }
+        }
     }
 
     pub(super) fn find_revision(

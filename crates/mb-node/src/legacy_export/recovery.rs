@@ -330,9 +330,14 @@ fn recover_packed(
                 Err(error) if inputs.volumes.is_empty() && inputs.remote.is_none() => {
                     return Err(error);
                 }
-                Err(_) => {
-                    recover_variable(control, guild, checkpoint_hash, descriptor, decoded, inputs)?
-                }
+                Err(_) => recover_variable(
+                    control,
+                    checkpoint,
+                    checkpoint_hash,
+                    descriptor,
+                    decoded,
+                    inputs,
+                )?,
             }
         };
         ensure!(
@@ -385,12 +390,13 @@ fn recover_packed(
 
 fn recover_variable(
     control: &ControlStore,
-    guild: [u8; 32],
+    checkpoint: &QuorumCheckpoint,
     checkpoint_hash: [u8; 32],
     descriptor: &mb_core::PackedSectorDescriptor,
     decoded: &mut Option<DecodedCodeword>,
     inputs: &RecoveryInputs<'_>,
 ) -> Result<Vec<u8>> {
+    let guild = checkpoint.checkpoint.guild_id;
     // An intact information copy needs only the certified descriptor. Its
     // position can change between retained groups, but its storage key cannot.
     for index in 0..mb_core::MAX_CODING_SHARDS {
@@ -419,98 +425,13 @@ fn recover_variable(
             mb_core::ShardRoleV2::Information(info) if info.sector.id == descriptor.id
                 && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero
         )) else { return Ok(true); };
-            let attempt = (|| -> Result<Vec<u8>> {
+            let attempt = (|| -> Result<_> {
                 ensure!(
                     key == group.id
                         && canonical_bytes_bounded(&transcript, V1_MAX_CATALOG_BYTES)? == encoded,
                     "preserved coding transcript has a conflicting identity or encoding"
                 );
-                ensure!(
-                    mb_core::replay_coding_transcript(&transcript)?
-                        == mb_core::CodingReplayFinding::Verified,
-                    "preserved coding transcript did not verify"
-                );
-                if let Some(cached) = decoded.as_ref().filter(|cached| {
-                    cached.checkpoint == checkpoint_hash && cached.group == group.id
-                }) {
-                    return Ok(cached.shards[wanted].clone());
-                }
-                // Drop the previous codeword before allocating the next one. All
-                // geometry comes from the verified transcript, never local defaults.
-                *decoded = None;
-                let mut shards = Vec::with_capacity(group.profile.total_shards()?);
-                let mut commitments = Vec::with_capacity(group.roles.len());
-                for (index, role) in group.roles.iter().enumerate() {
-                    let (storage_key, commitment, zero) = match role {
-                        mb_core::ShardRoleV2::Information(info) => (
-                            info.sector.id,
-                            &info.sector.commitment,
-                            info.sector.virtual_zero,
-                        ),
-                        mb_core::ShardRoleV2::Parity(parity) => {
-                            (group.id, &parity.commitment, false)
-                        }
-                    };
-                    let bytes = if zero {
-                        Some(vec![0; group.profile.shard_size as usize])
-                    } else {
-                        inputs
-                            .volumes
-                            .iter()
-                            .find_map(|volume| {
-                                volume
-                                    .load_variable(&guild, &storage_key, index as u16, commitment)
-                                    .ok()
-                            })
-                            .or_else(|| {
-                                transcript
-                                    .value
-                                    .manifest
-                                    .value
-                                    .information_bytes
-                                    .as_ref()
-                                    .and_then(|bytes| bytes.get(index))
-                                    .cloned()
-                                    .flatten()
-                            })
-                    };
-                    shards.push(bytes);
-                    commitments.push(commitment);
-                }
-                if let Some(remote) = inputs.remote {
-                    for assigned_only in [true, false] {
-                        for position in (0..shards.len()).rev() {
-                            if shards.iter().flatten().count()
-                                >= usize::from(group.profile.data_shards)
-                            {
-                                break;
-                            }
-                            if shards[position].is_none() {
-                                shards[position] = remote.variable(group, position, assigned_only);
-                            }
-                        }
-                    }
-                }
-                mb_core::reconstruct(group.profile, &mut shards)
-                    .context("not enough authenticated preserved variable shards")?;
-                let shards: Vec<Vec<u8>> = shards
-                    .into_iter()
-                    .map(|bytes| bytes.context("variable reconstruction left a missing position"))
-                    .collect::<Result<_>>()?;
-                for (bytes, commitment) in shards.iter().zip(commitments) {
-                    ensure!(
-                        merkle_commit(bytes)? == *commitment,
-                        "reconstructed variable codeword conflicts with its signed commitment"
-                    );
-                }
-                verify_codeword(group.profile, &shards)?;
-                let bytes = shards[wanted].clone();
-                *decoded = Some(DecodedCodeword {
-                    checkpoint: checkpoint_hash,
-                    group: group.id,
-                    shards,
-                });
-                Ok(bytes)
+                recover_variable_transcript(&transcript, checkpoint_hash, wanted, decoded, inputs)
             })();
             match attempt {
                 Ok(bytes) => {
@@ -524,9 +445,124 @@ fn recover_variable(
             }
         },
     )?;
+    if found.is_none()
+        && let Some(remote) = inputs.remote
+    {
+        remote.transcripts(control, checkpoint, descriptor, |transcript| {
+            let group = &transcript.value.manifest.value.group;
+            let Some(wanted) = group.roles.iter().position(|role| matches!(role,
+                mb_core::ShardRoleV2::Information(info) if info.sector.id == descriptor.id
+                    && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero
+            )) else { return Ok(true); };
+            match recover_variable_transcript(&transcript, checkpoint_hash, wanted, decoded, inputs)
+            {
+                Ok(bytes) => {
+                    found = Some(bytes);
+                    Ok(false)
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    Ok(true)
+                }
+            }
+        })?;
+    }
     found.ok_or_else(|| {
         last_error.unwrap_or_else(|| {
             anyhow::anyhow!("certified packed sector has no available verified variable placement")
         })
     })
+}
+
+fn recover_variable_transcript(
+    transcript: &SignedRecord<mb_core::CodingVerificationTranscript>,
+    checkpoint_hash: [u8; 32],
+    wanted: usize,
+    decoded: &mut Option<DecodedCodeword>,
+    inputs: &RecoveryInputs<'_>,
+) -> Result<Vec<u8>> {
+    let group = &transcript.value.manifest.value.group;
+    let guild = group.guild_id;
+    ensure!(
+        mb_core::replay_coding_transcript(transcript)? == mb_core::CodingReplayFinding::Verified,
+        "preserved coding transcript did not verify"
+    );
+    if let Some(cached) = decoded
+        .as_ref()
+        .filter(|cached| cached.checkpoint == checkpoint_hash && cached.group == group.id)
+    {
+        return Ok(cached.shards[wanted].clone());
+    }
+    // Drop the previous codeword before allocating the next one. All
+    // geometry comes from the verified transcript, never local defaults.
+    *decoded = None;
+    let mut shards = Vec::with_capacity(group.profile.total_shards()?);
+    let mut commitments = Vec::with_capacity(group.roles.len());
+    for (index, role) in group.roles.iter().enumerate() {
+        let (storage_key, commitment, zero) = match role {
+            mb_core::ShardRoleV2::Information(info) => (
+                info.sector.id,
+                &info.sector.commitment,
+                info.sector.virtual_zero,
+            ),
+            mb_core::ShardRoleV2::Parity(parity) => (group.id, &parity.commitment, false),
+        };
+        let bytes = if zero {
+            Some(vec![0; group.profile.shard_size as usize])
+        } else {
+            inputs
+                .volumes
+                .iter()
+                .find_map(|volume| {
+                    volume
+                        .load_variable(&guild, &storage_key, index as u16, commitment)
+                        .ok()
+                })
+                .or_else(|| {
+                    transcript
+                        .value
+                        .manifest
+                        .value
+                        .information_bytes
+                        .as_ref()
+                        .and_then(|bytes| bytes.get(index))
+                        .cloned()
+                        .flatten()
+                })
+        };
+        shards.push(bytes);
+        commitments.push(commitment);
+    }
+    if let Some(remote) = inputs.remote {
+        for assigned_only in [true, false] {
+            for position in (0..shards.len()).rev() {
+                if shards.iter().flatten().count() >= usize::from(group.profile.data_shards) {
+                    break;
+                }
+                if shards[position].is_none() {
+                    shards[position] = remote.variable(group, position, assigned_only);
+                }
+            }
+        }
+    }
+    mb_core::reconstruct(group.profile, &mut shards)
+        .context("not enough authenticated preserved variable shards")?;
+    let shards: Vec<Vec<u8>> = shards
+        .into_iter()
+        .map(|bytes| bytes.context("variable reconstruction left a missing position"))
+        .collect::<Result<_>>()?;
+    for (bytes, commitment) in shards.iter().zip(commitments) {
+        ensure!(
+            merkle_commit(bytes)? == *commitment,
+            "reconstructed variable codeword conflicts with its signed commitment"
+        );
+    }
+    verify_codeword(group.profile, &shards)?;
+    let bytes = shards[wanted].clone();
+    *decoded = Some(DecodedCodeword {
+        checkpoint: checkpoint_hash,
+        group: group.id,
+        shards,
+    });
+    Ok(bytes)
 }
