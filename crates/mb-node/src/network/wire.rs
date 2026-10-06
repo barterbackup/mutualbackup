@@ -951,6 +951,136 @@ mod tests {
         include_str!("../../../../protocol/vectors/recovery-locator.postcard.hex");
 
     #[tokio::test]
+    async fn versioned_coding_plan_tuples_preserve_both_transports_and_reject_extra_fields() {
+        use libp2p::request_response::Codec;
+        let keys: Vec<_> = (0..4)
+            .map(|i| KeyMaterial::from_seed(&Seed::from_bytes([90 + i; 32])))
+            .collect();
+        let shards = mb_core::encode(
+            mb_core::CodingProfile::new(2, 2, 64),
+            vec![vec![1; 64], vec![2; 64]],
+        )
+        .unwrap();
+        let protocol = libp2p::StreamProtocol::new("/mutualbackup/peer/2");
+        let mut codec = libp2p::request_response::cbor::codec::Codec::<
+            SignedRecord<PeerRequestEnvelope>,
+            SignedRecord<PeerResponseEnvelope>,
+        >::default()
+        .set_request_size_maximum(super::super::MAX_PEER_FRAME_BYTES as u64)
+        .set_response_size_maximum(super::super::MAX_PEER_FRAME_BYTES as u64);
+        for version in [1, 2, 3] {
+            let plan = CodingAttemptPlan {
+                format_version: version,
+                attempt_id: [1; 16],
+                checkpoint_hash: [2; 32],
+                membership_epoch: 1,
+                geometry: mb_core::CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: [3; 32],
+                    profile: mb_core::CodingProfile::new(2, 2, 64),
+                    information: (0..2)
+                        .map(|i| mb_core::InformationRoleV2 {
+                            owner: keys[i].node_id(),
+                            failure_domain: format!("site-{i}"),
+                            sector: mb_core::RangeSectorRef {
+                                id: [i as u8 + 1; 32],
+                                commitment: mb_core::merkle_commit(&shards[i]).unwrap(),
+                                logical_len: 64,
+                                virtual_zero: false,
+                            },
+                        })
+                        .collect(),
+                    parity: (0..2)
+                        .map(|i| mb_core::ParityPlacementV2 {
+                            holder: keys[i + 2].node_id(),
+                            failure_domain: format!("site-{}", i + 2),
+                            row: i as u16,
+                        })
+                        .collect(),
+                },
+                delegator: keys[0].node_id(),
+                coding_coordinator: keys[1].node_id(),
+                verification_coordinator: keys[3].node_id(),
+                expires_at_unix_seconds: u64::MAX,
+                information_roots: (version != 1).then(|| {
+                    shards[..2]
+                        .iter()
+                        .map(|bytes| mb_core::sector_root(bytes))
+                        .collect()
+                }),
+            };
+            plan.validate().unwrap();
+            let old_layout = (
+                plan.format_version,
+                plan.attempt_id,
+                plan.checkpoint_hash,
+                plan.membership_epoch,
+                &plan.geometry,
+                plan.delegator,
+                plan.coding_coordinator,
+                plan.verification_coordinator,
+                plan.expires_at_unix_seconds,
+            );
+            if version == 1 {
+                assert_eq!(
+                    mb_core::canonical_bytes(&plan).unwrap(),
+                    mb_core::canonical_bytes(&old_layout).unwrap()
+                );
+                let mut extra = cbor4ii::serde::to_vec(Vec::new(), &plan).unwrap();
+                assert_eq!(extra[0], 0x89);
+                extra[0] = 0x8a;
+                extra.push(0);
+                assert!(cbor4ii::serde::from_slice::<CodingAttemptPlan>(&extra).is_err());
+            } else {
+                let missing = cbor4ii::serde::to_vec(Vec::new(), &old_layout).unwrap();
+                assert!(cbor4ii::serde::from_slice::<CodingAttemptPlan>(&missing).is_err());
+            }
+            let signed =
+                SignedRecord::sign(mb_core::CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[0]).unwrap();
+            let transcript =
+                crate::node::tests::test_coding_transcript(signed.clone(), &shards, &keys);
+            let request = budget_request(PeerRequest::SubmitCodingTranscript {
+                transcript: Box::new(transcript.clone()),
+            });
+            let canonical = mb_core::canonical_bytes(&request).unwrap();
+            let restored: SignedRecord<PeerRequestEnvelope> =
+                mb_core::decode_canonical(&canonical).unwrap();
+            assert_eq!(mb_core::canonical_bytes(&restored).unwrap(), canonical);
+            let mut cursor = futures::io::Cursor::new(Vec::new());
+            codec
+                .write_request(&protocol, &mut cursor, request)
+                .await
+                .unwrap();
+            cursor.set_position(0);
+            let decoded = codec.read_request(&protocol, &mut cursor).await.unwrap();
+            assert_eq!(mb_core::canonical_bytes(&decoded).unwrap(), canonical);
+            let response = budget_response(PeerResponse::CodingVerificationTranscript(Box::new(
+                transcript.clone(),
+            )));
+            let canonical = mb_core::canonical_bytes(&response).unwrap();
+            let mut cursor = futures::io::Cursor::new(Vec::new());
+            codec
+                .write_response(&protocol, &mut cursor, response)
+                .await
+                .unwrap();
+            cursor.set_position(0);
+            let decoded = codec.read_response(&protocol, &mut cursor).await.unwrap();
+            assert_eq!(mb_core::canonical_bytes(&decoded).unwrap(), canonical);
+            let Ok(PeerResponse::CodingVerificationTranscript(decoded)) = decoded.value.result
+            else {
+                panic!("wrong response");
+            };
+            assert_eq!(*decoded, transcript);
+            assert_eq!(
+                mb_core::replay_coding_transcript(&decoded).unwrap(),
+                mb_core::CodingReplayFinding::Verified
+            );
+        }
+        assert!(cbor4ii::serde::from_slice::<[u8; 2]>(&[0x81, 1]).is_err());
+        assert!(cbor4ii::serde::from_slice::<[u8; 2]>(&[0x83, 1, 2, 3]).is_err());
+    }
+
+    #[tokio::test]
     async fn full_byte_proof_frames_fit_both_transports_and_keep_old_layouts() {
         use libp2p::request_response::Codec;
         use mb_core::{
