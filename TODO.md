@@ -242,6 +242,21 @@ passing tests below apply only to their recorded source and exercised cases.
     ignored), with formatting and strict workspace/all-targets Clippy. Durable
     multi-root/signed publication, source joins, bounded DAG validation and
     capture/recovery/admission integration remain open; this does not close R2.
+  - [x] Add atomic local multi-root publication and cancellation. A bounded
+    descriptor bundle publishes up to 16 existing intents/root pins and at most
+    4 KiB of descriptor bytes in one SQLCipher transaction. Immutable retries
+    bind every byte; intent-to-bundle links block independent member cancellation.
+    Group cancellation fences every member before cleanup, preserving shared
+    pending/published successors. SQL bounds the journal payload before
+    materialization, and nested declarations reject before allocation. Intent
+    updates now check affected-row counts so an ignored SQL update cannot
+    falsely succeed. Four new bundle fixtures include reopen at publication,
+    pin-release/cancellation/GC boundaries, sharing, corruption and injected
+    abort/ignore failures. All 54 catalog and 83 ordinary store tests pass
+    (18 provisioned store tests remain ignored), with formatting and strict
+    workspace/all-targets Clippy. Typed Git publication wiring, signed revision
+    authority, physical quota and authenticated generation-floor retirement
+    remain open.
   - [ ] Add quota reservations, bounded file/packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

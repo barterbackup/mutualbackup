@@ -12,6 +12,12 @@ use uuid::Uuid;
 
 use super::{ControlStore, DatabaseError};
 
+mod bundle;
+pub use bundle::{
+    CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
+    CatalogBundleState,
+};
+
 const INTENT: &str = "catalog-intent-v1";
 const PAGE: &str = "catalog-page-v1";
 const META: &str = "catalog-page-metadata-v1";
@@ -131,7 +137,7 @@ fn read_intent(
 }
 
 fn write_intent(connection: &Connection, record: &IntentRecord) -> Result<(), CatalogStoreError> {
-    connection.execute(
+    let written = connection.execute(
         "UPDATE protocol_records SET bytes = ?3 WHERE kind = ?1 AND record_id = ?2",
         params![
             INTENT,
@@ -139,7 +145,40 @@ fn write_intent(connection: &Connection, record: &IntentRecord) -> Result<(), Ca
             canonical_bytes(record)?
         ],
     )?;
+    if written != 1 {
+        return Err(DatabaseError::Conflict.into());
+    }
     Ok(())
+}
+
+fn publish_root(
+    connection: &Connection,
+    intent: CatalogIntent,
+    root: CatalogPageRef,
+) -> Result<(), CatalogStoreError> {
+    root.validate()?;
+    let mut record = read_intent(connection, intent)?;
+    if record.state != CatalogIntentState::Building
+        && record.state != CatalogIntentState::Published(root)
+    {
+        return Err(DatabaseError::Conflict.into());
+    }
+    if bounded_record(connection, &owners(intent), &root.hash, 0)?.is_none()
+        || bounded_record(connection, &pins(root.hash), intent.id.as_bytes(), 0)?.is_none()
+    {
+        return Err(DatabaseError::NotReady.into());
+    }
+    read_page(
+        connection,
+        PageMetadata {
+            format_version: 1,
+            scope: intent.scope,
+            section: intent.section,
+            reference: root,
+        },
+    )?;
+    record.state = CatalogIntentState::Published(root);
+    write_intent(connection, &record)
 }
 
 fn metadata(connection: &Connection, hash: [u8; 32]) -> Result<PageMetadata, CatalogStoreError> {
@@ -349,28 +388,7 @@ impl ControlStore {
     ) -> Result<(), CatalogStoreError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut record = read_intent(&transaction, intent)?;
-        if record.state != CatalogIntentState::Building
-            && record.state != CatalogIntentState::Published(root)
-        {
-            return Err(DatabaseError::Conflict.into());
-        }
-        if bounded_record(&transaction, &owners(intent), &root.hash, 0)?.is_none()
-            || bounded_record(&transaction, &pins(root.hash), intent.id.as_bytes(), 0)?.is_none()
-        {
-            return Err(DatabaseError::NotReady.into());
-        }
-        read_page(
-            &transaction,
-            PageMetadata {
-                format_version: 1,
-                scope: intent.scope,
-                section: intent.section,
-                reference: root,
-            },
-        )?;
-        record.state = CatalogIntentState::Published(root);
-        write_intent(&transaction, &record)?;
+        publish_root(&transaction, intent, root)?;
         transaction.commit()?;
         Ok(())
     }
@@ -380,6 +398,7 @@ impl ControlStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let mut record = read_intent(&transaction, intent)?;
+        bundle::require_unbundled(&transaction, intent)?;
         record.state = CatalogIntentState::Cancelled;
         write_intent(&transaction, &record)?;
         transaction.commit()?;

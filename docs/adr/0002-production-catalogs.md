@@ -296,3 +296,31 @@ atomic root-set publication and retention must explicitly retain them together.
 Owner-encrypted root binding, source-authority joins, plaintext blob hashing,
 bounded DAG validation, shared mutation preflight, daemon capture/recovery and
 legacy migration integration remain open.
+
+Atomic local multi-root ownership is implemented in
+`crates/mb-store/src/database/catalog/bundle.rs`. A version-one bundle binds one
+scope, an immutable descriptor of at most 4 KiB, and up to 16 existing intent/root
+pairs. One writer transaction verifies and publishes all roots, their retained
+pins, intent-to-bundle links and descriptor bytes together. Existing page/intent
+formats and the control schema remain unchanged. Retries must match the complete
+bundle; cancelled bundle IDs never resume. Links reject independent cancellation
+of a published member. Bundle cancellation marks all members cancelled and
+removes their links atomically before existing bounded cleanup can begin.
+
+Shared and pending successor roots keep their own pins and immutable parent
+closures. Publication/cancellation rollback covers every member and link even
+when SQL aborts or silently ignores an update/delete. Intent writes now check
+affected-row counts, fixing the prior unchecked-update path. Reads bound bundle
+payloads to 8 KiB in SQL before allocation and bound nested root/descriptor
+collections during decoding. A read transaction returns a consistent local
+descriptor/member-state snapshot; traversal still verifies actual page bytes.
+
+Four new fixtures cover publication/reopen, each pin-release/cancellation/GC
+boundary, pending/published sharing, immutable retries, missing roots, scope,
+collection/journal bounds, corruption and injected SQL abort/ignore failures.
+All 54 catalog tests and 83 ordinary store tests pass (18 provisioned store
+tests remain ignored), with formatting and strict workspace/all-targets Clippy.
+This is local durable publication, not a signed revision or remote protection.
+The caller must validate its typed descriptor against the manifest of retained
+roots. Typed Git wiring, signed activation, quota reservation, retention policy
+and generation-floor retirement of fencing journals remain open.
