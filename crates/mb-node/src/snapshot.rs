@@ -2222,6 +2222,39 @@ fn decode_private_metadata_with_git(
     }
 }
 
+/// Conversion admits only exact historical encodings; normal legacy recovery
+/// keeps its existing decoder and compatibility behavior.
+#[cfg(target_os = "linux")]
+pub(crate) fn decode_private_metadata_for_catalog(
+    bytes: &[u8],
+) -> Result<(PrivateMetadata, Option<GitBackupDescriptor>)> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= V1_MAX_CATALOG_BYTES,
+        "legacy private encoding exceeds its bound"
+    );
+    let canonical = match private_metadata_format(bytes)? {
+        1 | 3 => canonical_bytes(&decode_canonical::<PrivateMetadata>(bytes)?)?,
+        2 => {
+            if let Ok(value) = decode_canonical::<LinkV2PrivateMetadata>(bytes)
+                && validate_link_v2_layout(&value).is_ok()
+                && canonical_bytes(&value)? == bytes
+            {
+                canonical_bytes(&value)?
+            } else {
+                canonical_bytes(&decode_canonical::<NativeV2PrivateMetadata>(bytes)?)?
+            }
+        }
+        4 => canonical_bytes(&decode_canonical::<GitPrivateMetadataV4>(bytes)?)?,
+        5 => canonical_bytes(&decode_canonical::<GitPrivateMetadataV5>(bytes)?)?,
+        _ => bail!("unsupported legacy private metadata version"),
+    };
+    ensure!(
+        canonical == bytes,
+        "legacy private metadata is not canonical"
+    );
+    decode_private_metadata_with_git(bytes)
+}
+
 fn private_metadata_format(bytes: &[u8]) -> Result<u16> {
     Ok(postcard::take_from_bytes::<u16>(bytes)
         .context("decode private metadata version")?

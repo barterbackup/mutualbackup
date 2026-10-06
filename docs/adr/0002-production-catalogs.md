@@ -1177,3 +1177,51 @@ adapter tests (176 distinct cases overall). Formatting and strict locked
 workspace/all-targets Clippy pass. Nineteen provisioned store and eight snapshot
 cases remain ignored; native capture/topology/platform and real 1 TiB
 qualification were not run for this local operation.
+
+### Whole legacy private conversion (2026-10-06)
+
+`convert_legacy_revision` connects native namespace/recipes and optional Git
+refs/objects/blobs to one authenticated legacy input. It bounds the original
+signed envelope and private payload before signature work, checks recovering
+seed/guild, owner/writer signatures, dataset identity and sequence shape, then
+verifies metadata ciphertext roots and available Merkle commitments. Private
+encodings and metadata padding must be exact. The strict conversion decoder
+supports native formats 1/3, both frozen version-2 layouts and Git-bearing 4/5;
+normal legacy recovery decoding remains unchanged. Withdrawn 6/7 are rejected.
+
+Every native/Git sector reference must match signed legacy data exactly. All
+signed data, including unused retained references, is read and checked against
+its ciphertext root and available Merkle commitment. Legacy Git validation checks
+the graph/object schema; blob plaintext is streamed through sparse extents and
+zero holes and verified against its raw Git SHA-1 object ID. The new
+`GitBackupBlob::verify_plaintext` uses one sector-sized buffer, requires exact
+logical length/EOF and propagates read errors. Hash work includes logical holes.
+
+Both typed adapters and their aggregate root geometry preflight before calling
+the external page sink. Separate explicit stream roles preserve durable intent
+ownership. Sink failures leave staged pages under the caller's intents for
+normal retry/cancellation and return no complete root. Original data addresses,
+native attributes/recipes/hard links and raw Git object/ref identities remain
+unchanged; this function does not update old signed revisions or heads, sign a
+new revision, or publish protection.
+
+The Linux conversion adapter still reads an old bounded flat metadata object;
+it does not establish the new dataset/history capacity. Old non-content-derived
+sector addresses need a compatible authenticated source path or rewrite policy
+before consumer activation. New source authority/publication, native capture/
+restore, retention, seed-only recovery, full filesystem/platform qualification
+and the real 1 TiB gate remain open.
+
+Validation: one new Git fixture checks bounded blob hashing, exact length/EOF,
+wrong bytes and I/O errors. Four new Node fixtures cover private formats 1/3/4/5,
+both frozen version-2 layouts, signed outer 3/4/5, exact Git refs/object bytes,
+sparse blobs/hard links, source/commitment/authority/schema substitutions,
+withdrawn formats, original/head preservation, reopen/native source validation
+and sink interruption with intent cleanup. Locked workspace/all-targets build
+and 38 paged tests pass. All 90 ordinary Git, 120 ordinary store, 30 ordinary
+snapshot and five native adapter tests also pass (264 distinct cases overall,
+including five paged core and 14 paged Node cases). The four conversion cases
+pass again after test-only lint fixes. Final formatting and strict locked
+workspace/all-targets Clippy pass. Sixty-two provisioned Git, 19 store and eight
+snapshot cases remain ignored; native capture/topology/platform and real 1 TiB
+qualification were not run for this conversion adapter.

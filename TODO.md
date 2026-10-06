@@ -1109,8 +1109,37 @@ passing tests below apply only to their recorded source and exercised cases.
     and strict locked workspace/all-targets Clippy pass. Nineteen provisioned
     store and eight snapshot cases remain ignored; native capture/topology/
     platform and real 1 TiB qualification were not run for this local operation.
-  - [ ] Implement complete legacy private metadata conversion and migrate
-    native capture/restore consumers before enabling the new format.
+  - [x] Connect complete supported legacy private metadata to paged native/Git
+    streams through one authenticated conversion adapter. Bound the old signed
+    envelope and private payload, verify owner/writer/seed/guild, exact historical
+    encodings and metadata padding, and reject withdrawn private formats 6/7.
+    Join every native/Git recipe reference to the exact signed legacy data;
+    verify all signed ciphertext roots and available Merkle commitments, and
+    stream sparse Git plaintext to check blob IDs. Preflight both typed adapters
+    and their combined geometry before any external page sink. Preserve source
+    IDs, raw Git objects/refs, sparse recipes, hard-link identities and original
+    signed revision/head state. Sink interruption leaves caller-owned staged
+    intents for normal cancellation/retry and publishes no migration root.
+    This Linux adapter converts bounded old objects; it is not production
+    capture/recovery activation. Old non-content-derived data addresses still
+    need a compatible authenticated source adapter or rewrite policy, and new
+    authority/source-catalog publication, retention and 1 TiB qualification remain
+    open. Plaintext hash work includes declared sparse Git logical bytes.
+    Validation: one new Git and four Node fixtures pass. They cover bounded raw
+    blob hashing with exact length/EOF and I/O failures; private 1/3/4/5 and both
+    frozen version-2 layouts; signed outer formats 3/4/5; raw Git refs/objects,
+    sparse blobs and hard-link identity; source/commitment/authority/schema
+    substitutions; withdrawn formats; preserved originals/heads; reopen/native
+    source validation; and sink interruption with caller-owned intent cleanup.
+    Locked workspace/all-targets build and 38 paged tests pass. All 90 ordinary
+    Git, 120 ordinary store, 30 ordinary snapshot and five native adapter tests
+    also pass (264 distinct cases overall, including five paged core and 14
+    paged Node cases). The four new Node cases pass again after test-only lint
+    fixes. Final formatting and strict locked workspace/all-targets Clippy pass.
+    Sixty-two provisioned Git, 19 store and eight snapshot cases remain ignored;
+    native capture/topology/platform and real 1 TiB qualification were not run.
+  - [ ] Integrate legacy private conversion with retained revision publication
+    and migrate native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

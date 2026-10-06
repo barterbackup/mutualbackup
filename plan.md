@@ -1424,6 +1424,16 @@ generation zero; version-2 updates leave signed revision/private bytes unchanged
 Capture/recovery consumer activation and filesystem lifecycle qualification remain
 required.
 
+Whole legacy private conversion now authenticates the original bounded signed
+revision and exact private encoding before staging native and optional Git
+streams together. It preserves historical source addresses and signed/head state,
+checks exact recipe/public-source joins, verifies source roots/commitments, and
+hashes streamed sparse Git plaintext against its object ID. Both typed adapters
+and combined root geometry preflight before external staging; interrupted sinks
+retain caller-owned intents without publishing a migration revision. This Linux
+adapter leaves production activation, legacy-address serving/rewrite policy,
+new source authority/publication, retention and the real 1 TiB gate open.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

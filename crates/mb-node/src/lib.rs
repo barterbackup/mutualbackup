@@ -12,6 +12,10 @@ mod native_catalog;
 mod network;
 mod node;
 mod paged_data;
+#[cfg(target_os = "linux")]
+mod paged_legacy;
+#[cfg(target_os = "linux")]
+pub use paged_legacy::PagedPrivateStream;
 mod paged_revision;
 pub use paged_data::PagedAnchorSectorSource;
 mod snapshot;

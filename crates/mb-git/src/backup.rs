@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
@@ -12,6 +13,7 @@ use mb_core::{
     ModelError, SectorRef, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_size_bounded,
 };
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -28,7 +30,7 @@ pub enum GitBackupError {
     TooLarge,
     #[error("libgit2 rejected Git backup metadata: {0}")]
     Git(#[from] git2::Error),
-    #[error("temporary Git metadata repository failed: {0}")]
+    #[error("Git backup I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("Git backup descriptor encoding failed: {0}")]
     Model(#[from] mb_core::ModelError),
@@ -46,6 +48,28 @@ pub struct GitBackupBlob {
     pub oid: [u8; 20],
     pub logical_len: u64,
     pub data_extents: Vec<GitDataExtent>,
+}
+
+impl GitBackupBlob {
+    /// Verify exact raw Git blob bytes with one sector-sized buffer. The
+    /// reader must supply logical sparse holes as zero bytes and end at length.
+    pub fn verify_plaintext(&self, reader: &mut impl Read) -> Result<(), GitBackupError> {
+        let mut hash = Sha1::new();
+        hash.update(format!("blob {}\0", self.logical_len).as_bytes());
+        let mut remaining = self.logical_len;
+        let mut buffer = [0_u8; V1_SECTOR_SIZE];
+        while remaining != 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            reader.read_exact(&mut buffer[..count])?;
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        let actual: [u8; 20] = hash.finalize().into();
+        if reader.read(&mut buffer[..1])? != 0 || actual != self.oid {
+            return Err(GitBackupError::InvalidGraph);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -279,6 +303,55 @@ impl GitBackupDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paged_legacy_blob_verifier_checks_exact_length_oid_and_bounded_reads() {
+        struct BoundedReader<'a>(&'a [u8]);
+        impl Read for BoundedReader<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                assert!(output.len() <= V1_SECTOR_SIZE);
+                self.0.read(output)
+            }
+        }
+        let bytes = vec![0x81; V1_SECTOR_SIZE * 3 + 1];
+        let blob = GitBackupBlob {
+            oid: Oid::hash_object(ObjectType::Blob, &bytes)
+                .unwrap()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+            logical_len: bytes.len() as u64,
+            data_extents: Vec::new(),
+        };
+        blob.verify_plaintext(&mut BoundedReader(&bytes)).unwrap();
+        assert!(
+            blob.verify_plaintext(&mut &bytes[..bytes.len() - 1])
+                .is_err()
+        );
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(blob.verify_plaintext(&mut longer.as_slice()).is_err());
+        let mut damaged = bytes.clone();
+        damaged[0] ^= 1;
+        assert!(blob.verify_plaintext(&mut damaged.as_slice()).is_err());
+        struct Offline;
+        impl Read for Offline {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("offline"))
+            }
+        }
+        assert!(blob.verify_plaintext(&mut Offline).is_err());
+        let empty = GitBackupBlob {
+            oid: Oid::hash_object(ObjectType::Blob, &[])
+                .unwrap()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+            logical_len: 0,
+            data_extents: Vec::new(),
+        };
+        empty.verify_plaintext(&mut [].as_slice()).unwrap();
+    }
 
     #[test]
     fn bounded_backup_admission_counts_full_descriptor_at_the_legacy_limit() {
