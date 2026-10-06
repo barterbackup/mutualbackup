@@ -1586,6 +1586,16 @@ pub struct VariableParityObject {
     pub bytes: Vec<u8>,
 }
 
+/// One verified, bounded READY variable-profile shard and the evidence that
+/// must survive a local volume transfer. This is not a peer-wire format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyVariableObject {
+    pub object: VariableParityObject,
+    pub attempt_id: [u8; 16],
+    pub verification_hash: [u8; 32],
+    pub staged_receipt: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParityScrubReport {
     pub checked_objects: usize,
@@ -2010,6 +2020,176 @@ impl ParityStore {
         let group_id: [u8; 32] = group_id.try_into().map_err(|_| DatabaseError::Integrity)?;
         let shard_index = u8::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?;
         self.load_ready(&group_id, shard_index).map(Some)
+    }
+
+    /// Enumerate one variable READY shard at a time, preserving its attempt
+    /// and activation evidence. STAGED objects and reservations remain owned
+    /// by their existing coding operation until it finishes or aborts.
+    pub fn first_ready_variable_object(
+        &self,
+    ) -> Result<Option<ReadyVariableObject>, DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let identity = transaction
+            .query_row(
+                "SELECT group_id, shard_index FROM parity_objects
+             WHERE state = 'READY' AND format_version = 2
+             ORDER BY group_id, shard_index LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let result = if let Some((group_id, shard_index)) = identity {
+            let group_id: [u8; 32] = group_id.try_into().map_err(|_| DatabaseError::Integrity)?;
+            let shard_index = u16::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?;
+            Some(self.read_ready_variable_object(&group_id, shard_index)?)
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Install a previously verified READY shard on another local volume in
+    /// one transaction. Preserve its receipt and activation evidence exactly;
+    /// reservations count against the destination budget. Local control must
+    /// publish the destination location before withdrawing the source copy.
+    pub fn copy_ready_variable_object(
+        &mut self,
+        ready: &ReadyVariableObject,
+        budget_bytes: u64,
+    ) -> Result<(), DatabaseError> {
+        validate_ready_variable_object(ready)?;
+        let object = &ready.object;
+        let transaction = self.connection.unchecked_transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2)",
+            params![object.group_id.as_slice(), object.shard_index],
+            |row| row.get(0),
+        )?;
+        if exists {
+            if self.read_ready_variable_object(&object.group_id, object.shard_index)? != *ready {
+                return Err(DatabaseError::Conflict);
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        let required = self
+            .used_bytes()?
+            .checked_add(object.bytes.len() as u64)
+            .ok_or(DatabaseError::CapacityExceeded)?;
+        if required > budget_bytes {
+            return Err(DatabaseError::CapacityExceeded);
+        }
+        transaction.execute(
+            "INSERT INTO parity_objects(format_version, guild_id, group_id, shard_index, root,
+                byte_length, state, bytes, acknowledgement, attempt_id, verification_hash)
+             VALUES(2, ?1, ?2, ?3, ?4, ?5, 'READY', ?6, ?7, ?8, ?9)",
+            params![
+                object.guild_id.as_slice(),
+                object.group_id.as_slice(),
+                object.shard_index,
+                object.commitment.root.as_slice(),
+                object.bytes.len() as i64,
+                object.bytes.as_slice(),
+                ready.staged_receipt.as_slice(),
+                ready.attempt_id.as_slice(),
+                ready.verification_hash.as_slice()
+            ],
+        )?;
+        if self.read_ready_variable_object(&object.group_id, object.shard_index)? != *ready {
+            return Err(DatabaseError::Integrity);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Withdraw only the transferred attempt, after the destination location
+    /// is durable. A successor reusing the same group/root is never removed.
+    pub fn remove_ready_variable_object(
+        &mut self,
+        group_id: &[u8; 32],
+        shard_index: u16,
+        expected_root: &[u8; 32],
+        expected_attempt: &[u8; 16],
+        expected_verification: &[u8; 32],
+    ) -> Result<bool, DatabaseError> {
+        if *expected_attempt == [0; 16] || *expected_verification == [0; 32] {
+            return Err(DatabaseError::Integrity);
+        }
+        let transaction = self.connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2)",
+            params![group_id.as_slice(), shard_index],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let removed = transaction.execute(
+            "DELETE FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2 AND root = ?3
+             AND format_version = 2 AND state = 'READY' AND attempt_id = ?4 AND verification_hash = ?5",
+            params![group_id.as_slice(), shard_index, expected_root.as_slice(), expected_attempt.as_slice(), expected_verification.as_slice()],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        self.reclaim_deleted_pages()?;
+        Ok(true)
+    }
+
+    /// Read payload and evidence from the same database snapshot, including
+    /// when another connection is performing coding activation or garbage
+    /// collection. Corrupt or incomplete evidence never enters a transfer.
+    pub fn load_ready_variable_object(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<ReadyVariableObject, DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let result = self.read_ready_variable_object(group_id, shard_index)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    fn read_ready_variable_object(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<ReadyVariableObject, DatabaseError> {
+        let object = self.load_ready_variable(group_id, shard_index)?;
+        let (attempt_id, verification_hash, staged_receipt) = self.connection.query_row(
+            "SELECT attempt_id, verification_hash, acknowledgement FROM parity_objects
+             WHERE group_id = ?1 AND shard_index = ?2 AND format_version = 2 AND state = 'READY'",
+            params![group_id.as_slice(), shard_index],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )?;
+        let attempt_id: [u8; 16] = attempt_id
+            .try_into()
+            .map_err(|_| DatabaseError::Integrity)?;
+        let verification_hash: [u8; 32] = verification_hash
+            .try_into()
+            .map_err(|_| DatabaseError::Integrity)?;
+        if attempt_id == [0; 16]
+            || verification_hash == [0; 32]
+            || staged_receipt.is_empty()
+            || staged_receipt.len() > 64 * 1024
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        Ok(ReadyVariableObject {
+            object,
+            attempt_id,
+            verification_hash,
+            staged_receipt,
+        })
     }
 
     pub fn allocated_bytes(&self) -> Result<u64, DatabaseError> {
@@ -2813,6 +2993,18 @@ fn validate_parity_publication(
         || object.shard_index > 4
         || sector_root(&object.bytes) != object.root
         || acknowledgement.len() > 4096
+    {
+        return Err(DatabaseError::Integrity);
+    }
+    Ok(())
+}
+
+fn validate_ready_variable_object(ready: &ReadyVariableObject) -> Result<(), DatabaseError> {
+    validate_variable_parity_object(&ready.object)?;
+    if ready.attempt_id == [0; 16]
+        || ready.verification_hash == [0; 32]
+        || ready.staged_receipt.is_empty()
+        || ready.staged_receipt.len() > 64 * 1024
     {
         return Err(DatabaseError::Integrity);
     }
@@ -5606,6 +5798,262 @@ mod tests {
         );
         assert_eq!(store.discard_uncommitted_attempt(&attempt_id).unwrap(), 1);
         assert_eq!(store.ready_object_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn ready_variable_enumeration_preserves_exact_evidence_and_excludes_pending_ownership() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([175; 32]));
+        let path = temp.path().join("parity.db");
+        let volume_id = [176; 16];
+        let mut store = ParityStore::open(&path, &volume_id, &keys).unwrap();
+        store
+            .reserve_coding_attempt(&[177; 16], &[178; 32], 9, 64, 1024)
+            .unwrap();
+        let mut expected = Vec::new();
+        for (group, ready) in [(1_u8, false), (3, true), (2, true)] {
+            let bytes = vec![group; 64];
+            let object = VariableParityObject {
+                format_version: 2,
+                guild_id: [178; 32],
+                group_id: [group; 32],
+                shard_index: 4,
+                commitment: merkle_commit(&bytes).unwrap(),
+                bytes,
+            };
+            let attempt_id = [group; 16];
+            let staged_receipt = vec![group; 24];
+            store
+                .stage_attempt(&attempt_id, &object, &staged_receipt, 1024)
+                .unwrap();
+            if ready {
+                let verification_hash = [group; 32];
+                store
+                    .activate_attempt_object(
+                        &attempt_id,
+                        &object.group_id,
+                        object.shard_index,
+                        &object.commitment,
+                        &verification_hash,
+                    )
+                    .unwrap();
+                expected.push(ReadyVariableObject {
+                    object,
+                    attempt_id,
+                    verification_hash,
+                    staged_receipt,
+                });
+            }
+        }
+        expected.sort_by_key(|item| item.object.group_id);
+        drop(store);
+        let mut store = ParityStore::open(&path, &volume_id, &keys).unwrap();
+        assert_eq!(store.variable_object_count().unwrap(), 4);
+        assert_eq!(store.used_bytes().unwrap(), 256);
+        for item in expected {
+            assert_eq!(
+                store.first_ready_variable_object().unwrap(),
+                Some(item.clone())
+            );
+            assert_eq!(
+                store
+                    .load_ready_variable_object(&item.object.group_id, item.object.shard_index)
+                    .unwrap(),
+                item
+            );
+            store
+                .remove_ready(
+                    &item.object.group_id,
+                    item.object.shard_index as u8,
+                    &item.object.commitment.root,
+                )
+                .unwrap();
+        }
+        assert_eq!(store.first_ready_variable_object().unwrap(), None);
+        assert_eq!(store.variable_object_count().unwrap(), 2);
+        assert_eq!(store.used_bytes().unwrap(), 128);
+    }
+
+    #[test]
+    fn ready_variable_transfer_rejects_corrupt_payload_and_activation_evidence() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([179; 32]));
+        let mut store =
+            ParityStore::open(temp.path().join("parity.db"), &[180; 16], &keys).unwrap();
+        let bytes = vec![181; 64];
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: [182; 32],
+            group_id: [183; 32],
+            shard_index: 11,
+            commitment: merkle_commit(&bytes).unwrap(),
+            bytes,
+        };
+        store
+            .stage_attempt(&[184; 16], &object, b"original receipt", 1024)
+            .unwrap();
+        store
+            .activate_attempt_object(
+                &[184; 16],
+                &object.group_id,
+                object.shard_index,
+                &object.commitment,
+                &[185; 32],
+            )
+            .unwrap();
+        for (column, replacement) in [
+            ("attempt_id", vec![0; 16]),
+            ("verification_hash", vec![0; 32]),
+            ("acknowledgement", vec![]),
+            ("bytes", vec![186; 64]),
+        ] {
+            let original: Vec<u8> = store
+                .connection
+                .query_row(&format!("SELECT {column} FROM parity_objects"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE parity_objects SET {column} = ?1"),
+                    [replacement],
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    store.first_ready_variable_object(),
+                    Err(DatabaseError::Integrity)
+                ),
+                "{column}"
+            );
+            assert_eq!(store.ready_object_count().unwrap(), 1);
+            store
+                .connection
+                .execute(
+                    &format!("UPDATE parity_objects SET {column} = ?1"),
+                    [original],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.first_ready_variable_object().unwrap().unwrap().object,
+            object
+        );
+    }
+
+    #[test]
+    fn ready_variable_copy_counts_reservations_and_survives_reopen_with_exact_evidence() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([187; 32]));
+        let source_path = temp.path().join("source.db");
+        let destination_path = temp.path().join("destination.db");
+        let mut source = ParityStore::open(&source_path, &[188; 16], &keys).unwrap();
+        let mut destination = ParityStore::open(&destination_path, &[189; 16], &keys).unwrap();
+        let bytes = vec![190; 64];
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: [191; 32],
+            group_id: [192; 32],
+            shard_index: 3,
+            commitment: merkle_commit(&bytes).unwrap(),
+            bytes,
+        };
+        source
+            .stage_attempt(&[193; 16], &object, b"exact staged receipt", 128)
+            .unwrap();
+        source
+            .activate_attempt_object(
+                &[193; 16],
+                &object.group_id,
+                object.shard_index,
+                &object.commitment,
+                &[194; 32],
+            )
+            .unwrap();
+        let ready = source.first_ready_variable_object().unwrap().unwrap();
+        destination
+            .reserve_coding_attempt(&[195; 16], &object.guild_id, 4, 64, 128)
+            .unwrap();
+        assert!(matches!(
+            destination.copy_ready_variable_object(&ready, 64),
+            Err(DatabaseError::CapacityExceeded)
+        ));
+        assert_eq!(destination.first_ready_variable_object().unwrap(), None);
+        assert_eq!(destination.used_bytes().unwrap(), 64);
+        destination.copy_ready_variable_object(&ready, 128).unwrap();
+        destination.copy_ready_variable_object(&ready, 0).unwrap();
+        assert_eq!(destination.used_bytes().unwrap(), 128);
+        let mut conflicting = ready.clone();
+        conflicting.attempt_id = [196; 16];
+        assert!(matches!(
+            destination.copy_ready_variable_object(&conflicting, 128),
+            Err(DatabaseError::Conflict)
+        ));
+        let mut corrupt = ready.clone();
+        corrupt.object.bytes[0] ^= 1;
+        assert!(matches!(
+            destination.copy_ready_variable_object(&corrupt, 128),
+            Err(DatabaseError::Integrity)
+        ));
+        assert_eq!(
+            source.first_ready_variable_object().unwrap(),
+            Some(ready.clone())
+        );
+        drop(destination);
+        let destination = ParityStore::open(&destination_path, &[189; 16], &keys).unwrap();
+        assert_eq!(
+            destination.first_ready_variable_object().unwrap(),
+            Some(ready.clone())
+        );
+        assert_eq!(destination.variable_object_count().unwrap(), 2);
+        for (attempt, verification, root) in [
+            ([196; 16], ready.verification_hash, object.commitment.root),
+            (ready.attempt_id, [197; 32], object.commitment.root),
+            (ready.attempt_id, ready.verification_hash, [198; 32]),
+        ] {
+            assert!(matches!(
+                source.remove_ready_variable_object(
+                    &object.group_id,
+                    object.shard_index,
+                    &root,
+                    &attempt,
+                    &verification
+                ),
+                Err(DatabaseError::Conflict)
+            ));
+            assert_eq!(
+                source.first_ready_variable_object().unwrap(),
+                Some(ready.clone())
+            );
+        }
+        assert!(
+            source
+                .remove_ready_variable_object(
+                    &object.group_id,
+                    object.shard_index,
+                    &object.commitment.root,
+                    &ready.attempt_id,
+                    &ready.verification_hash
+                )
+                .unwrap()
+        );
+        assert!(
+            !source
+                .remove_ready_variable_object(
+                    &object.group_id,
+                    object.shard_index,
+                    &object.commitment.root,
+                    &ready.attempt_id,
+                    &ready.verification_hash
+                )
+                .unwrap()
+        );
+        assert_eq!(source.first_ready_variable_object().unwrap(), None);
+        assert_eq!(
+            destination.first_ready_variable_object().unwrap(),
+            Some(ready)
+        );
     }
 
     #[test]

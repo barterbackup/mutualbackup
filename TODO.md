@@ -172,6 +172,16 @@ passing tests below apply only to their recorded source and exercised cases.
     strict workspace/all-targets Clippy. This fixes a pending-ownership replay
     boundary; variable-profile disk evacuation remains open.
 
+  - [x] Add the verified READY transfer primitives. The store enumerates one
+    variable shard in a consistent snapshot, carrying its original attempt,
+    staged receipt, and verification hash. Atomic copying verifies the payload
+    and evidence and counts coding reservations against destination capacity;
+    conditional source deletion rejects different attempt/root/verification
+    evidence. Three targeted corruption, pending-ownership, capacity, replay,
+    and reopen fixtures pass, along with all 51 database tests, formatting, and
+    strict workspace/all-targets Clippy. These local primitives do not yet
+    implement cross-volume publication or evacuation.
+
 - [x] **R6 / P2 — Package ordinary Git as an explicit runtime dependency.**
   Implemented: the default Nix runtime wraps the CLI, daemon, native Git command,
   and remote helper with pinned ordinary Git on PATH; the optional alias points
