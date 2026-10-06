@@ -114,6 +114,97 @@ struct VolumeManifest {
     wrapped_database_key: WrappedDatabaseKey,
 }
 
+/// An existing local parity volume opened without registry reconciliation,
+/// key publication/rekeying, schema migration or shard retirement.
+pub struct PreservedParityVolume {
+    volume_id: Uuid,
+    store: ParityStore,
+}
+
+impl PreservedParityVolume {
+    pub fn open(root: &Path, keys: &KeyMaterial) -> Result<Self> {
+        let metadata = fs::symlink_metadata(root)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("preserved parity volume must be an existing directory");
+        }
+        let manifest_path = root.join(VOLUME_MANIFEST_FILE);
+        let (volume_id, path, database_key) = match fs::symlink_metadata(&manifest_path) {
+            Ok(_) => {
+                let signed: SignedRecord<VolumeManifest> = read_private_record(&manifest_path)?;
+                signed.verify(VOLUME_MANIFEST_DOMAIN)?;
+                validate_manifest(&signed.value, keys.node_id())?;
+                if signed.signer != keys.node_id() {
+                    bail!("parity volume manifest was not signed by its owner");
+                }
+                let key = keys.unwrap_database_key(
+                    &volume_database_id(signed.value.volume_id),
+                    &signed.value.wrapped_database_key,
+                )?;
+                (
+                    signed.value.volume_id,
+                    root.join(&signed.value.database_file),
+                    key,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let id = legacy_default_volume_id(keys);
+                (
+                    id,
+                    root.join("parity.db"),
+                    keys.database_key(&legacy_volume_database_id(id)),
+                )
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let store = ParityStore::open_existing_read_only_with_key(
+            &path,
+            volume_id.as_bytes(),
+            &database_key,
+        )
+        .or_else(|wrapped_error| {
+            ParityStore::open_existing_read_only_with_key(
+                &path,
+                volume_id.as_bytes(),
+                &keys.database_key(&legacy_volume_database_id(volume_id)),
+            )
+            .map_err(|_| wrapped_error)
+        })?;
+        Ok(Self { volume_id, store })
+    }
+
+    pub fn volume_id(&self) -> Uuid {
+        self.volume_id
+    }
+
+    pub fn load_fixed(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        index: u8,
+        root: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let object = self.store.load_ready(group_id, index)?;
+        if object.guild_id != *guild_id || object.root != *root {
+            bail!("preserved fixed shard differs from its authenticated reference");
+        }
+        Ok(object.bytes)
+    }
+
+    pub fn load_variable(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        index: u16,
+        commitment: &MerkleCommitment,
+    ) -> Result<Vec<u8>> {
+        let object = self.store.load_ready_variable(group_id, index)?;
+        if object.guild_id != *guild_id || object.commitment != *commitment {
+            bail!("preserved variable shard differs from its authenticated reference");
+        }
+        Ok(object.bytes)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct VolumeRecord {
     format_version: u16,
@@ -2815,6 +2906,9 @@ fn read_volume_manifest(root: &Path, keys: &KeyMaterial) -> Result<Option<Volume
     let signed: SignedRecord<VolumeManifest> = read_private_record(&manifest_path)?;
     signed.verify(VOLUME_MANIFEST_DOMAIN)?;
     validate_manifest(&signed.value, keys.node_id())?;
+    if signed.signer != keys.node_id() {
+        bail!("parity volume manifest was not signed by its owner");
+    }
     Ok(Some(signed.value))
 }
 
@@ -2827,6 +2921,9 @@ fn open_volume_store(
     let signed: SignedRecord<VolumeManifest> = read_private_record(&manifest_path)?;
     signed.verify(VOLUME_MANIFEST_DOMAIN)?;
     validate_manifest(&signed.value, keys.node_id())?;
+    if signed.signer != keys.node_id() {
+        bail!("parity volume manifest was not signed by its owner");
+    }
     if signed.value.volume_id != record.volume_id
         || signed.value.database_file != record.database_file
         || signed.value.wrapped_database_key != record.wrapped_database_key
@@ -3164,6 +3261,161 @@ mod tests {
     use super::*;
     use mb_core::{Seed, V1_SECTOR_SIZE, sector_root};
     use tempfile::TempDir;
+
+    #[test]
+    fn preserved_parity_volume_reads_wrapped_legacy_and_interrupted_keys_without_mutation() {
+        for mode in 0..3 {
+            let temp = TempDir::new().unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([119; 32]));
+            let volume_id = if mode == 1 {
+                Uuid::new_v4()
+            } else {
+                legacy_default_volume_id(&keys)
+            };
+            let wrapped_key = [120; 32];
+            let database_key = if mode == 1 {
+                wrapped_key
+            } else {
+                keys.database_key(&legacy_volume_database_id(volume_id))
+            };
+            let path = temp.path().join("parity.db");
+            let mut writer =
+                ParityStore::open_with_key(&path, volume_id.as_bytes(), &database_key).unwrap();
+            let fixed = parity_object(121, 3);
+            writer.stage_and_publish(&fixed).unwrap();
+            let bytes = vec![122; 4096];
+            let variable = VariableParityObject {
+                format_version: 2,
+                guild_id: [123; 32],
+                group_id: [124; 32],
+                shard_index: 7,
+                commitment: mb_core::merkle_commit(&bytes).unwrap(),
+                bytes,
+            };
+            writer
+                .stage_attempt(&[125; 16], &variable, b"receipt", 2 * 65536)
+                .unwrap();
+            writer
+                .activate_attempt_object(
+                    &[125; 16],
+                    &variable.group_id,
+                    variable.shard_index,
+                    &variable.commitment,
+                    &[126; 32],
+                )
+                .unwrap();
+            drop(writer);
+            if mode != 0 {
+                let manifest = VolumeManifest {
+                    format_version: 1,
+                    owner: keys.node_id(),
+                    volume_id,
+                    database_file: "parity.db".into(),
+                    wrapped_database_key: keys
+                        .wrap_database_key(&volume_database_id(volume_id), &wrapped_key)
+                        .unwrap(),
+                };
+                write_new_private_record(
+                    &temp.path().join(VOLUME_MANIFEST_FILE),
+                    &SignedRecord::sign(VOLUME_MANIFEST_DOMAIN, manifest, &keys).unwrap(),
+                )
+                .unwrap();
+            }
+            let original = fs::read(&path).unwrap();
+            let manifest_before = fs::read(temp.path().join(VOLUME_MANIFEST_FILE)).ok();
+            let reader = PreservedParityVolume::open(temp.path(), &keys).unwrap();
+            assert_eq!(reader.volume_id(), volume_id);
+            assert_eq!(
+                reader
+                    .load_fixed(
+                        &fixed.guild_id,
+                        &fixed.group_id,
+                        fixed.shard_index,
+                        &fixed.root
+                    )
+                    .unwrap(),
+                fixed.bytes
+            );
+            assert_eq!(
+                reader
+                    .load_variable(
+                        &variable.guild_id,
+                        &variable.group_id,
+                        variable.shard_index,
+                        &variable.commitment
+                    )
+                    .unwrap(),
+                variable.bytes
+            );
+            assert!(
+                reader
+                    .load_fixed(&[127; 32], &fixed.group_id, fixed.shard_index, &fixed.root)
+                    .is_err()
+            );
+            assert!(
+                reader
+                    .load_fixed(
+                        &fixed.guild_id,
+                        &fixed.group_id,
+                        fixed.shard_index,
+                        &[128; 32]
+                    )
+                    .is_err()
+            );
+            let mut changed = variable.commitment.clone();
+            changed.root = [129; 32];
+            assert!(
+                reader
+                    .load_variable(
+                        &variable.guild_id,
+                        &variable.group_id,
+                        variable.shard_index,
+                        &changed
+                    )
+                    .is_err()
+            );
+            drop(reader);
+            assert_eq!(fs::read(path).unwrap(), original);
+            assert_eq!(
+                fs::read(temp.path().join(VOLUME_MANIFEST_FILE)).ok(),
+                manifest_before
+            );
+            assert!(!temp.path().join("control.db").exists());
+            assert!(!temp.path().join("control.key").exists());
+        }
+    }
+
+    #[test]
+    fn preserved_parity_volume_rejects_foreign_manifest_signers_missing_and_symlinked_inputs() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([119; 32]));
+        assert!(PreservedParityVolume::open(temp.path(), &keys).is_err());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        let record = initialize_volume(temp.path(), Some("parity.db"), 65536, 0, &keys).unwrap();
+        let manifest = read_volume_manifest(temp.path(), &keys).unwrap().unwrap();
+        let original = fs::read(temp.path().join("parity.db")).unwrap();
+        let foreign = KeyMaterial::from_seed(&Seed::from_bytes([130; 32]));
+        let signed = SignedRecord::sign(VOLUME_MANIFEST_DOMAIN, manifest, &foreign).unwrap();
+        fs::remove_file(temp.path().join(VOLUME_MANIFEST_FILE)).unwrap();
+        write_new_private_record(&temp.path().join(VOLUME_MANIFEST_FILE), &signed).unwrap();
+        assert!(PreservedParityVolume::open(temp.path(), &keys).is_err());
+        assert!(read_volume_manifest(temp.path(), &keys).is_err());
+        let database_key = keys
+            .unwrap_database_key(
+                &volume_database_id(record.volume_id),
+                &record.wrapped_database_key,
+            )
+            .unwrap();
+        assert!(open_volume_store(&record, &database_key, &keys).is_err());
+        assert_eq!(fs::read(temp.path().join("parity.db")).unwrap(), original);
+        fs::remove_file(temp.path().join(VOLUME_MANIFEST_FILE)).unwrap();
+        let actual = temp.path().join("preserved.db");
+        fs::rename(temp.path().join("parity.db"), &actual).unwrap();
+        symlink(&actual, temp.path().join("parity.db")).unwrap();
+        assert!(PreservedParityVolume::open(temp.path(), &keys).is_err());
+        assert_eq!(fs::read(actual).unwrap(), original);
+    }
 
     #[test]
     fn coding_capacity_accounts_for_durable_reservations() {

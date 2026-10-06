@@ -864,6 +864,13 @@ remain. Native seed recovery, retention/prune, and repeated owner-loss coverage
 replace the useful generic guarded fixtures. Historical inventory with unavailable
 metadata and verified mount-free export remain required; R1 is still open.
 
+Available-input legacy export now reads signed files, preserved control catalogs,
+explicit anchor areas and certified cached fixed/packed checkpoint data. A
+separate read-only parity-volume reader validates historical schemas, existing
+keys, owner signatures and bounded READY payloads without migration or rekeying.
+Connecting parity-volume inputs to export, variable-profile reconstruction, peer
+downloads and complete retained-history/upgrade qualification remain required.
+
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
 implementation, enrollment and recovery publication paths, guarded Git
 operations, backend-specific control commands, tests/probes, and `fuser`

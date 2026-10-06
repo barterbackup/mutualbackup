@@ -224,3 +224,12 @@ provisioned snapshot regressions pass with verified disposable Btrfs cleanup;
 formatting and strict workspace/all-targets Clippy pass. This validation does not
 include complete ordinary Node/Git suites, all other provisioned cases or the
 full retained-history, peer/variable-volume and M6 platform/release requirements.
+
+The library now provides a read-only preserved parity-volume reader for existing
+seed-derived or wrapped SQLCipher keys, including an interrupted key-wrap
+transition. It validates supported historical schemas without upgrading them,
+requires an owner-signed volume manifest when present, and returns only READY
+fixed/variable payloads matching the supplied guild and root/commitment. Reads
+bound damaged database fields before allocation. This does not yet add parity
+volume arguments to `legacy-export` or implement variable-codeword reconstruction;
+preserve those volumes for the remaining recovery work.

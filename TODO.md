@@ -213,6 +213,30 @@ passing tests below apply only to their recorded source and exercised cases.
     cleanup (232 unique test cases). Formatting and strict locked workspace/
     all-targets Clippy pass. Complete ordinary Node/Git suites, remaining
     provisioned cases and full M6 upgrade/platform qualification were not rerun.
+  - [x] Add a migration-free reader for preserved local parity volumes.
+    Existing SQLCipher databases open read-only with exact volume identity and
+    supported schema checks (versions 2/3/5/6/7/8/9). Owner-signed manifests
+    unwrap existing keys; seed-derived legacy keys and interrupted key-wrap
+    publication are handled without rekeying, registry reconciliation, cleanup
+    or shard retirement. Fixed and variable READY reads authenticate stored
+    payloads and require the caller's expected guild and root/commitment.
+    SQL bounds damaged payload/identifier fields before allocation, including
+    the ordinary runtime readers. Normal volume opening now also rejects a
+    manifest whose signer differs from its declared owner. Missing databases,
+    symlinks, wrong keys/volume IDs and foreign manifests fail without creation.
+    This is the reader foundation; `legacy-export` does not yet accept parity
+    volume inputs or reconstruct variable-profile codewords from them. Peer
+    downloads, retained-history conversion and the full R1 release gates remain
+    open.
+    Validation: all 108 ordinary store tests, 56 ordinary volume tests, ten
+    targeted legacy exporter/range tests, the variable-volume evacuation and
+    reconstruction regression, and four CLI unit tests pass (179 unique cases).
+    Historical READY payloads read without migration in all supported schemas;
+    the live-WAL fixture preserves database/WAL bytes. Wrapped/legacy/interrupted
+    keys preserve database/manifest bytes and reject mismatched authentication.
+    Formatting and strict locked workspace/all-targets Clippy pass. Complete
+    ordinary Node/Git suites, provisioned cases and the full M6 platform/release
+    gates were not rerun by this reader increment.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

@@ -55,6 +55,8 @@ pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,
     restore_revision_from_source,
 };
-pub use volume::{StorageScrubReport, StorageVolumeState, StorageVolumeStatus};
+pub use volume::{
+    PreservedParityVolume, StorageScrubReport, StorageVolumeState, StorageVolumeStatus,
+};
 pub use watcher::run_root_watcher;
 pub use wire::{WireError, WireErrorCode};

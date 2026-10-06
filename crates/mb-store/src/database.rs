@@ -1822,6 +1822,34 @@ impl ParityStore {
         })
     }
 
+    /// Inspect existing parity state without creation, migration or rekeying.
+    pub fn open_existing_read_only_with_key(
+        path: impl AsRef<Path>,
+        volume_id: &[u8; 16],
+        database_key: &[u8; 32],
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let connection = configure_encrypted_connection(connection, database_key, true)?;
+        if meta_value(&connection, "database_kind")?.as_deref() != Some(b"parity")
+            || meta_value(&connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
+        {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        validate_parity_schema_version(&connection, stored_schema_version(&connection)?)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -3026,7 +3054,14 @@ impl ParityStore {
         params: P,
     ) -> Result<VariableParityObject, DatabaseError> {
         let sql = format!(
-            "SELECT format_version, guild_id, group_id, shard_index, root, byte_length, bytes
+            "SELECT format_version,
+                    CASE WHEN length(guild_id) = 32 THEN guild_id END,
+                    CASE WHEN length(group_id) = 32 THEN group_id END,
+                    shard_index,
+                    CASE WHEN length(root) = 32 THEN root END,
+                    byte_length,
+                    CASE WHEN byte_length BETWEEN 16 AND 4194304
+                         AND length(bytes) = byte_length THEN bytes END
              FROM parity_objects WHERE {predicate}"
         );
         let row = self
@@ -3034,21 +3069,33 @@ impl ParityStore {
             .query_row(&sql, params, |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
                 ))
             })
             .optional()?
             .ok_or(DatabaseError::NotReady)?;
-        let root: [u8; 32] = row.4.try_into().map_err(|_| DatabaseError::Integrity)?;
+        let root: [u8; 32] = row
+            .4
+            .ok_or(DatabaseError::Integrity)?
+            .try_into()
+            .map_err(|_| DatabaseError::Integrity)?;
         let object = VariableParityObject {
             format_version: u16::try_from(row.0).map_err(|_| DatabaseError::Integrity)?,
-            guild_id: row.1.try_into().map_err(|_| DatabaseError::Integrity)?,
-            group_id: row.2.try_into().map_err(|_| DatabaseError::Integrity)?,
+            guild_id: row
+                .1
+                .ok_or(DatabaseError::Integrity)?
+                .try_into()
+                .map_err(|_| DatabaseError::Integrity)?,
+            group_id: row
+                .2
+                .ok_or(DatabaseError::Integrity)?
+                .try_into()
+                .map_err(|_| DatabaseError::Integrity)?,
             shard_index: u16::try_from(row.3).map_err(|_| DatabaseError::Integrity)?,
             commitment: MerkleCommitment {
                 format_version: 1,
@@ -3056,7 +3103,7 @@ impl ParityStore {
                 byte_len: u32::try_from(row.5).map_err(|_| DatabaseError::Integrity)?,
                 root,
             },
-            bytes: row.6,
+            bytes: row.6.ok_or(DatabaseError::Integrity)?,
         };
         validate_variable_parity_object(&object)?;
         Ok(object)
@@ -3103,29 +3150,42 @@ impl ParityStore {
         let row = self
             .connection
             .query_row(
-                "SELECT format_version, guild_id, root, byte_length, bytes
+                "SELECT format_version,
+                        CASE WHEN length(guild_id) = 32 THEN guild_id END,
+                        CASE WHEN length(root) = 32 THEN root END,
+                        byte_length,
+                        CASE WHEN byte_length = 65536 AND length(bytes) = 65536 THEN bytes END
                  FROM parity_objects
                  WHERE group_id = ?1 AND shard_index = ?2 AND state = 'READY'",
                 params![group_id.as_slice(), shard_index],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
                         row.get::<_, i64>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 },
             )
             .optional()?
             .ok_or(DatabaseError::NotReady)?;
         let format_version = u16::try_from(row.0).map_err(|_| DatabaseError::Integrity)?;
-        let guild_id: [u8; 32] = row.1.try_into().map_err(|_| DatabaseError::Integrity)?;
-        let root: [u8; 32] = row.2.try_into().map_err(|_| DatabaseError::Integrity)?;
+        let guild_id: [u8; 32] = row
+            .1
+            .ok_or(DatabaseError::Integrity)?
+            .try_into()
+            .map_err(|_| DatabaseError::Integrity)?;
+        let root: [u8; 32] = row
+            .2
+            .ok_or(DatabaseError::Integrity)?
+            .try_into()
+            .map_err(|_| DatabaseError::Integrity)?;
+        let bytes = row.4.ok_or(DatabaseError::Integrity)?;
         if format_version != 1
-            || row.3 != row.4.len() as i64
-            || row.4.len() != V1_SECTOR_SIZE
-            || sector_root(&row.4) != root
+            || row.3 != bytes.len() as i64
+            || bytes.len() != V1_SECTOR_SIZE
+            || sector_root(&bytes) != root
         {
             return Err(DatabaseError::Integrity);
         }
@@ -3135,7 +3195,7 @@ impl ParityStore {
             group_id: *group_id,
             shard_index,
             root,
-            bytes: row.4,
+            bytes,
         })
     }
 
@@ -3686,6 +3746,26 @@ fn validate_parity_schema(connection: &Connection) -> Result<(), DatabaseError> 
     )
 }
 
+fn validate_parity_schema_version(
+    connection: &Connection,
+    version: u32,
+) -> Result<(), DatabaseError> {
+    if version == SCHEMA_VERSION {
+        return validate_parity_schema(connection);
+    }
+    let objects = match version {
+        8 => PARITY_OBJECTS_SCHEMA,
+        7 => PARITY_OBJECTS_BEFORE_V8_SCHEMA,
+        6 => PARITY_OBJECTS_BEFORE_V7_SCHEMA,
+        2 | 3 | 5 => PARITY_OBJECTS_BEFORE_V6_SCHEMA,
+        _ => return Err(DatabaseError::IncompatibleSchema),
+    };
+    require_exact_tables(
+        connection,
+        &[("meta", META_SCHEMA), ("parity_objects", objects)],
+    )
+}
+
 fn require_exact_tables(
     connection: &Connection,
     expected: &[(&str, &str)],
@@ -4001,6 +4081,180 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn read_only_parity_inspection_preserves_every_known_schema_without_migration() {
+        for version in [2, 3, 5, 6, 7, 8, SCHEMA_VERSION] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("parity.db");
+            let id = [111; 16];
+            let key = [112; 32];
+            let store = ParityStore::open_with_key(&path, &id, &key).unwrap();
+            if version != SCHEMA_VERSION {
+                let objects = match version {
+                    8 => PARITY_OBJECTS_SCHEMA,
+                    7 => PARITY_OBJECTS_BEFORE_V8_SCHEMA,
+                    6 => PARITY_OBJECTS_BEFORE_V7_SCHEMA,
+                    _ => PARITY_OBJECTS_BEFORE_V6_SCHEMA,
+                };
+                store
+                    .connection
+                    .execute_batch("DROP TABLE coding_reservations; DROP TABLE parity_objects;")
+                    .unwrap();
+                store.connection.execute_batch(objects).unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                        [version.to_be_bytes().as_slice()],
+                    )
+                    .unwrap();
+            }
+            let bytes = vec![115; V1_SECTOR_SIZE];
+            let object = ParityObject {
+                format_version: 1,
+                guild_id: [116; 32],
+                group_id: [117; 32],
+                shard_index: 3,
+                root: sector_root(&bytes),
+                bytes,
+            };
+            store
+                .connection
+                .execute(
+                    "INSERT INTO parity_objects(format_version, guild_id, group_id, shard_index,
+                 root, byte_length, state, bytes) VALUES (1, ?1, ?2, 3, ?3, 65536, 'READY', ?4)",
+                    params![
+                        object.guild_id.as_slice(),
+                        object.group_id.as_slice(),
+                        object.root.as_slice(),
+                        object.bytes.as_slice()
+                    ],
+                )
+                .unwrap();
+            drop(store);
+            let original = fs::read(&path).unwrap();
+            let reader = ParityStore::open_existing_read_only_with_key(&path, &id, &key).unwrap();
+            assert_eq!(stored_schema_version(&reader.connection).unwrap(), version);
+            assert_eq!(reader.load_ready(&object.group_id, 3).unwrap(), object);
+            assert!(
+                reader
+                    .connection
+                    .execute("DELETE FROM parity_objects", [])
+                    .is_err()
+            );
+            assert!(
+                reader
+                    .connection
+                    .execute_batch("CREATE TABLE forbidden(value BLOB)")
+                    .is_err()
+            );
+            drop(reader);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(
+                ParityStore::open_existing_read_only_with_key(&path, &[113; 16], &key).is_err()
+            );
+            assert!(ParityStore::open_existing_read_only_with_key(&path, &id, &[114; 32]).is_err());
+        }
+        let temp = tempdir().unwrap();
+        let missing = temp.path().join("missing.db");
+        assert!(
+            ParityStore::open_existing_read_only_with_key(&missing, &[1; 16], &[2; 32]).is_err()
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn read_only_parity_inspection_reads_live_ready_shards_without_checkpointing_wal() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let id = [111; 16];
+        let key = [112; 32];
+        let mut writer = ParityStore::open_with_key(&path, &id, &key).unwrap();
+        writer
+            .connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        let bytes = vec![113; V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [114; 32],
+            group_id: [115; 32],
+            shard_index: 3,
+            root: sector_root(&bytes),
+            bytes,
+        };
+        writer.stage_and_publish(&object).unwrap();
+        let wal = path.with_file_name("parity.db-wal");
+        let db_before = fs::read(&path).unwrap();
+        let wal_before = fs::read(&wal).unwrap();
+        let reader = ParityStore::open_existing_read_only_with_key(&path, &id, &key).unwrap();
+        assert_eq!(
+            reader
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+        assert!(
+            reader
+                .database_shell_statement("UPDATE parity_objects SET state='STAGED'", false)
+                .is_err()
+        );
+        drop(reader);
+        assert_eq!(fs::read(path).unwrap(), db_before);
+        assert_eq!(fs::read(wal).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn ready_shard_reads_bound_damaged_payload_and_identifier_allocations() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let id = [111; 16];
+        let key = [112; 32];
+        let mut store = ParityStore::open_with_key(&path, &id, &key).unwrap();
+        let bytes = vec![113; V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [114; 32],
+            group_id: [115; 32],
+            shard_index: 3,
+            root: sector_root(&bytes),
+            bytes,
+        };
+        store.stage_and_publish(&object).unwrap();
+        store.connection.execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE parity_objects SET bytes = zeroblob(8388608);").unwrap();
+        assert!(matches!(
+            store.load_ready(&object.group_id, 3),
+            Err(DatabaseError::Integrity)
+        ));
+        store
+            .connection
+            .execute_batch("UPDATE parity_objects SET format_version=2, byte_length=8388608;")
+            .unwrap();
+        assert!(matches!(
+            store.load_ready_variable(&object.group_id, 3),
+            Err(DatabaseError::Integrity)
+        ));
+        store.connection.execute_batch("UPDATE parity_objects SET byte_length=65536, bytes=zeroblob(65536), root=zeroblob(8388608);").unwrap();
+        assert!(matches!(
+            store.load_ready_variable(&object.group_id, 3),
+            Err(DatabaseError::Integrity)
+        ));
+        assert!(matches!(
+            store.load_ready(&object.group_id, 3),
+            Err(DatabaseError::Integrity)
+        ));
+        store
+            .connection
+            .execute_batch(
+                "UPDATE parity_objects SET root=zeroblob(32), guild_id=zeroblob(8388608);",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load_ready_variable(&object.group_id, 3),
+            Err(DatabaseError::Integrity)
+        ));
+    }
 
     #[test]
     fn read_only_inspection_preserves_legacy_schema_and_rejects_writes() {
