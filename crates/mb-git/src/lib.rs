@@ -15,6 +15,7 @@ use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 mod backup;
+mod blob_catalog;
 #[cfg(target_os = "linux")]
 mod checkout;
 #[cfg(target_os = "linux")]
@@ -47,6 +48,10 @@ mod worktree;
 mod worktree_scope;
 #[cfg(target_os = "linux")]
 pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
+pub use blob_catalog::{
+    GIT_BLOB_SECTOR_REFS, GitBlobCatalogBuilder, GitBlobCatalogReader, GitBlobCatalogRoot,
+    GitBlobRecord,
+};
 #[cfg(target_os = "linux")]
 pub use checkout::CheckoutError;
 #[cfg(target_os = "linux")]

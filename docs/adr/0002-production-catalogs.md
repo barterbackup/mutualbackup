@@ -1,6 +1,6 @@
 # Bounded authenticated catalogs for the 1 TiB release target
 
-Status: page/record framing, typed source records, Git object fragments, local ownership and address/encryption primitives implemented; production admission
+Status: page/record framing, typed source records, Git object/blob fragments, local ownership and address/encryption primitives implemented; production admission
 remains disabled until the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
 and their limits continue to apply.
 
@@ -229,3 +229,31 @@ retain libgit2's parsing/collision checks and validate the full graph's refs,
 blob availability and reachability. Git ref/blob fragments, the shared admission
 policy, bounded DAG validation, legacy migration and daemon integration remain
 open; existing graph and descriptor limits are still enforced.
+
+Sparse Git blob recipe records are implemented in
+`crates/mb-git/src/blob_catalog.rs`. Blob headers bind OID, logical length and
+extent/sector occurrence counts. Extent headers bind offset, byte coverage and
+sector count; following canonical fragments contain up to 128 sector references.
+Repeated references retain their exact order. Construction and traversal retain
+only the current blob/extent counters and a bounded fragment. The legacy adapter
+iterates an existing `GitBackupBlob` without copying its full extent/sector list.
+It does not change existing signed descriptor bytes or runtime admission.
+
+Readers check increasing blob OIDs, nonoverlapping in-bounds extents, arithmetic,
+fragment indices and counts, source-sector geometry and exact extent coverage.
+The authenticated root summarizes blob/extent/sector counts, logical bytes
+including holes, and data bytes. Totals are checked before the final record is
+returned. Source occurrences count repeatedly; these totals are not physical
+quota or the retained-dataset admission policy. Nested sector declarations are
+bounded before allocation. Incomplete recipes and failures cannot publish a root.
+
+Six fixtures cover legacy sparse conversion across pages, repeated references,
+empty/all-hole blobs, overlap/overflow/truncation/count/order corruption,
+canonical encoding, summary substitution and terminal storage/fetch failures.
+All 61 ordinary Git tests pass (62 provisioned tests remain ignored), along
+with formatting and strict workspace/all-targets Clippy. The synthetic 1 TiB
+logical sparse blob preserves exact recipe layout but does not demonstrate a
+real 1 TiB backup or restore. The enclosing Git container must authenticate this
+root and join recipes against signed source references; recovery must hash the
+regenerated plaintext blob. Those consumers, ref records, full DAG validation,
+legacy migration and the shared capacity policy remain open.

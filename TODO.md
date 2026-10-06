@@ -215,7 +215,20 @@ passing tests below apply only to their recorded source and exercised cases.
     workspace/all-targets Clippy. This is object-codec qualification, not an
     above-limit graph backup; full DAG/ref/blob validation, legacy migration
     and end-to-end admission/recovery remain open.
-  - [ ] Add quota reservations, bounded file/Git-ref/blob/packing/coding record
+  - [x] Add bounded sparse Git blob recipes and a legacy recipe adapter.
+    Blob/extent headers declare exact counts; fragments contain at most 128
+    sector references, preserving repeated references and their order. Readers
+    reject overlap, overflow, incomplete coverage, count/order/schema errors
+    and incorrect final summaries before yielding the final record. Nested
+    declarations reject before allocation; failures fence publication and
+    continuation. Six fixtures cover exact legacy conversion across pages,
+    empty/all-hole blobs, geometry, malformed encoding, summary substitution,
+    interruption and overflow. All 61 ordinary Git tests pass (62 provisioned
+    tests remain ignored), with formatting and strict workspace/all-targets
+    Clippy. The synthetic 1 TiB sparse layout is codec qualification only.
+    Source-authority joins, plaintext blob hashing and runtime migration remain
+    required before accepting a paged descriptor as protected/recoverable.
+  - [ ] Add quota reservations, bounded file/Git-ref/packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.
