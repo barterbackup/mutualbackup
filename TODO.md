@@ -628,6 +628,30 @@ passing tests below apply only to their recorded source and exercised cases.
     snapshot suite retains eight provisioned cases; the two capture cases ran
     separately. These checks do not replace full M6 release qualification.
 
+  - [x] Apply the existing flat capture data-vector limit to prospective Git
+    graph admission and status. Share core constants for 512 reserved metadata
+    positions and 39,488 data positions. Count each graph blob's dense recipe
+    independently, including partial sectors, with checked bounded arithmetic.
+    This conservatively assumes distinct sector identities; cached lengths
+    cannot prove capture's content sharing. A graph fitting the 32 MiB descriptor
+    but exceeding this dense budget rejects before publication through the common mutation
+    preflight; imported lengths participate before anchors exist. Report the
+    separate data-sector limit and the stock Git export remedy. Preserve legacy
+    history and its authenticated sparse import/recovery policy. This is the
+    current prototype admission policy, not physical/shared/sparse capacity or
+    the required full enclosing private/revision contract. R2/R3 and 1 TiB remain
+    open.
+    Validation: all 104 core and 89 ordinary Git tests, 30 ordinary snapshot
+    tests, seven mutualgit unit tests and the local-control schema fixture pass.
+    New geometry fixtures cover inclusive boundaries, per-blob rounding, checked
+    arithmetic, rejected publication and unchanged history across reopen without
+    allocating multi-GiB payloads. Both discovery tests pass, including real
+    Kademlia inventory/export. The discovery record guard now enforces its
+    documented 64 KiB limit rather than the older 512 KiB page constant; the
+    boundary test checks the rejection reason. Formatting and strict locked
+    workspace/all-targets Clippy pass. The 62 provisioned Git and eight snapshot
+    cases were not run here; full M6 release qualification remains open.
+
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
   production catalog design.** The first-release acceptance target is **1 TiB
   per protected dataset, including retained history**, selected by the user on

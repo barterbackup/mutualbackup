@@ -347,6 +347,7 @@ git-status = {
 git-backup-capacity =
     { state: "WithinDescriptorLimit", encoded_bytes: uint, limit_bytes: uint }
   / { state: "DescriptorLimitExceeded", limit_bytes: uint }
+  / { state: "CaptureDataLimitExceeded", limit_sectors: uint, sector_bytes: uint }
   / { state: "Unavailable", reason: tstr }
 
 git-status-change = {

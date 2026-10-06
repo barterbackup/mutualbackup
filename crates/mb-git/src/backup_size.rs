@@ -61,6 +61,26 @@ impl Serialize for Sectors {
     }
 }
 
+/// Bound prospective dense recipe geometry without assuming content sharing.
+/// Capture can deduplicate equal sector identities in its signed data vector;
+/// cached blob lengths alone cannot prove that sharing. Round each blob
+/// separately, as descriptor sizing does; empty blobs have no data sector.
+/// Existing sparse history remains readable under its authenticated geometry.
+pub(crate) fn fits_capture_data_sectors(blobs: &[([u8; 20], u64)]) -> bool {
+    let mut sectors = 0_u64;
+    for (_, len) in blobs {
+        let additional = len.div_ceil(V1_SECTOR_SIZE as u64);
+        let Some(total) = sectors.checked_add(additional) else {
+            return false;
+        };
+        if total > mb_core::V1_MAX_CAPTURE_DATA_SECTORS as u64 {
+            return false;
+        }
+        sectors = total;
+    }
+    true
+}
+
 pub(crate) fn dense_backup_size(
     repository_id: Uuid,
     refs: &[GitGraphRef],
@@ -88,6 +108,42 @@ pub(crate) fn dense_backup_size(
 mod tests {
     use super::*;
     use crate::{GitBackupBlob, GitBackupDescriptor, GitDataExtent};
+
+    #[test]
+    fn git_capture_sector_capacity_counts_per_blob_boundaries_without_payload_allocation() {
+        let limit = mb_core::V1_MAX_CAPTURE_DATA_SECTORS as u64;
+        let width = V1_SECTOR_SIZE as u64;
+        assert!(fits_capture_data_sectors(&[]));
+        assert!(fits_capture_data_sectors(&[
+            ([1; 20], 0),
+            ([2; 20], (limit - 1) * width)
+        ]));
+        assert!(fits_capture_data_sectors(&[([1; 20], limit * width)]));
+        assert!(!fits_capture_data_sectors(&[([1; 20], limit * width + 1)]));
+        assert!(fits_capture_data_sectors(&[
+            ([1; 20], (limit - 1) * width),
+            ([2; 20], 1)
+        ]));
+        assert!(!fits_capture_data_sectors(&[
+            ([1; 20], (limit - 1) * width),
+            ([2; 20], 1),
+            ([3; 20], 1)
+        ]));
+        assert!(!fits_capture_data_sectors(&[([1; 20], u64::MAX)]));
+        // This geometry passes the old descriptor admission but exceeds the
+        // data-vector budget when its sectors have distinct identities.
+        assert!(
+            dense_backup_size(
+                Uuid::from_bytes([1; 16]),
+                &[],
+                &[],
+                &[([1; 20], limit * width + 1)],
+                "main",
+                mb_core::V1_MAX_CATALOG_BYTES
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn git_admission_dense_size_matches_real_descriptor_geometry_and_boundaries() {

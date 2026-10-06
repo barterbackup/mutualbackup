@@ -1252,6 +1252,10 @@ mod tests {
             mb_git::GitBackupCapacity::DescriptorLimitExceeded {
                 limit_bytes: 33_554_432,
             },
+            mb_git::GitBackupCapacity::CaptureDataLimitExceeded {
+                limit_sectors: mb_core::V1_MAX_CAPTURE_DATA_SECTORS as u64,
+                sector_bytes: mb_core::V1_SECTOR_SIZE as u64,
+            },
             mb_git::GitBackupCapacity::Unavailable {
                 reason: "missing mapping".to_owned(),
             },

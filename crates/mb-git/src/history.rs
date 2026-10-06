@@ -74,6 +74,10 @@ pub enum HistoryError {
     IncompatibleRecord,
     #[error("the reachable Git graph exceeds the bounded backup metadata limit")]
     GraphTooLarge,
+    #[error(
+        "the prospective dense Git recipes exceed the current capture data-sector limit ({limit_sectors}); preserve or export history until paged capture is supported"
+    )]
+    CaptureDataTooLarge { limit_sectors: u64 },
     #[error("a branch name is invalid or conflicts with another branch namespace")]
     InvalidBranch,
     #[error("the branch already exists")]
@@ -1852,6 +1856,10 @@ pub enum GitBackupCapacity {
     DescriptorLimitExceeded {
         limit_bytes: u64,
     },
+    CaptureDataLimitExceeded {
+        limit_sectors: u64,
+        sector_bytes: u64,
+    },
     Unavailable {
         reason: String,
     },
@@ -1871,6 +1879,7 @@ pub(crate) fn backup_descriptor_capacity(
                     .ok_or(HistoryError::IncompatibleRecord)?,
             ));
         }
+        require_capture_data_budget(&blobs)?;
         Ok(crate::backup_size::dense_backup_size(
             repository_id,
             &graph.refs,
@@ -1888,6 +1897,12 @@ pub(crate) fn backup_descriptor_capacity(
         Err(HistoryError::Model(ModelError::EncodingTooLarge { .. })) => {
             GitBackupCapacity::DescriptorLimitExceeded {
                 limit_bytes: V1_MAX_CATALOG_BYTES as u64,
+            }
+        }
+        Err(HistoryError::CaptureDataTooLarge { limit_sectors }) => {
+            GitBackupCapacity::CaptureDataLimitExceeded {
+                limit_sectors,
+                sector_bytes: mb_core::V1_SECTOR_SIZE as u64,
             }
         }
         Err(error) => GitBackupCapacity::Unavailable {
@@ -1941,6 +1956,7 @@ pub(crate) fn preflight_graph_with_blob_lengths(
                 .ok_or(HistoryError::IncompatibleRecord)?,
         ));
     }
+    require_capture_data_budget(&blobs)?;
     crate::backup_size::dense_backup_size(
         repository_id,
         &graph.refs,
@@ -1953,6 +1969,15 @@ pub(crate) fn preflight_graph_with_blob_lengths(
         ModelError::EncodingTooLarge { .. } => HistoryError::GraphTooLarge,
         error => HistoryError::Model(error),
     })?;
+    Ok(())
+}
+
+fn require_capture_data_budget(blobs: &[([u8; 20], u64)]) -> Result<(), HistoryError> {
+    if !crate::backup_size::fits_capture_data_sectors(blobs) {
+        return Err(HistoryError::CaptureDataTooLarge {
+            limit_sectors: mb_core::V1_MAX_CAPTURE_DATA_SECTORS as u64,
+        });
+    }
     Ok(())
 }
 
@@ -2685,6 +2710,146 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn git_capture_capacity_rejects_data_growth_and_preserves_cached_history_on_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let control =
+            ControlStore::open_with_key(directory.path().join("control.db"), &[7; 32]).unwrap();
+        let repository_id = Uuid::from_bytes([1; 16]);
+        let anchor = SourceBlobImportPlan::plan_direct(&source, 1)
+            .unwrap()
+            .capture(Cursor::new(b"x"))
+            .unwrap();
+        let git = Repository::init_bare(directory.path().join("git")).unwrap();
+        let blob = git.blob(b"x").unwrap();
+        let mut builder = git.treebuilder(None).unwrap();
+        builder.insert("file", blob, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("Author", "a@example.test").unwrap();
+        let commit = git
+            .commit(None, &signature, &signature, "base", &tree, &[])
+            .unwrap();
+        for (kind, oid) in [(ObjectType::Tree, tree_oid), (ObjectType::Commit, commit)] {
+            control
+                .put_record(
+                    &metadata_kind(repository_id),
+                    oid.as_bytes(),
+                    &object_record(kind, git.odb().unwrap().read(oid).unwrap().data().to_vec())
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        control
+            .put_record(
+                &ref_kind(repository_id),
+                MAIN_REF,
+                &fetched_ref_record(commit.as_bytes().try_into().unwrap()).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                &object_kind(repository_id, blob),
+                anchor.anchor_id.as_bytes(),
+                &canonical_bytes(&anchor).unwrap(),
+            )
+            .unwrap();
+        let length_limit =
+            mb_core::V1_MAX_CAPTURE_DATA_SECTORS as u64 * mb_core::V1_SECTOR_SIZE as u64;
+        for length in [length_limit - 1, length_limit, length_limit + 1] {
+            let mut measured_anchor = anchor.clone();
+            measured_anchor.logical_len = length;
+            control
+                .put_record(
+                    &object_kind(repository_id, blob),
+                    measured_anchor.anchor_id.as_bytes(),
+                    &canonical_bytes(&measured_anchor).unwrap(),
+                )
+                .unwrap();
+            if length <= length_limit {
+                preflight_graph_changes(&control, repository_id, &[]).unwrap();
+                assert!(matches!(
+                    backup_descriptor_capacity(&control, repository_id),
+                    GitBackupCapacity::WithinDescriptorLimit { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    preflight_graph_changes(&control, repository_id, &[]),
+                    Err(HistoryError::CaptureDataTooLarge { .. })
+                ));
+                assert_eq!(
+                    backup_descriptor_capacity(&control, repository_id),
+                    GitBackupCapacity::CaptureDataLimitExceeded {
+                        limit_sectors: mb_core::V1_MAX_CAPTURE_DATA_SECTORS as u64,
+                        sector_bytes: mb_core::V1_SECTOR_SIZE as u64
+                    }
+                );
+                let before_metadata = control.records(&metadata_kind(repository_id)).unwrap();
+                let before_refs = control.records(&ref_kind(repository_id)).unwrap();
+                assert!(matches!(
+                    create_branch_at(&control, repository_id, "blocked-growth", commit),
+                    Err(HistoryError::CaptureDataTooLarge { .. })
+                ));
+                assert_eq!(
+                    control.records(&metadata_kind(repository_id)).unwrap(),
+                    before_metadata
+                );
+                assert_eq!(
+                    control.records(&ref_kind(repository_id)).unwrap(),
+                    before_refs
+                );
+                let reopened = ControlStore::open_existing_with_key(
+                    directory.path().join("control.db"),
+                    &[7; 32],
+                )
+                .unwrap();
+                assert_eq!(
+                    backup_descriptor_capacity(&reopened, repository_id),
+                    backup_descriptor_capacity(&control, repository_id)
+                );
+                assert_eq!(
+                    reopened.records(&ref_kind(repository_id)).unwrap(),
+                    before_refs
+                );
+                assert_eq!(
+                    reopened
+                        .get_record(
+                            &object_kind(repository_id, blob),
+                            measured_anchor.anchor_id.as_bytes()
+                        )
+                        .unwrap(),
+                    Some(canonical_bytes(&measured_anchor).unwrap())
+                );
+            }
+        }
+        control
+            .put_record(
+                &object_kind(repository_id, blob),
+                anchor.anchor_id.as_bytes(),
+                &canonical_bytes(&anchor).unwrap(),
+            )
+            .unwrap();
+        anchor.remove().unwrap();
+        assert!(export_graph_source(&control, repository_id).is_err());
+        preflight_graph_changes(&control, repository_id, &[]).unwrap();
+        let mut conflicting = anchor;
+        conflicting.anchor_id = Uuid::from_bytes([2; 16]);
+        conflicting.logical_len += 1;
+        control
+            .put_record(
+                &object_kind(repository_id, blob),
+                conflicting.anchor_id.as_bytes(),
+                &canonical_bytes(&conflicting).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            preflight_graph_changes(&control, repository_id, &[]),
+            Err(HistoryError::IncompatibleRecord)
+        ));
     }
 
     #[test]

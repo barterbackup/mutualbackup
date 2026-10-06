@@ -1350,6 +1350,15 @@ before Milestone 7 compatibility freeze. Native Windows/macOS work remains in
 the roadmap; a narrower production platform scope requires an explicit product
 decision rather than treating missing platform support as complete.
 
+Current Git mutation admission also shares capture's 39,488 data-position bound,
+reserving 512 metadata positions from the 40,000-position flat format. It rounds
+each reachable blob independently and conservatively assumes distinct sector
+identities; cached lengths cannot prove capture's content sharing. Status names
+this admission failure and retains full stock Git export. Recovery of existing
+authenticated recipes keeps their original geometry. This interim check closes
+another late capture failure but does not account for native namespace entries
+or the complete private/signed envelope, so the full R2 contract remains open.
+
 The user selected **1 TiB per protected dataset, including retained history**
 as R3's first-release capacity target on 2026-10-06. This target applies to
 the end-to-end capture, Git history, signing, packing, replay, retention and

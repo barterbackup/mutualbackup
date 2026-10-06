@@ -10908,7 +10908,7 @@ pub(crate) fn preserved_recovery_locator(
     if records.len() > MAX_DHT_RECORDS_PER_QUERY
         || records
             .iter()
-            .any(|record| record.value.len() > V1_CATALOG_PAGE_BYTES)
+            .any(|record| record.value.len() > mb_core::CATALOG_PAGE_BYTES)
     {
         bail!("legacy discovery recovery records exceed their bounded metadata budget");
     }
@@ -24505,10 +24505,12 @@ mod tests {
                 guild,
                 vec![DhtRecord {
                     publisher: None,
-                    value: vec![0; V1_CATALOG_PAGE_BYTES + 1]
+                    value: vec![0; mb_core::CATALOG_PAGE_BYTES + 1]
                 }]
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("bounded metadata budget")
         );
         assert!(
             preserved_recovery_locator(

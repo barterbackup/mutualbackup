@@ -1170,6 +1170,19 @@ fn write_backup_capacity(
                 "History is preserved. Export all retained refs and objects: git init --bare /path/to/history.git; mutualgit export /path/to/history.git"
             )?;
         }
+        GitBackupCapacity::CaptureDataLimitExceeded {
+            limit_sectors,
+            sector_bytes,
+        } => {
+            writeln!(
+                writer,
+                "Prospective dense Git recipes exceed the current admission limit of {limit_sectors} data sectors at {sector_bytes} bytes; growing mutations are blocked. Shared sector identities and enclosing metadata remain unverified"
+            )?;
+            writeln!(
+                writer,
+                "History is preserved. Export all retained refs and objects: git init --bare /path/to/history.git; mutualgit export /path/to/history.git"
+            )?;
+        }
         GitBackupCapacity::Unavailable { reason } => {
             writeln!(
                 writer,
@@ -1497,6 +1510,19 @@ mod tests {
         assert!(text.contains("exceeds 33554432 bytes"));
         assert!(text.contains("mutualgit export"));
         assert!(text.contains("History is preserved"));
+        let mut output = vec![];
+        write_backup_capacity(
+            &mut output,
+            &GitBackupCapacity::CaptureDataLimitExceeded {
+                limit_sectors: 39_488,
+                sector_bytes: 65_536,
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("39488 data sectors at 65536 bytes"));
+        assert!(text.contains("Shared sector identities and enclosing metadata remain unverified"));
+        assert!(text.contains("History is preserved") && text.contains("mutualgit export"));
         let mut output = vec![];
         write_backup_capacity(
             &mut output,

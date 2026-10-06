@@ -46,8 +46,8 @@ const ANCHOR_AREA_LOCATION_KIND: &str = "anchor-area-location";
 const RECOVERY_ANCHOR_INTENT_KIND: &str = "recovery-anchor-intent";
 
 const ANCHOR_RETIREMENT_KIND: &str = "anchor-retirement";
-const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
-const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
+const MAX_METADATA_SECTORS: usize = mb_core::V1_MAX_CAPTURE_METADATA_SECTORS;
+const MAX_DATA_SECTORS: usize = mb_core::V1_MAX_CAPTURE_DATA_SECTORS;
 const RESTORE_JOB_KIND: &str = "restore-job";
 const GIT_GRAPH_INTENT_KIND: &str = "git-graph-intent-v1";
 

@@ -114,6 +114,11 @@ pub const V1_MAX_CATALOG_PAGES: u32 = (V1_MAX_CATALOG_BYTES / V1_CATALOG_PAGE_BY
 /// A v1 checkpoint keeps coding descriptors inline; this bound keeps the
 /// resulting signed catalog below `V1_MAX_CATALOG_BYTES` with ample overhead.
 pub const V1_MAX_CODING_GROUPS: usize = 40_000;
+/// Current flat capture reserves room for the largest metadata vector. These
+/// limits describe the prototype format, not the paged 1 TiB release target.
+pub const V1_MAX_CAPTURE_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
+pub const V1_MAX_CAPTURE_DATA_SECTORS: usize =
+    V1_MAX_CODING_GROUPS - V1_MAX_CAPTURE_METADATA_SECTORS;
 
 /// Hash bytes exactly as they are consumed by Reed--Solomon.
 pub fn sector_root(bytes: &[u8]) -> [u8; 32] {

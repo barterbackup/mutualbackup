@@ -902,3 +902,23 @@ verified mount/image/loop cleanup. Formatting and strict workspace/all-targets
 Clippy pass. Ordinary suites retain 18 store and 20 Node provisioned cases; the
 eight snapshot cases ran separately. Full paged seed-only recovery and the M6
 topology/platform release gates remain unqualified.
+
+### Current flat capture data-sector admission (2026-10-06)
+
+Prospective Git mutation admission now also applies the existing flat capture's
+39,488 data-sector limit. Both capture and Git admission use the shared core
+constants reserving 512 metadata positions out of 40,000 coding positions. Dense
+recipe geometry rounds each unique graph blob independently to 64 KiB references,
+including its final partial sector and excluding empty blobs. This conservative
+estimate assumes distinct sector identities: capture can deduplicate identical
+Git sectors, but cached lengths do not prove their sharing. It is neither
+physical allocation nor sparse/shared payload accounting for the production target.
+
+Previously a Git graph with more than 39,488 distinct dense references could fit
+in its 32 MiB descriptor and publish, then fail capture at the separate data-vector
+limit. The common prospective graph preflight now bounds dense geometry before
+publication; current status names the data-sector limit and keeps the stock Git
+export remedy. Imported lengths participate before anchor creation. Existing
+history remains readable and recovery/import keeps its authenticated sparse
+recipe policy. The full enclosing private/revision budget and paged capture
+pipeline remain required; this interim admission check does not enable 1 TiB.
