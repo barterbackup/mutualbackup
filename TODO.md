@@ -111,12 +111,15 @@ passing tests below apply only to their recorded source and exercised cases.
     Rejection and runtime removal do not certify historical conversion.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
-  `crates/mb-git/src/history.rs` admits up to 64 MiB of graph metadata, while
-  `GitBackupDescriptor::validate` in `crates/mb-git/src/backup.rs` caps the encoded
+  Historical `crates/mb-git/src/history.rs` admission allowed up to 64 MiB of
+  graph metadata, while `GitBackupDescriptor::validate` caps the full encoded
   descriptor at `V1_MAX_CATALOG_BYTES` (32 MiB), including refs, object records,
-  blob sector references, and serialization overhead. A locally accepted graph
-  can therefore be unprotectable. Define one versioned budget covering the full
-  reachable descriptor and its enclosing revision metadata. Preflight commands
+  blob sector references and serialization overhead. Current growing commands
+  now preflight the complete dense Git descriptor against that bound, and native
+  history has a status/export remedy. Full enclosing native/private and signed
+  revision budgets still lack a shared mutation admission contract: an accepted
+  Git descriptor alone does not prove a protectable revision. Define one versioned
+  budget covering the full reachable descriptor and its enclosing revision metadata. Preflight commands
   that can grow it, including commits, refs/pins, merge, and import/fetch, before
   publishing catalog mutations; backup and recovery must enforce that same
   contract. Preserve existing oversized local history and give a precise status
@@ -231,6 +234,30 @@ passing tests below apply only to their recorded source and exercised cases.
     image/loop cleanup. Formatting and strict workspace/all-targets Clippy pass.
     The ordinary suites retain 62 provisioned Git and eight snapshot cases;
     the one Git import case and two capture cases were run separately here.
+  - [x] Report current descriptor capacity and preserve oversized native history
+    through full stock Git export. Primary and linked status share a read-only
+    current-capture measurement of all reachable refs, ancestry and dense blob
+    recipes, bounded by the inclusive 32 MiB descriptor limit. Unavailable graph/
+    mapping results remain unverified; fitting the descriptor does not attest the
+    enclosing revision or remote protection. An optional local-control field
+    preserves decoding of older status responses. `mutualgit status` reports the
+    failed limit and an export command. `mutualgit export EMPTY_BARE_REPOSITORY`
+    preserves every retained ref, exact blobs/metadata and primary symbolic HEAD,
+    including remote-tracking refs and pins, without the descriptor size gate.
+    It rejects populated destinations and paths inside primary/linked roots,
+    locks destination refs, verifies payloads and leaves source history intact.
+    External ref publication may fail partway; retry into a fresh empty target
+    while retaining the source. Existing graph traversal bounds still apply.
+    This native export does not qualify withdrawn FUSE history conversion or
+    production paged migration. Full enclosing R2 budgets and R3 remain open.
+    Validation: all 87 ordinary and 62 provisioned Git library tests, 28 ordinary
+    snapshot regressions, seven mutualgit unit tests and the expanded local-wire
+    schema fixture pass. The real daemon/CLI raw-path fixture exports remote refs,
+    tags, pins and non-UTF-8 paths with exact bytes and stock Git strict fsck.
+    Both native capture regressions pass. Disposable Btrfs mount/image/loop cleanup,
+    formatting and strict workspace/all-targets Clippy are verified. The ordinary
+    snapshot suite retains eight provisioned cases; the two capture cases ran
+    separately. These checks do not replace full M6 release qualification.
 
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
   production catalog design.** The first-release acceptance target is **1 TiB

@@ -1840,6 +1840,62 @@ fn proposed_graph_metadata(
     })
 }
 
+/// Read-only current-capture descriptor sizing. This does not attest enclosing
+/// revision limits, payload availability, or certified remote protection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state")]
+pub enum GitBackupCapacity {
+    WithinDescriptorLimit {
+        encoded_bytes: u64,
+        limit_bytes: u64,
+    },
+    DescriptorLimitExceeded {
+        limit_bytes: u64,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+pub(crate) fn backup_descriptor_capacity(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> GitBackupCapacity {
+    let measured = (|| -> Result<usize, HistoryError> {
+        let graph = proposed_graph_metadata(control, repository_id, &[])?;
+        let mut blobs = Vec::with_capacity(graph.blob_ids.len());
+        for oid in graph.blob_ids {
+            blobs.push((
+                oid.as_bytes().try_into().expect("SHA-1 OID"),
+                catalog_blob_length(control, repository_id, oid)?
+                    .ok_or(HistoryError::IncompatibleRecord)?,
+            ));
+        }
+        Ok(crate::backup_size::dense_backup_size(
+            repository_id,
+            &graph.refs,
+            &graph.objects,
+            &blobs,
+            &selected_branch(control, repository_id)?,
+            V1_MAX_CATALOG_BYTES,
+        )?)
+    })();
+    match measured {
+        Ok(encoded_bytes) => GitBackupCapacity::WithinDescriptorLimit {
+            encoded_bytes: encoded_bytes as u64,
+            limit_bytes: V1_MAX_CATALOG_BYTES as u64,
+        },
+        Err(HistoryError::Model(ModelError::EncodingTooLarge { .. })) => {
+            GitBackupCapacity::DescriptorLimitExceeded {
+                limit_bytes: V1_MAX_CATALOG_BYTES as u64,
+            }
+        }
+        Err(error) => GitBackupCapacity::Unavailable {
+            reason: error.to_string(),
+        },
+    }
+}
+
 /// Call while holding the writer transaction that will publish these changes.
 /// This checks the full reachable descriptor geometry, not just new objects.
 fn preflight_graph_changes(
@@ -2300,6 +2356,13 @@ mod tests {
             let result = import_graph_backup(&control, repository_id, &descriptor, &[]);
             if expected_size <= V1_MAX_CATALOG_BYTES {
                 result.unwrap();
+                assert_eq!(
+                    backup_descriptor_capacity(&control, repository_id),
+                    GitBackupCapacity::WithinDescriptorLimit {
+                        encoded_bytes: expected_size as u64,
+                        limit_bytes: V1_MAX_CATALOG_BYTES as u64
+                    }
+                );
                 assert_eq!(
                     head_oid_for_scope(&control, GitWorktreeScope::primary(repository_id)).unwrap(),
                     Some(oid)

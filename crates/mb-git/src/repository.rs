@@ -606,11 +606,12 @@ impl GitRepository {
     pub fn linked_status(&self, worktree_id: Uuid) -> Result<GitStatus, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-        Ok(repository_status_for_scope(
+        let mut status = repository_status_for_scope(&self.catalog, scope, &info.path)?;
+        status.backup_capacity = Some(crate::history::backup_descriptor_capacity(
             &self.catalog,
-            scope,
-            &info.path,
-        )?)
+            self.repository_id,
+        ));
+        Ok(status)
     }
 
     pub fn linked_add_path(
@@ -1376,11 +1377,12 @@ impl GitRepository {
 
     pub fn status(&self) -> Result<GitStatus, RepositoryError> {
         self.resume_checkout()?;
-        Ok(repository_status(
+        let mut status = repository_status(&self.catalog, self.repository_id, &self.root)?;
+        status.backup_capacity = Some(crate::history::backup_descriptor_capacity(
             &self.catalog,
             self.repository_id,
-            &self.root,
-        )?)
+        ));
+        Ok(status)
     }
 
     pub fn diff(&self, cached: bool) -> Result<GitDiff, RepositoryError> {
@@ -1396,6 +1398,32 @@ impl GitRepository {
     pub fn export_graph_source(&self) -> Result<GitGraphSource, RepositoryError> {
         self.resume_for_backend_on_open()?;
         Ok(export_graph_source(&self.catalog, self.repository_id)?)
+    }
+
+    /// Export every retained ref and its reachable objects to an empty bare
+    /// stock Git repository. Source records, anchors and protections remain.
+    pub fn export_all_refs_to_bare(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<u32, RepositoryError> {
+        self.resume_for_backend_on_open()?;
+        let destination = destination.as_ref().canonicalize()?;
+        for worktree in list_worktrees(&self.catalog, self.repository_id)? {
+            if destination.starts_with(&worktree.path)
+                || worktree
+                    .path
+                    .canonicalize()
+                    .is_ok_and(|path| destination.starts_with(path))
+            {
+                return Err(GitInteropError::UnsupportedDestination.into());
+            }
+        }
+        Ok(crate::interop::export_all_refs_to_bare(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            &destination,
+        )?)
     }
 
     pub fn export_to_git_repository(
@@ -1830,9 +1858,250 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
+    use mb_core::canonical_bytes;
     use mb_store::{GIT_CATALOG_DIRECTORY, git_catalog_marker};
 
     use super::*;
+
+    #[test]
+    fn oversized_history_status_and_full_export_preserve_all_refs_and_exact_bytes() {
+        use crate::history::{fetched_ref_record, metadata_kind, object_record, ref_kind};
+        use crate::stage::object_kind;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("tracked"), b"exact").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [7; 32];
+        let local = GitRepository::init(&root, repository_id, &key).unwrap();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(&root, 5)
+            .unwrap()
+            .capture(&b"exact"[..])
+            .unwrap();
+        let stock = git2::Repository::init_bare(temp.path().join("fixture.git")).unwrap();
+        let blob_oid = stock.blob(b"exact").unwrap();
+        let mut builder = stock.treebuilder(None).unwrap();
+        builder.insert("tracked", blob_oid, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = stock.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Author", "a@example.test").unwrap();
+        let mut raw = stock
+            .commit_create_buffer(&signature, &signature, "message", &tree, &[])
+            .unwrap()
+            .to_vec();
+        raw.resize(mb_core::V1_MAX_CATALOG_BYTES, b'x');
+        let oid = stock
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Commit, &raw)
+            .unwrap();
+        let tag_oid = stock
+            .tag_annotation_create(
+                "release",
+                &stock.find_object(oid, None).unwrap(),
+                &signature,
+                "retained tag",
+            )
+            .unwrap();
+        let refs = [
+            ("refs/heads/main".to_owned(), oid),
+            ("refs/heads/topic".to_owned(), oid),
+            ("refs/remotes/origin/main".to_owned(), oid),
+            ("refs/tags/release".to_owned(), tag_oid),
+            (format!("refs/mutualbackup/pins/{oid}"), oid),
+        ];
+        let mut records = vec![
+            (
+                metadata_kind(repository_id),
+                oid.as_bytes().to_vec(),
+                object_record(git2::ObjectType::Commit, raw.clone()).unwrap(),
+            ),
+            (
+                metadata_kind(repository_id),
+                tree_oid.as_bytes().to_vec(),
+                object_record(
+                    git2::ObjectType::Tree,
+                    stock.odb().unwrap().read(tree_oid).unwrap().data().to_vec(),
+                )
+                .unwrap(),
+            ),
+            (
+                metadata_kind(repository_id),
+                tag_oid.as_bytes().to_vec(),
+                object_record(
+                    git2::ObjectType::Tag,
+                    stock.odb().unwrap().read(tag_oid).unwrap().data().to_vec(),
+                )
+                .unwrap(),
+            ),
+            (
+                object_kind(repository_id, blob_oid),
+                anchor.anchor_id.as_bytes().to_vec(),
+                canonical_bytes(&anchor).unwrap(),
+            ),
+            (
+                crate::stage::index_kind(repository_id),
+                b"tracked".to_vec(),
+                canonical_bytes(&GitIndexEntry {
+                    format_version: 1,
+                    oid: blob_oid.as_bytes().try_into().unwrap(),
+                    mode: 0o100644,
+                    anchor_id: anchor.anchor_id,
+                })
+                .unwrap(),
+            ),
+            crate::head::selected_branch_record(repository_id, "topic").unwrap(),
+        ];
+        records.extend(refs.iter().map(|(name, oid)| {
+            (
+                ref_kind(repository_id),
+                name.as_bytes().to_vec(),
+                fetched_ref_record(oid.as_bytes().try_into().unwrap()).unwrap(),
+            )
+        }));
+        local.catalog.put_records_and_delete(&records, &[]).unwrap();
+        drop(records);
+        let status = local.status().unwrap();
+        assert_eq!(
+            status.backup_capacity,
+            Some(crate::GitBackupCapacity::DescriptorLimitExceeded {
+                limit_bytes: mb_core::V1_MAX_CATALOG_BYTES as u64
+            })
+        );
+        assert!(!status.history_backed_up);
+        assert!(status.changes.is_empty());
+        let before_refs = local.catalog.records(&ref_kind(repository_id)).unwrap();
+        let destination = temp.path().join("export.git");
+        let exported = git2::Repository::init_bare(&destination).unwrap();
+        assert_eq!(local.export_all_refs_to_bare(&destination).unwrap(), 4);
+        for (name, target) in &refs {
+            assert_eq!(
+                exported.find_reference(name).unwrap().target(),
+                Some(*target)
+            );
+        }
+        assert_eq!(exported.references().unwrap().count(), refs.len());
+        assert_eq!(
+            exported
+                .find_reference("HEAD")
+                .unwrap()
+                .symbolic_target()
+                .unwrap(),
+            Some("refs/heads/topic")
+        );
+        assert!(exported.odb().unwrap().read(oid).unwrap().data() == raw);
+        assert_eq!(exported.find_blob(blob_oid).unwrap().content(), b"exact");
+        assert!(
+            Command::new(crate::stock_git::executable().unwrap())
+                .arg("--git-dir")
+                .arg(&destination)
+                .args(["fsck", "--full", "--strict"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(matches!(
+            local.export_all_refs_to_bare(&destination),
+            Err(RepositoryError::Interop(
+                GitInteropError::DestinationNotEmpty
+            ))
+        ));
+        let inside = root.join("unsafe.git");
+        git2::Repository::init_bare(&inside).unwrap();
+        assert!(matches!(
+            local.export_all_refs_to_bare(&inside),
+            Err(RepositoryError::Interop(
+                GitInteropError::UnsupportedDestination
+            ))
+        ));
+        fs::remove_dir_all(&inside).unwrap();
+        let blocked = temp.path().join("blocked.git");
+        let blocked_git = git2::Repository::init_bare(&blocked).unwrap();
+        fs::write(blocked.join("HEAD.lock"), b"competing writer").unwrap();
+        assert!(local.export_all_refs_to_bare(&blocked).is_err());
+        assert_eq!(blocked_git.references().unwrap().count(), 0);
+        assert_eq!(
+            fs::read(blocked.join("HEAD.lock")).unwrap(),
+            b"competing writer"
+        );
+        assert_eq!(
+            local.catalog.records(&ref_kind(repository_id)).unwrap(),
+            before_refs
+        );
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), b"exact");
+        drop(local);
+        let reopened = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert_eq!(
+            reopened.status().unwrap().backup_capacity,
+            status.backup_capacity
+        );
+        assert_eq!(
+            reopened.catalog.records(&ref_kind(repository_id)).unwrap(),
+            before_refs
+        );
+        assert_eq!(reopened.export_graph_source().unwrap().blobs.len(), 1);
+    }
+
+    #[test]
+    fn unavailable_history_export_preserves_destination_refs_and_capacity_is_unverified() {
+        use crate::history::{fetched_ref_record, metadata_kind, object_record, ref_kind};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let local = GitRepository::init(&root, repository_id, &[7; 32]).unwrap();
+        let stock = git2::Repository::init_bare(temp.path().join("fixture.git")).unwrap();
+        let blob = stock.blob(b"missing mapping").unwrap();
+        let mut builder = stock.treebuilder(None).unwrap();
+        builder.insert("tracked", blob, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = stock.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Author", "a@example.test").unwrap();
+        let oid = stock
+            .commit(None, &signature, &signature, "small", &tree, &[])
+            .unwrap();
+        let mut records: Vec<_> = [
+            (git2::ObjectType::Commit, oid),
+            (git2::ObjectType::Tree, tree_oid),
+        ]
+        .into_iter()
+        .map(|(kind, oid)| {
+            (
+                metadata_kind(repository_id),
+                oid.as_bytes().to_vec(),
+                object_record(
+                    kind,
+                    stock.odb().unwrap().read(oid).unwrap().data().to_vec(),
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+        records.push((
+            ref_kind(repository_id),
+            b"refs/heads/main".to_vec(),
+            fetched_ref_record(oid.as_bytes().try_into().unwrap()).unwrap(),
+        ));
+        local.catalog.put_records_and_delete(&records, &[]).unwrap();
+        assert!(matches!(
+            local.status().unwrap().backup_capacity,
+            Some(crate::GitBackupCapacity::Unavailable { .. })
+        ));
+        let destination = temp.path().join("export.git");
+        let exported = git2::Repository::init_bare(&destination).unwrap();
+        assert!(local.export_all_refs_to_bare(&destination).is_err());
+        assert_eq!(exported.references().unwrap().count(), 0);
+        assert!(!destination.join("HEAD.lock").exists());
+        assert_eq!(
+            local
+                .catalog
+                .records(&ref_kind(repository_id))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn native_catalog_inspection_does_not_create_or_migrate_state() {

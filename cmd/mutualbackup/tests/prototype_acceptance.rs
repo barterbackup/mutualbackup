@@ -6,7 +6,7 @@ use std::io::Write;
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -1143,6 +1143,82 @@ fn raw_unix_paths_survive_cli_daemon_and_git_checkout() {
     let bare_arg = bare.to_str().unwrap();
     git_cli(&socket, &source, ["push", bare_arg]);
     git_cli(&socket, &source, ["fetch", bare_arg]);
+    let status = git_cli(&socket, &source, ["status"]);
+    assert!(status.contains("Git backup descriptor:"), "{status}");
+    assert!(status.contains("enclosing revision and source verification still required"));
+    let source_oid = git2::Repository::open_bare(&bare)
+        .unwrap()
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+    git_cli(&socket, &source, ["tag", "retained"]);
+    git_cli(&socket, &source, ["pin", &source_oid.to_string()]);
+    let full_export = source_area
+        .path()
+        .join(OsString::from_vec(b"history-\xfd.git".to_vec()));
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&full_export)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let export_args = vec![
+        os("--socket"),
+        socket.as_os_str().to_owned(),
+        os("-C"),
+        source.as_os_str().to_owned(),
+        os("export"),
+        full_export.as_os_str().to_owned(),
+    ];
+    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &export_args, CLI_TIMEOUT).unwrap();
+    assert!(
+        output.status.success(),
+        "full export failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exported = git2::Repository::open_bare(&full_export).unwrap();
+    for reference in [
+        "refs/heads/main".to_owned(),
+        "refs/remotes/origin/main".to_owned(),
+        "refs/tags/retained".to_owned(),
+        format!("refs/mutualbackup/pins/{source_oid}"),
+    ] {
+        assert_eq!(
+            exported.find_reference(&reference).unwrap().target(),
+            Some(source_oid)
+        );
+    }
+    let exported_tree = exported.find_commit(source_oid).unwrap().tree().unwrap();
+    let exported_file = exported_tree
+        .iter()
+        .find(|entry| entry.name_bytes() == relative.as_os_str().as_bytes())
+        .unwrap();
+    assert_eq!(
+        exported.find_blob(exported_file.id()).unwrap().content(),
+        b"exact bytes"
+    );
+    let exported_link = exported_tree
+        .iter()
+        .find(|entry| entry.name_bytes() == link_relative.as_os_str().as_bytes())
+        .unwrap();
+    assert_eq!(
+        exported.find_blob(exported_link.id()).unwrap().content(),
+        relative.as_os_str().as_bytes()
+    );
+    assert!(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&full_export)
+            .args(["fsck", "--full", "--strict"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     fs::write(source.join(&relative), b"edited bytes").unwrap();
     fs::remove_file(source.join(&link_relative)).unwrap();
     git_args[4] = os("restore");

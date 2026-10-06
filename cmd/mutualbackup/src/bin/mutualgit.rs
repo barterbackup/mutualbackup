@@ -126,6 +126,8 @@ enum Command {
         /// Optional BRANCH[:BRANCH], refs/heads/SRC:refs/heads/DST, or refs/tags/NAME.
         refspec: Option<String>,
     },
+    /// Export all retained refs and exact objects to a new, empty bare Git repository.
+    Export { destination: PathBuf },
     /// Fetch branches and tags from an existing local Git repository.
     Fetch { source: PathBuf },
     /// Fetch and merge the selected branch from a local Git repository.
@@ -1060,6 +1062,35 @@ async fn main() -> Result<()> {
             }
             io::stdout().write_all(&diff.patch)?;
         }
+        Command::Export { destination } => {
+            let repository_id =
+                discover_shared_repository_with_daemon(&working_directory, &socket).await?;
+            let destination = if destination.is_absolute() {
+                destination
+            } else {
+                working_directory.join(destination)
+            };
+            let LocalResponse::GitObjectsExported {
+                repository_id: returned_id,
+                object_count,
+            } = local_control_call(
+                &socket,
+                &LocalRequest::GitExportAllRefsBare {
+                    repository_id,
+                    destination,
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to full history export");
+            };
+            if returned_id != repository_id {
+                bail!("daemon exported another repository");
+            }
+            println!(
+                "Exported all retained refs and {object_count} exact Git objects; source history preserved"
+            );
+        }
         Command::Status => {
             let (_, repository_id, worktree_id) =
                 discover_location_with_daemon(&working_directory, &socket).await?;
@@ -1086,6 +1117,9 @@ async fn main() -> Result<()> {
                     println!("Commit graph or refs are awaiting a signed backup");
                 }
             }
+            if let Some(capacity) = &status.backup_capacity {
+                write_backup_capacity(&mut io::stdout(), capacity)?;
+            }
             if let Some(merge) = &status.merge {
                 println!("Merge pending from {}", display_path(&merge.source_ref));
                 for path in &merge.unresolved_paths {
@@ -1106,6 +1140,45 @@ async fn main() -> Result<()> {
             for path in status.pending_adds {
                 println!("pending add {}", display_path(&path));
             }
+        }
+    }
+    Ok(())
+}
+
+fn write_backup_capacity(
+    writer: &mut impl Write,
+    capacity: &mb_git::GitBackupCapacity,
+) -> io::Result<()> {
+    use mb_git::GitBackupCapacity;
+    match capacity {
+        GitBackupCapacity::WithinDescriptorLimit {
+            encoded_bytes,
+            limit_bytes,
+        } => {
+            writeln!(
+                writer,
+                "Git backup descriptor: {encoded_bytes}/{limit_bytes} bytes; enclosing revision and source verification still required"
+            )?;
+        }
+        GitBackupCapacity::DescriptorLimitExceeded { limit_bytes } => {
+            writeln!(
+                writer,
+                "Current Git backup descriptor exceeds {limit_bytes} bytes; a new backup cannot encode this history"
+            )?;
+            writeln!(
+                writer,
+                "History is preserved. Export all retained refs and objects: git init --bare /path/to/history.git; mutualgit export /path/to/history.git"
+            )?;
+        }
+        GitBackupCapacity::Unavailable { reason } => {
+            writeln!(
+                writer,
+                "Git backup descriptor capacity unavailable: {reason}"
+            )?;
+            writeln!(
+                writer,
+                "Keep the source catalog and anchors; repair unavailable history before claiming a new backup"
+            )?;
         }
     }
     Ok(())
@@ -1396,6 +1469,54 @@ fn parse_push_refspec(value: &str) -> Result<PushRefspec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_capacity_reports_limits_remedy_and_verification_scope() {
+        use mb_git::GitBackupCapacity;
+        let mut output = vec![];
+        write_backup_capacity(
+            &mut output,
+            &GitBackupCapacity::WithinDescriptorLimit {
+                encoded_bytes: 10,
+                limit_bytes: 20,
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("10/20 bytes"));
+        assert!(text.contains("enclosing revision and source verification still required"));
+        let mut output = vec![];
+        write_backup_capacity(
+            &mut output,
+            &GitBackupCapacity::DescriptorLimitExceeded {
+                limit_bytes: 33_554_432,
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("exceeds 33554432 bytes"));
+        assert!(text.contains("mutualgit export"));
+        assert!(text.contains("History is preserved"));
+        let mut output = vec![];
+        write_backup_capacity(
+            &mut output,
+            &GitBackupCapacity::Unavailable {
+                reason: "missing mapping".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("capacity unavailable: missing mapping")
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["mutualgit", "export", "/tmp/history.git"])
+                .unwrap()
+                .command,
+            Command::Export { .. }
+        ));
+    }
 
     #[test]
     fn withdrawn_guarded_retirement_command_is_not_exposed() {

@@ -66,8 +66,8 @@ pub use fetch::FetchError;
 pub use head::HeadError;
 #[cfg(target_os = "linux")]
 pub use history::{
-    GitBranchInfo, GitCommitInfo, GitGraphBlobSource, GitGraphObject, GitGraphRef, GitGraphSource,
-    GitLogEntry, GitRemoteBranchInfo, GitTagInfo, HistoryError,
+    GitBackupCapacity, GitBranchInfo, GitCommitInfo, GitGraphBlobSource, GitGraphObject,
+    GitGraphRef, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, GitTagInfo, HistoryError,
 };
 #[cfg(target_os = "linux")]
 pub use interop::GitInteropError;

@@ -1960,6 +1960,12 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_export_all_refs_bare(&self, repository_id: Uuid, destination: &Path) -> Result<u32> {
+        self.open_git_repository_for_metadata(repository_id)?
+            .export_all_refs_to_bare(destination)
+            .map_err(Into::into)
+    }
+
     pub fn git_export_to_git_repository(
         &self,
         repository_id: Uuid,

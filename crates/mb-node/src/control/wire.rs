@@ -223,6 +223,11 @@ pub enum LocalRequest {
         repository_id: Uuid,
         name: String,
     },
+    GitExportAllRefsBare {
+        repository_id: Uuid,
+        #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
+        destination: PathBuf,
+    },
     GitExportToGitRepository {
         repository_id: Uuid,
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
@@ -1070,6 +1075,10 @@ mod tests {
                 repository_id,
                 name: "v1".to_owned(),
             },
+            LocalRequest::GitExportAllRefsBare {
+                repository_id,
+                destination: PathBuf::from("/tmp/history.git"),
+            },
             LocalRequest::GitExportToGitRepository {
                 repository_id,
                 source_root: PathBuf::from("/tmp/source"),
@@ -1234,6 +1243,52 @@ mod tests {
             let decoded: LocalRequestEnvelope<LocalRequest> =
                 serde_json::from_str(&encoded).unwrap();
             assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        }
+        for capacity in [
+            mb_git::GitBackupCapacity::WithinDescriptorLimit {
+                encoded_bytes: 100,
+                limit_bytes: 33_554_432,
+            },
+            mb_git::GitBackupCapacity::DescriptorLimitExceeded {
+                limit_bytes: 33_554_432,
+            },
+            mb_git::GitBackupCapacity::Unavailable {
+                reason: "missing mapping".to_owned(),
+            },
+        ] {
+            let response = LocalResponseEnvelope {
+                format_version: LOCAL_WIRE_FORMAT_VERSION,
+                request_id: [9; 16],
+                result: Ok(LocalResponse::GitStatus(GitStatus {
+                    format_version: 1,
+                    repository_id,
+                    branch: "main".to_owned(),
+                    head_oid: None,
+                    history_backed_up: false,
+                    backup_capacity: Some(capacity),
+                    changes: vec![],
+                    untracked: vec![],
+                    pending_adds: vec![],
+                    merge: None,
+                })),
+            };
+            let encoded = serde_json::to_string(&response).unwrap();
+            cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
+            let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+            let mut legacy = serde_json::to_value(&response).unwrap();
+            legacy["result"]["Ok"]["GitStatus"]
+                .as_object_mut()
+                .unwrap()
+                .remove("backup_capacity");
+            let decoded: LocalResponseEnvelope = serde_json::from_value(legacy).unwrap();
+            assert!(matches!(
+                decoded.result,
+                Ok(LocalResponse::GitStatus(GitStatus {
+                    backup_capacity: None,
+                    ..
+                }))
+            ));
         }
         let older_merge = serde_json::json!({
             "format_version": LOCAL_WIRE_FORMAT_VERSION,
@@ -1482,6 +1537,7 @@ mod tests {
                 branch: "main".to_owned(),
                 head_oid: Some([7; 20]),
                 history_backed_up: false,
+                backup_capacity: None,
                 changes: vec![mb_git::GitStatusChange {
                     path: b"tracked".to_vec(),
                     staged: Some(mb_git::GitChange::Modified),

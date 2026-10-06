@@ -894,6 +894,19 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitExportAllRefsBare {
+            repository_id,
+            destination,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_export_all_refs_bare(repository_id, &destination)
+                    .map(|object_count| LocalResponse::GitObjectsExported {
+                        repository_id,
+                        object_count,
+                    })
+            })
+            .await
+        }
         LocalRequest::GitExportToGitRepository {
             repository_id,
             source_root,

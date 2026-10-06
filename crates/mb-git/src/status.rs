@@ -79,6 +79,10 @@ pub struct GitStatus {
     /// A certified checkpoint covers the local reachable graph and refs.
     /// This does not attest uncommitted index entries or worktree selection.
     pub history_backed_up: bool,
+    /// Current dense Git descriptor capacity, independent of checkpoint proof
+    /// and enclosing revision/native metadata admission. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_capacity: Option<crate::GitBackupCapacity>,
     pub changes: Vec<GitStatusChange>,
     pub untracked: Vec<Vec<u8>>,
     pub pending_adds: Vec<Vec<u8>>,
@@ -392,6 +396,7 @@ fn repository_status_with_directory(
         branch: selected_branch_for_scope(control, scope)?,
         head_oid: head.map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID")),
         history_backed_up: false,
+        backup_capacity: None,
         changes,
         untracked,
         pending_adds: pending_stage_paths_for_scope(control, scope)?,

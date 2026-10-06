@@ -170,6 +170,40 @@ and import keep raw file bytes; Git line-ending rules, content filters,
 stock Git to transform files. `mutualgit status` reports the raw-byte policy.
 Stock Git may still convert its own working-tree files after exchanging blobs.
 
+`mutualgit status` also reports the current-format Git descriptor's encoded size
+against its inclusive 32 MiB limit. That measurement includes all retained refs,
+ancestry, raw metadata and dense blob sector recipes without reopening payloads.
+It is separate from the signed-checkpoint protection report: fitting this
+individual descriptor does not certify source availability or the complete
+native metadata and signed revision. An unavailable mapping or graph produces
+an explicit unavailable capacity result rather than a fit claim. Existing
+oversized local history is preserved; growing commands reject it before their
+publication and a new current-format capture cannot encode it. Paged production
+migration and the 1 TiB target remain open in R2/R3 of `TODO.md`.
+
+To preserve an oversized native Git catalog in stock Git, initialize an empty
+SHA-1 bare repository outside every source/linked-worktree directory and export:
+
+```sh
+git init --bare /absolute/path/to/history.git
+mutualgit -C /absolute/path/to/source export /absolute/path/to/history.git
+git --git-dir=/absolute/path/to/history.git fsck --full --strict
+```
+
+Full export writes every retained ref, including branches, annotated/lightweight
+tags, remote-tracking refs and explicit pins, and selects the primary branch as
+symbolic HEAD. It streams and verifies exact native blobs and Git objects into
+stock Git's own object storage. The 32 MiB backup-descriptor bound does not gate
+this export; the existing prototype graph traversal bounds still apply. It
+preserves the source catalog, working files, anchors, pins and signed protections.
+Existing destination refs are rejected rather than overwritten. Missing or
+corrupt anchors prevent a successful export. Destination refs are locked before
+object writes; a later filesystem publication failure may leave part of the
+export in that external destination. Keep the source and retry into a new empty
+bare repository. A successful export contains committed retained history; it
+does not include uncommitted working/index bytes or replace encrypted native
+backups. Guarded/FUSE historical conversion remains a separate open R1 gate.
+
 Install `git-remote-mutualbackup` on `PATH` to fetch from or push to this history
 with stock Git. The URL after `mutualbackup::` is the absolute path to the
 MutualBackup source root, not its `.mutualbackup` directory:

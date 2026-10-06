@@ -31,6 +31,10 @@ pub enum GitInteropError {
     UnsupportedDestination,
     #[error("the requested local branch has no committed head")]
     NoHead,
+    #[error(
+        "full history export requires an empty destination ref namespace; initialize a new bare Git repository"
+    )]
+    DestinationNotEmpty,
     #[error("the destination branch has diverged; a force push is not supported")]
     NonFastForward,
     #[error("the destination tag exists at another object; moving a tag is not supported")]
@@ -299,6 +303,70 @@ pub(crate) fn export_graph_to_git_repository(
         }
     }
     export_objects(&destination, &graph)?;
+    u32::try_from(graph.blobs.len() + graph.objects.len())
+        .map_err(|_| GitInteropError::IncompatibleGraph)
+}
+
+/// Export all retained refs, including remote-tracking refs and explicit pins.
+/// This recovery path deliberately does not apply the backup descriptor limit.
+/// Objects are streamed and verified before destination refs are written. Any
+/// failed destination write leaves the original catalog and anchors untouched.
+pub(crate) fn export_all_refs_to_bare(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+    destination_path: &Path,
+) -> Result<u32, GitInteropError> {
+    let destination_path = destination_path.canonicalize()?;
+    if destination_path.starts_with(source_root) {
+        return Err(GitInteropError::UnsupportedDestination);
+    }
+    let destination = Repository::open_bare(&destination_path)?;
+    if !destination.is_bare()
+        || destination.path().canonicalize()? != destination_path
+        || destination.object_format() != ObjectFormat::Sha1
+    {
+        return Err(GitInteropError::UnsupportedDestination);
+    }
+    if destination.references()?.next().transpose()?.is_some() {
+        return Err(GitInteropError::DestinationNotEmpty);
+    }
+    let graph = export_graph_source(control, repository_id)?;
+    let head_branch =
+        crate::head::selected_branch(control, repository_id).map_err(HistoryError::from)?;
+    let mut transaction = destination.transaction()?;
+    transaction.lock_ref("HEAD")?;
+    for reference in &graph.refs {
+        let name =
+            std::str::from_utf8(&reference.name).map_err(|_| GitInteropError::IncompatibleGraph)?;
+        transaction.lock_ref(name)?;
+    }
+    // Known refs are now locked against competing updates. Do not overwrite
+    // anything added since the initial destination inspection.
+    if destination.references()?.next().transpose()?.is_some() {
+        return Err(GitInteropError::DestinationNotEmpty);
+    }
+    export_objects(&destination, &graph)?;
+    for reference in &graph.refs {
+        let name =
+            std::str::from_utf8(&reference.name).map_err(|_| GitInteropError::IncompatibleGraph)?;
+        transaction.set_target(
+            name,
+            Oid::from_bytes(&reference.oid)?,
+            None,
+            "mutualgit full history export",
+        )?;
+    }
+    transaction.set_symbolic_target(
+        "HEAD",
+        &format!("refs/heads/{head_branch}"),
+        None,
+        "mutualgit full history export",
+    )?;
+    // Libgit2's ref transaction locks each ref, but filesystem publication can
+    // fail partway through. Such an export reports failure; use a fresh empty
+    // destination to retry. It never trims or rewrites the source history.
+    transaction.commit()?;
     u32::try_from(graph.blobs.len() + graph.objects.len())
         .map_err(|_| GitInteropError::IncompatibleGraph)
 }

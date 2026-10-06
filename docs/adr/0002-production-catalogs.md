@@ -15,7 +15,9 @@ they do not provide a scalable catalog.
 
 A larger constant would allow one writer to publish state that another reader,
 signer, checkpoint, packing or recovery path cannot process. Git already has
-that problem: local graph admission and backup descriptor bounds differ.
+that historical problem: older local graphs can exceed the backup descriptor
+bound. Current mutation checks cover the complete Git descriptor, but the full
+enclosing native/private and signed revision contract remains open.
 
 ## Direction
 
@@ -710,3 +712,43 @@ regressions pass on disposable Btrfs with verified mount/image/loop cleanup.
 Formatting and strict workspace/all-targets Clippy pass. The ordinary suites
 retain 62 provisioned Git and eight snapshot cases; the one Git import case
 and two capture cases were run separately for this increment.
+
+Primary and linked Git status now expose an optional current-capture descriptor
+capacity result. The read-only measurement uses all retained refs/ancestry and
+cached blob lengths to count the exact dense recipe shape used by capture, with
+an inclusive 32 MiB bound. Missing/incompatible graph mappings produce an
+unavailable result. The result is independent of certified backup protection;
+a fitting descriptor does not certify native metadata, signed revision or
+payload availability. Older local-control status responses still decode.
+
+Oversized native history can be preserved with `mutualgit export` into an
+existing empty SHA-1 bare Git repository outside primary/linked source roots.
+Export includes all retained refs, remote-tracking refs and pins, exact raw
+objects and blobs, plus the primary symbolic HEAD. It uses the existing verified
+anchor streaming path without applying the backup descriptor bound; prototype
+graph traversal bounds still apply. Populated destinations are rejected. All
+known destination refs are locked before objects are written, but libgit2's
+filesystem ref publication can fail partway through. Such a failure reports an
+error and keeps the source intact; use a fresh empty destination to retry. This
+export covers committed native history and does not convert withdrawn FUSE state,
+copy uncommitted bytes, remove protections or enable production paged migration.
+
+New fixtures cover oversized status and full export with every retained ref
+namespace, byte-exact metadata/blobs, stock Git strict fsck, populated/inside-root
+and locked-destination rejection, unavailable graph mappings, and reopen.
+Existing import-boundary fixtures now check exact capacity immediately below and
+at the descriptor limit. Schema tests cover each capacity state and omitted
+legacy status fields; CLI tests cover capacity wording and the concrete export
+remedy. A provisioned daemon/CLI fixture exercises raw non-UTF-8 file and
+export-destination paths with remote refs, tags, pins and byte-exact export.
+Full enclosing R2 budgets, bounded scheduling and end-to-end R3 capacity remain
+open; this status/export increment does not support the 1 TiB release target.
+
+All 87 ordinary and 62 provisioned Git library tests, 28 ordinary snapshot
+regressions, seven mutualgit unit tests and the expanded local-wire schema
+fixture pass. The real daemon/CLI raw-path fixture passes full export of remote
+refs, tags, pins and non-UTF-8 paths with exact bytes and stock Git strict fsck.
+Both native capture regressions pass. Disposable Btrfs mount/image/loop cleanup,
+formatting and strict workspace/all-targets Clippy are verified. The ordinary
+snapshot suite retains eight provisioned cases; the two capture cases ran
+separately. This does not replace the complete M6 release gates.
