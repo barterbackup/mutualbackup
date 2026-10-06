@@ -34,9 +34,9 @@ pub use anchor::{
     GuardedViewMetadataEntry, GuardedViewMetadataV1,
 };
 pub use database::{
-    CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,
-    ObjectAttemptState, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
-    ReadyVariableObject, VariableParityObject,
+    CatalogIntent, CatalogIntentState, CatalogStoreError, CheckpointRow, ControlStore,
+    DatabaseError, DatabaseShellResult, KindedProtocolRecordRow, ObjectAttemptState, ParityObject,
+    ParityScrubReport, ParityStore, ProtocolRecordRow, ReadyVariableObject, VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";

@@ -162,8 +162,20 @@ passing tests below apply only to their recorded source and exercised cases.
     structural 16 GiB metadata-bound fixture is not a 1 TiB data qualification.
     Existing signed revision/checkpoint formats and runtime limits remain in
     force until their consumers migrate.
-  - [ ] Add durable page ownership, authenticated public/private addressing,
-    bounded record codecs and incremental seek/edit operations. Qualify
+  - [x] Persist local page ownership in the existing SQLCipher control schema.
+    Child-first staging verifies immutable pages and immediate children before
+    atomically recording pins and parent links. Root publication is fenced by
+    the durable intent; cancellation blocks stale writes before cleanup.
+    Surplus pins and unreferenced pages are released one at a time, preserving
+    shared and pending successor closures. SQL reads bound payload/key
+    allocation before materialization. Four interruption/reopen, sharing,
+    corruption and transaction-failure fixtures pass; all 58 core and 79
+    ordinary store tests pass (18 provisioned store tests remain ignored),
+    along with formatting and strict workspace/all-targets Clippy. This is
+    local catalog ownership, not signed revision or remote protection.
+  - [ ] Add authenticated public/private addressing, quota reservations,
+    bounded record codecs and incremental seek/edit operations. Retire intent
+    tombstones only behind a verified generation floor. Qualify
     interruption/reopen, cancellation and small changes to large catalogs.
   - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,
     retention and seed-only recovery together; qualify the declared capacity

@@ -14,6 +14,9 @@ use thiserror::Error;
 
 use crate::SCHEMA_VERSION;
 
+mod catalog;
+pub use catalog::{CatalogIntent, CatalogIntentState, CatalogStoreError};
+
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
 const CHECKPOINT_GENERATION_KIND: &str = "guild-checkpoint-generation";
 const CHECKPOINT_LEGACY_EPOCH_KIND: &str = "guild-checkpoint-legacy-epoch";

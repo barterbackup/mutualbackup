@@ -28,7 +28,7 @@ pub enum CatalogScope {
 }
 
 impl CatalogScope {
-    fn validate(self, section: CatalogSection) -> Result<(), CatalogError> {
+    pub fn validate(self, section: CatalogSection) -> Result<(), CatalogError> {
         match (self, section) {
             (
                 Self::Dataset {
@@ -64,6 +64,15 @@ pub struct CatalogPageRef {
     pub height: u8,
     pub byte_len: u64,
     pub page_occurrences: u64,
+}
+
+/// Contents obtained only after verifying the encoded page against its
+/// authenticated reference, scope, version, geometry and canonical encoding.
+/// The reference's authority must still come from a signed root or parent.
+#[derive(Debug, Eq, PartialEq)]
+pub enum CatalogPageContents {
+    Leaf(Vec<u8>),
+    Index(Vec<CatalogPageRef>),
 }
 
 #[derive(Debug, Error)]
@@ -144,6 +153,18 @@ struct Page {
 }
 
 impl CatalogPageRef {
+    pub fn verify_page(
+        self,
+        scope: CatalogScope,
+        section: CatalogSection,
+        bytes: &[u8],
+    ) -> Result<CatalogPageContents, CatalogError> {
+        Ok(match verify_page(self, scope, section, bytes)?.body {
+            PageBody::Leaf(bytes) => CatalogPageContents::Leaf(bytes),
+            PageBody::Index(children) => CatalogPageContents::Index(children),
+        })
+    }
+
     pub fn validate(&self) -> Result<(), CatalogError> {
         if self.encoded_len == 0
             || self.encoded_len as usize > CATALOG_PAGE_BYTES

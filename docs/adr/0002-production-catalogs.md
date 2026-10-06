@@ -1,7 +1,7 @@
 # Bounded authenticated catalogs for the 1 TiB release target
 
-Status: page foundation implemented and qualified; production admission remains disabled until
-the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
+Status: page foundation and local ownership implemented; production admission
+remains disabled until the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
 and their limits continue to apply.
 
 ## Problem and required capacity
@@ -108,3 +108,32 @@ fixtures; formatting and strict workspace/all-targets Clippy pass. Exact-limit
 metadata trees use repeated subtrees to exercise structural counts with bounded
 construction. They do not establish real data capacity, durable page ownership,
 incremental update work or end-to-end production support. Steps 2–5 remain open.
+
+Local ownership is now implemented separately in
+`crates/mb-store/src/database/catalog.rs`, using versioned protocol records in
+the existing SQLCipher schema. Immutable page payloads and metadata are stored
+with intent pins and parent links in one transaction. Each index is accepted
+only after its immediate children are durable and verified; their existing
+parent links retain the rest of the closure. Publishing a local root changes
+the intent state atomically and retains its root pin. Surplus construction pins
+can then be released one per transaction. Cancellation fences further writes
+and publication before releasing any pin. A durable candidate queue collects
+one unreferenced page and its bounded outgoing links per transaction, without
+rescanning an entire catalog for every deletion. Pending and published shared
+roots preserve the same immutable descendants through cancellation and reopen.
+
+Each intent bounds its owned page count and records encoded-byte accounting.
+Payloads and keys are bounded by SQL before allocation, then validated against
+their expected metadata and page hashes. Four targeted ownership fixtures pass
+at each page-write, publication, pin-release and page-collection reopen boundary,
+including corruption and injected SQL failures. All 58 core and 79 ordinary
+store tests pass; 18 provisioned store tests remain ignored. Formatting and
+strict workspace/all-targets Clippy pass.
+
+This local root is not a signed revision or a protection claim. At-rest storage
+uses SQLCipher; private remote addressing/encryption and public authority checks
+still need implementation. Cancelled intent records remain as small fencing
+tombstones until an authenticated generation-floor mechanism can retire them.
+Quota/headroom reservation, record codecs, incremental updates and integration
+with capture, packing, checkpoint replay, retention and seed-only recovery
+remain open. Local ownership alone does not enable the 1 TiB target.
