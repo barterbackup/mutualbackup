@@ -1140,3 +1140,40 @@ stable locator backend. Complete-source capture, Git blob plaintext IDs/full DAG
 verification, retained-history conversion, checkpoint/packing, production
 retention and seed-only recovery activation remain open, as does real 1 TiB
 qualification.
+
+### Conditional stable-source recovery replacement (2026-10-06)
+
+`replace_local_data_source` accepts an observed retained source and replacement
+stable anchor range. It bounds the encoded recipe and authenticates seed/scope;
+the store writer then rechecks the complete signed/root snapshot, exact source
+and local generation before Node regenerates the replacement bytes and verifies
+the scoped Data address and both signed ciphertext commitments. Source update,
+new anchor retention and old anchor release commit together. Shared owners retain
+their counts; changing only a range within one anchor does not change pin counts.
+
+Derived binding codec version 2 adds a monotonic `u64` generation. Canonical
+version-1 rows read as generation zero and exact publication retries preserve
+their original bytes. Changed recipes advance the generation; exhaustion fails
+before publication. Returning to identical old recipe bytes cannot restore an
+older attempt's authority. An exact retry is accepted only at the immediately
+following generation with identical replacement bytes, and still reauthenticates
+the physical source. A no-op at the current generation likewise verifies bytes.
+Cancelled roots cannot be rebound. Signed revision/private codecs stay unchanged.
+
+This is conditional local source replacement, not a cold-recovery activation.
+Complete capture and seed-only recovery, filesystem/source-intent concurrency,
+retention/prune migration, legacy conversion and real 1 TiB qualification remain
+open.
+
+Validation: three new store fixtures cover rejected authentication, shared pin
+transfer, same-anchor range changes, exact retry, stale/competing/cancelled
+attempts, return to an old recipe, canonical legacy bytes and generation
+exhaustion. SQL abort/ignore faults cover source update, new pin insert/update
+and old pin update/delete. One Node fixture exercises native and Git-bearing
+roots with lost sources, corrupt replacements, retry reauthentication, reopen,
+competing attempts and cleanup. Locked workspace/all-targets build and 33 paged
+tests pass, alongside 120 ordinary store, 30 ordinary snapshot and five native
+adapter tests (176 distinct cases overall). Formatting and strict locked
+workspace/all-targets Clippy pass. Nineteen provisioned store and eight snapshot
+cases remain ignored; native capture/topology/platform and real 1 TiB
+qualification were not run for this local operation.

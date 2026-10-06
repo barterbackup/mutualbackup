@@ -1085,6 +1085,30 @@ passing tests below apply only to their recorded source and exercised cases.
     all-targets Clippy pass. Nineteen provisioned store and eight snapshot cases
     remain ignored; native capture/topology/platform and real 1 TiB qualification
     were not run for this adapter step.
+  - [x] Conditionally replace retained stable data sources for local recovery.
+    Under one writer, compare signed/root ownership and the exact old binding,
+    authenticate replacement anchor bytes and update the recipe with both shared
+    anchor counts. A monotonic local source generation fences stale attempts,
+    including a source moved away and back to identical recipe bytes. Exact
+    one-generation retries reauthenticate bytes and preserve pin counts; same-
+    anchor range changes retain physical counts. Cancellation and generation
+    exhaustion reject replacement. Local binding codec version 2 reads canonical
+    version-1 records at generation zero without eager rewrite; signed revision
+    and private metadata bytes do not change. Complete recovery/capture, source
+    intent/filesystem concurrency, legacy conversion and production activation
+    remain open.
+    Validation: three new store and one Node fixture pass. They cover rejected
+    authentication, shared pin transfer, same-anchor range changes, exact retry,
+    stale/competing/cancelled attempts, moving back to an old recipe, legacy
+    canonical bytes, generation exhaustion and SQL abort/ignore at the source
+    update and every new/old pin insert/update/delete boundary. Node exercises
+    native and Git-bearing roots with lost sources, corrupted replacements,
+    retry reauthentication, reopen and cleanup. Locked workspace/all-targets
+    build and 33 paged tests pass; 120 ordinary store, 30 ordinary snapshot and
+    five native adapter tests also pass (176 distinct cases overall). Formatting
+    and strict locked workspace/all-targets Clippy pass. Nineteen provisioned
+    store and eight snapshot cases remain ignored; native capture/topology/
+    platform and real 1 TiB qualification were not run for this local operation.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

@@ -1414,6 +1414,16 @@ legacy prune bridge collects anchor identities. This uses the existing Linux
 stable locator backend and leaves complete-source capture, Git blob/DAG checks,
 normal consumer/retention/recovery migration and the real 1 TiB gate open.
 
+Local data recovery can now conditionally replace a retained stable source after
+authenticating replacement bytes under the writer. Source identity and a monotonic
+local generation fence concurrent/stale attempts, including movement back to an
+earlier recipe. The recipe and both physical anchor counts change together;
+same-anchor range changes leave counts intact. Exact retries reauthenticate bytes
+without repeating pin transfer. Canonical version-1 local bindings reopen at
+generation zero; version-2 updates leave signed revision/private bytes unchanged.
+Capture/recovery consumer activation and filesystem lifecycle qualification remain
+required.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

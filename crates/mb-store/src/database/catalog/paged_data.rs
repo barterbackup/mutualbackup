@@ -18,6 +18,15 @@ struct DataSourceRecord {
     source: CatalogSectorRecord,
     anchor: Uuid,
     recipe: Vec<u8>,
+    generation: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyDataSourceRecord {
+    version: u16,
+    source: CatalogSectorRecord,
+    anchor: Uuid,
+    recipe: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +35,8 @@ pub struct PagedCatalogDataSource {
     pub source: CatalogSectorRecord,
     pub anchor: Uuid,
     pub recipe: Vec<u8>,
+    /// Monotonic local source identity; zero for version-1 bindings.
+    pub generation: u64,
 }
 
 fn anchor_count(connection: &Connection, id: Uuid) -> Result<Option<u64>, CatalogStoreError> {
@@ -66,13 +77,34 @@ fn change_anchor_count(
 }
 
 fn decode_record(bytes: &[u8], sector: [u8; 32]) -> Result<DataSourceRecord, CatalogStoreError> {
-    let record: DataSourceRecord = decode_canonical(bytes)?;
-    if record.version != 1
+    let record: DataSourceRecord = match bytes.first() {
+        Some(1) => {
+            let old: LegacyDataSourceRecord = decode_canonical(bytes)?;
+            if canonical_bytes(&old)? != bytes {
+                return Err(DatabaseError::Integrity.into());
+            }
+            DataSourceRecord {
+                version: 2,
+                source: old.source,
+                anchor: old.anchor,
+                recipe: old.recipe,
+                generation: 0,
+            }
+        }
+        Some(2) => {
+            let record: DataSourceRecord = decode_canonical(bytes)?;
+            if canonical_bytes(&record)? != bytes {
+                return Err(DatabaseError::Integrity.into());
+            }
+            record
+        }
+        _ => return Err(DatabaseError::Integrity.into()),
+    };
+    if record.version != 2
         || record.source.sector.id != sector
         || record.anchor.is_nil()
         || record.recipe.is_empty()
         || record.recipe.len() > PAGED_DATA_RECIPE_BYTES
-        || canonical_bytes(&record)? != bytes
     {
         return Err(DatabaseError::Integrity.into());
     }
@@ -102,14 +134,18 @@ pub(super) fn bind(
         return Err(DatabaseError::Conflict.into());
     }
     let kind = sources(bundle.id);
-    let encoded = canonical_bytes(&DataSourceRecord {
-        version: 1,
+    let record = DataSourceRecord {
+        version: 2,
         source: source.clone(),
         anchor,
         recipe: recipe.to_vec(),
-    })?;
+        generation: 0,
+    };
+    let encoded = canonical_bytes(&record)?;
     if let Some(existing) = bounded_record(connection, &kind, &source.sector.id, RECORD_LIMIT)? {
-        if existing != encoded || anchor_count(connection, anchor)?.is_none() {
+        if decode_record(&existing, source.sector.id)? != record
+            || anchor_count(connection, anchor)?.is_none()
+        {
             return Err(DatabaseError::Conflict.into());
         }
         return Ok(());
@@ -123,7 +159,105 @@ pub(super) fn bind(
     change_anchor_count(connection, anchor, previous, next)
 }
 
+fn read_source(
+    connection: &Connection,
+    id: Uuid,
+    sector: [u8; 32],
+) -> Result<Option<PagedCatalogDataSource>, CatalogStoreError> {
+    let Some(catalog) = paged_revision::snapshot(connection, id)? else {
+        return Ok(None);
+    };
+    if catalog.state == CatalogBundleState::Cancelled {
+        return Ok(None);
+    }
+    let Some(bytes) = bounded_record(connection, &sources(id), &sector, RECORD_LIMIT)? else {
+        return Ok(None);
+    };
+    let record = decode_record(&bytes, sector)?;
+    if native_validation::source_record(connection, id, sector)?.as_ref() != Some(&record.source)
+        || anchor_count(connection, record.anchor)?.is_none()
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(Some(PagedCatalogDataSource {
+        catalog,
+        source: record.source,
+        anchor: record.anchor,
+        recipe: record.recipe,
+        generation: record.generation,
+    }))
+}
+
 impl ControlStore {
+    /// Replace one authenticated source under an exact ownership/generation
+    /// fence, transferring physical pins in the same writer transaction.
+    /// The callback verifies replacement bytes using this current snapshot.
+    /// One-generation exact retries are idempotent; intervening changes fail.
+    pub fn replace_paged_revision_data_source_checked<E: From<CatalogStoreError>>(
+        &self,
+        expected: &PagedCatalogDataSource,
+        anchor: Uuid,
+        recipe: &[u8],
+        check: impl FnOnce(&PagedCatalogDataSource) -> Result<(), E>,
+    ) -> Result<PagedCatalogDataSource, E> {
+        if anchor.is_nil() || recipe.is_empty() || recipe.len() > PAGED_DATA_RECIPE_BYTES {
+            return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(CatalogStoreError::from)?;
+        let id = expected.catalog.bundle.id;
+        let sector = expected.source.sector.id;
+        let mut current = read_source(&tx, id, sector)?
+            .ok_or_else(|| CatalogStoreError::from(DatabaseError::Conflict))?;
+        if current.catalog != expected.catalog || current.source != expected.source {
+            return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
+        let identical = current.anchor == anchor && current.recipe == recipe;
+        let retry = identical && expected.generation.checked_add(1) == Some(current.generation);
+        if &current != expected && !retry {
+            return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
+        check(&current)?;
+        if identical {
+            tx.commit().map_err(CatalogStoreError::from)?;
+            return Ok(current);
+        }
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| CatalogStoreError::from(DatabaseError::CapacityExceeded))?;
+        let old_bytes = bounded_record(&tx, &sources(id), &sector, RECORD_LIMIT)?
+            .ok_or_else(|| CatalogStoreError::from(DatabaseError::Integrity))?;
+        let encoded = canonical_bytes(&DataSourceRecord {
+            version: 2,
+            source: current.source.clone(),
+            anchor,
+            recipe: recipe.to_vec(),
+            generation,
+        })
+        .map_err(CatalogStoreError::from)?;
+        if tx.execute("UPDATE protocol_records SET bytes = ?4 WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![sources(id), sector, old_bytes, encoded]).map_err(CatalogStoreError::from)? != 1 {
+            return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
+        if current.anchor != anchor {
+            let next_count = anchor_count(&tx, anchor)?;
+            let next = next_count
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| CatalogStoreError::from(DatabaseError::CapacityExceeded))?;
+            let old = anchor_count(&tx, current.anchor)?
+                .ok_or_else(|| CatalogStoreError::from(DatabaseError::Integrity))?;
+            change_anchor_count(&tx, anchor, next_count, next)?;
+            change_anchor_count(&tx, current.anchor, Some(old), old - 1)?;
+        }
+        current.anchor = anchor;
+        current.recipe = recipe.to_vec();
+        current.generation = generation;
+        tx.commit().map_err(CatalogStoreError::from)?;
+        Ok(current)
+    }
+
     /// Read one bounded recipe and its signed/root ownership in one snapshot.
     /// Cancelled revisions are unavailable even while physical pins await GC.
     pub fn paged_revision_data_source(
@@ -132,29 +266,7 @@ impl ControlStore {
         sector: [u8; 32],
     ) -> Result<Option<PagedCatalogDataSource>, CatalogStoreError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let result = if let Some(catalog) = paged_revision::snapshot(&tx, id)? {
-            if catalog.state == CatalogBundleState::Cancelled {
-                None
-            } else if let Some(bytes) = bounded_record(&tx, &sources(id), &sector, RECORD_LIMIT)? {
-                let record = decode_record(&bytes, sector)?;
-                if native_validation::source_record(&tx, id, sector)?.as_ref()
-                    != Some(&record.source)
-                    || anchor_count(&tx, record.anchor)?.is_none()
-                {
-                    return Err(DatabaseError::Integrity.into());
-                }
-                Some(PagedCatalogDataSource {
-                    catalog,
-                    source: record.source,
-                    anchor: record.anchor,
-                    recipe: record.recipe,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let result = read_source(&tx, id, sector)?;
         tx.commit()?;
         Ok(result)
     }

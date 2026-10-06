@@ -845,6 +845,337 @@ mod tests {
     }
 
     #[test]
+    fn paged_data_source_replacement_fences_stale_attempts_and_transfers_shared_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let first = data_fixture(&store, a);
+        let other = data_fixture(&store, a);
+        let denied: Result<_, CatalogStoreError> = store
+            .replace_paged_revision_data_source_checked(&first, b, b"source-b", |_| {
+                Err(DatabaseError::Conflict.into())
+            });
+        assert!(denied.is_err());
+        assert_eq!(
+            store
+                .paged_revision_data_source(first.catalog.bundle.id, first.source.sector.id)
+                .unwrap(),
+            Some(first.clone())
+        );
+        assert!(!store.paged_data_anchor_is_pinned(b).unwrap());
+        let next = store
+            .replace_paged_revision_data_source_checked(
+                &first,
+                b,
+                b"source-b",
+                |current| -> Result<(), CatalogStoreError> {
+                    assert_eq!(current, &first);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(next.generation, 1);
+        assert!(store.paged_data_anchor_is_pinned(a).unwrap());
+        assert!(store.paged_data_anchor_is_pinned(b).unwrap());
+        assert_eq!(
+            store
+                .replace_paged_revision_data_source_checked(&first, b, b"source-b", |_| Ok::<
+                    _,
+                    CatalogStoreError,
+                >(
+                    ()
+                ))
+                .unwrap(),
+            next
+        );
+        assert!(
+            store
+                .replace_paged_revision_data_source_checked(
+                    &first,
+                    c,
+                    b"source-c",
+                    |_| -> Result<(), CatalogStoreError> { panic!("stale source reached check") }
+                )
+                .is_err()
+        );
+        let moved_other = store
+            .replace_paged_revision_data_source_checked(&other, b, b"source-b", |_| {
+                Ok::<_, CatalogStoreError>(())
+            })
+            .unwrap();
+        assert!(!store.paged_data_anchor_is_pinned(a).unwrap());
+        let changed_range = store
+            .replace_paged_revision_data_source_checked(&next, b, b"source-b-range-2", |_| {
+                Ok::<_, CatalogStoreError>(())
+            })
+            .unwrap();
+        assert_eq!(changed_range.generation, 2);
+        let back = store
+            .replace_paged_revision_data_source_checked(&changed_range, a, b"source-a", |_| {
+                Ok::<_, CatalogStoreError>(())
+            })
+            .unwrap();
+        assert_eq!(back.generation, 3);
+        // Returning to identical recipe bytes must not resurrect an old fence.
+        assert!(
+            store
+                .replace_paged_revision_data_source_checked(&first, c, b"source-c", |_| Ok::<
+                    _,
+                    CatalogStoreError,
+                >(
+                    ()
+                ))
+                .is_err()
+        );
+        drop(store);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(
+            store
+                .paged_revision_data_source(first.catalog.bundle.id, first.source.sector.id)
+                .unwrap(),
+            Some(back)
+        );
+        for source in [&first, &moved_other] {
+            store
+                .cancel_paged_revision_catalog(source.catalog.bundle.id)
+                .unwrap();
+            assert!(
+                store
+                    .replace_paged_revision_data_source_checked(source, c, b"source-c", |_| Ok::<
+                        _,
+                        CatalogStoreError,
+                    >(
+                        ()
+                    ))
+                    .is_err()
+            );
+            assert!(
+                store
+                    .release_paged_revision_data_source(source.catalog.bundle.id)
+                    .unwrap()
+            );
+        }
+        assert!(store.paged_data_anchor_ids().unwrap().is_empty());
+    }
+
+    fn data_fixture(store: &ControlStore, anchor: Uuid) -> super::super::PagedCatalogDataSource {
+        let (bundle, bytes) = fixture(store, 1, None);
+        let member = &bundle.roots[0];
+        let page = member.root;
+        let encoded = store
+            .catalog_page(bundle.scope, member.intent.section, page)
+            .unwrap();
+        let (sector, ciphertext) = page
+            .seal_private_page(
+                &keys().guild_content_id_key(&[73; 32]),
+                &keys().guild_data_key(&[73; 32]),
+                bundle.scope,
+                member.intent.section,
+                &encoded,
+            )
+            .unwrap();
+        let source = CatalogSectorRecord {
+            format_version: 1,
+            sector,
+            commitment: merkle_commit(&ciphertext).unwrap(),
+        };
+        store
+            .publish_paged_revision_catalog_checked(&bundle, &bytes, |view| {
+                view.bind_data_source(&source, anchor, b"source-a")
+            })
+            .unwrap();
+        store
+            .paged_revision_data_source(bundle.id, source.sector.id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn paged_data_source_replacement_preserves_competing_connection_and_legacy_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let original = data_fixture(&store, a);
+        let id = original.catalog.bundle.id;
+        let sector = original.source.sector.id;
+        let kind = format!("catalog-paged-data-source-v1/{}", id.simple());
+        let legacy =
+            canonical_bytes(&(1_u16, &original.source, a, original.recipe.clone())).unwrap();
+        store.put_record(&kind, &sector, &legacy).unwrap();
+        assert_eq!(
+            store.paged_revision_data_source(id, sector).unwrap(),
+            Some(original.clone())
+        );
+        store
+            .publish_paged_revision_catalog_checked(
+                &original.catalog.bundle,
+                original.catalog.bootstrap.as_ref().unwrap(),
+                |view| view.bind_data_source(&original.source, a, &original.recipe),
+            )
+            .unwrap();
+        assert_eq!(store.get_record(&kind, &sector).unwrap(), Some(legacy));
+        let other = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        let moved = other
+            .replace_paged_revision_data_source_checked(&original, b, b"source-b", |_| {
+                Ok::<_, CatalogStoreError>(())
+            })
+            .unwrap();
+        assert_eq!(moved.generation, 1);
+        assert!(
+            store
+                .replace_paged_revision_data_source_checked(
+                    &original,
+                    Uuid::new_v4(),
+                    b"competing",
+                    |_| Ok::<_, CatalogStoreError>(())
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.paged_revision_data_source(id, sector).unwrap(),
+            Some(moved.clone())
+        );
+        let exhausted =
+            canonical_bytes(&(2_u16, &moved.source, b, moved.recipe.clone(), u64::MAX)).unwrap();
+        store.put_record(&kind, &sector, &exhausted).unwrap();
+        let last = store
+            .paged_revision_data_source(id, sector)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .replace_paged_revision_data_source_checked(&last, a, b"source-a", |_| Ok::<
+                    _,
+                    CatalogStoreError,
+                >(
+                    ()
+                ))
+                .is_err()
+        );
+        assert_eq!(store.get_record(&kind, &sector).unwrap(), Some(exhausted));
+        assert!(!store.paged_data_anchor_is_pinned(a).unwrap());
+        other.cancel_paged_revision_catalog(id).unwrap();
+        assert!(
+            store
+                .replace_paged_revision_data_source_checked(&last, a, b"source-a", |_| Ok::<
+                    _,
+                    CatalogStoreError,
+                >(
+                    ()
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn paged_data_source_replacement_rolls_back_source_and_every_pin_boundary() {
+        for boundary in 0..5 {
+            for fault in ["ABORT", "IGNORE"] {
+                let temp = tempfile::tempdir().unwrap();
+                let store =
+                    ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+                let a = Uuid::new_v4();
+                let b = Uuid::new_v4();
+                let original = data_fixture(&store, a);
+                if boundary == 3 {
+                    data_fixture(&store, a);
+                }
+                if boundary == 2 {
+                    data_fixture(&store, b);
+                }
+                let before = store.records(paged_data::ANCHOR).unwrap();
+                let (operation, predicate) = match boundary {
+                    0 => (
+                        "UPDATE",
+                        "NEW.kind LIKE 'catalog-paged-data-source-v1/%'".to_owned(),
+                    ),
+                    1 => (
+                        "INSERT",
+                        format!(
+                            "NEW.kind = '{}' AND NEW.record_id = X'{}'",
+                            paged_data::ANCHOR,
+                            b.simple()
+                        ),
+                    ),
+                    2 => (
+                        "UPDATE",
+                        format!(
+                            "NEW.kind = '{}' AND NEW.record_id = X'{}'",
+                            paged_data::ANCHOR,
+                            b.simple()
+                        ),
+                    ),
+                    3 => (
+                        "UPDATE",
+                        format!(
+                            "NEW.kind = '{}' AND NEW.record_id = X'{}'",
+                            paged_data::ANCHOR,
+                            a.simple()
+                        ),
+                    ),
+                    4 => (
+                        "DELETE",
+                        format!(
+                            "OLD.kind = '{}' AND OLD.record_id = X'{}'",
+                            paged_data::ANCHOR,
+                            a.simple()
+                        ),
+                    ),
+                    _ => unreachable!(),
+                };
+                let raise = if fault == "ABORT" {
+                    "RAISE(ABORT, 'injected')"
+                } else {
+                    "RAISE(IGNORE)"
+                };
+                store.connection.execute_batch(&format!("CREATE TRIGGER reject_replacement BEFORE {operation} ON protocol_records WHEN {predicate} BEGIN SELECT {raise}; END;")).unwrap();
+                assert!(
+                    store
+                        .replace_paged_revision_data_source_checked(
+                            &original,
+                            b,
+                            b"source-b",
+                            |_| Ok::<_, CatalogStoreError>(())
+                        )
+                        .is_err(),
+                    "boundary {boundary} {fault}"
+                );
+                assert_eq!(store.records(paged_data::ANCHOR).unwrap(), before);
+                assert_eq!(
+                    store
+                        .paged_revision_data_source(
+                            original.catalog.bundle.id,
+                            original.source.sector.id
+                        )
+                        .unwrap(),
+                    Some(original.clone())
+                );
+                store
+                    .connection
+                    .execute_batch("DROP TRIGGER reject_replacement")
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .replace_paged_revision_data_source_checked(
+                            &original,
+                            b,
+                            b"source-b",
+                            |_| Ok::<_, CatalogStoreError>(())
+                        )
+                        .unwrap()
+                        .generation,
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn paged_stable_data_bindings_reopen_and_pin_shared_anchors_until_bounded_cleanup() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("control.db");

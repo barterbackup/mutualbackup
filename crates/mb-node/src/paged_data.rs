@@ -77,6 +77,29 @@ impl PagedAnchorSectorSource {
 }
 
 impl PagedPrivateMetadata {
+    /// Rebind a lost local source to verified replacement anchor bytes. The
+    /// writer rechecks ownership/generation before authentication and pin transfer.
+    pub fn replace_local_data_source(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        expected: &mb_store::PagedCatalogDataSource,
+        expected_scope: CatalogScope,
+        replacement: &PagedAnchorSectorSource,
+    ) -> Result<mb_store::PagedCatalogDataSource> {
+        Self::open_local_snapshot(keys, &expected.catalog, expected_scope)?;
+        let recipe = canonical_bytes_bounded(replacement, mb_store::PAGED_DATA_RECIPE_BYTES)?;
+        control.replace_paged_revision_data_source_checked(
+            expected,
+            replacement.locator.anchor_id,
+            &recipe,
+            |current| -> Result<()> {
+                Self::open_local_snapshot(keys, &current.catalog, expected_scope)?;
+                replacement.render(keys, current.catalog.bundle.scope, &current.source)?;
+                Ok(())
+            },
+        )
+    }
+
     pub fn render_local_data_sector(
         control: &ControlStore,
         keys: &KeyMaterial,

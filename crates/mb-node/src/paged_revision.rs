@@ -823,6 +823,208 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn paged_data_source_recovery_replacement_authenticates_bytes_and_preserves_fences() {
+        for with_git in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("protected");
+            std::fs::create_dir(&root).unwrap();
+            let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+            let payload = b"raw\r\nbytes\0";
+            let make_source = |prefix: &[u8]| {
+                let anchor_id = Uuid::new_v4();
+                let directory = area.path_hint.join(anchor_id.to_string());
+                std::fs::create_dir(&directory).unwrap();
+                let mut bytes = prefix.to_vec();
+                bytes.extend_from_slice(payload);
+                let file = directory.join("payload");
+                std::fs::write(&file, &bytes).unwrap();
+                (
+                    crate::PagedAnchorSectorSource {
+                        locator: mb_store::StableAnchorFileLocator {
+                            area: area.clone(),
+                            anchor_id,
+                            relative_path: "payload".into(),
+                        },
+                        offset: prefix.len() as u64,
+                    },
+                    file,
+                    bytes,
+                )
+            };
+            let (old_recipe, old_file, _) = make_source(b"old");
+            let (replacement, replacement_file, correct_bytes) = make_source(b"replacement");
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (private, signed, intents) = owned_fixture(&store, with_git, 0);
+            let sector = make_content_sector_id(
+                &keys().guild_content_id_key(&[73; 32]),
+                keys().node_id(),
+                [73; 32],
+                Uuid::from_bytes([74; 16]),
+                SectorPurpose::Data,
+                payload,
+            )
+            .unwrap();
+            private
+                .publish_local_catalog_with_data_sources(
+                    &store,
+                    &keys(),
+                    &signed,
+                    &writer_fence(&signed),
+                    intents,
+                    |record| Ok((record.sector.id == sector).then(|| old_recipe.clone())),
+                )
+                .unwrap();
+            let id = signed.value.revision_id;
+            let expected = store
+                .paged_revision_data_source(id, sector)
+                .unwrap()
+                .unwrap();
+            let (_, ciphertext) =
+                encrypted_sector(&keys().guild_data_key(&[73; 32]), sector, payload).unwrap();
+            std::fs::remove_file(old_file).unwrap();
+            assert!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    id,
+                    sector,
+                    scope()
+                )
+                .is_err()
+            );
+            let mut damaged = correct_bytes.clone();
+            damaged[replacement.offset as usize] ^= 1;
+            std::fs::write(&replacement_file, damaged).unwrap();
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &expected,
+                    scope(),
+                    &replacement
+                )
+                .is_err()
+            );
+            assert_eq!(
+                store.paged_revision_data_source(id, sector).unwrap(),
+                Some(expected.clone())
+            );
+            assert!(
+                !store
+                    .paged_data_anchor_is_pinned(replacement.locator.anchor_id)
+                    .unwrap()
+            );
+            std::fs::write(&replacement_file, &correct_bytes).unwrap();
+            let wrong_keys = KeyMaterial::from_seed(&Seed::from_bytes([1; 32]));
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &wrong_keys,
+                    &expected,
+                    scope(),
+                    &replacement
+                )
+                .is_err()
+            );
+            let moved = PagedPrivateMetadata::replace_local_data_source(
+                &store,
+                &keys(),
+                &expected,
+                scope(),
+                &replacement,
+            )
+            .unwrap();
+            assert_eq!(moved.generation, 1);
+            assert_eq!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &expected,
+                    scope(),
+                    &replacement
+                )
+                .unwrap(),
+                moved
+            );
+            assert!(
+                !store
+                    .paged_data_anchor_is_pinned(old_recipe.locator.anchor_id)
+                    .unwrap()
+            );
+            assert!(
+                crate::snapshot::git_prune_recipe_anchor_ids(&store)
+                    .unwrap()
+                    .contains(&replacement.locator.anchor_id)
+            );
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert_eq!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    id,
+                    sector,
+                    scope()
+                )
+                .unwrap(),
+                Some(ciphertext.clone())
+            );
+            // Reauthentication also applies to an otherwise exact retry.
+            std::fs::write(&replacement_file, b"lost").unwrap();
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &expected,
+                    scope(),
+                    &replacement
+                )
+                .is_err()
+            );
+            std::fs::write(&replacement_file, &correct_bytes).unwrap();
+            let (competing, _, _) = make_source(b"competing");
+            let winner = PagedPrivateMetadata::replace_local_data_source(
+                &store,
+                &keys(),
+                &moved,
+                scope(),
+                &competing,
+            )
+            .unwrap();
+            assert_eq!(winner.generation, 2);
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &expected,
+                    scope(),
+                    &replacement
+                )
+                .is_err()
+            );
+            assert_eq!(
+                store.paged_revision_data_source(id, sector).unwrap(),
+                Some(winner.clone())
+            );
+            store.cancel_paged_revision_catalog(id).unwrap();
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &winner,
+                    scope(),
+                    &replacement
+                )
+                .is_err()
+            );
+            assert!(store.release_paged_revision_data_source(id).unwrap());
+            assert!(store.paged_data_anchor_ids().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn paged_stable_native_and_git_data_sources_reopen_authenticate_and_pin_cleanup() {
         for with_git in [false, true] {
             let temp = tempfile::tempdir().unwrap();
