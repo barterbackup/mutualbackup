@@ -120,10 +120,10 @@ struct RecoveryAttempt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-struct PackedSectorRecord {
-    format_version: u16,
-    guild_id: [u8; 32],
-    sector: PackedSector,
+pub(crate) struct PackedSectorRecord {
+    pub(crate) format_version: u16,
+    pub(crate) guild_id: [u8; 32],
+    pub(crate) sector: PackedSector,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

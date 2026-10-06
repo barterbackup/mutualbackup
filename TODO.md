@@ -186,6 +186,33 @@ passing tests below apply only to their recorded source and exercised cases.
     area-marker reader also caps the actual read against concurrent growth.
     This increment does not rerun the complete ordinary Node/Git suites,
     remaining 18 store/12 Node provisioned cases, or full M6 release qualification.
+  - [x] Reconstruct legacy export ciphertext from preserved certified checkpoint
+    data. Canonical/hash-checked quorum checkpoints must contain the exact signed
+    revision. Fixed 3+2 recovery reads indexed, root-verified cache rows scoped to
+    checkpoint/guild/group/position, decodes any valid three positions and verifies
+    every reconstructed root and the complete coding relation. Authenticated zero
+    filler positions need no stored payload. Packed checkpoints read bounded
+    `packed-sector` records one payload at a time, verify certified descriptors,
+    guilds, roots/commitments and chunk hashes, then join split chunks into exactly
+    one owner-signed 64 KiB ciphertext sector. The resolver retains one checkpoint
+    and decoded codeword and tries alternate certified copies when necessary.
+    It does not mutate source records/caches, replay journals or mount a view.
+    Peer downloads, variable-profile parity-volume reconstruction, retained-history
+    inventory/conversion and complete upgrade/source-loss qualification remain open.
+    Validation: the fixed-profile fixture exercises all ten three-of-five
+    subsets through the read-only decoder and end-to-end export, alternate
+    certified copies, missing/quorum-invalid data, foreign checkpoint/guild cache
+    rows and corrupt shard bytes. Packed fixtures for formats 6/7 split both
+    metadata/data objects across sectors and reject missing, corrupt, foreign,
+    substituted, oversized and invalidly certified records without publication.
+    The actual CLI reconstructs metadata and file data with both original
+    information positions absent, retaining original database/key state.
+    All 104 core, 105 ordinary store, ten targeted Node export/range tests, four
+    CLI unit tests and the real offline export fixture pass. Eight provisioned
+    snapshot regressions pass with verified disposable Btrfs mount/image/loop
+    cleanup (232 unique test cases). Formatting and strict locked workspace/
+    all-targets Clippy pass. Complete ordinary Node/Git suites, remaining
+    provisioned cases and full M6 upgrade/platform qualification were not rerun.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

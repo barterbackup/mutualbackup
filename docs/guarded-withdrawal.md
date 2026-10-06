@@ -73,8 +73,8 @@ encoding and every metadata/data ciphertext sector it references. Each ciphertex
 file must be exactly 64 KiB and named `<sector-id-hex>.bin`. These inputs must come
 from preserved authenticated recovery/export data. The file-input mode accepts previously extracted inputs. The catalog-input mode
 below reads available recovered inputs from the preserved encrypted installation.
-Neither mode reconstructs unavailable parity or downloads missing sectors; remote
-recovery is still required for the complete R1 procedure.
+Neither mode downloads missing sectors; recovery beyond the preserved local
+inputs is still required for the complete R1 procedure.
 
 Create the destination's parent outside the revision and ciphertext input
 directories, then run:
@@ -99,14 +99,35 @@ mutualbackup legacy-export \
 
 This mode opens the control catalog read-only, using its existing wrapped key or
 legacy seed-derived key. It searches saved revisions, recovery heads and certified
-checkpoint history, then uses recovered Inline sources or verified cached recovery
-shards. The destination's parent must be outside the installation. It performs no
+checkpoint history, then uses recovered Inline sources, verified cached recovery
+shards or the certified local reconstruction described below. The destination's parent must be outside the installation. It performs no
 key wrapping, schema migration, journal replay, source-hint update or cache
 retirement. Without an explicit anchor area, it does not open anchor files.
 Revisions requiring unavailable ciphertext or uncached packed reconstruction
 still fail while preserving their original state. The command
 exports the requested revision only; it does not inventory all retained history.
 File inputs and catalog inputs are mutually exclusive.
+
+When a requested sector is not directly available, catalog mode can reconstruct
+it from preserved checkpoint data. The checkpoint must be canonical, carry the
+exact owner/writer-signed revision and verify its quorum signatures under its
+recorded hash. For historical fixed 3+2 groups, any three valid cached positions
+can recover the codeword; every reconstructed shard root and the coding relation
+are checked. Zero-length filler positions are inferred only when their certified
+full-sector root authenticates all-zero bytes. Cache rows from another checkpoint,
+guild or group cannot serve as reconstruction inputs.
+
+For packed checkpoints, cached `packed-sector` records supply one authenticated
+payload at a time. Descriptor identity, guild, roots/commitments and source chunk
+hashes are checked; chunks from multiple packed sectors join into the exact
+64 KiB ciphertext referenced by the signed revision. Missing, oversized or corrupt
+records fail without publishing an export. The reader caches one certified
+checkpoint and one decoded fixed codeword, and reads one packed payload at a time, rather than an
+installation-wide payload map. It can try another certified checkpoint containing
+the exact same signed revision if the first cannot reconstruct a sector.
+This does not download peer data or reconstruct variable-profile parity from
+original parity volumes. Keep those volumes, coding transcripts and peer-held
+history for the remaining recovery procedure.
 
 If a signed sector is available only in preserved anchor files, supply its area
 explicitly. Repeat `--anchor-area` for distinct areas:
@@ -191,3 +212,15 @@ mount rejection pass with verified mount/image/loop cleanup. Formatting and stri
 workspace/all-targets Clippy pass. This increment does not rerun the complete
 ordinary Node/Git suites or qualify all retained history, peer/packed reconstruction
 or the full M6 upgrade/source-loss/platform requirements.
+
+The certified-cache increment is checked by all 104 core and 105 ordinary store
+cases, ten targeted Node exporter/range cases, four CLI unit tests and the real
+CLI fixture. It covers all ten fixed three-of-five subsets, alternate certified
+copies, foreign scopes, invalid quorum and corrupt shards; formats 6/7 exercise
+split packed metadata/data and missing, oversized, corrupt or substituted records.
+The real CLI recovers metadata and file data with the original information
+positions absent and leaves the preserved database/key state unchanged. Eight
+provisioned snapshot regressions pass with verified disposable Btrfs cleanup;
+formatting and strict workspace/all-targets Clippy pass. This validation does not
+include complete ordinary Node/Git suites, all other provisioned cases or the
+full retained-history, peer/variable-volume and M6 platform/release requirements.

@@ -1,6 +1,8 @@
 //! Offline, mount-free export of authenticated withdrawn private formats.
 //! Original catalogs and explicitly selected preserved anchors are read-only.
 
+mod recovery;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -459,6 +461,7 @@ pub fn export_withdrawn_revision_from_catalog_with_anchor_areas(
             Ok(())
         })?;
     }
+    let mut checkpoint_recovery = recovery::CheckpointRecovery::default();
     export_withdrawn_revision_from_source(keys, &revision, target, |id| {
         let reference = references
             .get(id)
@@ -469,6 +472,9 @@ pub fn export_withdrawn_revision_from_catalog_with_anchor_areas(
             Err(error) => Some(error),
         };
         let Some(locator) = recovered.get(&reference.root) else {
+            if let Some(bytes) = checkpoint_recovery.load(&control, &revision, reference)? {
+                return Ok(bytes);
+            }
             if let Some(error) = local_error {
                 return Err(error).context("legacy source could not be authenticated; original anchors and journals remain preserved");
             }
@@ -665,6 +671,480 @@ mod tests {
         };
         descriptor.validate().unwrap();
         descriptor
+    }
+
+    #[test]
+    fn legacy_export_unpacks_certified_cached_sectors_with_split_object_chunks() {
+        for format in [6, 7] {
+            let (keys, revision, ciphertexts) = fixture(format);
+            let profile = mb_core::PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: 16 * 1024,
+            };
+            let inputs = revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+                .enumerate()
+                .map(|(index, reference)| mb_core::PackingInput {
+                    owner: keys.node_id(),
+                    protected_root: mb_core::packing_protected_root(
+                        revision.value.protected_root_id,
+                    ),
+                    object_id: reference.id,
+                    source_commitment: Some(
+                        revision.value.sector_commitments.as_ref().unwrap()[index].clone(),
+                    ),
+                    bytes: ciphertexts[&reference.id].clone(),
+                })
+                .collect();
+            let mut packing = mb_core::pack_incremental(profile, None, inputs).unwrap();
+            // Split both signed objects across the packed sectors.
+            let mut slots: Vec<_> = packing
+                .catalog
+                .sectors
+                .iter()
+                .flat_map(|sector| sector.slots.clone())
+                .filter(|slot| slot.source().is_some())
+                .collect();
+            slots.sort_by_key(|slot| {
+                let source = slot.source().unwrap();
+                (source.id.chunk_index, source.id.object_id)
+            });
+            packing.sectors.truncate(slots.len() / 4);
+            packing.catalog.sectors.truncate(packing.sectors.len());
+            for (index, sector) in packing.sectors.iter_mut().enumerate() {
+                sector.descriptor.slots = slots[index * 4..index * 4 + 4].to_vec();
+                sector.bytes.clear();
+                for slot in &sector.descriptor.slots {
+                    let source = slot.source().unwrap();
+                    let start = source.source_offset as usize;
+                    sector.bytes.extend_from_slice(
+                        &ciphertexts[&source.id.object_id]
+                            [start..start + source.logical_len as usize],
+                    );
+                }
+                sector.descriptor.commitment = merkle_commit(&sector.bytes).unwrap();
+                sector.descriptor.flat_root = if packing.catalog.format_version >= 3 {
+                    sector.descriptor.commitment.root
+                } else {
+                    sector_root(&sector.bytes)
+                };
+                sector.descriptor.id = sector.descriptor.calculate_id(profile).unwrap();
+                packing.catalog.sectors[index] = sector.descriptor.clone();
+            }
+            packing.catalog.id = packing.catalog.calculate_id().unwrap();
+            packing.catalog.validate().unwrap();
+            let mut checkpoint = mb_core::QuorumCheckpoint {
+                checkpoint: mb_core::GuildCheckpoint {
+                    format_version: 7,
+                    guild_id: revision.value.guild_id,
+                    genesis_hash: [99; 32],
+                    generation: 1,
+                    parent: None,
+                    members: vec![mb_core::Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: "fixture".into(),
+                    }],
+                    writer_fences: vec![mb_core::WriterFence {
+                        owner: keys.node_id(),
+                        epoch: 1,
+                        public_key: revision.value.writer_public_key,
+                    }],
+                    revision_tombstones: vec![],
+                    revisions: vec![revision.clone()],
+                    coding_groups: vec![],
+                    authority: Some(mb_core::CheckpointAuthority {
+                        format_version: 1,
+                        membership_epoch: 1,
+                        quorum: mb_core::QuorumPolicy {
+                            format_version: 1,
+                            rule: mb_core::QuorumRule::Unanimous,
+                        },
+                    }),
+                    packing_catalog: Some(packing.catalog),
+                },
+                signatures: vec![],
+            };
+            checkpoint.add_signature(&keys).unwrap();
+            checkpoint.verify().unwrap();
+            for case in 0..7 {
+                let temp = tempfile::tempdir().unwrap();
+                let data = temp.path().join("original");
+                fs::create_dir(&data).unwrap();
+                let store = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+                let mut certificate = checkpoint.clone();
+                if case == 6 {
+                    certificate.signatures[0].signature[0] ^= 1;
+                }
+                store
+                    .put_record(
+                        "guild-checkpoint",
+                        &checkpoint.hash().unwrap(),
+                        &canonical_bytes(&certificate).unwrap(),
+                    )
+                    .unwrap();
+                store
+                    .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
+                    .unwrap();
+                for (index, sector) in packing.sectors.iter().enumerate() {
+                    if case == 1 && index == 0 {
+                        continue;
+                    }
+                    let mut record = crate::node::PackedSectorRecord {
+                        format_version: 1,
+                        guild_id: revision.value.guild_id,
+                        sector: sector.clone(),
+                    };
+                    if index == 0 {
+                        match case {
+                            2 => record.sector.bytes[0] ^= 1,
+                            3 => record.guild_id = [98; 32],
+                            4 => record.sector.descriptor.id = [97; 32],
+                            5 => record.sector.bytes = vec![0; 1024 * 1024],
+                            _ => {}
+                        }
+                    }
+                    let key: Vec<_> = revision
+                        .value
+                        .guild_id
+                        .iter()
+                        .chain(&sector.descriptor.id)
+                        .copied()
+                        .collect();
+                    store
+                        .put_record("packed-sector", &key, &canonical_bytes(&record).unwrap())
+                        .unwrap();
+                }
+                drop(store);
+                let original = fs::read(data.join("control.db")).unwrap();
+                let target = temp.path().join("export");
+                let result = export_withdrawn_revision_from_catalog(
+                    &keys,
+                    &data,
+                    revision.value.revision_id,
+                    &target,
+                );
+                if case == 0 {
+                    let report = result.unwrap();
+                    assert_eq!(report.private_format, format);
+                    assert_eq!(
+                        &fs::read(
+                            target
+                                .join("namespace")
+                                .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec()))
+                        )
+                        .unwrap()[1000..1003],
+                        b"raw"
+                    );
+                    if format == 7 {
+                        assert!(git2::Repository::open_bare(target.join("history.git")).is_ok());
+                    }
+                } else {
+                    assert!(result.is_err(), "accepted case {case}");
+                    assert!(!target.exists());
+                }
+                assert_eq!(fs::read(data.join("control.db")).unwrap(), original);
+                assert!(!data.join("control.key").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_export_reconstructs_every_cached_three_of_five_codeword_without_mutation() {
+        use mb_core::{
+            CodingGroup, GuildCheckpoint, InformationRole, Member, ParityRole, QuorumCheckpoint,
+            ShardRole, WriterFence,
+        };
+        let (keys, revision, sectors) = fixture(6);
+        let members: Vec<_> = [49, 71, 72, 73, 74]
+            .into_iter()
+            .map(|byte| KeyMaterial::from_seed(&Seed::from_bytes([byte; 32])))
+            .collect();
+        let mut roster: Vec<_> = members
+            .iter()
+            .enumerate()
+            .map(|(index, keys)| Member {
+                node_id: keys.node_id(),
+                recovery_public_key: keys.recovery_public_key(),
+                failure_domain: format!("domain-{index}"),
+            })
+            .collect();
+        roster.sort_by_key(|member| member.node_id);
+        let mut groups = Vec::new();
+        for (index, reference) in revision
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&revision.value.data_sectors)
+            .enumerate()
+        {
+            let shards = mb_core::encode_3_2([
+                sectors[&reference.id].clone(),
+                vec![index as u8 + 1; V1_SECTOR_SIZE],
+                vec![index as u8 + 7; V1_SECTOR_SIZE],
+            ])
+            .unwrap();
+            let mut group = CodingGroup {
+                id: [0; 32],
+                format_version: 1,
+                guild_id: revision.value.guild_id,
+                data_shards: 3,
+                parity_shards: 2,
+                shard_size: V1_SECTOR_SIZE as u32,
+                roles: [
+                    ShardRole::Information(InformationRole {
+                        owner: keys.node_id(),
+                        sector: reference.clone(),
+                    }),
+                    ShardRole::Information(InformationRole {
+                        owner: members[1].node_id(),
+                        sector: SectorRef {
+                            id: [80 + index as u8; 32],
+                            root: sector_root(&shards[1]),
+                            logical_len: 0,
+                        },
+                    }),
+                    ShardRole::Information(InformationRole {
+                        owner: members[2].node_id(),
+                        sector: SectorRef {
+                            id: [90 + index as u8; 32],
+                            root: sector_root(&shards[2]),
+                            logical_len: 0,
+                        },
+                    }),
+                    ShardRole::Parity(ParityRole {
+                        holder: members[3].node_id(),
+                        row: 0,
+                        root: sector_root(&shards[3]),
+                    }),
+                    ShardRole::Parity(ParityRole {
+                        holder: members[4].node_id(),
+                        row: 1,
+                        root: sector_root(&shards[4]),
+                    }),
+                ],
+            };
+            group.id = group.calculate_id().unwrap();
+            groups.push((group, shards));
+        }
+        groups.sort_by_key(|(group, _)| group.id);
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 3,
+                guild_id: revision.value.guild_id,
+                genesis_hash: [99; 32],
+                generation: 1,
+                parent: None,
+                members: roster,
+                writer_fences: vec![WriterFence {
+                    owner: keys.node_id(),
+                    epoch: 1,
+                    public_key: revision.value.writer_public_key,
+                }],
+                revision_tombstones: vec![],
+                revisions: vec![revision.clone()],
+                coding_groups: groups.iter().map(|(group, _)| group.clone()).collect(),
+                authority: None,
+                packing_catalog: None,
+            },
+            signatures: vec![],
+        };
+        for member in &members {
+            checkpoint.add_signature(member).unwrap();
+        }
+        checkpoint.verify().unwrap();
+        let hash = checkpoint.hash().unwrap();
+        let combinations = [
+            [0, 1, 2],
+            [0, 1, 3],
+            [0, 1, 4],
+            [0, 2, 3],
+            [0, 2, 4],
+            [0, 3, 4],
+            [1, 2, 3],
+            [1, 2, 4],
+            [1, 3, 4],
+            [2, 3, 4],
+        ];
+        for positions in combinations {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("original");
+            fs::create_dir(&data).unwrap();
+            let mut store = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+            store
+                .put_record(
+                    "guild-checkpoint",
+                    &hash,
+                    &canonical_bytes(&checkpoint).unwrap(),
+                )
+                .unwrap();
+            store
+                .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
+                .unwrap();
+            for (group, shards) in &groups {
+                for index in positions {
+                    store
+                        .stage_recovery_shard(
+                            &hash,
+                            &group.guild_id,
+                            &group.id,
+                            index as u8,
+                            &sector_root(&shards[index]),
+                            &shards[index],
+                        )
+                        .unwrap();
+                }
+            }
+            drop(store);
+            let original = fs::read(data.join("control.db")).unwrap();
+            let inspected = crate::volume::inspect_control_store(&data, &keys)
+                .unwrap()
+                .unwrap();
+            let mut decoder = recovery::CheckpointRecovery::default();
+            for reference in revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+            {
+                assert_eq!(
+                    decoder
+                        .load(&inspected, &revision, reference)
+                        .unwrap()
+                        .unwrap(),
+                    sectors[&reference.id],
+                    "{positions:?}"
+                );
+            }
+            drop(inspected);
+            let target = temp.path().join("export");
+            export_withdrawn_revision_from_catalog(
+                &keys,
+                &data,
+                revision.value.revision_id,
+                &target,
+            )
+            .unwrap();
+            assert_eq!(
+                &fs::read(
+                    target
+                        .join("namespace")
+                        .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec()))
+                )
+                .unwrap()[1000..1003],
+                b"raw"
+            );
+            assert_eq!(fs::read(data.join("control.db")).unwrap(), original);
+            assert!(!data.join("control.key").exists());
+        }
+        // An earlier certified copy with no cached inputs cannot hide a later
+        // certified copy of the exact same signed revision that has a codeword.
+        let mut alternate = checkpoint.clone();
+        alternate.checkpoint.generation = 2;
+        alternate.checkpoint.parent = Some(hash);
+        for member in &members {
+            alternate.add_signature(member).unwrap();
+        }
+        alternate.verify().unwrap();
+        let alternate_hash = alternate.hash().unwrap();
+        let available_hash = std::cmp::max(hash, alternate_hash);
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("original");
+        fs::create_dir(&data).unwrap();
+        let mut store = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+        for certificate in [&checkpoint, &alternate] {
+            store
+                .put_record(
+                    "guild-checkpoint",
+                    &certificate.hash().unwrap(),
+                    &canonical_bytes(certificate).unwrap(),
+                )
+                .unwrap();
+        }
+        for (group, shards) in &groups {
+            for index in [2, 3, 4] {
+                store
+                    .stage_recovery_shard(
+                        &available_hash,
+                        &group.guild_id,
+                        &group.id,
+                        index as u8,
+                        &sector_root(&shards[index]),
+                        &shards[index],
+                    )
+                    .unwrap();
+            }
+        }
+        drop(store);
+        let original = fs::read(data.join("control.db")).unwrap();
+        export_withdrawn_revision_from_catalog(
+            &keys,
+            &data,
+            revision.value.revision_id,
+            &temp.path().join("alternate-export"),
+        )
+        .unwrap();
+        assert_eq!(fs::read(data.join("control.db")).unwrap(), original);
+
+        // Missing or foreign-scoped cache input never substitutes for the
+        // certified checkpoint's positions. Quorum loss also fails closed.
+        for case in 0..5 {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("original");
+            fs::create_dir(&data).unwrap();
+            let mut store = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+            let mut changed = checkpoint.clone();
+            if case == 1 {
+                changed.signatures.pop();
+            }
+            store
+                .put_record(
+                    "guild-checkpoint",
+                    &hash,
+                    &canonical_bytes(&changed).unwrap(),
+                )
+                .unwrap();
+            for (group, shards) in &groups {
+                for index in if case != 0 { vec![2, 3, 4] } else { vec![3, 4] } {
+                    store
+                        .stage_recovery_shard(
+                            &if case == 3 { [98; 32] } else { hash },
+                            &if case == 2 { [97; 32] } else { group.guild_id },
+                            &group.id,
+                            index as u8,
+                            &sector_root(&shards[index]),
+                            &shards[index],
+                        )
+                        .unwrap();
+                }
+            }
+            if case == 4 {
+                store
+                    .database_shell_statement(
+                        "UPDATE recovery_shards SET bytes = zeroblob(65536) WHERE shard_index = 2",
+                        false,
+                    )
+                    .unwrap();
+            }
+            drop(store);
+            let original = fs::read(data.join("control.db")).unwrap();
+            let target = temp.path().join("rejected");
+            assert!(
+                export_withdrawn_revision_from_catalog(
+                    &keys,
+                    &data,
+                    revision.value.revision_id,
+                    &target
+                )
+                .is_err()
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read(data.join("control.db")).unwrap(), original);
+        }
     }
 
     #[test]

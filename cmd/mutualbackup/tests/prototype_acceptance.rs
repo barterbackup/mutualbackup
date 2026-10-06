@@ -3485,7 +3485,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             os("--destination"),
             anchor_target.clone().into_os_string(),
             os("--seed-file"),
-            seed_file.into_os_string(),
+            seed_file.clone().into_os_string(),
         ],
         CLI_TIMEOUT,
     )
@@ -3506,6 +3506,169 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     assert_eq!(fs::read(payload).unwrap(), b"prefixoffline payload");
+    assert!(!catalog.join("control.key").exists());
+    let helpers: Vec<_> = [111, 112, 113, 114]
+        .into_iter()
+        .map(|byte| KeyMaterial::from_seed(&Seed::from_bytes([byte; 32])))
+        .collect();
+    let members = [&keys, &helpers[0], &helpers[1], &helpers[2], &helpers[3]];
+    let mut roster: Vec<_> = members
+        .iter()
+        .enumerate()
+        .map(|(index, key)| mb_core::Member {
+            node_id: key.node_id(),
+            recovery_public_key: key.recovery_public_key(),
+            failure_domain: format!("domain-{index}"),
+        })
+        .collect();
+    roster.sort_by_key(|member| member.node_id);
+    let mut groups = Vec::new();
+    for (index, reference) in revision
+        .value
+        .metadata_sectors
+        .iter()
+        .chain(&revision.value.data_sectors)
+        .enumerate()
+    {
+        let bytes = if reference.id == metadata_id {
+            metadata_bytes.clone()
+        } else {
+            data_bytes.clone()
+        };
+        let shards = mb_core::encode_3_2([
+            bytes,
+            vec![1; mb_core::V1_SECTOR_SIZE],
+            vec![2; mb_core::V1_SECTOR_SIZE],
+        ])
+        .unwrap();
+        let mut group = mb_core::CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id: guild,
+            data_shards: 3,
+            parity_shards: 2,
+            shard_size: mb_core::V1_SECTOR_SIZE as u32,
+            roles: [
+                mb_core::ShardRole::Information(mb_core::InformationRole {
+                    owner: keys.node_id(),
+                    sector: reference.clone(),
+                }),
+                mb_core::ShardRole::Information(mb_core::InformationRole {
+                    owner: members[1].node_id(),
+                    sector: mb_core::SectorRef {
+                        id: [200 + index as u8; 32],
+                        root: mb_core::sector_root(&shards[1]),
+                        logical_len: 0,
+                    },
+                }),
+                mb_core::ShardRole::Information(mb_core::InformationRole {
+                    owner: members[2].node_id(),
+                    sector: mb_core::SectorRef {
+                        id: [210 + index as u8; 32],
+                        root: mb_core::sector_root(&shards[2]),
+                        logical_len: 0,
+                    },
+                }),
+                mb_core::ShardRole::Parity(mb_core::ParityRole {
+                    holder: members[3].node_id(),
+                    row: 0,
+                    root: mb_core::sector_root(&shards[3]),
+                }),
+                mb_core::ShardRole::Parity(mb_core::ParityRole {
+                    holder: members[4].node_id(),
+                    row: 1,
+                    root: mb_core::sector_root(&shards[4]),
+                }),
+            ],
+        };
+        group.id = group.calculate_id().unwrap();
+        groups.push((group, shards));
+    }
+    groups.sort_by_key(|(group, _)| group.id);
+    let mut checkpoint = mb_core::QuorumCheckpoint {
+        checkpoint: mb_core::GuildCheckpoint {
+            format_version: 3,
+            guild_id: guild,
+            genesis_hash: [99; 32],
+            generation: 1,
+            parent: None,
+            members: roster,
+            writer_fences: vec![mb_core::WriterFence {
+                owner: keys.node_id(),
+                epoch: 1,
+                public_key: revision.value.writer_public_key,
+            }],
+            revision_tombstones: vec![],
+            revisions: vec![revision.clone()],
+            coding_groups: groups.iter().map(|(group, _)| group.clone()).collect(),
+            authority: None,
+            packing_catalog: None,
+        },
+        signatures: vec![],
+    };
+    for member in members {
+        checkpoint.add_signature(member).unwrap();
+    }
+    checkpoint.verify().unwrap();
+    let hash = checkpoint.hash().unwrap();
+    let mut store = mb_store::ControlStore::open(catalog.join("control.db"), &keys).unwrap();
+    store.clear_recovery_shards(&[80; 32]).unwrap();
+    store.delete_record("local-sector", &data_id).unwrap();
+    store
+        .put_record(
+            "guild-checkpoint",
+            &hash,
+            &canonical_bytes(&checkpoint).unwrap(),
+        )
+        .unwrap();
+    for (group, shards) in groups {
+        for index in [2, 3, 4] {
+            store
+                .stage_recovery_shard(
+                    &hash,
+                    &guild,
+                    &group.id,
+                    index as u8,
+                    &mb_core::sector_root(&shards[index]),
+                    &shards[index],
+                )
+                .unwrap();
+        }
+    }
+    drop(store);
+    let original = fs::read(catalog.join("control.db")).unwrap();
+    let coded_target = temp.path().join("coded-export");
+    let output = run_output(
+        env!("CARGO_BIN_EXE_mutualbackup"),
+        &[
+            os("legacy-export"),
+            os("--data-dir"),
+            catalog.clone().into_os_string(),
+            os("--revision-id"),
+            os(revision_id.to_string()),
+            os("--destination"),
+            coded_target.clone().into_os_string(),
+            os("--seed-file"),
+            seed_file.into_os_string(),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(
+            coded_target
+                .join("namespace")
+                .join(OsString::from_vec(b"payload-\xff".to_vec()))
+        )
+        .unwrap(),
+        b"offline payload"
+    );
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     assert!(!catalog.join("control.key").exists());
     let invalid = run_output(
         env!("CARGO_BIN_EXE_mutualbackup"),
