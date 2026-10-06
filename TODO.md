@@ -149,6 +149,26 @@ passing tests below apply only to their recorded source and exercised cases.
   limits with bounded memory; interrupted backup, prune, and seed-only recovery
   preserve exact data and old supported revisions remain readable.
 
+  - [x] Add the authenticated page foundation in `mb-core` and record the
+    implementation direction in
+    [`docs/adr/0002-production-catalogs.md`](docs/adr/0002-production-catalogs.md).
+    The format binds dataset or guild scope and section, encoded page bytes,
+    child order, decreasing height, subtree bytes and page occurrences.
+    Construction and traversal retain bounded buffers; oversized collection
+    declarations are rejected before allocation. Storage/fetch failure prevents
+    continuation or an emitted root. Eight targeted corruption, scope,
+    ordering, count, geometry, boundary and failure cases pass, along with all
+    58 core tests, formatting and strict workspace/all-targets Clippy. The
+    structural 16 GiB metadata-bound fixture is not a 1 TiB data qualification.
+    Existing signed revision/checkpoint formats and runtime limits remain in
+    force until their consumers migrate.
+  - [ ] Add durable page ownership, authenticated public/private addressing,
+    bounded record codecs and incremental seek/edit operations. Qualify
+    interruption/reopen, cancellation and small changes to large catalogs.
+  - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,
+    retention and seed-only recovery together; qualify the declared capacity
+    and geometry policy on real data before enabling production admission.
+
 - [x] **R4 / P1 — Complete variable-profile disk evacuation.**
   Implemented bounded READY enumeration and durable local transfers for variable
   information/parity shards alongside legacy objects. Destination writes count

@@ -1301,6 +1301,10 @@ seed-only recovery acceptance gates. It does not raise the current flat-catalog
 limits or establish support before those gates pass. The catalog design must
 also declare file/entry/history limits and memory/work bounds; a dataset byte
 target alone does not bound the number of names, extents or references.
+The authenticated page foundation and the consumer-migration sequence are
+recorded in [the production catalog design](docs/adr/0002-production-catalogs.md).
+The primitive is qualified independently; it does not change existing runtime
+admission limits or close R2/R3.
 
 ### Historical implementation and validation record (before scope correction)
 

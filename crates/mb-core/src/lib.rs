@@ -5,6 +5,7 @@
 //! cryptographic operations.
 
 mod attempt;
+mod catalog;
 mod coding;
 mod content;
 mod guild;
@@ -24,6 +25,11 @@ pub use attempt::{
     StagedStorageReceipt, coding_challenge, coding_challenge_commitment, coding_evidence_hash,
     coding_sample_guarantee, coding_transfer_estimate, encode_coding_attempt,
     replay_coding_transcript,
+};
+pub use catalog::{
+    CATALOG_FANOUT, CATALOG_LEAF_BYTES, CATALOG_MAX_HEIGHT, CATALOG_MAX_PAGE_OCCURRENCES,
+    CATALOG_MAX_STREAM_BYTES, CATALOG_PAGE_BYTES, CatalogBuilder, CatalogError, CatalogPageRef,
+    CatalogReader, CatalogScope, CatalogSection, CatalogStreamError,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
