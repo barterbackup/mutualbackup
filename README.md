@@ -13,7 +13,7 @@ identity. Current native source capture uses Linux on qualified reflink
 filesystems; native Windows and macOS backends remain planned. The experimental
 guarded/FUSE backend has been withdrawn. Enrollment commands are removed and
 startup rejects identified guarded state before catalog migration or replay.
-Its implementation remains pending full removal. Follow the
+Its mount runtime and dependency have been removed. Follow the
 [withdrawal procedure](docs/guarded-withdrawal.md) for an existing installation.
 See [`plan.md`](plan.md) for the removal and remaining
 production gates. Do not entrust unique data to this prototype.
@@ -76,8 +76,8 @@ mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 
 `root add` probes the reflink lifecycle and rejects unsupported source
 filesystems. Existing guarded roots and their retained history require the
-data-preserving retirement or compatibility path specified in [`plan.md`](plan.md)
-before the guarded implementation is deleted.
+preservation procedure in [the withdrawal guide](docs/guarded-withdrawal.md).
+Verified historical export and retirement remain open in R1 of [`plan.md`](plan.md).
 
 Parity may span several configured filesystems. Each volume has a signed UUID,
 an independently wrapped SQLCipher key, a byte budget and repair headroom.

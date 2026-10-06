@@ -65,14 +65,9 @@ pub use interop::GitInteropError;
 pub use merge::{GitMergeState, MergeBlobError};
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
-pub use prune::{
-    GitGuardedPruneAnchorCandidate, GitGuardedPrunePreview, GitPruneError, GitPruneReport,
-    GitPruneRoots,
-};
+pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};
 #[cfg(target_os = "linux")]
-pub use repository::{
-    GitGuardedCatalogRetirementV1, GitRepository, RepositoryError, require_native_catalog_state,
-};
+pub use repository::{GitRepository, RepositoryError, require_native_catalog_state};
 #[cfg(target_os = "linux")]
 pub use rm::GitRmError;
 pub use stage::{

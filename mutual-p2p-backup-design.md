@@ -34,11 +34,9 @@ and selects an ordinary folder.
 
 The protected source remains an ordinary NTFS/ext4/APFS/etc. folder. The
 system must not require FUSE, a custom filesystem, a virtual mounted
-disk, or a kernel driver. The experimental FUSE/guarded backend in the
-current implementation is a design deviation scheduled for removal,
-not a production backend to complete. Existing enrolled roots and
-retained backup/history records need an explicit safe transition before
-their support is removed; a backend identifier must never be silently
+disk, or a kernel driver. The experimental FUSE/guarded runtime and dependency
+have been removed. Existing enrolled roots and retained backup/history records
+are rejected when identified and must be preserved pending verified export; a backend identifier must never be silently
 reinterpreted as a different capture method.
 
 The client scans ordinary files and maintains an internal mapping from

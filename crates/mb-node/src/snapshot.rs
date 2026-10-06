@@ -4,9 +4,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -30,13 +28,8 @@ use mb_store::ImportedBlobCapturePlan;
 use mb_store::ReflinkAnchor;
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
-    ReflinkCapturePlan, SourceBackendKind, SourceCapturePlan, SourceFileCapturePlan,
-    StableAnchorFileLocator, git_catalog_marker,
-};
-#[cfg(target_os = "linux")]
-use mb_store::{
-    GUARDED_REVISION_CAPTURE_KIND, GuardedRevisionCaptureV1, GuardedViewMount,
-    RawFileAnchorManifestV2,
+    ReflinkCapturePlan, SourceBackendKind, SourceCapturePlan, StableAnchorFileLocator,
+    git_catalog_marker,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -50,19 +43,12 @@ use crate::guarded_metadata::{
 type RecordWrite = (String, Vec<u8>, Vec<u8>);
 const ANCHOR_AREA_LOCATION_KIND: &str = "anchor-area-location";
 const RECOVERY_ANCHOR_INTENT_KIND: &str = "recovery-anchor-intent";
-#[cfg(target_os = "linux")]
-const GUARDED_RECOVERY_INTENT_KIND: &str = "guarded-recovery-reflink-intent-v1";
-#[cfg(target_os = "linux")]
-const GUARDED_RECOVERY_CAPTURE_KIND: &str = "guarded-recovery-reflink-capture-v1";
-#[cfg(target_os = "linux")]
-const GUARDED_RECOVERY_RETIRE_KIND: &str = "guarded-recovery-reflink-retirement-v1";
+
 const ANCHOR_RETIREMENT_KIND: &str = "anchor-retirement";
 const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
 const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
 const RESTORE_JOB_KIND: &str = "restore-job";
 const GIT_GRAPH_INTENT_KIND: &str = "git-graph-intent-v1";
-#[cfg(target_os = "linux")]
-const GUARDED_GIT_SIGNED_KIND: &str = "guarded-git-signed-v1";
 
 #[derive(Serialize, Deserialize)]
 struct RawLocalPath(
@@ -75,8 +61,6 @@ type RestoreRenameHook = Box<dyn FnOnce() -> Result<()>>;
 #[cfg(test)]
 thread_local! {
     static INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-    static INTERRUPT_GUARDED_RECOVERY_AFTER_CAPTURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static INTERRUPT_AFTER_LEGACY_RESTORE_RETIRE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -373,42 +357,6 @@ struct RecoveryAnchorIntent {
     replaced_anchor: Option<mb_store::StableAnchorManifest>,
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct GuardedRecoveredFilePlanV1 {
-    path: Vec<u8>,
-    plan: SourceFileCapturePlan,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct GuardedRecoveryIntentV1 {
-    format_version: u16,
-    guild_id: [u8; 32],
-    revision_id: Uuid,
-    #[serde(with = "mb_store::raw_path_bytes")]
-    source_root: PathBuf,
-    metadata_hash: [u8; 32],
-    files: Vec<GuardedRecoveredFilePlanV1>,
-    replaced: Option<GuardedRecoveredCaptureV1>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct GuardedRecoveredFileV1 {
-    path: Vec<u8>,
-    anchor: RawFileAnchorManifestV2,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct GuardedRecoveredCaptureV1 {
-    format_version: u16,
-    revision_id: Uuid,
-    metadata_hash: [u8; 32],
-    files: Vec<GuardedRecoveredFileV1>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct LegacyRecoveryAnchorIntentV1 {
     format_version: u16,
@@ -480,39 +428,6 @@ fn prepare_git_graph_intent(
         source_root,
         SourceBackendKind::ReflinkV1,
     )
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn prepare_guarded_git_graph_intent(
-    control: &ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    revision_id: Uuid,
-    protected_root_id: Uuid,
-    source_root: &Path,
-    catalog_root: &Path,
-) -> Result<bool> {
-    Ok(prepare_git_graph_intent_with_catalog_root(
-        control,
-        keys,
-        guild_id,
-        revision_id,
-        protected_root_id,
-        source_root,
-        catalog_root,
-        SourceBackendKind::GuardedLinkFreezeV1,
-    )?
-    .is_some())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn guarded_git_revision_signed(
-    control: &ControlStore,
-    revision_id: Uuid,
-) -> Result<bool> {
-    Ok(control
-        .get_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?
-        .is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -815,10 +730,6 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
             .get_record("capture-intent", intent.revision_id.as_bytes())?
             .is_none()
         {
-            #[cfg(target_os = "linux")]
-            if GuardedViewMount::has_stopped_capture_attempt(intent.revision_id, control)? {
-                continue;
-            }
             control.delete_record(GIT_GRAPH_INTENT_KIND, &record_id)?;
         }
     }
@@ -836,19 +747,6 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
         }
         let _ = intent.plan.reconcile(control);
     }
-    #[cfg(target_os = "linux")]
-    for (record_id, bytes) in control.records(GUARDED_RECOVERY_INTENT_KIND)? {
-        let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
-        ensure!(
-            intent.format_version == 1
-                && record_id.as_slice() == intent.revision_id.as_bytes()
-                && canonical_bytes(&intent)?.len() <= V1_MAX_CATALOG_BYTES * 2,
-            "pending guarded recovery intent is invalid"
-        );
-        for file in &intent.files {
-            let _ = file.plan.reconcile_with_control(control);
-        }
-    }
     reconcile_anchor_retirements(control)?;
     Ok(())
 }
@@ -857,10 +755,7 @@ fn remove_revision_anchor(
     control: &ControlStore,
     manifest: &mb_store::StableAnchorManifest,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if let Some(plan) = mb_store::GuardedRootCapturePlan::load_for_manifest(control, manifest)? {
-        return plan.discard_unreferenced(control);
-    }
+    let _ = control;
     manifest.remove()?;
     Ok(())
 }
@@ -884,75 +779,10 @@ fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
             let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, &record_id)?;
         }
     }
-    #[cfg(target_os = "linux")]
-    if GuardedViewMount::has_revision_capture_retirements(control)? {
-        GuardedViewMount::reconcile_revision_capture_retirements(
-            control,
-            &git_prune_recipe_anchor_ids(control)?,
-        )?;
-    }
-    #[cfg(target_os = "linux")]
-    reconcile_guarded_recovered_retirements(control)?;
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn guarded_recovered_capture_ids(control: &ControlStore) -> Result<BTreeSet<Uuid>> {
-    let mut ids = BTreeSet::new();
-    for (record_id, bytes) in control.records(GUARDED_RECOVERY_CAPTURE_KIND)? {
-        let capture: GuardedRecoveredCaptureV1 = decode_canonical(&bytes)?;
-        ensure!(
-            capture.format_version == 1 && record_id.as_slice() == capture.revision_id.as_bytes(),
-            "recovered guarded capture record is invalid"
-        );
-        ids.extend(capture.files.iter().map(|file| file.anchor.anchor_id));
-    }
-    Ok(ids)
-}
-
-#[cfg(target_os = "linux")]
-fn reconcile_guarded_recovered_retirements(control: &ControlStore) -> Result<()> {
-    let retirements = control.records(GUARDED_RECOVERY_RETIRE_KIND)?;
-    if retirements.is_empty() {
-        return Ok(());
-    }
-    let mut pinned = git_prune_recipe_anchor_ids(control)?;
-    pinned.extend(guarded_recovered_capture_ids(control)?);
-    for (id, bytes) in retirements {
-        ensure!(
-            id.as_slice() == blake3::hash(&bytes).as_bytes()
-                && bytes.len() <= V1_MAX_CATALOG_BYTES * 2,
-            "recovered guarded anchor retirement record is invalid"
-        );
-        let capture: GuardedRecoveredCaptureV1 = decode_canonical(&bytes)?;
-        ensure!(
-            capture.format_version == 1
-                && capture.files.iter().all(|file| {
-                    file.anchor.format_version == 2
-                        && file.anchor.source_relative_path.as_os_str().as_bytes() == file.path
-                }),
-            "recovered guarded anchor retirement is inconsistent"
-        );
-        if capture
-            .files
-            .iter()
-            .any(|file| pinned.contains(&file.anchor.anchor_id))
-        {
-            continue;
-        }
-        if capture
-            .files
-            .iter()
-            .any(|file| file.anchor.remove().is_err())
-        {
-            continue;
-        }
-        control.delete_record_if_value(GUARDED_RECOVERY_RETIRE_KIND, &id, &bytes)?;
-    }
-    Ok(())
-}
-
-/// Return false while an unreachable guarded revision still has a signed
+/// Return false while an unreachable revision still has a signed
 /// record or a local sector recipe. GC retries its anchor candidate after
 /// those sources are released, then transfers cleanup to a durable journal.
 #[cfg(test)]
@@ -969,82 +799,7 @@ pub(crate) fn retire_revision_anchor_with_recipe_pins(
     revision_id: Uuid,
     recipe_anchors: &BTreeSet<Uuid>,
 ) -> Result<bool> {
-    #[cfg(target_os = "linux")]
-    if control
-        .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())?
-        .is_some()
-    {
-        return Ok(false);
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(capture) = GuardedViewMount::load_revision_capture(revision_id, control)? {
-        if control
-            .get_record("user-revision", revision_id.as_bytes())?
-            .is_some()
-        {
-            return Ok(false);
-        }
-        if recipe_anchors.contains(&capture.capture.metadata.anchor_id)
-            || capture
-                .capture
-                .files
-                .iter()
-                .any(|file| recipe_anchors.contains(&file.locator.anchor_id))
-        {
-            return Ok(false);
-        }
-        GuardedViewMount::retire_revision_capture_unreferenced(
-            revision_id,
-            control,
-            recipe_anchors,
-        )?;
-        control.delete_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?;
-        return Ok(true);
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(bytes) =
-        control.get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())?
-    {
-        let capture: GuardedRecoveredCaptureV1 = decode_canonical(&bytes)?;
-        ensure!(
-            capture.format_version == 1 && capture.revision_id == revision_id,
-            "recovered guarded revision capture is inconsistent"
-        );
-        if control
-            .get_record("user-revision", revision_id.as_bytes())?
-            .is_some()
-            || capture
-                .files
-                .iter()
-                .any(|file| recipe_anchors.contains(&file.anchor.anchor_id))
-        {
-            return Ok(false);
-        }
-        let retirement_id = blake3::hash(&bytes);
-        ensure!(
-            control
-                .get_record(GUARDED_RECOVERY_RETIRE_KIND, retirement_id.as_bytes())?
-                .is_none_or(|existing| existing == bytes),
-            "recovered guarded retirement conflicts with its capture"
-        );
-        control.move_protocol_record(
-            GUARDED_RECOVERY_CAPTURE_KIND,
-            revision_id.as_bytes(),
-            &bytes,
-            GUARDED_RECOVERY_RETIRE_KIND,
-            retirement_id.as_bytes(),
-        )?;
-        reconcile_guarded_recovered_retirements(control)?;
-        return Ok(true);
-    }
     let Some(bytes) = control.get_record("anchor-manifest", revision_id.as_bytes())? else {
-        #[cfg(target_os = "linux")]
-        if control
-            .get_record("user-revision", revision_id.as_bytes())?
-            .is_none()
-        {
-            control.delete_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?;
-        }
         return Ok(true);
     };
     let manifest: mb_store::StableAnchorManifest = decode_canonical(&bytes)?;
@@ -1073,17 +828,6 @@ pub(crate) fn abandon_recovered_anchor_capture(
     guild_id: [u8; 32],
     revision_id: Uuid,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if let Some(bytes) = control.get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())? {
-        let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
-        ensure!(
-            intent.format_version == 1
-                && intent.guild_id == guild_id
-                && intent.revision_id == revision_id,
-            "pending guarded recovery conflicts with the recovery job"
-        );
-        discard_guarded_recovery_intent(control, &intent, &bytes)?;
-    }
     let Some(bytes) = control.get_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())?
     else {
         return Ok(());
@@ -1099,23 +843,6 @@ pub(crate) fn abandon_recovered_anchor_capture(
     if !control.delete_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())? {
         bail!("pending recovered-anchor capture disappeared");
     }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn discard_guarded_recovery_intent(
-    control: &ControlStore,
-    intent: &GuardedRecoveryIntentV1,
-    bytes: &[u8],
-) -> Result<()> {
-    for file in &intent.files {
-        file.plan.discard_with_control(control)?;
-    }
-    control.delete_record_if_value(
-        GUARDED_RECOVERY_INTENT_KIND,
-        intent.revision_id.as_bytes(),
-        bytes,
-    )?;
     Ok(())
 }
 
@@ -1552,384 +1279,6 @@ pub(crate) fn prepare_revision(
     }
 }
 
-/// Sign one stopped guarded-view attempt. The store's published attempt owns
-/// all anchors until the final SQL transaction replaces it with a durable
-/// revision capture record and sector recipes.
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_guarded_revision(
-    control: &mut ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    protected_root_id: Uuid,
-    root_anchor_id: Uuid,
-    sequence: u64,
-    revision_id: Uuid,
-    writer: WriterCredentials<'_>,
-) -> Result<SignedRecord<UserRevision>> {
-    require_guarded_git_graph_absent(control, protected_root_id, revision_id)?;
-    prepare_guarded_revision_with_graph(
-        control,
-        keys,
-        guild_id,
-        protected_root_id,
-        root_anchor_id,
-        sequence,
-        revision_id,
-        writer,
-        false,
-        None,
-    )
-}
-
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_guarded_git_revision(
-    control: &mut ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    protected_root_id: Uuid,
-    root_anchor_id: Uuid,
-    sequence: u64,
-    revision_id: Uuid,
-    writer: WriterCredentials<'_>,
-) -> Result<SignedRecord<UserRevision>> {
-    let graph = control
-        .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())?
-        .map(|bytes| decode_git_graph_intent(&bytes).map(|(intent, _)| intent))
-        .transpose()?;
-    if graph.is_none()
-        && control
-            .get_record("user-revision", revision_id.as_bytes())?
-            .is_none()
-    {
-        bail!("guarded Git revision has no durable graph intent");
-    }
-    prepare_guarded_revision_with_graph(
-        control,
-        keys,
-        guild_id,
-        protected_root_id,
-        root_anchor_id,
-        sequence,
-        revision_id,
-        writer,
-        true,
-        graph,
-    )
-}
-
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn prepare_guarded_revision_with_graph(
-    control: &mut ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    protected_root_id: Uuid,
-    root_anchor_id: Uuid,
-    sequence: u64,
-    revision_id: Uuid,
-    writer: WriterCredentials<'_>,
-    expect_git: bool,
-    git_graph: Option<GitGraphIntent>,
-) -> Result<SignedRecord<UserRevision>> {
-    if let Some(graph) = &git_graph {
-        validate_git_graph_intent(graph)?;
-        if !expect_git
-            || graph.guild_id != guild_id
-            || graph.revision_id != revision_id
-            || graph.protected_root_id != protected_root_id
-            || graph.graph.repository_id != protected_root_id
-        {
-            bail!("guarded Git graph intent conflicts with the revision");
-        }
-    }
-    let writer_key = SigningKey::from_bytes(writer.secret);
-    if let Some(bytes) = control.get_record("user-revision", revision_id.as_bytes())? {
-        let existing: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
-        existing.verify(USER_REVISION_DOMAIN)?;
-        existing.value.verify_writer()?;
-        if existing.signer != keys.node_id()
-            || existing.value.revision_id != revision_id
-            || existing.value.owner != keys.node_id()
-            || existing.value.guild_id != guild_id
-            || existing.value.protected_root_id != protected_root_id
-            || existing.value.sequence != sequence
-            || existing.value.writer_epoch != writer.epoch
-            || existing.value.writer_public_key != writer_key.verifying_key().to_bytes()
-        {
-            bail!("guarded revision retry differs from its committed revision");
-        }
-        let retained = GuardedViewMount::load_revision_capture(revision_id, control)?
-            .context("committed guarded revision lost its local anchor map")?;
-        if retained.capture.metadata.anchor_id != root_anchor_id {
-            bail!("guarded revision retry belongs to another root anchor");
-        }
-        let signed_git = control
-            .get_record(GUARDED_GIT_SIGNED_KIND, revision_id.as_bytes())?
-            .map(|bytes| decode_canonical::<[u8; 32]>(&bytes))
-            .transpose()?;
-        let revision_hash = existing.value.hash()?;
-        if signed_git.is_some() != expect_git
-            || signed_git.is_some_and(|hash| hash != revision_hash)
-        {
-            bail!("guarded revision retry differs from its signed Git graph mode");
-        }
-        return Ok(existing);
-    }
-    if control
-        .get_record("capture-intent", revision_id.as_bytes())?
-        .is_some()
-        || control
-            .get_record(GUARDED_REVISION_CAPTURE_KIND, revision_id.as_bytes())?
-            .is_some()
-    {
-        bail!("guarded revision attempt conflicts with another source capture");
-    }
-    let head_id = revision_head_id(guild_id, protected_root_id);
-    let parent = match control.get_record("user-revision-head", &head_id)? {
-        Some(bytes) => {
-            let previous: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
-            previous.verify(USER_REVISION_DOMAIN)?;
-            previous.value.verify_writer()?;
-            if previous.signer != keys.node_id()
-                || previous.value.owner != keys.node_id()
-                || previous.value.guild_id != guild_id
-                || previous.value.protected_root_id != protected_root_id
-                || !matches!(previous.value.format_version, 3..=5)
-                || previous.value.cipher_profile != V1_CIPHER_PROFILE
-                || previous.value.sequence.checked_add(1) != Some(sequence)
-            {
-                bail!("guarded revision does not extend the durable local head");
-            }
-            Some(previous.value.hash()?)
-        }
-        None if sequence == 1 => None,
-        None => bail!("the first guarded revision must have sequence one"),
-    };
-    let (attempt_bytes, capture) =
-        GuardedViewMount::published_stopped_capture_attempt(root_anchor_id, revision_id, control)?;
-    let content_id_key = keys.guild_content_id_key(&guild_id);
-    let encryption_key = keys.guild_data_key(&guild_id);
-    let mut recipes = Vec::new();
-    let mut commitments = BTreeMap::<SectorId, MerkleCommitment>::new();
-    let mut ordinal = 0_u64;
-    let metadata =
-        crate::guarded_metadata::GuardedPrivateMetadataV6::from_capture(&capture, |file| {
-            prepare_sparse_file(
-                &mut recipes,
-                keys,
-                guild_id,
-                protected_root_id,
-                &content_id_key,
-                &mut ordinal,
-                &mut commitments,
-                &file.locator,
-                file.logical_len,
-                &file.data_extents,
-            )
-        })?;
-    let mut data_references = Vec::new();
-    let mut visible_references = BTreeMap::<SectorId, SectorRef>::new();
-    for entry in &metadata.entries {
-        if let GuardedPrivateEntryV6::File { data_extents, .. } = entry {
-            for reference in data_extents.iter().flat_map(|extent| extent.sectors.iter()) {
-                match visible_references.get(&reference.id) {
-                    Some(previous) if previous != reference => {
-                        bail!("guarded file sector ID has conflicting references")
-                    }
-                    Some(_) => {}
-                    None => {
-                        push_data_reference(&mut data_references, reference.clone())?;
-                        visible_references.insert(reference.id, reference.clone());
-                    }
-                }
-            }
-        }
-    }
-    let metadata_bytes = if let Some(graph) = git_graph.clone() {
-        let git = prepare_git_backup_descriptor(
-            &mut recipes,
-            &mut data_references,
-            keys,
-            guild_id,
-            protected_root_id,
-            &content_id_key,
-            &mut ordinal,
-            &mut commitments,
-            graph,
-        )?;
-        let private = GuardedGitPrivateMetadataV7 {
-            format_version: 7,
-            guarded: metadata,
-            git,
-        };
-        private.validate(protected_root_id)?;
-        canonical_bytes(&private)?
-    } else {
-        canonical_bytes(&metadata)?
-    };
-    // A Git blob may contain the same sector as a visible guarded file. Keep
-    // the visible file's already-pinned root recipe in that case.
-    let mut recipe_ids = BTreeSet::new();
-    recipes.retain(|(kind, id, _)| kind != "local-sector" || recipe_ids.insert(id.clone()));
-    let mut metadata_references = Vec::new();
-    for plaintext in metadata_bytes.chunks(V1_SECTOR_SIZE) {
-        let id = make_content_sector_id(
-            &content_id_key,
-            keys.node_id(),
-            guild_id,
-            protected_root_id,
-            SectorPurpose::Metadata,
-            plaintext,
-        )?;
-        let (reference, ciphertext) = encrypted_sector(&encryption_key, id, plaintext)?;
-        commitments.insert(id, merkle_commit(&ciphertext)?);
-        metadata_references.push(reference.clone());
-        queue_recipe(
-            &mut recipes,
-            LocalSectorRecipe {
-                guild_id,
-                reference,
-                source: LocalPlaintextSource::Inline(plaintext.to_vec()),
-            },
-        )?;
-    }
-    let signed_commitments = metadata_references
-        .iter()
-        .chain(&data_references)
-        .map(|reference| {
-            commitments
-                .get(&reference.id)
-                .cloned()
-                .context("guarded sector lacks a Merkle commitment")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut revision = UserRevision {
-        format_version: 5,
-        guild_id,
-        protected_root_id,
-        cipher_profile: V1_CIPHER_PROFILE,
-        revision_id,
-        owner: keys.node_id(),
-        writer_epoch: writer.epoch,
-        writer_public_key: writer_key.verifying_key().to_bytes(),
-        writer_signature: Vec::new(),
-        sequence,
-        parent,
-        metadata_sectors: metadata_references,
-        data_sectors: data_references,
-        sector_commitments: Some(signed_commitments),
-    };
-    revision.sign_writer(&writer_key)?;
-    let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, keys)?;
-    if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
-        bail!("guarded revision catalog exceeds the bounded-object limit");
-    }
-    let retained = GuardedRevisionCaptureV1 {
-        format_version: 1,
-        revision_id,
-        capture: capture.clone(),
-    };
-    retained.verify()?;
-    let mut areas = BTreeMap::<Uuid, PathBuf>::new();
-    for file in &capture.files {
-        let area = &file.locator.area;
-        if areas
-            .insert(area.area_id, area.path_hint.clone())
-            .is_some_and(|path| path != area.path_hint)
-        {
-            bail!("guarded capture uses conflicting anchor-area hints");
-        }
-    }
-    if let Some(graph) = &git_graph {
-        for blob in &graph.graph.blobs {
-            let area = &blob.anchor.area;
-            if areas
-                .insert(area.area_id, area.path_hint.clone())
-                .is_some_and(|path| path != area.path_hint)
-            {
-                bail!("guarded Git graph uses conflicting anchor-area hints");
-            }
-        }
-    }
-    for (area_id, hint) in areas {
-        recipes.push((
-            ANCHOR_AREA_LOCATION_KIND.to_owned(),
-            area_id.as_bytes().to_vec(),
-            canonical_bytes(&RawLocalPath(hint))?,
-        ));
-    }
-    recipes.extend([
-        (
-            GUARDED_REVISION_CAPTURE_KIND.to_owned(),
-            revision_id.as_bytes().to_vec(),
-            canonical_bytes(&retained)?,
-        ),
-        (
-            "user-revision".to_owned(),
-            revision_id.as_bytes().to_vec(),
-            canonical_bytes(&revision)?,
-        ),
-        (
-            "user-revision-head".to_owned(),
-            head_id,
-            canonical_bytes(&revision)?,
-        ),
-    ]);
-    if git_graph.is_some() {
-        recipes.push((
-            GUARDED_GIT_SIGNED_KIND.to_owned(),
-            revision_id.as_bytes().to_vec(),
-            canonical_bytes(&revision.value.hash()?)?,
-        ));
-    }
-    if let Some(change_sequence) = writer.captured_change_sequence {
-        recipes.push((
-            "revision-root-change".to_owned(),
-            revision_id.as_bytes().to_vec(),
-            canonical_bytes(&change_sequence)?,
-        ));
-    }
-    control.finalize_guarded_capture_records(revision_id.as_bytes(), &attempt_bytes, &recipes)?;
-    if git_graph.is_some() {
-        // Startup also retires this intent if a crash follows publication.
-        let _ = control.delete_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes());
-    }
-    Ok(revision)
-}
-
-/// Format-6 guarded private metadata has no Git graph descriptor. Refuse to
-/// sign a revision that would silently drop registered local history.
-#[cfg(target_os = "linux")]
-pub(crate) fn require_guarded_git_graph_absent(
-    control: &ControlStore,
-    protected_root_id: Uuid,
-    revision_id: Uuid,
-) -> Result<()> {
-    if control
-        .get_record("git-repository", protected_root_id.as_bytes())?
-        .is_some()
-        || control
-            .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())?
-            .is_some()
-    {
-        bail!("guarded Git graph backup is not yet supported");
-    }
-    Ok(())
-}
-
-/// The private catalog is hidden from the guarded view and can survive a
-/// missing node registration. The production node checks this through graph
-/// intent preparation before stopping the view.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn require_guarded_git_catalog_absent(lower_root: &Path) -> Result<()> {
-    if git_catalog_marker(lower_root)?.is_some() {
-        bail!("guarded Git graph backup is not yet supported");
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn prepare_sparse_file(
     recipe_records: &mut Vec<RecordWrite>,
@@ -2245,30 +1594,6 @@ pub(crate) fn install_inline_recipe(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn install_test_git_anchor_recipe(
-    control: &ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    sector_id: SectorId,
-    anchor: &mb_store::FileAnchorManifest,
-) -> Result<SectorRef> {
-    ensure!(anchor.logical_len > 0 && anchor.logical_len <= V1_SECTOR_SIZE as u64);
-    let mut plaintext = Vec::new();
-    anchor.open_verified()?.read_to_end(&mut plaintext)?;
-    let (reference, _) = encrypted_sector(&keys.guild_data_key(&guild_id), sector_id, &plaintext)?;
-    let recipe = LocalSectorRecipe {
-        guild_id,
-        reference: reference.clone(),
-        source: LocalPlaintextSource::StableAnchorFile {
-            locator: anchor.file_locator(),
-            offset: 0,
-        },
-    };
-    control.put_record("local-sector", &reference.id, &canonical_bytes(&recipe)?)?;
-    Ok(reference)
-}
-
 pub(crate) fn install_recovered_sector_recipe(
     control: &mut ControlStore,
     keys: &KeyMaterial,
@@ -2313,19 +1638,8 @@ pub(crate) fn reanchor_recovered_revision(
         bail!("recovered revision does not belong to the local seed and guild");
     }
     #[cfg(target_os = "linux")]
-    if !revision.value.metadata_sectors.is_empty() {
-        let metadata_bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
-        if private_metadata_format(&metadata_bytes)? == 6 {
-            reconcile_anchor_retirements(control)?;
-            return reanchor_recovered_guarded_revision(
-                control,
-                keys,
-                guild_id,
-                revision,
-                restored_root,
-                &metadata_bytes,
-            );
-        }
+    if guarded_private_metadata_for_revision(control, keys, guild_id, revision)?.is_some() {
+        bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
     }
     if revision.value.data_sectors.is_empty() {
         return Ok(());
@@ -2473,9 +1787,7 @@ pub(crate) fn reanchor_recovered_revision(
     Ok(())
 }
 
-/// A guarded restore is verified before publication, but its durable sector
-/// recipes are installed only after the private lower tree has been captured.
-/// That capture works on filesystems without reflinks.
+/// Anchor the verified native restore before publishing its protected root.
 pub(crate) fn prepare_recovered_revision_publication(
     control: &mut ControlStore,
     keys: &KeyMaterial,
@@ -2483,18 +1795,6 @@ pub(crate) fn prepare_recovered_revision_publication(
     revision: &SignedRecord<UserRevision>,
     restored: &PinnedDirectory,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if guarded_private_metadata_for_revision(control, keys, guild_id, revision)?.is_some() {
-        revision.verify(USER_REVISION_DOMAIN)?;
-        revision.value.verify_writer()?;
-        ensure!(
-            revision.signer == keys.node_id()
-                && revision.value.owner == keys.node_id()
-                && revision.value.guild_id == guild_id,
-            "recovered guarded revision does not belong to the local seed and guild"
-        );
-        return verify_guarded_recovered_namespace(control, keys, guild_id, revision, restored);
-    }
     reanchor_recovered_revision(
         control,
         keys,
@@ -2539,381 +1839,6 @@ fn recovered_anchor_records(
     Ok(records)
 }
 
-#[cfg(target_os = "linux")]
-impl GuardedRecoveredCaptureV1 {
-    fn validate(
-        &self,
-        revision_id: Uuid,
-        metadata_bytes: &[u8],
-        metadata: &GuardedPrivateMetadataV6,
-    ) -> Result<()> {
-        ensure!(
-            self.format_version == 1
-                && self.revision_id == revision_id
-                && self.metadata_hash == *blake3::hash(metadata_bytes).as_bytes(),
-            "recovered guarded anchor map differs from signed metadata"
-        );
-        let primary_paths = metadata.entries.iter().filter_map(|entry| match entry {
-            GuardedPrivateEntryV6::File { path, .. } => Some(path.as_slice()),
-            _ => None,
-        });
-        ensure!(
-            self.files
-                .iter()
-                .map(|file| file.path.as_slice())
-                .eq(primary_paths),
-            "recovered guarded anchor paths differ from signed metadata"
-        );
-        let mut anchor_ids = BTreeSet::new();
-        for file in &self.files {
-            ensure!(
-                file.anchor.format_version == 2
-                    && file.anchor.source_relative_path.as_os_str().as_bytes() == file.path
-                    && anchor_ids.insert(file.anchor.anchor_id),
-                "recovered guarded file anchor is inconsistent"
-            );
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn verify_zero_gap(file: &mut File, start: u64, end: u64) -> Result<()> {
-    ensure!(start <= end, "recovered guarded sparse extents overlap");
-    file.seek(SeekFrom::Start(start))?;
-    let mut remaining = end - start;
-    let mut buffer = [0_u8; 64 * 1024];
-    while remaining > 0 {
-        let size = usize::try_from(remaining.min(buffer.len() as u64))?;
-        file.read_exact(&mut buffer[..size])?;
-        ensure!(
-            buffer[..size].iter().all(|byte| *byte == 0),
-            "recovered guarded sparse hole contains unexpected bytes"
-        );
-        remaining -= size as u64;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn verify_guarded_file_content(
-    file: &mut File,
-    logical_len: u64,
-    data_extents: &[PrivateDataExtent],
-    encryption_key: &[u8; 32],
-    mut verified_sector: impl FnMut(&SectorRef, u64) -> Result<()>,
-) -> Result<()> {
-    let mut position = 0_u64;
-    for extent in data_extents {
-        verify_zero_gap(file, position, extent.offset)?;
-        let mut offset = extent.offset;
-        for reference in &extent.sectors {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut plaintext = vec![0_u8; reference.logical_len as usize];
-            file.read_exact(&mut plaintext)?;
-            let (actual, _) = encrypted_sector(encryption_key, reference.id, &plaintext)?;
-            ensure!(
-                actual == *reference,
-                "recovered guarded file content differs from a signed sector"
-            );
-            verified_sector(reference, offset)?;
-            offset = offset
-                .checked_add(reference.logical_len as u64)
-                .context("recovered guarded sector offset overflow")?;
-        }
-        position = offset;
-    }
-    verify_zero_gap(file, position, logical_len)
-}
-
-#[cfg(target_os = "linux")]
-fn recovered_guarded_anchor_records(
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    revision: &SignedRecord<UserRevision>,
-    metadata: &GuardedPrivateMetadataV6,
-    metadata_bytes: &[u8],
-    capture: &GuardedRecoveredCaptureV1,
-) -> Result<Vec<RecordWrite>> {
-    capture.validate(revision.value.revision_id, metadata_bytes, metadata)?;
-    let encryption_key = keys.guild_data_key(&guild_id);
-    let mut recipes = BTreeMap::<SectorId, LocalSectorRecipe>::new();
-    let mut files = capture.files.iter();
-    let mut records = Vec::new();
-    for entry in &metadata.entries {
-        let GuardedPrivateEntryV6::File {
-            path,
-            logical_len,
-            data_extents,
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        let anchored = files
-            .next()
-            .context("recovered guarded file anchor is missing")?;
-        ensure!(
-            anchored.path == *path && anchored.anchor.logical_len == *logical_len,
-            "recovered guarded file length or path differs from signed metadata"
-        );
-        let locator = anchored.anchor.file_locator();
-        let mut file = anchored.anchor.open_verified()?;
-        verify_guarded_file_content(
-            &mut file,
-            *logical_len,
-            data_extents,
-            &encryption_key,
-            |reference, offset| {
-                let recipe = LocalSectorRecipe {
-                    guild_id,
-                    reference: reference.clone(),
-                    source: LocalPlaintextSource::StableAnchorFile {
-                        locator: locator.clone(),
-                        offset,
-                    },
-                };
-                if recipes
-                    .insert(reference.id, recipe.clone())
-                    .is_some_and(|previous| previous.reference != recipe.reference)
-                {
-                    bail!("recovered guarded sector has conflicting signed references");
-                }
-                Ok(())
-            },
-        )?;
-        records.push((
-            ANCHOR_AREA_LOCATION_KIND.to_owned(),
-            locator.area.area_id.as_bytes().to_vec(),
-            canonical_bytes(&RawLocalPath(locator.area.path_hint.clone()))?,
-        ));
-    }
-    ensure!(
-        files.next().is_none(),
-        "recovered guarded anchor has an extra file"
-    );
-    ensure!(
-        recipes.len() == revision.value.data_sectors.len()
-            && revision.value.data_sectors.iter().all(|reference| {
-                recipes.get(&reference.id).map(|recipe| &recipe.reference) == Some(reference)
-            }),
-        "recovered guarded anchor data catalog differs from signed revision"
-    );
-    for recipe in recipes.into_values() {
-        records.push((
-            "local-sector".to_owned(),
-            recipe.reference.id.to_vec(),
-            canonical_bytes(&recipe)?,
-        ));
-    }
-    Ok(records)
-}
-
-#[cfg(target_os = "linux")]
-fn guarded_recovery_primary_paths(metadata: &GuardedPrivateMetadataV6) -> Vec<&[u8]> {
-    metadata
-        .entries
-        .iter()
-        .filter_map(|entry| match entry {
-            GuardedPrivateEntryV6::File { path, .. } => Some(path.as_slice()),
-            _ => None,
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-impl GuardedRecoveryIntentV1 {
-    fn validate(
-        &self,
-        revision: &SignedRecord<UserRevision>,
-        guild_id: [u8; 32],
-        metadata_bytes: &[u8],
-        metadata: &GuardedPrivateMetadataV6,
-        source_root: &Path,
-        previous: Option<&GuardedRecoveredCaptureV1>,
-    ) -> Result<()> {
-        ensure!(
-            self.format_version == 1
-                && self.guild_id == guild_id
-                && self.revision_id == revision.value.revision_id
-                && self.source_root == source_root
-                && self.metadata_hash == *blake3::hash(metadata_bytes).as_bytes()
-                && self.replaced.as_ref() == previous
-                && canonical_bytes(self)?.len() <= V1_MAX_CATALOG_BYTES * 2,
-            "pending guarded recovery differs from its signed revision"
-        );
-        let paths = guarded_recovery_primary_paths(metadata);
-        ensure!(
-            self.files.iter().map(|file| file.path.as_slice()).eq(paths)
-                && self.files.iter().all(|file| {
-                    file.plan.backend_kind() == SourceBackendKind::ReflinkV1
-                        && file.plan.source_root() == source_root
-                        && file.plan.relative_path().as_os_str().as_bytes() == file.path
-                }),
-            "pending guarded recovery file plans differ from signed paths"
-        );
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn reanchor_recovered_guarded_revision(
-    control: &mut ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    revision: &SignedRecord<UserRevision>,
-    restored_root: &Path,
-    metadata_bytes: &[u8],
-) -> Result<()> {
-    let metadata = GuardedPrivateMetadataV6::decode(metadata_bytes)?;
-    let existing = control
-        .get_record(
-            GUARDED_RECOVERY_CAPTURE_KIND,
-            revision.value.revision_id.as_bytes(),
-        )?
-        .map(|bytes| decode_canonical::<GuardedRecoveredCaptureV1>(&bytes))
-        .transpose()?;
-    let pending_intent = control.get_record(
-        GUARDED_RECOVERY_INTENT_KIND,
-        revision.value.revision_id.as_bytes(),
-    )?;
-    if let Some(capture) = existing.as_ref()
-        && pending_intent.is_none()
-    {
-        capture.validate(revision.value.revision_id, metadata_bytes, &metadata)?;
-        if let Ok(records) = recovered_guarded_anchor_records(
-            keys,
-            guild_id,
-            revision,
-            &metadata,
-            metadata_bytes,
-            capture,
-        ) {
-            control.put_records(&records)?;
-            return Ok(());
-        }
-    }
-    if control
-        .get_record(
-            GUARDED_REVISION_CAPTURE_KIND,
-            revision.value.revision_id.as_bytes(),
-        )?
-        .is_some()
-    {
-        bail!("recovered guarded revision still has an original claimed-view capture");
-    }
-    let source_root = restored_root
-        .canonicalize()
-        .context("resolve guarded recovered source before reflink capture")?;
-    // Reconstruct local inode identities from the signed namespace before
-    // retaining any file anchors. This rejects extra names and aliases that
-    // the portable metadata never authorized, including on recovery retries.
-    let restored = PinnedDirectory::open(&source_root)?;
-    let _bound_view = metadata.bind_restored_entries(&restored)?;
-    let (intent, intent_bytes) = match pending_intent {
-        Some(bytes) => {
-            let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
-            intent.validate(
-                revision,
-                guild_id,
-                metadata_bytes,
-                &metadata,
-                &source_root,
-                existing.as_ref(),
-            )?;
-            (intent, bytes)
-        }
-        None => {
-            let mut files = Vec::new();
-            for path in guarded_recovery_primary_paths(&metadata) {
-                let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
-                files.push(GuardedRecoveredFilePlanV1 {
-                    path: path.to_vec(),
-                    plan: SourceFileCapturePlan::plan_reflink_raw(&source_root, relative)
-                        .context("plan guarded recovered file reflink")?,
-                });
-            }
-            let intent = GuardedRecoveryIntentV1 {
-                format_version: 1,
-                guild_id,
-                revision_id: revision.value.revision_id,
-                source_root: source_root.clone(),
-                metadata_hash: *blake3::hash(metadata_bytes).as_bytes(),
-                files,
-                replaced: existing.clone(),
-            };
-            intent.validate(
-                revision,
-                guild_id,
-                metadata_bytes,
-                &metadata,
-                &source_root,
-                existing.as_ref(),
-            )?;
-            let bytes = canonical_bytes(&intent)?;
-            control.put_record(
-                GUARDED_RECOVERY_INTENT_KIND,
-                revision.value.revision_id.as_bytes(),
-                &bytes,
-            )?;
-            (intent, bytes)
-        }
-    };
-    let mut files = Vec::with_capacity(intent.files.len());
-    for planned in &intent.files {
-        let anchor = planned.plan.capture_with_control(control)?;
-        files.push(GuardedRecoveredFileV1 {
-            path: planned.path.clone(),
-            anchor: RawFileAnchorManifestV2::from_file_anchor(anchor)?,
-        });
-    }
-    #[cfg(test)]
-    if INTERRUPT_GUARDED_RECOVERY_AFTER_CAPTURE.with(|interrupt| interrupt.replace(false)) {
-        bail!("injected interruption after guarded recovered file capture");
-    }
-    let capture = GuardedRecoveredCaptureV1 {
-        format_version: 1,
-        revision_id: revision.value.revision_id,
-        metadata_hash: intent.metadata_hash,
-        files,
-    };
-    let mut records = match recovered_guarded_anchor_records(
-        keys,
-        guild_id,
-        revision,
-        &metadata,
-        metadata_bytes,
-        &capture,
-    ) {
-        Ok(records) => records,
-        Err(error) => {
-            discard_guarded_recovery_intent(control, &intent, &intent_bytes)
-                .with_context(|| format!("discard unverified guarded capture: {error:#}"))?;
-            return Err(error);
-        }
-    };
-    records.push((
-        GUARDED_RECOVERY_CAPTURE_KIND.to_owned(),
-        revision.value.revision_id.as_bytes().to_vec(),
-        canonical_bytes(&capture)?,
-    ));
-    if let Some(old) = &intent.replaced {
-        let bytes = canonical_bytes(old)?;
-        records.push((
-            GUARDED_RECOVERY_RETIRE_KIND.to_owned(),
-            blake3::hash(&bytes).as_bytes().to_vec(),
-            bytes,
-        ));
-    }
-    control.finalize_guarded_recovery_records(
-        revision.value.revision_id.as_bytes(),
-        &intent_bytes,
-        &records,
-    )?;
-    reconcile_anchor_retirements(control)?;
-    Ok(())
-}
-
 fn load_private_metadata_with_git(
     control: &ControlStore,
     keys: &KeyMaterial,
@@ -2944,192 +1869,43 @@ pub(crate) fn load_private_metadata_bytes(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) struct GuardedRecoveryMetadata {
-    pub(crate) guarded: GuardedPrivateMetadataV6,
-    pub(crate) git: Option<GitBackupDescriptor>,
-    pub(crate) metadata_hash: [u8; 32],
-}
-
-#[cfg(target_os = "linux")]
 pub(crate) fn guarded_private_metadata_for_revision(
     control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
-) -> Result<Option<GuardedRecoveryMetadata>> {
+) -> Result<Option<()>> {
     if revision.value.metadata_sectors.is_empty() {
         return Ok(None);
     }
     let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
-    let metadata_hash = *blake3::hash(&bytes).as_bytes();
     match private_metadata_format(&bytes)? {
         7 => {
-            let metadata =
-                GuardedGitPrivateMetadataV7::decode(&bytes, revision.value.protected_root_id)?;
-            Ok(Some(GuardedRecoveryMetadata {
-                guarded: metadata.guarded,
-                git: Some(metadata.git),
-                metadata_hash,
-            }))
+            GuardedGitPrivateMetadataV7::decode(&bytes, revision.value.protected_root_id)?;
+            Ok(Some(()))
         }
-        6 => Ok(Some(GuardedRecoveryMetadata {
-            guarded: GuardedPrivateMetadataV6::decode(&bytes)?,
-            git: None,
-            metadata_hash,
-        })),
+        6 => {
+            GuardedPrivateMetadataV6::decode(&bytes)?;
+            Ok(Some(()))
+        }
         _ => Ok(None),
     }
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn verify_guarded_recovered_namespace(
-    control: &ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    revision: &SignedRecord<UserRevision>,
-    root: &PinnedDirectory,
-) -> Result<()> {
-    if revision.value.metadata_sectors.is_empty() {
-        return Ok(());
-    }
-    let bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
-    if private_metadata_format(&bytes)? == 7 {
-        let metadata =
-            GuardedGitPrivateMetadataV7::decode(&bytes, revision.value.protected_root_id)?;
-        let root_path = root.descriptor_path();
-        let repository = GitRepository::open_with_backend(
-            &root_path,
-            metadata.git.repository_id,
-            &mb_git::catalog_key(keys, metadata.git.repository_id),
-            SourceBackendKind::GuardedLinkFreezeV1,
-        )?;
-        let catalog_id = repository.catalog_directory_identity()?;
-        repository.verify_guarded_catalog_files()?;
-        let (root_id, bound) = metadata.guarded.bind_restored_entries_with_git_catalog(
-            root,
-            metadata.git.repository_id,
-            catalog_id,
-        )?;
-        let encryption_key = keys.guild_data_key(&guild_id);
-        let mut sectors = BTreeMap::new();
-        verify_guarded_restored_files(
-            root,
-            &metadata.guarded,
-            root_id,
-            &bound,
-            &encryption_key,
-            |reference| record_verified_sector(&mut sectors, reference),
-        )?;
-        for recipe in
-            verify_recovered_git_graph(&repository, &metadata.git, &encryption_key, guild_id)?
-        {
-            record_verified_sector(&mut sectors, &recipe.reference)?;
-        }
-        let signed = revision
-            .value
-            .data_sectors
-            .iter()
-            .map(|reference| (reference.id, reference))
-            .collect::<BTreeMap<_, _>>();
+fn verify_zero_gap(file: &mut File, start: u64, end: u64) -> Result<()> {
+    ensure!(start <= end, "recovered sparse extents overlap");
+    file.seek(SeekFrom::Start(start))?;
+    let mut remaining = end - start;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let size = usize::try_from(remaining.min(buffer.len() as u64))?;
+        file.read_exact(&mut buffer[..size])?;
         ensure!(
-            signed.len() == revision.value.data_sectors.len()
-                && signed.len() == sectors.len()
-                && signed
-                    .iter()
-                    .all(|(id, reference)| sectors.get(id) == Some(*reference)),
-            "guarded Git data sectors differ from signed revision"
+            buffer[..size].iter().all(|byte| *byte == 0),
+            "recovered sparse hole contains unexpected bytes"
         );
-        metadata.guarded.bind_restored_entries_with_git_catalog(
-            root,
-            metadata.git.repository_id,
-            catalog_id,
-        )?;
-        ensure!(
-            repository.catalog_directory_identity()? == catalog_id,
-            "guarded Git catalog changed during verification"
-        );
-        repository.verify_guarded_catalog_files()?;
-        return Ok(());
-    }
-    if private_metadata_format(&bytes)? == 6 {
-        let metadata = GuardedPrivateMetadataV6::decode(&bytes)?;
-        let (root_id, bound) = metadata.bind_restored_entries(root)?;
-        let encryption_key = keys.guild_data_key(&guild_id);
-        verify_guarded_restored_files(root, &metadata, root_id, &bound, &encryption_key, |_| {
-            Ok(())
-        })?;
-        metadata.bind_restored_entries(root)?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn record_verified_sector(
-    sectors: &mut BTreeMap<SectorId, SectorRef>,
-    reference: &SectorRef,
-) -> Result<()> {
-    ensure!(
-        sectors
-            .insert(reference.id, reference.clone())
-            .is_none_or(|previous| previous == *reference),
-        "guarded Git sector ID has conflicting signed references"
-    );
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn verify_guarded_restored_files(
-    root: &PinnedDirectory,
-    metadata: &GuardedPrivateMetadataV6,
-    root_id: NativeFileId,
-    bound: &[mb_store::GuardedViewMetadataEntry],
-    encryption_key: &[u8; 32],
-    mut verified_sector: impl FnMut(&SectorRef) -> Result<()>,
-) -> Result<()> {
-    for (entry, bound_entry) in metadata.entries.iter().zip(bound) {
-        let GuardedPrivateEntryV6::File {
-            path,
-            logical_len,
-            data_extents,
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        let path = PathBuf::from(OsString::from_vec(path.clone()));
-        let parent = path
-            .parent()
-            .context("guarded restored file has no parent")?;
-        let directory = if parent.as_os_str().is_empty() {
-            None
-        } else {
-            Some(root.open_descendant_directory(parent)?)
-        };
-        let directory = directory.as_ref().unwrap_or(root);
-        let name = path
-            .file_name()
-            .context("guarded restored file has no name")?;
-        let mut file = directory
-            .open_child_file(name)?
-            .context("guarded restored file disappeared before publication")?;
-        let stat = file.metadata()?;
-        ensure!(
-            stat.len() == *logical_len
-                && bound_entry.native_id
-                    == (NativeFileId {
-                        filesystem_id: root_id.filesystem_id,
-                        inode: stat.ino(),
-                    })
-                && directory.entry_identity(name, false)? == Some(bound_entry.native_id),
-            "guarded restored file changed before publication"
-        );
-        verify_guarded_file_content(
-            &mut file,
-            *logical_len,
-            data_extents,
-            encryption_key,
-            |reference, _| verified_sector(reference),
-        )?;
+        remaining -= size as u64;
     }
     Ok(())
 }
@@ -3230,238 +2006,6 @@ pub(crate) fn verify_recovered_git_graph(
         verify_zero_gap(&mut file, position, blob.logical_len)?;
     }
     Ok(recipes.into_values().collect())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn verify_guarded_recovery_capture(
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    metadata: &GuardedPrivateMetadataV6,
-    manifest: &mb_store::StableAnchorManifest,
-) -> Result<()> {
-    let mut expected = BTreeMap::new();
-    for entry in &metadata.entries {
-        let path = PathBuf::from(OsString::from_vec(entry.path().to_vec()));
-        let shape = match entry {
-            GuardedPrivateEntryV6::Directory { .. } => None,
-            GuardedPrivateEntryV6::File { logical_len, .. }
-            | GuardedPrivateEntryV6::HardLink { logical_len, .. } => Some(*logical_len),
-        };
-        ensure!(
-            expected.insert(path, shape).is_none(),
-            "duplicate signed guarded path"
-        );
-    }
-    let mut captured = BTreeMap::new();
-    for entry in &manifest.entries {
-        let (path, shape) = match entry {
-            mb_store::CapturedEntry::Directory { path, .. } => (path, None),
-            mb_store::CapturedEntry::File {
-                path, logical_len, ..
-            }
-            | mb_store::CapturedEntry::FileV2 {
-                path, logical_len, ..
-            } => (path, Some(*logical_len)),
-        };
-        ensure!(
-            captured.insert(path.clone(), shape).is_none(),
-            "duplicate captured guarded path"
-        );
-    }
-    ensure!(
-        captured == expected,
-        "guarded recovery capture differs from signed namespace"
-    );
-    let encryption_key = keys.guild_data_key(&guild_id);
-    for entry in &metadata.entries {
-        let GuardedPrivateEntryV6::File {
-            path,
-            logical_len,
-            data_extents,
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        let path = PathBuf::from(OsString::from_vec(path.clone()));
-        let mut file = manifest.file_locator_path(&path)?.open()?;
-        ensure!(
-            file.metadata()?.len() == *logical_len,
-            "guarded recovery anchor length differs from signed file"
-        );
-        verify_guarded_file_content(
-            &mut file,
-            *logical_len,
-            data_extents,
-            &encryption_key,
-            |_, _| Ok(()),
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn install_guarded_recovery_root_recipes(
-    control: &mut ControlStore,
-    keys: &KeyMaterial,
-    guild_id: [u8; 32],
-    revision: &SignedRecord<UserRevision>,
-    metadata: &GuardedPrivateMetadataV6,
-    manifest: &mb_store::StableAnchorManifest,
-    git: Option<(&GitBackupDescriptor, &GitRepository)>,
-) -> Result<()> {
-    ensure!(
-        matches!(manifest.format_version, 2 | 3),
-        "unsupported guarded recovery root capture"
-    );
-    verify_guarded_recovery_capture(keys, guild_id, metadata, manifest)?;
-    let revision_key = revision.value.revision_id.as_bytes();
-    let manifest_bytes = canonical_bytes(manifest)?;
-    ensure!(
-        control
-            .get_record("anchor-manifest", revision_key)?
-            .is_none_or(|existing| existing == manifest_bytes),
-        "guarded recovery root capture conflicts with an existing revision anchor"
-    );
-    let encryption_key = keys.guild_data_key(&guild_id);
-    let mut recipes = BTreeMap::<SectorId, LocalSectorRecipe>::new();
-    let mut area_locations =
-        BTreeMap::from([(manifest.area.area_id, manifest.area.path_hint.clone())]);
-    for entry in &metadata.entries {
-        let GuardedPrivateEntryV6::File {
-            path,
-            logical_len,
-            data_extents,
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        let path = PathBuf::from(OsString::from_vec(path.clone()));
-        let locator = manifest.file_locator_path(&path)?;
-        let mut file = locator.open()?;
-        verify_guarded_file_content(
-            &mut file,
-            *logical_len,
-            data_extents,
-            &encryption_key,
-            |reference, offset| {
-                let recipe = LocalSectorRecipe {
-                    guild_id,
-                    reference: reference.clone(),
-                    source: LocalPlaintextSource::StableAnchorFile {
-                        locator: locator.clone(),
-                        offset,
-                    },
-                };
-                ensure!(
-                    recipes
-                        .insert(reference.id, recipe.clone())
-                        .is_none_or(|previous| previous.reference == recipe.reference),
-                    "guarded recovery sector has conflicting signed references"
-                );
-                Ok(())
-            },
-        )?;
-    }
-    if let Some((descriptor, repository)) = git {
-        ensure!(
-            descriptor.repository_id == revision.value.protected_root_id
-                && repository.id() == descriptor.repository_id,
-            "recovered guarded Git graph belongs to another protected root"
-        );
-        for recipe in verify_recovered_git_graph(repository, descriptor, &encryption_key, guild_id)?
-        {
-            let LocalPlaintextSource::StableAnchorFile { locator, .. } = &recipe.source else {
-                bail!("recovered Git blob lacks a native anchor recipe");
-            };
-            ensure!(
-                area_locations
-                    .insert(locator.area.area_id, locator.area.path_hint.clone())
-                    .is_none_or(|previous| previous == locator.area.path_hint),
-                "recovered Git anchors disagree about their area location"
-            );
-            // A visible guarded file already owns a verified root-anchor
-            // recipe for this sector. Keep that source when Git names the
-            // same signed bytes, so retiring the imported Git anchor later
-            // cannot strand the revision's sector recipe.
-            let retained = recipes
-                .entry(recipe.reference.id)
-                .or_insert_with(|| recipe.clone());
-            ensure!(
-                retained.reference == recipe.reference,
-                "guarded recovery Git sector conflicts with signed file sector"
-            );
-        }
-    }
-    ensure!(
-        recipes.len() == revision.value.data_sectors.len()
-            && revision.value.data_sectors.iter().all(|reference| {
-                recipes.get(&reference.id).map(|recipe| &recipe.reference) == Some(reference)
-            }),
-        "guarded recovery root capture differs from signed data catalog"
-    );
-    let mut records = Vec::with_capacity(recipes.len() + 2);
-    for recipe in recipes.into_values() {
-        records.push((
-            "local-sector".to_owned(),
-            recipe.reference.id.to_vec(),
-            canonical_bytes(&recipe)?,
-        ));
-    }
-    for (area_id, path) in area_locations {
-        records.push((
-            ANCHOR_AREA_LOCATION_KIND.to_owned(),
-            area_id.as_bytes().to_vec(),
-            canonical_bytes(&RawLocalPath(path))?,
-        ));
-    }
-    records.push((
-        "anchor-manifest".to_owned(),
-        revision_key.to_vec(),
-        manifest_bytes,
-    ));
-    control.put_records(&records)?;
-    let old_capture_bytes = control.get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_key)?;
-    let old_capture = old_capture_bytes
-        .as_deref()
-        .map(decode_canonical::<GuardedRecoveredCaptureV1>)
-        .transpose()?;
-    if let Some(capture) = &old_capture {
-        let metadata_bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
-        capture.validate(revision.value.revision_id, &metadata_bytes, metadata)?;
-    }
-    if let Some(bytes) = control.get_record(GUARDED_RECOVERY_INTENT_KIND, revision_key)? {
-        let intent: GuardedRecoveryIntentV1 = decode_canonical(&bytes)?;
-        let metadata_bytes = load_private_metadata_bytes(control, keys, guild_id, revision)?;
-        intent.validate(
-            revision,
-            guild_id,
-            &metadata_bytes,
-            metadata,
-            &intent.source_root,
-            old_capture.as_ref(),
-        )?;
-        discard_guarded_recovery_intent(control, &intent, &bytes)?;
-    }
-    if let Some(bytes) = old_capture_bytes {
-        let retirement_id = blake3::hash(&bytes);
-        ensure!(
-            control
-                .get_record(GUARDED_RECOVERY_RETIRE_KIND, retirement_id.as_bytes())?
-                .is_none_or(|existing| existing == bytes),
-            "guarded recovery reflink retirement conflicts with its capture"
-        );
-        control.move_protocol_record(
-            GUARDED_RECOVERY_CAPTURE_KIND,
-            revision_key,
-            &bytes,
-            GUARDED_RECOVERY_RETIRE_KIND,
-            retirement_id.as_bytes(),
-        )?;
-        reconcile_guarded_recovered_retirements(control)?;
-    }
-    Ok(())
 }
 
 pub(crate) fn revision_git_backup(
@@ -4654,36 +3198,7 @@ where
         )?);
     }
     if private_metadata_format(&metadata_bytes)? == 7 {
-        #[cfg(target_os = "linux")]
-        {
-            let metadata = GuardedGitPrivateMetadataV7::decode(
-                &metadata_bytes,
-                revision.value.protected_root_id,
-            )?;
-            restore_guarded_entries(
-                staging,
-                &metadata.guarded,
-                &encryption_key,
-                load_ciphertext,
-                false,
-            )?;
-            restore_git_backup_at(
-                keys,
-                staging,
-                &metadata.git,
-                SourceBackendKind::GuardedLinkFreezeV1,
-                &encryption_key,
-                load_ciphertext,
-            )?;
-            if apply_root_metadata {
-                set_guarded_metadata_durable(staging.as_file(), &metadata.guarded.root)?;
-            } else {
-                staging.sync_all()?;
-            }
-            return Ok(());
-        }
-        #[cfg(not(target_os = "linux"))]
-        bail!("guarded Git private metadata cannot be restored on this platform");
+        bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
     }
     if private_metadata_format(&metadata_bytes)? == 6 {
         #[cfg(target_os = "linux")]
@@ -5721,324 +4236,6 @@ mod metadata_compatibility_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn guarded_graph_intent_reads_private_catalog_and_survives_retry() {
-        let temporary = tempfile::tempdir().unwrap();
-        let view = temporary.path().join("view");
-        let lower = temporary.path().join("lower");
-        fs::create_dir(&view).unwrap();
-        fs::create_dir(&lower).unwrap();
-        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([219; 32]));
-        let control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
-        let repository_id = Uuid::new_v4();
-        let revision_id = Uuid::new_v4();
-        let guild_id = [220; 32];
-        let catalog_key = mb_git::catalog_key(&keys, repository_id);
-        GitRepository::init_with_catalog_root(
-            &view,
-            &lower,
-            repository_id,
-            &catalog_key,
-            SourceBackendKind::GuardedLinkFreezeV1,
-        )
-        .unwrap();
-        control
-            .put_record(
-                "git-repository",
-                repository_id.as_bytes(),
-                &canonical_bytes(&crate::control::GitRepositoryInfo {
-                    format_version: 1,
-                    repository_id,
-                    path: view.clone(),
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        assert!(
-            prepare_guarded_git_graph_intent(
-                &control,
-                &keys,
-                guild_id,
-                revision_id,
-                repository_id,
-                &view,
-                &lower,
-            )
-            .unwrap()
-        );
-        let encoded = control
-            .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())
-            .unwrap()
-            .unwrap();
-        let (intent, migrated) = decode_git_graph_intent(&encoded).unwrap();
-        assert!(!migrated);
-        assert_eq!(intent.graph.repository_id, repository_id);
-        assert!(intent.graph.refs.is_empty());
-        assert!(
-            prepare_guarded_git_graph_intent(
-                &control,
-                &keys,
-                guild_id,
-                revision_id,
-                repository_id,
-                &view,
-                &lower,
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            control
-                .get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())
-                .unwrap()
-                .unwrap(),
-            encoded
-        );
-        assert!(
-            prepare_guarded_git_graph_intent(
-                &control,
-                &keys,
-                guild_id,
-                revision_id,
-                repository_id,
-                &lower,
-                &view,
-            )
-            .is_err()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn guarded_revision_refuses_registered_or_pending_git_graph_before_signing() {
-        let temporary = tempfile::tempdir().unwrap();
-        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([216; 32]));
-        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
-        let root_id = Uuid::new_v4();
-        let revision_id = Uuid::new_v4();
-        let writer_secret = [217; 32];
-        let sign = |control: &mut ControlStore| {
-            prepare_guarded_revision(
-                control,
-                &keys,
-                [218; 32],
-                root_id,
-                Uuid::new_v4(),
-                1,
-                revision_id,
-                WriterCredentials {
-                    epoch: 1,
-                    secret: &writer_secret,
-                    captured_change_sequence: None,
-                },
-            )
-        };
-
-        control
-            .put_record("git-repository", root_id.as_bytes(), b"registered")
-            .unwrap();
-        assert!(
-            sign(&mut control)
-                .unwrap_err()
-                .to_string()
-                .contains("guarded Git graph backup is not yet supported")
-        );
-        control
-            .delete_record("git-repository", root_id.as_bytes())
-            .unwrap();
-        control
-            .put_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes(), b"pending")
-            .unwrap();
-        assert!(
-            sign(&mut control)
-                .unwrap_err()
-                .to_string()
-                .contains("guarded Git graph backup is not yet supported")
-        );
-        assert!(
-            control
-                .get_record("user-revision", revision_id.as_bytes())
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn guarded_revision_refuses_private_catalog_without_registration() {
-        let temporary = tempfile::tempdir().unwrap();
-        let catalog = temporary.path().join(mb_store::GIT_CATALOG_DIRECTORY);
-        fs::create_dir(&catalog).unwrap();
-        fs::write(
-            catalog.join(mb_store::GIT_CATALOG_MARKER_FILE),
-            mb_store::git_catalog_marker_bytes(Uuid::new_v4()),
-        )
-        .unwrap();
-        assert!(
-            require_guarded_git_catalog_absent(temporary.path())
-                .unwrap_err()
-                .to_string()
-                .contains("guarded Git graph backup is not yet supported")
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn signed_guarded_git_metadata_prepares_catalog_bound_mount_view() {
-        let temporary = tempfile::tempdir().unwrap();
-        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([221; 32]));
-        let guild_id = [222; 32];
-        let protected_root_id = Uuid::new_v4();
-        let revision_id = Uuid::new_v4();
-        let graph = GitBackupDescriptor {
-            format_version: 2,
-            repository_id: protected_root_id,
-            refs: Vec::new(),
-            objects: Vec::new(),
-            blobs: Vec::new(),
-            head_branch: "main".to_owned(),
-        };
-        let private = GuardedGitPrivateMetadataV7 {
-            format_version: 7,
-            guarded: GuardedPrivateMetadataV6 {
-                format_version: 6,
-                root: GuardedPrivateStatV6 {
-                    mode: 0o700,
-                    uid: 1000,
-                    gid: 1000,
-                    atime_secs: 1,
-                    atime_nanos: 0,
-                    modified_secs: 1,
-                    modified_nanos: 0,
-                },
-                entries: Vec::new(),
-            },
-            git: graph.clone(),
-        };
-        let metadata_bytes = canonical_bytes(&private).unwrap();
-        let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
-        let (metadata_ref, ciphertext) = encrypted_sector(
-            &keys.guild_data_key(&guild_id),
-            metadata_id,
-            &metadata_bytes,
-        )
-        .unwrap();
-        let writer = SigningKey::from_bytes(&[223; 32]);
-        let mut revision = UserRevision {
-            format_version: 5,
-            guild_id,
-            protected_root_id,
-            cipher_profile: V1_CIPHER_PROFILE,
-            revision_id,
-            owner: keys.node_id(),
-            writer_epoch: 1,
-            writer_public_key: writer.verifying_key().to_bytes(),
-            writer_signature: Vec::new(),
-            sequence: 1,
-            parent: None,
-            metadata_sectors: vec![metadata_ref.clone()],
-            data_sectors: Vec::new(),
-            sector_commitments: Some(vec![merkle_commit(&ciphertext).unwrap()]),
-        };
-        revision.sign_writer(&writer).unwrap();
-        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
-        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
-        install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
-        assert_eq!(
-            revision_git_backup(&control, &keys, guild_id, &revision).unwrap(),
-            Some(graph.clone())
-        );
-        let staging_path = temporary.path().join("staging");
-        fs::create_dir(&staging_path).unwrap();
-        let staging = PinnedDirectory::open(&staging_path).unwrap();
-        build_revision_restore(
-            &keys,
-            guild_id,
-            &revision,
-            &staging,
-            &mut |id| {
-                assert_eq!(*id, metadata_id);
-                Ok(ciphertext.clone())
-            },
-            false,
-        )
-        .unwrap();
-        restore_signed_root_metadata_at(&control, &keys, guild_id, &revision, &staging).unwrap();
-        assert_eq!(
-            git_catalog_marker(&staging_path).unwrap(),
-            Some(protected_root_id)
-        );
-        let repository = GitRepository::open_with_backend(
-            &staging_path,
-            protected_root_id,
-            &mb_git::catalog_key(&keys, protected_root_id),
-            SourceBackendKind::GuardedLinkFreezeV1,
-        )
-        .unwrap();
-        assert_eq!(repository.export_graph_source().unwrap().refs.len(), 0);
-        verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging).unwrap();
-        let selected = guarded_private_metadata_for_revision(&control, &keys, guild_id, &revision)
-            .unwrap()
-            .unwrap();
-        assert_eq!(selected.git, Some(graph));
-        assert!(
-            selected
-                .guarded
-                .bind_restored_view(&staging, Uuid::new_v4())
-                .is_err()
-        );
-        let view = selected
-            .guarded
-            .bind_restored_view_with_git_catalog(
-                &staging,
-                Uuid::new_v4(),
-                protected_root_id,
-                repository.catalog_directory_identity().unwrap(),
-            )
-            .unwrap();
-        assert!(view.entries.is_empty());
-        prepare_recovered_revision_publication(&mut control, &keys, guild_id, &revision, &staging)
-            .unwrap();
-        fs::write(staging_path.join("extra"), b"not signed").unwrap();
-        assert!(
-            verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging)
-                .unwrap_err()
-                .to_string()
-                .contains("unrecorded or replaced name")
-        );
-        fs::remove_file(staging_path.join("extra")).unwrap();
-        let private_extra = staging_path
-            .join(mb_store::GIT_CATALOG_DIRECTORY)
-            .join("unexpected");
-        fs::write(&private_extra, b"unrecognized state").unwrap();
-        assert!(
-            verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging)
-                .is_err()
-        );
-        fs::remove_file(private_extra).unwrap();
-        fs::write(
-            staging_path
-                .join(mb_store::GIT_CATALOG_DIRECTORY)
-                .join(mb_store::GIT_CATALOG_MARKER_FILE),
-            mb_store::git_catalog_marker_bytes(Uuid::new_v4()),
-        )
-        .unwrap();
-        assert!(
-            verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &staging)
-                .is_err()
-        );
-        assert!(
-            prepare_recovered_revision_publication(
-                &mut control,
-                &keys,
-                guild_id,
-                &revision,
-                &staging,
-            )
-            .is_err()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn recovered_git_blobs_stream_to_sparse_native_anchors_without_reflink() {
         use std::os::unix::fs::MetadataExt;
 
@@ -6142,6 +4339,25 @@ mod metadata_compatibility_tests {
             &mb_git::catalog_key(&keys, repository_id),
         )
         .unwrap();
+        let recipes = verify_recovered_git_graph(
+            &repository,
+            &descriptor,
+            &keys.guild_data_key(&guild_id),
+            guild_id,
+        )
+        .unwrap();
+        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes[0].guild_id, guild_id);
+        let mut altered = descriptor.clone();
+        altered.blobs[0].data_extents[0].sectors[0].root[0] ^= 1;
+        let error = verify_recovered_git_graph(
+            &repository,
+            &altered,
+            &keys.guild_data_key(&guild_id),
+            guild_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("signed data sector"));
         let graph = repository.export_graph_source().unwrap();
         assert_eq!(graph.refs, descriptor.refs);
         assert_eq!(graph.objects, descriptor.objects);
@@ -6158,251 +4374,21 @@ mod metadata_compatibility_tests {
                 .to_string_lossy()
                 .starts_with(".mutualbackup-recovered-blob-")
         }));
-        let guarded_restored = temporary.path().join("guarded-restored");
-        fs::create_dir(&guarded_restored).unwrap();
-        let guarded_staging = PinnedDirectory::open(&guarded_restored).unwrap();
-        restore_git_backup_at(
-            &keys,
-            &guarded_staging,
-            &descriptor,
-            SourceBackendKind::GuardedLinkFreezeV1,
-            &keys.guild_data_key(&guild_id),
-            &mut |id| {
-                ciphertexts
-                    .get(id)
-                    .cloned()
-                    .context("missing backed-up sector")
-            },
-        )
-        .unwrap();
-        let guarded_repository = GitRepository::open_with_backend(
-            &guarded_restored,
-            repository_id,
-            &mb_git::catalog_key(&keys, repository_id),
-            SourceBackendKind::GuardedLinkFreezeV1,
-        )
-        .unwrap();
-        let guarded_graph = guarded_repository.export_graph_source().unwrap();
-        assert_eq!(guarded_graph.refs, descriptor.refs);
-        assert_eq!(guarded_graph.objects, descriptor.objects);
-        assert_eq!(guarded_graph.blobs.len(), 1);
-        assert_eq!(
-            mb_git::blob_oid_from_anchor(&guarded_graph.blobs[0].anchor)
-                .unwrap()
-                .as_bytes(),
-            blob_oid.as_bytes()
-        );
-        let private = GuardedGitPrivateMetadataV7 {
-            format_version: 7,
-            guarded: GuardedPrivateMetadataV6 {
-                format_version: 6,
-                root: GuardedPrivateStatV6 {
-                    mode: 0o700,
-                    uid: 1000,
-                    gid: 1000,
-                    atime_secs: 1,
-                    atime_nanos: 0,
-                    modified_secs: 1,
-                    modified_nanos: 0,
-                },
-                entries: Vec::new(),
-            },
-            git: descriptor.clone(),
-        };
-        let metadata_bytes = canonical_bytes(&private).unwrap();
-        let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
-        let (metadata_ref, metadata_ciphertext) = encrypted_sector(
-            &keys.guild_data_key(&guild_id),
-            metadata_id,
-            &metadata_bytes,
-        )
-        .unwrap();
-        let writer = SigningKey::from_bytes(&[227; 32]);
-        let mut revision = UserRevision {
-            format_version: 5,
-            guild_id,
-            protected_root_id: repository_id,
-            cipher_profile: V1_CIPHER_PROFILE,
-            revision_id,
-            owner: keys.node_id(),
-            writer_epoch: 1,
-            writer_public_key: writer.verifying_key().to_bytes(),
-            writer_signature: Vec::new(),
-            sequence: 1,
-            parent: None,
-            metadata_sectors: vec![metadata_ref.clone()],
-            data_sectors: sectors.clone(),
-            sector_commitments: Some(
-                std::iter::once(&metadata_ciphertext)
-                    .chain(sectors.iter().map(|sector| &ciphertexts[&sector.id]))
-                    .map(|ciphertext| merkle_commit(ciphertext).unwrap())
-                    .collect(),
-            ),
-        };
-        revision.sign_writer(&writer).unwrap();
-        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
-        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
-        install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
-        verify_guarded_recovered_namespace(&control, &keys, guild_id, &revision, &guarded_staging)
-            .unwrap();
-        let mut incomplete = revision.value.clone();
-        incomplete.data_sectors.clear();
-        incomplete.sector_commitments = Some(vec![merkle_commit(&metadata_ciphertext).unwrap()]);
-        incomplete.sign_writer(&writer).unwrap();
-        let incomplete = SignedRecord::sign(USER_REVISION_DOMAIN, incomplete, &keys).unwrap();
-        assert!(
-            verify_guarded_recovered_namespace(
-                &control,
-                &keys,
-                guild_id,
-                &incomplete,
-                &guarded_staging,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("guarded Git data sectors differ")
-        );
-        let recovered_recipes = verify_recovered_git_graph(
-            &guarded_repository,
+        repository.create_branch("unexpected").unwrap();
+        let error = verify_recovered_git_graph(
+            &repository,
             &descriptor,
             &keys.guild_data_key(&guild_id),
             guild_id,
         )
-        .unwrap();
-        assert_eq!(recovered_recipes.len(), sectors.len());
-        for recipe in recovered_recipes {
-            control
-                .put_record(
-                    "local-sector",
-                    &recipe.reference.id,
-                    &canonical_bytes(&recipe).unwrap(),
-                )
-                .unwrap();
-        }
-        for reference in &sectors {
-            assert!(
-                recovered_recipe_is_stable(&control, &keys, guild_id, reference).unwrap(),
-                "recovered Git sector should be served from its native anchor"
-            );
-            assert_eq!(
-                render_sector(&control, &keys, &reference.id, Some(&guild_id)).unwrap(),
-                ciphertexts[&reference.id]
-            );
-        }
-        guarded_repository.create_branch("other").unwrap();
+        .unwrap_err();
+        assert!(error.to_string().contains("refs or objects differ"));
         assert!(
-            verify_guarded_recovered_namespace(
-                &control,
-                &keys,
-                guild_id,
-                &revision,
-                &guarded_staging,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("recovered Git refs or objects differ")
-        );
-        let mut damaged = ciphertexts;
-        damaged.get_mut(&sectors[0].id).unwrap()[0] ^= 1;
-        let encryption_key = keys.guild_data_key(&guild_id);
-        let mut load = |id: &SectorId| damaged.get(id).cloned().context("missing backed-up sector");
-        let mut reader =
-            RecoveredGitBlobReader::new(&descriptor.blobs[0], &encryption_key, &mut load);
-        assert!(reader.read_to_end(&mut Vec::new()).is_err());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn empty_guarded_recovery_binds_signed_directories_without_data_sectors() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let root_path = temporary.path().join("restored");
-        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([218; 32]));
-        let guild_id = [219; 32];
-        let revision_id = Uuid::new_v4();
-        let stat = GuardedPrivateStatV6 {
-            mode: 0o700,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
-            atime_secs: 1_700_000_000,
-            atime_nanos: 0,
-            modified_secs: 1_700_000_001,
-            modified_nanos: 0,
-        };
-        let metadata = GuardedPrivateMetadataV6 {
-            format_version: 6,
-            root: stat.clone(),
-            entries: vec![GuardedPrivateEntryV6::Directory {
-                path: b"empty-\xfe".to_vec(),
-                stat,
-                logical_len: 8192,
-            }],
-        };
-        let metadata_bytes = canonical_bytes(&metadata).unwrap();
-        let metadata_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0);
-        let (metadata_ref, metadata_ciphertext) = encrypted_sector(
-            &keys.guild_data_key(&guild_id),
-            metadata_id,
-            &metadata_bytes,
-        )
-        .unwrap();
-        let writer = SigningKey::from_bytes(&[220; 32]);
-        let mut revision = UserRevision {
-            format_version: 5,
-            guild_id,
-            protected_root_id: Uuid::new_v4(),
-            cipher_profile: V1_CIPHER_PROFILE,
-            revision_id,
-            owner: keys.node_id(),
-            writer_epoch: 1,
-            writer_public_key: writer.verifying_key().to_bytes(),
-            writer_signature: Vec::new(),
-            sequence: 1,
-            parent: None,
-            metadata_sectors: vec![metadata_ref.clone()],
-            data_sectors: Vec::new(),
-            sector_commitments: Some(vec![merkle_commit(&metadata_ciphertext).unwrap()]),
-        };
-        revision.sign_writer(&writer).unwrap();
-        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
-        let mut control = ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
-        restore_revision(
-            &control,
-            &keys,
-            guild_id,
-            &revision,
-            &BTreeMap::from([(metadata_id, metadata_ciphertext)]),
-            &root_path,
-        )
-        .unwrap();
-        install_inline_recipe(&mut control, guild_id, metadata_ref, metadata_bytes).unwrap();
-        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path).unwrap();
-        let capture: GuardedRecoveredCaptureV1 = decode_canonical(
-            &control
-                .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
+            repository
+                .branches()
                 .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(capture.files.is_empty());
-        assert!(
-            root_path
-                .join(std::ffi::OsString::from_vec(b"empty-\xfe".to_vec()))
-                .is_dir()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn raw_restore_reservation_preserves_utf8_record_id() {
-        let target = Path::new("/ordinary/restore-target");
-        let mut historical =
-            blake3::Hasher::new_derive_key("mutualbackup restore target reservation v1");
-        historical.update(&canonical_bytes(&target).unwrap());
-        assert_eq!(
-            restore_job_record_id(target).unwrap(),
-            *historical.finalize().as_bytes()
+                .iter()
+                .any(|branch| branch.name == "unexpected")
         );
     }
 
@@ -6554,141 +4540,6 @@ mod metadata_compatibility_tests {
         assert_eq!(root_stat.mode() & 0o7777, 0o750);
         assert_eq!(root_stat.atime(), 1_700_000_000);
         assert_eq!(root_stat.atime_nsec(), 123);
-        if std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").is_some() {
-            let mut plaintext = vec![0_u8; 1024];
-            plaintext[1000..1003].copy_from_slice(b"raw");
-            let data_reference = revision.value.data_sectors[0].clone();
-            install_inline_recipe(&mut control, guild_id, data_reference.clone(), plaintext)
-                .unwrap();
-            control
-                .put_record(
-                    "user-revision",
-                    revision_id.as_bytes(),
-                    &canonical_bytes(&revision).unwrap(),
-                )
-                .unwrap();
-            let mut writable = OpenOptions::new().write(true).open(&first).unwrap();
-            writable.seek(SeekFrom::Start(3)).unwrap();
-            writable.write_all(b"x").unwrap();
-            writable.sync_all().unwrap();
-            let error =
-                reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
-                    .unwrap_err();
-            assert!(error.to_string().contains("sparse hole"));
-            assert!(
-                control
-                    .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                control
-                    .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                !recovered_recipe_is_stable(&control, &keys, guild_id, &data_reference).unwrap()
-            );
-            writable.seek(SeekFrom::Start(3)).unwrap();
-            writable.write_all(&[0]).unwrap();
-            writable.sync_all().unwrap();
-            INTERRUPT_GUARDED_RECOVERY_AFTER_CAPTURE.with(|interrupt| interrupt.set(true));
-            assert!(
-                reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
-                    .is_err()
-            );
-            assert!(
-                control
-                    .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())
-                    .unwrap()
-                    .is_some()
-            );
-            drop(control);
-            let mut control =
-                ControlStore::open(temporary.path().join("control.db"), &keys).unwrap();
-            reconcile_pending_captures(&control).unwrap();
-            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
-                .unwrap();
-            assert!(
-                recovered_recipe_is_stable(&control, &keys, guild_id, &data_reference).unwrap()
-            );
-            let mut captured: GuardedRecoveredCaptureV1 = decode_canonical(
-                &control
-                    .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(captured.files.len(), 1);
-            assert_eq!(captured.files[0].path, b"nested/\xfe");
-            assert_eq!(
-                captured.files[0]
-                    .anchor
-                    .open_verified()
-                    .unwrap()
-                    .metadata()
-                    .unwrap()
-                    .len(),
-                1024
-            );
-            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
-                .unwrap();
-            let replacement = GuardedRecoveryIntentV1 {
-                format_version: 1,
-                guild_id,
-                revision_id,
-                source_root: root_path.canonicalize().unwrap(),
-                metadata_hash: *blake3::hash(&canonical_bytes(&metadata).unwrap()).as_bytes(),
-                files: vec![GuardedRecoveredFilePlanV1 {
-                    path: b"nested/\xfe".to_vec(),
-                    plan: SourceFileCapturePlan::plan_reflink_raw(
-                        &root_path,
-                        PathBuf::from(OsString::from_vec(b"nested/\xfe".to_vec())),
-                    )
-                    .unwrap(),
-                }],
-                replaced: Some(captured.clone()),
-            };
-            control
-                .put_record(
-                    GUARDED_RECOVERY_INTENT_KIND,
-                    revision_id.as_bytes(),
-                    &canonical_bytes(&replacement).unwrap(),
-                )
-                .unwrap();
-            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &root_path)
-                .unwrap();
-            assert!(
-                control
-                    .get_record(GUARDED_RECOVERY_INTENT_KIND, revision_id.as_bytes())
-                    .unwrap()
-                    .is_none()
-            );
-            let replacement_capture: GuardedRecoveredCaptureV1 = decode_canonical(
-                &control
-                    .get_record(GUARDED_RECOVERY_CAPTURE_KIND, revision_id.as_bytes())
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_ne!(
-                replacement_capture.files[0].anchor.anchor_id,
-                captured.files[0].anchor.anchor_id
-            );
-            assert!(captured.files[0].anchor.open_verified().is_err());
-            captured = replacement_capture;
-            assert!(!retire_revision_anchor(&mut control, revision_id).unwrap());
-            control
-                .delete_record("user-revision", revision_id.as_bytes())
-                .unwrap();
-            assert!(!retire_revision_anchor(&mut control, revision_id).unwrap());
-            control
-                .delete_record("local-sector", &data_reference.id)
-                .unwrap();
-            assert!(retire_revision_anchor(&mut control, revision_id).unwrap());
-            assert!(captured.files[0].anchor.open_verified().is_err());
-        }
     }
 
     #[test]

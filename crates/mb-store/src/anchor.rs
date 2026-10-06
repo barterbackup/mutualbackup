@@ -17,19 +17,13 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 #[cfg(target_os = "linux")]
-#[path = "guarded_file.rs"]
-mod guarded_file;
+#[path = "legacy_guarded.rs"]
+mod legacy_guarded;
 #[cfg(target_os = "linux")]
-pub use guarded_file::GuardedFileCapturePlan;
-#[cfg(target_os = "linux")]
-#[path = "guarded_root.rs"]
-mod guarded_root;
-#[cfg(target_os = "linux")]
-pub use guarded_root::GuardedRootCapturePlan;
-
-#[cfg(target_os = "linux")]
-use crate::link_freeze::{
-    AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, install_probe_acl,
+pub use legacy_guarded::{
+    GuardedFileCapturePlan, GuardedRevisionCaptureV1, GuardedRootCapturePlan,
+    GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewEntryKind, GuardedViewMetadataEntry,
+    GuardedViewMetadataV1,
 };
 
 const AREA_PREFIX: &str = ".mutualbackup-anchors";
@@ -94,10 +88,6 @@ pub enum AnchorError {
     Symlink(PathBuf),
     #[error("unsupported filesystem object in protected tree: {0}")]
     UnsupportedObject(PathBuf),
-    #[error("guarded capture cannot freeze a file with hard-link aliases: {0}")]
-    UnsafeHardLink(PathBuf),
-    #[error("guarded root capture plan is invalid or exceeds its versioned bounds")]
-    InvalidGuardedPlan,
     #[error("source backend does not support this operation: {0}")]
     UnsupportedSourceOperation(&'static str),
     #[error("unsafe relative path")]
@@ -184,26 +174,13 @@ pub struct PinnedDirectory {
     filesystem_id: u64,
 }
 
-/// Descriptor-relative worktree reads. The transient constructor may inspect
-/// a supervised FUSE view without claiming its mount-local device ID is a
-/// durable source identity. No mutation or identity-publication API is exposed.
+/// Descriptor-relative native worktree reads. No mutation or
+/// identity-publication API is exposed.
 pub struct PinnedReadDirectory(PinnedDirectory);
 
 impl PinnedReadDirectory {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AnchorError> {
         PinnedDirectory::open(path).map(Self)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn open_transient(path: impl AsRef<Path>) -> Result<Self, AnchorError> {
-        use std::os::unix::fs::MetadataExt;
-
-        let file = open_source_root(path.as_ref())?;
-        let filesystem_id = file.metadata()?.dev();
-        Ok(Self(PinnedDirectory {
-            file,
-            filesystem_id,
-        }))
     }
 
     pub fn try_clone(&self) -> Result<Self, AnchorError> {
@@ -480,12 +457,7 @@ impl PinnedDirectory {
         if !pinned.metadata()?.is_file() {
             return Err(AnchorError::UnsupportedObject(name.to_path_buf()));
         }
-        // The pinned inode is already known to be regular. A guarded FUSE
-        // worktree rejects O_NONBLOCK on file opens, and no FIFO can be reached
-        // through this verified descriptor.
-        Ok(Some(reopen_pinned_file_with_nonblock(
-            &pinned, false, name, false,
-        )?))
+        Ok(Some(reopen_pinned_file(&pinned, false, name)?))
     }
 
     fn pin_child_symlink(&self, name: &Path) -> Result<Option<File>, AnchorError> {
@@ -666,93 +638,12 @@ impl PinnedDirectory {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn child_names_match(
-        &self,
-        expected: &BTreeSet<Vec<u8>>,
-        ignored: Option<&[u8]>,
-    ) -> Result<bool, AnchorError> {
-        let mut missing = expected.clone();
-        let mut stream = DirectoryStream::open(&self.file)?;
-        while let Some(name) = stream.next_name()? {
-            if ignored.is_some_and(|ignored| name.as_bytes() == ignored) {
-                continue;
-            }
-            if !missing.remove(name.as_bytes()) {
-                return Ok(false);
-            }
-        }
-        Ok(missing.is_empty())
-    }
-
-    #[cfg(target_os = "linux")]
     pub(crate) fn has_marked_git_catalog(&self) -> Result<bool, AnchorError> {
         Ok(git_catalog_marker_from_root(&self.file)?.is_some())
     }
 
-    /// Read-only admission before guarded namespace replay. Every inode in the
-    /// lower tree must already belong to the capture or a durable view record.
-    /// The caller checks exact names after replay has settled pending moves.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn all_descendants_known(
-        &self,
-        allowed: &BTreeSet<NativeFileId>,
-    ) -> Result<bool, AnchorError> {
-        fn scan(
-            directory: &PinnedDirectory,
-            allowed: &BTreeSet<NativeFileId>,
-            seen: &mut BTreeSet<NativeFileId>,
-            depth: usize,
-            skip_catalog: bool,
-        ) -> Result<bool, AnchorError> {
-            if depth > MAX_CAPTURE_DEPTH {
-                return Ok(false);
-            }
-            let mut stream = DirectoryStream::open(directory.as_file())?;
-            while let Some(name) = stream.next_name()? {
-                if skip_catalog && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes() {
-                    continue;
-                }
-                let relative = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
-                let pinned = open_path_no_xdev_beneath(directory.as_file(), relative)?;
-                let metadata = pinned.metadata()?;
-                if !metadata.is_dir() && !metadata.is_file() {
-                    return Ok(false);
-                }
-                let id = native_file_id(directory.filesystem_id, &metadata);
-                if !allowed.contains(&id) || !seen.insert(id) {
-                    return Ok(false);
-                }
-                if metadata.is_dir() {
-                    let file = reopen_pinned_file(&pinned, true, relative)?;
-                    let child = PinnedDirectory {
-                        file,
-                        filesystem_id: directory.filesystem_id,
-                    };
-                    if child.identity()? != id || !scan(&child, allowed, seen, depth + 1, false)? {
-                        return Ok(false);
-                    }
-                }
-            }
-            Ok(true)
-        }
-
-        let mut seen = BTreeSet::from([self.identity()?]);
-        scan(self, allowed, &mut seen, 0, self.has_marked_git_catalog()?)
-    }
-
-    /// Every pre-replay lower name must map to an inode permitted by a durable
-    /// namespace record or one of its replayable pending transitions.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn all_descendant_paths_granted(
-        &self,
-        grants: &BTreeMap<PathBuf, BTreeSet<NativeFileId>>,
-    ) -> Result<bool, AnchorError> {
-        self.all_descendant_paths_granted_with_catalog_policy(grants, true)
-    }
-
     /// A restored signed namespace cannot inherit an unrecorded catalog or
-    /// another lower-tree name. Unlike guarded remount replay, no local name
-    /// has authority to be excluded from this comparison.
+    /// another source-tree name.
     #[cfg(target_os = "linux")]
     pub fn exact_descendant_paths(
         &self,
@@ -847,69 +738,6 @@ impl PinnedDirectory {
             grants,
             0,
             skip_marked_catalog && self.has_marked_git_catalog()?,
-        )
-    }
-
-    /// A removed guarded directory may release its owner-restoration record
-    /// only when its captured inode has no remaining name in the lower tree.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn contains_descendant_id(
-        &self,
-        expected: NativeFileId,
-    ) -> Result<bool, AnchorError> {
-        fn scan(
-            directory: &PinnedDirectory,
-            expected: NativeFileId,
-            depth: usize,
-            entries: &mut usize,
-            skip_catalog: bool,
-        ) -> Result<bool, AnchorError> {
-            if depth > MAX_CAPTURE_DEPTH {
-                return Err(AnchorError::CatalogTooLarge);
-            }
-            let mut stream = DirectoryStream::open(directory.as_file())?;
-            while let Some(name) = stream.next_name()? {
-                if skip_catalog && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes() {
-                    continue;
-                }
-                *entries += 1;
-                if *entries > MAX_CAPTURE_ENTRIES {
-                    return Err(AnchorError::CatalogTooLarge);
-                }
-                let component = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
-                let pinned = open_path_no_xdev_beneath(directory.as_file(), component)?;
-                let metadata = pinned.metadata()?;
-                if !metadata.is_dir() && !metadata.is_file() {
-                    return Err(AnchorError::UnsupportedObject(component.to_path_buf()));
-                }
-                let id = native_file_id(directory.filesystem_id, &metadata);
-                if id == expected {
-                    return Ok(true);
-                }
-                if metadata.is_dir() {
-                    let file = reopen_pinned_file(&pinned, true, component)?;
-                    let child = PinnedDirectory {
-                        file,
-                        filesystem_id: directory.filesystem_id,
-                    };
-                    if child.identity()? != id {
-                        return Err(AnchorError::SourceChanged(component.to_path_buf()));
-                    }
-                    if scan(&child, expected, depth + 1, entries, false)? {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
-        }
-
-        let mut entries = 0;
-        scan(
-            self,
-            expected,
-            0,
-            &mut entries,
-            self.has_marked_git_catalog()?,
         )
     }
 
@@ -1556,16 +1384,6 @@ impl StableAnchorAreaLocator {
             return Err(AnchorError::InvalidRoot);
         }
         prepare_stable_anchor_area(&source_root, &metadata)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn open_guarded_staging_area(&self) -> Result<PinnedDirectory, AnchorError> {
-        let path = resolve_anchor_area(self)?;
-        let file = open_stable_anchor_area(&path, self)?;
-        Ok(PinnedDirectory {
-            file,
-            filesystem_id: self.filesystem_id,
-        })
     }
 }
 
@@ -2318,58 +2136,6 @@ impl RawFileAnchorManifestV2 {
 }
 
 impl FileAnchorManifest {
-    #[cfg(target_os = "linux")]
-    pub(crate) fn from_guarded_root_file(
-        virtual_anchor_id: Uuid,
-        original: &StableAnchorManifest,
-        source_root: &Path,
-        stage_path: &Path,
-        captured_path: &Path,
-        native_id: NativeFileId,
-        proof: &crate::IndependentSparseCopy,
-    ) -> Result<Self, AnchorError> {
-        use std::os::unix::fs::MetadataExt;
-
-        if virtual_anchor_id.is_nil()
-            || virtual_anchor_id == original.anchor_id
-            || !source_root.is_absolute()
-            || native_id.filesystem_id != original.area.filesystem_id
-            || native_id.inode == 0
-        {
-            return Err(AnchorError::InvalidRoot);
-        }
-        validate_relative(stage_path)?;
-        validate_relative(captured_path)?;
-        let locator = original.file_locator_path(captured_path)?;
-        let file = locator.open()?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || native_file_id(original.area.filesystem_id, &metadata) != native_id
-            || metadata.len() != proof.logical_len
-            || metadata.nlink() != 2
-            || file_data_extents(&file, proof.logical_len)? != proof.data_extents
-        {
-            return Err(AnchorError::SourceChanged(stage_path.to_path_buf()));
-        }
-        let manifest = Self {
-            format_version: 2,
-            anchor_id: virtual_anchor_id,
-            area: original.area.clone(),
-            source_root_hint: source_root.to_path_buf(),
-            source_relative_path: stage_path.to_path_buf(),
-            logical_len: proof.logical_len,
-            content_hash: proof.content_hash,
-            source_version: capture_version(original.area.filesystem_id, &metadata),
-            guarded_root_file: Some(GuardedRootFileBacking {
-                root_anchor_id: original.anchor_id,
-                captured_relative_path: captured_path.to_path_buf(),
-                native_id,
-            }),
-        };
-        manifest.open_verified()?;
-        Ok(manifest)
-    }
-
     pub(crate) fn source_file_identity(&self) -> NativeFileId {
         NativeFileId {
             filesystem_id: self.source_version.filesystem_id,
@@ -2551,7 +2317,7 @@ impl StableAnchorManifest {
         }
         let area = resolve_anchor_area(&self.area)?;
         let area_file = open_stable_anchor_area(&area, &self.area)?;
-        let guarded_marker = guarded_root::guarded_root_marker_name(self.anchor_id);
+        let guarded_marker = legacy_guarded::guarded_root_marker_name(self.anchor_id);
         match open_path_no_xdev_beneath(&area_file, Path::new(&guarded_marker)) {
             Ok(_) => {
                 return Err(AnchorError::UnsafeOwnedDirectory(
@@ -3544,167 +3310,6 @@ pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
     result
 }
 
-/// Exercise the full disposable guarded hard-link lifecycle on this root's
-/// filesystem. Passing this probe does not enroll the backend: its durable
-/// capture, detach journal, and recovery path must be present before use.
-#[cfg(target_os = "linux")]
-pub fn probe_guarded_link_freeze(root: impl AsRef<Path>) -> Result<(), AnchorError> {
-    use std::io;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
-
-    let root = root.as_ref();
-    if !root.is_dir() {
-        return Err(AnchorError::InvalidRoot);
-    }
-    let root_identity = filesystem_identity(root)?;
-    let parent = root.parent().ok_or(AnchorError::NoExternalAnchorLocation)?;
-    if filesystem_identity(parent)? != root_identity {
-        return Err(AnchorError::NoExternalAnchorLocation);
-    }
-    reject_nested_filesystems(root, root_identity)?;
-    let probe_name = format!(".mutualbackup-link-probe-{}", Uuid::new_v4());
-    let probe_dir = parent.join(&probe_name);
-    create_private_dir_new(&probe_dir)?;
-    let source_path = probe_dir.join("source");
-    let moved_path = probe_dir.join("source-moved");
-    let anchor_path = probe_dir.join("anchor");
-    let staging_path = probe_dir.join("private-staging");
-    let result = (|| {
-        const LENGTH: u64 = 4 * 1024 * 1024;
-        const DATA_OFFSET: u64 = 1024 * 1024;
-        let source = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&source_path)?;
-        source.set_len(LENGTH)?;
-        source.write_at(b"source-before-freeze", DATA_OFFSET)?;
-        source.write_at(b"tail", 3 * 1024 * 1024)?;
-        source.sync_all()?;
-        let acl_supported = install_probe_acl(&source)?;
-        let source_extents = file_data_extents(&source, LENGTH)?;
-        validate_sparse_probe_extents(&source_extents, LENGTH)?;
-        if source.metadata()?.nlink() != 1 {
-            return Err(io::Error::other("probe source has an unexpected hard-link alias").into());
-        }
-        let writer_rejected = FileWriteExclusion::acquire(File::open(&source_path)?)
-            .err()
-            .and_then(|error| error.raw_os_error())
-            == Some(libc::EAGAIN);
-        if !writer_rejected {
-            return Err(io::Error::other("pre-opened writer did not block freeze").into());
-        }
-        // A writable shared mapping must remain a lease conflict even after
-        // its creating descriptor closes. Do not touch the sparse hole.
-        // SAFETY: source is a regular file longer than the requested mapping.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                source.as_raw_fd(),
-                0,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error().into());
-        }
-        drop(source);
-        let mapping_rejected = FileWriteExclusion::acquire(File::open(&source_path)?)
-            .err()
-            .and_then(|error| error.raw_os_error())
-            == Some(libc::EAGAIN);
-        // SAFETY: mapping is the exact 4096-byte region returned above.
-        if unsafe { libc::munmap(mapping, 4096) } < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        if !mapping_rejected {
-            return Err(
-                io::Error::other("pre-opened writable mapping did not block freeze").into(),
-            );
-        }
-
-        let source_read = File::open(&source_path)?;
-        let guard = FileWriteExclusion::acquire(source_read.try_clone()?)?;
-        let access = FileAccessSnapshot::capture(&source_read)?;
-        if acl_supported != matches!(&access.access_acl, AccessAclSnapshot::Present(_)) {
-            return Err(io::Error::other("probe ACL support changed").into());
-        }
-        fs::hard_link(&source_path, &anchor_path)?;
-        fs::set_permissions(
-            &source_path,
-            fs::Permissions::from_mode(access.mode & !0o222),
-        )?;
-        source_read.sync_all()?;
-        File::open(&probe_dir)?.sync_all()?;
-        if !guard.is_held()? || FileAccessSnapshot::capture(&source_read)?.mode & 0o222 != 0 {
-            return Err(io::Error::other("link freeze failed to remove write access").into());
-        }
-        let alias = CString::new(anchor_path.as_os_str().as_bytes())
-            .map_err(|_| AnchorError::UnsafePath)?;
-        // SAFETY: the pathname is NUL-terminated and points to the probe alias.
-        if unsafe { libc::truncate(alias.as_ptr(), 0) } != -1
-            || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
-        {
-            return Err(io::Error::other("frozen hard-link alias accepted truncate").into());
-        }
-        fs::rename(&source_path, &moved_path)?;
-        fs::write(&source_path, b"replacement")?;
-        fs::remove_file(&source_path)?;
-        fs::rename(&moved_path, &source_path)?;
-        if !guard.is_held()? {
-            return Err(io::Error::other("write exclusion did not follow moved inode").into());
-        }
-
-        let private = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&staging_path)?;
-        let copy = guard.copy_sparse_independent(&private)?;
-        if copy.logical_len != LENGTH || copy.data_extents != source_extents {
-            return Err(io::Error::other("private anchor changed sparse layout").into());
-        }
-        seal_anchor_file_handle(&private)?;
-        fs::rename(&staging_path, &anchor_path)?;
-        File::open(&probe_dir)?.sync_all()?;
-        if !guard.is_held()? {
-            return Err(io::Error::other("write exclusion failed before anchor detach").into());
-        }
-        guard.release()?;
-
-        let anchor_read = File::open(&anchor_path)?;
-        access.restore_after_detach(&source_read, &anchor_read, &copy)?;
-        let editable = OpenOptions::new().write(true).open(&source_path)?;
-        editable.write_at(b"source-after-freeze!", DATA_OFFSET)?;
-        editable.sync_all()?;
-        let mut unchanged = [0_u8; 20];
-        let read = anchor_read.read_at(&mut unchanged, DATA_OFFSET)?;
-        if read != unchanged.len()
-            || &unchanged != b"source-before-freeze"
-            || source_read.metadata()?.ino() == anchor_read.metadata()?.ino()
-            || !access.matches(&source_read)?
-        {
-            return Err(
-                io::Error::other("private anchor or original access metadata changed").into(),
-            );
-        }
-        if filesystem_identity(root)? != root_identity
-            || filesystem_identity(&probe_dir)? != root_identity
-        {
-            return Err(AnchorError::FilesystemChanged);
-        }
-        Ok(())
-    })();
-    let cleanup = remove_owned_directory(parent, &probe_name);
-    cleanup?;
-    sync_directory(parent)?;
-    result
-}
-
 fn validate_sparse_probe_extents(
     extents: &[FileExtent],
     logical_len: u64,
@@ -4604,8 +4209,8 @@ fn remove_directory_at_expected(
         && anchor_id.to_string() == name
     {
         for marker in [
-            guarded_root::guarded_root_marker_name(anchor_id),
-            guarded_file::guarded_file_marker_name(anchor_id),
+            legacy_guarded::guarded_root_marker_name(anchor_id),
+            legacy_guarded::guarded_file_marker_name(anchor_id),
         ] {
             match open_path_no_xdev_beneath(parent, Path::new(&marker)) {
                 Ok(_) => return Err(AnchorError::UnsafeOwnedDirectory(display.to_path_buf())),
@@ -5320,9 +4925,8 @@ fn open_source_root(path: &Path) -> Result<File, AnchorError> {
     use std::os::unix::fs::OpenOptionsExt;
     let open = |flags| OpenOptions::new().read(true).custom_flags(flags).open(path);
     let flags = libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-    // Guarded remount scans must not turn a user-set directory atime into the
-    // time of an internal inventory read. Other source backends may run
-    // without permission to suppress atime, so retain their normal open path.
+    // Inventory reads should preserve the directory access time. Fall back
+    // to a normal open when this user cannot request O_NOATIME.
     match open(flags | libc::O_NOATIME) {
         Ok(file) => Ok(file),
         Err(error)
@@ -5405,23 +5009,13 @@ fn reopen_pinned_file(
     directory: bool,
     relative: &Path,
 ) -> Result<File, AnchorError> {
-    reopen_pinned_file_with_nonblock(pinned, directory, relative, !directory)
-}
-
-#[cfg(target_os = "linux")]
-fn reopen_pinned_file_with_nonblock(
-    pinned: &File,
-    directory: bool,
-    relative: &Path,
-    nonblock: bool,
-) -> Result<File, AnchorError> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
 
     let path = CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
         .expect("a numeric proc descriptor path has no NUL");
     let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
-    if nonblock {
+    if !directory {
         flags |= libc::O_NONBLOCK;
     }
     if directory {
@@ -5670,7 +5264,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exact_guarded_namespace_excludes_only_its_bound_git_catalog() {
+    fn exact_native_namespace_excludes_only_its_bound_git_catalog() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         let repository_id = Uuid::new_v4();
@@ -5805,70 +5399,6 @@ mod tests {
             root_backed.file_locator().relative_path,
             PathBuf::from("old/file")
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn guarded_root_file_manifest_adds_no_link_and_survives_root_detach() {
-        use std::os::unix::fs::MetadataExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let lower = temp.path().join("lower");
-        fs::create_dir(&lower).unwrap();
-        let source = lower.join("file");
-        let bytes = b"CRLF\r\nraw\0bytes";
-        fs::write(&source, bytes).unwrap();
-        let area = StableAnchorAreaLocator::prepare_for_root(&lower).unwrap();
-        let root_id = Uuid::from_u128(100);
-        let root_dir = area.path_hint.join(root_id.to_string());
-        fs::create_dir(&root_dir).unwrap();
-        let captured = root_dir.join("file");
-        fs::hard_link(&source, &captured).unwrap();
-        let original = StableAnchorManifest {
-            format_version: 3,
-            anchor_id: root_id,
-            source_root_hint: lower.clone(),
-            area: area.clone(),
-            root_mode: 0o700,
-            root_modified_secs: 0,
-            root_modified_nanos: 0,
-            entries: Vec::new(),
-        };
-        let metadata = fs::metadata(&source).unwrap();
-        let native_id = NativeFileId {
-            filesystem_id: area.filesystem_id,
-            inode: metadata.ino(),
-        };
-        let proof = crate::IndependentSparseCopy {
-            logical_len: bytes.len() as u64,
-            content_hash: *blake3::hash(bytes).as_bytes(),
-            data_extents: file_data_extents(&File::open(&captured).unwrap(), bytes.len() as u64)
-                .unwrap(),
-        };
-        let manifest = FileAnchorManifest::from_guarded_root_file(
-            Uuid::from_u128(101),
-            &original,
-            &lower,
-            Path::new("file"),
-            Path::new("file"),
-            native_id,
-            &proof,
-        )
-        .unwrap();
-        assert_eq!(fs::metadata(&source).unwrap().nlink(), 2);
-        assert_eq!(manifest.file_locator().anchor_id, root_id);
-
-        let private = root_dir.join("private");
-        fs::write(&private, bytes).unwrap();
-        fs::rename(&private, &captured).unwrap();
-        assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
-        let mut anchored = Vec::new();
-        manifest
-            .open_verified()
-            .unwrap()
-            .read_to_end(&mut anchored)
-            .unwrap();
-        assert_eq!(anchored, bytes);
     }
 
     #[cfg(target_os = "linux")]
@@ -6023,8 +5553,8 @@ mod tests {
         let area = StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
         let pinned = PinnedDirectory::open(&area.path_hint).unwrap();
         let marker_names: [fn(Uuid) -> String; 2] = [
-            guarded_file::guarded_file_marker_name,
-            guarded_root::guarded_root_marker_name,
+            legacy_guarded::guarded_file_marker_name,
+            legacy_guarded::guarded_root_marker_name,
         ];
         for marker_name in marker_names {
             let anchor_id = Uuid::new_v4();
@@ -6228,30 +5758,6 @@ mod tests {
         }
         assert_eq!(left_names, right_names);
         assert_eq!(left_names.len(), 3);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn descendant_identity_scan_follows_moves_and_proves_removed_directory_absent() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("parent/captured")).unwrap();
-        let root = PinnedDirectory::open(temp.path()).unwrap();
-        let captured = root
-            .open_descendant_directory("parent/captured")
-            .unwrap()
-            .identity()
-            .unwrap();
-        assert!(root.contains_descendant_id(captured).unwrap());
-
-        fs::rename(
-            temp.path().join("parent/captured"),
-            temp.path().join("moved"),
-        )
-        .unwrap();
-        assert!(root.contains_descendant_id(captured).unwrap());
-
-        fs::remove_dir(temp.path().join("moved")).unwrap();
-        assert!(!root.contains_descendant_id(captured).unwrap());
     }
 
     #[cfg(target_os = "linux")]

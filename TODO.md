@@ -5,7 +5,7 @@
 FUSE-backed guarded storage was added in error and is removed from the target
 architecture. The first withdrawal step removes enrollment commands and rejects
 identified legacy guarded state before catalog migration or replay. The source
-still contains the runtime pending full removal; R1 remains open. Stop
+no longer contains the mount runtime or its dependency; R1 remains open. Stop
 FUSE feature work, including retained-descriptor recapture isolation, guarded
 Git enrollment/checkout, metadata fidelity, edit guards, and mount qualification.
 Their earlier work and test evidence are archived below, with unfinished work
@@ -76,9 +76,26 @@ passing tests below apply only to their recorded source and exercised cases.
     Five native Btrfs regressions pass: Git reopen/add, linked worktree reopen,
     signed-history prune, backend reprobe/migration, and seed-only branch/blob
     recovery. The disposable mount and image were removed after qualification.
-  - [ ] Remove the runtime/dependency, finish the mount-free export/recovery
-    policy (including unavailable historical metadata), and replace useful
-    generic acceptance coverage. Admission checks do not complete removal.
+  - [x] Remove the FUSE runtime/dependency, mount supervisor, guarded capture
+    and publication, guarded Git operations, and link-freeze machinery. Retain
+    minimal legacy record decoding and marker recognition. Inspect ordinary and
+    linked-worktree stage journals before unbound-catalog migration. Preserve
+    pre-existing test WIP in `.git/preserved-wip/2026-10-06-fuse-removal/`.
+    Native recovery verifies recovered Git refs, objects, exact blob bytes,
+    authenticated sector recipes, and sparse gaps before root registration.
+    Generic seed recovery, retention/prune, and repeated owner-loss coverage
+    now use the native backend.
+    Validation: locked workspace tests passed (611 passed, zero failed, 105
+    ignored across 27 targets including doctests); format and strict all-target
+    Clippy passed. The complete `git-linux-acceptance.sh` gate passed on disposable
+    Btrfs: 73 provisioned tests, including both owner losses and the five-daemon
+    direct/hole-punch/relay topology. The qualified source manifest and binary
+    hashes matched; the disposable filesystem and network resources were cleaned
+    up. The Cargo dependency tree contains no `fuser`.
+  - [ ] Finish the verified mount-free export/recovery policy, including
+    unavailable historical metadata and marker-only single-file captures, and
+    qualify legacy upgrade/recovery.
+    Rejection and runtime removal do not certify historical conversion.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
   `crates/mb-git/src/history.rs` admits up to 64 MiB of graph metadata, while
@@ -157,7 +174,9 @@ passing tests below apply only to their recorded source and exercised cases.
   recovery. Preserve those jobs and keep the build-only Nix sandbox distinction.
   The new `native-git-acceptance` job invokes the complete
   `scripts/git-linux-acceptance.sh` gate on disposable Btrfs, retains the gate and
-  per-peer logs before cleanup, and unmounts/removes its image on exit. Required
+  remaining per-peer logs before mount cleanup, and unmounts/removes its image on
+  exit. Successful topology fixtures currently delete their own logs first; fix
+  that diagnostics gap below. Required
   upgrade/multi-volume regression coverage remains open. The dedicated packaged Git runtime
   smoke job now covers the R6 slice. Qualify
   the exact release artifact through native-filesystem, topology, and source-loss
@@ -202,6 +221,12 @@ passing tests below apply only to their recorded source and exercised cases.
     byte-for-byte. Independent cleanup checks found no remaining test network
     namespaces, loop devices, or fixture firewall rules. Workflow syntax and the diagnostic log-copy
     step were checked locally; the hosted CI job has not been run here.
+
+  - [ ] Archive successful topology peer logs before the fixture deletes its
+    process directory. The post-suite collector preserves failure diagnostics,
+    but finds no peer logs after successful fixture cleanup. Preserve only the
+    fixture's top-level daemon logs in a separate private artifact directory;
+    never walk protected source payloads. Qualify both success and failure paths.
 
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and

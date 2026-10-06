@@ -393,24 +393,6 @@ pub(crate) fn repository_diff_for_scope(
     repository_diff_with_directory(control, scope, working_root, cached)
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn repository_diff_for_guarded(
-    control: &ControlStore,
-    repository_id: Uuid,
-    root: &Path,
-    cached: bool,
-) -> Result<GitDiff, DiffError> {
-    let working_root = (!cached)
-        .then(|| PinnedReadDirectory::open_transient(root))
-        .transpose()?;
-    repository_diff_with_directory(
-        control,
-        GitWorktreeScope::primary(repository_id),
-        working_root,
-        cached,
-    )
-}
-
 fn repository_diff_with_directory(
     control: &ControlStore,
     scope: GitWorktreeScope,

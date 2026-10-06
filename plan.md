@@ -8,9 +8,10 @@ them as ADRs and test vectors before promising wire compatibility.
 source backend and its product integration. Protected folders remain ordinary
 native filesystem directories. FUSE completion, guarded Git integration, and
 the guarded recapture bug are canceled work; the removal and existing-state
-transition replace them. This is a plan change, not a claim that the source has
-already been deleted. Historical guarded implementation reports below remain
-evidence only and do not authorize continued development. The current removal
+transition replace them. The runtime and dependency are now removed; verified
+historical export and the complete upgrade policy remain open. Historical guarded
+implementation reports below remain evidence only and do not authorize continued
+development. The current removal
 contract is in section 4; the remaining non-FUSE corrections and release gates
 are in section 8 and `TODO.md`. Native Windows/macOS, metadata, watchers,
 application-consistent capture, and the Git byte-preservation requirements
@@ -849,16 +850,19 @@ Proactive background repair comes later.
 
 ### Remove the FUSE-backed guarded backend (R1)
 
-The first implementation increment withdraws enrollment/removal CLI commands
+The implementation withdraws enrollment/removal CLI commands
 and rejects their legacy control requests. Startup now inspects the existing
 encrypted catalog read-only before rekeying, schema migration, cleanup, or
 replay, and rejects identified guarded roots, bindings, journals, and pending
 capture/recovered-anchor plans. Source-loss recovery refuses guarded enrollment
 before publishing its job. Serialized backend identities remain stable. The
 [preservation procedure](docs/guarded-withdrawal.md) describes rejection and the
-absence of a qualified migration tool. Runtime/dependency deletion, historical
-revision inventory, and verified export remain required; this increment does
-not close R1.
+absence of a qualified migration tool. The mount runtime, supervisor, guarded
+capture/publication and Git operations, link-freeze machinery, and `fuser`
+dependency are removed. Minimal historical decoding and marker recognition
+remain. Native seed recovery, retention/prune, and repeated owner-loss coverage
+replace the useful generic guarded fixtures. Historical inventory with unavailable
+metadata and verified mount-free export remain required; R1 is still open.
 
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
 implementation, enrollment and recovery publication paths, guarded Git
@@ -1268,7 +1272,7 @@ that guarded completion is required.
 
 ### Production corrections from the 2026-10-05 source review
 
-These are planned corrections, not completed fixes or new runtime evidence.
+These are the correction requirements; completed increments are recorded below.
 `TODO.md` owns their open status and evidence. Retain existing passing safety
 checks while adding the specific missing behavior.
 

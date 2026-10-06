@@ -15,14 +15,16 @@ Source-loss recovery cannot enroll a guarded revision as a new root.
 Decoded legacy capture plans cannot capture, replay, detach edits, or discard
 anchors through the versioned source-backend API.
 
-This is the first removal step. The implementation and its dependency are still
-present while the remaining legacy formats and shared recovery code are audited.
+The mount runtime, supervisor, capture/publication paths, guarded Git operations,
+link-freeze machinery, and `fuser` dependency have been removed. Minimal historical
+record decoding and marker recognition remain for rejection and preservation.
+Ordinary and linked-worktree stage journals are inspected even when their backend
+binding is absent; neither initialization nor reopening can migrate them first.
 There is no supported automatic migration or offline export tool in this build.
 Offline Git catalogs and revision metadata not yet downloaded during seed
 recovery cannot be classified by the startup check. Recovery admission must
 classify the downloaded metadata before publishing a restore job or enrolling
-its root. The remaining runtime removal and complete recovery/export policy
-are still tracked in R1.
+its root. The complete recovery/export policy remains tracked in R1.
 Do not interpret a successfully opened native catalog as proof that all retained
 history has been converted.
 

@@ -38,5 +38,5 @@ symlinks, linked worktrees, merge, restore/reset, stock-Git exchange, and
 conversion-inducing config and attributes. This source audit covers the
 remaining command mapping; the full milestone gate still requires its exact
 source local acceptance and the non-FUSE production gates in `plan.md`.
-Guarded/FUSE work is withdrawn and scheduled for removal; the remaining source
-does not add a requirement to complete Git-on-FUSE.
+The guarded/FUSE runtime and dependency have been removed. Historical record
+decoders serve admission and preservation; Git-on-FUSE work is canceled.

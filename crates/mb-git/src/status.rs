@@ -341,19 +341,6 @@ pub(crate) fn repository_status_for_scope(
     repository_status_with_directory(control, scope, PinnedReadDirectory::open(root)?)
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn repository_status_for_guarded(
-    control: &ControlStore,
-    repository_id: Uuid,
-    root: &Path,
-) -> Result<GitStatus, StatusError> {
-    repository_status_with_directory(
-        control,
-        GitWorktreeScope::primary(repository_id),
-        PinnedReadDirectory::open_transient(root)?,
-    )
-}
-
 fn repository_status_with_directory(
     control: &ControlStore,
     scope: GitWorktreeScope,

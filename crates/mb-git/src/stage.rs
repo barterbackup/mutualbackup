@@ -7,8 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-#[cfg(target_os = "linux")]
-use std::ffi::OsString;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -21,8 +19,6 @@ use mb_store::{
     NativeFileId, PinnedDirectory, SourceBackendKind, SourceFileCaptureError,
     SourceFileCapturePlan,
 };
-#[cfg(target_os = "linux")]
-use mb_store::{GuardedGitRecoveryPin, GuardedGitStagePin};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -51,245 +47,6 @@ const WORKTREE_STAGE_INTENT_PREFIX: &str = "git-worktree-stage-intent-v1/";
 const WORKTREE_SYMLINK_INTENT_PREFIX: &str = "git-worktree-symlink-stage-intent-v1/";
 const WORKTREE_INDEX_PREFIX: &str = "git-worktree-index-entry-v1/";
 const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
-#[cfg(target_os = "linux")]
-const GUARDED_STAGE_RECEIPT_PREFIX: &str = "git-guarded-stage-receipt-v1/";
-#[cfg(target_os = "linux")]
-const GUARDED_RECOVERY_REBIND_PREFIX: &str = "git-guarded-recovery-rebind-v1/";
-
-#[cfg(target_os = "linux")]
-pub(crate) fn guarded_recovery_rebind_kind(repository_id: Uuid) -> String {
-    format!("{GUARDED_RECOVERY_REBIND_PREFIX}{repository_id}")
-}
-
-#[cfg(target_os = "linux")]
-fn validate_recovery_rebind(record: &GuardedGitRecoveryPin) -> Result<Oid, StageError> {
-    record
-        .root_anchor_id()
-        .map_err(|_| StageError::IncompatibleRecord)?;
-    Oid::from_bytes(&record.oid).map_err(|_| StageError::IncompatibleRecord)
-}
-
-/// Validate every durable recovered mapping without needing the imported
-/// payload, which may have been physically retired after publication.
-#[cfg(target_os = "linux")]
-pub(crate) fn guarded_catalog_recovery_rebinds(
-    control: &ControlStore,
-    repository_id: Uuid,
-) -> Result<Vec<GuardedGitRecoveryPin>, StageError> {
-    if repository_id.is_nil() {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let mut rebinds = Vec::new();
-    for (key, bytes) in control.records(&guarded_recovery_rebind_kind(repository_id))? {
-        let record: GuardedGitRecoveryPin = decode_canonical(&bytes)?;
-        let oid = validate_recovery_rebind(&record)?;
-        if record.repository_id != repository_id
-            || key != record.imported.anchor_id.as_bytes()
-            || canonical_bytes(&record)? != bytes
-            || control.get_record(
-                &object_kind(repository_id, oid),
-                record.root_file.anchor_id.as_bytes(),
-            )? != Some(canonical_bytes(&record.root_file)?)
-        {
-            return Err(StageError::IncompatibleRecord);
-        }
-        rebinds.push(record);
-    }
-    rebinds.sort_by_key(|record| record.imported.anchor_id);
-    Ok(rebinds)
-}
-
-/// Atomically replace an imported blob's object map with a verified virtual
-/// root-file mapping and publish the catalog receipt. A caller must establish
-/// a node-owned root pin before this operation and retire the imported payload
-/// only after both halves match on replay.
-#[cfg(target_os = "linux")]
-pub(crate) fn rebind_recovered_guarded_blob(
-    control: &ControlStore,
-    record: &GuardedGitRecoveryPin,
-) -> Result<(), StageError> {
-    let oid = validate_recovery_rebind(record)?;
-    let kind = object_kind(record.repository_id, oid);
-    let key = record.imported.anchor_id.as_bytes();
-    let receipt_kind = guarded_recovery_rebind_kind(record.repository_id);
-    let encoded = canonical_bytes(record)?;
-    let virtual_bytes = canonical_bytes(&record.root_file)?;
-    if let Some(existing) = control.get_record(&receipt_kind, key)? {
-        if existing != encoded || control.get_record(&kind, key)? != Some(virtual_bytes) {
-            return Err(StageError::IncompatibleRecord);
-        }
-        return Ok(());
-    }
-    if guarded_catalog_stage_pins(control, record.repository_id)?
-        .iter()
-        .any(|pin| pin.manifest.anchor_id == record.imported.anchor_id)
-        || control
-            .records_with_kind_prefix(&object_kind_prefix(record.repository_id))?
-            .iter()
-            .any(|(mapped_kind, mapped_key, _)| mapped_key == key && mapped_kind != &kind)
-        || blob_oid_from_anchor(&record.imported)? != oid
-        || blob_oid_from_anchor(&record.root_file)? != oid
-    {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let imported_bytes = canonical_bytes(&record.imported)?;
-    if control.get_record(&kind, key)? != Some(imported_bytes.clone()) {
-        return Err(StageError::IncompatibleRecord);
-    }
-    control.put_records_and_retire_if_value(
-        &[
-            (kind.clone(), key.to_vec(), virtual_bytes),
-            (receipt_kind, key.to_vec(), encoded),
-        ],
-        &kind,
-        key,
-        &imported_bytes,
-    )?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn guarded_stage_receipt_kind(repository_id: Uuid) -> String {
-    format!("{GUARDED_STAGE_RECEIPT_PREFIX}{repository_id}")
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn guarded_stage_receipt_matches(
-    control: &ControlStore,
-    pin: &GuardedGitStagePin,
-) -> Result<bool, StageError> {
-    if pin.repository_id.is_nil()
-        || pin.worktree_id.is_nil()
-        || pin.root_anchor_id.is_nil()
-        || pin.attempt_id.is_nil()
-        || !matches!(pin.git_mode, 0o100644 | 0o100755)
-        || pin
-            .manifest
-            .guarded_root_file
-            .as_ref()
-            .is_some_and(|backing| backing.root_anchor_id != pin.root_anchor_id)
-    {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let path = PathBuf::from(OsString::from_vec(pin.relative_path.clone()));
-    if stage_path_key(&path)? != pin.relative_path {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let kind = guarded_stage_receipt_kind(pin.repository_id);
-    let Some(bytes) = control.get_record(&kind, pin.attempt_id.as_bytes())? else {
-        return Ok(false);
-    };
-    let receipt: GuardedStageReceipt = decode_canonical(&bytes)?;
-    if receipt.format_version != 1
-        || receipt.repository_id != pin.repository_id
-        || receipt.worktree_id != pin.worktree_id
-        || receipt.root_anchor_id != pin.root_anchor_id
-        || receipt.attempt_id != pin.attempt_id
-        || receipt.relative_path != pin.relative_path
-        || receipt.manifest != pin.manifest
-        || receipt.entry.format_version != 1
-        || receipt.entry.mode != pin.git_mode
-        || receipt.entry.anchor_id != pin.manifest.anchor_id
-        || canonical_bytes(&receipt)? != bytes
-    {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let oid = Oid::from_bytes(&receipt.entry.oid).map_err(|_| StageError::IncompatibleRecord)?;
-    let mapped = control.get_record(
-        &object_kind(pin.repository_id, oid),
-        pin.manifest.anchor_id.as_bytes(),
-    )?;
-    if mapped.as_deref() != Some(canonical_bytes(&pin.manifest)?.as_slice()) {
-        return Err(StageError::IncompatibleRecord);
-    }
-    Ok(true)
-}
-
-/// Read the catalog side of the cross-database guarded handoff. A receipt
-/// remains after a newer stage replaces its index entry, so every receipt
-/// must still have its original object mapping and an owner in node control.
-/// Root-backed virtual mappings are always guarded and may not appear without
-/// a receipt even if the node-side pin was lost.
-#[cfg(target_os = "linux")]
-pub(crate) fn guarded_catalog_stage_pins(
-    control: &ControlStore,
-    repository_id: Uuid,
-) -> Result<Vec<GuardedGitStagePin>, StageError> {
-    if repository_id.is_nil() {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let mut pins = Vec::new();
-    let mut by_anchor = std::collections::HashMap::new();
-    let recovered = guarded_catalog_recovery_rebinds(control, repository_id)?;
-    let recovered_by_anchor = recovered
-        .iter()
-        .map(|record| (record.root_file.anchor_id, record))
-        .collect::<std::collections::HashMap<_, _>>();
-    let kind = guarded_stage_receipt_kind(repository_id);
-    for (key, bytes) in control.records(&kind)? {
-        let receipt: GuardedStageReceipt = decode_canonical(&bytes)?;
-        if receipt.format_version != 1
-            || receipt.repository_id != repository_id
-            || key != receipt.attempt_id.as_bytes()
-            || receipt.manifest.anchor_id != receipt.entry.anchor_id
-            || canonical_bytes(&receipt)? != bytes
-        {
-            return Err(StageError::IncompatibleRecord);
-        }
-        let oid = receipt.entry.oid;
-        let pin = GuardedGitStagePin {
-            repository_id,
-            root_anchor_id: receipt.root_anchor_id,
-            manifest: receipt.manifest,
-            attempt_id: receipt.attempt_id,
-            worktree_id: receipt.worktree_id,
-            relative_path: receipt.relative_path,
-            git_mode: receipt.entry.mode,
-        };
-        if !guarded_stage_receipt_matches(control, &pin)?
-            || by_anchor
-                .insert(pin.manifest.anchor_id, (pin.clone(), oid))
-                .is_some()
-        {
-            return Err(StageError::IncompatibleRecord);
-        }
-        pins.push(pin);
-    }
-    for (kind, key, bytes) in
-        control.records_with_kind_prefix(&object_kind_prefix(repository_id))?
-    {
-        let manifest: FileAnchorManifest = decode_canonical(&bytes)?;
-        if manifest.guarded_root_file.is_some() {
-            match (
-                by_anchor.get(&manifest.anchor_id),
-                recovered_by_anchor.get(&manifest.anchor_id),
-            ) {
-                (Some((pin, oid)), None) => {
-                    let oid = Oid::from_bytes(oid).map_err(|_| StageError::IncompatibleRecord)?;
-                    if key != manifest.anchor_id.as_bytes()
-                        || manifest != pin.manifest
-                        || kind != object_kind(repository_id, oid)
-                    {
-                        return Err(StageError::IncompatibleRecord);
-                    }
-                }
-                (None, Some(rebind)) => {
-                    let oid =
-                        Oid::from_bytes(&rebind.oid).map_err(|_| StageError::IncompatibleRecord)?;
-                    if key != manifest.anchor_id.as_bytes()
-                        || manifest != rebind.root_file
-                        || kind != object_kind(repository_id, oid)
-                    {
-                        return Err(StageError::IncompatibleRecord);
-                    }
-                }
-                _ => return Err(StageError::IncompatibleRecord),
-            }
-        }
-    }
-    pins.sort_by_key(|pin| pin.attempt_id);
-    Ok(pins)
-}
 
 #[cfg(test)]
 thread_local! {
@@ -375,19 +132,6 @@ pub struct GitIndexEntry {
     pub anchor_id: Uuid,
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct GuardedStageReceipt {
-    format_version: u16,
-    repository_id: Uuid,
-    worktree_id: Uuid,
-    root_anchor_id: Uuid,
-    attempt_id: Uuid,
-    relative_path: Vec<u8>,
-    manifest: FileAnchorManifest,
-    entry: GitIndexEntry,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct StageIntent {
     format_version: u16,
@@ -454,6 +198,33 @@ impl From<SymlinkStageIntentV1> for SymlinkStageIntent {
             catalog_root: None,
         }
     }
+}
+
+/// Classify capture journals before catalog initialization or replay. A legacy
+/// intent can survive its backend binding, including in a linked worktree.
+pub(crate) fn require_native_stage_state(control: &ControlStore) -> anyhow::Result<()> {
+    for prefix in [INTENT_PREFIX, WORKTREE_STAGE_INTENT_PREFIX] {
+        control.for_each_record_value_with_kind_prefix(prefix, |bytes| {
+            let intent: StageIntent = decode_canonical(bytes)?;
+            intent.plan.backend_kind().require_supported()?;
+            Ok(())
+        })?;
+    }
+    for prefix in [SYMLINK_INTENT_PREFIX, WORKTREE_SYMLINK_INTENT_PREFIX] {
+        control.for_each_record_value_with_kind_prefix(prefix, |bytes| {
+            let intent: SymlinkStageIntent = match decode_canonical(bytes) {
+                Ok(intent) => intent,
+                Err(_) => {
+                    SymlinkStageIntent::from(decode_canonical::<SymlinkStageIntentV1>(bytes)?)
+                }
+            };
+            if let Some(plan) = intent.plan {
+                plan.backend_kind().require_supported()?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 fn intent_kind_for_scope(scope: GitWorktreeScope) -> String {
@@ -935,106 +706,6 @@ fn finish_stage_for_scope(
     Ok(entry)
 }
 
-/// Publish a node-pinned guarded capture into the Git catalog. The node's
-/// control database owns the capture before this call; one catalog transaction
-/// publishes the object map, index entry, and exact attempt receipt. Replaying
-/// a receipt never rewrites a path that was staged again later.
-#[cfg(target_os = "linux")]
-pub(crate) fn publish_guarded_stage_for_scope(
-    control: &ControlStore,
-    scope: GitWorktreeScope,
-    pin: &GuardedGitStagePin,
-) -> Result<GitIndexEntry, StageError> {
-    if pin.repository_id != scope.repository_id()
-        || pin.worktree_id != scope.worktree_id()
-        || pin.root_anchor_id.is_nil()
-        || pin.attempt_id.is_nil()
-        || !matches!(pin.git_mode, 0o100644 | 0o100755)
-        || pin
-            .manifest
-            .guarded_root_file
-            .as_ref()
-            .is_some_and(|backing| backing.root_anchor_id != pin.root_anchor_id)
-    {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let path = PathBuf::from(OsString::from_vec(pin.relative_path.clone()));
-    let key = stage_path_key(&path)?;
-    if key != pin.relative_path {
-        return Err(StageError::IncompatibleRecord);
-    }
-    let oid = blob_oid_from_anchor(&pin.manifest)?;
-    let entry = GitIndexEntry {
-        format_version: 1,
-        oid: oid.as_bytes().try_into().expect("SHA-1 OID has 20 bytes"),
-        mode: pin.git_mode,
-        anchor_id: pin.manifest.anchor_id,
-    };
-    let receipt = GuardedStageReceipt {
-        format_version: 1,
-        repository_id: pin.repository_id,
-        worktree_id: pin.worktree_id,
-        root_anchor_id: pin.root_anchor_id,
-        attempt_id: pin.attempt_id,
-        relative_path: key.clone(),
-        manifest: pin.manifest.clone(),
-        entry: entry.clone(),
-    };
-    let receipt_kind = guarded_stage_receipt_kind(scope.repository_id());
-    let receipt_bytes = canonical_bytes(&receipt)?;
-    if let Some(existing) = control.get_record(&receipt_kind, pin.attempt_id.as_bytes())? {
-        let recorded: GuardedStageReceipt = decode_canonical(&existing)?;
-        if existing != receipt_bytes || recorded != receipt {
-            return Err(StageError::IncompatibleRecord);
-        }
-        let mapped = control.get_record(
-            &object_kind(scope.repository_id(), oid),
-            pin.manifest.anchor_id.as_bytes(),
-        )?;
-        if mapped.as_deref() != Some(canonical_bytes(&pin.manifest)?.as_slice()) {
-            return Err(StageError::IncompatibleRecord);
-        }
-        return Ok(entry);
-    }
-    if control
-        .get_record(&intent_kind_for_scope(scope), &key)?
-        .is_some()
-        || control
-            .get_record(&symlink_intent_kind_for_scope(scope), &key)?
-            .is_some()
-        || control
-            .get_record(&crate::rm::intent_kind_for_scope(scope), &key)?
-            .is_some()
-    {
-        return Err(StageError::PendingStage);
-    }
-    for existing in anchors_for_oid(control, scope.repository_id(), oid)? {
-        require_same_blob_bytes(&existing, &pin.manifest)?;
-    }
-    let mut records = vec![
-        (
-            object_kind(scope.repository_id(), oid),
-            pin.manifest.anchor_id.as_bytes().to_vec(),
-            canonical_bytes(&pin.manifest)?,
-        ),
-        (
-            index_kind_for_scope(scope),
-            key.clone(),
-            canonical_bytes(&entry)?,
-        ),
-        (
-            receipt_kind,
-            pin.attempt_id.as_bytes().to_vec(),
-            receipt_bytes,
-        ),
-    ];
-    if let Some(resolution) = resolution_record_for_stage(control, scope, &key, true)? {
-        records.push(resolution);
-    }
-    control.put_records_and_delete(&records, &[])?;
-    Ok(entry)
-}
-
 /// Stage an exact regular-file snapshot. The caller must serialize writes to
 /// this repository's catalog; a failed add keeps a replayable intent.
 pub fn stage_file(
@@ -1512,8 +1183,7 @@ mod tests {
     use git2::Oid;
     use mb_core::canonical_bytes;
     use mb_store::{
-        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, GuardedGitStagePin,
-        GuardedRootFileBacking, NativeFileId, PinnedDirectory, SourceBackendKind,
+        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceBackendKind,
         SourceFileCapturePlan, StableAnchorAreaLocator,
     };
     use serde::Serialize;
@@ -1530,119 +1200,108 @@ mod tests {
     use crate::merge::{MergeSession, merge_state_for_scope, store_merge_session_for_scope};
 
     #[test]
-    fn guarded_stage_receipt_replays_without_rewriting_a_later_index() {
-        let temporary = tempfile::tempdir().unwrap();
-        let repository_id = Uuid::new_v4();
-        let root_anchor_id = Uuid::new_v4();
-        let scope = GitWorktreeScope::primary(repository_id);
-        let catalog_path = temporary.path().join("catalog.db");
-        let make_pin = |bytes: &'static [u8]| GuardedGitStagePin {
-            repository_id,
-            root_anchor_id,
-            manifest: mb_store::SourceBlobImportPlan::plan_direct(
-                temporary.path(),
-                bytes.len() as u64,
-            )
-            .unwrap()
-            .capture(std::io::Cursor::new(bytes))
-            .unwrap(),
-            attempt_id: Uuid::new_v4(),
-            worktree_id: repository_id,
-            relative_path: b"tracked".to_vec(),
-            git_mode: 0o100644,
-        };
-        let first = make_pin(b"alpha");
-        let control = ControlStore::open_with_key(&catalog_path, &[31; 32]).unwrap();
-        assert!(!super::guarded_stage_receipt_matches(&control, &first).unwrap());
-        let first_entry = super::publish_guarded_stage_for_scope(&control, scope, &first).unwrap();
-        assert!(super::guarded_stage_receipt_matches(&control, &first).unwrap());
-        assert_eq!(
-            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
-            Some(first_entry.clone())
-        );
-        drop(control);
-        let control = ControlStore::open_existing_with_key(&catalog_path, &[31; 32]).unwrap();
-        assert_eq!(
-            super::publish_guarded_stage_for_scope(&control, scope, &first).unwrap(),
-            first_entry
-        );
-        let second = make_pin(b"bravo");
-        let second_entry =
-            super::publish_guarded_stage_for_scope(&control, scope, &second).unwrap();
-        assert_eq!(
-            super::publish_guarded_stage_for_scope(&control, scope, &first).unwrap(),
-            first_entry
-        );
-        assert_eq!(
-            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
-            Some(second_entry.clone())
-        );
-        let linked_scope = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
-        let mut linked = make_pin(b"linked");
-        linked.worktree_id = linked_scope.worktree_id();
-        let linked_entry =
-            super::publish_guarded_stage_for_scope(&control, linked_scope, &linked).unwrap();
-        assert_eq!(
-            staged_entry_for_scope(&control, linked_scope, "tracked").unwrap(),
-            Some(linked_entry)
-        );
-        assert_eq!(
-            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
-            Some(second_entry)
-        );
-        let mut altered = first.clone();
-        altered.git_mode = 0o100755;
-        assert!(matches!(
-            super::guarded_stage_receipt_matches(&control, &altered),
-            Err(StageError::IncompatibleRecord)
-        ));
-        assert!(matches!(
-            super::publish_guarded_stage_for_scope(&control, scope, &altered),
-            Err(StageError::IncompatibleRecord)
-        ));
-        let catalog = super::guarded_catalog_stage_pins(&control, repository_id).unwrap();
-        assert_eq!(catalog.len(), 3);
-        assert!(catalog.contains(&first));
-        assert!(catalog.contains(&second));
-        assert!(catalog.contains(&linked));
-
-        let mut wrong_root = make_pin(b"wrong-root");
-        wrong_root.manifest.format_version = 2;
-        wrong_root.manifest.guarded_root_file = Some(GuardedRootFileBacking {
-            root_anchor_id: Uuid::new_v4(),
-            captured_relative_path: PathBuf::from("tracked"),
-            native_id: NativeFileId {
-                filesystem_id: wrong_root.manifest.area.filesystem_id,
-                inode: 1,
+    fn unbound_guarded_stage_journals_reject_before_catalog_migration() {
+        // Decode the historical field sequence without creating a guarded
+        // source, anchor, mount, or backend binding.
+        let encoded = canonical_bytes(&(
+            1_u16,
+            Uuid::new_v4(),
+            b"/legacy/source".to_vec(),
+            mb_store::NativeFileId {
+                filesystem_id: 3,
+                inode: 4,
             },
-        });
-        assert!(matches!(
-            super::publish_guarded_stage_for_scope(&control, scope, &wrong_root),
-            Err(StageError::IncompatibleRecord)
-        ));
-
-        let mut unreceipted = make_pin(b"virtual").manifest;
-        let oid = crate::blob_oid_from_anchor(&unreceipted).unwrap();
-        unreceipted.format_version = 2;
-        unreceipted.guarded_root_file = Some(GuardedRootFileBacking {
-            root_anchor_id,
-            captured_relative_path: PathBuf::from("tracked"),
-            native_id: NativeFileId {
-                filesystem_id: unreceipted.area.filesystem_id,
-                inode: 1,
+            b"file".to_vec(),
+            (3_u64, 5_u64, 6_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+            0o100644_u32,
+            StableAnchorAreaLocator {
+                area_id: Uuid::new_v4(),
+                path_hint: PathBuf::from("/legacy/anchors"),
+                filesystem_id: 3,
+                volume_root_hint: PathBuf::from("/legacy"),
             },
-        });
-        control
-            .put_record(
-                &super::object_kind(repository_id, oid),
-                unreceipted.anchor_id.as_bytes(),
-                &canonical_bytes(&unreceipted).unwrap(),
-            )
-            .unwrap();
-        assert!(matches!(
-            super::guarded_catalog_stage_pins(&control, repository_id),
-            Err(StageError::IncompatibleRecord)
-        ));
+        ))
+        .unwrap();
+        let legacy =
+            mb_core::decode_canonical::<mb_store::GuardedFileCapturePlan>(&encoded).unwrap();
+        let plan = SourceFileCapturePlan::GuardedLinkFreezeV1(legacy);
+        for (prefix, symlink, old_encoding) in [
+            (super::INTENT_PREFIX, false, false),
+            (super::WORKTREE_STAGE_INTENT_PREFIX, false, false),
+            (super::SYMLINK_INTENT_PREFIX, true, false),
+            (super::WORKTREE_SYMLINK_INTENT_PREFIX, true, false),
+            (super::SYMLINK_INTENT_PREFIX, true, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = temp.path().join(GIT_CATALOG_DIRECTORY);
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = directory.join("catalog.db");
+            let key = [91; 32];
+            let repository_id = Uuid::new_v4();
+            let payload = if symlink {
+                let intent = super::SymlinkStageIntentV1 {
+                    format_version: 1,
+                    repository_id,
+                    source_root: PathBuf::from("/legacy/source"),
+                    root_id: mb_store::NativeFileId {
+                        filesystem_id: 3,
+                        inode: 4,
+                    },
+                    catalog_id: mb_store::NativeFileId {
+                        filesystem_id: 3,
+                        inode: 8,
+                    },
+                    relative_path: PathBuf::from("link"),
+                    source_id: mb_store::NativeFileId {
+                        filesystem_id: 3,
+                        inode: 9,
+                    },
+                    target: b"target".to_vec(),
+                    temp_name: format!("symlink-input-{}", Uuid::new_v4()),
+                    temp_id: Some(mb_store::NativeFileId {
+                        filesystem_id: 3,
+                        inode: 5,
+                    }),
+                    plan: Some(plan.clone()),
+                };
+                if old_encoding {
+                    canonical_bytes(&intent).unwrap()
+                } else {
+                    let mut intent = super::SymlinkStageIntent::from(intent);
+                    intent.format_version = 2;
+                    intent.catalog_root = Some(PathBuf::from("/legacy/catalog"));
+                    canonical_bytes(&intent).unwrap()
+                }
+            } else {
+                canonical_bytes(&super::StageIntent {
+                    format_version: 1,
+                    repository_id,
+                    relative_path: PathBuf::from("file"),
+                    git_mode: 0o100644,
+                    plan: plan.clone(),
+                })
+                .unwrap()
+            };
+            let catalog = ControlStore::open_with_key(&path, &key).unwrap();
+            catalog
+                .put_record(&format!("{prefix}{repository_id}"), b"file", &payload)
+                .unwrap();
+            drop(catalog);
+            let original = fs::read(&path).unwrap();
+            let error =
+                crate::require_native_catalog_state(temp.path(), repository_id, &key).unwrap_err();
+            assert!(
+                error.to_string().contains("withdrawn"),
+                "{prefix}: {error:#}"
+            );
+            let error = crate::GitRepository::init(temp.path(), repository_id, &key)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("withdrawn"), "{prefix}: {error}");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!directory.join(mb_store::GIT_CATALOG_MARKER_FILE).exists());
+        }
     }
 
     #[test]
@@ -1870,74 +1529,6 @@ mod tests {
         assert_eq!(decoded.format_version, 1);
         assert!(decoded.catalog_root.is_none());
         assert_eq!(mb_core::canonical_bytes(&decoded).unwrap(), encoded);
-    }
-
-    #[test]
-    fn guarded_backend_rejects_symlink_stage_before_creating_temporary_input() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("work");
-        let catalog_path = root.join(GIT_CATALOG_DIRECTORY);
-        fs::create_dir_all(&catalog_path).unwrap();
-        symlink("target", root.join("linked")).unwrap();
-        let catalog = PinnedDirectory::open(&catalog_path).unwrap();
-        let control =
-            ControlStore::open_with_key(catalog_path.join("catalog.db"), &[37; 32]).unwrap();
-        let repository_id = Uuid::new_v4();
-        let scope = GitWorktreeScope::primary(repository_id);
-
-        assert!(matches!(
-            super::stage_symlink_for_scope_with_backend(
-                &control,
-                scope,
-                &root,
-                &root,
-                &catalog,
-                Path::new("linked"),
-                SourceBackendKind::GuardedLinkFreezeV1,
-            ),
-            Err(StageError::Anchor(AnchorError::UnsupportedSourceOperation(
-                _
-            )))
-        ));
-        assert!(
-            control
-                .get_record(&super::symlink_intent_kind_for_scope(scope), b"linked")
-                .unwrap()
-                .is_none()
-        );
-
-        let (key, intent) = begin_symlink_stage(
-            &control,
-            repository_id,
-            &root,
-            &catalog,
-            Path::new("linked"),
-        )
-        .unwrap();
-        assert!(matches!(
-            super::finish_symlink_stage(
-                &control,
-                scope,
-                &key,
-                intent.clone(),
-                SourceBackendKind::GuardedLinkFreezeV1,
-            ),
-            Err(StageError::Anchor(AnchorError::UnsupportedSourceOperation(
-                _
-            )))
-        ));
-        assert!(
-            catalog
-                .entry_identity(&intent.temp_name, false)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            control
-                .get_record(&super::symlink_intent_kind_for_scope(scope), &key)
-                .unwrap(),
-            Some(mb_core::canonical_bytes(&intent).unwrap())
-        );
     }
 
     #[test]
