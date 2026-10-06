@@ -1431,8 +1431,19 @@ checks exact recipe/public-source joins, verifies source roots/commitments, and
 hashes streamed sparse Git plaintext against its object ID. Both typed adapters
 and combined root geometry preflight before external staging; interrupted sinks
 retain caller-owned intents without publishing a migration revision. This Linux
-adapter leaves production activation, legacy-address serving/rewrite policy,
-new source authority/publication, retention and the real 1 TiB gate open.
+adapter leaves production activation, automated new source authority/publication,
+retention and the real 1 TiB gate open.
+
+Historical data sources can now retain their original addresses under a new
+paged revision. A bounded authority object verifies the original owner/writer
+signatures and exact data membership before creating a legacy source binding.
+Publication verifies the dataset, exact source and ciphertext commitments;
+ordinary captures still require the scoped content address. Canonical local
+recipes preserve the explicit address policy after reopen and recovery
+replacement, using existing generation fences and atomic anchor pin transfer.
+Original revision/head state remains intact. This completes the source adapter,
+while whole retained-history migration, normal consumer activation, physical
+source lifecycle and capacity/platform qualification remain required.
 
 ### Historical implementation and validation record (before scope correction)
 

@@ -143,6 +143,28 @@ impl PagedPrivateMetadata {
             &CatalogSectorRecord,
         ) -> Result<Option<crate::PagedAnchorSectorSource>>,
     ) -> Result<()> {
+        self.publish_local_catalog_with_authenticated_sources(
+            control,
+            keys,
+            signed,
+            fence,
+            intents,
+            |record| Ok(source_for(record)?.map(crate::PagedDataSource::from)),
+        )
+    }
+
+    /// Publish scoped sources or historical sources authorized by an original
+    /// signed legacy revision. The certified new source root remains the
+    /// authority for serving after reopen; local recipes preserve address mode.
+    pub fn publish_local_catalog_with_authenticated_sources(
+        &self,
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        signed: &SignedRecord<PagedUserRevision>,
+        fence: &mb_core::WriterFence,
+        intents: PagedCatalogIntents,
+        mut source_for: impl FnMut(&CatalogSectorRecord) -> Result<Option<crate::PagedDataSource>>,
+    ) -> Result<()> {
         let bundle = self.local_bundle(signed, intents)?;
         let (record, bootstrap) = self.seal(keys, bundle.scope)?;
         ensure!(
@@ -184,10 +206,9 @@ impl PagedPrivateMetadata {
                         "native source index differs from signed source catalog"
                     );
                     if let Some(source) = source_for(&record)? {
-                        let recipe =
-                            canonical_bytes_bounded(&source, mb_store::PAGED_DATA_RECIPE_BYTES)?;
+                        let recipe = source.encode()?;
                         source.render(keys, bundle.scope, &record)?;
-                        view.bind_data_source(&record, source.locator.anchor_id, &recipe)?;
+                        view.bind_data_source(&record, source.anchor_id(), &recipe)?;
                     }
                 }
                 ensure!(

@@ -17,7 +17,7 @@ mod paged_legacy;
 #[cfg(target_os = "linux")]
 pub use paged_legacy::PagedPrivateStream;
 mod paged_revision;
-pub use paged_data::PagedAnchorSectorSource;
+pub use paged_data::{PagedAnchorSectorSource, PagedDataSource, PagedLegacyDataAuthority};
 mod snapshot;
 mod source_policy;
 mod volume;

@@ -1121,10 +1121,10 @@ passing tests below apply only to their recorded source and exercised cases.
     signed revision/head state. Sink interruption leaves caller-owned staged
     intents for normal cancellation/retry and publishes no migration root.
     This Linux adapter converts bounded old objects; it is not production
-    capture/recovery activation. Old non-content-derived data addresses still
-    need a compatible authenticated source adapter or rewrite policy, and new
-    authority/source-catalog publication, retention and 1 TiB qualification remain
-    open. Plaintext hash work includes declared sparse Git logical bytes.
+    capture/recovery activation. The historical address source adapter below is
+    separate from complete retained-history migration; automated new authority/
+    source-catalog publication, retention and 1 TiB qualification remain open.
+    Plaintext hash work includes declared sparse Git logical bytes.
     Validation: one new Git and four Node fixtures pass. They cover bounded raw
     blob hashing with exact length/EOF and I/O failures; private 1/3/4/5 and both
     frozen version-2 layouts; signed outer formats 3/4/5; raw Git refs/objects,
@@ -1138,6 +1138,32 @@ passing tests below apply only to their recorded source and exercised cases.
     fixes. Final formatting and strict locked workspace/all-targets Clippy pass.
     Sixty-two provisioned Git, 19 store and eight snapshot cases remain ignored;
     native capture/topology/platform and real 1 TiB qualification were not run.
+  - [x] Preserve authenticated historical data addresses when retaining converted
+    native/Git roots. Construct bounded owner/writer-verified legacy membership
+    authority, admit only exact data references and available commitments, and
+    reject metadata IDs, ambiguous duplicates, malformed geometry and wrong
+    datasets. Publish explicit historical sources under the certified paged
+    source root, verifying exact ciphertext and Merkle commitments from bounded
+    stable anchor ranges. Keep normal capture content-address checks strict.
+    Preserve canonical old scoped recipes; require a separate bounded canonical
+    historical encoding with dataset/source/original-revision provenance.
+    Reopen and fenced recovery replacement retain this address policy and
+    existing atomic anchor pin transfer. Original signed revisions/heads remain
+    intact; cancellation fences serving before bounded pin cleanup. The local
+    original revision hash is provenance; serving authority after reopen comes
+    from the retained signed paged root. Whole migration and production activation
+    remain required.
+    Validation: three new Node fixtures cover frozen scoped recipe bytes,
+    malformed/truncated/noncanonical/oversized encodings, signed legacy membership
+    and substitutions/bounds, native-only and Git-bearing conversion/publication,
+    normal-address rejection, damaged source rollback, exact retry, reopen,
+    seed/dataset rejection, lost-source replacement, generation/pin transfer and
+    cancellation/cleanup. Locked workspace/all-targets build and all 41 paged
+    tests pass. Thirty ordinary snapshot/restore and five native adapter tests
+    also pass (76 distinct cases overall). Formatting and strict locked
+    workspace/all-targets Clippy pass. Eight provisioned snapshot cases remain
+    ignored; full native capture/topology/platform, filesystem lifecycle and real
+    1 TiB qualification were not run for this source adapter.
   - [ ] Integrate legacy private conversion with retained revision publication
     and migrate native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

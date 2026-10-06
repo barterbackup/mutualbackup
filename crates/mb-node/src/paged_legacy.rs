@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, ensure};
 use mb_core::{
-    CatalogPageRef, CatalogScope, KeyMaterial, MerkleCommitment, PAGED_USER_REVISION_VERSION,
-    SectorId, SectorRef, SignedRecord, UserRevision, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE,
-    canonical_size_bounded, crypt_sector, merkle_commit, sector_root,
+    CatalogPageRef, KeyMaterial, MerkleCommitment, PAGED_USER_REVISION_VERSION, SectorId,
+    SectorRef, SignedRecord, UserRevision, V1_SECTOR_SIZE, crypt_sector, merkle_commit,
+    sector_root,
 };
 use mb_git::GitCatalogStream;
 
@@ -61,25 +61,7 @@ impl PagedPrivateMetadata {
         load: &mut impl FnMut(&SectorId) -> Result<Vec<u8>>,
         sink: &mut impl FnMut(PagedPrivateStream, CatalogPageRef, Vec<u8>) -> Result<()>,
     ) -> Result<Self> {
-        let length = crate::snapshot::checked_metadata_length(revision)?;
-        ensure!(
-            revision.signature.len() == 64 && revision.value.writer_signature.len() == 64,
-            "legacy revision exceeds bounded conversion geometry"
-        );
-        canonical_size_bounded(revision, V1_MAX_CATALOG_BYTES)?;
-        crate::snapshot::validate_restore_revision(keys, guild_id, revision)?;
-        ensure!(
-            !revision.value.revision_id.is_nil()
-                && !revision.value.protected_root_id.is_nil()
-                && revision.value.sequence > 0
-                && (revision.value.sequence == 1) == revision.value.parent.is_none(),
-            "legacy revision has no protected dataset identity"
-        );
-        let scope = CatalogScope::Dataset {
-            guild_id,
-            owner: keys.node_id(),
-            protected_root_id: revision.value.protected_root_id,
-        };
+        let (scope, length) = crate::paged_data::legacy_revision_scope(keys, guild_id, revision)?;
         let commitments = revision.value.sector_commitments.as_deref();
         if let Some(values) = commitments {
             ensure!(
@@ -223,9 +205,9 @@ mod tests {
     use crate::{PrivateDataExtent, PrivateMetadata};
     use ed25519_dalek::SigningKey;
     use mb_core::{
-        CatalogFileEvent, CatalogFileRecipeRecord, CatalogNativeFileReader, CatalogSection,
-        CatalogSectorBuilder, CatalogSectorRecord, Seed, USER_REVISION_DOMAIN, V1_CIPHER_PROFILE,
-        canonical_bytes, encrypted_sector,
+        CatalogFileEvent, CatalogFileRecipeRecord, CatalogNativeFileReader, CatalogScope,
+        CatalogSection, CatalogSectorBuilder, CatalogSectorRecord, Seed, USER_REVISION_DOMAIN,
+        V1_CIPHER_PROFILE, canonical_bytes, encrypted_sector,
     };
     use mb_git::{
         GitBackupBlob, GitBackupDescriptor, GitBlobCatalogReader, GitBlobRecord, GitDataExtent,
@@ -451,6 +433,510 @@ mod tests {
             BTreeMap::from([([82; 32], ciphertext)]),
         );
         (revision, sources, git)
+    }
+
+    #[test]
+    fn paged_legacy_data_authority_rejects_substitution_and_unsigned_or_unbounded_history() {
+        let (revision, sources, _) = fixture(5, 3, PAYLOAD);
+        let reference = revision.value.data_sectors[0].clone();
+        let data = CatalogSectorRecord {
+            format_version: 1,
+            sector: reference,
+            commitment: merkle_commit(&sources[&[82; 32]]).unwrap(),
+        };
+        let anchor = crate::PagedAnchorSectorSource {
+            locator: mb_store::StableAnchorFileLocator {
+                area: mb_store::StableAnchorAreaLocator {
+                    area_id: Uuid::new_v4(),
+                    path_hint: "/absent".into(),
+                    filesystem_id: 1,
+                    volume_root_hint: "/".into(),
+                },
+                anchor_id: Uuid::new_v4(),
+                relative_path: "payload".into(),
+            },
+            offset: 0,
+        };
+        let authority = crate::PagedLegacyDataAuthority::new(&keys(), [73; 32], &revision).unwrap();
+        let bound = authority.bind(anchor.clone(), &data).unwrap();
+        for case in 0..5 {
+            let mut changed = data.clone();
+            match case {
+                0 => changed.sector.id[0] ^= 1,
+                1 => changed.sector.root[0] ^= 1,
+                2 => changed.sector.logical_len += 1,
+                3 => changed.commitment.root[0] ^= 1,
+                _ => changed.format_version += 1,
+            }
+            assert!(authority.bind(anchor.clone(), &changed).is_err());
+            assert!(bound.render(&keys(), scope(), &changed).is_err());
+        }
+        let metadata = &revision.value.metadata_sectors[0];
+        assert!(
+            authority
+                .bind(
+                    anchor.clone(),
+                    &CatalogSectorRecord {
+                        format_version: 1,
+                        sector: metadata.clone(),
+                        commitment: merkle_commit(&sources[&metadata.id]).unwrap(),
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            bound
+                .render(
+                    &keys(),
+                    CatalogScope::Dataset {
+                        guild_id: [73; 32],
+                        owner: keys().node_id(),
+                        protected_root_id: Uuid::new_v4()
+                    },
+                    &data
+                )
+                .is_err()
+        );
+        assert!(crate::PagedLegacyDataAuthority::new(&keys(), [1; 32], &revision).is_err());
+        assert!(
+            crate::PagedLegacyDataAuthority::new(
+                &KeyMaterial::from_seed(&Seed::from_bytes([1; 32])),
+                [73; 32],
+                &revision
+            )
+            .is_err()
+        );
+        for case in 0..11 {
+            let mut changed = revision.clone();
+            match case {
+                0 => changed.signature[0] ^= 1,
+                1 => changed.value.writer_signature[0] ^= 1,
+                2 => changed.value.data_sectors[0].logical_len = 0,
+                3 => changed.value.protected_root_id = Uuid::nil(),
+                4 => changed.value.sequence = 2,
+                5 => {
+                    changed.value.sector_commitments.as_mut().unwrap().pop();
+                }
+                6 => {
+                    let mut conflict = changed.value.data_sectors[0].clone();
+                    conflict.root[0] ^= 1;
+                    changed.value.data_sectors.push(conflict);
+                    let commitment = changed
+                        .value
+                        .sector_commitments
+                        .as_ref()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .clone();
+                    changed
+                        .value
+                        .sector_commitments
+                        .as_mut()
+                        .unwrap()
+                        .push(commitment);
+                }
+                7 => changed.value.data_sectors[0].id = changed.value.metadata_sectors[0].id,
+                8 => changed
+                    .signature
+                    .resize(mb_core::V1_MAX_CATALOG_BYTES + 1, 0),
+                9 => changed
+                    .value
+                    .metadata_sectors
+                    .resize(513, changed.value.metadata_sectors[0].clone()),
+                _ => changed.value.format_version = 6,
+            }
+            if matches!(case, 2..=7 | 9) {
+                changed
+                    .value
+                    .sign_writer(&SigningKey::from_bytes(&[72; 32]))
+                    .unwrap();
+                changed = SignedRecord::sign(USER_REVISION_DOMAIN, changed.value, &keys()).unwrap();
+            } else if case == 1 {
+                changed = SignedRecord::sign(USER_REVISION_DOMAIN, changed.value, &keys()).unwrap();
+            }
+            assert!(
+                crate::PagedLegacyDataAuthority::new(&keys(), [73; 32], &changed).is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn paged_legacy_sources_publish_reopen_replace_and_release_without_address_rewrite() {
+        for version in [1, 4, 5] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("protected");
+            std::fs::create_dir(&root).unwrap();
+            let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+            let make_anchor = |prefix: &[u8]| {
+                let anchor_id = Uuid::new_v4();
+                let directory = area.path_hint.join(anchor_id.to_string());
+                std::fs::create_dir(&directory).unwrap();
+                let file = directory.join("payload");
+                let mut bytes = prefix.to_vec();
+                bytes.extend_from_slice(PAYLOAD);
+                std::fs::write(&file, &bytes).unwrap();
+                (
+                    crate::PagedAnchorSectorSource {
+                        locator: mb_store::StableAnchorFileLocator {
+                            area: area.clone(),
+                            anchor_id,
+                            relative_path: "payload".into(),
+                        },
+                        offset: prefix.len() as u64,
+                    },
+                    file,
+                    bytes,
+                )
+            };
+            let (anchor, file, correct) = make_anchor(b"original");
+            let (replacement, replacement_file, replacement_bytes) = make_anchor(b"replacement");
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (legacy, sources, git) =
+                fixture(version, if version == 4 { 1 } else { 3 }, PAYLOAD);
+            let original = canonical_bytes(&legacy).unwrap();
+            store
+                .put_record(
+                    "user-revision",
+                    legacy.value.revision_id.as_bytes(),
+                    &original,
+                )
+                .unwrap();
+            store
+                .put_record("user-revision-head", b"sentinel", b"unchanged")
+                .unwrap();
+            let authority =
+                crate::PagedLegacyDataAuthority::new(&keys(), [73; 32], &legacy).unwrap();
+            let new_intent = |section| CatalogIntent {
+                id: Uuid::new_v4(),
+                scope: scope(),
+                section,
+            };
+            let intents = crate::PagedCatalogIntents {
+                native: [
+                    new_intent(CatalogSection::FileMetadata),
+                    new_intent(CatalogSection::FileMetadata),
+                ],
+                sources: new_intent(CatalogSection::SectorReferences),
+                git: git.map(|_| {
+                    [
+                        new_intent(CatalogSection::GitGraph),
+                        new_intent(CatalogSection::GitGraph),
+                        new_intent(CatalogSection::GitGraph),
+                    ]
+                }),
+            };
+            let roles: Vec<_> = intents
+                .native
+                .into_iter()
+                .chain(intents.git.into_iter().flatten())
+                .collect();
+            for intent in roles.iter().chain([&intents.sources]) {
+                store.begin_catalog(*intent).unwrap();
+            }
+            let mut pages = BTreeMap::new();
+            let private = PagedPrivateMetadata::convert_legacy_revision(
+                &keys(),
+                [73; 32],
+                &legacy,
+                &mut |id| Ok(sources[id].clone()),
+                &mut |stream, page, bytes| {
+                    let intent = roles[stream.index()];
+                    store.stage_catalog_page(intent, page, &bytes)?;
+                    pages.insert(page.hash, (intent.section, page, bytes));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let (metadata, _) = private.seal(&keys(), scope()).unwrap();
+            let data = CatalogSectorRecord {
+                format_version: 1,
+                sector: legacy.value.data_sectors[0].clone(),
+                commitment: merkle_commit(&sources[&[82; 32]]).unwrap(),
+            };
+            let mut records = BTreeMap::from([
+                (data.sector.id, data.clone()),
+                (metadata.sector.id, metadata.clone()),
+            ]);
+            for (section, page, bytes) in pages.values() {
+                let (sector, ciphertext) = page
+                    .seal_private_page(
+                        &keys().guild_content_id_key(&[73; 32]),
+                        &keys().guild_data_key(&[73; 32]),
+                        scope(),
+                        *section,
+                        bytes,
+                    )
+                    .unwrap();
+                records.insert(
+                    sector.id,
+                    CatalogSectorRecord {
+                        format_version: 1,
+                        sector,
+                        commitment: merkle_commit(&ciphertext).unwrap(),
+                    },
+                );
+            }
+            let mut builder = CatalogSectorBuilder::new(scope()).unwrap();
+            let mut sink =
+                |page, bytes: Vec<u8>| store.stage_catalog_page(intents.sources, page, &bytes);
+            for record in records.values() {
+                builder.push(record, &mut sink).unwrap();
+            }
+            let public_sources = builder.finish(&mut sink).unwrap();
+            let writer = SigningKey::from_bytes(&[72; 32]);
+            let signed = mb_core::PagedUserRevision {
+                format_version: PAGED_USER_REVISION_VERSION,
+                guild_id: [73; 32],
+                protected_root_id: root_id(),
+                cipher_profile: V1_CIPHER_PROFILE,
+                revision_id: Uuid::new_v4(),
+                owner: keys().node_id(),
+                writer_epoch: 1,
+                writer_public_key: writer.verifying_key().to_bytes(),
+                writer_signature: vec![],
+                sequence: 1,
+                parent: None,
+                metadata,
+                sources: public_sources,
+            }
+            .sign(&writer, &keys())
+            .unwrap();
+            let fence = mb_core::WriterFence {
+                owner: keys().node_id(),
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            };
+            let id = signed.value.revision_id;
+            // The ordinary capture API must not silently accept historical IDs.
+            assert!(
+                private
+                    .publish_local_catalog_with_data_sources(
+                        &store,
+                        &keys(),
+                        &signed,
+                        &fence,
+                        intents,
+                        |record| Ok((record == &data).then(|| anchor.clone())),
+                    )
+                    .is_err()
+            );
+            assert!(store.paged_revision_catalog(id).unwrap().is_none());
+            assert!(
+                !store
+                    .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                    .unwrap()
+            );
+            std::fs::write(&file, b"wrong historical source bytes").unwrap();
+            assert!(
+                private
+                    .publish_local_catalog_with_authenticated_sources(
+                        &store,
+                        &keys(),
+                        &signed,
+                        &fence,
+                        intents,
+                        |record| if record == &data {
+                            authority.bind(anchor.clone(), record).map(Some)
+                        } else {
+                            Ok(None)
+                        },
+                    )
+                    .is_err()
+            );
+            assert!(store.paged_revision_catalog(id).unwrap().is_none());
+            assert!(
+                !store
+                    .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                    .unwrap()
+            );
+            std::fs::write(&file, correct).unwrap();
+            private
+                .publish_local_catalog_with_authenticated_sources(
+                    &store,
+                    &keys(),
+                    &signed,
+                    &fence,
+                    intents,
+                    |record| {
+                        if record == &data {
+                            authority.bind(anchor.clone(), record).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )
+                .unwrap();
+            // Exact publication retry preserves the canonical source binding.
+            private
+                .publish_local_catalog_with_authenticated_sources(
+                    &store,
+                    &keys(),
+                    &signed,
+                    &fence,
+                    intents,
+                    |record| {
+                        if record == &data {
+                            authority.bind(anchor.clone(), record).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )
+                .unwrap();
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            let read = || {
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    id,
+                    data.sector.id,
+                    scope(),
+                )
+            };
+            assert_eq!(read().unwrap(), Some(sources[&data.sector.id].clone()));
+            assert!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &KeyMaterial::from_seed(&Seed::from_bytes([1; 32])),
+                    id,
+                    data.sector.id,
+                    scope()
+                )
+                .is_err()
+            );
+            assert!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    id,
+                    data.sector.id,
+                    CatalogScope::Dataset {
+                        guild_id: [73; 32],
+                        owner: keys().node_id(),
+                        protected_root_id: Uuid::new_v4()
+                    }
+                )
+                .is_err()
+            );
+            let expected = store
+                .paged_revision_data_source(id, data.sector.id)
+                .unwrap()
+                .unwrap();
+            std::fs::remove_file(&file).unwrap();
+            assert!(read().is_err());
+            std::fs::write(&replacement_file, b"incorrect replacement").unwrap();
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &expected,
+                    scope(),
+                    &replacement
+                )
+                .is_err()
+            );
+            assert!(
+                !store
+                    .paged_data_anchor_is_pinned(replacement.locator.anchor_id)
+                    .unwrap()
+            );
+            std::fs::write(&replacement_file, replacement_bytes).unwrap();
+            let updated = PagedPrivateMetadata::replace_local_data_source(
+                &store,
+                &keys(),
+                &expected,
+                scope(),
+                &replacement,
+            )
+            .unwrap();
+            assert_eq!(updated.generation, 1);
+            assert_eq!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &expected,
+                    scope(),
+                    &replacement
+                )
+                .unwrap(),
+                updated
+            );
+            assert!(
+                !store
+                    .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                    .unwrap()
+            );
+            assert_eq!(read().unwrap(), Some(sources[&data.sector.id].clone()));
+            let mut forged = updated.clone();
+            forged.recipe = canonical_bytes(&replacement).unwrap();
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &forged,
+                    scope(),
+                    &anchor
+                )
+                .is_err()
+            );
+            assert_eq!(
+                store
+                    .get_record("user-revision", legacy.value.revision_id.as_bytes())
+                    .unwrap(),
+                Some(original)
+            );
+            assert_eq!(
+                store.get_record("user-revision-head", b"sentinel").unwrap(),
+                Some(b"unchanged".to_vec())
+            );
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert_eq!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    id,
+                    data.sector.id,
+                    scope()
+                )
+                .unwrap(),
+                Some(sources[&data.sector.id].clone())
+            );
+            store.cancel_paged_revision_catalog(id).unwrap();
+            assert!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    id,
+                    data.sector.id,
+                    scope()
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                PagedPrivateMetadata::replace_local_data_source(
+                    &store,
+                    &keys(),
+                    &updated,
+                    scope(),
+                    &replacement
+                )
+                .is_err()
+            );
+            assert!(
+                store
+                    .paged_data_anchor_is_pinned(replacement.locator.anchor_id)
+                    .unwrap()
+            );
+            assert!(store.release_paged_revision_data_source(id).unwrap());
+            assert!(!store.release_paged_revision_data_source(id).unwrap());
+            assert!(store.paged_data_anchor_ids().unwrap().is_empty());
+        }
     }
 
     #[test]

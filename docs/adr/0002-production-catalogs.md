@@ -1225,3 +1225,56 @@ pass again after test-only lint fixes. Final formatting and strict locked
 workspace/all-targets Clippy pass. Sixty-two provisioned Git, 19 store and eight
 snapshot cases remain ignored; native capture/topology/platform and real 1 TiB
 qualification were not run for this conversion adapter.
+
+### Historical data source addresses (2026-10-06)
+
+`PagedLegacyDataAuthority` bounds the old signed envelope/private geometry and
+verifies recovering seed/guild, owner and writer signatures, dataset identity,
+sequence shape, data ranges, optional commitment alignment, duplicate reference
+consistency and separation from metadata IDs. It holds a bounded membership
+index and creates opaque `PagedDataSource` values only for exact signed data
+references and available old commitments. This source authority does not approve
+an old private schema; the complete conversion adapter still rejects withdrawn
+private formats 6/7 before producing native/Git roots.
+
+`publish_local_catalog_with_authenticated_sources` accepts these explicit
+historical sources alongside scoped content sources. Under the existing atomic
+publication writer, it checks the dataset and exact signed new source, reads one
+bounded anchor range and verifies both the ciphertext reference and Merkle
+commitment using the original ID. Historical format-3 sources acquire a verified
+Merkle commitment in the new signed source catalog. Ordinary source publication
+still requires the scoped Data content address and never falls back after an
+address mismatch. The newly signed paged source root supplies authority after
+reopen; the old revision hash retained in the local recipe records provenance,
+not an independently replayable signature proof. Original signed revisions and
+heads remain intact for recovery/audit and later migration policy.
+
+The canonical historical local recipe has an explicit version and retains its
+dataset, exact source and original revision identity. Existing two-field scoped
+recipes keep their bytes and semantics. Decoder dispatch is unambiguous: the old
+recipe starts with a UUID byte-string length of 16, the historical recipe with
+version 1. Both require exact bounded canonical bytes; unknown versions,
+truncation, trailing bytes and overlong encodings fail without fallback.
+Replacement preserves the existing address policy, reauthenticates bytes under
+the publication/generation fence and transfers anchor pins atomically. It cannot
+turn a scoped binding into a historical one. Cancellation stops serving before
+bounded source cleanup releases physical retention.
+
+This completes local stable-source compatibility for converted legacy roots.
+It does not automate retained-history conversion/publication, activate normal
+capture/restore or checkpoint/seed-only replay, qualify filesystem lifecycle,
+or establish the declared 1 TiB dataset/history capacity.
+
+Validation: three new Node fixtures cover frozen scoped recipe bytes; unknown,
+truncated, trailing, overlong and oversized local encodings; signed historical
+membership and source/commitment/authority/geometry substitutions; and complete
+native-only plus Git-bearing conversion/publication with original ciphertext
+IDs. They exercise strict normal-address rejection, damaged-source rollback,
+publication/replacement retry, seed/dataset checks, reopen, lost-source recovery,
+generation and pin transfer, original/head preservation and cancellation/cleanup.
+Locked workspace/all-targets build and all 41 paged tests pass (five core, seven
+Git, 17 Node, 12 store). Thirty ordinary snapshot/restore and five native adapter
+tests also pass, for 76 distinct cases. Formatting and strict locked workspace/
+all-targets Clippy pass. Eight provisioned snapshot cases remain ignored; full
+native capture/topology/platform, filesystem lifecycle and real 1 TiB
+qualification were not run for this source adapter.
