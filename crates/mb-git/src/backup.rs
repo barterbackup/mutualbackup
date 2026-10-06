@@ -8,7 +8,9 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use git2::{Branch, ObjectType, Oid, Repository};
-use mb_core::{SectorRef, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_bytes};
+use mb_core::{
+    ModelError, SectorRef, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_size_bounded,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -77,9 +79,12 @@ impl GitBackupDescriptor {
         {
             return Err(GitBackupError::InvalidGraph);
         }
-        let encoded = canonical_bytes(self)?;
-        if encoded.len() > V1_MAX_CATALOG_BYTES {
-            return Err(GitBackupError::TooLarge);
+        match canonical_size_bounded(self, V1_MAX_CATALOG_BYTES) {
+            Ok(_) => {}
+            Err(ModelError::EncodingTooLarge { .. }) => {
+                return Err(GitBackupError::TooLarge);
+            }
+            Err(error) => return Err(error.into()),
         }
         let temporary = tempfile::tempdir()?;
         let repository = Repository::init_bare(temporary.path())?;
@@ -274,6 +279,74 @@ impl GitBackupDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_backup_admission_counts_full_descriptor_at_the_legacy_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::init_bare(directory.path()).unwrap();
+        let tree_oid = repository.treebuilder(None).unwrap().write().unwrap();
+        let tree = repository.find_tree(tree_oid).unwrap();
+        let signature =
+            git2::Signature::new("Author", "a@example.test", &git2::Time::new(0, 0)).unwrap();
+        let mut commit = repository
+            .commit_create_buffer(&signature, &signature, "message", &tree, &[])
+            .unwrap()
+            .to_vec();
+        commit.resize(V1_MAX_CATALOG_BYTES, b'x');
+        let mut descriptor = GitBackupDescriptor {
+            format_version: 4,
+            repository_id: Uuid::from_bytes([1; 16]),
+            refs: vec![GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: [0; 20],
+            }],
+            objects: vec![
+                GitGraphObject {
+                    kind: 1,
+                    oid: [0; 20],
+                    bytes: commit,
+                },
+                GitGraphObject {
+                    kind: 2,
+                    oid: tree_oid.as_bytes().try_into().unwrap(),
+                    bytes: vec![],
+                },
+            ],
+            blobs: vec![],
+            head_branch: "main".to_owned(),
+        };
+        let overhead = canonical_size_bounded(&descriptor, usize::MAX).unwrap()
+            - descriptor.objects[0].bytes.len();
+        assert!(overhead > descriptor.refs[0].name.len());
+        let raw_limit = V1_MAX_CATALOG_BYTES - overhead;
+        for delta in [-1_isize, 0, 1] {
+            descriptor.objects[0]
+                .bytes
+                .resize(raw_limit.checked_add_signed(delta).unwrap(), b'x');
+            let oid = Oid::hash_object(ObjectType::Commit, &descriptor.objects[0].bytes).unwrap();
+            descriptor.objects[0].oid = oid.as_bytes().try_into().unwrap();
+            descriptor.refs[0].oid = descriptor.objects[0].oid;
+            let actual = canonical_size_bounded(&descriptor, usize::MAX).unwrap();
+            assert_eq!(
+                actual,
+                V1_MAX_CATALOG_BYTES.checked_add_signed(delta).unwrap()
+            );
+            let before_oid = descriptor.refs[0].oid;
+            if delta <= 0 {
+                descriptor.validate().unwrap();
+            } else {
+                assert!(matches!(
+                    descriptor.validate(),
+                    Err(GitBackupError::TooLarge)
+                ));
+            }
+            assert_eq!(descriptor.refs[0].oid, before_oid);
+            assert_eq!(
+                descriptor.objects[0].bytes.len(),
+                raw_limit.checked_add_signed(delta).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn annotated_tag_is_reachable_metadata_and_must_match_its_ref() {

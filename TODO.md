@@ -127,6 +127,24 @@ passing tests below apply only to their recorded source and exercised cases.
   geometry, import, and crash/reopen show every accepted protectable graph can
   produce a signed backup descriptor and recover exact refs, IDs, and bytes.
   Rejected mutations preserve the prior catalog and anchors.
+  - [x] Bound canonical encoding before allocation and capture signing.
+    Shared Postcard counting includes nested records, vector lengths and wire
+    overhead, stops at the caller's exact inclusive limit and allocates only
+    the counted output size. Git descriptor validation now checks the full
+    32 MiB encoding without constructing a second descriptor buffer. Capture
+    applies bounded checks to the anchor manifest and complete native/Git
+    private metadata, and counts the enclosing revision with both fixed-size
+    signatures before signing. The native legacy adapter uses the same counter.
+    New fixtures cover exact encoding boundaries, early termination, preserved
+    errors, a changing serializer, a valid Git graph below/at/above 32 MiB,
+    native/Git envelope overhead and both signatures. Native Git capture/restore
+    and rejected-capture repair pass on disposable Btrfs with verified cleanup.
+    All 96 core and 73 ordinary Git tests, 28 ordinary snapshot regressions and
+    six legacy adapter tests pass, with formatting and strict workspace/all-targets
+    Clippy (62 Git and eight snapshot provisioned tests remain ignored in the
+    ordinary suites; the two named Btrfs capture tests were run separately).
+    Mutation preflights, the shared admission contract, oversized-history status
+    and the complete R2 boundary/reopen/recovery qualification remain open.
 
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
   production catalog design.** The first-release acceptance target is **1 TiB

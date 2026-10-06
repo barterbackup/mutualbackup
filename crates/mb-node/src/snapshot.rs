@@ -15,8 +15,9 @@ use mb_core::make_sector_id;
 use mb_core::{
     KeyMaterial, MerkleCommitment, SectorId, SectorPurpose, SectorRef, SignedRecord,
     USER_REVISION_DOMAIN, UserRevision, V1_CIPHER_PROFILE, V1_MAX_CATALOG_BYTES,
-    V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical,
-    encrypted_sector, make_content_sector_id, merkle_commit, sector_root,
+    V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, canonical_bytes_bounded,
+    canonical_size_bounded, crypt_sector, decode_canonical, encrypted_sector,
+    make_content_sector_id, merkle_commit, sector_root,
 };
 use mb_git::{
     GitBackupBlob, GitBackupDescriptor, GitDataExtent, GitGraphObject, GitGraphRef, GitGraphSource,
@@ -984,9 +985,8 @@ pub(crate) fn prepare_revision(
                 .context("capture source anchor")?,
             committed: false,
         };
-        if canonical_bytes(&anchor.manifest)?.len() > V1_MAX_CATALOG_BYTES / 2 {
-            bail!("captured source catalog exceeds the v1 bounded-object limit");
-        }
+        canonical_size_bounded(&anchor.manifest, V1_MAX_CATALOG_BYTES / 2)
+            .context("captured source catalog exceeds the v1 bounded-object limit")?;
         validate_capture_sector_budget(&anchor.manifest)?;
         let encryption_key = keys.guild_data_key(&guild_id);
         let content_id_key = keys.guild_content_id_key(&guild_id);
@@ -1147,22 +1147,30 @@ pub(crate) fn prepare_revision(
                 &mut sector_commitments,
                 graph,
             )?;
-            canonical_bytes(&GitPrivateMetadataV5 {
-                format_version: 5,
-                root_mode: anchor.manifest.root_mode,
-                root_modified_secs: anchor.manifest.root_modified_secs,
-                root_modified_nanos: anchor.manifest.root_modified_nanos,
-                entries: private_entries,
-                git,
-            })?
+            canonical_bytes_bounded(
+                &GitPrivateMetadataV5 {
+                    format_version: 5,
+                    root_mode: anchor.manifest.root_mode,
+                    root_modified_secs: anchor.manifest.root_modified_secs,
+                    root_modified_nanos: anchor.manifest.root_modified_nanos,
+                    entries: private_entries,
+                    git,
+                },
+                V1_MAX_CATALOG_BYTES,
+            )
+            .context("private metadata exceeds the v1 bounded-object limit")?
         } else {
-            canonical_bytes(&PrivateMetadata {
-                format_version: 3,
-                root_mode: anchor.manifest.root_mode,
-                root_modified_secs: anchor.manifest.root_modified_secs,
-                root_modified_nanos: anchor.manifest.root_modified_nanos,
-                entries: private_entries,
-            })?
+            canonical_bytes_bounded(
+                &PrivateMetadata {
+                    format_version: 3,
+                    root_mode: anchor.manifest.root_mode,
+                    root_modified_secs: anchor.manifest.root_modified_secs,
+                    root_modified_nanos: anchor.manifest.root_modified_nanos,
+                    entries: private_entries,
+                },
+                V1_MAX_CATALOG_BYTES,
+            )
+            .context("private metadata exceeds the v1 bounded-object limit")?
         };
         if metadata_bytes.is_empty() || metadata_bytes.len() > V1_MAX_CATALOG_BYTES {
             bail!("private metadata exceeds the v1 bounded-object limit");
@@ -1201,7 +1209,7 @@ pub(crate) fn prepare_revision(
                     .context("captured sector is missing its Merkle commitment")
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut revision = UserRevision {
+        let revision = UserRevision {
             format_version: 5,
             guild_id,
             protected_root_id,
@@ -1217,11 +1225,7 @@ pub(crate) fn prepare_revision(
             data_sectors: data_references,
             sector_commitments: Some(signed_sector_commitments),
         };
-        revision.sign_writer(&writer)?;
-        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, keys)?;
-        if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
-            bail!("revision catalog exceeds the v1 bounded-object limit");
-        }
+        let revision = sign_captured_revision(revision, &writer, keys, V1_MAX_CATALOG_BYTES)?;
         let mut records = recipe_records;
         records.extend([
             (
@@ -1345,6 +1349,27 @@ fn prepare_sparse_file(
         });
     }
     Ok(result)
+}
+
+fn sign_captured_revision(
+    mut revision: UserRevision,
+    writer: &SigningKey,
+    keys: &KeyMaterial,
+    limit: usize,
+) -> Result<SignedRecord<UserRevision>> {
+    // Both Ed25519 signatures have fixed length. Count the complete envelope
+    // before either signing operation allocates the canonical body.
+    revision.writer_signature = vec![0; 64];
+    let preview = SignedRecord {
+        signer: keys.node_id(),
+        value: revision,
+        signature: vec![0; 64],
+    };
+    canonical_size_bounded(&preview, limit)
+        .context("revision catalog exceeds the v1 bounded-object limit")?;
+    let mut revision = preview.value;
+    revision.sign_writer(writer)?;
+    Ok(SignedRecord::sign(USER_REVISION_DOMAIN, revision, keys)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4115,6 +4140,80 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn bounded_backup_admission_includes_native_git_envelope_overhead() {
+        let metadata = GitPrivateMetadataV5 {
+            format_version: 5,
+            root_mode: 0o750,
+            root_modified_secs: -9,
+            root_modified_nanos: 17,
+            entries: vec![PrivateEntry::Directory {
+                path: "nested".to_owned(),
+                mode: 0o710,
+                modified_secs: -11,
+                modified_nanos: 13,
+            }],
+            git: GitBackupDescriptor {
+                format_version: 4,
+                repository_id: Uuid::from_bytes([6; 16]),
+                refs: vec![],
+                objects: vec![],
+                blobs: vec![],
+                head_branch: "main".to_owned(),
+            },
+        };
+        metadata.git.validate().unwrap();
+        let original = canonical_bytes(&metadata).unwrap();
+        let descriptor_size = canonical_size_bounded(&metadata.git, usize::MAX).unwrap();
+        assert!(descriptor_size < original.len() - 1);
+        assert!(canonical_bytes_bounded(&metadata, original.len() - 1).is_err());
+        assert_eq!(
+            canonical_bytes_bounded(&metadata, original.len()).unwrap(),
+            original
+        );
+        assert_eq!(
+            canonical_bytes_bounded(&metadata, original.len() + 1).unwrap(),
+            original
+        );
+        assert_eq!(canonical_bytes(&metadata).unwrap(), original);
+    }
+
+    #[test]
+    fn bounded_backup_admission_counts_both_revision_signatures_before_signing() {
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([7; 32]));
+        let writer = SigningKey::from_bytes(&[8; 32]);
+        let revision = UserRevision {
+            format_version: 5,
+            guild_id: [1; 32],
+            protected_root_id: Uuid::from_bytes([2; 16]),
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([3; 16]),
+            owner: keys.node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: vec![],
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![],
+            data_sectors: vec![],
+            sector_commitments: Some(vec![]),
+        };
+        let before = canonical_bytes(&revision).unwrap();
+        let signed = sign_captured_revision(revision.clone(), &writer, &keys, usize::MAX).unwrap();
+        let expected = canonical_bytes(&signed).unwrap();
+        assert!(expected.len() > before.len() + 128);
+        assert!(
+            sign_captured_revision(revision.clone(), &writer, &keys, expected.len() - 1).is_err()
+        );
+        for limit in [expected.len(), expected.len() + 1] {
+            let signed = sign_captured_revision(revision.clone(), &writer, &keys, limit).unwrap();
+            signed.value.verify_writer().unwrap();
+            signed.verify(USER_REVISION_DOMAIN).unwrap();
+            assert_eq!(canonical_bytes(&signed).unwrap(), expected);
+        }
+        assert_eq!(canonical_bytes(&revision).unwrap(), before);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

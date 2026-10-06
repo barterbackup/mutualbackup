@@ -7,10 +7,9 @@ use anyhow::{Result, bail, ensure};
 use mb_core::{
     CATALOG_FILE_PATH_BYTES, CatalogError, CatalogFileBuilder, CatalogFileExtent, CatalogFileKind,
     CatalogFileRecipeBuilder, CatalogFileRecord, CatalogFileStat, CatalogNativeFileRoot,
-    CatalogPageRef, CatalogScope, CatalogStreamError, V1_MAX_CATALOG_BYTES,
+    CatalogPageRef, CatalogScope, CatalogStreamError, V1_MAX_CATALOG_BYTES, canonical_size_bounded,
     catalog_file_path_order,
 };
-use postcard::ser_flavors::Flavor;
 use thiserror::Error;
 
 use crate::{PrivateEntry, PrivateMetadata};
@@ -36,28 +35,6 @@ pub enum NativeCatalogWriteError<E> {
     Legacy(#[from] anyhow::Error),
     #[error(transparent)]
     Catalog(#[from] CatalogStreamError<E>),
-}
-
-/// Count canonical legacy bytes without allocating a complete encoding. Abort
-/// at the existing bound instead of enlarging legacy admission or allocating a
-/// peer-sized output buffer just to discover that it cannot be converted.
-struct BoundedSize(usize);
-impl Flavor for BoundedSize {
-    type Output = usize;
-    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
-        self.try_extend(&[byte])
-    }
-    fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
-        self.0 = self
-            .0
-            .checked_add(bytes.len())
-            .filter(|size| *size <= V1_MAX_CATALOG_BYTES)
-            .ok_or(postcard::Error::SerializeBufferFull)?;
-        Ok(())
-    }
-    fn finalize(self) -> postcard::Result<usize> {
-        Ok(self.0)
-    }
 }
 
 fn parts(entry: &PrivateEntry) -> (&str, CatalogFileStat) {
@@ -296,7 +273,7 @@ impl PrivateMetadata {
         sink: &mut impl FnMut(NativeCatalogStream, CatalogPageRef, Vec<u8>) -> Result<(), E>,
     ) -> Result<CatalogNativeFileRoot, NativeCatalogWriteError<E>> {
         validate_legacy_version(self)?;
-        postcard::serialize_with_flavor(self, BoundedSize(0)).map_err(|_| {
+        canonical_size_bounded(self, V1_MAX_CATALOG_BYTES).map_err(|_| {
             anyhow::anyhow!("legacy native metadata exceeds its 32 MiB encoding bound")
         })?;
         // Preserve legacy restore semantics before sorting: aliases require a
@@ -589,9 +566,6 @@ mod tests {
 
     #[test]
     fn legacy_native_catalog_adapter_bounds_counting_and_preserves_versions_and_failures() {
-        let mut counter = BoundedSize(V1_MAX_CATALOG_BYTES - 1);
-        counter.try_extend(&[1]).unwrap();
-        assert!(counter.try_push(1).is_err());
         let value = metadata(vec![dense(&"x".repeat(V1_MAX_CATALOG_BYTES), 0, vec![])]);
         let mut writes = 0;
         assert!(

@@ -1584,6 +1584,8 @@ pub fn decode_canonical<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ModelErr
 
 #[derive(Debug, Error)]
 pub enum ModelError {
+    #[error("canonical encoding exceeds the {limit} byte limit")]
+    EncodingTooLarge { limit: usize },
     #[error("canonical encode failed: {0}")]
     Encode(postcard::Error),
     #[error("canonical decode failed: {0}")]

@@ -543,3 +543,35 @@ local source validation/publication/reopen, both immutable version-2 wire
 fixtures and decoded Git-bearing version-4/5 envelopes. Historical originals and
 Git descriptors remain unchanged. These are metadata conversion checks; complete
 historical migration, consumer activation and real 1 TiB qualification remain open.
+
+Existing runtime encoding now uses `canonical_size_bounded` and
+`canonical_bytes_bounded` from `crates/mb-core/src/canonical.rs`. Counting uses the
+same Postcard serializer, includes all nested lengths and field overhead, stops
+at an inclusive byte bound and allocates no complete encoding. Bounded encoding
+then allocates the counted size and writes into that fixed buffer; even a
+serializer whose output changes between passes cannot grow it. Ordinary encoding
+errors remain distinct from a size-limit error. Deterministic values retain their
+original wire bytes.
+
+Git descriptor validation applies the existing 32 MiB bound before constructing
+its temporary DAG repository. Native capture checks its anchor manifest without
+encoding it, bounds the complete private metadata (including its Git descriptor)
+before allocating the output, and counts the complete revision envelope with both
+64-byte signatures before signing. The legacy native adapter shares the same
+counter. These changes preserve current wire versions and inclusive limits.
+They prevent allocating an oversized encoding merely to reject it; they do not
+bound the already assembled model or resolve R2's 64 MiB local graph admission
+mismatch. Commit/ref/merge/import preflights and a complete shared admission
+contract remain required.
+
+Six new fixtures cover exact canonical boundaries, early termination without
+visiting the entire input, arithmetic overflow, serializer errors and changing
+output, a valid Git graph just below/at/above the 32 MiB descriptor limit,
+native/Git envelope overhead and both revision signatures. Native Git
+capture/restore and rejected-capture repair pass on disposable Btrfs, with
+verified mount/image/loop cleanup. These checks preserve legacy backup behavior;
+they do not establish production capacity or end-to-end mutation admission.
+All 96 core and 73 ordinary Git tests, 28 ordinary snapshot regressions and six
+legacy adapter tests pass, with formatting and strict workspace/all-targets
+Clippy. The ordinary suites retain 62 ignored Git and eight ignored snapshot
+provisioned cases; the two named capture cases were run separately on Btrfs.

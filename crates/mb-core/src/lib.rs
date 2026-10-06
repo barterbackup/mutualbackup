@@ -5,6 +5,7 @@
 //! cryptographic operations.
 
 mod attempt;
+mod canonical;
 mod catalog;
 mod coding;
 mod content;
@@ -26,6 +27,7 @@ pub use attempt::{
     coding_sample_guarantee, coding_transfer_estimate, encode_coding_attempt,
     replay_coding_transcript,
 };
+pub use canonical::{canonical_bytes_bounded, canonical_size_bounded};
 pub use catalog::{
     CATALOG_FANOUT, CATALOG_FILE_PATH_BYTES, CATALOG_FILE_RECORD_BYTES, CATALOG_FILE_SECTOR_REFS,
     CATALOG_LEAF_BYTES, CATALOG_MAX_HEIGHT, CATALOG_MAX_PAGE_OCCURRENCES, CATALOG_MAX_RECORDS,
