@@ -1386,6 +1386,14 @@ bootstrap ciphertext until its last owner retires. The migration namespaces
 leave existing flat backup heads unchanged; full capture/replay and protection
 activation remain required.
 
+Sector rendering now resolves retained paged bootstrap ciphertext through one
+indexed live owner. A single database snapshot checks signed identity, root/index
+ownership and ciphertext; Node authenticates the seed, guild and private root
+descriptor before serving bytes. Shared ownership survives individual revision
+retirement and releases the source after its final owner cancels. No independent
+legacy Inline recipe is created. Private page/file/blob source integration and
+capture/recovery migration remain required before production format activation.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

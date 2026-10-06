@@ -2854,6 +2854,14 @@ fn render_sector_with_hint_update(
     expected_guild: Option<&[u8; 32]>,
     update_area_hint: bool,
 ) -> Result<Vec<u8>> {
+    if let Some(ciphertext) = crate::paged_revision::PagedPrivateMetadata::render_local_bootstrap(
+        control,
+        keys,
+        *sector_id,
+        expected_guild,
+    )? {
+        return Ok(ciphertext);
+    }
     let encoded = control
         .get_record("local-sector", sector_id)?
         .context("local sector recipe is unavailable")?;

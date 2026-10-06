@@ -1018,6 +1018,24 @@ passing tests below apply only to their recorded source and exercised cases.
     strict locked workspace/all-targets Clippy pass. The ordinary suites retain
     19 provisioned store and eight snapshot cases; no native/topology/platform
     or real 1 TiB gate ran for this local ownership step.
+  - [x] Serve encrypted paged bootstraps through their live root ownership.
+    Resolve one owner with an indexed sector lookup and check its signed
+    identity, retained roots, native index, pin and ciphertext in one database
+    snapshot. Sector rendering authenticates the seed/guild, private descriptor
+    and exact root roles before returning ciphertext. Shared owners survive
+    individual cancellation; last-owner retirement makes the source unavailable.
+    Malformed, orphaned or corrupt ownership fails closed. This introduces no
+    separate Inline recipe or flat head update. Private page/file/blob source
+    integration and the remaining consumer migration still need implementation.
+    Validation: two new store and one Node fixture pass, covering shared-owner
+    lookup/retirement across reopen, malformed/oversized pins, orphaned sources,
+    cancelled or substituted owners, corrupt ciphertext, seed/guild rejection
+    and precedence over invalid legacy recipes, with native and Git root layouts.
+    Locked workspace/all-targets build and 22 paged tests pass. The 113 ordinary
+    store, 30 ordinary snapshot and five native adapter tests also pass (165
+    distinct cases overall). Formatting and strict locked workspace/all-targets
+    Clippy pass. Nineteen provisioned store and eight snapshot cases remain
+    ignored; native/topology/platform and real 1 TiB gates were not run here.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

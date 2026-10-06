@@ -251,6 +251,18 @@ impl PagedPrivateMetadata {
         let Some(snapshot) = control.paged_revision_catalog(id)? else {
             return Ok(None);
         };
+        Ok(Some(Self::open_local_snapshot(
+            keys,
+            &snapshot,
+            expected_scope,
+        )?))
+    }
+
+    fn open_local_snapshot(
+        keys: &KeyMaterial,
+        snapshot: &mb_store::PagedCatalogSnapshot,
+        expected_scope: CatalogScope,
+    ) -> Result<PagedRevisionCatalogSnapshot> {
         let signed = PagedUserRevision::decode_signed(&snapshot.bundle.descriptor)?;
         ensure!(
             signed.value.scope() == expected_scope && signed.value.owner == keys.node_id(),
@@ -273,11 +285,34 @@ impl PagedPrivateMetadata {
         } else {
             None
         };
-        Ok(Some(PagedRevisionCatalogSnapshot {
+        Ok(PagedRevisionCatalogSnapshot {
             revision: signed,
             state: snapshot.state,
             private,
-        }))
+        })
+    }
+
+    /// Serve retained bootstrap ciphertext through its live paged root owner;
+    /// never copy it into an independently collected legacy Inline recipe.
+    pub(crate) fn render_local_bootstrap(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        sector_id: [u8; 32],
+        expected_guild: Option<&[u8; 32]>,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(snapshot) = control.paged_revision_bootstrap_catalog(sector_id)? else {
+            return Ok(None);
+        };
+        let opened = Self::open_local_snapshot(keys, &snapshot, snapshot.bundle.scope)?;
+        ensure!(
+            expected_guild.is_none_or(|guild| *guild == opened.revision.value.guild_id),
+            "paged bootstrap does not belong to the requested guild"
+        );
+        ensure!(
+            opened.private.is_some(),
+            "paged bootstrap owner is cancelled"
+        );
+        Ok(snapshot.bootstrap)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -661,6 +696,74 @@ mod tests {
             owner: signed.value.owner,
             epoch: signed.value.writer_epoch,
             public_key: signed.value.writer_public_key,
+        }
+    }
+
+    #[test]
+    fn paged_bootstrap_sector_rendering_authenticates_and_tracks_shared_ownership() {
+        for with_git in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (private, signed, intents) = owned_fixture(&store, with_git, 0);
+            let (source, ciphertext) = private.seal(&keys(), scope()).unwrap();
+            let sector = source.sector.id;
+            let render = |store: &ControlStore| {
+                crate::snapshot::render_sector(store, &keys(), &sector, Some(&[73; 32]))
+            };
+            assert!(render(&store).is_err());
+            private
+                .publish_local_catalog(&store, &keys(), &signed, &writer_fence(&signed), intents)
+                .unwrap();
+            let (next_private, next, next_intents) = owned_fixture(&store, with_git, 0);
+            let mut body = next.value;
+            body.sequence = 2;
+            body.parent = Some(signed.value.hash().unwrap());
+            let next = body
+                .sign(&SigningKey::from_bytes(&[72; 32]), &keys())
+                .unwrap();
+            assert_eq!(next_private, private);
+            assert_eq!(next.value.metadata, source);
+            next_private
+                .publish_local_catalog(&store, &keys(), &next, &writer_fence(&next), next_intents)
+                .unwrap();
+            // Legacy recipe bytes cannot replace a retained signed bootstrap.
+            store
+                .put_record("local-sector", &sector, b"invalid recipe")
+                .unwrap();
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert_eq!(render(&store).unwrap(), ciphertext);
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &sector, Some(&[1; 32])).is_err()
+            );
+            let other_keys = KeyMaterial::from_seed(&Seed::from_bytes([1; 32]));
+            assert!(crate::snapshot::render_sector(&store, &other_keys, &sector, None).is_err());
+            let mut corrupt = ciphertext.clone();
+            corrupt[0] ^= 1;
+            store
+                .put_record("paged-revision-bootstrap-v1", &sector, &corrupt)
+                .unwrap();
+            assert!(render(&store).is_err());
+            store
+                .put_record("paged-revision-bootstrap-v1", &sector, &ciphertext)
+                .unwrap();
+            store
+                .cancel_paged_revision_catalog(signed.value.revision_id)
+                .unwrap();
+            assert_eq!(render(&store).unwrap(), ciphertext);
+            store
+                .cancel_paged_revision_catalog(next.value.revision_id)
+                .unwrap();
+            assert!(
+                PagedPrivateMetadata::render_local_bootstrap(&store, &keys(), sector, None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(render(&store).is_err());
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert!(render(&store).is_err());
         }
     }
 

@@ -1018,3 +1018,35 @@ cases pass again after early writer-fence admission was tightened. Locked
 workspace/all-targets build, formatting and strict Clippy pass. Nineteen
 provisioned store and eight snapshot cases remain ignored; no native/topology/
 platform or real 1 TiB gate ran for this local ownership step.
+
+### Live bootstrap sector rendering (2026-10-06)
+
+`paged_revision_bootstrap_catalog` resolves one owner using the sector's indexed
+bootstrap-pin namespace. The read transaction checks the pin's bounded key/value,
+published signed revision, exact requested bootstrap ID, retained member roots,
+native validation index and ciphertext commitments. A pin without a valid live
+owner or ciphertext without a pin is an integrity error. It does not scan retained
+history or allocate a source list. A corrupt selected owner fails the lookup;
+another owner is not used to hide damaged ownership state.
+
+The ordinary local sector renderer consults this ownership before legacy recipes.
+Node authenticates the seed/guild, decrypts and validates the private descriptor,
+and compares all root roles with the retained bundle using that same snapshot.
+The returned ciphertext remains owned by the paged publication; no independently
+collected Inline copy is installed. Shared bootstrap owners retain availability
+through individual cancellation, and the last owner's cancellation removes the
+source. A concurrent read may finish using the snapshot acquired before retirement.
+
+Private page/file/blob source integration, normal capture/checkpoint/packing,
+retention and seed-only recovery migration remain open. This source adapter
+neither advances a flat head nor establishes production protection or 1 TiB support.
+
+Validation: two new store fixtures and one Node fixture cover shared-owner
+retirement and reopen, malformed/oversized pins, orphaned sources, cancelled or
+substituted owner identity, ciphertext damage, wrong seed/guild and legacy recipe
+precedence. Node exercises both native-only and Git-bearing roots. Locked
+workspace/all-targets build and 22 paged tests pass, alongside 113 ordinary store,
+30 ordinary snapshot and five native adapter tests (165 distinct cases overall).
+Formatting and strict locked workspace/all-targets Clippy pass. Nineteen
+provisioned store and eight snapshot cases remain ignored; native/topology/
+platform and real 1 TiB qualification were not run for this adapter step.

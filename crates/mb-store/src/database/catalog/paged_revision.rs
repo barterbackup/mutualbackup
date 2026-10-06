@@ -270,6 +270,47 @@ impl ControlStore {
         Ok(result)
     }
 
+    /// Resolve one live bootstrap owner by its indexed sector namespace. The
+    /// pin, signed identity, root ownership and ciphertext are checked in one
+    /// read snapshot. No history scan or caller-supplied revision is needed.
+    pub fn paged_revision_bootstrap_catalog(
+        &self,
+        sector_id: [u8; 32],
+    ) -> Result<Option<PagedCatalogSnapshot>, CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let owner: Option<Option<Vec<u8>>> = transaction
+            .query_row(
+                "SELECT CASE WHEN length(record_id) = 16 AND length(bytes) = 0
+                 THEN record_id END FROM protocol_records WHERE kind = ?1
+                 ORDER BY record_id LIMIT 1",
+                params![bootstrap_pins(sector_id)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let result = match owner {
+            Some(Some(owner)) => {
+                let id = Uuid::from_slice(&owner).map_err(|_| DatabaseError::Integrity)?;
+                let current = snapshot(&transaction, id)?.ok_or(DatabaseError::Integrity)?;
+                if current.state != CatalogBundleState::Published
+                    || revision(&current.bundle)?.value.metadata.sector.id != sector_id
+                {
+                    return Err(DatabaseError::Integrity.into());
+                }
+                Some(current)
+            }
+            Some(None) => return Err(DatabaseError::Integrity.into()),
+            None => {
+                if bounded_record(&transaction, BOOTSTRAP, &sector_id, V1_SECTOR_SIZE)?.is_some() {
+                    return Err(DatabaseError::Integrity.into());
+                }
+                None
+            }
+        };
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Cancel validation and every root together, then remove this revision's
     /// bootstrap pin. Shared ciphertext is deleted only after its last owner.
     /// Existing cancellation journals fence replay until generation-floor GC.
@@ -504,6 +545,135 @@ mod tests {
             assert!(reader.is_complete());
             Ok(())
         })
+    }
+
+    #[test]
+    fn paged_bootstrap_lookup_follows_shared_live_owners_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        assert!(
+            store
+                .paged_revision_bootstrap_catalog([0; 32])
+                .unwrap()
+                .is_none()
+        );
+        let (first, bytes) = fixture(&store, 1, None);
+        let signed = revision(&first).unwrap();
+        let sector = signed.value.metadata.sector.id;
+        // Staged catalog pages do not establish bootstrap ownership.
+        assert!(
+            store
+                .paged_revision_bootstrap_catalog(sector)
+                .unwrap()
+                .is_none()
+        );
+        publish(&store, &first, &bytes).unwrap();
+        let (next, shared) = fixture(&store, 2, Some(signed.value.hash().unwrap()));
+        publish(&store, &next, &shared).unwrap();
+        drop(store);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(
+            store
+                .paged_revision_bootstrap_catalog(sector)
+                .unwrap()
+                .unwrap()
+                .bootstrap,
+            Some(bytes.clone())
+        );
+        // Retire the owner actually selected by the indexed lookup.
+        let selected = store
+            .paged_revision_bootstrap_catalog(sector)
+            .unwrap()
+            .unwrap()
+            .bundle
+            .id;
+        store.cancel_paged_revision_catalog(selected).unwrap();
+        let remaining = store
+            .paged_revision_bootstrap_catalog(sector)
+            .unwrap()
+            .unwrap();
+        assert_ne!(selected, remaining.bundle.id);
+        assert_eq!(remaining.bootstrap, Some(bytes));
+        store
+            .cancel_paged_revision_catalog(remaining.bundle.id)
+            .unwrap();
+        drop(store);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert!(
+            store
+                .paged_revision_bootstrap_catalog(sector)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn paged_bootstrap_lookup_rejects_corrupt_or_unowned_sources() {
+        for damage in 0..7 {
+            let temp = tempfile::tempdir().unwrap();
+            let store =
+                ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+            let (bundle, mut bytes) = fixture(&store, 1, None);
+            let sector = revision(&bundle).unwrap().value.metadata.sector.id;
+            publish(&store, &bundle, &bytes).unwrap();
+            let pins = bootstrap_pins(sector);
+            match damage {
+                0 => {
+                    bytes[0] ^= 1;
+                    store.put_record(BOOTSTRAP, &sector, &bytes).unwrap();
+                }
+                1 => {
+                    store
+                        .connection
+                        .execute(
+                            "DELETE FROM protocol_records WHERE kind = ?1",
+                            params![pins],
+                        )
+                        .unwrap();
+                }
+                2 => {
+                    store
+                        .put_record(&pins, bundle.id.as_bytes(), &[0; 4096])
+                        .unwrap();
+                }
+                3 => {
+                    store
+                        .connection
+                        .execute(
+                            "DELETE FROM protocol_records WHERE kind = ?1",
+                            params![pins],
+                        )
+                        .unwrap();
+                    store.put_record(&pins, &[0; 4096], &[]).unwrap();
+                }
+                4 => {
+                    store
+                        .connection
+                        .execute(
+                            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                            params![REVISION, bundle.id.as_bytes()],
+                        )
+                        .unwrap();
+                }
+                5 => {
+                    store.cancel_paged_revision_catalog(bundle.id).unwrap();
+                    store.put_record(&pins, bundle.id.as_bytes(), &[]).unwrap();
+                }
+                6 => {
+                    store
+                        .put_record(&bootstrap_pins([0; 32]), bundle.id.as_bytes(), &[])
+                        .unwrap();
+                    assert!(store.paged_revision_bootstrap_catalog([0; 32]).is_err());
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                store.paged_revision_bootstrap_catalog(sector).is_err(),
+                "damage {damage}"
+            );
+        }
     }
 
     #[test]
