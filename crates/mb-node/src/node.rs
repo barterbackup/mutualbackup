@@ -14619,6 +14619,15 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn legacy_export_peer_recovery_reads_real_survivors_without_opening_withdrawn_node() {
+        legacy_export_peer_recovery_fixture(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_export_peer_recovery_traverses_signed_history_across_survivors() {
+        legacy_export_peer_recovery_fixture(true).await;
+    }
+
+    async fn legacy_export_peer_recovery_fixture(history: bool) {
         use crate::{P2pConfig, build_p2p};
         for format in [6, 7] {
             let ((keys, revision, _), identities, groups, mut checkpoint) =
@@ -14761,7 +14770,39 @@ pub(crate) mod tests {
                 );
                 clients.push(client);
             }
-            for case in [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 4] {
+            let cases: &[u8] = if history {
+                &[12, 13, 14, 15, 16, 17]
+            } else {
+                &[0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 4]
+            };
+            let sign_checkpoint = |checkpoint: &mut QuorumCheckpoint| {
+                checkpoint.signatures = identities
+                    .iter()
+                    .map(|key| checkpoint.checkpoint.member_signature(key).unwrap())
+                    .collect();
+                checkpoint
+                    .signatures
+                    .sort_by_key(|signature| signature.signer);
+                checkpoint.verify().unwrap();
+            };
+            let replace_head = |node: &Node, checkpoint: &QuorumCheckpoint| {
+                node.control
+                    .put_record(
+                        "guild-checkpoint",
+                        &checkpoint.hash().unwrap(),
+                        &canonical_bytes(checkpoint).unwrap(),
+                    )
+                    .unwrap();
+                // Deliberate test-only injection also permits certified but
+                // invalid history links which normal commit admission rejects.
+                node.database_shell_statement(None, &format!(
+                    "UPDATE checkpoint_heads SET generation={}, checkpoint_hash=X'{}', checkpoint_bytes=X'{}' WHERE guild_id=X'{}'",
+                    checkpoint.checkpoint.generation, hex::encode(checkpoint.hash().unwrap()),
+                    hex::encode(canonical_bytes(checkpoint).unwrap()),
+                    hex::encode(checkpoint.checkpoint.guild_id),
+                ), true).unwrap();
+            };
+            for &case in cases {
                 // Fixture edits precede the read-only export. Every export must
                 // preserve the exact input bytes at its own starting point.
                 if case == 5 || case == 6 {
@@ -14790,6 +14831,89 @@ pub(crate) mod tests {
                     peer.control
                         .put_record("guild-checkpoint", &checkpoint.hash().unwrap(), b"corrupt")
                         .unwrap();
+                }
+                if history {
+                    let store = ControlStore::open(original.join("control.db"), &keys).unwrap();
+                    store
+                        .delete_record("guild-checkpoint", &checkpoint.hash().unwrap())
+                        .unwrap();
+                    if case == 13 {
+                        store
+                            .put_record(
+                                "user-revision",
+                                revision.value.revision_id.as_bytes(),
+                                &canonical_bytes(&revision).unwrap(),
+                            )
+                            .unwrap();
+                    } else {
+                        store
+                            .delete_record("user-revision", revision.value.revision_id.as_bytes())
+                            .unwrap();
+                    }
+                    let mut head = checkpoint.clone();
+                    head.checkpoint.generation = 2;
+                    head.checkpoint.parent = Some(checkpoint.hash().unwrap());
+                    let mut current = revision.value.clone();
+                    current.revision_id = Uuid::new_v4();
+                    current
+                        .sign_writer(&ed25519_dalek::SigningKey::from_bytes(&[53; 32]))
+                        .unwrap();
+                    head.checkpoint.revisions =
+                        vec![SignedRecord::sign(USER_REVISION_DOMAIN, current, &keys).unwrap()];
+                    let middle = if case == 13 {
+                        sign_checkpoint(&mut head);
+                        let middle = head.clone();
+                        head.checkpoint.generation = 3;
+                        head.checkpoint.parent = Some(middle.hash().unwrap());
+                        Some(middle)
+                    } else {
+                        None
+                    };
+                    let mut parent = checkpoint.clone();
+                    if case == 16 {
+                        head.checkpoint.generation = 3; // skips generation two
+                    }
+                    if case == 17 {
+                        parent.checkpoint.genesis_hash = [17; 32];
+                        sign_checkpoint(&mut parent);
+                        head.checkpoint.parent = Some(parent.hash().unwrap());
+                    }
+                    sign_checkpoint(&mut head);
+                    let survivor = peer_nodes
+                        .iter()
+                        .map(|node| node.lock().unwrap().keys().node_id())
+                        .max()
+                        .unwrap();
+                    for node in &peer_nodes {
+                        let peer = node.lock().unwrap();
+                        if let Some(middle) = &middle {
+                            peer.control
+                                .put_record(
+                                    "guild-checkpoint",
+                                    &middle.hash().unwrap(),
+                                    &canonical_bytes(middle).unwrap(),
+                                )
+                                .unwrap();
+                        }
+                        replace_head(&peer, &head);
+                        if case == 15 {
+                            peer.control
+                                .delete_record("guild-checkpoint", &parent.hash().unwrap())
+                                .unwrap();
+                        } else if case == 14 && peer.keys().node_id() != survivor {
+                            peer.control
+                                .put_record("guild-checkpoint", &parent.hash().unwrap(), b"corrupt")
+                                .unwrap();
+                        } else {
+                            peer.control
+                                .put_record(
+                                    "guild-checkpoint",
+                                    &parent.hash().unwrap(),
+                                    &canonical_bytes(&parent).unwrap(),
+                                )
+                                .unwrap();
+                        }
+                    }
                 }
                 if matches!(case, 9 | 10 | 11 | 4) {
                     let store = ControlStore::open(original.join("control.db"), &keys).unwrap();
@@ -14826,6 +14950,9 @@ pub(crate) mod tests {
                         // insufficient: the complete record must match the head.
                         let mut different = revision.value.clone();
                         different.metadata_sectors[0].root = [11; 32];
+                        different
+                            .sign_writer(&ed25519_dalek::SigningKey::from_bytes(&[53; 32]))
+                            .unwrap();
                         let different =
                             SignedRecord::sign(USER_REVISION_DOMAIN, different, &keys).unwrap();
                         store
@@ -14893,7 +15020,7 @@ pub(crate) mod tests {
                     endpoints,
                 )
                 .await;
-                if matches!(case, 0 | 3 | 5 | 6 | 7) {
+                if matches!(case, 0 | 3 | 5 | 6 | 7 | 12 | 13 | 14) {
                     assert_eq!(result.unwrap().private_format, format);
                     use std::os::unix::ffi::OsStringExt;
                     assert_eq!(

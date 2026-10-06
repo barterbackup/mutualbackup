@@ -181,11 +181,18 @@ conflicting genesis, generation or hash is rejected; a bad peer copy does not
 prevent trying another selected peer. Downloaded records stay in memory and
 are not installed in the original catalog.
 
-This searches announced heads only. It does not discover peers through the
-recovery directory, traverse older checkpoint generations, fetch event or
+If the revision or its placement is absent from those heads, the client follows
+their certified parent hashes. Every parent must have the same guild/genesis
+and be exactly one generation older. A missing or corrupt copy is retried on
+other selected peers. The search streams one certificate at a time, keeping
+only a cursor for each selected head; it installs no history or progress state
+in the preserved catalog. It checks available heads before walking history.
+
+This does not discover peers through the recovery directory, fetch event or
 coding-transcript history, unlock other identities' volume databases or
-inventory/convert all retained revisions. Keep historical metadata, coding
-transcripts and peer-held history for the remaining recovery work.
+inventory/convert all retained revisions. Missing parent links cannot be
+invented or skipped. Keep historical metadata, coding transcripts and peer-held
+history for the remaining recovery work.
 
 If a signed sector is available only in preserved anchor files, supply its area
 explicitly. Repeat `--anchor-area` for distinct areas:
@@ -328,3 +335,13 @@ the same ID fail without publication. Each attempt preserves the original
 database bytes and leaves key/parity files absent. This does not qualify older
 checkpoint traversal, event/transcript fetching or complete retained-history
 conversion, and the full M6 release gates remain open.
+
+The older-checkpoint increment passes thirteen exporter/recovery tests, the real
+CLI fixture and the core/store/reader/frame/sync/CLI suites above (236 unique
+cases). Real format-6/7 survivors recover a revision absent from their current
+heads, including two parent links with a saved revision record and fallback to
+the only valid parent copy. Missing links, generation skips and a foreign-genesis
+parent fail without publication or original-catalog changes. The strengthened
+two-link fixture was also rerun separately. Formatting and strict workspace/
+all-targets Clippy pass. Event/transcript fetching, retained-history inventory/
+conversion and full M6 platform/release qualification remain required.

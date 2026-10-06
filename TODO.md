@@ -277,7 +277,7 @@ passing tests below apply only to their recorded source and exercised cases.
     Invalid/identity-mismatched peer arguments fail before recovery-string input.
     The canonical temporary parent must be outside all selected preserved inputs;
     a confined `TMPDIR` is rejected before creating client state.
-    Missing peer discovery, older checkpoints/events/transcripts and retained-history
+    Missing peer discovery, events/transcripts and retained-history
     inventory/conversion remain open; this does not unlock foreign volume images.
     Validation: a real authenticated three-survivor fixture exports formats 6/7
     while normal owner startup rejects the withdrawn catalog, including raw file
@@ -300,9 +300,9 @@ passing tests below apply only to their recorded source and exercised cases.
     If that revision is also missing, the preserved signed installed-guild
     certificate binds the guild/genesis for finding it in a peer head. Bad copies
     are skipped so another selected peer can supply the certificate; downloaded
-    records remain in memory. This searches heads only: older generations,
-    recovery-directory discovery, events/transcripts and inventory/conversion
-    of all retained history remain open.
+    records remain in memory. This increment searches heads only; older-generation
+    traversal is recorded below. Recovery-directory discovery, events/transcripts
+    and inventory/conversion of all retained history remain open.
     Validation: the real three-survivor format-6/7 fixture also exports with
     no local checkpoint, then with neither a revision nor checkpoint record.
     A corrupt peer certificate falls back to another copy. A conflicting signed
@@ -314,6 +314,30 @@ passing tests below apply only to their recorded source and exercised cases.
     tests and the real CLI fixture pass (235 unique cases). Formatting and strict
     locked workspace/all-targets Clippy pass. Complete ordinary Node/Git suites,
     provisioned cases and full M6 platform/release qualification were not rerun.
+  - [x] Search older certified checkpoints when selected peer heads lack the
+    requested signed revision or its reconstructable placement. Try available
+    heads first, then follow signed parent hashes with exact preceding-generation
+    and guild/genesis checks. Retry missing or corrupt link copies across selected
+    peers. Stream one certificate at a time and retain only bounded head cursors;
+    do not write checkpoints or progress state into the preserved installation.
+    Missing links cannot be bypassed using an unrelated generation advertisement.
+    Event/transcript fetching, recovery-directory discovery and full retained-
+    history inventory/conversion remain open.
+    Validation: real three-survivor format-6/7 fixtures recover an older revision
+    absent from every current head, with and without a saved revision record.
+    The saved-record case crosses two parent links. Only one survivor retains a
+    valid parent in the corrupt-copy fallback case. Missing links, a signed link
+    that skips a generation and a signed parent with another genesis reject
+    without publication. Raw namespace bytes, stock Git history, exact original
+    catalog bytes and absent key/parity files are checked. The same-ID mismatch
+    fixture now also carries a valid writer signature, so rejection exercises
+    full-record equality rather than an invalid writer signature.
+    All 104 core, 108 ordinary store, thirteen exporter/recovery, two preserved-
+    volume reader, one frame-bound, three checkpoint-sync regression, four CLI unit
+    tests and the real CLI fixture pass (236 unique cases); the strengthened
+    two-link fixture was rerun separately. Formatting and strict locked workspace/
+    all-targets Clippy pass. Complete ordinary Node/Git suites, provisioned cases,
+    real variable/relay/Tor peer export and full M6 release gates remain open.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

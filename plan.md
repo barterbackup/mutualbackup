@@ -877,9 +877,12 @@ preserving the withdrawn installation and requesting a decoding quorum after
 local inputs. Missing checkpoint certificates can now be read from selected
 peer heads; missing revision records require the preserved signed guild genesis
 and a matching certified head. Paging, hashes, quorum and exact signed revision
-checks apply without installing downloaded records. Recovery-directory discovery,
-older checkpoint traversal, event/transcript fetching and complete retained-history/
-upgrade qualification remain required.
+checks apply without installing downloaded records. If the head does not contain
+the requested record or placement, the reader follows certified parent hashes,
+checking the same guild/genesis and exact preceding generation, and retries
+missing/corrupt links across selected peers. History is streamed without storing
+it in the preserved catalog. Recovery-directory discovery, event/transcript
+fetching and complete retained-history/upgrade qualification remain required.
 
 The FUSE-backed guarded source backend is withdrawn. Remove its mount and view
 implementation, enrollment and recovery publication paths, guarded Git

@@ -80,29 +80,78 @@ impl PeerRecovery {
         origin: Option<[u8; 32]>,
         mut visit: impl FnMut(mb_core::QuorumCheckpoint) -> Result<bool>,
     ) -> Result<()> {
+        // Check every available head before searching history. A peer's long
+        // history must not hide a usable current certificate on another peer.
+        let mut parents = Vec::new();
         for peer in &self.peers {
             let Some(Some((generation, hash))) =
                 self.read(self.client.preserved_checkpoint_head(*peer, guild))
             else {
                 continue;
             };
-            let Some(checkpoint) = self.read(crate::network::fetch_p2p_checkpoint(
-                &self.client,
-                *peer,
-                guild,
-                hash,
-            )) else {
+            let Some(checkpoint) = self.checkpoint(*peer, guild, origin, generation, hash) else {
                 continue;
             };
-            if checkpoint.checkpoint.guild_id == guild
-                && checkpoint.checkpoint.generation == generation
-                && origin.is_none_or(|hash| checkpoint.checkpoint.genesis_hash == hash)
-                && !visit(checkpoint)?
-            {
+            let parent = checkpoint.checkpoint.parent.map(|hash| {
+                (
+                    *peer,
+                    checkpoint.checkpoint.genesis_hash,
+                    generation - 1,
+                    hash,
+                )
+            });
+            if !visit(checkpoint)? {
                 return Ok(());
+            }
+            parents.extend(parent);
+        }
+        // Each signed link commits to the parent's hash. Exact decreasing
+        // generations prevent loops without retaining a history-sized hash set.
+        // Keep only the bounded head cursors and one decoded certificate.
+        for (mut source, origin, mut generation, mut hash) in parents {
+            loop {
+                let candidate = std::iter::once(source)
+                    .chain(self.peers.iter().copied().filter(|peer| *peer != source))
+                    .find_map(|peer| {
+                        self.checkpoint(peer, guild, Some(origin), generation, hash)
+                            .map(|checkpoint| (peer, checkpoint))
+                    });
+                let Some((peer, checkpoint)) = candidate else {
+                    break;
+                };
+                let parent = checkpoint.checkpoint.parent;
+                if !visit(checkpoint)? {
+                    return Ok(());
+                }
+                let Some(parent) = parent else {
+                    break;
+                };
+                source = peer;
+                generation -= 1;
+                hash = parent;
             }
         }
         Ok(())
+    }
+
+    fn checkpoint(
+        &self,
+        peer: NodeId,
+        guild: [u8; 32],
+        origin: Option<[u8; 32]>,
+        generation: u64,
+        hash: [u8; 32],
+    ) -> Option<mb_core::QuorumCheckpoint> {
+        let checkpoint = self.read(crate::network::fetch_p2p_checkpoint(
+            &self.client,
+            peer,
+            guild,
+            hash,
+        ))?;
+        (checkpoint.checkpoint.guild_id == guild
+            && checkpoint.checkpoint.generation == generation
+            && origin.is_none_or(|hash| checkpoint.checkpoint.genesis_hash == hash))
+        .then_some(checkpoint)
     }
 
     pub(super) fn find_revision(
