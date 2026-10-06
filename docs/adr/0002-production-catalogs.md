@@ -378,3 +378,32 @@ absent/directory/file to a nested namespace. All 81 core tests and the workspace
 catalog-filtered suite pass, with formatting and strict workspace/all-targets
 Clippy. The 1 TiB logical length in a header is a structural fixture, not payload
 capture, retained-history accounting or capacity qualification.
+
+Native sparse payload recipes are implemented in
+`crates/mb-core/src/catalog/file_recipes.rs`. File headers bind namespace record
+ordinals to logical length and exact extent/sector occurrence counts. Extent
+headers carry offsets and coverage; sector fragments contain at most 128
+references. File keys are strictly increasing and bounded by the namespace
+record geometry. Readers validate canonical schemas, fragment declarations
+before collection allocation, overlap/overflow, fragment ordinals and exact
+extent coverage with only the current file/extent counters. Repeated source
+references preserve their occurrence order. Root totals are checked before
+yielding the final record, and incomplete input or storage/fetch errors prevent
+publication or continuation.
+
+`push_file` bridges borrowed legacy extents in two passes to declare counts and
+emit fragments; it never clones the complete extent or sector list. New capture
+must provide bounded records directly. Logical bytes include sparse gaps and
+data bytes count every extent occurrence. These totals do not establish source
+authority, deduplicated physical usage or retained-history capacity. The file
+namespace and recipe roots still require exact key/length, hard-link and signed
+source joins, atomic typed publication and native runtime/legacy integration
+before activation.
+
+Five recipe fixtures cover borrowed multi-page conversion preserving exact
+gaps/offsets/repeated references, empty/all-hole files, key/geometry/count/order
+errors, malformed schema/encoding/declarations, final summaries and terminal
+overflow/storage/fetch failures. All 86 core tests and 84 catalog-filtered
+workspace tests pass (two provisioned tests remain ignored), with formatting and
+strict workspace/all-targets Clippy. A synthetic 1 TiB sparse length exercises
+recipe geometry; it does not qualify payload backup, restore or retained usage.

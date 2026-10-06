@@ -283,7 +283,22 @@ passing tests below apply only to their recorded source and exercised cases.
     This codec covers namespace/attributes; bounded sparse recipes, link/source
     joins, legacy conversion and runtime capture/restore migration remain open.
     Complete platform metadata and real 1 TiB qualification remain required.
-  - [ ] Add quota reservations, bounded file-recipe/packing/coding record
+  - [x] Add bounded sparse native file recipes and a borrowed legacy extent
+    bridge. File keys preserve namespace record ordinals; extent/sector counts,
+    offsets, coverage and fragment order are checked with current-file counters.
+    Fragments contain at most 128 references and retain repeated sectors exactly.
+    Empty/all-hole files remain explicit. Root totals are verified before the
+    final record is yielded; failures fence publication/continuation. The bridge
+    counts and emits borrowed extents without another complete recipe vector.
+    Five fixtures and all 86 core tests pass; the catalog-filtered workspace
+    suite passes 84 tests with two provisioned tests ignored. Formatting and
+    strict workspace/all-targets Clippy pass. Sparse logical lengths in these
+    fixtures do not qualify real payload or retained-history capacity.
+  - [ ] Join file namespace and recipes by exact keys/lengths, validate hard-link
+    identities and signed source references, implement complete legacy private
+    metadata conversion and typed durable publication, and migrate native
+    capture/restore consumers before enabling the new format.
+  - [ ] Add quota reservations, bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.
