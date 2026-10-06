@@ -7,7 +7,13 @@ schema migration, journal replay, or mount recovery. Guarded journals, root
 bindings, and pending guarded capture or recovered-anchor intents cause startup
 to stop. The read-only check also opens registered Git catalogs when their source
 is present and rejects guarded bindings, journals, and root-backed historical
-blobs. Root and mount records need not remain for that detection to work.
+blobs. Historical single-file captures can have ordinary format-1 manifests;
+their guarded ownership markers also stop admission when the anchor area is
+available, even if the catalog claims a native binding. Root and mount records
+need not remain for that detection to work. An unbound catalog must have
+available anchor provenance before migration. A native binding must be stored
+under the repository's own key. A bound native catalog may retain unavailable
+or damaged copies for repair; that does not certify legacy export.
 Locally available authenticated revision metadata in user revisions, revision
 heads, and certified checkpoint history identifies withdrawn formats 6 and 7;
 the first metadata sector suffices even when later sectors are absent.

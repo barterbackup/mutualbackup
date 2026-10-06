@@ -2158,6 +2158,37 @@ impl FileAnchorManifest {
         }
     }
 
+    /// Reject historical root-backed and single-file guarded captures before
+    /// native Git can treat their potentially mutable hard links as anchors.
+    /// This reads ownership markers without modifying the area or payload.
+    pub fn require_native_ownership(&self) -> Result<(), AnchorError> {
+        if self.guarded_root_file.is_some() {
+            return Err(AnchorError::UnsupportedSourceOperation(
+                crate::WITHDRAWN_GUARDED_BACKEND,
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let area = resolve_anchor_area(&self.area)?;
+            let parent = open_stable_anchor_area(&area, &self.area)?;
+            for marker in [
+                legacy_guarded::guarded_file_marker_name(self.anchor_id),
+                legacy_guarded::guarded_root_marker_name(self.anchor_id),
+            ] {
+                match open_path_no_xdev_beneath(&parent, Path::new(&marker)) {
+                    Ok(_) => {
+                        return Err(AnchorError::UnsupportedSourceOperation(
+                            crate::WITHDRAWN_GUARDED_BACKEND,
+                        ));
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Verify the immutable anchor before giving its bytes to another format.
     pub fn open_verified(&self) -> Result<File, AnchorError> {
         if !matches!(self.format_version, 1 | 2)
@@ -2165,6 +2196,7 @@ impl FileAnchorManifest {
         {
             return Err(AnchorError::InvalidRoot);
         }
+        self.require_native_ownership()?;
         validate_relative(&self.source_relative_path)?;
         if let Some(backing) = &self.guarded_root_file {
             validate_relative(&backing.captured_relative_path)?;

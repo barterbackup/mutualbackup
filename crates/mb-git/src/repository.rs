@@ -164,6 +164,9 @@ fn require_native_pinned_catalog_state(
         directory.descriptor_path().join(CATALOG_DATABASE),
         database_key,
     )?;
+    let native_binding = catalog
+        .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())?
+        .is_some();
     catalog.for_each_record_value(SOURCE_BACKEND_KIND, |bytes| {
         let record: GitSourceBackendRecord =
             mb_core::decode_canonical(bytes).map_err(|_| RepositoryError::Conflict)?;
@@ -189,10 +192,16 @@ fn require_native_pinned_catalog_state(
     // Inspect its historical manifest rather than inferring native ownership.
     catalog.for_each_record_value_with_kind_prefix("git-object-anchor-v1/", |bytes| {
         let anchor: FileAnchorManifest = mb_core::decode_canonical(bytes)?;
-        if anchor.guarded_root_file.is_some() {
-            anyhow::bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
+        match anchor.require_native_ownership() {
+            // A bound native catalog may retain damaged or unavailable copies
+            // for repair. Its other verified copies remain usable. An unbound
+            // catalog needs available provenance before backend migration.
+            Err(AnchorError::AnchorAreaCollision(_)) if native_binding => Ok(()),
+            Err(error @ AnchorError::AnchorAreaCollision(_)) => Err(anyhow::Error::new(error).context(
+                "cannot classify an unbound Git anchor; preserve the original catalog and make its anchor area available",
+            )),
+            result => result.map_err(Into::into),
         }
-        Ok(())
     })?;
     let current = directory
         .open_child_file(CATALOG_DATABASE)?
@@ -1925,6 +1934,199 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), original);
             assert!(!directory.join(GIT_CATALOG_MARKER_FILE).exists());
         }
+    }
+
+    #[test]
+    fn single_file_guarded_markers_stop_native_admission_before_mutation() {
+        for native_binding in [false, true] {
+            for marker_prefix in [
+                ".mutualbackup-guarded-file-v1-",
+                ".mutualbackup-guarded-root-v1-",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("source");
+                fs::create_dir(&root).unwrap();
+                fs::write(root.join("working"), b"working bytes").unwrap();
+                let anchor = mb_store::SourceBlobImportPlan::plan_direct(&root, 14)
+                    .unwrap()
+                    .capture(std::io::Cursor::new(b"retained bytes"))
+                    .unwrap();
+                let oid = crate::blob_oid_from_anchor(&anchor).unwrap();
+                let marker = anchor
+                    .area
+                    .path_hint
+                    .join(format!("{marker_prefix}{}", anchor.anchor_id));
+                fs::write(&marker, b"historical ownership claim").unwrap();
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o444)).unwrap();
+                let repository_id = Uuid::new_v4();
+                let key = [94; 32];
+                let directory = root.join(GIT_CATALOG_DIRECTORY);
+                fs::create_dir(&directory).unwrap();
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+                let database = directory.join(CATALOG_DATABASE);
+                let catalog = ControlStore::open_with_key(&database, &key).unwrap();
+                if native_binding {
+                    catalog
+                        .put_record(
+                            SOURCE_BACKEND_KIND,
+                            repository_id.as_bytes(),
+                            &mb_core::canonical_bytes(&GitSourceBackendRecord {
+                                format_version: 1,
+                                repository_id,
+                                backend: SourceBackendKind::ReflinkV1,
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                catalog
+                    .put_record(
+                        &crate::stage::object_kind(repository_id, oid),
+                        anchor.anchor_id.as_bytes(),
+                        &mb_core::canonical_bytes(&anchor).unwrap(),
+                    )
+                    .unwrap();
+                drop(catalog);
+                let original_database = fs::read(&database).unwrap();
+                let original_marker = fs::read(&marker).unwrap();
+                let original_payload = fs::read(
+                    anchor
+                        .area
+                        .path_hint
+                        .join(anchor.anchor_id.to_string())
+                        .join("blob"),
+                )
+                .unwrap();
+                for error in [
+                    require_native_catalog_state(&root, repository_id, &key).unwrap_err(),
+                    GitRepository::init(&root, repository_id, &key)
+                        .err()
+                        .unwrap()
+                        .into(),
+                    GitRepository::open(&root, repository_id, &key)
+                        .err()
+                        .unwrap()
+                        .into(),
+                    anchor.open_verified().err().unwrap().into(),
+                    crate::blob_oid_from_anchor(&anchor).err().unwrap().into(),
+                ] {
+                    assert!(
+                        error.to_string().contains("withdrawn"),
+                        "{marker_prefix}: {error:#}"
+                    );
+                }
+                assert_eq!(fs::read(&database).unwrap(), original_database);
+                assert_eq!(fs::read(&marker).unwrap(), original_marker);
+                assert_eq!(
+                    fs::read(
+                        anchor
+                            .area
+                            .path_hint
+                            .join(anchor.anchor_id.to_string())
+                            .join("blob")
+                    )
+                    .unwrap(),
+                    original_payload
+                );
+                assert_eq!(fs::read(root.join("working")).unwrap(), b"working bytes");
+                assert!(!directory.join(GIT_CATALOG_MARKER_FILE).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_anchor_provenance_does_not_migrate_an_unbound_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(&root, 14)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"retained bytes"))
+            .unwrap();
+        let oid = crate::blob_oid_from_anchor(&anchor).unwrap();
+        let mut unavailable = anchor.clone();
+        unavailable.anchor_id = Uuid::new_v4();
+        unavailable.area.area_id = Uuid::new_v4();
+        assert!(matches!(
+            unavailable.require_native_ownership(),
+            Err(AnchorError::AnchorAreaCollision(_))
+        ));
+        let repository_id = Uuid::new_v4();
+        let key = [95; 32];
+        let directory = root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let database = directory.join(CATALOG_DATABASE);
+        let catalog = ControlStore::open_with_key(&database, &key).unwrap();
+        for candidate in [&anchor, &unavailable] {
+            catalog
+                .put_record(
+                    &crate::stage::object_kind(repository_id, oid),
+                    candidate.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(candidate).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(catalog);
+        let original = fs::read(&database).unwrap();
+        let error = require_native_catalog_state(&root, repository_id, &key).unwrap_err();
+        assert!(
+            error.to_string().contains("unbound Git anchor"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&database).unwrap(), original);
+        assert!(!directory.join(GIT_CATALOG_MARKER_FILE).exists());
+        // A binding-shaped value under the wrong key does not bind this
+        // repository and must not permit migration of unavailable provenance.
+        let wrong_key = Uuid::new_v4();
+        let catalog = ControlStore::open_with_key(&database, &key).unwrap();
+        catalog
+            .put_record(
+                SOURCE_BACKEND_KIND,
+                wrong_key.as_bytes(),
+                &mb_core::canonical_bytes(&GitSourceBackendRecord {
+                    format_version: 1,
+                    repository_id,
+                    backend: SourceBackendKind::ReflinkV1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(catalog);
+        let original = fs::read(&database).unwrap();
+        let error = require_native_catalog_state(&root, repository_id, &key).unwrap_err();
+        assert!(
+            error.to_string().contains("unbound Git anchor"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&database).unwrap(), original);
+        assert!(!directory.join(GIT_CATALOG_MARKER_FILE).exists());
+        let catalog = ControlStore::open_with_key(&database, &key).unwrap();
+        catalog
+            .delete_record(SOURCE_BACKEND_KIND, wrong_key.as_bytes())
+            .unwrap();
+        drop(catalog);
+        // A previously bound native catalog retains unusable copies for repair.
+        // Recognition of an unavailable duplicate must not discard its viable copy.
+        let catalog = ControlStore::open_with_key(&database, &key).unwrap();
+        catalog
+            .put_record(
+                SOURCE_BACKEND_KIND,
+                repository_id.as_bytes(),
+                &mb_core::canonical_bytes(&GitSourceBackendRecord {
+                    format_version: 1,
+                    repository_id,
+                    backend: SourceBackendKind::ReflinkV1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(catalog);
+        let original = fs::read(&database).unwrap();
+        require_native_catalog_state(&root, repository_id, &key).unwrap();
+        assert_eq!(fs::read(&database).unwrap(), original);
+        assert_eq!(crate::blob_oid_from_anchor(&anchor).unwrap(), oid);
+        assert!(!directory.join(GIT_CATALOG_MARKER_FILE).exists());
     }
 
     #[test]

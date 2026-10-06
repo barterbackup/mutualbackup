@@ -92,9 +92,22 @@ passing tests below apply only to their recorded source and exercised cases.
     direct/hole-punch/relay topology. The qualified source manifest and binary
     hashes matched; the disposable filesystem and network resources were cleaned
     up. The Cargo dependency tree contains no `fuser`.
+  - [x] Recognize marker-only historical single-file captures before Git catalog
+    initialization, reopening, or unbound-backend migration, including catalogs
+    with a native binding. Ordinary native blob verification also rejects those
+    ownership markers and root-backed legacy manifests. Reject unavailable
+    provenance before migrating an unbound catalog; retain unavailable native
+    copies for repair in an already bound catalog. Only the binding stored under
+    this repository's key establishes native ownership; a misplaced record does
+    not authorize migration.
+    Validation: locked workspace tests passed (613 passed, zero failed, 105
+    ignored). Disposable Btrfs regressions passed all 70 provisioned Git, extent,
+    daemon reopen, retention, migration, and recovery checks, including two owner
+    losses and physical history reclamation. The final binding-key hardening is
+    covered by the ordinary Git preservation fixture; format and strict
+    workspace/all-target Clippy pass. The disposable mount and image were removed.
   - [ ] Finish the verified mount-free export/recovery policy, including
-    unavailable historical metadata and marker-only single-file captures, and
-    qualify legacy upgrade/recovery.
+    unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
