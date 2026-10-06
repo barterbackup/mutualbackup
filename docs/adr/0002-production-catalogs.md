@@ -616,3 +616,38 @@ native Git capture/restore and rejected-capture repair pass. Disposable Btrfs
 mount/image/loop cleanup is verified. Formatting and strict workspace/all-targets
 Clippy pass. Ordinary suites retain 18 ignored store and eight ignored snapshot
 cases; these results do not replace the complete M6 release/production gates.
+
+Fetch and stock branch/tag push now preflight the combined destination graph
+before recording a fresh intent or creating blob anchors. The reachable
+descriptor traversal accepts imported blob lengths before mappings exist;
+existing cached lengths must agree. Both source and retained destination history
+contribute to the same descriptor limit, rather than testing the source alone.
+Replayed intents recheck admission before importing any remaining blobs. A
+capacity failure retains their exact intent and prior history for explicit
+repair; already captured pending anchors remain owned.
+
+Final publication checks the immutable intent, combined budget and ref/tag
+conditions under the same immediate writer transaction that publishes metadata,
+refs and deletes temporary verification/intent rows. Push also checks selected
+branches, the advertised old ref and fast-forward ancestry there. Ancestry uses
+hash-checked proposed objects in a temporary metadata repository, so it does not
+need to publish those objects before deciding whether the push is admissible.
+Irrecoverable stale/ref/tag conflicts retire only the exact owned intent and its
+temporary verification rows using guarded publication. Wire formats and native
+anchor verification remain unchanged.
+
+These checks address descriptor growth for fetch and stock push. Signed-backup
+reconstruction, merge/checkout, full enclosing native/revision budgets,
+oversized-history status/export policy and bounded incremental scheduling remain
+open. This is not production admission for the declared 1 TiB target.
+
+Two new fixtures reject individually bounded source/destination histories whose
+combined descriptor exceeds 32 MiB before creating intents or anchors; they also
+preserve an oversized pending intent and prior history across reopen. Successful
+imports reuse existing anchors, publish a valid fast-forward and reject a
+divergent push before its metadata is written. All 79 ordinary and 62 provisioned
+Git library tests, 28 ordinary snapshot regressions and both native capture
+regressions pass, with verified disposable Btrfs mount/image/loop cleanup,
+formatting and strict workspace/all-targets Clippy. The ordinary snapshot suite
+retains eight ignored provisioned cases; the two named capture tests ran
+separately. This is targeted mutation/replay qualification, not the full M6 gate.

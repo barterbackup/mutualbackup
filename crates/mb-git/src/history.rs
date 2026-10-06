@@ -258,6 +258,16 @@ pub(crate) fn commit_descends_from(
     descendant: Oid,
     ancestor: Oid,
 ) -> Result<bool, HistoryError> {
+    commit_descends_from_with_changes(control, repository_id, descendant, ancestor, &[])
+}
+
+pub(crate) fn commit_descends_from_with_changes(
+    control: &ControlStore,
+    repository_id: Uuid,
+    descendant: Oid,
+    ancestor: Oid,
+    changes: &[(String, Vec<u8>, Vec<u8>)],
+) -> Result<bool, HistoryError> {
     if descendant == ancestor {
         return Ok(true);
     }
@@ -266,7 +276,7 @@ pub(crate) fn commit_descends_from(
     let odb = git2::Odb::new()?;
     let _pack = odb.add_new_mempack_backend(1000)?;
     repository.set_odb(&odb)?;
-    load_metadata(control, repository_id, &repository)?;
+    load_proposed_metadata(control, repository_id, &repository, changes)?;
     repository
         .find_commit(descendant)
         .map_err(|_| HistoryError::IncompatibleRecord)?;
@@ -298,6 +308,41 @@ fn load_metadata(
         }
     }
     Ok(objects)
+}
+
+fn load_proposed_metadata(
+    control: &ControlStore,
+    repository_id: Uuid,
+    repository: &Repository,
+    changes: &[(String, Vec<u8>, Vec<u8>)],
+) -> Result<HashMap<Oid, MetadataObject>, HistoryError> {
+    let mut stored = load_metadata(control, repository_id, repository)?;
+    let namespace = metadata_kind(repository_id);
+    let odb = repository.odb()?;
+    for (kind, key, encoded) in changes {
+        if *kind != namespace {
+            continue;
+        }
+        let object: MetadataObject = decode_canonical(encoded)?;
+        let kind = object_type(object.kind).ok_or(HistoryError::IncompatibleRecord)?;
+        let oid = Oid::hash_object(kind, &object.bytes)?;
+        if object.format_version != 1
+            || key != oid.as_bytes()
+            || stored.get(&oid).is_some_and(|previous| {
+                previous.kind != object.kind || previous.bytes != object.bytes
+            })
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        if odb.write(kind, &object.bytes)? != oid {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        stored.insert(oid, object);
+        if stored.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
+    }
+    Ok(stored)
 }
 
 pub(crate) fn verified_metadata_ids(
@@ -1597,7 +1642,6 @@ fn proposed_graph_metadata(
     changes: &[(String, Vec<u8>, Vec<u8>)],
 ) -> Result<ProposedGraph, HistoryError> {
     let ref_namespace = ref_kind(repository_id);
-    let metadata_namespace = metadata_kind(repository_id);
     let mut proposed_refs: BTreeMap<_, _> = control.records(&ref_namespace)?.into_iter().collect();
     for (kind, key, encoded) in changes {
         if *kind == ref_namespace {
@@ -1647,30 +1691,7 @@ fn proposed_graph_metadata(
     let odb = git2::Odb::new()?;
     let _pack = odb.add_new_mempack_backend(1000)?;
     repository.set_odb(&odb)?;
-    let mut stored = load_metadata(control, repository_id, &repository)?;
-    for (kind, key, encoded) in changes {
-        if *kind != metadata_namespace {
-            continue;
-        }
-        let object: MetadataObject = decode_canonical(encoded)?;
-        let kind = object_type(object.kind).ok_or(HistoryError::IncompatibleRecord)?;
-        let oid = Oid::hash_object(kind, &object.bytes)?;
-        if object.format_version != 1
-            || key != oid.as_bytes()
-            || stored.get(&oid).is_some_and(|previous| {
-                previous.kind != object.kind || previous.bytes != object.bytes
-            })
-        {
-            return Err(HistoryError::IncompatibleRecord);
-        }
-        if odb.write(kind, &object.bytes)? != oid {
-            return Err(HistoryError::IncompatibleRecord);
-        }
-        stored.insert(oid, object);
-        if stored.len() > MAX_GRAPH_OBJECTS {
-            return Err(HistoryError::GraphTooLarge);
-        }
-    }
+    let stored = load_proposed_metadata(control, repository_id, &repository, changes)?;
     let mut commits = Vec::new();
     let mut seen_tags = HashSet::new();
     for reference in &refs {
@@ -1771,12 +1792,42 @@ fn preflight_graph_changes(
     repository_id: Uuid,
     changes: &[(String, Vec<u8>, Vec<u8>)],
 ) -> Result<(), HistoryError> {
+    preflight_graph_with_blob_lengths(control, repository_id, changes, &[])
+}
+
+/// Imported lengths allow checking a proposed graph before capturing blobs.
+/// Existing cached mappings must agree; this remains metadata admission only.
+pub(crate) fn preflight_graph_with_blob_lengths(
+    control: &ControlStore,
+    repository_id: Uuid,
+    changes: &[(String, Vec<u8>, Vec<u8>)],
+    imported: &[([u8; 20], u64)],
+) -> Result<(), HistoryError> {
+    if imported.len() > MAX_GRAPH_OBJECTS {
+        return Err(HistoryError::GraphTooLarge);
+    }
+    let mut lengths = HashMap::new();
+    for (oid, len) in imported {
+        if lengths.insert(Oid::from_bytes(oid)?, *len).is_some() {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+    }
     let graph = proposed_graph_metadata(control, repository_id, changes)?;
     let mut blobs = Vec::with_capacity(graph.blob_ids.len());
     for oid in graph.blob_ids {
+        let cached = catalog_blob_length(control, repository_id, oid)?;
+        let imported = lengths.get(&oid).copied();
+        if cached
+            .zip(imported)
+            .is_some_and(|(left, right)| left != right)
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
         blobs.push((
             oid.as_bytes().try_into().expect("SHA-1 OID"),
-            catalog_blob_length(control, repository_id, oid)?,
+            cached
+                .or(imported)
+                .ok_or(HistoryError::IncompatibleRecord)?,
         ));
     }
     crate::backup_size::dense_backup_size(
@@ -1798,7 +1849,7 @@ fn catalog_blob_length(
     control: &ControlStore,
     repository_id: Uuid,
     oid: Oid,
-) -> Result<u64, HistoryError> {
+) -> Result<Option<u64>, HistoryError> {
     // Staging/import already verified the OID-to-anchor mapping. Admission
     // needs its geometry, not another read of all retained blob payloads.
     // Backup/export still authenticate and open the actual anchors.
@@ -1813,7 +1864,7 @@ fn catalog_blob_length(
         }
         len = Some(anchor.logical_len);
     }
-    len.ok_or(HistoryError::IncompatibleRecord)
+    Ok(len)
 }
 
 /// Rebuild an empty local catalog from a signed Git descriptor and already

@@ -12,8 +12,8 @@ use std::process::{Command, Stdio};
 use git2::{ObjectFormat, ObjectType, Oid, Repository};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{
-    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, SourceBackendKind,
-    SourceBlobImportPlan,
+    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, KindedProtocolRecordRow,
+    SourceBackendKind, SourceBlobImportPlan,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,8 +22,8 @@ use uuid::Uuid;
 use crate::head::{HeadError, linked_selected_branches, selected_branch};
 use crate::history::{
     GitGraphObject, GitGraphRef, HistoryError, MAX_GRAPH_METADATA_BYTES, MAX_GRAPH_OBJECTS,
-    commit_descends_from, fetched_ref_record, list_tags, metadata_kind, object_record, ref_kind,
-    ref_oid,
+    commit_descends_from_with_changes, fetched_ref_record, list_tags, metadata_kind, object_record,
+    preflight_graph_with_blob_lengths, ref_kind, ref_oid,
 };
 use crate::interop::GitInteropError;
 use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
@@ -830,10 +830,72 @@ fn check_fetched_tags(
     Ok(())
 }
 
-/// Fetch source branches into `refs/remotes/origin/*` and tags into
-/// `refs/tags/*`. The selected local branch, index and worktree are unchanged.
-/// Blob imports are replayable; refs become visible only after every required
-/// native anchor has been published. Historical branch-only intents still replay.
+fn fetch_records(intent: &FetchIntent) -> Result<Vec<KindedProtocolRecordRow>, FetchError> {
+    let mut records = Vec::with_capacity(intent.objects.len() + intent.refs.len());
+    for object in &intent.objects {
+        let kind = match object.kind {
+            1 => ObjectType::Commit,
+            2 => ObjectType::Tree,
+            3 if matches!(intent.format_version, 4..=6) => ObjectType::Tag,
+            _ => return Err(FetchError::IncompatibleSource),
+        };
+        records.push((
+            metadata_kind(intent.repository_id),
+            object.oid.to_vec(),
+            object_record(kind, object.bytes.clone())?,
+        ));
+    }
+    for reference in &intent.refs {
+        records.push((
+            ref_kind(intent.repository_id),
+            reference.name.clone(),
+            fetched_ref_record(reference.oid)?,
+        ));
+    }
+    Ok(records)
+}
+
+fn preflight_fetch(
+    control: &ControlStore,
+    intent: &FetchIntent,
+    records: &[(String, Vec<u8>, Vec<u8>)],
+) -> Result<(), FetchError> {
+    let lengths: Vec<_> = intent
+        .blobs
+        .iter()
+        .map(|blob| (blob.oid, blob.logical_len))
+        .collect();
+    preflight_graph_with_blob_lengths(control, intent.repository_id, records, &lengths).map_err(
+        |error| match error {
+            HistoryError::GraphTooLarge => FetchError::GraphTooLarge,
+            error => FetchError::History(error),
+        },
+    )
+}
+
+fn require_pending(control: &ControlStore, kind: &str, encoded: &[u8]) -> Result<(), FetchError> {
+    if control.get_record(kind, ACTIVE)?.as_deref() != Some(encoded) {
+        return Err(DatabaseError::Conflict.into());
+    }
+    Ok(())
+}
+
+fn retire_pending(
+    control: &ControlStore,
+    kind: &str,
+    encoded: &[u8],
+    temporary: &[(String, Vec<u8>)],
+) -> Result<(), FetchError> {
+    let mut deletions = temporary.to_vec();
+    deletions.push((kind.to_owned(), ACTIVE.to_vec()));
+    control
+        .put_records_and_delete_checked(&[], &deletions, || require_pending(control, kind, encoded))
+}
+
+/// Fetch source branches into `refs/remotes/origin/*` and tags into `refs/tags/*`.
+/// The selected local branch, index and worktree are unchanged. Blob imports
+/// are replayable; refs publish only after anchors and the final preflight pass.
+/// Historical branch-only intents still replay.
 pub(crate) fn fetch_bare(
     control: &ControlStore,
     repository_id: Uuid,
@@ -875,54 +937,52 @@ pub(crate) fn fetch_bare(
             validate_intent(&intent, repository_id, target.root)?;
             check_fetched_tags(control, repository_id, &intent)?;
             let bytes = canonical_bytes(&intent)?;
-            if !control.put_record_if_absent(&kind, ACTIVE, &bytes)? {
-                return Err(FetchError::PendingFetch);
-            }
+            let proposed = fetch_records(&intent)?;
+            control.put_records_and_delete_checked(
+                &[(kind.clone(), ACTIVE.to_vec(), bytes.clone())],
+                &[],
+                || {
+                    if control.get_record(&kind, ACTIVE)?.is_some()
+                        || control
+                            .get_record(&push_kind(repository_id), ACTIVE)?
+                            .is_some()
+                    {
+                        return Err(FetchError::PendingFetch);
+                    }
+                    check_fetched_tags(control, repository_id, &intent)?;
+                    preflight_fetch(control, &intent, &proposed)
+                },
+            )?;
             (intent, bytes)
         }
     };
+    let records = fetch_records(&intent)?;
+    control.put_records_and_delete_checked(&[], &[], || {
+        require_pending(control, &kind, &encoded)?;
+        preflight_fetch(control, &intent, &records)
+    })?;
     for blob in &intent.blobs {
         import_blob(control, &intent, blob, target.backend)?;
-    }
-    let mut records = Vec::with_capacity(intent.objects.len() + intent.refs.len());
-    for object in &intent.objects {
-        let kind = match object.kind {
-            1 => ObjectType::Commit,
-            2 => ObjectType::Tree,
-            3 if matches!(intent.format_version, 5 | 6) => ObjectType::Tag,
-            _ => return Err(FetchError::IncompatibleSource),
-        };
-        records.push((
-            metadata_kind(repository_id),
-            object.oid.to_vec(),
-            object_record(kind, object.bytes.clone())?,
-        ));
-    }
-    for reference in &intent.refs {
-        records.push((
-            ref_kind(repository_id),
-            reference.name.clone(),
-            fetched_ref_record(reference.oid)?,
-        ));
     }
     let deletions = intent
         .blobs
         .iter()
         .map(|blob| (verified_kind(&intent), blob.oid.to_vec()))
         .collect::<Vec<_>>();
-    if let Err(error) = check_fetched_tags(control, repository_id, &intent) {
-        control.put_records_and_retire_and_delete_if_value(
-            &[],
-            &deletions,
-            &kind,
-            ACTIVE,
-            &encoded,
-        )?;
+    let mut publication_deletions = deletions.clone();
+    publication_deletions.push((kind.clone(), ACTIVE.to_vec()));
+    let published =
+        control.put_records_and_delete_checked(&records, &publication_deletions, || {
+            require_pending(control, &kind, &encoded)?;
+            check_fetched_tags(control, repository_id, &intent)?;
+            preflight_fetch(control, &intent, &records)
+        });
+    if let Err(error) = published {
+        if matches!(error, FetchError::TagExists) {
+            retire_pending(control, &kind, &encoded, &deletions)?;
+        }
         return Err(error);
     }
-    control.put_records_and_retire_and_delete_if_value(
-        &records, &deletions, &kind, ACTIVE, &encoded,
-    )?;
     Ok(intent
         .refs
         .iter()
@@ -1062,93 +1122,92 @@ fn import_pushed_ref(
                 fetch,
             };
             let bytes = canonical_bytes(&pending)?;
-            if !control.put_record_if_absent(&kind, ACTIVE, &bytes)? {
-                return Err(FetchError::PendingFetch);
-            }
+            let proposed = fetch_records(&pending.fetch)?;
+            control.put_records_and_delete_checked(
+                &[(kind.clone(), ACTIVE.to_vec(), bytes.clone())],
+                &[],
+                || {
+                    if control.get_record(&kind, ACTIVE)?.is_some()
+                        || control
+                            .get_record(&fetch_kind(repository_id), ACTIVE)?
+                            .is_some()
+                    {
+                        return Err(FetchError::PendingFetch);
+                    }
+                    check_push_target(control, &pending, &proposed)?;
+                    preflight_fetch(control, &pending.fetch, &proposed)
+                },
+            )?;
             (pending, bytes)
         }
     };
+    let records = fetch_records(&intent.fetch)?;
+    control.put_records_and_delete_checked(&[], &[], || {
+        require_pending(control, &kind, &encoded)?;
+        preflight_fetch(control, &intent.fetch, &records)
+    })?;
     for blob in &intent.fetch.blobs {
         import_blob(control, &intent.fetch, blob, target.backend)?;
     }
-    let metadata = intent
-        .fetch
-        .objects
-        .iter()
-        .map(|object| {
-            let kind = match object.kind {
-                1 => ObjectType::Commit,
-                2 => ObjectType::Tree,
-                3 if is_tag => ObjectType::Tag,
-                _ => return Err(FetchError::IncompatibleSource),
-            };
-            Ok((
-                metadata_kind(repository_id),
-                object.oid.to_vec(),
-                object_record(kind, object.bytes.clone())?,
-            ))
-        })
-        .collect::<Result<Vec<_>, FetchError>>()?;
-    control.put_records_and_delete(&metadata, &[])?;
-    let new_oid = Oid::from_bytes(&target_oid)?;
-    let still_unselected = is_tag
-        || selected_branch(control, repository_id)? != target_name
-            && !linked_selected_branches(control, repository_id)?
-                .iter()
-                .any(|branch| branch == target_name);
-    let still_same =
-        ref_oid(control, repository_id, local_ref.as_bytes())?.map(sha1) == expected_old;
-    let fast_forward = if is_tag {
-        match check_pushed_tag_namespace(control, repository_id, target_name, target_oid) {
-            Ok(()) => true,
-            Err(FetchError::TagExists) => false,
-            Err(error) => return Err(error),
-        }
-    } else {
-        expected_old
-            .map(|old| {
-                commit_descends_from(control, repository_id, new_oid, Oid::from_bytes(&old)?)
-            })
-            .transpose()?
-            .unwrap_or(true)
-    };
     let deletions = intent
         .fetch
         .blobs
         .iter()
         .map(|blob| (verified_kind(&intent.fetch), blob.oid.to_vec()))
         .collect::<Vec<_>>();
-    if !still_unselected || !still_same || !fast_forward {
-        control.put_records_and_retire_and_delete_if_value(
-            &[],
-            &deletions,
-            &kind,
-            ACTIVE,
-            &encoded,
-        )?;
-        return if !still_unselected {
-            Err(FetchError::CheckedOutBranch)
-        } else if !still_same {
-            Err(FetchError::StalePush)
-        } else {
-            Err(if is_tag {
-                FetchError::TagExists
-            } else {
-                FetchError::NonFastForward
-            })
-        };
+    let mut publication_deletions = deletions.clone();
+    publication_deletions.push((kind.clone(), ACTIVE.to_vec()));
+    let published =
+        control.put_records_and_delete_checked(&records, &publication_deletions, || {
+            require_pending(control, &kind, &encoded)?;
+            check_push_target(control, &intent, &records)?;
+            preflight_fetch(control, &intent.fetch, &records)
+        });
+    if let Err(error) = published {
+        if matches!(
+            error,
+            FetchError::CheckedOutBranch
+                | FetchError::StalePush
+                | FetchError::NonFastForward
+                | FetchError::TagExists
+        ) {
+            retire_pending(control, &kind, &encoded, &deletions)?;
+        }
+        return Err(error);
     }
-    control.put_records_and_retire_and_delete_if_value(
-        &[(
-            ref_kind(repository_id),
-            local_ref.into_bytes(),
-            fetched_ref_record(target_oid)?,
-        )],
-        &deletions,
-        &kind,
-        ACTIVE,
-        &encoded,
-    )?;
+    Ok(())
+}
+
+fn check_push_target(
+    control: &ControlStore,
+    pending: &PushImportIntent,
+    records: &[(String, Vec<u8>, Vec<u8>)],
+) -> Result<(), FetchError> {
+    let id = pending.fetch.repository_id;
+    let reference = &pending.fetch.refs[0];
+    let is_tag = pending.format_version == 2;
+    if !is_tag
+        && (selected_branch(control, id)? == pending.target_branch
+            || linked_selected_branches(control, id)?.contains(&pending.target_branch))
+    {
+        return Err(FetchError::CheckedOutBranch);
+    }
+    if ref_oid(control, id, &reference.name)?.map(sha1) != pending.expected_old {
+        return Err(FetchError::StalePush);
+    }
+    if is_tag {
+        check_pushed_tag_namespace(control, id, &pending.target_branch, reference.oid)?;
+    } else if let Some(old) = pending.expected_old
+        && !commit_descends_from_with_changes(
+            control,
+            id,
+            Oid::from_bytes(&reference.oid)?,
+            Oid::from_bytes(&old)?,
+            records,
+        )?
+    {
+        return Err(FetchError::NonFastForward);
+    }
     Ok(())
 }
 
@@ -1204,6 +1263,238 @@ mod tests {
         drop(tree);
         drop(builder);
         (remote, commit)
+    }
+
+    #[test]
+    fn git_fetch_admission_rejects_combined_history_before_intents_or_anchor_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let control =
+            ControlStore::open_with_key(directory.path().join("control.db"), &[7; 32]).unwrap();
+        let id = Uuid::from_bytes([1; 16]);
+        let stock_path = directory.path().join("stock");
+        let (stock, first) = make_remote(&stock_path, b"x", 0o100644);
+        let tree_oid = stock.find_commit(first).unwrap().tree_id();
+        let tree = stock.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Remote", "remote@example.test").unwrap();
+        let message = "x".repeat(20 * 1024 * 1024);
+        let incoming = stock
+            .commit(None, &signature, &signature, &message, &tree, &[])
+            .unwrap();
+        stock
+            .reference("refs/heads/main", incoming, true, "replace fixture history")
+            .unwrap();
+        let empty_tree_oid = stock.treebuilder(None).unwrap().write().unwrap();
+        let empty_tree = stock.find_tree(empty_tree_oid).unwrap();
+        let existing = stock
+            .commit(None, &signature, &signature, &message, &empty_tree, &[])
+            .unwrap();
+        drop(message);
+        for (kind, oid) in [
+            (ObjectType::Tree, empty_tree_oid),
+            (ObjectType::Commit, existing),
+        ] {
+            control
+                .put_record(
+                    &metadata_kind(id),
+                    oid.as_bytes(),
+                    &object_record(
+                        kind,
+                        stock.odb().unwrap().read(oid).unwrap().data().to_vec(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        control
+            .put_record(
+                &ref_kind(id),
+                b"refs/heads/main",
+                &fetched_ref_record(sha1(existing)).unwrap(),
+            )
+            .unwrap();
+        let old_refs = control.records(&ref_kind(id)).unwrap();
+        let old_metadata = control.records(&metadata_kind(id)).unwrap();
+        let target = NativeSource {
+            root: &root,
+            backend: SourceBackendKind::ReflinkV1,
+        };
+        assert!(matches!(
+            fetch_bare(&control, id, target, &stock_path),
+            Err(FetchError::GraphTooLarge)
+        ));
+        assert!(matches!(
+            import_pushed_branch(
+                &control,
+                id,
+                target,
+                &stock_path,
+                "topic",
+                sha1(incoming),
+                None
+            ),
+            Err(FetchError::GraphTooLarge)
+        ));
+        let object = stock
+            .find_object(incoming, Some(ObjectType::Commit))
+            .unwrap();
+        let tag = stock
+            .tag_annotation_create("release", &object, &signature, "tag")
+            .unwrap();
+        assert!(matches!(
+            import_pushed_tag(
+                &control,
+                id,
+                target,
+                &stock_path,
+                "release",
+                sha1(tag),
+                None
+            ),
+            Err(FetchError::GraphTooLarge)
+        ));
+        assert_eq!(control.records(&ref_kind(id)).unwrap(), old_refs);
+        assert_eq!(control.records(&metadata_kind(id)).unwrap(), old_metadata);
+        for prefix in [FETCH_PREFIX, PUSH_PREFIX, BLOB_PREFIX, VERIFIED_PREFIX] {
+            assert!(!control.has_records_with_kind_prefix(prefix).unwrap());
+        }
+        assert!(
+            !control
+                .has_records_with_kind_prefix(&crate::stage::object_kind_prefix(id))
+                .unwrap()
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        // Historical/replayed intents are fenced by the same combined budget.
+        // Rejection preserves their ownership for explicit repair or retirement.
+        let pending = discover(
+            &stock,
+            id,
+            stock_path.canonicalize().unwrap(),
+            root.clone(),
+            5,
+        )
+        .unwrap();
+        let pending_bytes = canonical_bytes(&pending).unwrap();
+        control
+            .put_record(&fetch_kind(id), ACTIVE, &pending_bytes)
+            .unwrap();
+        drop(control);
+        let reopened =
+            ControlStore::open_existing_with_key(directory.path().join("control.db"), &[7; 32])
+                .unwrap();
+        assert!(matches!(
+            fetch_bare(&reopened, id, target, &stock_path),
+            Err(FetchError::GraphTooLarge)
+        ));
+        assert_eq!(
+            reopened
+                .get_record(&fetch_kind(id), ACTIVE)
+                .unwrap()
+                .unwrap(),
+            pending_bytes
+        );
+        assert_eq!(reopened.records(&ref_kind(id)).unwrap(), old_refs);
+        assert_eq!(reopened.records(&metadata_kind(id)).unwrap(), old_metadata);
+    }
+
+    #[test]
+    fn git_fetch_admission_imports_reused_anchors_and_rejects_divergence_before_metadata_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let path = directory.path().join("control.db");
+        let control = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let id = Uuid::from_bytes([1; 16]);
+        let stock_path = directory.path().join("stock");
+        let (stock, first) = make_remote(&stock_path, b"x", 0o100644);
+        let blob = Oid::hash_object(ObjectType::Blob, b"x").unwrap();
+        let anchor = SourceBlobImportPlan::plan_direct(&root, 1)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"x"))
+            .unwrap();
+        let anchor_bytes = canonical_bytes(&anchor).unwrap();
+        control
+            .put_record(
+                &object_kind(id, blob),
+                anchor.anchor_id.as_bytes(),
+                &anchor_bytes,
+            )
+            .unwrap();
+        let target = NativeSource {
+            root: &root,
+            backend: SourceBackendKind::ReflinkV1,
+        };
+        assert_eq!(fetch_bare(&control, id, target, &stock_path).unwrap(), 1);
+        import_pushed_branch(
+            &control,
+            id,
+            target,
+            &stock_path,
+            "topic",
+            sha1(first),
+            None,
+        )
+        .unwrap();
+        let parent = stock.find_commit(first).unwrap();
+        let tree = parent.tree().unwrap();
+        let signature = git2::Signature::now("Remote", "remote@example.test").unwrap();
+        let child = stock
+            .commit(None, &signature, &signature, "child", &tree, &[&parent])
+            .unwrap();
+        import_pushed_branch(
+            &control,
+            id,
+            target,
+            &stock_path,
+            "topic",
+            sha1(child),
+            Some(sha1(first)),
+        )
+        .unwrap();
+        let divergent = stock
+            .commit(None, &signature, &signature, "divergent", &tree, &[])
+            .unwrap();
+        let old_refs = control.records(&ref_kind(id)).unwrap();
+        let old_metadata = control.records(&metadata_kind(id)).unwrap();
+        assert!(matches!(
+            import_pushed_branch(
+                &control,
+                id,
+                target,
+                &stock_path,
+                "topic",
+                sha1(divergent),
+                Some(sha1(child))
+            ),
+            Err(FetchError::NonFastForward)
+        ));
+        assert!(
+            control
+                .get_record(&metadata_kind(id), divergent.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(control.records(&ref_kind(id)).unwrap(), old_refs);
+        assert_eq!(control.records(&metadata_kind(id)).unwrap(), old_metadata);
+        assert_eq!(
+            control
+                .get_record(&object_kind(id, blob), anchor.anchor_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+            anchor_bytes
+        );
+        for prefix in [FETCH_PREFIX, PUSH_PREFIX, BLOB_PREFIX, VERIFIED_PREFIX] {
+            assert!(!control.has_records_with_kind_prefix(prefix).unwrap());
+        }
+        drop(control);
+        let reopened = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(reopened.records(&ref_kind(id)).unwrap(), old_refs);
+        assert_eq!(reopened.records(&metadata_kind(id)).unwrap(), old_metadata);
+        let graph = crate::history::export_graph_source(&reopened, id).unwrap();
+        assert_eq!(graph.blobs.len(), 1);
+        assert_eq!(graph.objects.len(), 3);
+        anchor.remove().unwrap();
     }
 
     #[test]

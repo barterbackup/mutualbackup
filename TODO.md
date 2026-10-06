@@ -163,6 +163,27 @@ passing tests below apply only to their recorded source and exercised cases.
     repair pass. Disposable Btrfs mount/image/loop cleanup is verified. Formatting
     and strict workspace/all-targets Clippy pass. Ordinary suites retain 18 ignored
     store cases and eight ignored snapshot cases; this is not a full M6 release gate.
+  - [x] Preflight fetch and stock branch/tag push against the combined destination
+    graph before recording a new intent or capturing blobs. Imported lengths
+    permit exact dense recipe counting before anchors exist and must agree with
+    existing cached mappings. Replayed intents recheck admission before import;
+    capacity rejection retains the exact intent and prior history for repair.
+    Final publication rechecks the budget, intent, tag namespace, expected ref,
+    branch selection and fast-forward condition under the writer lock. Push
+    metadata, refs and temporary intent retirement now commit together. Ancestry
+    checks use proposed objects in a temporary repository without durable writes.
+    Fresh rejected imports create no intent or anchors. Previously captured
+    pending anchors remain owned if a later capacity check fails. Signed backup
+    reconstruction, merge/checkout, full enclosing budgets and oversized-history
+    status/export qualification remain open; this does not close R2.
+    Validation: two new fixtures reject individually bounded histories whose
+    combined descriptor cannot fit, preserve oversized pending intents on reopen,
+    import reused anchors, publish a valid fast-forward and reject divergence
+    before metadata writes. All 79 ordinary and 62 provisioned Git library tests,
+    28 ordinary snapshot regressions and both native capture regressions pass,
+    with verified disposable Btrfs cleanup, formatting and strict workspace/
+    all-targets Clippy. Eight provisioned snapshot cases remain ignored in the
+    ordinary suite; the two named capture cases ran separately.
 
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
   production catalog design.** The first-release acceptance target is **1 TiB
