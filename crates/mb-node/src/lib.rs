@@ -27,12 +27,14 @@ pub use control::{
 pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6};
 #[cfg(target_os = "linux")]
 pub use legacy_export::{
-    LegacyExportPeer, LegacyExportReport, LegacyRevisionInventory, LegacyRevisionInventoryEntry,
-    export_withdrawn_revision_from_catalog, export_withdrawn_revision_from_catalog_over_network,
+    LegacyExportPeer, LegacyExportReport, LegacyPeerInventoryCoverage, LegacyRevisionInventory,
+    LegacyRevisionInventoryEntry, export_withdrawn_revision_from_catalog,
+    export_withdrawn_revision_from_catalog_over_network,
     export_withdrawn_revision_from_catalog_with_anchor_areas,
     export_withdrawn_revision_from_catalog_with_preserved_sources,
     export_withdrawn_revision_from_files, export_withdrawn_revision_from_source,
     inventory_withdrawn_revisions_from_catalog,
+    inventory_withdrawn_revisions_from_catalog_over_network,
 };
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use native_catalog::{NativeCatalogStream, NativeCatalogWriteError};

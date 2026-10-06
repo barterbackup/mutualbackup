@@ -45,6 +45,15 @@ pub(super) struct PeerRecovery {
     pub(super) peers: BTreeSet<NodeId>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LegacyPeerInventoryCoverage {
+    pub selected_peers: u64,
+    pub verified_checkpoints: u64,
+    pub unavailable_heads: u64,
+    pub unavailable_parent_links: u64,
+    pub unauthorized_owner_checkpoints: u64,
+}
+
 fn scratch_parent(
     candidate: &Path,
     data_dir: &Path,
@@ -82,17 +91,23 @@ impl PeerRecovery {
         guild: [u8; 32],
         origin: Option<[u8; 32]>,
         mut visit: impl FnMut(mb_core::QuorumCheckpoint) -> Result<bool>,
-    ) -> Result<()> {
+    ) -> Result<LegacyPeerInventoryCoverage> {
         // Check every available head before searching history. A peer's long
         // history must not hide a usable current certificate on another peer.
+        let mut coverage = LegacyPeerInventoryCoverage {
+            selected_peers: self.peers.len() as u64,
+            ..Default::default()
+        };
         let mut parents = Vec::new();
         for peer in &self.peers {
             let Some(Some((generation, hash))) =
                 self.read(self.client.preserved_checkpoint_head(*peer, guild))
             else {
+                coverage.unavailable_heads += 1;
                 continue;
             };
             let Some(checkpoint) = self.checkpoint(*peer, guild, origin, generation, hash) else {
+                coverage.unavailable_heads += 1;
                 continue;
             };
             let parent = checkpoint.checkpoint.parent.map(|hash| {
@@ -103,8 +118,13 @@ impl PeerRecovery {
                     hash,
                 )
             });
+            coverage.verified_checkpoints += 1;
+            ensure!(
+                coverage.verified_checkpoints <= 1_000_000,
+                "selected peer checkpoint history exceeds the recovery work bound"
+            );
             if !visit(checkpoint)? {
-                return Ok(());
+                return Ok(coverage);
             }
             parents.extend(parent);
         }
@@ -120,11 +140,17 @@ impl PeerRecovery {
                             .map(|checkpoint| (peer, checkpoint))
                     });
                 let Some((peer, checkpoint)) = candidate else {
+                    coverage.unavailable_parent_links += 1;
                     break;
                 };
                 let parent = checkpoint.checkpoint.parent;
+                coverage.verified_checkpoints += 1;
+                ensure!(
+                    coverage.verified_checkpoints <= 1_000_000,
+                    "selected peer checkpoint history exceeds the recovery work bound"
+                );
                 if !visit(checkpoint)? {
-                    return Ok(());
+                    return Ok(coverage);
                 }
                 let Some(parent) = parent else {
                     break;
@@ -134,7 +160,7 @@ impl PeerRecovery {
                 hash = parent;
             }
         }
-        Ok(())
+        Ok(coverage)
     }
 
     fn checkpoint(
@@ -313,11 +339,6 @@ impl PeerRecovery {
         let Some(certificate) = crate::node::preserved_guild_certificate(control)? else {
             return Ok(None);
         };
-        let original_member = certificate
-            .genesis
-            .members
-            .iter()
-            .any(|member| member.node_id == owner);
         let mut found = None;
         self.checkpoints(
             certificate.genesis.guild_id,
@@ -326,20 +347,8 @@ impl PeerRecovery {
                 if checkpoint.checkpoint.revisions.iter().any(|revision| {
                     revision.value.owner == owner && revision.value.revision_id == revision_id
                 }) {
-                    let mut authorized = original_member;
-                    if !authorized {
-                        self.replay_events(certificate.clone(), |state, _| {
-                            authorized = state
-                                .members
-                                .iter()
-                                .any(|member| member.member.node_id == owner)
-                                && crate::node::checkpoint_matches_dynamic_authority(
-                                    &checkpoint.checkpoint,
-                                    state,
-                                );
-                            Ok(!authorized)
-                        })?;
-                    }
+                    let authorized =
+                        self.authorizes_checkpoint(&certificate, owner, &checkpoint)?;
                     if authorized {
                         found = Some(checkpoint);
                     }
@@ -350,6 +359,38 @@ impl PeerRecovery {
             },
         )?;
         Ok(found)
+    }
+
+    pub(super) fn authorizes_checkpoint(
+        &self,
+        certificate: &mb_core::QuorumGuildGenesis,
+        owner: NodeId,
+        checkpoint: &mb_core::QuorumCheckpoint,
+    ) -> Result<bool> {
+        ensure!(
+            checkpoint.checkpoint.guild_id == certificate.genesis.guild_id
+                && checkpoint.checkpoint.genesis_hash == certificate.hash()?,
+            "selected peer checkpoint conflicts with the preserved genesis"
+        );
+        let mut authorized = certificate
+            .genesis
+            .members
+            .iter()
+            .any(|member| member.node_id == owner);
+        if !authorized {
+            self.replay_events(certificate.clone(), |state, _| {
+                authorized = state
+                    .members
+                    .iter()
+                    .any(|member| member.member.node_id == owner)
+                    && crate::node::checkpoint_matches_dynamic_authority(
+                        &checkpoint.checkpoint,
+                        state,
+                    );
+                Ok(!authorized)
+            })?;
+        }
+        Ok(authorized)
     }
 
     pub(super) fn sector(&self, guild: [u8; 32], reference: &SectorRef) -> Option<Vec<u8>> {
@@ -444,6 +485,38 @@ pub async fn export_withdrawn_revision_from_catalog_over_network(
     parity_volumes: Vec<PathBuf>,
     peers: Vec<LegacyExportPeer>,
 ) -> Result<LegacyExportReport> {
+    let protected_inputs = anchor_areas
+        .iter()
+        .chain(&parity_volumes)
+        .cloned()
+        .collect();
+    with_peer_recovery(
+        seed,
+        data_dir,
+        protected_inputs,
+        peers,
+        move |keys, data_dir, remote| {
+            super::export_catalog(
+                &keys,
+                &data_dir,
+                revision_id,
+                &target,
+                &anchor_areas,
+                &parity_volumes,
+                Some(&remote),
+            )
+        },
+    )
+    .await
+}
+
+pub(super) async fn with_peer_recovery<T: Send + 'static>(
+    seed: Seed,
+    data_dir: PathBuf,
+    protected_inputs: Vec<PathBuf>,
+    peers: Vec<LegacyExportPeer>,
+    operation: impl FnOnce(KeyMaterial, PathBuf, PeerRecovery) -> Result<T> + Send + 'static,
+) -> Result<T> {
     ensure!(
         !peers.is_empty() && peers.len() <= 64,
         "select between one and 64 peer endpoints"
@@ -456,12 +529,7 @@ pub async fn export_withdrawn_revision_from_catalog_over_network(
             "select surviving peers, not the recovering identity"
         );
     }
-    let parent = scratch_parent(
-        &std::env::temp_dir(),
-        &data_dir,
-        &anchor_areas,
-        &parity_volumes,
-    )?;
+    let parent = scratch_parent(&std::env::temp_dir(), &data_dir, &protected_inputs, &[])?;
     let scratch = tempfile::Builder::new()
         .prefix("mutualbackup-legacy-peer-client-")
         .tempdir_in(parent)?;
@@ -504,19 +572,9 @@ pub async fn export_withdrawn_revision_from_catalog_over_network(
             runtime: tokio::runtime::Handle::current(),
             peers: selected,
         };
-        tokio::task::spawn_blocking(move || {
-            super::export_catalog(
-                &keys,
-                &data_dir,
-                revision_id,
-                &target,
-                &anchor_areas,
-                &parity_volumes,
-                Some(&remote),
-            )
-        })
-        .await
-        .context("legacy peer export worker failed")?
+        tokio::task::spawn_blocking(move || operation(keys, data_dir, remote))
+            .await
+            .context("legacy peer read worker failed")?
     }
     .await;
     // Finish the isolated transport before removing its private scratch state,

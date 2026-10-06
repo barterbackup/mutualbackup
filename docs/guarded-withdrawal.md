@@ -103,6 +103,32 @@ journal replay or opening original anchors. Missing ciphertext does not prevent
 metadata inventory. Invalid signatures, conflicting record IDs/scopes or two
 different signed records with one revision ID fail without a partial report.
 
+To include missing local revision metadata from explicitly selected survivors:
+
+```sh
+mutualbackup legacy-list \
+  --data-dir /preserved/installation \
+  --peer NODE-ID=MULTIADDR \
+  --seed-file /preserved/recovery.txt
+```
+
+Repeat `--peer` to combine survivors. The preserved quorum-signed
+guild genesis certificate is required to bind the guild and origin. Peer heads
+and every parent are checked for canonical encoding, page/full hashes, quorum,
+exact preceding generation and guild/genesis. Later-member authorization replays
+signed membership evidence as for export, including removed-member history.
+The report deduplicates available local/remote signed records and marks
+`peer_checkpoint` provenance. Conflicting records fail without a partial report.
+
+`peer_coverage` records selected peer identities, verified checkpoint visits
+(including repeated copies), unavailable heads/parent links and certificates
+whose owner membership authority could not be established. These gaps must be
+resolved before declaring a complete retained-history inventory. Traversal keeps
+one checkpoint plus bounded head cursors, caps visits at the existing one-million
+recovery work bound, and uses a private temporary client outside the original
+installation. It issues only authenticated reads and installs no peer evidence,
+replay state or keys in the original catalog. Endpoint discovery is still explicit.
+
 The report's `signed_format` describes the public revision format, not private
 namespace format 6/7. `retained_history_complete` is false: local metadata cannot
 prove that peer-held history, root/Git catalogs, pins or pending intents have all
@@ -427,3 +453,15 @@ foreign owners and summary-budget boundaries. Invalid scopes/IDs, owner/writer
 signatures, checkpoint certificates/hashes and conflicting valid signed records
 fail while preserving original inputs. The CLI lists revision IDs before export.
 Complete ordinary Node/Git/core/store suites and full M6 gates were not rerun.
+
+The selected-peer inventory increment passes seventeen exporter/inventory, one
+membership, eight wire, three checkpoint-sync, five CLI unit tests and the real
+CLI fixture (35 distinct functions), plus the final signed-history rerun,
+formatting, locked workspace/all-targets build and strict Clippy. Real formats
+6/7 cover peer-only revision metadata, current/older retained revisions, two
+parent links, mixed provenance, corrupt-copy fallback and explicit gaps for
+missing/skipped/foreign parents. Later and removed members require certified
+replay; unsupported checkpoint epochs report unmatched owner authority. The CLI
+rejects absent preserved genesis without partial JSON. Original catalogs and
+absent key/parity files are preserved and temporary clients are cleaned up.
+Complete ordinary core/store/Node/Git suites and full M6 gates remain open.

@@ -14924,6 +14924,35 @@ pub(crate) mod tests {
                         .unwrap();
                     node.database_shell_statement(None, &format!("UPDATE checkpoint_heads SET checkpoint_hash=X'{}', checkpoint_bytes=X'{}' WHERE guild_id=X'{}'", hex::encode(conflict.hash().unwrap()), hex::encode(canonical_bytes(&conflict).unwrap()), hex::encode(state.guild_id)), true).unwrap();
                 }
+                let listed = crate::inventory_withdrawn_revisions_from_catalog_over_network(
+                    Seed::from_bytes([49; 32]),
+                    original.clone(),
+                    vec![selected.clone()],
+                )
+                .await;
+                if case < 2 {
+                    let report = listed.unwrap();
+                    assert_eq!(report.revisions.len(), 1);
+                    assert_eq!(report.revisions[0].revision_id, revision.value.revision_id);
+                    assert!(report.revisions[0].peer_checkpoint);
+                    assert!(!report.revisions[0].saved_revision);
+                    assert!(!report.retained_history_complete);
+                    let coverage = report.peer_coverage.unwrap();
+                    assert_eq!(coverage.verified_checkpoints, 1);
+                    assert_eq!(
+                        coverage.unavailable_heads + coverage.unavailable_parent_links,
+                        0
+                    );
+                } else if case == 5 {
+                    let report = listed.unwrap();
+                    assert!(report.revisions.is_empty());
+                    assert_eq!(
+                        report.peer_coverage.unwrap().unauthorized_owner_checkpoints,
+                        1
+                    );
+                } else {
+                    assert!(listed.is_err(), "case {case}");
+                }
                 let output = temp.path().join(format!("export-{case}"));
                 let result = crate::export_withdrawn_revision_from_catalog_over_network(
                     Seed::from_bytes([49; 32]),
@@ -15308,6 +15337,41 @@ pub(crate) mod tests {
                     }
                 }
                 let catalog_before = fs::read(original.join("control.db")).unwrap();
+                if matches!(case, 6 | 7 | 12 | 13 | 14 | 15 | 16 | 17) {
+                    let report = crate::inventory_withdrawn_revisions_from_catalog_over_network(
+                        Seed::from_bytes([49; 32]),
+                        original.clone(),
+                        selected.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!report.retained_history_complete);
+                    let coverage = report.peer_coverage.unwrap();
+                    assert!(coverage.verified_checkpoints >= if case == 7 { 2 } else { 3 });
+                    if matches!(case, 15..=17) {
+                        assert_eq!(report.revisions.len(), 1);
+                        assert!(
+                            report
+                                .revisions
+                                .iter()
+                                .all(|entry| entry.revision_id != revision.value.revision_id)
+                        );
+                        assert!(coverage.unavailable_parent_links > 0);
+                    } else {
+                        assert_eq!(report.revisions.len(), if history { 2 } else { 1 });
+                        let older = report
+                            .revisions
+                            .iter()
+                            .find(|entry| entry.revision_id == revision.value.revision_id)
+                            .unwrap();
+                        assert!(older.peer_checkpoint);
+                        if case == 13 {
+                            assert!(older.saved_revision);
+                        }
+                        assert_eq!(coverage.unavailable_heads, u64::from(case == 7));
+                        assert_eq!(coverage.unavailable_parent_links, 0);
+                    }
+                }
                 let target = temp.path().join(format!("export-{case}"));
                 let mut endpoints = selected.clone();
                 if case == 1 {

@@ -131,6 +131,9 @@ enum Command {
         /// Preserved installation inspected read-only.
         #[arg(long)]
         data_dir: PathBuf,
+        /// Explicit surviving peer NODE-ID=MULTIADDR; repeat for retained history.
+        #[arg(long)]
+        peer: Vec<mb_node::LegacyExportPeer>,
         #[arg(long)]
         seed_file: Option<PathBuf>,
         #[arg(long, conflicts_with = "seed_file")]
@@ -267,18 +270,26 @@ async fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         Command::LegacyList {
             data_dir,
+            peer,
             seed_file,
             seed_stdin,
         } => {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             let seed = derive_seed(&recovery).await?;
-            let report = tokio::task::spawn_blocking(move || {
-                mb_node::inventory_withdrawn_revisions_from_catalog(
-                    &KeyMaterial::from_seed(&seed),
-                    &data_dir,
+            let report = if peer.is_empty() {
+                tokio::task::spawn_blocking(move || {
+                    mb_node::inventory_withdrawn_revisions_from_catalog(
+                        &KeyMaterial::from_seed(&seed),
+                        &data_dir,
+                    )
+                })
+                .await??
+            } else {
+                mb_node::inventory_withdrawn_revisions_from_catalog_over_network(
+                    seed, data_dir, peer,
                 )
-            })
-            .await??;
+                .await?
+            };
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(target_os = "linux")]
@@ -1235,6 +1246,12 @@ fn legacy_list_requires_catalog_and_excludes_export_arguments() {
     };
     assert!(parse(&[]).is_err());
     assert!(parse(&["--data-dir", "original"]).is_ok());
+    let peer = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
+    let endpoint = format!(
+        "{peer}=/ip4/127.0.0.1/udp/9/quic-v1/p2p/{}",
+        peer.libp2p_peer_id().unwrap()
+    );
+    assert!(parse(&["--data-dir", "original", "--peer", &endpoint]).is_ok());
     for args in [
         vec!["--data-dir", "original", "--destination", "export"],
         vec![

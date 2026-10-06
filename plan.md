@@ -899,6 +899,12 @@ revision metadata from saved revision rows, legacy/scoped recovery heads and
 certified checkpoint records. It deduplicates exact signed records, rejects
 conflicting IDs/scopes/signatures, bounds the summary and reports per-revision
 provenance. It neither reads ciphertext/source anchors nor proves exportability.
+Explicit `legacy-list --peer NODE-ID=MULTIADDR` reads authenticated peer heads and
+signed parent chains, binding the preserved guild genesis and using the export
+path's later-member replay authority. Peer metadata joins the bounded, exact
+signed-record inventory with separate provenance. Coverage reports unavailable
+heads/parent links and unmatched owner authority; one-million checkpoint visits
+bound recovery work. No peer evidence is installed in preserved state.
 Its completeness flag remains false until remote history and preserved root/Git
 catalogs, pins and pending intents can be reconciled; missing private metadata
 must not be inferred from public signed revision formats.

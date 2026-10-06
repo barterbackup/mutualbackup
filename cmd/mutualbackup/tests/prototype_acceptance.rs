@@ -3425,6 +3425,21 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         "{extra_peer}=/ip4/127.0.0.1/udp/9/quic-v1/p2p/{}",
         extra_peer.libp2p_peer_id().unwrap()
     );
+    let mut peer_list_args = list_args.clone();
+    peer_list_args.extend([os("--peer"), os(&extra_endpoint)]);
+    let refused = run_output(
+        env!("CARGO_BIN_EXE_mutualbackup"),
+        &peer_list_args,
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("peer inventory requires the preserved signed guild certificate")
+    );
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     let catalog_args = vec![
         os("legacy-export"),
         os("--peer"),

@@ -7,8 +7,12 @@ mod remote;
 pub use inventory::{
     LegacyRevisionInventory, LegacyRevisionInventoryEntry,
     inventory_withdrawn_revisions_from_catalog,
+    inventory_withdrawn_revisions_from_catalog_over_network,
 };
-pub use remote::{LegacyExportPeer, export_withdrawn_revision_from_catalog_over_network};
+pub use remote::{
+    LegacyExportPeer, LegacyPeerInventoryCoverage,
+    export_withdrawn_revision_from_catalog_over_network,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};

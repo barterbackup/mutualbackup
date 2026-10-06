@@ -10,7 +10,7 @@ use mb_core::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// One authenticated revision available in the selected local metadata sources.
+/// One authenticated revision available in the selected metadata sources.
 /// This does not prove that its private metadata or ciphertext can be recovered.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyRevisionInventoryEntry {
@@ -26,9 +26,11 @@ pub struct LegacyRevisionInventoryEntry {
     pub saved_revision: bool,
     pub recovery_head: bool,
     pub certified_checkpoint: bool,
+    pub peer_checkpoint: bool,
 }
 
-/// Local available metadata only. Missing records, remote history, root/Git
+/// Available metadata only; peer gaps are reported when peers are selected.
+/// Missing records, remote history, root/Git
 /// catalogs, pins and pending intents require separate preservation/recovery.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyRevisionInventory {
@@ -37,6 +39,7 @@ pub struct LegacyRevisionInventory {
     pub scope: String,
     pub retained_history_complete: bool,
     pub revisions: Vec<LegacyRevisionInventoryEntry>,
+    pub peer_coverage: Option<super::remote::LegacyPeerInventoryCoverage>,
 }
 
 const SCOPE: &str = "available-local-signed-revision-metadata";
@@ -48,13 +51,28 @@ pub fn inventory_withdrawn_revisions_from_catalog(
     keys: &KeyMaterial,
     data_dir: &Path,
 ) -> Result<LegacyRevisionInventory> {
-    inventory_catalog(keys, data_dir, V1_MAX_CATALOG_BYTES)
+    inventory_catalog(keys, data_dir, V1_MAX_CATALOG_BYTES, None)
+}
+
+/// Inventory local metadata plus available certified history from selected peers.
+/// An unavailable head or parent remains an explicit coverage gap, never proof
+/// that a revision did not exist. No peer evidence is written to original state.
+pub async fn inventory_withdrawn_revisions_from_catalog_over_network(
+    seed: mb_core::Seed,
+    data_dir: std::path::PathBuf,
+    peers: Vec<super::LegacyExportPeer>,
+) -> Result<LegacyRevisionInventory> {
+    super::remote::with_peer_recovery(seed, data_dir, vec![], peers, |keys, data_dir, remote| {
+        inventory_catalog(&keys, &data_dir, V1_MAX_CATALOG_BYTES, Some(&remote))
+    })
+    .await
 }
 
 fn inventory_catalog(
     keys: &KeyMaterial,
     data_dir: &Path,
     summary_budget: usize,
+    remote: Option<&super::remote::PeerRecovery>,
 ) -> Result<LegacyRevisionInventory> {
     let control = crate::volume::inspect_control_store(data_dir, keys)?
         .context("original control catalog is unavailable")?;
@@ -78,7 +96,8 @@ fn inventory_catalog(
             match source {
                 0 => entry.saved_revision = true,
                 1 => entry.recovery_head = true,
-                _ => entry.certified_checkpoint = true,
+                2 => entry.certified_checkpoint = true,
+                _ => entry.peer_checkpoint = true,
             }
             return Ok(());
         }
@@ -95,6 +114,7 @@ fn inventory_catalog(
             saved_revision: source == 0,
             recovery_head: source == 1,
             certified_checkpoint: source == 2,
+            peer_checkpoint: source == 3,
         };
         summary_size = summary_size
             .checked_add(canonical_size_bounded(&entry, summary_budget)?)
@@ -156,6 +176,37 @@ fn inventory_catalog(
             Ok(true)
         },
     )?;
+    let peer_coverage = if let Some(remote) = remote {
+        let certificate = crate::node::preserved_guild_certificate(&control)?
+            .context("peer inventory requires the preserved signed guild certificate")?;
+        let mut unauthorized_owner_checkpoints = 0;
+        let mut coverage = remote.checkpoints(
+            certificate.genesis.guild_id,
+            Some(certificate.hash()?),
+            |checkpoint| {
+                if checkpoint
+                    .checkpoint
+                    .revisions
+                    .iter()
+                    .any(|revision| revision.value.owner == keys.node_id())
+                {
+                    if remote.authorizes_checkpoint(&certificate, keys.node_id(), &checkpoint)? {
+                        for revision in &checkpoint.checkpoint.revisions {
+                            add(revision, 3)?;
+                        }
+                    } else {
+                        unauthorized_owner_checkpoints += 1;
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        coverage.unauthorized_owner_checkpoints = unauthorized_owner_checkpoints;
+        Some(coverage)
+    } else {
+        None
+    };
+
     let mut revisions: Vec<_> = entries.into_values().collect();
     revisions.sort_by(|a, b| {
         (&a.guild_id, a.protected_root_id, a.sequence, a.revision_id).cmp(&(
@@ -168,9 +219,15 @@ fn inventory_catalog(
     let report = LegacyRevisionInventory {
         format_version: 1,
         owner: keys.node_id().to_string(),
-        scope: SCOPE.to_owned(),
+        scope: if remote.is_some() {
+            "available-local-and-selected-peer-signed-revision-metadata"
+        } else {
+            SCOPE
+        }
+        .to_owned(),
         retained_history_complete: false,
         revisions,
+        peer_coverage,
     };
     canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES)?;
     Ok(report)
@@ -281,8 +338,8 @@ mod tests {
                 .iter()
                 .map(|entry| canonical_size_bounded(entry, V1_MAX_CATALOG_BYTES).unwrap())
                 .sum();
-            assert!(inventory_catalog(&keys, &data, cost).is_ok());
-            assert!(inventory_catalog(&keys, &data, cost - 1).is_err());
+            assert!(inventory_catalog(&keys, &data, cost, None).is_ok());
+            assert!(inventory_catalog(&keys, &data, cost - 1, None).is_err());
             assert_eq!(fs::read(data.join("control.db")).unwrap(), before);
             assert_eq!(fs::read(data.join("control.key")).ok(), key_before);
             assert!(!data.join("parity.db").exists());

@@ -417,6 +417,33 @@ passing tests below apply only to their recorded source and exercised cases.
     all five CLI unit tests and the real CLI fixture pass (eight targeted functions).
     Locked workspace/all-targets build, formatting and strict Clippy pass.
     Complete ordinary Node/Git/core/store suites and full M6 gates were not rerun.
+  - [x] Include available selected-peer checkpoint history in `legacy-list`
+    with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
+    guild/origin; head/page hashes, canonical encoding, quorum and exact parent
+    generations remain mandatory. Reuse export's active/removed later-member
+    authorization and isolated temporary read client. Deduplicate exact local/
+    remote signed records with separate peer provenance; conflicts fail without
+    a partial report. Report selected identities, verified certificate visits,
+    unavailable heads/parent links and unmatched owner authority. Stream one
+    certificate plus bounded cursors, enforce the existing one-million recovery
+    work bound and the complete 32 MiB summary budget. Install no peer evidence
+    or replay state in preserved inputs. Missing history remains a coverage gap;
+    completeness remains false. Recovery-directory discovery, root/Git catalog,
+    pin/intent reconciliation, conversion and full release gates remain open.
+    Validation: real format-6/7 survivors inventory peer-only metadata, current
+    and older revisions across two parent links, mixed local/remote provenance
+    and corrupt-copy fallback. Missing parents, generation skips and foreign-
+    genesis parents preserve current entries with explicit history gaps. Active
+    and removed later-member records require certified replay; invalid evidence
+    rejects, and unmatched checkpoint epochs report unavailable owner authority.
+    Original catalog bytes and absent key/parity files remain unchanged. The CLI
+    rejects peer inventory without a preserved genesis and prints no partial JSON.
+    Seventeen exporter/inventory, one membership, eight wire, three checkpoint-
+    sync, five CLI unit and the real CLI fixture pass (35 unique functions).
+    The history fixture passes again after the test-only Clippy pattern correction.
+    Locked workspace/all-targets build, formatting and strict Clippy pass. Temporary
+    client cleanup is checked. Complete ordinary core/store/Node/Git suites and
+    full M6/platform gates remain open.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.
