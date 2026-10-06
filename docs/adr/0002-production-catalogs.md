@@ -1,6 +1,6 @@
 # Bounded authenticated catalogs for the 1 TiB release target
 
-Status: page/record framing, typed source records, local ownership and address/encryption primitives implemented; production admission
+Status: page/record framing, typed source records, Git object fragments, local ownership and address/encryption primitives implemented; production admission
 remains disabled until the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
 and their limits continue to apply.
 
@@ -203,3 +203,29 @@ ordering and duplicates, summary substitution, and terminal storage/fetch
 failure. All 29 catalog tests and all 75 core tests pass, along with formatting
 and strict workspace/all-targets Clippy. Signed revision integration, shared
 admission policy and file/Git/packing/coding record fragments remain open.
+
+Git metadata-object fragmentation is implemented in
+`crates/mb-git/src/object_catalog.rs`. Each commit/tree/tag has a bounded header
+followed by canonical 32 KiB fragments (the final fragment may be shorter).
+The builder reads an isolated object's input incrementally and requires its
+exact declared length. The reader enforces increasing OIDs, contiguous offsets,
+fragment geometry and complete objects. Both verify Git's type/length-prefixed
+SHA-1 OID incrementally; the final fragment is withheld if the object hash or
+authenticated count/byte summary fails. Blob payloads stay in source anchors.
+Oversized nested fragment declarations reject before allocating their contents.
+
+Six fixtures cover object kinds, empty trees, cross-page fragments, malformed
+declarations/encoding, ordering, hash/geometry/summary corruption, truncation,
+extra input and terminal input/storage/fetch failures. A generated tag larger
+than the old 32 MiB descriptor bound streams through the codec and regenerates
+its exact OID using independent libgit2 write streams. All 55 ordinary Git tests
+pass (62 provisioned tests remain ignored), with formatting and strict
+workspace/all-targets Clippy.
+
+This object stream is not a complete Git descriptor or a protection claim.
+Its root and summary require authentication inside the owner-encrypted Git
+container. Consumers must reach verified EOF before activating staged objects,
+retain libgit2's parsing/collision checks and validate the full graph's refs,
+blob availability and reachability. Git ref/blob fragments, the shared admission
+policy, bounded DAG validation, legacy migration and daemon integration remain
+open; existing graph and descriptor limits are still enforced.

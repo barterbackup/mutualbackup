@@ -204,10 +204,21 @@ passing tests below apply only to their recorded source and exercised cases.
     workspace/all-targets Clippy. This does not establish physical quota or
     retained dataset capacity; signed revision/packing consumers still need
     migration.
-  - [ ] Add quota reservations,
-    bounded file/Git/packing/coding record codecs and incremental seek/edit operations. Retire intent
-    tombstones only behind a verified generation floor. Qualify
-    interruption/reopen, cancellation and small changes to large catalogs.
+  - [x] Add bounded Git metadata-object fragments. Commit/tree/tag headers
+    and fixed 32 KiB fragments stream in OID order; readers check canonical
+    encoding, fragment declarations before allocation, offsets, lengths,
+    incremental Git OIDs and final object/count/byte summaries. Input, hashing,
+    storage and fetch failure fence continuation/publication. Six fixtures
+    include a generated object above the old 32 MiB descriptor bound, independently
+    hashed and regenerated using libgit2's native streams. All 55 ordinary Git
+    tests pass (62 provisioned tests remain ignored), with formatting and strict
+    workspace/all-targets Clippy. This is object-codec qualification, not an
+    above-limit graph backup; full DAG/ref/blob validation, legacy migration
+    and end-to-end admission/recovery remain open.
+  - [ ] Add quota reservations, bounded file/Git-ref/blob/packing/coding record
+    codecs and incremental seek/edit operations. Retire intent tombstones only
+    behind a verified generation floor. Qualify interruption/reopen,
+    cancellation and small changes to large catalogs.
   - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,
     retention and seed-only recovery together; qualify the declared capacity
     and geometry policy on real data before enabling production admission.

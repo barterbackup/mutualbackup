@@ -29,6 +29,7 @@ mod history;
 mod interop;
 #[cfg(target_os = "linux")]
 mod merge;
+mod object_catalog;
 mod odb;
 #[cfg(target_os = "linux")]
 mod prune;
@@ -63,6 +64,10 @@ pub use history::{
 pub use interop::GitInteropError;
 #[cfg(target_os = "linux")]
 pub use merge::{GitMergeState, MergeBlobError};
+pub use object_catalog::{
+    GIT_OBJECT_FRAGMENT_BYTES, GitObjectCatalogBuilder, GitObjectCatalogReader,
+    GitObjectCatalogRoot, GitObjectRecord,
+};
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
 pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};

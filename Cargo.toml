@@ -51,6 +51,7 @@ rusqlite = { version = "0.37", features = ["blob", "bundled-sqlcipher-vendored-o
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+sha1 = "=0.10.7"
 sha3 = "0.10"
 tempfile = "3.21"
 thiserror = "2.0"

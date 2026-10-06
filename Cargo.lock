@@ -3928,6 +3928,7 @@ dependencies = [
  "mb-core",
  "mb-store",
  "serde",
+ "sha1",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
