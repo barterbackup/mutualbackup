@@ -29,9 +29,10 @@ pub use attempt::{
 pub use catalog::{
     CATALOG_FANOUT, CATALOG_LEAF_BYTES, CATALOG_MAX_HEIGHT, CATALOG_MAX_PAGE_OCCURRENCES,
     CATALOG_MAX_RECORDS, CATALOG_MAX_STREAM_BYTES, CATALOG_PAGE_BYTES, CATALOG_RECORD_BYTES,
-    CatalogBuilder, CatalogError, CatalogPageContents, CatalogPageRef, CatalogReader,
-    CatalogRecordBuilder, CatalogRecordReader, CatalogRecordRoot, CatalogScope, CatalogSection,
-    CatalogStreamError,
+    CATALOG_SECTOR_RECORD_BYTES, CatalogBuilder, CatalogError, CatalogPageContents, CatalogPageRef,
+    CatalogReader, CatalogRecordBuilder, CatalogRecordReader, CatalogRecordRoot, CatalogScope,
+    CatalogSection, CatalogSectorBuilder, CatalogSectorReader, CatalogSectorRecord,
+    CatalogSectorRoot, CatalogStreamError,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,

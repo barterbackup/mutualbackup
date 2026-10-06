@@ -1,6 +1,6 @@
 # Bounded authenticated catalogs for the 1 TiB release target
 
-Status: page foundation, local ownership and address/encryption primitives implemented; production admission
+Status: page/record framing, typed source records, local ownership and address/encryption primitives implemented; production admission
 remains disabled until the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
 and their limits continue to apply.
 
@@ -184,3 +184,22 @@ strict workspace/all-targets Clippy. Records returned by this reader are raw
 bounded bytes: schema-specific decoders must still bound nested collections
 and validate canonical encoding and semantics. Typed record fragments,
 incremental seek/edit, quota reservation and runtime integration remain open.
+
+Typed source records are implemented in
+`crates/mb-core/src/catalog/sectors.rs`. Each version-one fixed-size record
+pairs a `SectorRef` with the existing `MerkleCommitment`. The decoder bounds
+encoded bytes, uses only fixed-size fields, checks canonical encoding and
+validates logical length and full encrypted-sector commitment geometry.
+Ciphertext flat roots and Merkle roots remain distinct authenticated values.
+Builders and readers enforce strictly increasing sector IDs, rejecting
+duplicate or conflicting sources without allocating a catalog-sized map.
+
+The source root binds the record root and total logical source bytes; consumers
+must authenticate both in the enclosing revision. The reader checks this
+summary before yielding the final source. Unique-source logical bytes are
+accounting evidence, not a retained-dataset capacity or physical quota measure.
+Five fixtures cover multi-page streaming, malformed schema/encoding/geometry,
+ordering and duplicates, summary substitution, and terminal storage/fetch
+failure. All 29 catalog tests and all 75 core tests pass, along with formatting
+and strict workspace/all-targets Clippy. Signed revision integration, shared
+admission policy and file/Git/packing/coding record fragments remain open.

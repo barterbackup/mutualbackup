@@ -10,9 +10,14 @@ use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
 mod privacy;
 mod records;
+mod sectors;
 pub use records::{
     CATALOG_MAX_RECORDS, CATALOG_RECORD_BYTES, CatalogRecordBuilder, CatalogRecordReader,
     CatalogRecordRoot,
+};
+pub use sectors::{
+    CATALOG_SECTOR_RECORD_BYTES, CatalogSectorBuilder, CatalogSectorReader, CatalogSectorRecord,
+    CatalogSectorRoot,
 };
 
 pub const CATALOG_PAGE_BYTES: usize = 64 * 1024;

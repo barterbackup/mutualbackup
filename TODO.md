@@ -194,8 +194,18 @@ passing tests below apply only to their recorded source and exercised cases.
     workspace/all-targets Clippy. Schema-specific nested collection bounds,
     typed records and runtime consumers remain open; framing alone does not
     enable production capacity.
+  - [x] Add typed source-sector records and streaming validation. Fixed-size
+    records pair the exact sector reference with its Merkle commitment; decoding
+    checks canonical encoding, version and encrypted-sector geometry. Strict
+    sector-ID order rejects duplicates and conflicts with constant memory.
+    The authenticated root accounts for unique-source logical bytes, checked
+    before yielding the final source. Five new fixtures and all 29 catalog
+    tests and 75 core tests pass, with formatting and strict
+    workspace/all-targets Clippy. This does not establish physical quota or
+    retained dataset capacity; signed revision/packing consumers still need
+    migration.
   - [ ] Add quota reservations,
-    bounded record codecs and incremental seek/edit operations. Retire intent
+    bounded file/Git/packing/coding record codecs and incremental seek/edit operations. Retire intent
     tombstones only behind a verified generation floor. Qualify
     interruption/reopen, cancellation and small changes to large catalogs.
   - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,
