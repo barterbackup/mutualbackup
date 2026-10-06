@@ -150,8 +150,15 @@ MUTUALBACKUP_REFLINK_TEST_ROOT=/mnt/disposable-btrfs \
 For only the five-daemon product acceptance scenario:
 
 ```sh
-nix develop -c bash scripts/network-smoke.sh /mnt/disposable-btrfs
+MUTUALBACKUP_TEST_LOG_ROOT=/tmp/mutualbackup-peer-logs \
+  nix develop -c bash scripts/network-smoke.sh /mnt/disposable-btrfs
 ```
+
+`MUTUALBACKUP_TEST_LOG_ROOT` optionally retains named topology daemon logs on
+success and failure, in private directories outside the fixture. Choose a path
+outside the disposable filesystem so its unmount and image removal preserve
+the diagnostics. The collector never traverses protected source directories.
+The native Git CI job archives these logs alongside its acceptance transcript.
 
 This Linux-only gate uses disposable network namespaces, veth interfaces,
 port-preserving NAT, and firewall rules to make direct, successful-DCUtR, and

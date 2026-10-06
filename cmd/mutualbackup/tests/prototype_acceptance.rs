@@ -28,6 +28,10 @@ use mutualbackup::{
 };
 use uuid::Uuid;
 
+#[path = "support/peer_logs.rs"]
+mod peer_logs;
+use peer_logs::PeerLogArchive;
+
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_BULK_TRANSFER_BYTES: u64 = 64 * 1024;
 const PROCESS_SMALL_BACKUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1170,6 +1174,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         .expect("the acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
     let run_root = PathBuf::from(test_root).join(format!("process-{}", Uuid::new_v4()));
     fs::create_dir_all(&run_root).unwrap();
+    let mut peer_log_archive = PeerLogArchive::from_environment(&run_root).unwrap();
     let seed_dir = run_root.join("offline");
     fs::create_dir(&seed_dir).unwrap();
     set_private(&seed_dir);
@@ -2052,6 +2057,9 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     daemons[0].stop();
     daemons[2].stop();
     daemons[3].stop();
+    peer_log_archive
+        .finish()
+        .expect("archive peer diagnostics before fixture cleanup");
     fs::remove_dir_all(&run_root).unwrap();
 }
 
@@ -2067,6 +2075,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     assert!(arti_config.is_file());
     let run_root = PathBuf::from(test_root).join(format!("private-tor-{}", Uuid::new_v4()));
     fs::create_dir_all(&run_root).unwrap();
+    let mut peer_log_archive = PeerLogArchive::from_environment(&run_root).unwrap();
     // Keep local-control endpoints independent of the potentially long Btrfs
     // acceptance path. Linux Unix-domain sockets have a small fixed pathname
     // limit, while only the captured data and databases need reflink storage.
@@ -2419,6 +2428,9 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     for daemon in &mut daemons {
         daemon.stop();
     }
+    peer_log_archive
+        .finish()
+        .expect("archive peer diagnostics before fixture cleanup");
     fs::remove_dir_all(&run_root).unwrap();
 }
 

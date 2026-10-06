@@ -187,9 +187,10 @@ passing tests below apply only to their recorded source and exercised cases.
   recovery. Preserve those jobs and keep the build-only Nix sandbox distinction.
   The new `native-git-acceptance` job invokes the complete
   `scripts/git-linux-acceptance.sh` gate on disposable Btrfs, retains the gate and
-  remaining per-peer logs before mount cleanup, and unmounts/removes its image on
-  exit. Successful topology fixtures currently delete their own logs first; fix
-  that diagnostics gap below. Required
+  per-peer logs before mount cleanup, and unmounts/removes its image on exit.
+  Topology fixtures now optionally archive their named daemon logs before
+  successful cleanup and during failure unwinding. Provisioned archive
+  qualification is tracked below. Required
   upgrade/multi-volume regression coverage remains open. The dedicated packaged Git runtime
   smoke job now covers the R6 slice. Qualify
   the exact release artifact through native-filesystem, topology, and source-loss
@@ -235,11 +236,17 @@ passing tests below apply only to their recorded source and exercised cases.
     namespaces, loop devices, or fixture firewall rules. Workflow syntax and the diagnostic log-copy
     step were checked locally; the hosted CI job has not been run here.
 
-  - [ ] Archive successful topology peer logs before the fixture deletes its
-    process directory. The post-suite collector preserves failure diagnostics,
-    but finds no peer logs after successful fixture cleanup. Preserve only the
-    fixture's top-level daemon logs in a separate private artifact directory;
-    never walk protected source payloads. Qualify both success and failure paths.
+  - [ ] Qualify topology log archival on the provisioned five-daemon scenario.
+    Implemented: `MUTUALBACKUP_TEST_LOG_ROOT` selects a separate private artifact
+    directory. Both process and private-Tor fixtures archive named daemon logs
+    after stopping daemons and before successful cleanup, and on failure unwind.
+    The collector copies only regular named daemon logs, refuses symlinks, and
+    never walks protected source directories. A copy error preserves the fixture.
+    CI retains these archives and also collects remaining logs after abrupt
+    failures. All 15 ordinary process-acceptance tests pass, including successful
+    cleanup, failure unwind, privacy/filtering, and copy-error preservation;
+    workflow syntax, format, and strict workspace/all-target Clippy pass.
+    Confirm the real topology archive survives disposable mount/image cleanup.
 
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and

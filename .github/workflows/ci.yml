@@ -87,6 +87,7 @@ jobs:
       - name: Run the complete native Git acceptance suite
         env:
           MUTUALBACKUP_REFLINK_TEST_ROOT: /mnt/mutualbackup-git-ci
+          MUTUALBACKUP_TEST_LOG_ROOT: ${{ github.workspace }}/git-peer-logs
         run: |
           set -o pipefail
           git rev-parse HEAD
@@ -96,13 +97,17 @@ jobs:
         if: always()
         run: |
           python3 - <<'PY'
+          import os
           import shutil
           from pathlib import Path
+          os.umask(0o077)
           root = Path("/mnt/mutualbackup-git-ci")
+          names = {"p0.log", "p1.log", "p2.log", "p3.log", "p4.log",
+                   "recovered.log", "storage-recovered.log", "outsider.log"}
           for source in root.glob("process-*/*.log"):
-              if source.is_file():
+              if source.name in names and not source.is_symlink() and source.is_file():
                   destination = Path("git-peer-logs") / source.relative_to(root)
-                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                   shutil.copyfile(source, destination)
           PY
       - name: Retain native Git qualification diagnostics
