@@ -1379,6 +1379,12 @@ writer fence, exact bootstrap source and authenticated EOF. Normal capture,
 checkpoint, packing, retention and seed-only recovery still need to adopt these
 roots together, with complete private/source joins and durable ownership before
 activation. The codec alone changes no production protection claim or capacity.
+Local publication now binds all three/six owned streams, the signed migration
+record, completed native/source index and shared encrypted bootstrap in one
+writer transaction. Typed cancellation fences them together and preserves
+bootstrap ciphertext until its last owner retires. The migration namespaces
+leave existing flat backup heads unchanged; full capture/replay and protection
+activation remain required.
 
 ### Historical implementation and validation record (before scope correction)
 

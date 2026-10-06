@@ -150,6 +150,75 @@ fn require_verified(
     Ok(record)
 }
 
+pub(super) fn verified_manifest(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<CatalogNativeValidation, CatalogStoreError> {
+    Ok(require_verified(connection, id)?.manifest)
+}
+
+pub(super) fn validation_snapshot(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<Option<(CatalogNativeValidation, CatalogNativeValidationState)>, CatalogStoreError> {
+    Ok(read_validation(connection, id)?.map(|record| (record.manifest, record.state)))
+}
+
+pub(super) fn link_publication(connection: &Connection, id: Uuid) -> Result<(), CatalogStoreError> {
+    require_verified(connection, id)?;
+    insert_exact(connection, BUNDLE_LINK, id.as_bytes(), id.as_bytes())
+}
+
+pub(super) fn require_publication_link(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<(), CatalogStoreError> {
+    if bounded_record(connection, BUNDLE_LINK, id.as_bytes(), 16)?.as_deref() != Some(id.as_bytes())
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(())
+}
+
+pub(super) fn cancel_linked_publication(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<(), CatalogStoreError> {
+    require_publication_link(connection, id)?;
+    cancel_validation(connection, id)?;
+    if connection.execute(
+        "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?2",
+        params![BUNDLE_LINK, id.as_bytes()],
+    )? != 1
+    {
+        return Err(DatabaseError::Conflict.into());
+    }
+    Ok(())
+}
+
+pub(super) fn source_record(
+    connection: &Connection,
+    id: Uuid,
+    sector: SectorId,
+) -> Result<Option<CatalogSectorRecord>, CatalogStoreError> {
+    require_verified(connection, id)?;
+    let record = bounded_record(
+        connection,
+        &sources(id),
+        &sector,
+        CATALOG_SECTOR_RECORD_BYTES,
+    )?
+    .map(|bytes| CatalogSectorRecord::decode(&bytes))
+    .transpose()?;
+    if record
+        .as_ref()
+        .is_some_and(|record| record.sector.id != sector)
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(record)
+}
+
 /// A published native bundle must cancel its validation and roots together.
 pub(super) fn require_unpublished_validation(
     connection: &Connection,

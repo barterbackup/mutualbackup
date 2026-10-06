@@ -57,7 +57,10 @@ pub use node::{
     DhtPublicationSet, DhtSequenceFloors, GuildAuditReport, GuildPeer, GuildPhase, GuildSummary,
     LockedDataDir, Node, ProtectionState, RecoveredShards, SnapshotInfo,
 };
-pub use paged_revision::{PAGED_PRIVATE_METADATA_BYTES, PagedPrivateMetadata};
+pub use paged_revision::{
+    PAGED_PRIVATE_METADATA_BYTES, PagedCatalogIntents, PagedPrivateMetadata,
+    PagedRevisionCatalogSnapshot,
+};
 pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,
     restore_revision_from_source,

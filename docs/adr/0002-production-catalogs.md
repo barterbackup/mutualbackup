@@ -972,3 +972,49 @@ snapshot, five native adapter, six paged Git and 24 catalog-store tests pass
 complete core suite pass again after final admission hardening. Locked workspace/
 all-targets build, formatting and strict Clippy pass. Eight provisioned snapshot
 cases remain ignored; no full native/topology/platform or real 1 TiB gate ran.
+
+### Durable signed paged root publication (2026-10-06)
+
+`PagedPrivateMetadata::publish_local_catalog` connects the signed envelope to
+local SQLCipher ownership. It retains native namespace/recipe and public source
+roots, plus optional Git ref/object/blob roots, in explicit role order. These
+three or six roots share the existing aggregate stream/page-occurrence bound.
+The completed native/source validation index is bound to the same revision ID.
+An immutable encrypted bootstrap sector, saved signed migration record and
+bootstrap-owner pin publish in the same writer transaction as every root pin.
+The new namespaces leave current flat revision heads and protection unchanged.
+
+`CatalogPublicationView` provides reads from that exact writer snapshot without
+nested transactions. Node checks the supplied certified writer fence, signed
+source EOF and bootstrap identity, exact source-index records, every private
+page's derived ciphertext reference/Merkle commitment, typed Git stream EOFs
+and blob recipe/source joins. Reopening compares the decrypted descriptor with
+all retained roots and checks the signed record, native index and bootstrap
+ownership together. Subsequent traversals still authenticate actual bytes.
+
+Typed cancellation fences the validation index and all member intents in one
+transaction before releasing the signed migration record and bootstrap pin.
+Shared bootstrap ciphertext survives until its last revision owner retires.
+Independent bundle/member/index cancellation is rejected while published.
+Existing bounded index/pin/page cleanup APIs reclaim cancelled closures;
+cancellation journals remain until generation-floor retirement is implemented.
+SQL abort/ignore faults must roll back the complete publication or cancellation.
+
+This is durable migration-root ownership. It does not install file/blob source
+recipes, advance a production backup head, establish checkpoint/remote protection,
+verify the complete Git DAG or plaintext blob IDs, or qualify the 1 TiB target.
+Normal capture, checkpoint/packing, retention and seed-only recovery consumers
+still need to adopt the roots and complete those activation checks together.
+
+Validation: three new store and two Node fixtures pass, with SQL abort/ignore
+faults across publication/retirement boundaries, shared bootstrap ownership,
+reopen/retry and independent cancellation fences. Native/Git-bearing fixtures
+exercise raw paths, sparse recipes and forward hard-link identity. Rejected
+writer authority creates no validation rows; missing/substituted page/bootstrap
+sources and mismatched Git recipes leave no published root or bootstrap.
+All 109 core, 111 ordinary store, 30 ordinary snapshot, five native adapter,
+six paged Git and five paged Node tests pass (266 distinct cases). The five Node
+cases pass again after early writer-fence admission was tightened. Locked
+workspace/all-targets build, formatting and strict Clippy pass. Nineteen
+provisioned store and eight snapshot cases remain ignored; no native/topology/
+platform or real 1 TiB gate ran for this local ownership step.

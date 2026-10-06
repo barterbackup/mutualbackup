@@ -18,8 +18,9 @@ mod catalog;
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogIntentState,
-    CatalogNativeValidation, CatalogNativeValidationState, CatalogSectorSource, CatalogSourceSweep,
-    CatalogStoreError, CatalogValidatedLink,
+    CatalogNativeValidation, CatalogNativeValidationState, CatalogPublicationView,
+    CatalogSectorSource, CatalogSourceSweep, CatalogStoreError, CatalogValidatedLink,
+    PagedCatalogSnapshot,
 };
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";

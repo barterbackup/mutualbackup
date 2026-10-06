@@ -989,6 +989,35 @@ passing tests below apply only to their recorded source and exercised cases.
     and signature-admission hardening. Locked workspace/all-targets build,
     formatting and strict Clippy pass. Eight provisioned snapshot cases remain
     ignored; native/topology/platform and real 1 TiB gates were not run here.
+  - [x] Publish signed paged revision roots and bootstrap ownership atomically.
+    A writer transaction retains native namespace/recipe, public sources and
+    optional Git ref/object/blob roots with the signed migration record and
+    immutable bootstrap ciphertext. Reuse the completed native/source index
+    and fence its independent cancellation while published. Under the same
+    transaction, verify the supplied writer fence, complete signed source EOF,
+    exact index/bootstrap joins, every private page's encrypted source roots and
+    commitments, typed Git stream EOFs and blob recipe/source joins. Reopen
+    checks signed identity, scope, role order, encrypted descriptor and retained
+    member/index/pin state. Cancellation fences index and every root together,
+    releases the saved migration record and deletes shared bootstrap ciphertext
+    only after its last owner; bounded page/index cleanup follows existing APIs.
+    All roots share an aggregate geometry bound. The new migration namespaces
+    do not advance flat backup heads or emit production protection claims.
+    Full Git graph/blob byte verification, source recipe installation, capture/
+    checkpoint/packing/retention/recovery migration and the 1 TiB gate remain open.
+    Validation: three new store and two Node fixtures pass. They cover atomic
+    publication/cancellation with SQL abort/ignore faults, exact retry, reopen,
+    shared bootstrap retirement, member/index fences, missing/substituted page
+    and bootstrap sources, mismatched writer and Git recipe/source joins. Native
+    and Git-bearing root fixtures include raw paths, a sparse recipe and forward
+    hard-link identity. All 109 core, 111 ordinary store, 30 ordinary snapshot,
+    five native adapter, six paged Git and five paged Node tests pass (266 distinct
+    cases). Locked workspace/all-targets build passes.
+    All five paged Node tests pass again after the early writer-fence check;
+    mismatched authority creates no pending validation rows. Formatting and
+    strict locked workspace/all-targets Clippy pass. The ordinary suites retain
+    19 provisioned store and eight snapshot cases; no native/topology/platform
+    or real 1 TiB gate ran for this local ownership step.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

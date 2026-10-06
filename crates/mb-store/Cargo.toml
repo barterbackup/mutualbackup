@@ -17,3 +17,6 @@ tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
