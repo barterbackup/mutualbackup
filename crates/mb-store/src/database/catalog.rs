@@ -575,6 +575,67 @@ mod tests {
     }
 
     #[test]
+    fn catalog_ranges_seek_reopened_sql_pages_without_reading_unrelated_leaf() {
+        let (bytes, root, pages) = graph();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([90; 32]));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let operation = intent(9);
+        let store = ControlStore::open(&path, &keys).unwrap();
+        store.begin_catalog(operation).unwrap();
+        for (reference, encoded) in &pages {
+            store
+                .stage_catalog_page(operation, *reference, encoded)
+                .unwrap();
+        }
+        store.publish_catalog(operation, root).unwrap();
+        drop(store);
+        let store = ControlStore::open(&path, &keys).unwrap();
+        // Corrupt the first leaf: an authenticated range in the last leaf must
+        // not fetch it, while a complete scan must still detect the corruption.
+        store.connection.execute(
+            "UPDATE protocol_records SET bytes = zeroblob(length(bytes)) WHERE kind = ?1 AND record_id = ?2",
+            params![PAGE, pages[0].0.hash],
+        ).unwrap();
+        let range = root.byte_len - 8..root.byte_len;
+        let mut reader = mb_core::CatalogRangeReader::new(
+            operation.scope,
+            operation.section,
+            root,
+            range.clone(),
+        )
+        .unwrap();
+        let mut reads = 0;
+        let mut fetch = |reference| {
+            reads += 1;
+            store.catalog_page(operation.scope, operation.section, reference)
+        };
+        assert_eq!(
+            reader.next_chunk(&mut fetch).unwrap().unwrap(),
+            bytes[range.start as usize..]
+        );
+        assert!(reader.next_chunk(&mut fetch).unwrap().is_none());
+        assert_eq!(reads, 2);
+        let mut complete = CatalogReader::new(operation.scope, operation.section, root).unwrap();
+        assert!(
+            complete
+                .next_leaf(&mut |reference| store.catalog_page(
+                    operation.scope,
+                    operation.section,
+                    reference
+                ))
+                .is_err()
+        );
+        drop(store);
+        let store = ControlStore::open(&path, &keys).unwrap();
+        assert_eq!(
+            store.catalog_intent_state(operation).unwrap(),
+            CatalogIntentState::Published(root)
+        );
+        assert!(!store.collect_catalog_page().unwrap());
+    }
+
+    #[test]
     fn catalog_ownership_reopens_at_each_stage_publication_and_cleanup_boundary() {
         let (bytes, root, pages) = graph();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([91; 32]));

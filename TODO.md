@@ -505,6 +505,24 @@ passing tests below apply only to their recorded source and exercised cases.
     pass. Ordinary suites retain 18 store, 62 Git and 20 Node provisioned cases;
     the Git and snapshot cases above ran separately. This is source integration
     and legacy regression qualification, not the complete M6 production gate.
+  - [x] Add authenticated byte-range traversal with bounded seek work.
+    `CatalogRangeReader` verifies each intersecting parent and leaf, uses
+    authenticated child lengths to skip unrelated subtrees, and returns only
+    the requested bytes in bounded chunks. Repeated page occurrences retain
+    their distinct stream offsets. Storage/verification failures poison the
+    reader; invalid and overflowing ranges fail before fetching. Empty ranges
+    perform no fetch. This is range authentication, not full-catalog validation.
+    Three core fixtures cover boundary combinations, partial leaves, corruption,
+    scope/reference substitution, storage failures and small reads at the exact
+    16 GiB catalog-stream limit. One reopened SQLCipher fixture proves a tail
+    read fetches only its root and leaf despite an unrelated corrupt leaf;
+    whole-stream traversal still detects that corruption. The maximum-size
+    fixture uses repeated authenticated subtrees, not real 1 TiB dataset data.
+    Production consumer migration, variable-length edits and stable record
+    locations remain open; this does not change current snapshot limits.
+    Validation: all 99 core and 97 ordinary store tests pass (18 provisioned
+    store cases remain ignored), with formatting and strict workspace/all-targets
+    Clippy. No native source-backend or topology behavior changed in this step.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

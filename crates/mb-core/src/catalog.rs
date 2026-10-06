@@ -12,6 +12,7 @@ mod file_recipes;
 mod files;
 mod native_files;
 mod privacy;
+mod range;
 mod records;
 mod sectors;
 pub use file_recipes::{
@@ -27,6 +28,7 @@ pub use native_files::{
     CATALOG_NATIVE_FILE_ROOT_BYTES, CatalogFileEvent, CatalogNativeFileReader,
     CatalogNativeFileRoot,
 };
+pub use range::CatalogRangeReader;
 pub use records::{
     CATALOG_MAX_RECORDS, CATALOG_RECORD_BYTES, CatalogRecordBuilder, CatalogRecordReader,
     CatalogRecordRoot,

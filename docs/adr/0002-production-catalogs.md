@@ -791,3 +791,33 @@ cleanup. Formatting and strict workspace/all-targets Clippy pass. The ordinary
 suites retain 18 store, 62 Git and 20 Node provisioned cases; the Git and snapshot
 cases above ran separately. This source integration and legacy regression
 qualification does not replace the complete M6 production gates.
+
+### Authenticated range traversal (2026-10-06)
+
+`CatalogRangeReader` reads an exact byte range using the existing version-one
+page tree. It authenticates intersecting parents and leaves, deriving skipped
+subtree offsets from verified parent summaries. It preserves offsets for
+repeated page occurrences and visits no preceding leaves. Returned chunks stay
+within one bounded leaf; pending references stay within the existing fanout and
+height bound. Invalid ranges fail at construction, empty ranges fetch nothing,
+and any storage or verification failure permanently poisons that reader.
+
+This operation authenticates the requested range. It does not certify the
+integrity or availability of skipped pages, replace whole-stream validation,
+or provide signed root authority. Callers still obtain roots from authenticated
+metadata and bound fetched page allocation. Page geometry and wire formats are
+unchanged. Stable typed-record locations, variable-length editing and production
+consumer migration remain required before bounded byte seeking makes capture,
+restore and small edits incremental end to end.
+
+Three core fixtures cover combinations of leaf boundaries and partial leaves,
+small reads at every tree level and at the exact 16 GiB stream limit, repeated
+subtrees, invalid ranges, storage failures, corruption and reference/scope
+substitution. The maximum-size fixture constructs a repeated tree rather than
+allocating 16 GiB or qualifying real 1 TiB dataset data. A reopened SQLCipher
+fixture reads the tail in two page fetches while an unrelated first leaf is
+corrupt; full traversal rejects that corrupt leaf and the published root stays
+pinned across reopen. All 99 core and 97 ordinary store tests pass, with 18
+provisioned store cases still ignored, plus formatting and strict workspace/
+all-targets Clippy. Native source-backend and topology qualification were not
+rerun for this reader addition. R3 and the full M6 release gates remain open.

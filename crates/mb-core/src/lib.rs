@@ -37,9 +37,9 @@ pub use catalog::{
     CatalogFileRecipeBuilder, CatalogFileRecipeReader, CatalogFileRecipeRecord,
     CatalogFileRecipeRoot, CatalogFileRecord, CatalogFileRoot, CatalogFileStat,
     CatalogNativeFileReader, CatalogNativeFileRoot, CatalogPageContents, CatalogPageRef,
-    CatalogReader, CatalogRecordBuilder, CatalogRecordReader, CatalogRecordRoot, CatalogScope,
-    CatalogSection, CatalogSectorBuilder, CatalogSectorReader, CatalogSectorRecord,
-    CatalogSectorRoot, CatalogStreamError, catalog_file_path_order,
+    CatalogRangeReader, CatalogReader, CatalogRecordBuilder, CatalogRecordReader,
+    CatalogRecordRoot, CatalogScope, CatalogSection, CatalogSectorBuilder, CatalogSectorReader,
+    CatalogSectorRecord, CatalogSectorRoot, CatalogStreamError, catalog_file_path_order,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
