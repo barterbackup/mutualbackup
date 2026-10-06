@@ -5,12 +5,24 @@ are no longer exposed. Old local control requests receive a withdrawal error.
 The daemon inspects existing control catalogs read-only before key wrapping,
 schema migration, journal replay, or mount recovery. Guarded journals, root
 bindings, and pending guarded capture or recovered-anchor intents cause startup
-to stop. Source-loss recovery cannot enroll a guarded revision as a new root.
+to stop. The read-only check also opens registered Git catalogs when their source
+is present and rejects guarded bindings, journals, and root-backed historical
+blobs. Root and mount records need not remain for that detection to work.
+Locally available authenticated revision metadata in user revisions, revision
+heads, and certified checkpoint history identifies withdrawn formats 6 and 7;
+the first metadata sector suffices even when later sectors are absent.
+Source-loss recovery cannot enroll a guarded revision as a new root.
+Decoded legacy capture plans cannot capture, replay, detach edits, or discard
+anchors through the versioned source-backend API.
 
 This is the first removal step. The implementation and its dependency are still
 present while the remaining legacy formats and shared recovery code are audited.
 There is no supported automatic migration or offline export tool in this build.
-The startup check is not a complete audit of every historical signed revision.
+Offline Git catalogs and revision metadata not yet downloaded during seed
+recovery cannot be classified by the startup check. Recovery admission must
+classify the downloaded metadata before publishing a restore job or enrolling
+its root. The remaining runtime removal and complete recovery/export policy
+are still tracked in R1.
 Do not interpret a successfully opened native catalog as proof that all retained
 history has been converted.
 

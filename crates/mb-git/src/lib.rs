@@ -70,7 +70,9 @@ pub use prune::{
     GitPruneRoots,
 };
 #[cfg(target_os = "linux")]
-pub use repository::{GitGuardedCatalogRetirementV1, GitRepository, RepositoryError};
+pub use repository::{
+    GitGuardedCatalogRetirementV1, GitRepository, RepositoryError, require_native_catalog_state,
+};
 #[cfg(target_os = "linux")]
 pub use rm::GitRmError;
 pub use stage::{

@@ -4267,32 +4267,6 @@ mod tests {
     }
 
     #[test]
-    fn durable_source_plan_dispatches_guarded_root_capture() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        fs::create_dir(&root).unwrap();
-        let plan = planned_without_privileged_probe(&root);
-        let keys = KeyMaterial::from_seed(&Seed::from_bytes([83; 32]));
-        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
-        let source = crate::SourceCapturePlan::GuardedLinkFreezeV1(plan.clone());
-        let decoded: crate::SourceCapturePlan =
-            mb_core::decode_canonical(&mb_core::canonical_bytes(&source).unwrap()).unwrap();
-        assert_eq!(decoded, source);
-        assert_eq!(decoded.source_root(), root);
-        let manifest = decoded.capture(&store).unwrap();
-        assert!(
-            GuardedRootCapturePlan::load_for_manifest(&store, &manifest)
-                .unwrap()
-                .is_some()
-        );
-        let mut wrong = manifest.clone();
-        wrong.root_mode ^= 0o100;
-        assert!(GuardedRootCapturePlan::load_for_manifest(&store, &wrong).is_err());
-        decoded.discard(&store).unwrap();
-        decoded.reconcile(&store).unwrap();
-    }
-
-    #[test]
     fn root_edit_requires_a_published_file_capture() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");

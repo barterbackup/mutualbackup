@@ -705,6 +705,83 @@ pub(crate) fn require_native_capture_state(control: &ControlStore) -> Result<()>
             bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
         }
         Ok(())
+    })?;
+    control.for_each_record_value(GIT_GRAPH_INTENT_KIND, |bytes| {
+        let (intent, _) = decode_git_graph_intent(bytes)?;
+        if intent
+            .graph
+            .blobs
+            .iter()
+            .any(|blob| blob.anchor.guarded_root_file.is_some())
+        {
+            bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
+        }
+        Ok(())
+    })
+}
+
+/// A signed private format remains identifiable after its root, mount records,
+/// and Git registration have been removed. Inspect only the authenticated first
+/// metadata sector: this also detects an interrupted download with later pages
+/// absent, without allocating the complete historical catalog.
+pub(crate) fn require_native_signed_history(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+) -> Result<()> {
+    // Checkpoints commonly repeat the same revision for many generations.
+    // Bound this cache independently of the number of historical checkpoints.
+    let mut inspected = BTreeSet::new();
+    let mut inspect = |revision: &SignedRecord<UserRevision>| -> Result<()> {
+        if revision.value.owner != keys.node_id() {
+            // Other guild members' captures do not select our local backend.
+            return Ok(());
+        }
+        let identity = *blake3::hash(&canonical_bytes(revision)?).as_bytes();
+        if inspected.contains(&identity) {
+            return Ok(());
+        }
+        revision.verify(USER_REVISION_DOMAIN)?;
+        ensure!(
+            revision.signer == revision.value.owner,
+            "signed revision has another owner"
+        );
+        revision.value.verify_writer()?;
+        if let Some(reference) = revision.value.metadata_sectors.first() {
+            checked_metadata_length(revision)?;
+            if control.get_record("local-sector", &reference.id)?.is_some() {
+                let guild_id = revision.value.guild_id;
+                let bytes =
+                    decrypt_reference(&keys.guild_data_key(&guild_id), reference, &mut |id| {
+                        render_sector(control, keys, id, Some(&guild_id))
+                    })?;
+                if matches!(private_metadata_format(&bytes)?, 6 | 7) {
+                    bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
+                }
+            }
+            // A seed recovery can persist a certified checkpoint before its
+            // metadata is downloaded. Recovery admission must classify it once
+            // available, before publishing a restore job or enrolling a root.
+        }
+        if inspected.len() == 4096 {
+            inspected.clear();
+        }
+        inspected.insert(identity);
+        Ok(())
+    };
+    for kind in ["user-revision", "user-revision-head"] {
+        control.for_each_record_value(kind, |bytes| {
+            inspect(&decode_canonical::<SignedRecord<UserRevision>>(bytes)?)
+        })?;
+    }
+    control.for_each_record_value("guild-checkpoint", |bytes| {
+        let checkpoint: mb_core::QuorumCheckpoint = decode_canonical(bytes)?;
+        // Classify each owner's signed revision independently, including drafts
+        // in an incomplete certificate. Normal checkpoint replay and recovery
+        // still perform their complete quorum/authority validation.
+        for revision in &checkpoint.checkpoint.revisions {
+            inspect(revision)?;
+        }
+        Ok(())
     })
 }
 
@@ -5568,12 +5645,63 @@ mod metadata_compatibility_tests {
             plan,
             replaced_anchor: None,
         };
+        let anchor_bytes = canonical_bytes(&(
+            2_u16,
+            Uuid::from_bytes([7; 16]),
+            mb_store::StableAnchorAreaLocator {
+                area_id: Uuid::from_bytes([2; 16]),
+                path_hint: PathBuf::from("/legacy/anchors"),
+                filesystem_id: 3,
+                volume_root_hint: PathBuf::from("/legacy"),
+            },
+            b"/legacy/source".to_vec(),
+            b"file".to_vec(),
+            0_u64,
+            [8_u8; 32],
+            (3_u64, 4_u64, 0_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+            (
+                Uuid::from_bytes([1; 16]),
+                b"file".to_vec(),
+                NativeFileId {
+                    filesystem_id: 3,
+                    inode: 4,
+                },
+            ),
+        ))
+        .unwrap();
+        let graph = GitGraphSource {
+            format_version: 1,
+            repository_id: Uuid::from_bytes([9; 16]),
+            refs: Vec::new(),
+            objects: Vec::new(),
+            blobs: vec![mb_git::GitGraphBlobSource {
+                oid: [10; 20],
+                anchor: decode_canonical(&anchor_bytes).unwrap(),
+            }],
+        };
+        let old_graph = LegacyGitGraphIntentV1 {
+            format_version: 1,
+            guild_id: [6; 32],
+            revision_id,
+            protected_root_id: graph.repository_id,
+            graph: graph.clone(),
+        };
+        let new_graph = GitGraphIntent {
+            format_version: 2,
+            guild_id: [6; 32],
+            revision_id,
+            protected_root_id: graph.repository_id,
+            graph,
+            head_branch: "main".to_owned(),
+        };
         for (kind, bytes) in [
             ("capture-intent", canonical_bytes(&capture).unwrap()),
             (
                 RECOVERY_ANCHOR_INTENT_KIND,
                 canonical_bytes(&recovery).unwrap(),
             ),
+            (GIT_GRAPH_INTENT_KIND, canonical_bytes(&old_graph).unwrap()),
+            (GIT_GRAPH_INTENT_KIND, canonical_bytes(&new_graph).unwrap()),
         ] {
             let area = tempfile::tempdir().unwrap();
             let control =

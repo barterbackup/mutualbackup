@@ -139,6 +139,71 @@ pub struct GitRepository {
     source_backend: SourceBackendKind,
 }
 
+/// Inspect an existing catalog without initializing, migrating, or replaying it.
+/// An offline source is left for the normal native recovery path. When the
+/// source is present, even history-only guarded records must stop startup.
+pub fn require_native_catalog_state(
+    source_root: &Path,
+    repository_id: Uuid,
+    database_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    let root = match PinnedDirectory::open(source_root) {
+        Ok(root) => root,
+        Err(AnchorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(directory) = root.open_child_directory(GIT_CATALOG_DIRECTORY)? else {
+        return Ok(());
+    };
+    let Some(database) = directory.open_child_file(CATALOG_DATABASE)? else {
+        return Ok(());
+    };
+    let identity = database.metadata()?;
+    let catalog = ControlStore::open_existing_read_only_with_key(
+        directory.descriptor_path().join(CATALOG_DATABASE),
+        database_key,
+    )?;
+    catalog.for_each_record_value(SOURCE_BACKEND_KIND, |bytes| {
+        let record: GitSourceBackendRecord =
+            mb_core::decode_canonical(bytes).map_err(|_| RepositoryError::Conflict)?;
+        if record.format_version != 1
+            || record.repository_id != repository_id
+            || mb_core::canonical_bytes(&record).map_err(|_| RepositoryError::Conflict)? != bytes
+        {
+            return Err(RepositoryError::Conflict.into());
+        }
+        record.backend.require_supported()?;
+        Ok(())
+    })?;
+    for prefix in ["git-guarded-", "guarded-", "link-freeze-"] {
+        if catalog.has_records_with_kind_prefix(prefix)? {
+            return Err(AnchorError::UnsupportedSourceOperation(
+                mb_store::WITHDRAWN_GUARDED_BACKEND,
+            )
+            .into());
+        }
+    }
+    // A root-backed blob can outlive its stage receipt or backend binding.
+    // Inspect its historical manifest rather than inferring native ownership.
+    catalog.for_each_record_value_with_kind_prefix("git-object-anchor-v1/", |bytes| {
+        let anchor: FileAnchorManifest = mb_core::decode_canonical(bytes)?;
+        if anchor.guarded_root_file.is_some() {
+            anyhow::bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
+        }
+        Ok(())
+    })?;
+    let current = directory
+        .open_child_file(CATALOG_DATABASE)?
+        .ok_or(RepositoryError::Conflict)?
+        .metadata()?;
+    if identity.dev() != current.dev() || identity.ino() != current.ino() {
+        return Err(RepositoryError::Conflict.into());
+    }
+    Ok(())
+}
+
 /// Exact native names fenced by the node before retiring an empty guarded
 /// catalog. Missing files on replay are prior progress; replacements fail.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2156,6 +2221,101 @@ mod tests {
     use mb_store::{GIT_CATALOG_DIRECTORY, git_catalog_marker};
 
     use super::*;
+
+    #[test]
+    fn native_catalog_inspection_does_not_create_or_migrate_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let repository_id = Uuid::new_v4();
+        let key = [89; 32];
+        require_native_catalog_state(&root, repository_id, &key).unwrap();
+        assert!(!root.exists());
+        fs::create_dir(&root).unwrap();
+        require_native_catalog_state(&root, repository_id, &key).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        let catalog_dir = root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir(&catalog_dir).unwrap();
+        let database = catalog_dir.join(CATALOG_DATABASE);
+        let catalog = ControlStore::open_with_key(&database, &key).unwrap();
+        catalog
+            .put_record("git-ref-v1/test", b"ref", b"preserved history")
+            .unwrap();
+        drop(catalog);
+        let original = fs::read(&database).unwrap();
+        require_native_catalog_state(&root, repository_id, &key).unwrap();
+        assert_eq!(fs::read(&database).unwrap(), original);
+        let catalog = ControlStore::open_existing_read_only_with_key(&database, &key).unwrap();
+        assert!(
+            catalog
+                .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn history_only_guarded_catalog_inspection_is_read_only() {
+        for kind in [
+            SOURCE_BACKEND_KIND,
+            "git-guarded-stage-receipt-v1/test",
+            "git-guarded-prune-intent-v1/test",
+            "git-object-anchor-v1/test/object",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let repository_id = Uuid::new_v4();
+            let key = [90; 32];
+            let directory = root.join(GIT_CATALOG_DIRECTORY);
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join(CATALOG_DATABASE);
+            let catalog = ControlStore::open_with_key(&path, &key).unwrap();
+            let bytes = if kind == SOURCE_BACKEND_KIND {
+                mb_core::canonical_bytes(&GitSourceBackendRecord {
+                    format_version: 1,
+                    repository_id,
+                    backend: SourceBackendKind::GuardedLinkFreezeV1,
+                })
+                .unwrap()
+            } else if kind.starts_with("git-object-anchor-") {
+                // Historical format-2 root-backed manifest, without probing or
+                // modifying any source/anchor files to manufacture the fixture.
+                mb_core::canonical_bytes(&(
+                    2_u16,
+                    Uuid::from_bytes([1; 16]),
+                    mb_store::StableAnchorAreaLocator {
+                        area_id: Uuid::from_bytes([2; 16]),
+                        path_hint: PathBuf::from("/legacy/anchors"),
+                        filesystem_id: 3,
+                        volume_root_hint: PathBuf::from("/legacy"),
+                    },
+                    b"/legacy/source".to_vec(),
+                    b"file".to_vec(),
+                    4_u64,
+                    [5_u8; 32],
+                    (3_u64, 6_u64, 4_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+                    (
+                        Uuid::from_bytes([7; 16]),
+                        b"file".to_vec(),
+                        mb_store::NativeFileId {
+                            filesystem_id: 3,
+                            inode: 6,
+                        },
+                    ),
+                ))
+                .unwrap()
+            } else {
+                b"unfinished guarded record".to_vec()
+            };
+            catalog
+                .put_record(kind, repository_id.as_bytes(), &bytes)
+                .unwrap();
+            drop(catalog);
+            let original = fs::read(&path).unwrap();
+            let error = require_native_catalog_state(root, repository_id, &key).unwrap_err();
+            assert!(error.to_string().contains("withdrawn"), "{kind}: {error:#}");
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
 
     #[test]
     fn repository_init_reopens_and_refuses_missing_catalog() {

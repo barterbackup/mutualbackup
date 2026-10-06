@@ -4,12 +4,17 @@
 //! Even unfinished or malformed guarded journals must remain untouched.
 
 use anyhow::{Result, bail};
-use mb_core::decode_canonical;
+use mb_core::{KeyMaterial, decode_canonical};
 use mb_store::{ControlStore, SourceBackendBinding, WITHDRAWN_GUARDED_BACKEND};
 
+#[cfg(target_os = "linux")]
+use crate::control::GitRepositoryInfo;
 use crate::control::ProtectedRoot;
 
-pub(crate) fn require_native_source_state(control: &ControlStore) -> Result<()> {
+pub(crate) fn require_native_source_state(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+) -> Result<()> {
     for prefix in ["guarded-", "link-freeze-"] {
         if control.has_records_with_kind_prefix(prefix)? {
             bail!("{WITHDRAWN_GUARDED_BACKEND}");
@@ -27,7 +32,23 @@ pub(crate) fn require_native_source_state(control: &ControlStore) -> Result<()> 
         binding.backend.require_supported()?;
         Ok(())
     })?;
-    crate::snapshot::require_native_capture_state(control)
+    #[cfg(target_os = "linux")]
+    control.for_each_record_value("git-repository", |bytes| {
+        let repository: GitRepositoryInfo = decode_canonical(bytes)?;
+        anyhow::ensure!(
+            repository.format_version == 1,
+            "unsupported Git registration"
+        );
+        mb_git::require_native_catalog_state(
+            &repository.path,
+            repository.repository_id,
+            &mb_git::catalog_key(keys, repository.repository_id),
+        )
+    })?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = keys;
+    crate::snapshot::require_native_capture_state(control)?;
+    crate::snapshot::require_native_signed_history(control, keys)
 }
 
 #[cfg(test)]
@@ -37,6 +58,208 @@ mod tests {
     use mb_core::{KeyMaterial, Seed, canonical_bytes};
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn retained_signed_guarded_history_stops_startup_without_root_records() {
+        use ed25519_dalek::SigningKey;
+        use mb_core::{
+            GuildCheckpoint, Member, QuorumCheckpoint, SectorPurpose, SignedRecord,
+            USER_REVISION_DOMAIN, UserRevision, V1_CIPHER_PROFILE, WriterFence, encrypted_sector,
+            make_sector_id,
+        };
+
+        for private_format in [6_u16, 7] {
+            for kind in ["user-revision", "user-revision-head", "guild-checkpoint"] {
+                let area = tempfile::tempdir().unwrap();
+                let data = area.path();
+                let seed = Seed::from_bytes([96; 32]);
+                let keys = KeyMaterial::from_seed(&seed);
+                drop(Node::open(data, seed.clone()).unwrap());
+                let (mut control, _) = crate::volume::open_control_store(data, &keys).unwrap();
+                let guild_id = [97; 32];
+                let revision_id = Uuid::new_v4();
+                let header = canonical_bytes(&private_format).unwrap();
+                let (first, _) = encrypted_sector(
+                    &keys.guild_data_key(&guild_id),
+                    make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 0),
+                    &header,
+                )
+                .unwrap();
+                let (later, _) = encrypted_sector(
+                    &keys.guild_data_key(&guild_id),
+                    make_sector_id(keys.node_id(), revision_id, SectorPurpose::Metadata, 1),
+                    b"not downloaded yet",
+                )
+                .unwrap();
+                crate::snapshot::install_inline_recipe(
+                    &mut control,
+                    guild_id,
+                    first.clone(),
+                    header,
+                )
+                .unwrap();
+                let writer = SigningKey::from_bytes(&[98; 32]);
+                let mut revision = UserRevision {
+                    format_version: 3,
+                    guild_id,
+                    protected_root_id: Uuid::new_v4(),
+                    cipher_profile: V1_CIPHER_PROFILE,
+                    revision_id,
+                    owner: keys.node_id(),
+                    writer_epoch: 1,
+                    writer_public_key: writer.verifying_key().to_bytes(),
+                    writer_signature: Vec::new(),
+                    sequence: 1,
+                    parent: None,
+                    metadata_sectors: vec![first, later],
+                    data_sectors: Vec::new(),
+                    sector_commitments: None,
+                };
+                revision.sign_writer(&writer).unwrap();
+                let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys).unwrap();
+                let bytes = if kind == "guild-checkpoint" {
+                    // The certified history can survive without user-revision
+                    // rows. A single-member v4 fixture needs no storage claims.
+                    let mut checkpoint = QuorumCheckpoint {
+                        checkpoint: GuildCheckpoint {
+                            format_version: 4,
+                            guild_id,
+                            genesis_hash: [99; 32],
+                            generation: 1,
+                            parent: None,
+                            members: vec![Member {
+                                node_id: keys.node_id(),
+                                recovery_public_key: keys.recovery_public_key(),
+                                failure_domain: "fixture".to_owned(),
+                            }],
+                            writer_fences: vec![WriterFence {
+                                owner: keys.node_id(),
+                                epoch: 1,
+                                public_key: writer.verifying_key().to_bytes(),
+                            }],
+                            revision_tombstones: Vec::new(),
+                            revisions: vec![revision],
+                            coding_groups: Vec::new(),
+                            authority: None,
+                            packing_catalog: None,
+                        },
+                        signatures: Vec::new(),
+                    };
+                    checkpoint.add_signature(&keys).unwrap();
+                    checkpoint.verify().unwrap();
+                    canonical_bytes(&checkpoint).unwrap()
+                } else {
+                    canonical_bytes(&revision).unwrap()
+                };
+                control
+                    .put_record(kind, revision_id.as_bytes(), &bytes)
+                    .unwrap();
+                control
+                    .begin_operation(&[7; 16], "ensure-filler", &[8; 32], &[9; 32])
+                    .unwrap();
+                drop(control);
+                let paths = [
+                    data.join("control.db"),
+                    data.join("control.key"),
+                    data.join("parity.db"),
+                ];
+                let original: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+                let error = match Node::open(data, seed) {
+                    Err(error) => error,
+                    Ok(_) => {
+                        panic!("signed guarded format {private_format} in {kind} was reopened")
+                    }
+                };
+                assert!(error.to_string().contains("withdrawn"), "{kind}: {error:#}");
+                for (path, original) in paths.iter().zip(original) {
+                    assert_eq!(
+                        fs::read(path).unwrap(),
+                        original,
+                        "{} changed",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn history_only_git_catalog_stops_startup_before_node_cleanup() {
+        for kind in [
+            "git-source-backend-v1",
+            "git-guarded-recovery-rebind-v1/legacy",
+        ] {
+            let area = tempfile::tempdir().unwrap();
+            let data = area.path().join("node");
+            let source = area.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("file"), b"working\r\n\0bytes").unwrap();
+            let seed = Seed::from_bytes([95; 32]);
+            let keys = KeyMaterial::from_seed(&seed);
+            drop(Node::open(&data, seed.clone()).unwrap());
+            let repository_id = Uuid::new_v4();
+            let directory = source.join(mb_store::GIT_CATALOG_DIRECTORY);
+            fs::create_dir(&directory).unwrap();
+            let database = directory.join("catalog.db");
+            let catalog =
+                ControlStore::open_with_key(&database, &mb_git::catalog_key(&keys, repository_id))
+                    .unwrap();
+            let record = if kind == "git-source-backend-v1" {
+                canonical_bytes(&(
+                    1_u16,
+                    repository_id,
+                    mb_store::SourceBackendKind::GuardedLinkFreezeV1,
+                ))
+                .unwrap()
+            } else {
+                b"unfinished recovered history pin".to_vec()
+            };
+            catalog
+                .put_record(kind, repository_id.as_bytes(), &record)
+                .unwrap();
+            drop(catalog);
+            let (mut control, _) = crate::volume::open_control_store(&data, &keys).unwrap();
+            // No protected root, mount claim, or node-side guarded prefix.
+            control
+                .put_record(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: source.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            control
+                .begin_operation(&[7; 16], "ensure-filler", &[8; 32], &[9; 32])
+                .unwrap();
+            drop(control);
+            let paths = [
+                data.join("control.db"),
+                data.join("control.key"),
+                data.join("parity.db"),
+                database,
+                source.join("file"),
+            ];
+            let original: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+            let error = match Node::open(&data, seed) {
+                Err(error) => error,
+                Ok(_) => panic!("history-only guarded catalog was reopened"),
+            };
+            assert!(error.to_string().contains("withdrawn"), "{error:#}");
+            for (path, original) in paths.iter().zip(original) {
+                assert_eq!(
+                    fs::read(path).unwrap(),
+                    original,
+                    "{} changed",
+                    path.display()
+                );
+            }
+        }
+    }
 
     #[test]
     fn guarded_journals_are_rejected_before_replay_or_catalog_mutation() {
@@ -151,10 +374,13 @@ mod tests {
             .unwrap();
         control.make_query_only().unwrap();
         assert!(
-            require_native_source_state(&control)
-                .unwrap_err()
-                .to_string()
-                .contains("withdrawn")
+            require_native_source_state(
+                &control,
+                &KeyMaterial::from_seed(&Seed::from_bytes([93; 32]))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("withdrawn")
         );
     }
 
@@ -174,10 +400,13 @@ mod tests {
             .unwrap();
         control.make_query_only().unwrap();
         assert!(
-            require_native_source_state(&control)
-                .unwrap_err()
-                .to_string()
-                .contains("withdrawn")
+            require_native_source_state(
+                &control,
+                &KeyMaterial::from_seed(&Seed::from_bytes([94; 32]))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("withdrawn")
         );
     }
 }

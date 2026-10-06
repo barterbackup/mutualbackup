@@ -1544,7 +1544,7 @@ impl Node {
         let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
         if let Some(control) = inspect_control_store(&data_dir, &keys)? {
-            crate::source_policy::require_native_source_state(&control)?;
+            crate::source_policy::require_native_source_state(&control, &keys)?;
         }
         let (mut control, control_database_key) = open_control_store(&data_dir, &keys)?;
         control.clear_recomputable_operations()?;

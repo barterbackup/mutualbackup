@@ -530,6 +530,25 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Visit one payload at a time across kinds sharing an exact prefix.
+    /// Prefix characters are literal; SQL LIKE wildcards have no special meaning.
+    pub fn for_each_record_value_with_kind_prefix(
+        &self,
+        prefix: &str,
+        mut visit: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut statement = self.connection.prepare(
+            "SELECT bytes FROM protocol_records
+             WHERE substr(kind, 1, ?1) = ?2 ORDER BY kind, record_id",
+        )?;
+        let mut rows = statement.query(params![prefix.chars().count(), prefix])?;
+        while let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(0)?;
+            visit(&bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn finalize_capture_records(
         &mut self,
         capture_id: &[u8; 16],
@@ -3900,6 +3919,36 @@ mod tests {
             })
             .unwrap();
         assert_eq!(visited, 130);
+    }
+
+    #[test]
+    fn prefix_value_scan_is_literal_and_stops_on_rejection() {
+        let temp = tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[76; 32]).unwrap();
+        for kind in ["é_%/one", "é_%/two", "éXX/three"] {
+            store.put_record(kind, b"id", kind.as_bytes()).unwrap();
+        }
+        let mut seen = Vec::new();
+        store
+            .for_each_record_value_with_kind_prefix("é_%/", |bytes| {
+                seen.push(bytes.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            [b"\xc3\xa9_%/one".to_vec(), b"\xc3\xa9_%/two".to_vec()]
+        );
+        let mut visited = 0;
+        assert!(
+            store
+                .for_each_record_value_with_kind_prefix("é_%/", |_| {
+                    visited += 1;
+                    anyhow::bail!("reject first historical record")
+                })
+                .is_err()
+        );
+        assert_eq!(visited, 1);
     }
 
     #[test]

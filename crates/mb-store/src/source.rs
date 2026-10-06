@@ -24,10 +24,7 @@ use crate::{
     StableAnchorManifest, probe_reflink,
 };
 #[cfg(target_os = "linux")]
-use crate::{
-    GuardedFileCapturePlan, GuardedRootCapturePlan, RawReflinkFileCapturePlanV2,
-    probe_guarded_link_freeze,
-};
+use crate::{GuardedFileCapturePlan, GuardedRootCapturePlan, RawReflinkFileCapturePlanV2};
 
 /// Local source capabilities never enter a signed peer record. ReflinkV1
 /// provides sparse reflink capture, raw imports, and reflink checkout.
@@ -136,7 +133,9 @@ impl SourceBackendKind {
         match self {
             Self::ReflinkV1 => probe_reflink(source_root),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1 => probe_guarded_link_freeze(source_root),
+            Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
+                WITHDRAWN_GUARDED_BACKEND,
+            )),
         }
     }
 
@@ -148,8 +147,9 @@ impl SourceBackendKind {
         match self {
             Self::ReflinkV1 => SourceCapturePlan::plan_reflink(source_root),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1 => GuardedRootCapturePlan::plan(source_root)
-                .map(SourceCapturePlan::GuardedLinkFreezeV1),
+            Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
+                WITHDRAWN_GUARDED_BACKEND,
+            )),
         }
     }
 
@@ -169,7 +169,7 @@ impl SourceBackendKind {
             }
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
-                "Git file staging with guarded link-freeze",
+                WITHDRAWN_GUARDED_BACKEND,
             )),
         }
     }
@@ -179,12 +179,13 @@ impl SourceBackendKind {
         source_root: impl AsRef<Path>,
         logical_len: u64,
     ) -> Result<SourceBlobImportPlan, AnchorError> {
+        self.require_supported()?;
         match self {
             Self::ReflinkV1 => SourceBlobImportPlan::plan_direct(source_root, logical_len),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1 => {
-                SourceBlobImportPlan::plan_direct(source_root, logical_len)
-            }
+            Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
+                WITHDRAWN_GUARDED_BACKEND,
+            )),
         }
     }
 
@@ -200,7 +201,7 @@ impl SourceBackendKind {
             Self::ReflinkV1 => staging.publish_reflink_child(name, anchor, mode),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
-                "Git checkout with guarded link-freeze",
+                WITHDRAWN_GUARDED_BACKEND,
             )),
         }
     }
@@ -226,44 +227,42 @@ impl SourceCapturePlan {
         }
     }
 
-    pub fn capture(&self, control: &ControlStore) -> anyhow::Result<StableAnchorManifest> {
+    pub fn capture(&self, _control: &ControlStore) -> anyhow::Result<StableAnchorManifest> {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_plan(plan)?),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => plan.capture(control),
+            Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
         }
     }
 
-    /// Detach one file in a published guarded root before an edit. Reflink
-    /// roots already keep their anchors on independent COW inodes.
+    /// Native reflink roots keep anchors on independent COW inodes.
+    /// A withdrawn plan cannot authorize an edit or journal replay.
     pub fn prepare_file_edit_at(
         &self,
-        control: &ControlStore,
-        captured_relative_path: impl AsRef<Path>,
-        current_relative_path: impl AsRef<Path>,
+        _control: &ControlStore,
+        _captured_relative_path: impl AsRef<Path>,
+        _current_relative_path: impl AsRef<Path>,
     ) -> anyhow::Result<()> {
         match self {
             Self::ReflinkV1(_) => Ok(()),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => {
-                plan.prepare_file_edit_at(control, captured_relative_path, current_relative_path)
-            }
+            Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
         }
     }
 
-    pub fn discard(&self, control: &ControlStore) -> anyhow::Result<()> {
+    pub fn discard(&self, _control: &ControlStore) -> anyhow::Result<()> {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::discard_capture(plan)?),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => plan.discard_unreferenced(control),
+            Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
         }
     }
 
-    pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
+    pub fn reconcile(&self, _control: &ControlStore) -> anyhow::Result<()> {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::reconcile_capture(plan)?),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => plan.reconcile(control),
+            Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
         }
     }
 }
@@ -321,30 +320,29 @@ impl SourceFileCapturePlan {
             Self::ReflinkRawV2(plan) => plan.capture(),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
-                "guarded file capture needs the control store",
+                WITHDRAWN_GUARDED_BACKEND,
             )),
         }
     }
 
-    /// Replay either backend using the durable control journal. New guarded
-    /// plans remain gated by `SourceBackendKind::plan_file` until edit safety
-    /// permits retaining a shared hard-link inode.
+    /// Replay native captures; legacy plans remain decodable for rejection.
     pub fn capture_with_control(
         &self,
-        control: &ControlStore,
+        _control: &ControlStore,
     ) -> Result<FileAnchorManifest, SourceFileCaptureError> {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_file_plan(plan)?),
             #[cfg(target_os = "linux")]
             Self::ReflinkRawV2(plan) => Ok(plan.capture()?),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => Ok(plan.capture(control)?),
+            Self::GuardedLinkFreezeV1(_) => {
+                Err(AnchorError::UnsupportedSourceOperation(WITHDRAWN_GUARDED_BACKEND).into())
+            }
         }
     }
 
-    /// Ensure a retained source file can be edited without changing its
-    /// immutable anchor. Reflink captures already have independent inodes;
-    /// guarded captures must complete their durable sparse detach first.
+    /// Native captures already have independent inodes. Legacy captures
+    /// cannot authorize edits to a previously shared inode.
     pub fn prepare_edit_with_control(
         &self,
         control: &ControlStore,
@@ -352,21 +350,19 @@ impl SourceFileCapturePlan {
         self.prepare_edit_at_with_control(control, self.relative_path())
     }
 
-    /// A guarded source may have moved since capture. The caller supplies its
-    /// current path so the backend can prove that inode before replaying the
-    /// edit journal; a reflink capture needs no detach at either path.
+    /// A native reflink capture needs no detach at either source path.
     pub fn prepare_edit_at_with_control(
         &self,
-        control: &ControlStore,
-        current_relative_path: impl AsRef<Path>,
+        _control: &ControlStore,
+        _current_relative_path: impl AsRef<Path>,
     ) -> Result<(), SourceFileCaptureError> {
         match self {
             Self::ReflinkV1(_) => Ok(()),
             #[cfg(target_os = "linux")]
             Self::ReflinkRawV2(_) => Ok(()),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => {
-                Ok(plan.prepare_edit_at(control, current_relative_path)?)
+            Self::GuardedLinkFreezeV1(_) => {
+                Err(AnchorError::UnsupportedSourceOperation(WITHDRAWN_GUARDED_BACKEND).into())
             }
         }
     }
@@ -418,7 +414,7 @@ impl SourceFileCapturePlan {
             Self::ReflinkRawV2(plan) => plan.reconcile(),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
-                "guarded file reconciliation needs the control store",
+                WITHDRAWN_GUARDED_BACKEND,
             )),
         }
     }
@@ -433,9 +429,7 @@ impl SourceFileCapturePlan {
             Self::ReflinkRawV2(plan) => Ok(plan.reconcile()?),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => {
-                // capture() verified and synced the guarded manifest before
-                // returning; replay calls capture() again before reaching here.
-                Ok(())
+                Err(AnchorError::UnsupportedSourceOperation(WITHDRAWN_GUARDED_BACKEND).into())
             }
         }
     }
@@ -447,22 +441,113 @@ impl SourceFileCapturePlan {
             Self::ReflinkRawV2(plan) => plan.discard(),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
-                "guarded file retirement needs the control store",
+                WITHDRAWN_GUARDED_BACKEND,
             )),
         }
     }
 
     pub fn discard_with_control(
         &self,
-        control: &ControlStore,
+        _control: &ControlStore,
     ) -> Result<(), SourceFileCaptureError> {
         match self {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::discard_file_capture(plan)?),
             #[cfg(target_os = "linux")]
             Self::ReflinkRawV2(plan) => Ok(plan.discard()?),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => Ok(plan.discard_unreferenced(control)?),
+            Self::GuardedLinkFreezeV1(_) => {
+                Err(AnchorError::UnsupportedSourceOperation(WITHDRAWN_GUARDED_BACKEND).into())
+            }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod withdrawal_tests {
+    use super::*;
+    use mb_core::{canonical_bytes, decode_canonical};
+    use std::fmt::Display;
+    use std::fs;
+
+    fn withdrawn<T, E: Display>(result: Result<T, E>) {
+        match result {
+            Err(error) => assert!(error.to_string().contains("withdrawn"), "{error}"),
+            Ok(_) => panic!("a withdrawn source operation succeeded"),
+        }
+    }
+
+    #[test]
+    fn legacy_plans_decode_but_cannot_capture_edit_replay_or_discard() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("absent-source");
+        let area = crate::StableAnchorAreaLocator {
+            area_id: Uuid::from_bytes([1; 16]),
+            path_hint: temporary.path().join("absent-anchors"),
+            filesystem_id: 2,
+            volume_root_hint: temporary.path().to_path_buf(),
+        };
+        let source_bytes = source.to_str().unwrap().as_bytes().to_vec();
+        let version = (2_u64, 3_u64, 0_u64, 0_i64, 0_i64, 0_i64, 0_i64);
+        let root_bytes = canonical_bytes(&(
+            1_u16,
+            Uuid::from_bytes([4; 16]),
+            source_bytes.clone(),
+            area.clone(),
+            version,
+            0o755_u32,
+            0_i64,
+            0_u32,
+            Vec::<u8>::new(),
+        ))
+        .unwrap();
+        let root = SourceCapturePlan::GuardedLinkFreezeV1(decode_canonical(&root_bytes).unwrap());
+        let file_bytes = canonical_bytes(&(
+            1_u16,
+            Uuid::from_bytes([5; 16]),
+            source_bytes,
+            NativeFileId {
+                filesystem_id: 2,
+                inode: 3,
+            },
+            b"file".to_vec(),
+            version,
+            0o644_u32,
+            area.clone(),
+        ))
+        .unwrap();
+        let file =
+            SourceFileCapturePlan::GuardedLinkFreezeV1(decode_canonical(&file_bytes).unwrap());
+        let root_wire = canonical_bytes(&root).unwrap();
+        let file_wire = canonical_bytes(&file).unwrap();
+        assert_eq!(root_wire[0], 1);
+        assert_eq!(file_wire[0], 1);
+        let database = temporary.path().join("control.db");
+        let control = ControlStore::open_with_key(&database, &[6; 32]).unwrap();
+        control.make_query_only().unwrap();
+        let original = fs::read(&database).unwrap();
+        withdrawn(root.capture(&control));
+        withdrawn(root.prepare_file_edit_at(&control, "file", "renamed"));
+        withdrawn(root.reconcile(&control));
+        withdrawn(root.discard(&control));
+        withdrawn(file.capture());
+        withdrawn(file.capture_with_control(&control));
+        withdrawn(file.prepare_edit_with_control(&control));
+        withdrawn(file.prepare_edit_at_with_control(&control, "renamed"));
+        withdrawn(file.reconcile());
+        withdrawn(file.reconcile_with_control(&control));
+        withdrawn(file.discard());
+        withdrawn(file.discard_with_control(&control));
+        let backend = SourceBackendKind::GuardedLinkFreezeV1;
+        withdrawn(backend.probe(&source));
+        withdrawn(backend.plan_root(&source));
+        withdrawn(backend.plan_file(&source, "file"));
+        withdrawn(backend.plan_blob_import(&source, 0));
+        assert_eq!(canonical_bytes(&root).unwrap(), root_wire);
+        assert_eq!(canonical_bytes(&file).unwrap(), file_wire);
+        assert_eq!(fs::read(database).unwrap(), original);
+        assert!(!source.exists());
+        assert!(!area.path_hint.exists());
+        assert!(!control.has_records_with_kind_prefix("").unwrap());
     }
 }
 

@@ -56,9 +56,29 @@ passing tests below apply only to their recorded source and exercised cases.
     reopen/commit, backend reprobe/migration, relocated recovery, encrypted Git
     history, and legacy intent migration regressions. Format and strict Clippy
     pass with unrelated pre-existing FUSE test WIP held aside and restored.
-  - [ ] Remove the runtime/dependency, audit history-only catalogs and signed
-    revisions, finish the mount-free export/recovery policy, and replace useful
-    generic acceptance coverage. The admission check is not that complete audit.
+  - [x] Extend read-only admission to registered history-only Git catalogs:
+    inspect backend bindings, guarded journals, and root-backed blob manifests
+    without replay or unbound-catalog migration. Inspect authenticated local
+    metadata headers in retained user revisions, revision heads, and certified
+    checkpoints, detecting formats 6/7 even when later sectors are unavailable.
+    Pending Git graph intents with root-backed blobs are rejected before cleanup.
+    Durable backend dispatch also rejects legacy root/file capture, edit,
+    replay, discard, and blob-import planning without touching source or anchors;
+    their serialized enum identities remain unchanged.
+    Offline catalogs and metadata not yet downloaded remain subject to recovery
+    admission; this does not certify migration or historical export.
+    Validation: read-only native/unbound and historical Git catalog fixtures,
+    history-only startup fixtures preserving database/key/parity/source bytes,
+    signed revision/head/checkpoint rejection fixtures, and literal streaming
+    catalog scans. Locked workspace tests: 691 passed, zero failed, 182 ignored
+    across 19 targets. Format and strict workspace/all-target Clippy pass with
+    the unrelated pre-existing FUSE test WIP held aside and restored byte-for-byte.
+    Five native Btrfs regressions pass: Git reopen/add, linked worktree reopen,
+    signed-history prune, backend reprobe/migration, and seed-only branch/blob
+    recovery. The disposable mount and image were removed after qualification.
+  - [ ] Remove the runtime/dependency, finish the mount-free export/recovery
+    policy (including unavailable historical metadata), and replace useful
+    generic acceptance coverage. Admission checks do not complete removal.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
   `crates/mb-git/src/history.rs` admits up to 64 MiB of graph metadata, while
@@ -180,6 +200,21 @@ passing tests below apply only to their recorded source and exercised cases.
   explain the original 5,400-second outlier.
 
   Existing investigation and validation record:
+
+  The 2026-10-06 withdrawal-audit workspace run, overlapping native artifact
+  compilation, failed `mixed_packed_group_replacement_reclaims_obsolete_ready_shards`
+  with fewer than two reachable coding coordinators and
+  `packed_failure_retry_restages_remote_inputs_after_partial_upload_and_reopen`
+  because the persisted group transcript named a different attempt from the
+  retry's activated plan. Both passed individually (270.63 and 108.62 seconds).
+  The following complete node suite passed all 342 ordinary cases in 429.53
+  seconds without competing native compilation. The withdrawal audit now caches
+  at most 4,096 authenticated signed revisions and classifies owner metadata
+  independently of checkpoint authorization; normal replay/recovery retain
+  quorum validation. This removes redundant startup work across repeated
+  historical revisions. These results are additional load/restart evidence;
+  neither a demonstrated production fix for the network failures nor closure
+  of the original R5 missing-signer gate.
 
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out

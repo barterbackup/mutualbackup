@@ -6324,7 +6324,7 @@ mod tests {
         let source_root = run_root.join("work");
         fs::create_dir_all(&source_root).unwrap();
         let bytes = [b"Git\r\nbytes\0".as_slice(), &vec![0x5a; 2 * 1024 * 1024]].concat();
-        let plan = crate::SourceBackendKind::GuardedLinkFreezeV1
+        let plan = crate::SourceBackendKind::ReflinkV1
             .plan_blob_import(&source_root, bytes.len() as u64)
             .unwrap();
         let plan: crate::SourceBlobImportPlan =
