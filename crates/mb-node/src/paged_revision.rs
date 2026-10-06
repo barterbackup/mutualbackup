@@ -125,6 +125,24 @@ impl PagedPrivateMetadata {
         fence: &mb_core::WriterFence,
         intents: PagedCatalogIntents,
     ) -> Result<()> {
+        self.publish_local_catalog_with_data_sources(control, keys, signed, fence, intents, |_| {
+            Ok(None)
+        })
+    }
+
+    /// Supply stable native/Git data sources one signed sector at a time. Every
+    /// supplied source is authenticated before binding it to the revision.
+    pub fn publish_local_catalog_with_data_sources(
+        &self,
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        signed: &SignedRecord<PagedUserRevision>,
+        fence: &mb_core::WriterFence,
+        intents: PagedCatalogIntents,
+        mut source_for: impl FnMut(
+            &CatalogSectorRecord,
+        ) -> Result<Option<crate::PagedAnchorSectorSource>>,
+    ) -> Result<()> {
         let bundle = self.local_bundle(signed, intents)?;
         let (record, bootstrap) = self.seal(keys, bundle.scope)?;
         ensure!(
@@ -165,6 +183,12 @@ impl PagedPrivateMetadata {
                         view.source(record.sector.id)?.as_ref() == Some(&record),
                         "native source index differs from signed source catalog"
                     );
+                    if let Some(source) = source_for(&record)? {
+                        let recipe =
+                            canonical_bytes_bounded(&source, mb_store::PAGED_DATA_RECIPE_BYTES)?;
+                        source.render(keys, bundle.scope, &record)?;
+                        view.bind_data_source(&record, source.locator.anchor_id, &recipe)?;
+                    }
                 }
                 ensure!(
                     sources.is_complete(),
@@ -259,7 +283,7 @@ impl PagedPrivateMetadata {
         )?))
     }
 
-    fn open_local_snapshot(
+    pub(super) fn open_local_snapshot(
         keys: &KeyMaterial,
         snapshot: &mb_store::PagedCatalogSnapshot,
         expected_scope: CatalogScope,
@@ -589,8 +613,17 @@ mod tests {
             store.begin_catalog(intent).unwrap();
         }
         let payload = b"raw\r\nbytes\0";
+        let data_id = make_content_sector_id(
+            &keys().guild_content_id_key(&[73; 32]),
+            keys().node_id(),
+            [73; 32],
+            Uuid::from_bytes([74; 16]),
+            SectorPurpose::Data,
+            payload,
+        )
+        .unwrap();
         let (sector, data) =
-            encrypted_sector(&keys().guild_data_key(&[73; 32]), [82; 32], payload).unwrap();
+            encrypted_sector(&keys().guild_data_key(&[73; 32]), data_id, payload).unwrap();
         let data_source = CatalogSectorRecord {
             format_version: 1,
             sector: sector.clone(),
@@ -785,6 +818,214 @@ mod tests {
             owner: signed.value.owner,
             epoch: signed.value.writer_epoch,
             public_key: signed.value.writer_public_key,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn paged_stable_native_and_git_data_sources_reopen_authenticate_and_pin_cleanup() {
+        for with_git in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("protected");
+            std::fs::create_dir(&root).unwrap();
+            let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+            let anchor_id = Uuid::new_v4();
+            let directory = area.path_hint.join(anchor_id.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let payload = b"raw\r\nbytes\0";
+            let file = directory.join("payload");
+            let mut contents = b"head".to_vec();
+            contents.extend_from_slice(payload);
+            std::fs::write(&file, &contents).unwrap();
+            let recipe = crate::PagedAnchorSectorSource {
+                locator: mb_store::StableAnchorFileLocator {
+                    area,
+                    anchor_id,
+                    relative_path: "payload".into(),
+                },
+                offset: 4,
+            };
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (private, signed, intents) = owned_fixture(&store, with_git, 0);
+            let sector = make_content_sector_id(
+                &keys().guild_content_id_key(&[73; 32]),
+                keys().node_id(),
+                [73; 32],
+                Uuid::from_bytes([74; 16]),
+                SectorPurpose::Data,
+                payload,
+            )
+            .unwrap();
+            let (_, ciphertext) =
+                encrypted_sector(&keys().guild_data_key(&[73; 32]), sector, payload).unwrap();
+            for _ in 0..2 {
+                private
+                    .publish_local_catalog_with_data_sources(
+                        &store,
+                        &keys(),
+                        &signed,
+                        &writer_fence(&signed),
+                        intents,
+                        |record| Ok((record.sector.id == sector).then(|| recipe.clone())),
+                    )
+                    .unwrap();
+            }
+            assert!(store.records("local-sector").unwrap().is_empty());
+            assert!(
+                crate::snapshot::git_prune_recipe_anchor_ids(&store)
+                    .unwrap()
+                    .contains(&anchor_id)
+            );
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            let render = || {
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    signed.value.revision_id,
+                    sector,
+                    scope(),
+                )
+            };
+            assert_eq!(render().unwrap(), Some(ciphertext.clone()));
+            let other = KeyMaterial::from_seed(&Seed::from_bytes([1; 32]));
+            assert!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &other,
+                    signed.value.revision_id,
+                    sector,
+                    scope()
+                )
+                .is_err()
+            );
+            let mut wrong_scope = scope();
+            if let CatalogScope::Dataset {
+                protected_root_id, ..
+            } = &mut wrong_scope
+            {
+                *protected_root_id = Uuid::new_v4();
+            }
+            assert!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    signed.value.revision_id,
+                    sector,
+                    wrong_scope
+                )
+                .is_err()
+            );
+            let mut changed = contents.clone();
+            changed[4] ^= 1;
+            std::fs::write(&file, changed).unwrap();
+            assert!(render().is_err());
+            std::fs::write(&file, &contents).unwrap();
+            assert_eq!(render().unwrap(), Some(ciphertext));
+            std::fs::remove_file(&file).unwrap();
+            assert!(render().is_err());
+            std::fs::write(&file, &contents).unwrap();
+            store
+                .cancel_paged_revision_catalog(signed.value.revision_id)
+                .unwrap();
+            assert!(render().unwrap().is_none());
+            assert!(
+                crate::snapshot::git_prune_recipe_anchor_ids(&store)
+                    .unwrap()
+                    .contains(&anchor_id)
+            );
+            assert!(
+                store
+                    .release_paged_revision_data_source(signed.value.revision_id)
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .release_paged_revision_data_source(signed.value.revision_id)
+                    .unwrap()
+            );
+            assert!(
+                !crate::snapshot::git_prune_recipe_anchor_ids(&store)
+                    .unwrap()
+                    .contains(&anchor_id)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn paged_stable_data_rejects_bad_geometry_paths_and_payload_without_publication() {
+        for damage in 0..4 {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("protected");
+            std::fs::create_dir(&root).unwrap();
+            let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+            let anchor_id = Uuid::new_v4();
+            std::fs::create_dir(area.path_hint.join(anchor_id.to_string())).unwrap();
+            std::fs::write(
+                area.path_hint.join(anchor_id.to_string()).join("payload"),
+                b"wrong",
+            )
+            .unwrap();
+            let mut recipe = crate::PagedAnchorSectorSource {
+                locator: mb_store::StableAnchorFileLocator {
+                    area,
+                    anchor_id,
+                    relative_path: "payload".into(),
+                },
+                offset: 0,
+            };
+            match damage {
+                0 => recipe.offset = u64::MAX,
+                1 => recipe.locator.relative_path = "../payload".into(),
+                2 => {
+                    recipe.locator.relative_path =
+                        "p".repeat(mb_store::PAGED_DATA_RECIPE_BYTES + 1).into()
+                }
+                3 => {}
+                _ => unreachable!(),
+            }
+            let store =
+                ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+            let (private, signed, intents) = owned_fixture(&store, true, 0);
+            let data_id = make_content_sector_id(
+                &keys().guild_content_id_key(&[73; 32]),
+                keys().node_id(),
+                [73; 32],
+                Uuid::from_bytes([74; 16]),
+                SectorPurpose::Data,
+                b"raw\r\nbytes\0",
+            )
+            .unwrap();
+            assert!(
+                private
+                    .publish_local_catalog_with_data_sources(
+                        &store,
+                        &keys(),
+                        &signed,
+                        &writer_fence(&signed),
+                        intents,
+                        |record| Ok((record.sector.id == data_id).then(|| recipe.clone()))
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .paged_revision_catalog(signed.value.revision_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!store.paged_data_anchor_is_pinned(anchor_id).unwrap());
+            assert!(
+                store
+                    .records(&format!(
+                        "catalog-paged-data-source-v1/{}",
+                        signed.value.revision_id.simple()
+                    ))
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

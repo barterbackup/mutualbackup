@@ -1092,3 +1092,51 @@ store, 30 ordinary snapshot and five native adapter tests (168 distinct cases
 overall). Formatting and strict locked workspace/all-targets Clippy pass.
 Nineteen provisioned store and eight snapshot cases remain ignored; native/
 topology/platform and real 1 TiB qualification were not run for this step.
+
+### Stable native/Git data sources (2026-10-06)
+
+`publish_local_catalog_with_data_sources` accepts a provider called for each
+authenticated signed sector. Supplied `PagedAnchorSectorSource` recipes identify
+a stable anchor file and offset, with an 8 KiB encoded recipe limit. Before
+binding, Node checks dataset ownership, nonempty sector geometry, overflow and
+file bounds; it opens the existing stable locator, reads at most one 64 KiB
+sector and verifies the scoped Data content address, encrypted reference and
+Merkle commitment. It never assembles a dataset-wide recipe or payload vector.
+
+Derived source rows are keyed by revision/sector. Store checks the completed
+source index and retains a physical anchor count atomically with each new row,
+all root pins and the signed revision. Exact retries do not increase counts.
+Bootstrap sources cannot be installed as data recipes. The low-level binding
+trusts the caller to authenticate its opaque recipe; the Node facade does so.
+`render_local_data_sector` checks a single database ownership snapshot, expected
+scope, signed/private descriptor and canonical recipe/anchor identity, then
+regenerates and rechecks the exact file range and signed commitments.
+
+Cancellation immediately disables reads but retains physical anchor pins until
+`release_paged_revision_data_source` deletes one cancelled recipe and decrements
+its anchor count in one writer transaction. Other sectors/revisions keep their
+counts. Native anchor retirement and retirement replay reject retained pins;
+existing native Git prune includes their identities through its compatibility
+collection. That legacy bridge still materializes an anchor-identity set, while
+source reads and per-source cleanup stay bounded. This does not complete the
+production prune/retention consumer migration or concurrent filesystem lifecycle
+qualification.
+
+Validation: two new store fixtures check shared anchor retention across reopen,
+cancellation, exact retry and SQL abort/ignore source/pin insertion/deletion
+faults. Two new Node fixtures use marked local anchor areas with native and
+Git-bearing roots, checking source regeneration, byte changes/loss, wrong
+seed/scope, overflow, unsafe/oversized paths, prune-pin visibility and bounded
+cleanup. These are adapter tests, not native capture qualification. Locked
+workspace/all-targets build and 29 paged tests pass, alongside 117 ordinary store,
+30 ordinary snapshot and five native adapter tests (172 distinct cases overall).
+Formatting and strict locked workspace/all-targets Clippy pass. Nineteen
+provisioned store and eight snapshot cases remain ignored; native capture/
+topology/platform and real 1 TiB qualification were not run for this step.
+
+The provider may omit sources for pending migration roots; publication still
+makes no complete capture/protection claim. The adapter uses the existing Linux
+stable locator backend. Complete-source capture, Git blob plaintext IDs/full DAG
+verification, retained-history conversion, checkpoint/packing, production
+retention and seed-only recovery activation remain open, as does real 1 TiB
+qualification.

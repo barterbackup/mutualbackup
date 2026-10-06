@@ -20,7 +20,7 @@ pub use catalog::{
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogIntentState,
     CatalogNativeValidation, CatalogNativeValidationState, CatalogPublicationView,
     CatalogSectorSource, CatalogSourceSweep, CatalogStoreError, CatalogValidatedLink,
-    PagedCatalogPageSource, PagedCatalogSnapshot,
+    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource, PagedCatalogSnapshot,
 };
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";

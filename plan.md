@@ -1403,6 +1403,17 @@ the writer; cancellation fences this source immediately and index cleanup
 reclaims one row per step. File/blob source adapters, legacy conversion and
 production capture/checkpoint/recovery activation remain required.
 
+Paged publication can now receive stable native/Git source recipes one signed
+sector at a time. It verifies a bounded file range's scoped Data address and both
+ciphertext commitments, then binds the recipe and physical anchor count within
+the root writer transaction. Explicit revision/sector serving reopens signed and
+private ownership before reading that range. Cancellation fences serving while
+bounded cleanup releases one recipe and its shared anchor count together.
+Native anchor retirement/replay and existing Git prune honor these pins; the
+legacy prune bridge collects anchor identities. This uses the existing Linux
+stable locator backend and leaves complete-source capture, Git blob/DAG checks,
+normal consumer/retention/recovery migration and the real 1 TiB gate open.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

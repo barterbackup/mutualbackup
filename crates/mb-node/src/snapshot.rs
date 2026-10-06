@@ -576,7 +576,7 @@ pub(crate) fn git_prune_capture_pending(
 /// data after its branch or index entry has gone away. Prune must preserve that
 /// physical source until the recipe itself is retired by guild GC.
 pub(crate) fn git_prune_recipe_anchor_ids(control: &ControlStore) -> Result<BTreeSet<Uuid>> {
-    let mut anchors = BTreeSet::new();
+    let mut anchors: BTreeSet<Uuid> = control.paged_data_anchor_ids()?.into_iter().collect();
     for (record_id, encoded) in control.records("local-sector")? {
         let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
         if record_id != recipe.reference.id {
@@ -762,7 +762,10 @@ fn remove_revision_anchor(
     control: &ControlStore,
     manifest: &mb_store::StableAnchorManifest,
 ) -> Result<()> {
-    let _ = control;
+    ensure!(
+        !control.paged_data_anchor_is_pinned(manifest.anchor_id)?,
+        "revision anchor remains owned by a paged data source"
+    );
     manifest.remove()?;
     Ok(())
 }
@@ -814,6 +817,7 @@ pub(crate) fn retire_revision_anchor_with_recipe_pins(
         .get_record("user-revision", revision_id.as_bytes())?
         .is_some()
         || recipe_anchors.contains(&manifest.anchor_id)
+        || control.paged_data_anchor_is_pinned(manifest.anchor_id)?
     {
         return Ok(false);
     }

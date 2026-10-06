@@ -1059,6 +1059,32 @@ passing tests below apply only to their recorded source and exercised cases.
     overall). Formatting and strict locked workspace/all-targets Clippy pass.
     Nineteen provisioned store and eight snapshot cases remain ignored; native/
     topology/platform and real 1 TiB qualification were not run for this step.
+  - [x] Bind stable native/Git data recipes to retained paged revisions.
+    The publication facade accepts a streaming source provider and authenticates
+    each supplied stable-anchor range against its scoped Data address and both
+    signed ciphertext commitments. Recipe/index and physical-anchor pin changes
+    publish atomically with the roots; immutable retries preserve exact sources.
+    Revision/sector reads reopen ownership and the encrypted descriptor before
+    regenerating a bounded file range. Cancellation immediately stops serving;
+    one-row cleanup releases recipes and shared physical anchor counts together.
+    Native retirement/replay and existing Git prune include these physical pins,
+    which remain until cancelled source cleanup completes. Existing Git prune's
+    compatibility collection materializes anchor identities, not sector recipes.
+    Missing sources are still allowed for pending migration roots: complete
+    capture availability, full Git blob/DAG verification, normal consumer
+    activation, retained-history conversion and real 1 TiB qualification remain
+    open. The stable locator adapter currently uses the existing Linux backend.
+    Validation: two new store and two Node fixtures pass. Store checks shared
+    anchor retention across reopen/cancellation, exact retry and atomic source/
+    pin insertion/deletion under SQL abort/ignore faults. Node uses marked local
+    anchor areas for native and Git-bearing source regeneration, changed/missing
+    bytes, wrong seed/scope, overflow, unsafe/oversized paths, prune-pin visibility
+    and bounded cleanup. Locked workspace/all-targets build and 29 paged tests
+    pass, plus 117 ordinary store, 30 ordinary snapshot and five native adapter
+    tests (172 distinct cases overall). Formatting and strict locked workspace/
+    all-targets Clippy pass. Nineteen provisioned store and eight snapshot cases
+    remain ignored; native capture/topology/platform and real 1 TiB qualification
+    were not run for this adapter step.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

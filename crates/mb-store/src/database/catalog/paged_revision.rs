@@ -69,6 +69,17 @@ impl CatalogPublicationView<'_> {
         native_validation::source_record(self.connection, self.manifest.id, sector)
     }
 
+    /// Bind a caller-authenticated stable native/Git data recipe and retain
+    /// its physical anchor in the root publication's writer transaction.
+    pub fn bind_data_source(
+        &self,
+        source: &CatalogSectorRecord,
+        anchor: Uuid,
+        recipe: &[u8],
+    ) -> Result<(), CatalogStoreError> {
+        paged_data::bind(self.connection, self.bundle, source, anchor, recipe)
+    }
+
     /// Bind a verified private page while traversing the typed root. This
     /// immutable index publishes or rolls back with every revision root.
     pub fn bind_private_page_source(
@@ -265,7 +276,7 @@ fn marker(signed: &SignedRecord<PagedUserRevision>) -> Result<Vec<u8>, CatalogSt
     Ok(canonical_bytes(&(1_u16, signed.value.hash()?))?)
 }
 
-fn snapshot(
+pub(super) fn snapshot(
     connection: &Connection,
     id: Uuid,
 ) -> Result<Option<PagedCatalogSnapshot>, CatalogStoreError> {
@@ -831,6 +842,145 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn paged_stable_data_bindings_reopen_and_pin_shared_anchors_until_bounded_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let (first, bytes) = fixture(&store, 1, None);
+        let (next, next_bytes) = fixture(
+            &store,
+            2,
+            Some(revision(&first).unwrap().value.hash().unwrap()),
+        );
+        let anchor = Uuid::new_v4();
+        let page = first.roots[0].root;
+        let encoded = store
+            .catalog_page(first.scope, first.roots[0].intent.section, page)
+            .unwrap();
+        let (sector, ciphertext) = page
+            .seal_private_page(
+                &keys().guild_content_id_key(&[73; 32]),
+                &keys().guild_data_key(&[73; 32]),
+                first.scope,
+                first.roots[0].intent.section,
+                &encoded,
+            )
+            .unwrap();
+        let source = CatalogSectorRecord {
+            format_version: 1,
+            sector,
+            commitment: merkle_commit(&ciphertext).unwrap(),
+        };
+        for (bundle, bytes) in [(&first, &bytes), (&next, &next_bytes)] {
+            for _ in 0..2 {
+                store
+                    .publish_paged_revision_catalog_checked(bundle, bytes, |view| {
+                        view.bind_data_source(&source, anchor, b"bounded opaque recipe")
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.paged_data_anchor_ids().unwrap(), [anchor]);
+        assert!(store.release_paged_revision_data_source(first.id).is_err());
+        drop(store);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(
+            store
+                .paged_revision_data_source(first.id, source.sector.id)
+                .unwrap()
+                .unwrap()
+                .recipe,
+            b"bounded opaque recipe"
+        );
+        store.cancel_paged_revision_catalog(first.id).unwrap();
+        assert!(
+            store
+                .paged_revision_data_source(first.id, source.sector.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.paged_data_anchor_is_pinned(anchor).unwrap());
+        assert!(store.release_paged_revision_data_source(first.id).unwrap());
+        assert!(!store.release_paged_revision_data_source(first.id).unwrap());
+        assert!(store.paged_data_anchor_is_pinned(anchor).unwrap());
+        assert!(
+            store
+                .paged_revision_data_source(next.id, source.sector.id)
+                .unwrap()
+                .is_some()
+        );
+        store.cancel_paged_revision_catalog(next.id).unwrap();
+        assert!(store.paged_data_anchor_is_pinned(anchor).unwrap());
+        assert!(store.release_paged_revision_data_source(next.id).unwrap());
+        assert!(!store.paged_data_anchor_is_pinned(anchor).unwrap());
+        assert!(store.paged_data_anchor_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn paged_stable_data_source_and_anchor_pin_writes_roll_back_together() {
+        for kind in ["catalog-paged-data-source-v1/%", paged_data::ANCHOR] {
+            for fault in ["ABORT", "IGNORE"] {
+                let temp = tempfile::tempdir().unwrap();
+                let store =
+                    ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+                let (bundle, bytes) = fixture(&store, 1, None);
+                let anchor = Uuid::new_v4();
+                let page = bundle.roots[0].root;
+                let encoded = store
+                    .catalog_page(bundle.scope, bundle.roots[0].intent.section, page)
+                    .unwrap();
+                let (sector, ciphertext) = page
+                    .seal_private_page(
+                        &keys().guild_content_id_key(&[73; 32]),
+                        &keys().guild_data_key(&[73; 32]),
+                        bundle.scope,
+                        bundle.roots[0].intent.section,
+                        &encoded,
+                    )
+                    .unwrap();
+                let source = CatalogSectorRecord {
+                    format_version: 1,
+                    sector,
+                    commitment: merkle_commit(&ciphertext).unwrap(),
+                };
+                let raise = if fault == "ABORT" {
+                    "RAISE(ABORT, 'injected')"
+                } else {
+                    "RAISE(IGNORE)"
+                };
+                store.connection.execute_batch(&format!("CREATE TRIGGER reject_data BEFORE INSERT ON protocol_records WHEN NEW.kind LIKE '{kind}' BEGIN SELECT {raise}; END;")).unwrap();
+                assert!(
+                    store
+                        .publish_paged_revision_catalog_checked(&bundle, &bytes, |view| view
+                            .bind_data_source(&source, anchor, b"recipe"))
+                        .is_err()
+                );
+                assert!(!store.paged_data_anchor_is_pinned(anchor).unwrap());
+                assert!(store.paged_revision_catalog(bundle.id).unwrap().is_none());
+                store
+                    .connection
+                    .execute_batch("DROP TRIGGER reject_data")
+                    .unwrap();
+                store
+                    .publish_paged_revision_catalog_checked(&bundle, &bytes, |view| {
+                        view.bind_data_source(&source, anchor, b"recipe")
+                    })
+                    .unwrap();
+                store.cancel_paged_revision_catalog(bundle.id).unwrap();
+                store.connection.execute_batch(&format!("CREATE TRIGGER reject_cleanup BEFORE DELETE ON protocol_records WHEN OLD.kind LIKE '{kind}' BEGIN SELECT {raise}; END;")).unwrap();
+                assert!(store.release_paged_revision_data_source(bundle.id).is_err());
+                assert!(store.paged_data_anchor_is_pinned(anchor).unwrap());
+                store
+                    .connection
+                    .execute_batch("DROP TRIGGER reject_cleanup")
+                    .unwrap();
+                assert!(store.release_paged_revision_data_source(bundle.id).unwrap());
+                assert!(!store.paged_data_anchor_is_pinned(anchor).unwrap());
+            }
+        }
     }
 
     #[test]
