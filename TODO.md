@@ -334,6 +334,19 @@ passing tests below apply only to their recorded source and exercised cases.
     and 62 Git provisioned tests remain ignored), with formatting and strict
     workspace/all-targets Clippy. Local publication does not establish signed
     activation, ciphertext protection, runtime support or production capacity.
+  - [x] Add a borrowed converter for supported legacy native entries.
+    Decoded formats 1–5 preserve attributes, dense/sparse recipes, repeated
+    sectors and hard-link identities without rewriting original signed bytes.
+    Format 4/5 Git descriptors are preserved and converted separately. A bounded
+    32 MiB encoding counter and dry conversion reject invalid versions, paths,
+    recipes and original-order hard links before external page writes. The
+    adapter emits explicit namespace/recipe roles and requires authenticated
+    source joins before typed publication. Six adapter tests and 26 snapshot
+    regressions pass (eight provisioned snapshot tests remain ignored), including
+    both immutable version-2 fixtures and decoded version-4/5 Git envelopes,
+    with formatting and strict workspace/all-targets Clippy. Unsupported legacy
+    shapes retain their existing recovery path; this does not activate a new
+    format or complete historical migration.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

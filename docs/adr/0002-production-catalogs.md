@@ -515,3 +515,31 @@ and 72 ordinary Git tests pass (18 store and 62 Git provisioned tests remain
 ignored), with formatting and strict workspace/all-targets Clippy. These checks
 qualify local ownership/validation consistency rather than signed activation or
 real 1 TiB payload/retained-history capacity.
+
+`crates/mb-node/src/native_catalog.rs` adds borrowed conversion of the native
+portion of decoded legacy private metadata. Formats 1–5 retain root/entry
+attributes, dense and sparse recipes, repeated sector occurrences and hard-link
+identities. Original-order primary/alias checks run before namespace sorting;
+the durable group join can then resolve aliases that sort ahead of their primary.
+Conversion counts the existing canonical encoding with a 32 MiB bounded serializer
+and performs a dry bounded page pass before any external writes. It sorts borrowed
+entry references and copies only bounded paths and recipe fragments. It does not
+rewrite the original metadata or increase legacy admission limits.
+
+The sink identifies namespace and recipe roles explicitly. The returned file
+root still requires sources from the authenticated enclosing revision and the
+native validator before typed publication. Formats 4/5 supply only their decoded
+native portion to this adapter; their Git descriptor must also be retained and
+converted separately. Unsupported versions and namespace shapes, including
+missing explicit directory parents, stay on their existing legacy recovery path.
+Withdrawn formats 6/7 remain rejected. This library adapter does not enable a new
+capture, signed revision, restore or migration format.
+
+Six adapter tests and 26 ordinary snapshot regressions pass (eight provisioned
+snapshot tests remain ignored), with formatting and strict workspace/all-targets
+Clippy. Coverage includes dense/sparse/empty files, forward sorted aliases,
+repeated references across pages, bounded rejection before writes, sink failure,
+local source validation/publication/reopen, both immutable version-2 wire
+fixtures and decoded Git-bearing version-4/5 envelopes. Historical originals and
+Git descriptors remain unchanged. These are metadata conversion checks; complete
+historical migration, consumer activation and real 1 TiB qualification remain open.

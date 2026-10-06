@@ -6547,6 +6547,76 @@ mod metadata_compatibility_tests {
         assert_v2_hard_link_fixture(decode_private_metadata(FIXTURE).unwrap());
     }
 
+    #[test]
+    fn legacy_native_catalog_adapter_preserves_decoded_git_private_versions() {
+        let entries = vec![PrivateEntry::File {
+            path: "empty".to_owned(),
+            mode: 0o640,
+            logical_len: 0,
+            modified_secs: -7,
+            modified_nanos: 12,
+            sectors: vec![],
+        }];
+        let historical = GitPrivateMetadataV4 {
+            format_version: 4,
+            root_mode: 0o750,
+            root_modified_secs: -9,
+            root_modified_nanos: 17,
+            entries: entries.clone(),
+            git: LegacyGitBackupDescriptorV1 {
+                format_version: 1,
+                repository_id: Uuid::from_bytes([6; 16]),
+                refs: vec![],
+                objects: vec![],
+                blobs: vec![],
+            },
+        };
+        let current = GitPrivateMetadataV5 {
+            format_version: 5,
+            root_mode: 0o750,
+            root_modified_secs: -9,
+            root_modified_nanos: 17,
+            entries,
+            git: GitBackupDescriptor {
+                format_version: 4,
+                repository_id: Uuid::from_bytes([6; 16]),
+                refs: vec![],
+                objects: vec![],
+                blobs: vec![],
+                head_branch: "main".to_owned(),
+            },
+        };
+        let scope = mb_core::CatalogScope::Dataset {
+            guild_id: [1; 32],
+            owner: mb_core::NodeId([2; 32]),
+            protected_root_id: Uuid::from_bytes([3; 16]),
+        };
+        for bytes in [
+            canonical_bytes(&historical).unwrap(),
+            canonical_bytes(&current).unwrap(),
+        ] {
+            let before = bytes.clone();
+            let (native, git) = decode_private_metadata_with_git(&bytes).unwrap();
+            let git = git.unwrap();
+            let original_git = git.clone();
+            let root = native
+                .write_paged_native_entries(scope, &mut |_, _, _| Ok::<_, &'static str>(()))
+                .unwrap();
+            assert_eq!(root.namespace.files, 1);
+            assert_eq!(root.recipes.sectors, 0);
+            let git_root = git
+                .write_paged_catalog(scope, &mut |_, _| Ok::<_, &'static str>(()))
+                .unwrap();
+            assert_eq!(git_root.repository_id, original_git.repository_id);
+            assert_eq!(
+                git_root.refs.head_branch,
+                original_git.head_branch.as_bytes()
+            );
+            assert_eq!(git, original_git);
+            assert_eq!(bytes, before);
+        }
+    }
+
     fn assert_v2_hard_link_fixture(metadata: PrivateMetadata) {
         assert_eq!(metadata.format_version, 2);
         assert_eq!(metadata.root_mode, 0o755);
@@ -6565,5 +6635,51 @@ mod metadata_compatibility_tests {
                 } if actual_path == path && data_extents.is_empty()
             ));
         }
+        let before = canonical_bytes(&metadata).unwrap();
+        let scope = mb_core::CatalogScope::Dataset {
+            guild_id: [1; 32],
+            owner: mb_core::NodeId([2; 32]),
+            protected_root_id: Uuid::from_bytes([3; 16]),
+        };
+        let mut pages = std::collections::HashMap::new();
+        let root = metadata
+            .write_paged_native_entries(
+                scope,
+                &mut |_, reference: mb_core::CatalogPageRef, bytes| {
+                    pages.insert(reference.hash, bytes);
+                    Ok::<_, &'static str>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                root.namespace.files,
+                root.namespace.hard_links,
+                root.recipes.sectors
+            ),
+            (2, 0, 0)
+        );
+        let mut reader = mb_core::CatalogNativeFileReader::new(scope, root).unwrap();
+        let mut fetch = |reference: mb_core::CatalogPageRef| {
+            Ok::<_, &'static str>(pages[&reference.hash].clone())
+        };
+        for ordinal in 0..2 {
+            let Some(mb_core::CatalogFileEvent::Entry(entry)) =
+                reader.next_event(&mut fetch).unwrap()
+            else {
+                panic!("missing legacy entry");
+            };
+            assert_eq!(entry.path, [b"a", b"b"][ordinal]);
+            assert!(
+                matches!(entry.kind, mb_core::CatalogFileKind::File { file_key, logical_len: 0, link_group: Some(0) } if file_key == ordinal as u64)
+            );
+            assert!(
+                matches!(reader.next_event(&mut fetch).unwrap(), Some(mb_core::CatalogFileEvent::Recipe(
+                mb_core::CatalogFileRecipeRecord::File { file_key, logical_len: 0, extents: 0, sectors: 0, .. }
+            )) if file_key == ordinal as u64)
+            );
+        }
+        assert!(reader.next_event(&mut fetch).unwrap().is_none());
+        assert_eq!(canonical_bytes(&metadata).unwrap(), before);
     }
 }

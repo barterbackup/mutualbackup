@@ -6,6 +6,7 @@ mod control;
 mod guarded_metadata;
 #[cfg(test)]
 mod lab;
+mod native_catalog;
 mod network;
 mod node;
 mod snapshot;
@@ -23,6 +24,7 @@ pub use control::{
 #[cfg(target_os = "linux")]
 pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6};
 pub use mb_core::{KeyMaterial, NodeId, Seed};
+pub use native_catalog::{NativeCatalogStream, NativeCatalogWriteError};
 pub use network::{
     ClaimedTorTransportConfig, DhtRecord, DhtRecoveryResult, ONION_SERVICE_PORT, P2pActiveSession,
     P2pClient, P2pConfig, P2pEventLoop, P2pPath, P2pPathMetrics, P2pPathTransfer, P2pPeerProfile,
