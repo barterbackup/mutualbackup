@@ -15,6 +15,8 @@ use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 mod backup;
+#[cfg(target_os = "linux")]
+mod backup_size;
 mod blob_catalog;
 #[cfg(target_os = "linux")]
 mod checkout;

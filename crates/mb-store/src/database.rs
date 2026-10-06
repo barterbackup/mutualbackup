@@ -322,6 +322,59 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Hold the SQLite writer while a read-only preflight checks proposed
+    /// records, then publish them in the same transaction. The check may read
+    /// this store; it must not mutate it or begin a nested transaction.
+    /// A rejected check or incomplete SQL write rolls back the whole batch.
+    pub fn put_records_and_delete_checked<E: From<DatabaseError>>(
+        &self,
+        records: &[(String, Vec<u8>, Vec<u8>)],
+        deletions: &[(String, Vec<u8>)],
+        check: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(DatabaseError::from)?;
+        check()?;
+        {
+            let mut put = transaction
+                .prepare_cached(
+                    "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+                )
+                .map_err(DatabaseError::from)?;
+            for (kind, id, bytes) in records {
+                if put
+                    .execute(params![kind, id, bytes])
+                    .map_err(DatabaseError::from)?
+                    != 1
+                {
+                    return Err(DatabaseError::Conflict.into());
+                }
+            }
+            let mut delete = transaction
+                .prepare_cached("DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2")
+                .map_err(DatabaseError::from)?;
+            for (kind, id) in deletions {
+                let expected: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind = ?1 AND record_id = ?2)",
+                    params![kind, id], |row| row.get(0),
+                ).map_err(DatabaseError::from)?;
+                if delete
+                    .execute(params![kind, id])
+                    .map_err(DatabaseError::from)?
+                    != usize::from(expected)
+                {
+                    return Err(DatabaseError::Conflict.into());
+                }
+            }
+        }
+        transaction.commit().map_err(DatabaseError::from)?;
+        Ok(())
+    }
+
     /// Publish dependent records only while an exact durable intent still
     /// owns the transition. A stale worker cannot overwrite a newer result.
     pub fn put_records_and_retire_if_value(
@@ -4060,6 +4113,116 @@ mod tests {
             Err(DatabaseError::Conflict)
         ));
         assert_eq!(store.get_record("job", b"one").unwrap().unwrap(), b"second");
+    }
+
+    #[test]
+    fn git_admission_guard_rejects_before_writes_and_holds_the_writer_through_publication() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let competitor = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        competitor
+            .connection
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        store.put_record("guarded", b"ref", b"old").unwrap();
+        let records = vec![("guarded".to_owned(), b"ref".to_vec(), b"new".to_vec())];
+        let rejected = store.put_records_and_delete_checked(&records, &[], || {
+            assert_eq!(store.get_record("guarded", b"ref")?.unwrap(), b"old");
+            Err::<(), _>(DatabaseError::CapacityExceeded)
+        });
+        assert!(matches!(rejected, Err(DatabaseError::CapacityExceeded)));
+        assert_eq!(
+            store.get_record("guarded", b"ref").unwrap().unwrap(),
+            b"old"
+        );
+        store.put_records_and_delete_checked(&records, &[], || {
+            let competing = competitor.put_record("guarded", b"phantom", b"another graph");
+            assert!(matches!(competing, Err(DatabaseError::Sql(rusqlite::Error::SqliteFailure(error, _)))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy));
+            assert!(store.get_record("guarded", b"phantom")?.is_none());
+            Ok::<_, DatabaseError>(())
+        }).unwrap();
+        competitor
+            .put_record("guarded", b"after", b"allowed")
+            .unwrap();
+        assert_eq!(
+            competitor.get_record("guarded", b"ref").unwrap().unwrap(),
+            b"new"
+        );
+        drop(competitor);
+        drop(store);
+        let reopened = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(
+            reopened.get_record("guarded", b"ref").unwrap().unwrap(),
+            b"new"
+        );
+        assert!(
+            reopened
+                .get_record("guarded", b"phantom")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn git_admission_guard_rolls_back_aborted_and_ignored_record_writes() {
+        for (operation, outcome) in [
+            ("INSERT", "ABORT"),
+            ("INSERT", "IGNORE"),
+            ("UPDATE", "ABORT"),
+            ("UPDATE", "IGNORE"),
+            ("DELETE", "IGNORE"),
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            store.put_record("prior", b"old", b"preserved").unwrap();
+            if operation == "UPDATE" {
+                store.put_record("guarded", b"b", b"previous").unwrap();
+            }
+            let before = store.records("guarded").unwrap();
+            let predicate = if operation == "DELETE" {
+                "OLD.kind = 'prior'"
+            } else {
+                "NEW.kind = 'guarded' AND NEW.record_id = x'62'"
+            };
+            let raise = if outcome == "IGNORE" {
+                "RAISE(IGNORE)"
+            } else {
+                "RAISE(ABORT, 'injected fault')"
+            };
+            store.connection.execute_batch(&format!("CREATE TRIGGER reject_guard BEFORE {operation} ON protocol_records WHEN {predicate} BEGIN SELECT {raise}; END;")).unwrap();
+            let records = vec![
+                ("guarded".to_owned(), b"a".to_vec(), b"first".to_vec()),
+                ("guarded".to_owned(), b"b".to_vec(), b"second".to_vec()),
+            ];
+            assert!(
+                store
+                    .put_records_and_delete_checked(
+                        &records,
+                        &[("prior".to_owned(), b"old".to_vec())],
+                        || Ok::<_, DatabaseError>(())
+                    )
+                    .is_err()
+            );
+            assert_eq!(store.records("guarded").unwrap(), before);
+            assert_eq!(
+                store.get_record("prior", b"old").unwrap().unwrap(),
+                b"preserved"
+            );
+            store
+                .connection
+                .execute_batch("DROP TRIGGER reject_guard")
+                .unwrap();
+            drop(store);
+            let reopened = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert_eq!(reopened.records("guarded").unwrap(), before);
+            assert_eq!(
+                reopened.get_record("prior", b"old").unwrap().unwrap(),
+                b"preserved"
+            );
+        }
     }
 
     #[test]

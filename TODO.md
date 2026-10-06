@@ -145,6 +145,24 @@ passing tests below apply only to their recorded source and exercised cases.
     ordinary suites; the two named Btrfs capture tests were run separately).
     Mutation preflights, the shared admission contract, oversized-history status
     and the complete R2 boundary/reopen/recovery qualification remain open.
+  - [x] Preflight local commit, branch, pin and tag descriptor growth under the
+    SQLite writer lock. The proposed complete reachable graph includes retained
+    ancestry and all existing refs, plus the candidate records. A virtual dense
+    recipe serializer counts exact current-format blob sector geometry without
+    allocating sector vectors or rereading retained payloads. Oversized changes
+    fail before their metadata/ref writes; annotated tag object/ref publication
+    is now atomic. Cached lengths are admission geometry; backup/export still
+    verify actual anchors. Existing history and staged anchors are preserved.
+    Guarded publication rejects competing writers and rolls back SQL abort/ignore
+    faults, including ignored deletion. Full enclosing native/revision budgets,
+    merge/checkout/import/fetch preflights, oversized-history status and bounded
+    incremental scheduling remain required; this descriptor check does not close R2.
+    Validation: six targeted preflight/transaction fixtures, all 93 ordinary store
+    and 77 ordinary Git tests, 28 ordinary snapshot regressions, all 62 provisioned
+    Git library tests and both native Git capture/restore and rejected-capture
+    repair pass. Disposable Btrfs mount/image/loop cleanup is verified. Formatting
+    and strict workspace/all-targets Clippy pass. Ordinary suites retain 18 ignored
+    store cases and eight ignored snapshot cases; this is not a full M6 release gate.
 
 - [ ] **R3 / P1 — Replace the prototype snapshot-capacity ceiling with a defined
   production catalog design.** The first-release acceptance target is **1 TiB

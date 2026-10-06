@@ -575,3 +575,44 @@ All 96 core and 73 ordinary Git tests, 28 ordinary snapshot regressions and six
 legacy adapter tests pass, with formatting and strict workspace/all-targets
 Clippy. The ordinary suites retain 62 ignored Git and eight ignored snapshot
 provisioned cases; the two named capture cases were run separately on Btrfs.
+
+Local commit, branch, pin and tag publication now preflights the proposed full
+reachable descriptor while holding the SQLite writer through publication.
+`ControlStore::put_records_and_delete_checked` starts an immediate transaction,
+runs a read-only caller check, checks affected write/deletion counts and commits
+the batch only after success. A competing writer cannot add a ref between the
+check and publication; SQL rejection or ignored writes roll back the batch.
+Annotated tags publish their metadata object and ref together. Commits also
+reject a changed selected branch or previous HEAD inside that transaction.
+
+`history.rs` shares reachable graph traversal between export and proposed-record
+preflight. Proposed metadata is hash-checked and overlaid in a temporary metadata
+repository; refs include existing branches, remote refs, tags and pins. Export
+retains its existing native anchor verification. Admission reads cached, mutually
+consistent blob lengths from the already verified local mappings; it does not
+read retained blob payloads. This geometry check is not a new payload certificate.
+
+`backup_size.rs` uses a borrowed descriptor and virtual dense blob/extent/sector
+serializers to count the same recipe emitted by current capture. Empty blobs,
+full sectors, tails, lengths and field overhead match current descriptor versions
+2/3/4. Sector identity/root bytes have fixed encoded length, so placeholders can
+count bytes without creating sector vectors. The existing inclusive 32 MiB
+descriptor bound is enforced before publishing candidate metadata or refs.
+
+These checks still assemble and scan the prototype metadata graph in one writer
+transaction. They do not provide incremental update scheduling, full enclosing
+native/revision admission budgets, or merge/checkout/import/fetch preflights.
+Those consumers, oversized-history status/export policy and real capacity
+qualification remain required before closing R2 or enabling the production
+catalog. No wire versions, control schema or existing history are rewritten.
+
+Six new preflight/transaction fixtures cover dense recipe geometry and exact
+boundaries, rejection of a large commit before publication, a valid near-limit
+history whose added branch/pin/tag cannot fit, preserved export/reopen, cached
+blob geometry after payload loss, conflicting cached lengths, competing writers
+and SQL abort/ignore rollback. All 93 ordinary store and 77 ordinary Git tests,
+28 ordinary snapshot regressions, all 62 provisioned Git library cases and both
+native Git capture/restore and rejected-capture repair pass. Disposable Btrfs
+mount/image/loop cleanup is verified. Formatting and strict workspace/all-targets
+Clippy pass. Ordinary suites retain 18 ignored store and eight ignored snapshot
+cases; these results do not replace the complete M6 release/production gates.
