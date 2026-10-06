@@ -228,7 +228,21 @@ passing tests below apply only to their recorded source and exercised cases.
     Clippy. The synthetic 1 TiB sparse layout is codec qualification only.
     Source-authority joins, plaintext blob hashing and runtime migration remain
     required before accepting a paged descriptor as protected/recoverable.
-  - [ ] Add quota reservations, bounded file/Git-ref/packing/coding record
+  - [x] Add bounded Git refs and the complete paged Git root/legacy adapter.
+    Component ordering catches parent/child namespace conflicts with one prior
+    name, including conflicts hidden by ordinary byte sorting. Ref names are
+    bounded to 8 KiB, selected branch names to 1 KiB; selected/unborn HEAD is
+    authenticated and checked before the final ref is returned. The 4 KiB
+    enclosing root applies one aggregate metadata/page-occurrence bound across
+    refs, objects and recipes. Supported legacy graphs validate before writes
+    and preserve exact refs, object bytes/IDs, recipes and branch selection;
+    failed conversion leaves their signed bytes unchanged. Five ref and four
+    combined-root fixtures pass, including staged control-store reopen. All
+    50 catalog and 70 ordinary Git tests pass (62 provisioned Git tests remain
+    ignored), with formatting and strict workspace/all-targets Clippy. Durable
+    multi-root/signed publication, source joins, bounded DAG validation and
+    capture/recovery/admission integration remain open; this does not close R2.
+  - [ ] Add quota reservations, bounded file/packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.

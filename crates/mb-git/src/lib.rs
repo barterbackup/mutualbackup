@@ -32,8 +32,10 @@ mod interop;
 mod merge;
 mod object_catalog;
 mod odb;
+mod paged_catalog;
 #[cfg(target_os = "linux")]
 mod prune;
+mod ref_catalog;
 #[cfg(target_os = "linux")]
 mod repository;
 #[cfg(target_os = "linux")]
@@ -74,8 +76,13 @@ pub use object_catalog::{
     GitObjectCatalogRoot, GitObjectRecord,
 };
 pub use odb::NativeOdb;
+pub use paged_catalog::{GIT_CATALOG_ROOT_BYTES, GitCatalogRoot, GitCatalogWriteError};
 #[cfg(target_os = "linux")]
 pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};
+pub use ref_catalog::{
+    GIT_HEAD_BRANCH_BYTES, GIT_REF_NAME_BYTES, GitRefCatalogBuilder, GitRefCatalogReader,
+    GitRefCatalogRoot, GitRefRecord, git_ref_name_order,
+};
 #[cfg(target_os = "linux")]
 pub use repository::{GitRepository, RepositoryError, require_native_catalog_state};
 #[cfg(target_os = "linux")]

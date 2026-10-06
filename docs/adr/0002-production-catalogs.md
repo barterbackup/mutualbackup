@@ -1,6 +1,6 @@
 # Bounded authenticated catalogs for the 1 TiB release target
 
-Status: page/record framing, typed source records, Git object/blob fragments, local ownership and address/encryption primitives implemented; production admission
+Status: page/record framing, typed source records, paged Git container and legacy adapter, local ownership and address/encryption primitives implemented; production admission
 remains disabled until the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
 and their limits continue to apply.
 
@@ -257,3 +257,42 @@ real 1 TiB backup or restore. The enclosing Git container must authenticate this
 root and join recipes against signed source references; recovery must hash the
 regenerated plaintext blob. Those consumers, ref records, full DAG validation,
 legacy migration and the shared capacity policy remain open.
+
+Git refs and a complete paged Git container are implemented in
+`crates/mb-git/src/ref_catalog.rs` and `crates/mb-git/src/paged_catalog.rs`.
+Version-one ref names are bounded to 8 KiB and selected branch names to 1 KiB,
+with declarations checked before allocation. Component ordering, rather than
+ordinary byte ordering, makes a parent ref immediately precede its descendants.
+Thus one previous name suffices to reject namespace conflicts, duplicates and
+reordering, including `foo`, `foo-bar`, `foo/x`. The root authenticates the
+selected branch and its exact OID, or an explicit unborn selection; traversal
+checks this before yielding the final ref.
+
+The enclosing container binds repository identity and the three typed roots in
+at most 4 KiB. Their represented metadata bytes and page occurrences share the
+existing 16 GiB / one-million-occurrence bounds, rather than each section
+independently admitting the whole budget. This is a structural metadata bound,
+not physical quota or the complete retained-dataset policy.
+
+`GitBackupDescriptor::write_paged_catalog` first validates a supported legacy
+descriptor and checks the new name bounds before emitting any pages. It sorts
+borrowed indices into the already bounded legacy value and streams exact refs,
+object bytes and blob recipes without rewriting the original signed bytes.
+Oversized/unsupported existing history remains on its original path; this
+adapter does not enable new runtime admission. New capture/recovery paths must
+provide ordered streams directly, rather than assemble a larger legacy value.
+
+Five ref fixtures and four combined-container fixtures pass, covering name
+boundaries, namespace conflicts, selected/unborn branches, encoding, failures,
+aggregate geometry, legacy round trips and control-store reopen. All 50 catalog
+tests and 70 ordinary Git tests pass (62 provisioned Git tests remain ignored),
+with formatting and strict workspace/all-targets Clippy. The reopen fixture
+retains a building intent and verifies staged pages and a locally stored root;
+it does not publish a signed revision or prove remote/seed-only recovery.
+
+Each stream still needs durable ownership. An opaque container leaf does not
+create the page store's authenticated index-child edges to its three streams;
+atomic root-set publication and retention must explicitly retain them together.
+Owner-encrypted root binding, source-authority joins, plaintext blob hashing,
+bounded DAG validation, shared mutation preflight, daemon capture/recovery and
+legacy migration integration remain open.
