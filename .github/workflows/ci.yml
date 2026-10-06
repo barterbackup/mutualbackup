@@ -66,6 +66,62 @@ jobs:
             sudo umount /mnt/mutualbackup-package-ci
           fi
 
+  native-git-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          components: clippy
+      - name: Provision disposable Btrfs filesystem
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs iproute2 iptables procps util-linux
+          truncate -s 6G /tmp/mutualbackup-git-ci.btrfs
+          sudo mkfs.btrfs -q -f /tmp/mutualbackup-git-ci.btrfs
+          sudo mkdir -p /mnt/mutualbackup-git-ci
+          sudo mount -o loop,user_subvol_rm_allowed /tmp/mutualbackup-git-ci.btrfs /mnt/mutualbackup-git-ci
+          sudo chown "$USER":"$USER" /mnt/mutualbackup-git-ci
+      - name: Run the complete native Git acceptance suite
+        env:
+          MUTUALBACKUP_REFLINK_TEST_ROOT: /mnt/mutualbackup-git-ci
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          rustc --version --verbose
+          bash scripts/git-linux-acceptance.sh 2>&1 | tee git-linux-acceptance.log
+      - name: Collect peer diagnostics before filesystem cleanup
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+          root = Path("/mnt/mutualbackup-git-ci")
+          for source in root.glob("process-*/*.log"):
+              if source.is_file():
+                  destination = Path("git-peer-logs") / source.relative_to(root)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(source, destination)
+          PY
+      - name: Retain native Git qualification diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-git-qualification
+          path: |
+            git-linux-acceptance.log
+            git-peer-logs/
+          if-no-files-found: ignore
+      - name: Remove disposable filesystem
+        if: always()
+        run: |
+          if mountpoint -q /mnt/mutualbackup-git-ci; then
+            sudo umount /mnt/mutualbackup-git-ci
+          fi
+          rm -f /tmp/mutualbackup-git-ci.btrfs
+
   port-mapping-acceptance:
     runs-on: ubuntu-latest
     steps:

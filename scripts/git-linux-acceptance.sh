@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Provisioned Linux Git slice. Milestone 6 also requires platform and guarded
-# link-freeze gates; this script does not claim the complete milestone gate.
+# Provisioned native Linux Git slice. Milestone 6 also requires platform,
+# upgrade, and release-artifact gates; this is one required slice.
 if [[ -z "${MUTUALBACKUP_REFLINK_TEST_ROOT:-}" ]]; then
   echo "MUTUALBACKUP_REFLINK_TEST_ROOT must name a disposable reflink filesystem" >&2
   exit 2
@@ -19,6 +19,7 @@ cargo test -p mb-node node::tests::git_repository_init_and_add_survive_daemon_re
 cargo test -p mb-node node::tests::git_linked_worktree_registration_survives_daemon_reopen --locked -- --ignored --exact
 cargo test -p mb-node node::tests::git_prune_keeps_signed_revision_history_until_its_retirement --locked -- --ignored --exact
 cargo test -p mb-node lab::tests::seed_only_recovery_rebuilds_git_branches_and_exact_blobs --locked -- --ignored --exact
+cargo test -p mb-node network::p2p::tests::native_git_graph_recovers_from_format_seven_packed_checkpoint --locked -- --ignored --exact --nocapture
 cargo test -p mb-node node::tests::source_backend_binding_reprobes_and_migrates --locked -- --ignored --exact
 cargo test -p mb-node snapshot::metadata_compatibility_tests::git_history_enters_encrypted_revision_sectors_without_changing_root_restore --locked -- --ignored --exact
 cargo test -p mutualbackup --test git_remote_helper --locked -- --ignored --test-threads=1

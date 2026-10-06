@@ -33799,17 +33799,25 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[ignore = "requires a privileged guarded FUSE view and a reflink test filesystem"]
-    async fn guarded_git_graph_recovers_from_format_seven_packed_checkpoint() {
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    async fn native_git_graph_recovers_from_format_seven_packed_checkpoint() {
         use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::process::CommandExt;
 
         let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
         let run_root =
-            std::path::PathBuf::from(test_root).join(format!("p2p-guarded-git-{}", Uuid::new_v4()));
+            std::path::PathBuf::from(test_root).join(format!("p2p-native-git-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&run_root).unwrap();
         std::fs::set_permissions(&run_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Keep IPC outside a possibly long filesystem path. Bind before peer
+        // setup so socket path or permission failures do not run a backup first.
+        let control_directory = tempfile::Builder::new()
+            .prefix("mb-git-ctl-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let control_socket = control_directory.path().join("socket");
+        let listener = crate::control::bind_local_control(&control_socket).unwrap();
         // Only this fixture's owner enrolls a source root. Its native payload
         // areas live beside the source, outside the node directory; erase them
         // too so seed recovery cannot reuse a surviving local anchor.
@@ -33818,24 +33826,18 @@ mod tests {
                 let entry = entry.unwrap();
                 let name = entry.file_name();
                 let name = name.to_str().unwrap();
-                if name.starts_with(".mutualbackup-anchors-")
-                    || name.starts_with(".mutualbackup-guarded-lower-")
-                {
+                if name.starts_with(".mutualbackup-anchors-") {
                     assert!(entry.file_type().unwrap().is_dir());
                     std::fs::remove_dir_all(entry.path()).unwrap();
                 }
             }
         };
-        let lower = run_root.join("lower");
-        let view = run_root.join("view");
-        std::fs::create_dir(&lower).unwrap();
-        std::fs::create_dir(&view).unwrap();
-        std::fs::set_permissions(&lower, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(&view, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let first = b"\r\n\0guarded Git first\n".repeat(8_000);
-        let second = b"\n\r\0guarded Git second\r\n".repeat(5_000);
-        let before_edit = b"guarded Git edited before stage\r\n".repeat(4_000);
-        let history_only = b"history-only\r\n\0guarded Git blob".repeat(3_000);
+        let source = run_root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        let first = b"\r\n\0native Git first\n".repeat(8_000);
+        let second = b"\n\r\0native Git second\r\n".repeat(5_000);
+        let before_edit = b"native Git edited before stage\r\n".repeat(4_000);
+        let history_only = b"history-only\r\n\0native Git blob".repeat(3_000);
         let mut edited = before_edit.clone();
         edited[0] = b'E';
         for (name, bytes) in [
@@ -33844,8 +33846,8 @@ mod tests {
             ("edited", &before_edit),
             ("history-only", &history_only),
         ] {
-            std::fs::write(lower.join(name), bytes).unwrap();
-            std::fs::set_permissions(lower.join(name), std::fs::Permissions::from_mode(0o644))
+            std::fs::write(source.join(name), bytes).unwrap();
+            std::fs::set_permissions(source.join(name), std::fs::Permissions::from_mode(0o644))
                 .unwrap();
         }
 
@@ -33910,66 +33912,66 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
+        fn native_git_graph(owner: &Node, root_id: Uuid) -> mb_git::GitGraphSource {
+            let root = owner
+                .protected_roots()
+                .unwrap()
+                .into_iter()
+                .find(|root| root.root_id == root_id)
+                .unwrap();
+            mb_git::GitRepository::open(
+                &root.path,
+                root_id,
+                &mb_git::catalog_key(owner.keys(), root_id),
+            )
+            .unwrap()
+            .export_graph_source()
+            .unwrap()
+        }
+
         let (root_id, original_graph) = {
             let mut owner = nodes[1].lock().unwrap();
-            let root = owner
-                .enroll_test_guarded_root(&lower, &view, 65534, 65534)
-                .unwrap();
-            let edit = std::process::Command::new("python3")
-                .uid(65534)
-                .gid(65534)
-                .arg("-c")
-                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'E',0); os.fsync(fd); os.close(fd)")
-                .arg(view.join("edited"))
-                .output()
-                .unwrap();
-            assert!(edit.status.success(), "{edit:?}");
-            assert_eq!(std::fs::read(view.join("edited")).unwrap(), edited);
+            let root_id = owner.git_init(&source).unwrap().repository_id;
+            std::fs::write(source.join("edited"), &edited).unwrap();
+            for name in ["first", "second", "edited"] {
+                owner
+                    .git_add_path(root_id, std::path::Path::new(name))
+                    .unwrap();
+            }
             owner
-                .seed_test_guarded_git_commit(
-                    root.root_id,
-                    &[("first", 2), ("second", 2), ("edited", 1)],
-                )
+                .git_commit(root_id, "Owner", "owner@example.test", "base")
                 .unwrap();
-            owner.git_create_branch(root.root_id, "topic").unwrap();
-            owner.git_switch_branch(root.root_id, "topic").unwrap();
+            owner.git_create_branch(root_id, "topic").unwrap();
+            owner.git_switch_branch(root_id, "topic").unwrap();
             owner
-                .seed_test_guarded_git_commit(root.root_id, &[("history-only", 2)])
+                .git_add_path(root_id, std::path::Path::new("history-only"))
                 .unwrap();
-            let refused = owner.git_switch_branch(root.root_id, "main").unwrap_err();
-            assert!(
-                refused
-                    .to_string()
-                    .contains("guarded Git checkout is not enabled")
-            );
+            owner
+                .git_commit(root_id, "Owner", "owner@example.test", "history")
+                .unwrap();
+            std::fs::remove_file(source.join("history-only")).unwrap();
             assert!(
                 owner
-                    .git_branches(root.root_id)
+                    .git_remove_cached(root_id, std::path::Path::new("history-only"))
                     .unwrap()
-                    .iter()
-                    .any(|branch| { branch.name == "topic" && branch.current })
             );
-            let remove = std::process::Command::new("python3")
-                .uid(65534)
-                .gid(65534)
-                .arg("-c")
-                .arg("import os,sys; os.unlink(sys.argv[1])")
-                .arg(view.join("history-only"))
-                .output()
-                .unwrap();
-            assert!(remove.status.success(), "{remove:?}");
             owner
-                .test_guarded_git_commit_removed_file(
-                    root.root_id,
-                    std::path::Path::new("history-only"),
+                .git_commit(
+                    root_id,
+                    "Owner",
+                    "owner@example.test",
+                    "remove history file",
                 )
                 .unwrap();
-            owner.git_switch_branch(root.root_id, "main").unwrap();
-            let graph = owner.test_guarded_git_graph(root.root_id).unwrap();
-            (root.root_id, graph)
+            owner.git_switch_branch(root_id, "main").unwrap();
+            (root_id, native_git_graph(&owner, root_id))
         };
         assert_eq!(original_graph.refs.len(), 2);
         assert_eq!(original_graph.blobs.len(), 4);
+        assert!(original_graph.blobs.iter().all(|blob| {
+            blob.anchor.format_version == 1 && blob.anchor.guarded_root_file.is_none()
+        }));
+        eprintln!("native Git initial packed checkpoint: preparing");
         let owner_id = nodes[1].lock().unwrap().keys().node_id();
         let descriptor = nodes[1]
             .lock()
@@ -33992,8 +33994,9 @@ mod tests {
             commit_backup_job(nodes[0].clone(), &clients[0], &queued),
         )
         .await
-        .expect("guarded Git format-7 packing timed out")
+        .expect("native Git format-7 packing timed out")
         .unwrap();
+        eprintln!("native Git initial packed checkpoint: committed");
         nodes[0]
             .lock()
             .unwrap()
@@ -34076,17 +34079,12 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
-        nodes[1]
-            .lock()
-            .unwrap()
-            .stop_test_guarded_mount(root_id)
-            .unwrap();
         drop(nodes.remove(1));
         clients.remove(1);
         std::fs::remove_dir_all(run_root.join("node-1")).unwrap();
-        std::fs::remove_dir_all(&lower).unwrap();
-        std::fs::remove_dir_all(&view).unwrap();
+        std::fs::remove_dir_all(&source).unwrap();
         wipe_owner_payload_areas();
+        eprintln!("native Git first owner state, source, and anchors erased");
 
         let restored = run_root.join("restored");
         let recovered_state = run_root.join("recovered-node");
@@ -34103,16 +34101,16 @@ mod tests {
             recover_from_dht(recovered_node.clone(), &recovery_client, &restored),
         )
         .await
-        .expect("guarded Git seed-only recovery timed out")
+        .expect("native Git seed-only recovery timed out")
         .unwrap();
+        eprintln!("native Git first seed-only recovery: completed");
         assert_eq!(recovered.generation, 1);
         assert_eq!(std::fs::read(restored.join("first")).unwrap(), first);
         assert_eq!(std::fs::read(restored.join("second")).unwrap(), second);
         assert_eq!(std::fs::read(restored.join("edited")).unwrap(), edited);
         assert!(std::fs::symlink_metadata(restored.join("history-only")).is_err());
-        assert!(std::fs::symlink_metadata(restored.join(".mutualbackup")).is_err());
-        let control_socket = run_root.join("control").join("socket");
-        let listener = crate::control::bind_local_control(&control_socket).unwrap();
+        assert!(restored.join(".mutualbackup").is_dir());
+        assert!(std::fs::symlink_metadata(restored.join(".git")).is_err());
         let control_task = tokio::spawn(crate::control::serve_local_control_on(
             recovered_node.clone(),
             recovery_client.clone(),
@@ -34126,7 +34124,7 @@ mod tests {
         )
         .await
         .unwrap() else {
-            panic!("recovered guarded repository is not locatable through local control");
+            panic!("recovered native repository is not locatable through local control");
         };
         assert_eq!(located.repository_id, root_id);
         assert_eq!(located.path, restored);
@@ -34138,38 +34136,21 @@ mod tests {
         )
         .await
         .unwrap() else {
-            panic!("recovered guarded status is unavailable through local control");
+            panic!("recovered native status is unavailable through local control");
         };
         assert!(control_status.history_backed_up);
         assert_eq!(control_status.head_oid, Some(original_graph.refs[0].oid));
-        let recovered_graph = recovered_node
-            .lock()
-            .unwrap()
-            .test_guarded_git_graph(root_id)
-            .unwrap();
+        let recovered_graph = native_git_graph(&recovered_node.lock().unwrap(), root_id);
         assert_eq!(recovered_graph.refs, original_graph.refs);
         assert_eq!(recovered_graph.objects, original_graph.objects);
         assert_eq!(recovered_graph.blobs.len(), 4);
         let history_oid = git2::Oid::hash_object(git2::ObjectType::Blob, &history_only).unwrap();
-        let mut root_anchor_ids = BTreeSet::new();
         for (recovered_blob, original_blob) in
             recovered_graph.blobs.iter().zip(&original_graph.blobs)
         {
             assert_eq!(recovered_blob.oid, original_blob.oid);
-            if recovered_blob.oid == history_oid.as_bytes() {
-                assert_eq!(recovered_blob.anchor.format_version, 1);
-                assert!(recovered_blob.anchor.guarded_root_file.is_none());
-            } else {
-                assert_eq!(recovered_blob.anchor.format_version, 2);
-                root_anchor_ids.insert(
-                    recovered_blob
-                        .anchor
-                        .guarded_root_file
-                        .as_ref()
-                        .unwrap()
-                        .root_anchor_id,
-                );
-            }
+            assert_eq!(recovered_blob.anchor.format_version, 1);
+            assert!(recovered_blob.anchor.guarded_root_file.is_none());
             assert_eq!(
                 mb_git::blob_oid_from_anchor(&recovered_blob.anchor)
                     .unwrap()
@@ -34177,9 +34158,8 @@ mod tests {
                 recovered_blob.oid
             );
         }
-        assert_eq!(root_anchor_ids.len(), 1);
         {
-            let mut recovered_owner = recovered_node.lock().unwrap();
+            let recovered_owner = recovered_node.lock().unwrap();
             let located = recovered_owner.git_locate(&restored).unwrap().unwrap();
             assert_eq!(located.repository_id, root_id);
             assert_eq!(located.path, restored);
@@ -34207,21 +34187,10 @@ mod tests {
                     .patch
                     .is_empty()
             );
-            assert!(
-                recovered_owner
-                    .git_add_path(root_id, std::path::Path::new("first"))
-                    .is_err()
-            );
         }
-        let edit = std::process::Command::new("python3")
-            .uid(65534)
-            .gid(65534)
-            .arg("-c")
-            .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.pwrite(fd,b'\\n',0); os.fsync(fd); os.close(fd)")
-            .arg(restored.join("first"))
-            .output()
-            .unwrap();
-        assert!(edit.status.success(), "{edit:?}");
+        let mut dirty_first = first.clone();
+        dirty_first[0] = b'\n';
+        std::fs::write(restored.join("first"), dirty_first).unwrap();
         {
             let owner = recovered_node.lock().unwrap();
             let status = owner.git_status(root_id).unwrap();
@@ -34241,7 +34210,7 @@ mod tests {
         )
         .await
         .unwrap() else {
-            panic!("recovered guarded branches are unavailable through local control");
+            panic!("recovered native branches are unavailable through local control");
         };
         let crate::LocalResponse::GitObjectsExported {
             repository_id: exported_id,
@@ -34259,7 +34228,7 @@ mod tests {
         .await
         .unwrap()
         else {
-            panic!("recovered guarded objects are unavailable through local control");
+            panic!("recovered native objects are unavailable through local control");
         };
         assert_eq!(exported_id, root_id);
         assert!(object_count >= 8);
@@ -34313,7 +34282,7 @@ mod tests {
                     Some("topic"),
                     "Owner",
                     "owner@example.test",
-                    "retained guarded history",
+                    "retained native history",
                 )
                 .unwrap();
             assert_eq!(owner.git_tags(root_id).unwrap().len(), 2);
@@ -34332,7 +34301,7 @@ mod tests {
         )
         .await
         .unwrap() else {
-            panic!("recovered guarded branch deletion is unavailable through local control");
+            panic!("recovered native branch deletion is unavailable through local control");
         };
         assert_eq!(deleted.oid, history_tip);
         recovered_node
@@ -34348,16 +34317,12 @@ mod tests {
         )
         .await
         .unwrap() else {
-            panic!("recovered guarded prune is unavailable through local control");
+            panic!("recovered native prune is unavailable through local control");
         };
         assert_eq!(retained.native_anchors_removed, 0);
         // Only the temporary annotated tag lacks checkpoint protection.
         assert_eq!(retained.metadata_objects_removed, 1);
-        let local_graph = recovered_node
-            .lock()
-            .unwrap()
-            .test_guarded_git_graph(root_id)
-            .unwrap();
+        let local_graph = native_git_graph(&recovered_node.lock().unwrap(), root_id);
         assert_eq!(local_graph.refs.len(), 1);
         assert_eq!(local_graph.blobs.len(), 3);
         let history_anchor = &recovered_graph
@@ -34438,11 +34403,11 @@ mod tests {
         let mut expired_groups = Vec::new();
         nodes[0].lock().unwrap().configure_retention(1).unwrap();
         for generation in [2, 3, 4] {
-            eprintln!("guarded Git retention checkpoint {generation}: preparing");
+            eprintln!("native Git retention checkpoint {generation}: preparing");
             let descriptor = {
                 let mut owner = recovered_node.lock().unwrap();
                 owner
-                    .mark_root_dirty(root_id, "advance guarded history retention")
+                    .mark_root_dirty(root_id, "advance native history retention")
                     .unwrap();
                 owner.prepare_protected_backup(Some(root_id)).unwrap()
             };
@@ -34462,14 +34427,14 @@ mod tests {
                 commit_backup_job(nodes[0].clone(), &clients[0], &queued),
             )
             .await
-            .expect("guarded Git retention backup timed out")
+            .expect("native Git retention backup timed out")
             .unwrap();
             nodes[0]
                 .lock()
                 .unwrap()
                 .complete_backup_job(&descriptor, checkpoint_hash)
                 .unwrap();
-            eprintln!("guarded Git retention checkpoint {generation}: committed");
+            eprintln!("native Git retention checkpoint {generation}: committed");
             let current = recovered_node
                 .lock()
                 .unwrap()
@@ -34594,7 +34559,7 @@ mod tests {
                     );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                eprintln!("guarded Git history: obsolete coding groups forgotten");
+                eprintln!("native Git history: obsolete coding groups forgotten");
             }
         }
 
@@ -34681,7 +34646,7 @@ mod tests {
                 );
             }
         }
-        eprintln!("guarded Git history: expired packed caches and READY shards deleted");
+        eprintln!("native Git history: expired packed caches and READY shards deleted");
         let latest_hash = latest.hash().unwrap();
         let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
@@ -34701,11 +34666,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let latest_graph = recovered_node
-            .lock()
-            .unwrap()
-            .test_guarded_git_graph(root_id)
-            .unwrap();
+        let latest_graph = native_git_graph(&recovered_node.lock().unwrap(), root_id);
         let mut current_first = first.clone();
         current_first[0] = b'\n';
         assert_eq!(
@@ -34729,11 +34690,6 @@ mod tests {
         let _ = control_task.await;
         recovery_client.shutdown().await.unwrap();
         recovery_task.await.unwrap().unwrap();
-        recovered_node
-            .lock()
-            .unwrap()
-            .stop_test_guarded_mount(root_id)
-            .unwrap();
         drop(all_nodes);
         let drop_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&recovered_node) != 1 {
@@ -34773,11 +34729,9 @@ mod tests {
         assert_eq!(std::fs::read(target_again.join("second")).unwrap(), second);
         assert_eq!(std::fs::read(target_again.join("edited")).unwrap(), edited);
         assert!(std::fs::symlink_metadata(target_again.join("history-only")).is_err());
-        let graph_again = recovered_again
-            .lock()
-            .unwrap()
-            .test_guarded_git_graph(root_id)
-            .unwrap();
+        assert!(target_again.join(".mutualbackup").is_dir());
+        assert!(std::fs::symlink_metadata(target_again.join(".git")).is_err());
+        let graph_again = native_git_graph(&recovered_again.lock().unwrap(), root_id);
         assert_eq!(graph_again.refs, latest_graph.refs);
         assert_eq!(graph_again.objects, latest_graph.objects);
         assert_eq!(graph_again.blobs.len(), 3);
@@ -34797,10 +34751,8 @@ mod tests {
             assert_eq!(mb_git::blob_oid_from_anchor(&blob.anchor).unwrap(), oid);
             // The unstaged LF edit is the restored working file; Git still
             // retains the original CRLF blob in one independent native anchor.
-            assert_eq!(
-                blob.anchor.format_version,
-                if bytes == &first { 1 } else { 2 }
-            );
+            assert_eq!(blob.anchor.format_version, 1);
+            assert!(blob.anchor.guarded_root_file.is_none());
         }
         {
             let owner = recovered_again.lock().unwrap();
@@ -34813,15 +34765,10 @@ mod tests {
             assert!(owner.git_commit_pins(root_id).unwrap().is_empty());
         }
         eprintln!(
-            "guarded Git history: current graph and unstaged bytes recovered after second owner loss"
+            "native Git history: current graph and unstaged bytes recovered after second owner loss"
         );
         client_again.shutdown().await.unwrap();
         task_again.await.unwrap().unwrap();
-        recovered_again
-            .lock()
-            .unwrap()
-            .stop_test_guarded_mount(root_id)
-            .unwrap();
         drop(recovered_again);
         for task in coding_tasks
             .into_iter()

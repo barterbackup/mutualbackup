@@ -154,9 +154,11 @@ passing tests below apply only to their recorded source and exercised cases.
   successful builds do not run the required ordinary or privileged suites.
   `.github/workflows/ci.yml` already runs format, strict Clippy, locked workspace
   tests, Docker safety, reflink/network acceptance, port-mapping, and private-Tor
-  recovery. Preserve those jobs and keep the build-only Nix sandbox distinction;
-  add the missing complete `scripts/git-linux-acceptance.sh` CI gate and required
-  upgrade/multi-volume regression coverage. The dedicated packaged Git runtime
+  recovery. Preserve those jobs and keep the build-only Nix sandbox distinction.
+  The new `native-git-acceptance` job invokes the complete
+  `scripts/git-linux-acceptance.sh` gate on disposable Btrfs, retains the gate and
+  per-peer logs before cleanup, and unmounts/removes its image on exit. Required
+  upgrade/multi-volume regression coverage remains open. The dedicated packaged Git runtime
   smoke job now covers the R6 slice. Qualify
   the exact release artifact through native-filesystem, topology, and source-loss
   scenarios, rather than equating a build or source-tree test pass with packaged
@@ -167,6 +169,40 @@ passing tests below apply only to their recorded source and exercised cases.
   prior FUSE test passes do not qualify the replacement. Preserve exact-byte
   Git interop and no-duplicate-payload checks. Bound test timeouts, retain
   per-peer diagnostics, and independently audit mount/image/loop/network cleanup.
+
+  - [x] Port the five-peer format-7 checkpoint fixture to native Git capture and
+    normal Git commands. Preserve exact CRLF/NUL blob OIDs and bytes, branches,
+    tags and commit pins, checkpoint grace protection, physical history-anchor
+    reclamation, expired raw/packed cache and READY shard deletion, and seed-only
+    recovery after two complete owner losses. Both losses erase state, source,
+    and external native anchor areas; the second also erases the stock-Git
+    export. Recovered catalogs contain
+    independent format-1 blob anchors, with no ordinary `.git` payload mirror;
+    committed blobs and unstaged working bytes remain distinct. Remove the four
+    guarded-only helpers left unused by this port. The fixture binds its private
+    control socket in a separate short temporary path before peer setup, keeping
+    long qualified filesystem paths within the Unix socket limit. The stock-Git
+    bridge and five-daemon topology fixtures also use separate short private
+    control paths, including both recovered peers.
+    Validation: disposable Btrfs passes in the workspace feature configuration
+    (727.04 seconds) and the acceptance script's node configuration (690.01 seconds).
+    Format and strict all-target workspace Clippy pass with pre-existing FUSE
+    test WIP held aside; that WIP is restored after each qualification run.
+    The remaining native Git stages also pass: all 62 ignored Git library cases,
+    extent sharing, daemon Git reopen/linked worktrees/signed-history prune,
+    seed-only branch/blob recovery, backend migration, encrypted history/root
+    restore, stock-Git fetch/push, and raw Unix CLI/daemon/Git paths. The gate was
+    resumed after correcting the fixtures' socket length and directory privacy;
+    unchanged stages were not rerun solely to produce one uninterrupted log.
+    The provisioned five-daemon topology also passed (2,095.29 seconds),
+    exercising source/storage loss, native Git recovery, direct and punched
+    paths, relay fallback, and final verified backup. This run still logged
+    transient four-of-five signatures and stale endpoint retries; R5 stays open.
+    The runner verified mount/image cleanup and restored the pre-existing WIP
+    byte-for-byte. Independent cleanup checks found no remaining test network
+    namespaces, loop devices, or fixture firewall rules. Workflow syntax and the diagnostic log-copy
+    step were checked locally; the hosted CI job has not been run here.
+
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
   source-loss matrix on the release source. Record repeated topology evidence

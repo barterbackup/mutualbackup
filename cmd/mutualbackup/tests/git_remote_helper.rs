@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -17,6 +18,16 @@ use uuid::Uuid;
 #[test]
 #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
 fn stock_git_fetches_and_pushes_through_native_anchors() {
+    // Control sockets must stay short even when the provisioned source area
+    // has a long path. Keep IPC in its own private temporary directory.
+    let control_directory = tempfile::Builder::new()
+        .prefix("mb-git-ctl-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let socket = control_directory.path().join("socket");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let test_root = PathBuf::from(
         std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
@@ -59,9 +70,6 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let socket = run_root.join("control.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let server_stop = stop.clone();
     let server_root = source_root.clone();

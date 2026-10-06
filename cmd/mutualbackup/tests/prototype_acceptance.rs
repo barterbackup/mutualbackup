@@ -1159,6 +1159,13 @@ fn raw_unix_paths_survive_cli_daemon_and_git_checkout() {
 #[ignore = "requires an explicitly provisioned reflink test filesystem"]
 fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let topology = ProcessNetworkTopology::from_environment();
+    // The Btrfs source path can be long; recovery adds still longer state
+    // directory names. Keep every control socket in a short private IPC area.
+    let control_directory = tempfile::Builder::new()
+        .prefix("mb-net-ctl-")
+        .tempdir()
+        .unwrap();
+    set_private(control_directory.path());
     let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
         .expect("the acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
     let run_root = PathBuf::from(test_root).join(format!("process-{}", Uuid::new_v4()));
@@ -1189,7 +1196,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         set_private(&peer_dir);
         let seed = seed_dir.join(format!("p{index}.seed"));
         let config = peer_dir.join("node.toml");
-        let socket = peer_dir.join("c");
+        let socket = control_directory.path().join(format!("p{index}"));
         let args = vec![
             os("--socket"),
             socket.as_os_str().to_owned(),
@@ -1487,7 +1494,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let recovered_dir = run_root.join("recovered");
     fs::create_dir(&recovered_dir).unwrap();
     set_private(&recovered_dir);
-    let recovered_socket = recovered_dir.join("c");
+    let recovered_socket = control_directory.path().join("recovered");
     let recovered_config = recovered_dir.join("node.toml");
     let bootstrap = format!("{}/p2p/{}", transports[0], peer_ids[0]);
     run_cli(
@@ -1611,7 +1618,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let storage_recovered_dir = run_root.join("storage-recovered");
     fs::create_dir(&storage_recovered_dir).unwrap();
     set_private(&storage_recovered_dir);
-    let storage_recovered_socket = storage_recovered_dir.join("c");
+    let storage_recovered_socket = control_directory.path().join("storage-recovered");
     let storage_recovered_config = storage_recovered_dir.join("node.toml");
     run_cli(
         &[
@@ -1970,7 +1977,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let outsider_dir = run_root.join("outsider");
     fs::create_dir(&outsider_dir).unwrap();
     set_private(&outsider_dir);
-    let outsider_socket = outsider_dir.join("c");
+    let outsider_socket = control_directory.path().join("outsider");
     let outsider_config = outsider_dir.join("node.toml");
     let outsider_transport = topology.transport(&transports[8], &topology.host_ip);
     run_cli(

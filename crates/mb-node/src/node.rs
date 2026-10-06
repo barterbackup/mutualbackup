@@ -3133,63 +3133,12 @@ impl Node {
     }
 
     #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn seed_test_guarded_git_commit(
-        &mut self,
-        root_id: Uuid,
-        paths: &[(&str, u16)],
-    ) -> Result<mb_git::GitGraphSource> {
-        self.init_registered_guarded_git(root_id)?;
-        for &(path, expected_format) in paths {
-            let (_, anchor) = self.stage_registered_guarded_git_file(root_id, Path::new(path))?;
-            anyhow::ensure!(
-                anchor.format_version == expected_format,
-                "guarded Git stage used an unexpected anchor format for {path}"
-            );
-        }
-        let repository = self.open_guarded_git_repository(root_id)?;
-        repository.commit("Owner", "owner@example.test", "guarded graph")?;
-        repository.export_graph_source().map_err(Into::into)
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn test_guarded_git_commit_removed_file(
-        &self,
-        root_id: Uuid,
-        path: &Path,
-    ) -> Result<mb_git::GitGraphSource> {
-        let repository = self.open_guarded_git_repository(root_id)?;
-        anyhow::ensure!(repository.remove_cached(path)?, "Git path was not staged");
-        repository.commit("Owner", "owner@example.test", "remove visible file")?;
-        repository.export_graph_source().map_err(Into::into)
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn test_guarded_git_graph(&self, root_id: Uuid) -> Result<mb_git::GitGraphSource> {
-        self.open_guarded_git_repository(root_id)?
-            .export_graph_source()
-            .map_err(Into::into)
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_revision_git_descriptor(
         &self,
         revision: &SignedRecord<UserRevision>,
     ) -> Result<mb_git::GitBackupDescriptor> {
         revision_git_backup(&self.control, &self.keys, revision.value.guild_id, revision)?
             .context("test revision has no signed Git graph")
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn stop_test_guarded_mount(&mut self, root_id: Uuid) -> Result<()> {
-        let root = self.protected_root_by_id(root_id)?;
-        let binding = self.guarded_root_mount_binding(&root)?;
-        let position = self
-            .guarded_mounts
-            .iter()
-            .position(|mount| mount.anchor_id() == binding.anchor_id)
-            .context("test guarded mount is absent")?;
-        self.guarded_mounts.swap_remove(position).stop()?;
-        Ok(())
     }
 
     fn git_catalog_key(&self, repository_id: Uuid) -> [u8; 32] {
