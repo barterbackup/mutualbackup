@@ -40,6 +40,7 @@ pub(crate) enum VolumeInterruption {
     GarbageObjectRemoved,
     GarbageReceiptRetired,
     AttemptObjectActivated,
+    CodingUploadReceiptStored,
 }
 
 #[cfg(test)]
@@ -1047,6 +1048,36 @@ impl StorageVolumes {
             {
                 bail!("completed coding upload conflicts with its receipt");
             }
+            let reservation_id = attempt_reservation_id(attempt_id, shard);
+            let reservation_bytes =
+                control.get_record("volume-attempt-reservation", &reservation_id)?;
+            if let Some(bytes) = &reservation_bytes {
+                let reservation: AttemptReservationRecord = decode_canonical(bytes)?;
+                validate_attempt_reservation_record(&reservation)?;
+                if reservation.attempt_id != *attempt_id
+                    || reservation.volume_id != existing.receipt.volume_id
+                    || reservation.guild_id != existing.receipt.guild_id
+                    || reservation.shard_index != shard
+                    || reservation.byte_length != commitment.byte_len
+                {
+                    bail!("completed coding upload conflicts with its pending reservation");
+                }
+            }
+            // The receipt can precede reservation retirement. Revalidate the
+            // physical STAGED/READY bytes before returning it, and finish both
+            // database and control cleanup after an interrupted publication.
+            self.volumes
+                .get_mut(&existing.receipt.volume_id)
+                .and_then(|volume| volume.store.as_mut())
+                .context("completed coding upload volume is offline")?
+                .finish_coding_attempt_upload(attempt_id, &group_id, shard_index, commitment)?;
+            if let Some(bytes) = reservation_bytes {
+                control.delete_record_if_value(
+                    "volume-attempt-reservation",
+                    &reservation_id,
+                    &bytes,
+                )?;
+            }
             return Ok(existing.receipt);
         }
         let reservation_id = attempt_reservation_id(attempt_id, shard);
@@ -1082,6 +1113,7 @@ impl StorageVolumes {
             &attempt_object_id,
             &canonical_bytes(&durable)?,
         )?;
+        volume_interruption(VolumeInterruption::CodingUploadReceiptStored)?;
         control.delete_record("volume-attempt-reservation", &reservation_id)?;
         Ok(receipt)
     }
@@ -4483,6 +4515,232 @@ mod tests {
             volumes
                 .load_ready_variable(&control, &object.group_id, 4)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn completed_coding_upload_retry_verifies_bytes_and_retires_interrupted_reservation() {
+        let data = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([199; 32])));
+        let attempt = [200; 16];
+        let guild = [201; 32];
+        let group = [202; 32];
+        let bytes = vec![203; 64];
+        let commitment = mb_core::merkle_commit(&bytes).unwrap();
+        let shard = 4;
+        let reservation_id = attempt_reservation_id(&attempt, shard);
+        let object_id = attempt_volume_object_id(&attempt, &group, shard);
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .reserve_attempt(&control, &attempt, guild, shard.into(), 64)
+            .unwrap();
+        volumes
+            .write_attempt_range(&control, &attempt, shard.into(), 0, &bytes)
+            .unwrap();
+        let reservation_bytes = control
+            .get_record("volume-attempt-reservation", &reservation_id)
+            .unwrap()
+            .unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::CodingUploadReceiptStored);
+        assert!(
+            volumes
+                .finish_attempt_upload(&control, &attempt, group, shard.into(), &commitment)
+                .is_err()
+        );
+        assert_eq!(
+            control
+                .get_record("volume-attempt-reservation", &reservation_id)
+                .unwrap(),
+            Some(reservation_bytes.clone())
+        );
+        let receipt_bytes = control
+            .get_record("volume-attempt-receipt", &object_id)
+            .unwrap()
+            .unwrap();
+        let stored: AttemptVolumeRecord = decode_canonical(&receipt_bytes).unwrap();
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys, &control).unwrap();
+        let receipt = volumes
+            .finish_attempt_upload(&control, &attempt, group, shard.into(), &commitment)
+            .unwrap();
+        assert_eq!(receipt, stored.receipt);
+        assert!(
+            control
+                .get_record("volume-attempt-reservation", &reservation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            control
+                .get_record("volume-attempt-receipt", &object_id)
+                .unwrap(),
+            Some(receipt_bytes.clone())
+        );
+        assert_eq!(
+            volumes.volumes[&receipt.volume_id]
+                .store
+                .as_ref()
+                .unwrap()
+                .used_bytes()
+                .unwrap(),
+            64
+        );
+        volumes
+            .attach_attempt_receipt(
+                &control,
+                &attempt,
+                &group,
+                shard.into(),
+                b"signed staged receipt",
+            )
+            .unwrap();
+        volumes
+            .activate_attempt_object(
+                &control,
+                &attempt,
+                &group,
+                shard.into(),
+                &commitment,
+                &[204; 32],
+            )
+            .unwrap();
+        assert_eq!(
+            volumes
+                .finish_attempt_upload(&control, &attempt, group, shard.into(), &commitment)
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            volumes
+                .load_ready_variable(&control, &group, shard.into())
+                .unwrap()
+                .bytes,
+            bytes
+        );
+
+        // A completed receipt alone cannot certify missing physical storage.
+        // Preserve all control evidence when revalidation fails.
+        control
+            .put_record(
+                "volume-attempt-reservation",
+                &reservation_id,
+                &reservation_bytes,
+            )
+            .unwrap();
+        volumes
+            .volumes
+            .get_mut(&receipt.volume_id)
+            .unwrap()
+            .store
+            .as_mut()
+            .unwrap()
+            .remove_ready(&group, shard, &commitment.root)
+            .unwrap();
+        assert!(
+            volumes
+                .finish_attempt_upload(&control, &attempt, group, shard.into(), &commitment)
+                .is_err()
+        );
+        assert_eq!(
+            control
+                .get_record("volume-attempt-reservation", &reservation_id)
+                .unwrap(),
+            Some(reservation_bytes)
+        );
+        assert_eq!(
+            control
+                .get_record("volume-attempt-receipt", &object_id)
+                .unwrap(),
+            Some(receipt_bytes)
+        );
+    }
+
+    #[test]
+    fn completed_coding_upload_keeps_conflicting_reservation_and_offline_evidence() {
+        let data = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([205; 32])));
+        let attempt = [206; 16];
+        let guild = [207; 32];
+        let group = [208; 32];
+        let bytes = vec![209; 64];
+        let commitment = mb_core::merkle_commit(&bytes).unwrap();
+        let shard = 4;
+        let reservation_id = attempt_reservation_id(&attempt, shard);
+        let object_id = attempt_volume_object_id(&attempt, &group, shard);
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys, &control).unwrap();
+        volumes
+            .reserve_attempt(&control, &attempt, guild, shard.into(), 64)
+            .unwrap();
+        volumes
+            .write_attempt_range(&control, &attempt, shard.into(), 0, &bytes)
+            .unwrap();
+        let reservation_bytes = control
+            .get_record("volume-attempt-reservation", &reservation_id)
+            .unwrap()
+            .unwrap();
+        let mut reservation: AttemptReservationRecord =
+            decode_canonical(&reservation_bytes).unwrap();
+        let receipt = volumes
+            .finish_attempt_upload(&control, &attempt, group, shard.into(), &commitment)
+            .unwrap();
+        let receipt_bytes = control
+            .get_record("volume-attempt-receipt", &object_id)
+            .unwrap()
+            .unwrap();
+        reservation.byte_length = 128;
+        let conflicting = canonical_bytes(&reservation).unwrap();
+        control
+            .put_record("volume-attempt-reservation", &reservation_id, &conflicting)
+            .unwrap();
+        assert!(
+            volumes
+                .finish_attempt_upload(&control, &attempt, group, shard.into(), &commitment)
+                .is_err()
+        );
+        assert_eq!(
+            control
+                .get_record("volume-attempt-reservation", &reservation_id)
+                .unwrap(),
+            Some(conflicting)
+        );
+        assert_eq!(
+            volumes.volumes[&receipt.volume_id]
+                .store
+                .as_ref()
+                .unwrap()
+                .used_bytes()
+                .unwrap(),
+            64
+        );
+        control
+            .put_record(
+                "volume-attempt-reservation",
+                &reservation_id,
+                &reservation_bytes,
+            )
+            .unwrap();
+        volumes.volumes.get_mut(&receipt.volume_id).unwrap().store = None;
+        assert!(
+            volumes
+                .finish_attempt_upload(&control, &attempt, group, shard.into(), &commitment)
+                .is_err()
+        );
+        assert_eq!(
+            control
+                .get_record("volume-attempt-reservation", &reservation_id)
+                .unwrap(),
+            Some(reservation_bytes)
+        );
+        assert_eq!(
+            control
+                .get_record("volume-attempt-receipt", &object_id)
+                .unwrap(),
+            Some(receipt_bytes)
         );
     }
 

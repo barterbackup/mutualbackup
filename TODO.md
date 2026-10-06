@@ -162,6 +162,16 @@ passing tests below apply only to their recorded source and exercised cases.
   and interruption at each publication boundary converge after reopen; the
   evacuated disk can be removed while reads/reconstruction still succeed.
 
+  - [x] Repair interrupted coding-upload reservation retirement. A retry after
+    receipt publication now verifies the physical STAGED/READY shard and the
+    pending reservation identity before conditionally retiring the control
+    reservation. Missing, offline, or conflicting storage preserves the control
+    evidence. Crash/reopen and READY replay fixtures pass; the volume suite
+    passes 39 ordinary tests (one privileged test remains ignored). The packed
+    partial-upload network retry/reopen fixture passes, as do formatting and
+    strict workspace/all-targets Clippy. This fixes a pending-ownership replay
+    boundary; variable-profile disk evacuation remains open.
+
 - [x] **R6 / P2 — Package ordinary Git as an explicit runtime dependency.**
   Implemented: the default Nix runtime wraps the CLI, daemon, native Git command,
   and remote helper with pinned ordinary Git on PATH; the optional alias points
