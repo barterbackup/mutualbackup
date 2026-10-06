@@ -3,11 +3,13 @@
 //! consumer migrates and the shared dataset/history policy is qualified.
 
 use mb_core::{
-    CATALOG_MAX_PAGE_OCCURRENCES, CATALOG_MAX_STREAM_BYTES, CatalogError, CatalogStreamError,
-    canonical_bytes, decode_canonical,
+    CATALOG_MAX_PAGE_OCCURRENCES, CATALOG_MAX_STREAM_BYTES, CatalogError, CatalogPageRef,
+    CatalogScope, CatalogSection, CatalogStreamError, canonical_bytes, decode_canonical,
 };
-#[cfg(target_os = "linux")]
-use mb_core::{CatalogPageRef, CatalogScope};
+use mb_store::{
+    CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogStoreError,
+    ControlStore, DatabaseError,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -20,6 +22,25 @@ use crate::{
 use crate::{GitBlobCatalogRoot, GitObjectCatalogRoot, GitRefCatalogRoot};
 
 pub const GIT_CATALOG_ROOT_BYTES: usize = 4096;
+
+/// Explicit stream roles also define the order of the descriptor's retained
+/// root manifest. Callers stage each role under its own durable intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitCatalogStream {
+    Refs,
+    Objects,
+    Blobs,
+}
+
+impl GitCatalogStream {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Refs => 0,
+            Self::Objects => 1,
+            Self::Blobs => 2,
+        }
+    }
+}
 
 /// This complete root requires authentication in owner-encrypted metadata.
 /// Its three streams share one aggregate metadata/page-occurrence budget.
@@ -66,6 +87,88 @@ impl GitCatalogRoot {
         }
         Ok(root)
     }
+
+    /// Ref/object/blob roots, in `GitCatalogStream` order.
+    pub fn page_roots(&self) -> [CatalogPageRef; 3] {
+        [
+            self.refs.records.page,
+            self.objects.records.page,
+            self.blobs.records.page,
+        ]
+    }
+
+    /// Bind the caller-validated descriptor to exactly its three owned streams.
+    /// This local manifest does not replace signed revision/source authority or
+    /// full graph/blob validation before activation.
+    pub fn as_local_bundle(
+        &self,
+        id: Uuid,
+        intents: [CatalogIntent; 3],
+    ) -> Result<CatalogBundle, CatalogStoreError> {
+        self.validate()?;
+        if intents
+            .iter()
+            .any(|intent| intent.section != CatalogSection::GitGraph)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let bundle = CatalogBundle {
+            id,
+            scope: intents[0].scope,
+            roots: intents
+                .into_iter()
+                .zip(self.page_roots())
+                .map(|(intent, root)| CatalogBundleRoot { intent, root })
+                .collect(),
+            descriptor: canonical_bytes(self)?,
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    pub fn publish_local_catalog(
+        &self,
+        control: &ControlStore,
+        id: Uuid,
+        intents: [CatalogIntent; 3],
+    ) -> Result<(), CatalogStoreError> {
+        control.publish_catalog_bundle(&self.as_local_bundle(id, intents)?)
+    }
+
+    /// Read one consistent local bundle snapshot and reject scope/repository or
+    /// manifest substitution before exposing its typed descriptor. Published is
+    /// a local ownership state; consumers still verify every page they traverse.
+    pub fn load_local_catalog(
+        control: &ControlStore,
+        id: Uuid,
+        expected_scope: CatalogScope,
+        expected_repository: Uuid,
+    ) -> Result<Option<(Self, CatalogBundleState)>, CatalogStoreError> {
+        expected_scope.validate(CatalogSection::GitGraph)?;
+        let Some((bundle, state)) = control.catalog_bundle(id)? else {
+            return Ok(None);
+        };
+        if bundle.scope != expected_scope
+            || bundle.roots.len() != 3
+            || bundle
+                .roots
+                .iter()
+                .any(|member| member.intent.section != CatalogSection::GitGraph)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let root = Self::decode(&bundle.descriptor)?;
+        if root.repository_id != expected_repository
+            || bundle
+                .roots
+                .iter()
+                .zip(root.page_roots())
+                .any(|(member, expected)| member.root != expected)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        Ok(Some((root, state)))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -89,6 +192,17 @@ impl crate::GitBackupDescriptor {
         scope: CatalogScope,
         sink: &mut impl FnMut(CatalogPageRef, Vec<u8>) -> Result<(), E>,
     ) -> Result<GitCatalogRoot, GitCatalogWriteError<E>> {
+        self.write_paged_catalog_streams(scope, &mut |_, reference, bytes| sink(reference, bytes))
+    }
+
+    /// Select a separate sink/intent for each stream while preserving the
+    /// single-sink adapter for existing callers. No complete root is returned
+    /// if any stream fails; publication is a separate atomic bundle operation.
+    pub fn write_paged_catalog_streams<E>(
+        &self,
+        scope: CatalogScope,
+        sink: &mut impl FnMut(GitCatalogStream, CatalogPageRef, Vec<u8>) -> Result<(), E>,
+    ) -> Result<GitCatalogRoot, GitCatalogWriteError<E>> {
         self.validate()?;
         let mut references: Vec<_> = self.refs.iter().collect();
         references.sort_by(|left, right| git_ref_name_order(&left.name, &right.name));
@@ -107,6 +221,7 @@ impl crate::GitBackupDescriptor {
         }
         let mut refs = GitRefCatalogBuilder::new(scope, self.head_branch.as_bytes())
             .map_err(CatalogStreamError::from)?;
+        let mut ref_sink = |reference, bytes| sink(GitCatalogStream::Refs, reference, bytes);
         for reference in references {
             refs.push_ref(
                 &GitRefRecord {
@@ -114,37 +229,39 @@ impl crate::GitBackupDescriptor {
                     name: reference.name.clone(),
                     oid: reference.oid,
                 },
-                sink,
+                &mut ref_sink,
             )?;
         }
-        let refs = refs.finish(sink)?;
+        let refs = refs.finish(&mut ref_sink)?;
         let mut objects: Vec<_> = self.objects.iter().collect();
         objects.sort_by_key(|object| object.oid);
         let mut object_builder =
             GitObjectCatalogBuilder::new(scope).map_err(CatalogStreamError::from)?;
+        let mut object_sink = |reference, bytes| sink(GitCatalogStream::Objects, reference, bytes);
         for object in objects {
             object_builder.push_object(
                 object.oid,
                 object.kind,
                 object.bytes.len() as u64,
                 &mut object.bytes.as_slice(),
-                sink,
+                &mut object_sink,
             )?;
         }
-        let objects = object_builder.finish(sink)?;
+        let objects = object_builder.finish(&mut object_sink)?;
         let mut blobs: Vec<_> = self.blobs.iter().collect();
         blobs.sort_by_key(|blob| blob.oid);
         let mut blob_builder =
             GitBlobCatalogBuilder::new(scope).map_err(CatalogStreamError::from)?;
+        let mut blob_sink = |reference, bytes| sink(GitCatalogStream::Blobs, reference, bytes);
         for blob in blobs {
-            blob_builder.push_blob(blob, sink)?;
+            blob_builder.push_blob(blob, &mut blob_sink)?;
         }
         let root = GitCatalogRoot {
             format_version: 1,
             repository_id: self.repository_id,
             refs,
             objects,
-            blobs: blob_builder.finish(sink)?,
+            blobs: blob_builder.finish(&mut blob_sink)?,
         };
         root.validate().map_err(CatalogStreamError::from)?;
         Ok(root)
@@ -347,52 +464,208 @@ mod tests {
     }
 
     #[test]
-    fn paged_git_catalog_staged_pages_and_complete_root_reopen_in_control_store() {
+    fn paged_git_catalog_published_root_and_stream_ownership_reopen_in_control_store() {
         let directory = tempfile::tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([31; 32]));
         let path = directory.path().join("control.db");
         let control = ControlStore::open(&path, &keys).unwrap();
-        let intent = CatalogIntent {
-            id: Uuid::from_bytes([9; 16]),
+        let intents: [CatalogIntent; 3] = std::array::from_fn(|index| CatalogIntent {
+            id: Uuid::from_bytes([9 + index as u8; 16]),
             scope: scope(),
-            section: mb_core::CatalogSection::GitGraph,
-        };
-        control.begin_catalog(intent).unwrap();
+            section: CatalogSection::GitGraph,
+        });
+        for intent in intents {
+            control.begin_catalog(intent).unwrap();
+        }
+        let bundle_id = Uuid::from_bytes([12; 16]);
         let original = descriptor();
         let root = original
-            .write_paged_catalog(scope(), &mut |reference: CatalogPageRef, bytes: Vec<u8>| {
-                control.stage_catalog_page(intent, reference, &bytes)
+            .write_paged_catalog_streams(scope(), &mut |stream, reference, bytes| {
+                control.stage_catalog_page(intents[stream.index()], reference, &bytes)
             })
             .unwrap();
-        control
-            .put_record(
-                "test-paged-git-root",
-                b"root",
-                &canonical_bytes(&root).unwrap(),
+        assert!(
+            GitCatalogRoot::load_local_catalog(
+                &control,
+                bundle_id,
+                scope(),
+                original.repository_id
             )
+            .unwrap()
+            .is_none()
+        );
+        root.publish_local_catalog(&control, bundle_id, intents)
             .unwrap();
         drop(control);
         let control = ControlStore::open(&path, &keys).unwrap();
-        let root = GitCatalogRoot::decode(
-            &control
-                .get_record("test-paged-git-root", b"root")
-                .unwrap()
-                .unwrap(),
+        let (loaded, state) = GitCatalogRoot::load_local_catalog(
+            &control,
+            bundle_id,
+            scope(),
+            original.repository_id,
         )
+        .unwrap()
         .unwrap();
+        assert_eq!(state, CatalogBundleState::Published);
+        assert_eq!(loaded, root);
+        root.publish_local_catalog(&control, bundle_id, intents)
+            .unwrap();
+        for (intent, page) in intents.into_iter().zip(root.page_roots()) {
+            assert_eq!(
+                control.catalog_intent_state(intent).unwrap(),
+                mb_store::CatalogIntentState::Published(page)
+            );
+            assert!(control.cancel_catalog(intent).is_err());
+            while control.release_catalog_pin(intent).unwrap() {}
+        }
+        assert!(!control.collect_catalog_page().unwrap());
+        assert!(
+            GitCatalogRoot::load_local_catalog(
+                &control,
+                bundle_id,
+                scope(),
+                Uuid::from_bytes([99; 16])
+            )
+            .is_err()
+        );
+        let mut foreign_scope = scope();
+        if let CatalogScope::Dataset {
+            protected_root_id, ..
+        } = &mut foreign_scope
+        {
+            *protected_root_id = Uuid::from_bytes([98; 16]);
+        }
+        assert!(
+            GitCatalogRoot::load_local_catalog(
+                &control,
+                bundle_id,
+                foreign_scope,
+                original.repository_id
+            )
+            .is_err()
+        );
         let restored = restore_small(&root, &mut |reference| {
             control
-                .catalog_page(scope(), intent.section, reference)
+                .catalog_page(scope(), CatalogSection::GitGraph, reference)
                 .map_err(|_| "page read failed")
         });
         assert_eq!(restored.repository_id, original.repository_id);
         assert_eq!(restored.blobs, original.blobs);
+        control.cancel_catalog_bundle(bundle_id).unwrap();
+        for intent in intents {
+            while control.release_catalog_pin(intent).unwrap() {}
+        }
+        while control.collect_catalog_page().unwrap() {}
         assert_eq!(
-            control.catalog_intent_state(intent).unwrap(),
-            mb_store::CatalogIntentState::Building
+            GitCatalogRoot::load_local_catalog(
+                &control,
+                bundle_id,
+                scope(),
+                original.repository_id
+            )
+            .unwrap()
+            .unwrap(),
+            (root, CatalogBundleState::Cancelled)
         );
-        // Keeping the staging intent is deliberate: atomic multi-root/signed
-        // publication and authenticated root-set retention are still required.
+    }
+
+    #[test]
+    fn paged_git_catalog_typed_publication_rejects_manifest_scope_and_role_substitution() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([32; 32]));
+        let control = ControlStore::open(directory.path().join("control.db"), &keys).unwrap();
+        let intents: [CatalogIntent; 3] = std::array::from_fn(|index| CatalogIntent {
+            id: Uuid::from_bytes([20 + index as u8; 16]),
+            scope: scope(),
+            section: CatalogSection::GitGraph,
+        });
+        for intent in intents {
+            control.begin_catalog(intent).unwrap();
+        }
+        let original = descriptor();
+        let root = original
+            .write_paged_catalog_streams(scope(), &mut |stream, reference, bytes| {
+                control.stage_catalog_page(intents[stream.index()], reference, &bytes)
+            })
+            .unwrap();
+        let id = Uuid::from_bytes([23; 16]);
+        let mut wrong = intents;
+        wrong[1].section = CatalogSection::FileMetadata;
+        assert!(root.publish_local_catalog(&control, id, wrong).is_err());
+        let mut wrong = intents;
+        wrong[1].scope = CatalogScope::Guild { guild_id: [1; 32] };
+        assert!(root.publish_local_catalog(&control, id, wrong).is_err());
+        let mut wrong = intents;
+        wrong[1] = wrong[0];
+        assert!(root.publish_local_catalog(&control, id, wrong).is_err());
+        assert!(control.catalog_bundle(id).unwrap().is_none());
+        // The generic store intentionally treats descriptor bytes as opaque.
+        // Typed loads must reject a caller-supplied role order mismatch even
+        // when each individual intent/root pair is valid and durable.
+        let mut bundle = root.as_local_bundle(id, intents).unwrap();
+        bundle.roots.swap(0, 1);
+        control.publish_catalog_bundle(&bundle).unwrap();
+        assert!(
+            GitCatalogRoot::load_local_catalog(&control, id, scope(), original.repository_id)
+                .is_err()
+        );
+        control.cancel_catalog_bundle(id).unwrap();
+    }
+
+    #[test]
+    fn paged_git_catalog_interrupted_streams_have_no_published_bundle_and_cancel_fences_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([33; 32]));
+        let path = directory.path().join("control.db");
+        let control = ControlStore::open(&path, &keys).unwrap();
+        let intents: [CatalogIntent; 3] = std::array::from_fn(|index| CatalogIntent {
+            id: Uuid::from_bytes([30 + index as u8; 16]),
+            scope: scope(),
+            section: CatalogSection::GitGraph,
+        });
+        for intent in intents {
+            control.begin_catalog(intent).unwrap();
+        }
+        let original = descriptor();
+        let id = Uuid::from_bytes([34; 16]);
+        assert!(
+            original
+                .write_paged_catalog_streams(scope(), &mut |stream, reference, bytes| {
+                    if stream == GitCatalogStream::Objects {
+                        return Err("injected interruption");
+                    }
+                    control
+                        .stage_catalog_page(intents[stream.index()], reference, &bytes)
+                        .map_err(|_| "stage failed")
+                })
+                .is_err()
+        );
+        drop(control);
+        let control = ControlStore::open(&path, &keys).unwrap();
+        assert!(
+            GitCatalogRoot::load_local_catalog(&control, id, scope(), original.repository_id)
+                .unwrap()
+                .is_none()
+        );
+        for intent in intents {
+            assert_eq!(
+                control.catalog_intent_state(intent).unwrap(),
+                mb_store::CatalogIntentState::Building
+            );
+            control.cancel_catalog(intent).unwrap();
+        }
+        assert!(
+            original
+                .write_paged_catalog_streams(scope(), &mut |stream, reference, bytes| control
+                    .stage_catalog_page(intents[stream.index()], reference, &bytes))
+                .is_err()
+        );
+        for intent in intents {
+            while control.release_catalog_pin(intent).unwrap() {}
+        }
+        while control.collect_catalog_page().unwrap() {}
+        assert!(control.records("catalog-page-v1").unwrap().is_empty());
+        assert!(control.catalog_bundle(id).unwrap().is_none());
     }
 
     #[test]

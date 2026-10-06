@@ -324,3 +324,24 @@ This is local durable publication, not a signed revision or remote protection.
 The caller must validate its typed descriptor against the manifest of retained
 roots. Typed Git wiring, signed activation, quota reservation, retention policy
 and generation-floor retirement of fencing journals remain open.
+
+Typed Git bundle publication is now wired through `GitCatalogRoot` in
+`crates/mb-git/src/paged_catalog.rs`. `write_paged_catalog_streams` supplies
+explicit ref/object/blob roles so callers stage each stream under its own
+intent. The original single-sink adapter remains compatible. Typed publication
+constructs an exact three-root manifest and canonical descriptor before calling
+the atomic bundle API. Typed reopen checks expected dataset scope and repository
+identity, decodes the bounded descriptor, and compares every ordered role/root
+against the bundle. A valid opaque store bundle with a substituted manifest is
+rejected by the typed loader.
+
+The earlier staging-only reopen fixture now publishes and reopens the complete
+typed bundle, verifies all stream pins, releases surplus pins, restores exact
+metadata/recipes, and cancels/collects it. Two additional fixtures cover ownership
+substitution and an interrupted object stream with no published descriptor,
+followed by cancellation, rejected stale retry and cleanup. All 56 catalog tests
+and 72 ordinary Git tests pass (62 provisioned Git tests remain ignored), with
+formatting and strict workspace/all-targets Clippy. These are local publication
+and compatibility checks; they do not prove daemon capture, signed activation,
+remote protection or seed-only recovery. Those consumers, source-authority joins,
+plaintext blob hashing, shared admission and the 1 TiB qualification remain open.

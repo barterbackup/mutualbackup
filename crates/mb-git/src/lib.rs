@@ -76,7 +76,9 @@ pub use object_catalog::{
     GitObjectCatalogRoot, GitObjectRecord,
 };
 pub use odb::NativeOdb;
-pub use paged_catalog::{GIT_CATALOG_ROOT_BYTES, GitCatalogRoot, GitCatalogWriteError};
+pub use paged_catalog::{
+    GIT_CATALOG_ROOT_BYTES, GitCatalogRoot, GitCatalogStream, GitCatalogWriteError,
+};
 #[cfg(target_os = "linux")]
 pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};
 pub use ref_catalog::{

@@ -257,6 +257,19 @@ passing tests below apply only to their recorded source and exercised cases.
     workspace/all-targets Clippy. Typed Git publication wiring, signed revision
     authority, physical quota and authenticated generation-floor retirement
     remain open.
+  - [x] Wire typed Git roots to durable bundle publication. An explicit
+    ref/object/blob stream selector stages each stream under a separate intent;
+    the existing single-sink adapter stays compatible. Typed publication binds
+    precisely those three roots to the canonical descriptor. Reopen verifies
+    dataset scope, repository identity, role order and exact root references
+    against the bundle before exposing the descriptor. The former staging-only
+    fixture now exercises atomic publication, pin release, exact metadata/recipe
+    recovery and cancellation/GC. Two additional fixtures reject mismatched
+    ownership and demonstrate interruption without publication plus fenced
+    retry/cleanup. All 56 catalog and 72 ordinary Git tests pass (62 provisioned
+    Git tests remain ignored), with formatting and strict workspace/all-targets
+    Clippy. Daemon capture, signed activation, source-authority joins and seed-only
+    recovery still need consumer migration; local publication does not close R2/R3.
   - [ ] Add quota reservations, bounded file/packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
