@@ -41,8 +41,9 @@ pub use database::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogPublicationView,
     CatalogSectorSource, CatalogSourceSweep, CatalogStoreError, CatalogValidatedLink,
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,
-    ObjectAttemptState, PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore,
-    ProtocolRecordRow, ReadyVariableObject, RecoveryShardLocator, VariableParityObject,
+    ObjectAttemptState, PagedCatalogPageSource, PagedCatalogSnapshot, ParityObject,
+    ParityScrubReport, ParityStore, ProtocolRecordRow, ReadyVariableObject, RecoveryShardLocator,
+    VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";

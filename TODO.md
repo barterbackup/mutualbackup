@@ -1036,6 +1036,29 @@ passing tests below apply only to their recorded source and exercised cases.
     distinct cases overall). Formatting and strict locked workspace/all-targets
     Clippy pass. Nineteen provisioned store and eight snapshot cases remain
     ignored; native/topology/platform and real 1 TiB gates were not run here.
+  - [x] Bind and regenerate private catalog page sources under retained revisions.
+    During verified private-root traversal, publish a disk-backed source index
+    keyed by revision and sector in the same writer transaction as all roots.
+    Index and leaf pages retain exact member ownership and signed ciphertext
+    references/commitments; identical pages shared by member roots deduplicate.
+    Explicit revision-scoped reads regenerate encrypted pages and verify both
+    commitments. Repair authenticates recovered ciphertext and rechecks live
+    source identity, metadata and child links under the writer before changing
+    only payload bytes. Cancellation immediately fences reads/repair; one-row
+    cleanup reclaims the derived index after cancellation. No independent legacy
+    recipe or flat head is installed. File/blob source integration, legacy
+    conversion and normal capture/recovery activation remain open.
+    Validation: two new store fixtures and one Node fixture pass. They cover
+    publication/cleanup SQL abort/ignore faults, oversized damaged bindings,
+    shared-page deduplication, shared revision ownership, reopen, missing/corrupt
+    payload repair and cancellation between inspection and repair. A 1,000-
+    directory fixture forces index pages; native and Git-bearing roots exercise
+    regeneration/repair, signed commitments, wrong seed/scope and one-row cleanup.
+    Locked workspace/all-targets build and 25 paged tests pass, plus 115 ordinary
+    store, 30 ordinary snapshot and five native adapter tests (168 distinct cases
+    overall). Formatting and strict locked workspace/all-targets Clippy pass.
+    Nineteen provisioned store and eight snapshot cases remain ignored; native/
+    topology/platform and real 1 TiB qualification were not run for this step.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

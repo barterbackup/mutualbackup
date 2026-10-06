@@ -1394,6 +1394,15 @@ retirement and releases the source after its final owner cancels. No independent
 legacy Inline recipe is created. Private page/file/blob source integration and
 capture/recovery migration remain required before production format activation.
 
+Private page traversal now binds a derived revision/sector source index within
+the root-publication writer transaction. Explicit revision-scoped reads serve
+encrypted index and leaf pages after checking retained member ownership, signed
+source identity and both ciphertext commitments. Recovery repair authenticates
+the page and rechecks its live binding and immutable metadata/child links under
+the writer; cancellation fences this source immediately and index cleanup
+reclaims one row per step. File/blob source adapters, legacy conversion and
+production capture/checkpoint/recovery activation remain required.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

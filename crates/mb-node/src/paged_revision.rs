@@ -197,6 +197,7 @@ impl PagedPrivateMetadata {
                                 view.source(expected.sector.id)?.as_ref() == Some(&expected),
                                 "private page lacks its exact signed source commitment"
                             );
+                            view.bind_private_page_source(member.intent, page, &expected)?;
                             Ok(encoded)
                         })?
                         .is_some()
@@ -313,6 +314,68 @@ impl PagedPrivateMetadata {
             "paged bootstrap owner is cancelled"
         );
         Ok(snapshot.bootstrap)
+    }
+
+    /// Regenerate a private catalog page using the exact retained revision.
+    /// Data/file/blob sectors require their own stable source adapters.
+    pub fn render_local_catalog_page(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        id: uuid::Uuid,
+        sector_id: [u8; 32],
+        expected_scope: CatalogScope,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some((source, encoded)) = control.read_paged_revision_page(id, sector_id)? else {
+            return Ok(None);
+        };
+        Self::open_local_snapshot(keys, &source.catalog, expected_scope)?;
+        let signed = PagedUserRevision::decode_signed(&source.catalog.bundle.descriptor)?;
+        let guild = signed.value.guild_id;
+        let (reference, ciphertext) = source.page.seal_private_page(
+            &keys.guild_content_id_key(&guild),
+            &keys.guild_data_key(&guild),
+            source.intent.scope,
+            source.intent.section,
+            &encoded,
+        )?;
+        ensure!(
+            reference == source.source.sector
+                && merkle_commit(&ciphertext)? == source.source.commitment,
+            "regenerated catalog page differs from its signed source"
+        );
+        Ok(Some(ciphertext))
+    }
+
+    /// Authenticate recovered page ciphertext, then repair its payload only
+    /// if the owning revision and immutable binding remain live under the writer.
+    pub fn repair_local_catalog_page(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        id: uuid::Uuid,
+        sector_id: [u8; 32],
+        expected_scope: CatalogScope,
+        ciphertext: &[u8],
+    ) -> Result<()> {
+        let source = control
+            .paged_revision_page_source(id, sector_id)?
+            .ok_or_else(|| anyhow::anyhow!("paged catalog source is unavailable"))?;
+        Self::open_local_snapshot(keys, &source.catalog, expected_scope)?;
+        let signed = PagedUserRevision::decode_signed(&source.catalog.bundle.descriptor)?;
+        let guild = signed.value.guild_id;
+        ensure!(
+            merkle_commit(ciphertext)? == source.source.commitment,
+            "recovered page differs from its signed Merkle commitment"
+        );
+        let encoded = source.page.open_private_page(
+            &keys.guild_content_id_key(&guild),
+            &keys.guild_data_key(&guild),
+            source.intent.scope,
+            source.intent.section,
+            &source.source.sector,
+            ciphertext,
+        )?;
+        control.repair_paged_revision_page(&source, &encoded)?;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -485,6 +548,19 @@ mod tests {
         SignedRecord<PagedUserRevision>,
         PagedCatalogIntents,
     ) {
+        owned_fixture_with_directories(store, with_git, damage, 0)
+    }
+
+    fn owned_fixture_with_directories(
+        store: &ControlStore,
+        with_git: bool,
+        damage: u8,
+        directories: usize,
+    ) -> (
+        PagedPrivateMetadata,
+        SignedRecord<PagedUserRevision>,
+        PagedCatalogIntents,
+    ) {
         let new_intent = |section| CatalogIntent {
             id: Uuid::new_v4(),
             scope: scope(),
@@ -553,6 +629,19 @@ mod tests {
                         path: path.to_vec(),
                         stat,
                         kind,
+                    },
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        for index in 0..directories {
+            namespace
+                .push(
+                    &mb_core::CatalogFileRecord {
+                        format_version: 1,
+                        path: format!("z-{index:08}-{}", "d".repeat(128)).into_bytes(),
+                        stat,
+                        kind: mb_core::CatalogFileKind::Directory,
                     },
                     &mut sink,
                 )
@@ -696,6 +785,157 @@ mod tests {
             owner: signed.value.owner,
             epoch: signed.value.writer_epoch,
             public_key: signed.value.writer_public_key,
+        }
+    }
+
+    #[test]
+    fn paged_private_page_sources_regenerate_and_repair_all_root_roles_and_index_pages() {
+        for with_git in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (private, signed, intents) =
+                owned_fixture_with_directories(&store, with_git, 0, 1000);
+            assert!(private.native.namespace.records.page.height > 0);
+            private
+                .publish_local_catalog(&store, &keys(), &signed, &writer_fence(&signed), intents)
+                .unwrap();
+            let id = signed.value.revision_id;
+            let bundle = store.paged_revision_catalog(id).unwrap().unwrap().bundle;
+            let mut expected = std::collections::BTreeMap::new();
+            for member in bundle
+                .roots
+                .iter()
+                .filter(|member| member.intent.section.is_private())
+            {
+                let section = member.intent.section;
+                let mut reader =
+                    mb_core::CatalogReader::new(scope(), section, member.root).unwrap();
+                while reader
+                    .next_leaf(&mut |page| -> Result<Vec<u8>> {
+                        let encoded = store.catalog_page(scope(), section, page)?;
+                        let (reference, ciphertext) = page.seal_private_page(
+                            &keys().guild_content_id_key(&[73; 32]),
+                            &keys().guild_data_key(&[73; 32]),
+                            scope(),
+                            section,
+                            &encoded,
+                        )?;
+                        expected.insert(reference.id, (page, ciphertext));
+                        Ok(encoded)
+                    })
+                    .unwrap()
+                    .is_some()
+                {}
+            }
+            assert_eq!(
+                store
+                    .records(&format!("catalog-paged-page-source-v1/{}", id.simple()))
+                    .unwrap()
+                    .len(),
+                expected.len()
+            );
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            for (sector, (page, ciphertext)) in &expected {
+                let render = || {
+                    PagedPrivateMetadata::render_local_catalog_page(
+                        &store,
+                        &keys(),
+                        id,
+                        *sector,
+                        scope(),
+                    )
+                };
+                assert_eq!(render().unwrap(), Some(ciphertext.clone()));
+                assert!(
+                    PagedPrivateMetadata::render_local_catalog_page(
+                        &store,
+                        &KeyMaterial::from_seed(&Seed::from_bytes([1; 32])),
+                        id,
+                        *sector,
+                        scope()
+                    )
+                    .is_err()
+                );
+                let mut wrong_scope = scope();
+                if let CatalogScope::Dataset { guild_id, .. } = &mut wrong_scope {
+                    *guild_id = [1; 32];
+                }
+                assert!(
+                    PagedPrivateMetadata::render_local_catalog_page(
+                        &store,
+                        &keys(),
+                        id,
+                        *sector,
+                        wrong_scope
+                    )
+                    .is_err()
+                );
+                let encoded = store
+                    .get_record("catalog-page-v1", &page.hash)
+                    .unwrap()
+                    .unwrap();
+                let mut damaged = encoded.clone();
+                damaged[0] ^= 1;
+                store
+                    .put_record("catalog-page-v1", &page.hash, &damaged)
+                    .unwrap();
+                assert!(render().is_err());
+                let mut bad_ciphertext = ciphertext.clone();
+                bad_ciphertext[0] ^= 1;
+                assert!(
+                    PagedPrivateMetadata::repair_local_catalog_page(
+                        &store,
+                        &keys(),
+                        id,
+                        *sector,
+                        scope(),
+                        &bad_ciphertext
+                    )
+                    .is_err()
+                );
+                PagedPrivateMetadata::repair_local_catalog_page(
+                    &store,
+                    &keys(),
+                    id,
+                    *sector,
+                    scope(),
+                    ciphertext,
+                )
+                .unwrap();
+                assert_eq!(render().unwrap(), Some(ciphertext.clone()));
+            }
+            store.cancel_paged_revision_catalog(id).unwrap();
+            for (sector, (_, ciphertext)) in &expected {
+                assert!(
+                    PagedPrivateMetadata::render_local_catalog_page(
+                        &store,
+                        &keys(),
+                        id,
+                        *sector,
+                        scope()
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                assert!(
+                    PagedPrivateMetadata::repair_local_catalog_page(
+                        &store,
+                        &keys(),
+                        id,
+                        *sector,
+                        scope(),
+                        ciphertext
+                    )
+                    .is_err()
+                );
+            }
+            let mut released = 0;
+            while store.release_paged_revision_page_source(id).unwrap() {
+                released += 1;
+            }
+            assert_eq!(released, expected.len());
         }
     }
 

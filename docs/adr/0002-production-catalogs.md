@@ -1050,3 +1050,45 @@ workspace/all-targets build and 22 paged tests pass, alongside 113 ordinary stor
 Formatting and strict locked workspace/all-targets Clippy pass. Nineteen
 provisioned store and eight snapshot cases remain ignored; native/topology/
 platform and real 1 TiB qualification were not run for this adapter step.
+
+### Revision-owned private page sources (2026-10-06)
+
+Publication now binds each private index/leaf page to its encrypted sector through
+`CatalogPublicationView::bind_private_page_source`. These derived rows are keyed
+by revision and sector and publish or roll back with all root pins. The binding
+checks private member intent ownership, immutable page metadata and exact signed
+source-index identity. Node creates bindings during authenticated root traversal,
+after deriving each ciphertext reference and Merkle commitment. Identical pages
+under multiple member roots retain one verified member owner and one sector row.
+
+`render_local_catalog_page` requires the retained revision and expected dataset
+scope explicitly. A bounded indexed lookup checks publication, encrypted private
+descriptor/root roles, member ownership and source identity, reads authenticated
+page bytes in that database snapshot, then regenerates ciphertext and checks both
+signed commitments. This avoids scanning retained history to find a sector owner
+and avoids separate legacy Inline or dedicated page-source intent lifetimes.
+
+`repair_local_catalog_page` authenticates recovered ciphertext and decodes its
+scoped page. Under the writer, repair checks the exact live source snapshot,
+immutable metadata and index-child links before updating only the page payload.
+The source descriptor remains readable without payload bytes so missing/corrupt
+pages can be repaired. Cancellation immediately fences source reads and repair;
+`release_paged_revision_page_source` later deletes one derived row per transaction.
+Shared revisions retain their own bindings and root pins independently.
+
+The adapter is deliberately revision-scoped: ordinary ID-only source serving,
+stable file/blob sources, native capture/restore, legacy conversion, checkpoint/
+packing/retention and seed-only recovery activation still require integration.
+It does not advance production heads or qualify the declared 1 TiB target.
+
+Validation: two new store fixtures cover shared-page deduplication, shared
+revision ownership, reopen, missing payload repair, cancellation between read
+and writer repair, bounded cleanup, oversized bindings and SQL abort/ignore
+faults. One Node fixture adds 1,000 directories to force index pages and checks
+native-only and Git-bearing private root regeneration/repair, corrupt payloads
+and ciphertext, wrong seed/scope, cancellation and exact one-row cleanup counts.
+Locked workspace/all-targets build and 25 paged tests pass, alongside 115 ordinary
+store, 30 ordinary snapshot and five native adapter tests (168 distinct cases
+overall). Formatting and strict locked workspace/all-targets Clippy pass.
+Nineteen provisioned store and eight snapshot cases remain ignored; native/
+topology/platform and real 1 TiB qualification were not run for this step.

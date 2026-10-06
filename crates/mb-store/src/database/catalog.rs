@@ -23,7 +23,7 @@ pub use bundle::{
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };
-pub use paged_revision::{CatalogPublicationView, PagedCatalogSnapshot};
+pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCatalogSnapshot};
 pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSectorSource, CatalogSourceSweep};
 
 const INTENT: &str = "catalog-intent-v1";

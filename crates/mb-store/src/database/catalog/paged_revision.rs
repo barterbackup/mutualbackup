@@ -16,12 +16,33 @@ fn bootstrap_pins(id: [u8; 32]) -> String {
     format!("catalog-paged-bootstrap-owner-v1/{}", hex::encode(id))
 }
 
-/// Reads use the publication transaction's exact snapshot and cannot start a
-/// nested transaction or mutate the catalog. The caller verifies typed private
+fn page_sources(id: Uuid) -> String {
+    format!("catalog-paged-page-source-v1/{}", id.simple())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PageSourceRecord {
+    format_version: u16,
+    intent: CatalogIntent,
+    page: CatalogPageRef,
+    source: CatalogSectorRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PagedCatalogPageSource {
+    pub catalog: PagedCatalogSnapshot,
+    pub intent: CatalogIntent,
+    pub page: CatalogPageRef,
+    pub source: CatalogSectorRecord,
+}
+
+/// Reads and source bindings use the publication transaction's exact snapshot
+/// and cannot start a nested transaction. The caller verifies typed private
 /// roots, signed source joins and current writer authority before publication.
 pub struct CatalogPublicationView<'a> {
     connection: &'a Connection,
     manifest: CatalogNativeValidation,
+    bundle: &'a CatalogBundle,
 }
 
 impl CatalogPublicationView<'_> {
@@ -47,6 +68,122 @@ impl CatalogPublicationView<'_> {
     ) -> Result<Option<CatalogSectorRecord>, CatalogStoreError> {
         native_validation::source_record(self.connection, self.manifest.id, sector)
     }
+
+    /// Bind a verified private page while traversing the typed root. This
+    /// immutable index publishes or rolls back with every revision root.
+    pub fn bind_private_page_source(
+        &self,
+        intent: CatalogIntent,
+        page: CatalogPageRef,
+        source: &CatalogSectorRecord,
+    ) -> Result<(), CatalogStoreError> {
+        require_page_owner(self.connection, self.bundle, intent, page)?;
+        read_page(
+            self.connection,
+            PageMetadata {
+                format_version: 1,
+                scope: intent.scope,
+                section: intent.section,
+                reference: page,
+            },
+        )?;
+        if self.source(source.sector.id)?.as_ref() != Some(source) {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let kind = page_sources(self.bundle.id);
+        if let Some(bytes) = bounded_record(
+            self.connection,
+            &kind,
+            &source.sector.id,
+            CATALOG_SECTOR_RECIPE_BYTES,
+        )? {
+            let previous: PageSourceRecord = decode_canonical(&bytes)?;
+            if previous.format_version != 1
+                || previous.page != page
+                || previous.source != *source
+                || canonical_bytes(&previous)? != bytes
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            // Identical pages may occur under several member roots. Retain
+            // one verified member owner rather than duplicate sector rows.
+            require_page_owner(self.connection, self.bundle, previous.intent, previous.page)?;
+            return Ok(());
+        }
+        insert_exact(
+            self.connection,
+            &page_sources(self.bundle.id),
+            &source.sector.id,
+            &canonical_bytes(&PageSourceRecord {
+                format_version: 1,
+                intent,
+                page,
+                source: source.clone(),
+            })?,
+        )
+    }
+}
+
+fn require_page_owner(
+    connection: &Connection,
+    bundle: &CatalogBundle,
+    intent: CatalogIntent,
+    page: CatalogPageRef,
+) -> Result<(), CatalogStoreError> {
+    if !intent.section.is_private()
+        || !bundle.roots.iter().any(|member| member.intent == intent)
+        || metadata(connection, page.hash)?
+            != (PageMetadata {
+                format_version: 1,
+                scope: intent.scope,
+                section: intent.section,
+                reference: page,
+            })
+        || bounded_record(connection, &owners(intent), &page.hash, 0)?.as_deref() != Some(&[])
+        || bounded_record(connection, &pins(page.hash), intent.id.as_bytes(), 0)?.as_deref()
+            != Some(&[])
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(())
+}
+
+fn page_source(
+    connection: &Connection,
+    id: Uuid,
+    sector: [u8; 32],
+) -> Result<Option<PagedCatalogPageSource>, CatalogStoreError> {
+    let Some(catalog) = snapshot(connection, id)? else {
+        return Ok(None);
+    };
+    if catalog.state == CatalogBundleState::Cancelled {
+        return Ok(None);
+    }
+    let Some(bytes) = bounded_record(
+        connection,
+        &page_sources(id),
+        &sector,
+        CATALOG_SECTOR_RECIPE_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let record: PageSourceRecord = decode_canonical(&bytes)?;
+    if record.format_version != 1
+        || record.source.sector.id != sector
+        || canonical_bytes(&record)? != bytes
+        || native_validation::source_record(connection, id, sector)?.as_ref()
+            != Some(&record.source)
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    require_page_owner(connection, &catalog.bundle, record.intent, record.page)?;
+    Ok(Some(PagedCatalogPageSource {
+        catalog,
+        intent: record.intent,
+        page: record.page,
+        source: record.source,
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,6 +365,7 @@ impl ControlStore {
         check(&CatalogPublicationView {
             connection: &transaction,
             manifest,
+            bundle,
         })?;
         bundle::publish_bundle(&transaction, bundle)?;
         native_validation::link_publication(&transaction, bundle.id)?;
@@ -268,6 +406,117 @@ impl ControlStore {
         let result = snapshot(&transaction, id)?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    /// Inspect a page source without requiring its payload, so recovery can
+    /// repair missing bytes. Cancellation fences the source immediately.
+    pub fn paged_revision_page_source(
+        &self,
+        id: Uuid,
+        sector: [u8; 32],
+    ) -> Result<Option<PagedCatalogPageSource>, CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let result = page_source(&transaction, id, sector)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Return the source and authenticated page bytes in the same snapshot.
+    pub fn read_paged_revision_page(
+        &self,
+        id: Uuid,
+        sector: [u8; 32],
+    ) -> Result<Option<(PagedCatalogPageSource, Vec<u8>)>, CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let result = if let Some(source) = page_source(&transaction, id, sector)? {
+            let encoded = read_page(
+                &transaction,
+                PageMetadata {
+                    format_version: 1,
+                    scope: source.intent.scope,
+                    section: source.intent.section,
+                    reference: source.page,
+                },
+            )?;
+            Some((source, encoded))
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Recheck live revision ownership and exact source identity under the
+    /// writer before repairing only the authenticated immutable page payload.
+    pub fn repair_paged_revision_page(
+        &self,
+        expected: &PagedCatalogPageSource,
+        encoded: &[u8],
+    ) -> Result<(), CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if page_source(
+            &transaction,
+            expected.catalog.bundle.id,
+            expected.source.sector.id,
+        )?
+        .as_ref()
+            != Some(expected)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        source::repair_payload(
+            &transaction,
+            PageMetadata {
+                format_version: 1,
+                scope: expected.intent.scope,
+                section: expected.intent.section,
+                reference: expected.page,
+            },
+            encoded,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Release one cancelled revision's source-index row. Root/page pins have
+    /// their own existing bounded cleanup; cancellation journals remain.
+    pub fn release_paged_revision_page_source(&self, id: Uuid) -> Result<bool, CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if snapshot(&transaction, id)?
+            .ok_or(DatabaseError::NotReady)?
+            .state
+            != CatalogBundleState::Cancelled
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let kind = page_sources(id);
+        let key: Option<Option<Vec<u8>>> = transaction
+            .query_row(
+                "SELECT CASE WHEN length(record_id) = 32 THEN record_id END
+             FROM protocol_records WHERE kind = ?1 ORDER BY record_id LIMIT 1",
+                params![kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let removed = if let Some(key) = key {
+            let key = key.ok_or(DatabaseError::Integrity)?;
+            if transaction.execute(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                params![kind, key],
+            )? != 1
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            true
+        } else {
+            false
+        };
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Resolve one live bootstrap owner by its indexed sector namespace. The
@@ -543,8 +792,180 @@ mod tests {
                 }
             }
             assert!(reader.is_complete());
+            for member in bundle
+                .roots
+                .iter()
+                .filter(|member| member.intent.section.is_private())
+            {
+                let mut reader =
+                    mb_core::CatalogReader::new(bundle.scope, member.intent.section, member.root)?;
+                while reader
+                    .next_leaf(&mut |page| -> Result<Vec<u8>, CatalogStoreError> {
+                        let encoded = view.catalog_page(member.intent.section, page)?;
+                        let (sector, ciphertext) = page.seal_private_page(
+                            &keys().guild_content_id_key(&[73; 32]),
+                            &keys().guild_data_key(&[73; 32]),
+                            bundle.scope,
+                            member.intent.section,
+                            &encoded,
+                        )?;
+                        view.bind_private_page_source(
+                            member.intent,
+                            page,
+                            &CatalogSectorRecord {
+                                format_version: 1,
+                                sector,
+                                commitment: merkle_commit(&ciphertext).map_err(ModelError::from)?,
+                            },
+                        )?;
+                        Ok(encoded)
+                    })
+                    .map_err(|error| match error {
+                        mb_core::CatalogStreamError::Catalog(error) => {
+                            CatalogStoreError::from(error)
+                        }
+                        mb_core::CatalogStreamError::Storage(error) => error,
+                    })?
+                    .is_some()
+                {}
+            }
             Ok(())
         })
+    }
+
+    #[test]
+    fn paged_page_sources_reopen_repair_and_retire_with_their_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let (first, bootstrap) = fixture(&store, 1, None);
+        publish(&store, &first, &bootstrap).unwrap();
+        publish(&store, &first, &bootstrap).unwrap();
+        let rows = store.records(&page_sources(first.id)).unwrap();
+        // Empty namespace and recipe share the same page under distinct intents.
+        assert_eq!(rows.len(), 1);
+        let sector: [u8; 32] = rows[0].0.as_slice().try_into().unwrap();
+        let (source, encoded) = store
+            .read_paged_revision_page(first.id, sector)
+            .unwrap()
+            .unwrap();
+        assert!(store.release_paged_revision_page_source(first.id).is_err());
+        let (next, next_bootstrap) = fixture(
+            &store,
+            2,
+            Some(revision(&first).unwrap().value.hash().unwrap()),
+        );
+        publish(&store, &next, &next_bootstrap).unwrap();
+        drop(store);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(
+            store.read_paged_revision_page(first.id, sector).unwrap(),
+            Some((source.clone(), encoded.clone()))
+        );
+        store
+            .connection
+            .execute(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                params![PAGE, source.page.hash],
+            )
+            .unwrap();
+        assert!(store.read_paged_revision_page(first.id, sector).is_err());
+        assert_eq!(
+            store.paged_revision_page_source(first.id, sector).unwrap(),
+            Some(source.clone())
+        );
+        assert!(
+            store
+                .repair_paged_revision_page(&source, b"damaged")
+                .is_err()
+        );
+        store.repair_paged_revision_page(&source, &encoded).unwrap();
+        store.cancel_paged_revision_catalog(first.id).unwrap();
+        assert!(
+            store
+                .paged_revision_page_source(first.id, sector)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.repair_paged_revision_page(&source, &encoded).is_err());
+        assert_eq!(
+            store
+                .read_paged_revision_page(next.id, sector)
+                .unwrap()
+                .unwrap()
+                .1,
+            encoded
+        );
+        assert!(store.release_paged_revision_page_source(first.id).unwrap());
+        assert!(!store.release_paged_revision_page_source(first.id).unwrap());
+        store.cancel_paged_revision_catalog(next.id).unwrap();
+        assert!(store.release_paged_revision_page_source(next.id).unwrap());
+        for bundle in [&first, &next] {
+            while store
+                .release_native_file_validation_record(bundle.id)
+                .unwrap()
+            {}
+            for member in &bundle.roots {
+                while store.release_catalog_pin(member.intent).unwrap() {}
+            }
+        }
+        while store.collect_catalog_page().unwrap() {}
+        assert!(store.records(&page_sources(first.id)).unwrap().is_empty());
+        assert!(store.records(&page_sources(next.id)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn paged_page_source_writes_fail_atomically_and_reads_bound_damaged_rows() {
+        for action in ["ABORT", "IGNORE"] {
+            let rejection = if action == "ABORT" {
+                "RAISE(ABORT, 'injected')"
+            } else {
+                "RAISE(IGNORE)"
+            };
+            let temp = tempfile::tempdir().unwrap();
+            let store =
+                ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+            let (bundle, bootstrap) = fixture(&store, 1, None);
+            store
+                .connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER reject_source BEFORE INSERT ON protocol_records
+                WHEN NEW.kind LIKE 'catalog-paged-page-source-v1/%' BEGIN SELECT {rejection}; END;"
+                ))
+                .unwrap();
+            assert!(publish(&store, &bundle, &bootstrap).is_err());
+            assert!(store.records(&page_sources(bundle.id)).unwrap().is_empty());
+            assert!(store.paged_revision_catalog(bundle.id).unwrap().is_none());
+            store
+                .connection
+                .execute_batch("DROP TRIGGER reject_source")
+                .unwrap();
+            publish(&store, &bundle, &bootstrap).unwrap();
+            let rows = store.records(&page_sources(bundle.id)).unwrap();
+            let sector: [u8; 32] = rows[0].0.as_slice().try_into().unwrap();
+            store
+                .put_record(&page_sources(bundle.id), &sector, &[0; 4096])
+                .unwrap();
+            assert!(store.paged_revision_page_source(bundle.id, sector).is_err());
+            store
+                .put_record(&page_sources(bundle.id), &sector, &rows[0].1)
+                .unwrap();
+            store.cancel_paged_revision_catalog(bundle.id).unwrap();
+            store
+                .connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER reject_source_delete BEFORE DELETE ON protocol_records
+                WHEN OLD.kind LIKE 'catalog-paged-page-source-v1/%' BEGIN SELECT {rejection}; END;"
+                ))
+                .unwrap();
+            assert!(store.release_paged_revision_page_source(bundle.id).is_err());
+            assert_eq!(store.records(&page_sources(bundle.id)).unwrap(), rows);
+            store
+                .connection
+                .execute_batch("DROP TRIGGER reject_source_delete")
+                .unwrap();
+            assert!(store.release_paged_revision_page_source(bundle.id).unwrap());
+        }
     }
 
     #[test]

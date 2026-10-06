@@ -53,6 +53,48 @@ fn delete_exact(connection: &Connection, kind: &str, key: &[u8]) -> Result<(), C
     Ok(())
 }
 
+pub(super) fn repair_payload(
+    connection: &Connection,
+    expected: PageMetadata,
+    encoded: &[u8],
+) -> Result<(), CatalogStoreError> {
+    let contents = expected
+        .reference
+        .verify_page(expected.scope, expected.section, encoded)?;
+    if metadata(connection, expected.reference.hash)? != expected {
+        return Err(DatabaseError::Integrity.into());
+    }
+    if let CatalogPageContents::Index(children) = contents {
+        for child in children {
+            if metadata(connection, child.hash)?
+                != (PageMetadata {
+                    reference: child,
+                    ..expected
+                })
+                || bounded_record(
+                    connection,
+                    &parents(child.hash),
+                    &expected.reference.hash,
+                    0,
+                )?
+                .as_deref()
+                    != Some(&[])
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+        }
+    }
+    if connection.execute(
+        "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+         ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+        params![PAGE, expected.reference.hash, encoded],
+    )? != 1
+    {
+        return Err(DatabaseError::Conflict.into());
+    }
+    Ok(())
+}
+
 impl ControlStore {
     /// Return a bounded source descriptor only while its exact live recipe is
     /// still pinned. Repair must recheck ownership in its writer transaction.
@@ -83,42 +125,16 @@ impl ControlStore {
         if source.recipe != expected_recipe {
             return Err(DatabaseError::Conflict.into());
         }
-        let contents =
-            source
-                .page
-                .verify_page(source.intent.scope, source.intent.section, encoded)?;
-        let expected = PageMetadata {
-            format_version: 1,
-            scope: source.intent.scope,
-            section: source.intent.section,
-            reference: source.page,
-        };
-        if metadata(&transaction, source.page.hash)? != expected {
-            return Err(DatabaseError::Integrity.into());
-        }
-        if let CatalogPageContents::Index(children) = contents {
-            for child in children {
-                if metadata(&transaction, child.hash)?
-                    != (PageMetadata {
-                        reference: child,
-                        ..expected
-                    })
-                    || bounded_record(&transaction, &parents(child.hash), &source.page.hash, 0)?
-                        .as_deref()
-                        != Some(&[])
-                {
-                    return Err(DatabaseError::Integrity.into());
-                }
-            }
-        }
-        if transaction.execute(
-            "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
-             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
-            params![PAGE, source.page.hash, encoded],
-        )? != 1
-        {
-            return Err(DatabaseError::Conflict.into());
-        }
+        repair_payload(
+            &transaction,
+            PageMetadata {
+                format_version: 1,
+                scope: source.intent.scope,
+                section: source.intent.section,
+                reference: source.page,
+            },
+            encoded,
+        )?;
         transaction.commit()?;
         Ok(())
     }
