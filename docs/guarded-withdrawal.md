@@ -73,8 +73,8 @@ encoding and every metadata/data ciphertext sector it references. Each ciphertex
 file must be exactly 64 KiB and named `<sector-id-hex>.bin`. These inputs must come
 from preserved authenticated recovery/export data. The file-input mode accepts previously extracted inputs. The catalog-input mode
 below reads available recovered inputs from the preserved encrypted installation.
-Neither mode downloads missing sectors; recovery beyond the preserved local
-inputs is still required for the complete R1 procedure.
+Catalog mode can use the explicitly selected peers described below; complete
+retained-history recovery and conversion remain required for the R1 procedure.
 
 Create the destination's parent outside the revision and ciphertext input
 directories, then run:
@@ -86,6 +86,29 @@ mutualbackup legacy-export \
   --destination /exports/revision-001 \
   --seed-file /preserved/recovery.txt
 ```
+
+To find revision IDs already available in a preserved installation, run:
+
+```sh
+mutualbackup legacy-list \
+  --data-dir /preserved/installation \
+  --seed-file /preserved/recovery.txt
+```
+
+The JSON report lists this identity's owner/writer-signed revisions from saved
+revision rows, recovery heads and quorum-certified local checkpoints. Matching
+records are deduplicated and show which metadata sources contain them. It reads
+existing encrypted control data without daemon startup, key wrapping, migration,
+journal replay or opening original anchors. Missing ciphertext does not prevent
+metadata inventory. Invalid signatures, conflicting record IDs/scopes or two
+different signed records with one revision ID fail without a partial report.
+
+The report's `signed_format` describes the public revision format, not private
+namespace format 6/7. `retained_history_complete` is false: local metadata cannot
+prove that peer-held history, root/Git catalogs, pins or pending intents have all
+been inventoried. Listing a revision does not prove recoverable ciphertext or
+replacement protection. Preserve those inputs and use its `revision_id` with
+`legacy-export` to verify an individual export.
 
 Alternatively, select a revision from a preserved installation:
 
@@ -395,3 +418,12 @@ Complete core/store/ordinary Node/Git suites are not rerun for this increment.
 
 Directory discovery, complete retained-history conversion, broader variable/
 relay/Tor qualification and the full M6 release gates remain open.
+
+The local inventory increment passes two inventory, five CLI unit tests and the
+real offline CLI fixture (eight targeted functions), locked workspace/all-targets
+build, formatting and strict Clippy. Format-6/7 metadata without ciphertext covers
+wrapped/legacy database keys, distinct retained revisions, duplicate provenance,
+foreign owners and summary-budget boundaries. Invalid scopes/IDs, owner/writer
+signatures, checkpoint certificates/hashes and conflicting valid signed records
+fail while preserving original inputs. The CLI lists revision IDs before export.
+Complete ordinary Node/Git/core/store suites and full M6 gates were not rerun.

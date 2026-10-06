@@ -125,6 +125,17 @@ enum Command {
     },
     /// Restore this identity's latest revision through the recovery-mode daemon.
     Restore { target: PathBuf },
+    /// List authenticated available local revision metadata without starting a daemon.
+    #[cfg(target_os = "linux")]
+    LegacyList {
+        /// Preserved installation inspected read-only.
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "seed_file")]
+        seed_stdin: bool,
+    },
     /// Export an authenticated withdrawn revision without opening a daemon or mounting a view.
     #[cfg(target_os = "linux")]
     #[command(group(clap::ArgGroup::new("legacy_input").required(true).multiple(false).args(["revision_file", "data_dir"])))]
@@ -253,6 +264,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let control_socket = cli.socket.clone().unwrap_or_else(default_control_socket);
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Command::LegacyList {
+            data_dir,
+            seed_file,
+            seed_stdin,
+        } => {
+            let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
+            let seed = derive_seed(&recovery).await?;
+            let report = tokio::task::spawn_blocking(move || {
+                mb_node::inventory_withdrawn_revisions_from_catalog(
+                    &KeyMaterial::from_seed(&seed),
+                    &data_dir,
+                )
+            })
+            .await??;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         #[cfg(target_os = "linux")]
         Command::LegacyExport {
             revision_file,
@@ -1193,4 +1221,37 @@ fn legacy_export_requires_complete_exclusive_input_modes_before_recovery() {
             PathBuf::from("volume-second")
         ]
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_list_requires_catalog_and_excludes_export_arguments() {
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(
+            ["mutualbackup", "legacy-list"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+    };
+    assert!(parse(&[]).is_err());
+    assert!(parse(&["--data-dir", "original"]).is_ok());
+    for args in [
+        vec!["--data-dir", "original", "--destination", "export"],
+        vec![
+            "--data-dir",
+            "original",
+            "--revision-id",
+            "00000000-0000-0000-0000-000000000001",
+        ],
+        vec![
+            "--data-dir",
+            "original",
+            "--seed-file",
+            "seed",
+            "--seed-stdin",
+        ],
+        vec!["--data-dir", "original", "--peer", "invalid"],
+    ] {
+        assert!(parse(&args).is_err());
+    }
 }

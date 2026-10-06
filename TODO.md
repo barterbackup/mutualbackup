@@ -396,6 +396,27 @@ passing tests below apply only to their recorded source and exercised cases.
     targeted functions). Locked workspace/all-targets build, formatting and strict
     Clippy pass. This increment does not rerun complete core/store/ordinary Node/
     Git suites or full M6 platform/release gates.
+  - [x] Add a read-only inventory of available local signed revision metadata
+    through Linux `legacy-list --data-dir PATH`. Bounded scans verify canonical
+    saved revisions, legacy/scoped recovery heads and quorum-certified checkpoint
+    records. Require owner/writer signatures and exact record IDs/scopes/hashes;
+    deduplicate identical signed records and reject conflicting records for one
+    UUID. Return deterministic per-revision metadata and source provenance for
+    the recovering identity without opening ciphertexts or the withdrawn runtime.
+    Bound the complete summary to 32 MiB and fail instead of truncating it.
+    The report explicitly leaves retained-history completeness false and private
+    namespace format/exportability unproven. Full inventory must still reconcile
+    peer history, root/Git catalogs, pins and pending intents; recovery-directory
+    discovery, retained-history conversion and full upgrade/release gates remain.
+    Validation: format-6/7 fixtures with no ciphertext cover wrapped/legacy keys,
+    distinct retained revisions, exact duplicate provenance, foreign owner
+    filtering and summary-budget boundaries. Invalid IDs/scopes, owner/writer
+    signatures, checkpoint signatures/hashes and conflicting valid signed
+    revisions fail without mutation. The actual offline CLI lists authenticated
+    IDs before exporting and preserves catalog/key state. Both inventory tests,
+    all five CLI unit tests and the real CLI fixture pass (eight targeted functions).
+    Locked workspace/all-targets build, formatting and strict Clippy pass.
+    Complete ordinary Node/Git/core/store suites and full M6 gates were not rerun.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

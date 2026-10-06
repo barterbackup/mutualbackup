@@ -1,8 +1,13 @@
 //! Mount-free export of authenticated withdrawn private formats.
 //! Original catalogs and explicitly selected preserved anchors are read-only.
 
+mod inventory;
 mod recovery;
 mod remote;
+pub use inventory::{
+    LegacyRevisionInventory, LegacyRevisionInventoryEntry,
+    inventory_withdrawn_revisions_from_catalog,
+};
 pub use remote::{LegacyExportPeer, export_withdrawn_revision_from_catalog_over_network};
 
 use std::collections::{BTreeMap, BTreeSet};

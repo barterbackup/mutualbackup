@@ -894,6 +894,14 @@ must include the owner; retained history remains exportable after removal. Remov
 members may read checkpoint heads/pages and event evidence, but cannot use this
 path to enroll or authorize mutations. Original-genesis owners and available local
 exports do not require an extra membership-history round trip.
+The read-only `legacy-list` command inventories authenticated available local
+revision metadata from saved revision rows, legacy/scoped recovery heads and
+certified checkpoint records. It deduplicates exact signed records, rejects
+conflicting IDs/scopes/signatures, bounds the summary and reports per-revision
+provenance. It neither reads ciphertext/source anchors nor proves exportability.
+Its completeness flag remains false until remote history and preserved root/Git
+catalogs, pins and pending intents can be reconciled; missing private metadata
+must not be inferred from public signed revision formats.
 Recovery-directory discovery and complete retained-history/upgrade qualification
 remain required.
 

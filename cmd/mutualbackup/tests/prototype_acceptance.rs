@@ -3399,6 +3399,26 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     }
     drop(store);
     let original = fs::read(catalog.join("control.db")).unwrap();
+    let list_args = vec![
+        os("legacy-list"),
+        os("--data-dir"),
+        catalog.clone().into_os_string(),
+        os("--seed-file"),
+        seed_file.clone().into_os_string(),
+    ];
+    let listed = run_output(env!("CARGO_BIN_EXE_mutualbackup"), &list_args, CLI_TIMEOUT).unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let inventory: mb_node::LegacyRevisionInventory =
+        serde_json::from_slice(&listed.stdout).unwrap();
+    assert!(!inventory.retained_history_complete);
+    assert_eq!(inventory.revisions.len(), 1);
+    assert_eq!(inventory.revisions[0].revision_id, revision_id);
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
+    assert!(!catalog.join("control.key").exists());
     let catalog_target = temp.path().join("catalog-export");
     let extra_peer = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
     let extra_endpoint = format!(
