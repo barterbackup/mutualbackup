@@ -17,7 +17,8 @@ use crate::SCHEMA_VERSION;
 mod catalog;
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
-    CatalogBundleState, CatalogIntent, CatalogIntentState, CatalogStoreError,
+    CatalogBundleState, CatalogIntent, CatalogIntentState, CatalogNativeValidation,
+    CatalogNativeValidationState, CatalogStoreError, CatalogValidatedLink,
 };
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";

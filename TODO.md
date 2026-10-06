@@ -305,9 +305,26 @@ passing tests below apply only to their recorded source and exercised cases.
     page boundaries. All 93 core tests and 91 catalog-filtered workspace tests
     pass (two provisioned tests remain ignored), with formatting and strict
     workspace/all-targets Clippy.
-  - [ ] Validate hard-link identities and signed source references. Implement
-    complete legacy private metadata conversion and typed durable publication;
-    migrate native capture/restore consumers before enabling the new format.
+  - [x] Derive disk-backed native hard-link/source joins from verified streams.
+    A scoped manifest binds the native and source roots under one aggregate
+    metadata/page budget. Indexed SQL rows check exact recipe sector references
+    without a dataset-sized memory map. Group attributes and domain-separated
+    recipe hashes preserve duplicate primaries and resolve forward aliases;
+    every alias requires a primary. Lookup rows and completion commit atomically
+    after all authenticated EOFs/joins; failures roll back, immutable retries
+    bind the same manifest, and cancellation fences lookup/retry before bounded
+    cleanup. Five fixtures cover 3,200 multi-page sources/groups, repeated sectors,
+    reopen/cleanup, conflicts, cached-row bounds and SQL abort/ignore injection.
+    The catalog-filtered workspace suite passes 96 tests with two provisioned
+    tests ignored; all 88 ordinary store tests pass (18 provisioned store tests
+    remain ignored), with formatting and strict workspace/all-targets Clippy.
+    This is local metadata validation; caller authentication,
+    ciphertext verification, root ownership, typed publication and runtime
+    scheduling/activation remain required. Validation currently scans complete
+    streams in one writer transaction; incremental update scheduling remains open.
+  - [ ] Implement complete legacy private metadata conversion and typed durable
+    publication; migrate native capture/restore consumers before enabling the
+    new format.
   - [ ] Add quota reservations, bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

@@ -438,3 +438,51 @@ core tests and 91 catalog-filtered workspace tests pass (two provisioned tests
 remain ignored), with formatting and strict workspace/all-targets Clippy.
 These are structural join checks, not payload/retained-history
 capacity qualification or signed activation evidence.
+
+Native hard-link/source joins are implemented in
+`crates/mb-store/src/database/catalog/native_validation.rs`. A validation manifest
+binds dataset scope, the native file container and the public source root, with
+one aggregate metadata/page-occurrence bound across all three streams. Callers
+must authenticate those descriptors before validation; this API derives local
+evidence and does not establish signed authority itself.
+
+Validation first traverses the complete source catalog and writes fixed-size
+rows indexed by sector ID. The joined native reader then checks each recipe's
+exact sector ID, ciphertext root and logical length against that index. Only
+bounded readers, one SQL row, a current file/hash and a bounded fragment are
+held in application memory. Source records not referenced by native file
+payloads remain legitimate: the revision may also own private metadata/Git
+sectors. Ciphertext bytes and range proofs are checked by recovery/protection
+consumers, not by this metadata join.
+
+Hard-link groups are indexed by group ID. Mode, signed seconds/nanoseconds and
+logical length must agree for every primary and alias. A domain-separated
+incremental recipe hash includes sparse offsets, extent boundaries and exact
+sector occurrence order, excluding the namespace file ordinal. Thus historical
+duplicate primaries are accepted only for identical recipes; forward aliases
+resolve to the first primary key encountered in namespace order. Any group
+without a primary rejects at EOF.
+
+One SQLCipher writer transaction commits lookup rows and the immutable completion
+manifest only after all source/native EOFs and joins pass. Errors roll back the
+entire derivation. This currently performs a full validation scan in one writer
+transaction; incremental validation/update scheduling remains part of runtime
+migration. Successful immutable retries use the derived completion record, not
+a new ciphertext or bitrot certification. Lookup reads validate bounded canonical
+rows in a consistent read transaction. Cancellation fences lookups and retries
+before cleanup removes one index row per transaction; fencing journals remain
+until generation-floor retirement is defined. Validation never publishes or
+cancels the page roots or signed revision, and those pages need their own durable
+ownership. Typed publication, legacy conversion and native consumer activation
+remain open.
+
+Five native validation fixtures cover forward aliases, duplicate primaries,
+conflicting attributes/recipe identities, exact source substitutions, incorrect
+source summaries, bounded cached-row reads, reopen and each cleanup boundary,
+and SQL abort/ignore rollback at source/group/completion/cancellation/cleanup
+writes. A multi-page fixture derives 3,200 source and group rows and reopens
+indexed lookups, preserving repeated sector occurrences. The catalog-filtered
+workspace suite passes 96 tests (two provisioned tests remain ignored). All 88
+ordinary store tests pass (18 provisioned store tests remain ignored), with
+formatting and strict workspace/all-targets Clippy. These fixtures establish
+local metadata joins; no real payload or 1 TiB qualification is claimed.

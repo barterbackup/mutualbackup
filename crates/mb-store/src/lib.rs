@@ -35,7 +35,8 @@ pub use anchor::{
 };
 pub use database::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
-    CatalogBundleState, CatalogIntent, CatalogIntentState, CatalogStoreError, CheckpointRow,
+    CatalogBundleState, CatalogIntent, CatalogIntentState, CatalogNativeValidation,
+    CatalogNativeValidationState, CatalogStoreError, CatalogValidatedLink, CheckpointRow,
     ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow, ObjectAttemptState,
     ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow, ReadyVariableObject,
     VariableParityObject,
