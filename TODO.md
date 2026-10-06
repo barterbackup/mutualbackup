@@ -270,7 +270,20 @@ passing tests below apply only to their recorded source and exercised cases.
     Git tests remain ignored), with formatting and strict workspace/all-targets
     Clippy. Daemon capture, signed activation, source-authority joins and seed-only
     recovery still need consumer migration; local publication does not close R2/R3.
-  - [ ] Add quota reservations, bounded file/packing/coding record
+  - [x] Add bounded native file namespace and attribute records. Raw paths are
+    bounded to 8 KiB; component ordering validates declared directory parents,
+    duplicates and file/alias children with two bounded path buffers. Records
+    preserve root/directory/file attributes and hard-link group IDs; file keys
+    equal their record ordinal. Checked counts and file/alias byte totals are
+    verified before returning the final record; encoding, storage and fetch
+    failures fence continuation/publication. Six fixtures include multi-page
+    raw-path round trips and an independent comparison over all 19,683 nested
+    absent/directory/file assignments. All 81 core tests and the workspace
+    catalog-filtered suite pass, with formatting and strict all-target Clippy.
+    This codec covers namespace/attributes; bounded sparse recipes, link/source
+    joins, legacy conversion and runtime capture/restore migration remain open.
+    Complete platform metadata and real 1 TiB qualification remain required.
+  - [ ] Add quota reservations, bounded file-recipe/packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.

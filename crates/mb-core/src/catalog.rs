@@ -8,9 +8,15 @@ use uuid::Uuid;
 
 use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
+mod files;
 mod privacy;
 mod records;
 mod sectors;
+pub use files::{
+    CATALOG_FILE_PATH_BYTES, CATALOG_FILE_RECORD_BYTES, CatalogFileBuilder, CatalogFileKind,
+    CatalogFileReader, CatalogFileRecord, CatalogFileRoot, CatalogFileStat,
+    catalog_file_path_order,
+};
 pub use records::{
     CATALOG_MAX_RECORDS, CATALOG_RECORD_BYTES, CatalogRecordBuilder, CatalogRecordReader,
     CatalogRecordRoot,

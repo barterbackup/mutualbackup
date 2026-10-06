@@ -345,3 +345,36 @@ formatting and strict workspace/all-targets Clippy. These are local publication
 and compatibility checks; they do not prove daemon capture, signed activation,
 remote protection or seed-only recovery. Those consumers, source-authority joins,
 plaintext blob hashing, shared admission and the 1 TiB qualification remain open.
+
+The native file namespace codec is implemented in
+`crates/mb-core/src/catalog/files.rs`. Version-one records bound raw relative
+path bytes to 8 KiB and preserve the current mode and signed seconds/nanoseconds
+fields. Slash-delimited components reject empty, absolute, dot, parent and NUL
+names. The codec preserves non-UTF-8 bytes; runtime capture still needs its own
+platform representability checks and migration. This does not define complete
+ACL/xattr/Windows stream metadata support.
+
+Component ordering keeps a directory subtree contiguous. Validation retains
+only the previous path and active directory path: declared ancestors are prefixes
+of that directory. Missing parents, children of files/aliases, duplicate paths
+and reordering fail without a full namespace map. File keys equal their record
+ordinal, including directories and aliases, and therefore cannot be substituted
+or duplicated within a validated stream. Root attributes, entry-kind counts and
+checked file/alias byte totals are authenticated together; traversal checks the
+summary before yielding the final record and fences errors.
+
+File records deliberately separate namespace/attributes from payload recipes.
+They preserve hard-link group IDs but do not establish group consistency or
+alias ownership. Separate bounded sparse extent/sector records must join against
+these file keys and authenticated source references. Legacy conversion, joined
+validation, durable file-root publication, native capture/restore migration and
+capacity qualification remain required before this format is activated. Byte
+totals count path occurrences, not physical quota or retained dataset usage.
+
+Six fixtures cover multi-page raw-path/attribute/link-identity round trips,
+namespace/schema/encoding/count bounds, overflow and terminal storage/fetch
+failure. An independent directory-set check covers all 19,683 assignments of
+absent/directory/file to a nested namespace. All 81 core tests and the workspace
+catalog-filtered suite pass, with formatting and strict workspace/all-targets
+Clippy. The 1 TiB logical length in a header is a structural fixture, not payload
+capture, retained-history accounting or capacity qualification.
