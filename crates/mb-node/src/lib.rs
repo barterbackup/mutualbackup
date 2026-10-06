@@ -11,6 +11,7 @@ mod legacy_export;
 mod native_catalog;
 mod network;
 mod node;
+mod paged_revision;
 mod snapshot;
 mod source_policy;
 mod volume;
@@ -56,6 +57,7 @@ pub use node::{
     DhtPublicationSet, DhtSequenceFloors, GuildAuditReport, GuildPeer, GuildPhase, GuildSummary,
     LockedDataDir, Node, ProtectionState, RecoveredShards, SnapshotInfo,
 };
+pub use paged_revision::{PAGED_PRIVATE_METADATA_BYTES, PagedPrivateMetadata};
 pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,
     restore_revision_from_source,

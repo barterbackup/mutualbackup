@@ -13,6 +13,7 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `GuildGenesis` | `format_version`, `guild_id`, `coordinator`, `members` | `mutualbackup/guild-genesis/v1`; hash derive-key context `mutualbackup guild genesis v1` |
 | `QuorumGuildGenesis` | `genesis`, `signatures` | certificate of genesis signatures |
 | `UserRevision` | `format_version`, `guild_id`, `protected_root_id`, `cipher_profile`, `revision_id`, `owner`, `writer_epoch`, `writer_public_key`, `writer_signature`, `sequence`, `parent`, `metadata_sectors`, `data_sectors` | stable signature `mutualbackup/user-revision/v3`; writer signature `mutualbackup/writer-revision/v1`; hash derive-key context `mutualbackup user revision body v3` |
+| `PagedUserRevision` (migration codec, format 8) | `format_version`, `guild_id`, `protected_root_id`, `cipher_profile`, `revision_id`, `owner`, `writer_epoch`, `writer_public_key`, `writer_signature`, `sequence`, `parent`, `metadata`, `sources` | `mutualbackup/paged-user-revision/v1`; writer signature `mutualbackup/paged-writer-revision/v1`; hash derive-key context `mutualbackup paged user revision body v1` |
 | `WriterFence` | `owner`, `epoch`, `public_key` | embedded value; epochs for each owner are contiguous and permanently certified by checkpoints |
 | `RevisionTombstone` | `owner`, `protected_root_id`, `through_sequence`, `last_revision_id`, `last_revision_hash`, `retired_at_generation` | embedded retained-prefix high-water mark for one protected-root chain; checkpoint signatures authorize retirement |
 | `SectorRef` | `id`, `root`, `logical_len` | embedded value; sector root is BLAKE3 of exact RS-level bytes |
@@ -34,6 +35,23 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `RecoveryBundle` | `format_version`, `subject`, `publisher`, `sequence`, `expires_at_unix_seconds`, `key_envelope`, `sealed` | `mutualbackup/recovery-bundle/v1`; format 1 has no envelope and uses the seed-derived recovery key, while format 2 carries the current quorum-authenticated recovery-key envelope and seals the locator to that epoch |
 | peer request envelope | format 2: `format_version`, `request_id`, `caller`, `recipient`, `guild_scope`, `issued_at_unix_seconds`, `expires_at_unix_seconds`, `request`; coding path observations carry one canonical bounded active-member target list | `mutualbackup/direct-request/v2` |
 | peer response envelope | format 2: `format_version`, `request_id`, `recipient`, `request_hash`, `result`; coding path observations carry a fresh ordered direct/relay/Tor availability result for every requested target | `mutualbackup/direct-response/v2` |
+
+The paged migration codec bounds the complete signed revision to 2 KiB and
+both signature collections to 64 bytes before peer-controlled allocation.
+Both signatures count toward admission before signing. The shared 8 KiB private
+bootstrap limit applies in both the core envelope and private descriptor decoder.
+`paged-user-revision-v8.postcard.hex` freezes a deterministic 440-byte signed
+codec fixture; it does not establish source availability or protection.
+`metadata` is one `CatalogSectorRecord` (version, encrypted `SectorRef`, Merkle
+commitment); `sources` is the complete typed `CatalogSectorRoot` (record root,
+logical bytes). The streamed sources must include the exact metadata record.
+The encrypted metadata contains `PagedPrivateMetadata` format 8, ordered as
+`format_version`, `native`, optional `git`, bounded to 8 KiB. Private native/Git
+page hashes are never placed in the public revision. Owner and writer signatures
+authenticate the roots; checkpoint authorization of the writer fence, complete
+private/source joins and durable ownership remain separate activation checks.
+Flat revision formats 3–5 and withdrawn private formats 6/7 are unchanged.
+Normal capture/checkpoint/recovery does not yet activate this migration codec.
 
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw

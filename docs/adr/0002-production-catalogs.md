@@ -1,6 +1,6 @@
 # Bounded authenticated catalogs for the 1 TiB release target
 
-Status: page/record framing, typed source records, paged Git container and legacy adapter, local ownership and address/encryption primitives implemented; production admission
+Status: page/record framing, typed source records, paged Git container and legacy adapter, local ownership, address/encryption primitives and a bounded signed paged revision codec implemented; production admission
 remains disabled until the complete R2/R3 acceptance gates pass. Existing revision/checkpoint formats
 and their limits continue to apply.
 
@@ -57,8 +57,9 @@ addressing, encryption and source-sector regeneration must bind the same
 scope and section as page hashing.
 
 New signed revision and checkpoint formats carry section roots and bounded
-summary counts rather than the corresponding flat collections. Their exact
-format numbers will be assigned when the consumers are implemented; withdrawn
+summary counts rather than the corresponding flat collections. The paged
+revision/private migration codec reserves format 8; a new checkpoint version
+will be assigned as its consumers migrate. Withdrawn
 guarded private metadata formats 6/7 must never be reinterpreted as native
 paged catalogs. Existing decoders and signed bytes remain unchanged.
 
@@ -922,3 +923,52 @@ export remedy. Imported lengths participate before anchor creation. Existing
 history remains readable and recovery/import keeps its authenticated sparse
 recipe policy. The full enclosing private/revision budget and paged capture
 pipeline remain required; this interim admission check does not enable 1 TiB.
+
+### Signed paged revision envelope (2026-10-06)
+
+`PagedUserRevision` in `mb-core` supplies bounded signed authority for the
+migration pipeline. Format 8 replaces flat source/commitment vectors with one
+typed public source root and an exact encrypted bootstrap-sector record. The
+complete signed record is bounded to 2 KiB. Owner and current-writer signatures
+are counted together before either signing operation. A shared 8 KiB bootstrap
+limit applies in both core envelope admission and the Node private decoder.
+The immutable `paged-user-revision-v8.postcard.hex` vector records exact field
+order, signatures and domains for a deterministic fixture. The signatures
+bind all identities, sequence/parent and both roots, using distinct paged
+signature/hash domains. Signature decoding caps both collections at 64 bytes
+before allocation; canonical encoding and supported versions remain mandatory.
+Existing flat revision formats 3–5 and withdrawn private formats 6/7 retain
+their original bytes and interpretation.
+
+`PagedRevisionSourceReader` requires the expected guild/owner and checkpoint's
+certified writer fence. It verifies source pages in sector-ID order and requires
+an exact bootstrap reference/commitment match. Completion is false until the
+authenticated end of the whole source stream; a missing bootstrap, substituted
+commitment, corrupt or unavailable tail fails and fences continuation. The
+writer fence still requires checkpoint authorization by its caller.
+
+`PagedPrivateMetadata` in `mb-node` is an owner-encrypted format-8 bootstrap
+descriptor, bounded to 8 KiB, containing typed native namespace/recipe roots and
+optional Git ref/object/blob roots. The private forest shares the existing
+aggregate stream/page-occurrence bounds. Private plaintext hashes remain in
+encrypted metadata. Opening verifies signatures, both ciphertext commitments,
+canonical padding, descriptor geometry and its scoped keyed content address.
+This authenticates root authority; it does not prove that every private page or
+file/blob recipe joins the signed sources, or publish durable root ownership.
+
+The codec is available for consumer migration; ordinary capture, checkpoint,
+packing, retention and seed-only recovery remain on existing formats. Their
+migration, shared retained-history quota and real 1 TiB qualification are required
+before production admission is enabled. No format-8 protection claim is emitted
+by ordinary backup yet.
+
+Validation: five core and three Node fixtures pass, covering immutable signed
+bytes, signature/root/identity substitution, oversized signature declarations,
+inclusive shared bootstrap geometry, fence and exact source joins, unavailable/
+corrupt tails, encrypted native/Git descriptors, both commitments, scoped
+addresses, padding and aggregate structural bounds. All 109 core, 30 ordinary
+snapshot, five native adapter, six paged Git and 24 catalog-store tests pass
+(177 distinct cases including the three new Node fixtures). The new cases and
+complete core suite pass again after final admission hardening. Locked workspace/
+all-targets build, formatting and strict Clippy pass. Eight provisioned snapshot
+cases remain ignored; no full native/topology/platform or real 1 TiB gate ran.

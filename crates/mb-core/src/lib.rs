@@ -39,7 +39,9 @@ pub use catalog::{
     CatalogNativeFileReader, CatalogNativeFileRoot, CatalogPageContents, CatalogPageRef,
     CatalogRangeReader, CatalogReader, CatalogRecordBuilder, CatalogRecordReader,
     CatalogRecordRoot, CatalogScope, CatalogSection, CatalogSectorBuilder, CatalogSectorReader,
-    CatalogSectorRecord, CatalogSectorRoot, CatalogStreamError, catalog_file_path_order,
+    CatalogSectorRecord, CatalogSectorRoot, CatalogStreamError, PAGED_PRIVATE_METADATA_BYTES,
+    PAGED_USER_REVISION_BYTES, PAGED_USER_REVISION_DOMAIN, PAGED_USER_REVISION_VERSION,
+    PagedRevisionSourceReader, PagedUserRevision, catalog_file_path_order,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,

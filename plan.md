@@ -1371,6 +1371,15 @@ recorded in [the production catalog design](docs/adr/0002-production-catalogs.md
 The primitive is qualified independently; it does not change existing runtime
 admission limits or close R2/R3.
 
+The format-8 migration codec now authenticates a bounded public source root and
+one encrypted private root descriptor with distinct owner/writer signatures.
+The private descriptor carries typed native and optional Git roots without
+publishing private plaintext page hashes. Source traversal checks the certified
+writer fence, exact bootstrap source and authenticated EOF. Normal capture,
+checkpoint, packing, retention and seed-only recovery still need to adopt these
+roots together, with complete private/source joins and durable ownership before
+activation. The codec alone changes no production protection claim or capacity.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

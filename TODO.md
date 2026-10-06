@@ -963,6 +963,32 @@ passing tests below apply only to their recorded source and exercised cases.
     strict workspace/all-targets Clippy pass. Ordinary suites retain 18 store
     and 20 Node provisioned cases; the eight snapshot cases ran separately.
     This does not qualify complete seed-only paged recovery or the M6 topology.
+  - [x] Add bounded signed authority for paged revision sources and encrypted
+    native/Git root descriptors. The migration codec uses version 8 and distinct
+    owner/writer/hash domains, preserving flat revisions 3–5 and withdrawn
+    private formats 6/7. The complete signed body is bounded to 2 KiB; both
+    signature decoders cap collections before allocation. One exact encrypted
+    bootstrap source and the typed public source root are signed together.
+    A streamed reader checks guild/owner and the certified writer fence, verifies
+    ordered source pages, joins the exact bootstrap reference/commitment and
+    reports completion only after authenticated EOF. The 8 KiB encrypted private
+    descriptor binds native namespace/recipe and optional Git ref/object/blob
+    roots, sharing an aggregate geometry bound. Opening checks owner/writer,
+    flat ciphertext root, Merkle commitment, padding and scoped content address.
+    This supplies the signed migration envelope, not normal capture/checkpoint
+    activation or complete private/source joins. Existing runtime limits,
+    retained-history quota and the real 1 TiB gate remain open.
+    Validation: five new core and three new Node fixtures pass, including exact
+    immutable signed bytes, owner/writer/root substitution, bounded signature
+    declarations, shared bootstrap limits at ±1 byte, exact source joins,
+    corrupt/unavailable tails, encrypted native/Git roots, both ciphertext
+    commitments, padding and aggregate geometry rejection. All 109 core tests,
+    30 ordinary snapshot, five native adapter, six paged Git and 24 catalog-store
+    tests pass (177 distinct cases including the three new Node fixtures).
+    The eight new cases and all core tests pass again after final shared-limit
+    and signature-admission hardening. Locked workspace/all-targets build,
+    formatting and strict Clippy pass. Eight provisioned snapshot cases remain
+    ignored; native/topology/platform and real 1 TiB gates were not run here.
   - [ ] Implement complete legacy private metadata conversion and migrate
     native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

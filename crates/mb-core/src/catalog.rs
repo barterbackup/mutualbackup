@@ -14,6 +14,7 @@ mod native_files;
 mod privacy;
 mod range;
 mod records;
+mod revision;
 mod sectors;
 mod splice;
 pub use file_recipes::{
@@ -33,6 +34,10 @@ pub use range::CatalogRangeReader;
 pub use records::{
     CATALOG_MAX_RECORDS, CATALOG_RECORD_BYTES, CatalogRecordBuilder, CatalogRecordReader,
     CatalogRecordRoot,
+};
+pub use revision::{
+    PAGED_PRIVATE_METADATA_BYTES, PAGED_USER_REVISION_BYTES, PAGED_USER_REVISION_DOMAIN,
+    PAGED_USER_REVISION_VERSION, PagedRevisionSourceReader, PagedUserRevision,
 };
 pub use sectors::{
     CATALOG_SECTOR_RECORD_BYTES, CatalogSectorBuilder, CatalogSectorReader, CatalogSectorRecord,
