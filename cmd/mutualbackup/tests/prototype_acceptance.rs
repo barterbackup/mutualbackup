@@ -3433,6 +3433,80 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     assert!(!catalog.join("control.key").exists());
+    let area_id = Uuid::new_v4();
+    let anchor_id = Uuid::new_v4();
+    let area = temp.path().join("preserved-area");
+    let anchor = area.join(anchor_id.to_string());
+    fs::create_dir_all(&anchor).unwrap();
+    fs::write(
+        area.join(".mutualbackup-anchor-area-v1"),
+        format!("mutualbackup-anchor-area-v1\n{area_id}\n"),
+    )
+    .unwrap();
+    let payload = anchor.join("payload");
+    fs::write(&payload, b"prefixoffline payload").unwrap();
+    let mut store = mb_store::ControlStore::open(catalog.join("control.db"), &keys).unwrap();
+    store.clear_recovery_shards(&[80; 32]).unwrap();
+    store
+        .stage_recovery_shard(
+            &[80; 32],
+            &guild,
+            &[0; 32],
+            0,
+            &revision.value.metadata_sectors[0].root,
+            &metadata_bytes,
+        )
+        .unwrap();
+    let locator = mb_store::AnchorFileLocator {
+        area: mb_store::AnchorAreaLocator {
+            area_id,
+            path_hint: temp.path().join("missing-old-view"),
+        },
+        anchor_id,
+        relative_path: "payload".into(),
+    };
+    // Historical AnchorFile discriminant 0, followed by its locator and offset.
+    let recipe =
+        canonical_bytes(&(guild, &revision.value.data_sectors[0], 0_u8, locator, 6_u64)).unwrap();
+    store.put_record("local-sector", &data_id, &recipe).unwrap();
+    drop(store);
+    let original = fs::read(catalog.join("control.db")).unwrap();
+    let anchor_target = temp.path().join("anchor-export");
+    let output = run_output(
+        env!("CARGO_BIN_EXE_mutualbackup"),
+        &[
+            os("legacy-export"),
+            os("--data-dir"),
+            catalog.clone().into_os_string(),
+            os("--revision-id"),
+            os(revision_id.to_string()),
+            os("--anchor-area"),
+            area.into_os_string(),
+            os("--destination"),
+            anchor_target.clone().into_os_string(),
+            os("--seed-file"),
+            seed_file.into_os_string(),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(
+            anchor_target
+                .join("namespace")
+                .join(OsString::from_vec(b"payload-\xff".to_vec()))
+        )
+        .unwrap(),
+        b"offline payload"
+    );
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
+    assert_eq!(fs::read(payload).unwrap(), b"prefixoffline payload");
+    assert!(!catalog.join("control.key").exists());
     let invalid = run_output(
         env!("CARGO_BIN_EXE_mutualbackup"),
         &[

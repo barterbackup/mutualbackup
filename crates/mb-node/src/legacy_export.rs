@@ -1,5 +1,5 @@
 //! Offline, mount-free export of authenticated withdrawn private formats.
-//! Original catalogs are inspected read-only; native anchors and views stay unopened.
+//! Original catalogs and explicitly selected preserved anchors are read-only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -20,7 +20,7 @@ use crate::guarded_metadata::{
     GuardedGitPrivateMetadataV7, GuardedPrivateEntryV6, GuardedPrivateMetadataV6,
 };
 use crate::snapshot::{
-    RecoveredGitBlobReader, checked_metadata_length, decrypt_reference,
+    RecoveredGitBlobReader, checked_metadata_length, decrypt_reference, local_sector_for_export,
     recovered_inline_sector_for_export, restore_guarded_entries, validate_restore_revision,
 };
 
@@ -302,6 +302,25 @@ pub fn export_withdrawn_revision_from_catalog(
     revision_id: Uuid,
     target: &Path,
 ) -> Result<LegacyExportReport> {
+    export_withdrawn_revision_from_catalog_with_anchor_areas(
+        keys,
+        data_dir,
+        revision_id,
+        target,
+        &[],
+    )
+}
+
+/// Explicitly selected preserved areas may supply authenticated anchor ranges.
+/// Locator path hints and recorded filesystem IDs are not used to discover or
+/// reopen the original view; relocated copies are checked against signed roots.
+pub fn export_withdrawn_revision_from_catalog_with_anchor_areas(
+    keys: &KeyMaterial,
+    data_dir: &Path,
+    revision_id: Uuid,
+    target: &Path,
+    anchor_areas: &[std::path::PathBuf],
+) -> Result<LegacyExportReport> {
     let data_dir = data_dir.canonicalize()?;
     let parent = target
         .parent()
@@ -381,6 +400,21 @@ pub fn export_withdrawn_revision_from_catalog(
     checked_metadata_length(&revision)?;
     canonical_bytes_bounded(&revision, V1_MAX_CATALOG_BYTES)?;
     validate_restore_revision(keys, revision.value.guild_id, &revision)?;
+    let mut areas = Vec::new();
+    let mut area_ids = BTreeSet::new();
+    for path in anchor_areas {
+        let area = mb_store::PreservedAnchorArea::open(path)
+            .with_context(|| format!("open preserved anchor area {}", path.display()))?;
+        ensure!(
+            !parent.starts_with(path.canonicalize()?),
+            "export destination must be outside preserved anchor areas"
+        );
+        ensure!(
+            area_ids.insert(area.area_id()),
+            "preserved anchor area ID supplied more than once"
+        );
+        areas.push(area);
+    }
     let references: BTreeMap<_, _> = revision
         .value
         .metadata_sectors
@@ -389,11 +423,16 @@ pub fn export_withdrawn_revision_from_catalog(
         .map(|reference| (reference.id, reference))
         .collect();
     let guild = revision.value.guild_id;
+    let load_local = |reference: &mb_core::SectorRef| {
+        if areas.is_empty() {
+            recovered_inline_sector_for_export(&control, keys, guild, reference)
+        } else {
+            local_sector_for_export(&control, keys, guild, reference, &areas)
+        }
+    };
     let mut missing = BTreeSet::new();
     for reference in references.values() {
-        if !recovered_inline_sector_for_export(&control, keys, guild, reference)
-            .is_ok_and(|bytes| bytes.is_some())
-        {
+        if !load_local(reference).is_ok_and(|bytes| bytes.is_some()) {
             missing.insert(reference.root);
         }
     }
@@ -424,12 +463,19 @@ pub fn export_withdrawn_revision_from_catalog(
         let reference = references
             .get(id)
             .context("unsigned legacy sector requested")?;
-        if let Ok(Some(bytes)) =
-            recovered_inline_sector_for_export(&control, keys, guild, reference)
-        {
-            return Ok(bytes);
-        }
-        let locator = recovered.get(&reference.root).context("legacy sector has no available recovered Inline/cache ciphertext; original anchors and journals remain preserved")?;
+        let local_error = match load_local(reference) {
+            Ok(Some(bytes)) => return Ok(bytes),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        let Some(locator) = recovered.get(&reference.root) else {
+            if let Some(error) = local_error {
+                return Err(error).context("legacy source could not be authenticated; original anchors and journals remain preserved");
+            }
+            bail!(
+                "legacy sector has no available recovered Inline/cache ciphertext or authenticated preserved anchor range; original anchors and journals remain preserved"
+            );
+        };
         Ok(control.recovery_shard(
             &locator.checkpoint_hash,
             &guild,
@@ -619,6 +665,211 @@ mod tests {
         };
         descriptor.validate().unwrap();
         descriptor
+    }
+
+    #[test]
+    fn legacy_export_explicit_anchors_preserve_relocated_raw_bytes_and_metadata() {
+        #[derive(Serialize)]
+        enum Source {
+            AnchorFile {
+                locator: mb_store::AnchorFileLocator,
+                offset: u64,
+            },
+            Inline(Vec<u8>),
+            StableAnchorFile {
+                locator: mb_store::StableAnchorFileLocator,
+                offset: u64,
+            },
+        }
+        #[derive(Serialize)]
+        struct Recipe {
+            guild_id: [u8; 32],
+            reference: mb_core::SectorRef,
+            source: Source,
+        }
+        for format in [6, 7] {
+            let (keys, revision, sectors) = fixture(format);
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("original");
+            fs::create_dir(&data).unwrap();
+            let store = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+            store
+                .put_record(
+                    "user-revision",
+                    revision.value.revision_id.as_bytes(),
+                    &canonical_bytes(&revision).unwrap(),
+                )
+                .unwrap();
+            store
+                .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
+                .unwrap();
+            let area_id = Uuid::new_v4();
+            let anchor_id = Uuid::new_v4();
+            let area = temp.path().join("relocated-area");
+            let anchor = area.join(anchor_id.to_string());
+            fs::create_dir_all(&anchor).unwrap();
+            let marker = area.join(".mutualbackup-anchor-area-v1");
+            fs::write(&marker, format!("mutualbackup-anchor-area-v1\n{area_id}\n")).unwrap();
+            let relative = if format == 6 {
+                std::path::PathBuf::from("payload")
+            } else {
+                std::path::PathBuf::from(std::ffi::OsString::from_vec(b"payload-\xfe".to_vec()))
+            };
+            let payload = anchor.join(&relative);
+            fs::write(&payload, b"prefixraw").unwrap();
+            for reference in &revision.value.metadata_sectors {
+                let plaintext = decrypt_reference(
+                    &keys.guild_data_key(&revision.value.guild_id),
+                    reference,
+                    &mut |id| Ok(sectors[id].clone()),
+                )
+                .unwrap();
+                store
+                    .put_record(
+                        "local-sector",
+                        &reference.id,
+                        &canonical_bytes(&Recipe {
+                            guild_id: revision.value.guild_id,
+                            reference: reference.clone(),
+                            source: Source::Inline(plaintext),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let reference = revision.value.data_sectors[0].clone();
+            let source = if format == 6 {
+                Source::AnchorFile {
+                    locator: mb_store::AnchorFileLocator {
+                        area: mb_store::AnchorAreaLocator {
+                            area_id,
+                            path_hint: temp.path().join("absent-old-view"),
+                        },
+                        anchor_id,
+                        relative_path: "payload".into(),
+                    },
+                    offset: 6,
+                }
+            } else {
+                Source::StableAnchorFile {
+                    locator: mb_store::StableAnchorFileLocator {
+                        area: mb_store::StableAnchorAreaLocator {
+                            area_id,
+                            path_hint: temp.path().join("absent-old-view"),
+                            filesystem_id: u64::MAX,
+                            volume_root_hint: temp.path().join("absent-volume"),
+                        },
+                        anchor_id,
+                        relative_path: relative,
+                    },
+                    offset: 6,
+                }
+            };
+            store
+                .put_record(
+                    "local-sector",
+                    &reference.id,
+                    &canonical_bytes(&Recipe {
+                        guild_id: revision.value.guild_id,
+                        reference: reference.clone(),
+                        source,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            drop(store);
+            for path in [&marker, &payload] {
+                File::open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_accessed(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+                    ))
+                    .unwrap();
+            }
+            let before: Vec<_> = [&marker, &payload]
+                .map(|path| fs::metadata(path).unwrap())
+                .into();
+            let original = fs::read(data.join("control.db")).unwrap();
+            let target = temp.path().join("export");
+            assert!(
+                export_withdrawn_revision_from_catalog(
+                    &keys,
+                    &data,
+                    revision.value.revision_id,
+                    &target
+                )
+                .is_err()
+            );
+            assert!(!target.exists());
+            let report = export_withdrawn_revision_from_catalog_with_anchor_areas(
+                &keys,
+                &data,
+                revision.value.revision_id,
+                &target,
+                std::slice::from_ref(&area),
+            )
+            .unwrap();
+            assert_eq!(report.private_format, format);
+            let content = fs::read(
+                target
+                    .join("namespace")
+                    .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec())),
+            )
+            .unwrap();
+            assert_eq!(&content[1000..1003], b"raw");
+            for (path, before) in [&marker, &payload].into_iter().zip(before) {
+                let after = fs::metadata(path).unwrap();
+                assert_eq!(
+                    (
+                        after.ino(),
+                        after.len(),
+                        after.atime(),
+                        after.atime_nsec(),
+                        after.mtime(),
+                        after.mtime_nsec(),
+                        after.ctime(),
+                        after.ctime_nsec()
+                    ),
+                    (
+                        before.ino(),
+                        before.len(),
+                        before.atime(),
+                        before.atime_nsec(),
+                        before.mtime(),
+                        before.mtime_nsec(),
+                        before.ctime(),
+                        before.ctime_nsec()
+                    )
+                );
+            }
+            assert_eq!(fs::read(data.join("control.db")).unwrap(), original);
+            assert!(!data.join("control.key").exists());
+            assert!(
+                export_withdrawn_revision_from_catalog_with_anchor_areas(
+                    &keys,
+                    &data,
+                    revision.value.revision_id,
+                    &area.join("unsafe-export"),
+                    std::slice::from_ref(&area)
+                )
+                .is_err()
+            );
+            assert!(!area.join("unsafe-export").exists());
+            // A damaged original is never exported merely because its locator exists.
+            fs::write(&payload, b"prefixbad").unwrap();
+            let rejected = temp.path().join("rejected");
+            assert!(
+                export_withdrawn_revision_from_catalog_with_anchor_areas(
+                    &keys,
+                    &data,
+                    revision.value.revision_id,
+                    &rejected,
+                    &[area]
+                )
+                .is_err()
+            );
+            assert!(!rejected.exists());
+        }
     }
 
     #[test]

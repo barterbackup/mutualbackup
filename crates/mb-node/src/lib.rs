@@ -28,7 +28,8 @@ pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, Guar
 #[cfg(target_os = "linux")]
 pub use legacy_export::{
     LegacyExportReport, export_withdrawn_revision_from_catalog,
-    export_withdrawn_revision_from_files, export_withdrawn_revision_from_source,
+    export_withdrawn_revision_from_catalog_with_anchor_areas, export_withdrawn_revision_from_files,
+    export_withdrawn_revision_from_source,
 };
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use native_catalog::{NativeCatalogStream, NativeCatalogWriteError};

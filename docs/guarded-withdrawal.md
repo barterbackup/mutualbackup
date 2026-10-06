@@ -102,11 +102,36 @@ legacy seed-derived key. It searches saved revisions, recovery heads and certifi
 checkpoint history, then uses recovered Inline sources or verified cached recovery
 shards. The destination's parent must be outside the installation. It performs no
 key wrapping, schema migration, journal replay, source-hint update or cache
-retirement. It never opens original anchor files or a guarded view. Revisions
-requiring unavailable ciphertext, uncached packed reconstruction or original
-anchor extraction still fail while preserving their original state. The command
+retirement. Without an explicit anchor area, it does not open anchor files.
+Revisions requiring unavailable ciphertext or uncached packed reconstruction
+still fail while preserving their original state. The command
 exports the requested revision only; it does not inventory all retained history.
 File inputs and catalog inputs are mutually exclusive.
+
+If a signed sector is available only in preserved anchor files, supply its area
+explicitly. Repeat `--anchor-area` for distinct areas:
+
+```sh
+mutualbackup legacy-export \
+  --data-dir /preserved/installation \
+  --revision-id REVISION-UUID \
+  --anchor-area /preserved/anchor-area \
+  --destination /exports/revision-001 \
+  --seed-file /preserved/recovery.txt
+```
+
+The directory must carry the original `.mutualbackup-anchor-area-v1` marker.
+The exporter pins that directory and uses the recorded area/anchor IDs and raw
+relative paths. It ignores old path, volume and filesystem hints, allowing a
+relocated preserved copy. Marker and regular-file reads preserve access times;
+missing no-atime permission fails instead of changing them. Symlinks, special
+files, FUSE areas and nested mount crossings are rejected. No mount search,
+guarded view, manifest migration or source-location update is used. Selected
+ranges must re-encrypt to the exact signed sector roots and commitments.
+Corruption, unavailable ranges and offset overflow fail without publishing an
+export. The destination parent must also be outside every supplied anchor area.
+Preserve original guarded ownership markers and pending intents; this reader
+needs no changes to them and does not authorize their cleanup.
 
 The destination must not already exist. Recovery input may instead come from
 `--seed-stdin` or the existing non-echo prompt. No daemon socket or mount is
@@ -136,7 +161,7 @@ claim protection or authorize deletion of original history. If metadata or
 sectors are unavailable, keep the original state and peer-held data for the
 remaining recovery procedure; do not delete backend markers to bypass admission.
 
-Validation for the available-input export: six library fixtures and one actual
+Prior catalog-export baseline (`a4c70d8`): six library fixtures and one actual
 CLI fixture cover formats 6/7, raw paths, sparse files, hard links, recorded
 ownership/modes/times, exact stock Git objects/refs/HEAD and strict Git fsck.
 They reject missing/corrupt/changing inputs, unauthorized and oversized revisions,
@@ -153,5 +178,16 @@ mount/image/loop cleanup, along with formatting and strict workspace/all-targets
 Clippy. Ordinary suites retain 18 store, 62 Git and 20 Node provisioned cases;
 only the eight snapshot cases ran separately. The actual CLI also exercises
 catalog extraction and rejects incomplete catalog flags. This is available-input export
-qualification; it does not close remote/anchor extraction, complete
+qualification; it does not close remote extraction, complete
 retained-history conversion or the full M6 upgrade/source-loss/platform gates.
+
+The explicit-anchor increment is checked by the 105 ordinary store tests, eight
+Node exporter/range fixtures, four CLI unit tests and the actual offline CLI
+fixture. It covers relocated historical and raw-path locators, exact bytes and
+unchanged marker/payload times, pinned-directory replacement, invalid markers,
+symlinks, traversal, special files, unavailable/overflowing ranges and conflicting
+CLI inputs. On disposable Btrfs, eight snapshot regressions and the new nested
+mount rejection pass with verified mount/image/loop cleanup. Formatting and strict
+workspace/all-targets Clippy pass. This increment does not rerun the complete
+ordinary Node/Git suites or qualify all retained history, peer/packed reconstruction
+or the full M6 upgrade/source-loss/platform requirements.

@@ -145,7 +145,8 @@ passing tests below apply only to their recorded source and exercised cases.
     schemas, wrapping keys, updating hints or retiring source records. File and
     catalog input modes are exclusive. Missing/invalid inputs fail before target
     publication. This does not inventory all retained history or recover absent
-    sectors; peer/packed reconstruction and original-anchor extraction remain open.
+    sectors; peer/packed reconstruction and retained-history conversion remain
+    open. Explicit original-anchor reads are implemented below.
     Validation: two new catalog fixtures cover legacy/wrapped keys, legacy/scoped
     recovery heads, certified history, mixed Inline/cache sources, unchanged
     database/key/journal bytes, preserved schema and failure without publication.
@@ -157,6 +158,34 @@ passing tests below apply only to their recorded source and exercised cases.
     cases). Disposable Btrfs mount/image/loop cleanup, formatting and strict locked
     workspace/all-targets Clippy pass. The 18 store, 62 Git and other 12 Node
     provisioned cases were not run by this slice; full M6 release gates remain open.
+  - [x] Read explicitly supplied preserved anchor areas during catalog export.
+    Linux `legacy-export --anchor-area PATH` pins each marked area, rejecting
+    symlinks, special files, FUSE filesystems and nested mount crossings. It
+    preserves marker/payload access times with mandatory no-atime reads and has
+    no discovery, migration, journal replay, source-hint update or retirement.
+    Historical AnchorFile/StableAnchorFile recipes keep their serialized tags;
+    recorded IDs/raw relative paths resolve within selected areas, ignoring old
+    path/volume/filesystem hints so relocated copies can be exported. Bounded
+    ranges must reproduce the signed ciphertext roots/commitments before output
+    publication. The destination parent must be outside the installation and all
+    selected areas. Missing permission/ranges, offset overflow or changed bytes
+    fail while preserving the original installation. Peer/packed reconstruction,
+    retained-history inventory/conversion and full upgrade/recovery gates remain
+    open; explicit area extraction alone does not qualify replacement protection.
+    Validation: formats 6/7 export relocated historical AnchorFile and raw-path
+    StableAnchorFile sources with exact signed bytes and unchanged marker/payload
+    inode, length and atime/mtime/ctime. Two store fixtures cover pinned-area
+    rename/replacement, symlinks, invalid markers, traversal and special files.
+    The real CLI fixture exports a preserved anchor without the old view path.
+    Range and parser fixtures reject overflow/short reads and incomplete/mixed
+    inputs before recovery input. All 105 ordinary store tests, eight targeted
+    Node export/range tests, four CLI unit tests and one real CLI fixture pass.
+    Disposable Btrfs qualification passes eight snapshot regressions and the
+    new nested-mount reader rejection, with verified mount/image/loop cleanup.
+    Formatting and strict locked workspace/all-targets Clippy pass. The shared
+    area-marker reader also caps the actual read against concurrent growth.
+    This increment does not rerun the complete ordinary Node/Git suites,
+    remaining 18 store/12 Node provisioned cases, or full M6 release qualification.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.

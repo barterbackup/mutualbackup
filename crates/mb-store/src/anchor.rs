@@ -1360,6 +1360,97 @@ pub struct AnchorFileLocator {
     pub relative_path: String,
 }
 
+/// An explicitly selected preserved area for offline authenticated export.
+/// It provides no discovery, capture, repair, mutation or ownership migration.
+#[cfg(target_os = "linux")]
+pub struct PreservedAnchorArea {
+    directory: File,
+    area_id: Uuid,
+}
+
+#[cfg(target_os = "linux")]
+impl PreservedAnchorArea {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path.as_ref();
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let relative = absolute
+            .strip_prefix("/")
+            .map_err(|_| AnchorError::UnsafePath)?;
+        validate_relative(relative)?;
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open("/")?;
+        // Pin without opening a directory stream or following any symlinks.
+        // Mount crossings are permitted only while resolving the supplied area;
+        // reads beneath it never cross into another mount, including a view.
+        let directory = open_path_beneath(&root, relative)?;
+        if !directory.metadata()?.is_dir() {
+            return Err(AnchorError::InvalidRoot);
+        }
+        if filesystem_type_for_file(&directory)? == 0x6573_5546 {
+            return Err(AnchorError::UnsupportedSourceOperation(
+                crate::WITHDRAWN_GUARDED_BACKEND,
+            ));
+        }
+        let marker = open_preserved_file(&directory, Path::new(AREA_MARKER))?;
+        let area_id = read_area_marker_contents(marker, path)?;
+        if area_id.is_nil() {
+            return Err(AnchorError::InvalidRoot);
+        }
+        Ok(Self { directory, area_id })
+    }
+
+    pub fn area_id(&self) -> Uuid {
+        self.area_id
+    }
+
+    pub fn open_file(&self, anchor_id: Uuid, relative: &Path) -> Result<File, AnchorError> {
+        if anchor_id.is_nil() {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_relative(relative)?;
+        open_preserved_file(
+            &self.directory,
+            &PathBuf::from(anchor_id.to_string()).join(relative),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_preserved_file(directory: &File, relative: &Path) -> Result<File, AnchorError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    let pinned = open_path_no_xdev_beneath(directory, relative)?;
+    let metadata = pinned.metadata()?;
+    if !metadata.is_file() {
+        return Err(AnchorError::UnsupportedObject(relative.to_path_buf()));
+    }
+    let path =
+        CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd())).expect("numeric descriptor");
+    // No fallback: preserving source atime is part of the offline export policy.
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOATIME,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let actual = file.metadata()?;
+    if metadata.dev() != actual.dev() || metadata.ino() != actual.ino() || !actual.is_file() {
+        return Err(AnchorError::PinnedFileChanged);
+    }
+    Ok(file)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StableAnchorAreaLocator {
     pub area_id: Uuid,
@@ -4154,12 +4245,15 @@ fn read_area_marker(area: &Path) -> Result<Uuid, AnchorError> {
     read_area_marker_contents(File::open(marker)?, area)
 }
 
-fn read_area_marker_contents(mut marker: File, area: &Path) -> Result<Uuid, AnchorError> {
+fn read_area_marker_contents(marker: File, area: &Path) -> Result<Uuid, AnchorError> {
     if marker.metadata()?.len() > 128 {
         return Err(AnchorError::AnchorAreaCollision(area.to_path_buf()));
     }
     let mut bytes = String::new();
-    marker.read_to_string(&mut bytes)?;
+    marker.take(129).read_to_string(&mut bytes)?;
+    if bytes.len() > 128 {
+        return Err(AnchorError::AnchorAreaCollision(area.to_path_buf()));
+    }
     let mut lines = bytes.lines();
     if lines.next() != Some(AREA_MAGIC) {
         return Err(AnchorError::AnchorAreaCollision(area.to_path_buf()));
@@ -5293,6 +5387,162 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_anchor_reads_pin_raw_files_without_changing_source_times() {
+        use std::os::unix::{ffi::OsStringExt, fs::MetadataExt};
+        let temp = tempfile::tempdir().unwrap();
+        let area = temp.path().join("area");
+        let id = Uuid::new_v4();
+        let anchor = Uuid::new_v4();
+        fs::create_dir_all(area.join(anchor.to_string())).unwrap();
+        let marker = area.join(AREA_MARKER);
+        fs::write(&marker, format!("{AREA_MAGIC}\n{id}\n")).unwrap();
+        let relative = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff".to_vec()));
+        let payload = area.join(anchor.to_string()).join(&relative);
+        fs::write(&payload, b"original bytes").unwrap();
+        for path in [&marker, &payload] {
+            File::open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_accessed(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+                ))
+                .unwrap();
+        }
+        let before = [&marker, &payload].map(|path| fs::metadata(path).unwrap());
+        let pinned = PreservedAnchorArea::open(&area).unwrap();
+        assert_eq!(pinned.area_id(), id);
+        // A renamed/replaced user path cannot redirect the pinned area.
+        let moved = temp.path().join("moved");
+        fs::rename(&area, &moved).unwrap();
+        fs::create_dir_all(area.join(anchor.to_string())).unwrap();
+        fs::write(
+            area.join(anchor.to_string()).join(&relative),
+            b"replacement",
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        pinned
+            .open_file(anchor, &relative)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"original bytes");
+        for (path, original) in [
+            moved.join(AREA_MARKER),
+            moved.join(anchor.to_string()).join(relative),
+        ]
+        .into_iter()
+        .zip(before)
+        {
+            let actual = fs::metadata(path).unwrap();
+            assert_eq!(
+                (
+                    actual.ino(),
+                    actual.atime(),
+                    actual.atime_nsec(),
+                    actual.mtime(),
+                    actual.mtime_nsec(),
+                    actual.ctime(),
+                    actual.ctime_nsec()
+                ),
+                (
+                    original.ino(),
+                    original.atime(),
+                    original.atime_nsec(),
+                    original.mtime(),
+                    original.mtime_nsec(),
+                    original.ctime(),
+                    original.ctime_nsec()
+                )
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_anchor_rejects_unsafe_paths_markers_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let area = temp.path().join("area");
+        let id = Uuid::new_v4();
+        let anchor = Uuid::new_v4();
+        let captured = area.join(anchor.to_string());
+        fs::create_dir_all(&captured).unwrap();
+        let marker = area.join(AREA_MARKER);
+        fs::write(&marker, format!("{AREA_MAGIC}\n{id}\n")).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"keep").unwrap();
+        symlink(&outside, captured.join("link")).unwrap();
+        symlink(temp.path(), captured.join("parent")).unwrap();
+        fs::create_dir(captured.join("directory")).unwrap();
+        let fifo = CString::new(captured.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let pinned = PreservedAnchorArea::open(&area).unwrap();
+        for path in [
+            "link",
+            "parent/outside",
+            "directory",
+            "fifo",
+            "../outside",
+            "/etc/passwd",
+            "",
+        ] {
+            assert!(pinned.open_file(anchor, Path::new(path)).is_err(), "{path}");
+        }
+        assert!(pinned.open_file(Uuid::nil(), Path::new("link")).is_err());
+        let linked_area = temp.path().join("linked");
+        symlink(&area, &linked_area).unwrap();
+        assert!(PreservedAnchorArea::open(&linked_area).is_err());
+        let parent_link = temp.path().join("parent-link");
+        symlink(temp.path(), &parent_link).unwrap();
+        assert!(PreservedAnchorArea::open(parent_link.join("area")).is_err());
+        fs::remove_file(&marker).unwrap();
+        symlink(&outside, &marker).unwrap();
+        assert!(PreservedAnchorArea::open(&area).is_err());
+        fs::remove_file(&marker).unwrap();
+        for bytes in [
+            vec![0; 129],
+            format!("{AREA_MAGIC}\n{}\n", Uuid::nil()).into_bytes(),
+            b"invalid marker".to_vec(),
+        ] {
+            fs::write(&marker, bytes).unwrap();
+            assert!(PreservedAnchorArea::open(&area).is_err());
+        }
+        assert_eq!(fs::read(outside).unwrap(), b"keep");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem and bind mounts"]
+    fn preserved_anchor_rejects_nested_mounts_without_reading_external_data() {
+        let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        let temp = tempfile::tempdir_in(root).unwrap();
+        let area = temp.path().join("area");
+        let anchor = Uuid::new_v4();
+        let target = area.join(anchor.to_string()).join("mounted");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            area.join(AREA_MARKER),
+            format!("{AREA_MAGIC}\n{}\n", Uuid::new_v4()),
+        )
+        .unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("payload"), b"external bytes").unwrap();
+        let pinned = PreservedAnchorArea::open(&area).unwrap();
+        bind_mount(&external, &target);
+        let result = pinned.open_file(anchor, Path::new("mounted/payload"));
+        unmount(&target);
+        assert!(
+            matches!(result, Err(AnchorError::Io(error)) if error.raw_os_error() == Some(libc::EXDEV))
+        );
+        assert_eq!(
+            fs::read(external.join("payload")).unwrap(),
+            b"external bytes"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

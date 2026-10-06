@@ -139,6 +139,9 @@ enum Command {
         data_dir: Option<PathBuf>,
         #[arg(long, requires = "data_dir", conflicts_with = "revision_file")]
         revision_id: Option<Uuid>,
+        /// Explicit preserved anchor area; repeat for multiple areas. No mount discovery.
+        #[arg(long, requires = "data_dir", conflicts_with_all = ["revision_file", "sectors_dir"])]
+        anchor_area: Vec<PathBuf>,
         /// New export package outside the input directories; parent must exist.
         #[arg(long)]
         destination: PathBuf,
@@ -250,6 +253,7 @@ async fn main() -> Result<()> {
             sectors_dir,
             data_dir,
             revision_id,
+            anchor_area,
             destination,
             seed_file,
             seed_stdin,
@@ -268,11 +272,12 @@ async fn main() -> Result<()> {
                         )
                     }
                     (None, None, Some(data), Some(id)) => {
-                        mb_node::export_withdrawn_revision_from_catalog(
+                        mb_node::export_withdrawn_revision_from_catalog_with_anchor_areas(
                             &keys,
                             &data,
                             id,
                             &destination,
+                            &anchor_area,
                         )
                     }
                     _ => bail!("select revision-file/sectors-dir or data-dir/revision-id inputs"),
@@ -1043,4 +1048,62 @@ mod tests {
             );
         }
     }
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_export_requires_complete_exclusive_input_modes_before_recovery() {
+    let id = "00000000-0000-0000-0000-000000000001";
+    let prefix = ["mutualbackup", "legacy-export", "--destination", "export"];
+    let parse = |args: &[&str]| Cli::try_parse_from(prefix.into_iter().chain(args.iter().copied()));
+    for args in [
+        vec![],
+        vec!["--revision-file", "revision"],
+        vec!["--sectors-dir", "sectors"],
+        vec!["--data-dir", "original"],
+        vec!["--revision-id", id],
+        vec!["--anchor-area", "area"],
+        vec![
+            "--revision-file",
+            "revision",
+            "--sectors-dir",
+            "sectors",
+            "--anchor-area",
+            "area",
+        ],
+        vec![
+            "--revision-file",
+            "revision",
+            "--sectors-dir",
+            "sectors",
+            "--data-dir",
+            "original",
+            "--revision-id",
+            id,
+        ],
+    ] {
+        assert!(
+            parse(&args).is_err(),
+            "accepted incomplete/conflicting inputs: {args:?}"
+        );
+    }
+    assert!(parse(&["--revision-file", "revision", "--sectors-dir", "sectors"]).is_ok());
+    assert!(parse(&["--data-dir", "original", "--revision-id", id]).is_ok());
+    let cli = parse(&[
+        "--data-dir",
+        "original",
+        "--revision-id",
+        id,
+        "--anchor-area",
+        "first",
+        "--anchor-area",
+        "second",
+    ])
+    .unwrap();
+    let Command::LegacyExport { anchor_area, .. } = cli.command else {
+        panic!("wrong command");
+    };
+    assert_eq!(
+        anchor_area,
+        vec![PathBuf::from("first"), PathBuf::from("second")]
+    );
 }

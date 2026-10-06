@@ -9,6 +9,8 @@ mod database;
 mod source;
 
 #[cfg(target_os = "linux")]
+pub use anchor::PreservedAnchorArea;
+#[cfg(target_os = "linux")]
 pub use anchor::raw_path_bytes;
 #[cfg(target_os = "linux")]
 pub use anchor::raw_path_bytes_option;

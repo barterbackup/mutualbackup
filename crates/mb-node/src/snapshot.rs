@@ -2755,14 +2755,25 @@ pub(crate) fn render_sector(
     render_sector_with_hint_update(control, keys, sector_id, expected_guild, true)
 }
 
-/// The offline legacy exporter must never open an old anchor/view or update a
-/// source hint. Only already recovered Inline plaintext is eligible here.
+/// Without explicitly selected areas, only recovered Inline data is eligible.
 #[cfg(target_os = "linux")]
 pub(crate) fn recovered_inline_sector_for_export(
     control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     reference: &SectorRef,
+) -> Result<Option<Vec<u8>>> {
+    local_sector_for_export(control, keys, guild_id, reference, &[])
+}
+
+/// Export sources never discover mounts, open views or update source hints.
+#[cfg(target_os = "linux")]
+pub(crate) fn local_sector_for_export(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    reference: &SectorRef,
+    areas: &[mb_store::PreservedAnchorArea],
 ) -> Result<Option<Vec<u8>>> {
     let Some(encoded) =
         control.get_record_bounded("local-sector", &reference.id, V1_SECTOR_SIZE + 4096)?
@@ -2774,20 +2785,66 @@ pub(crate) fn recovered_inline_sector_for_export(
         recipe.guild_id == guild_id && recipe.reference == *reference,
         "legacy source recipe differs from its signed sector"
     );
-    let LocalPlaintextSource::Inline(bytes) = recipe.source else {
-        return Ok(None);
+    ensure!(
+        reference.logical_len > 0 && reference.logical_len as usize <= V1_SECTOR_SIZE,
+        "invalid legacy source geometry"
+    );
+    let bytes = match recipe.source {
+        LocalPlaintextSource::Inline(bytes) => bytes,
+        LocalPlaintextSource::AnchorFile { locator, offset } => {
+            let Some(area) = areas
+                .iter()
+                .find(|area| area.area_id() == locator.area.area_id)
+            else {
+                return Ok(None);
+            };
+            read_export_anchor(
+                area.open_file(locator.anchor_id, Path::new(&locator.relative_path))?,
+                offset,
+                reference.logical_len,
+            )?
+        }
+        LocalPlaintextSource::StableAnchorFile { locator, offset } => {
+            let Some(area) = areas
+                .iter()
+                .find(|area| area.area_id() == locator.area.area_id)
+            else {
+                return Ok(None);
+            };
+            read_export_anchor(
+                area.open_file(locator.anchor_id, &locator.relative_path)?,
+                offset,
+                reference.logical_len,
+            )?
+        }
+        LocalPlaintextSource::CatalogPage { .. } => return Ok(None),
     };
     ensure!(
         bytes.len() == reference.logical_len as usize && bytes.len() <= V1_SECTOR_SIZE,
-        "legacy Inline source has invalid length"
+        "legacy export source has invalid length"
     );
     let (actual, ciphertext) =
         encrypted_sector(&keys.guild_data_key(&guild_id), reference.id, &bytes)?;
     ensure!(
         actual == *reference,
-        "legacy Inline source differs from its signed root"
+        "legacy export source differs from its signed root"
     );
     Ok(Some(ciphertext))
+}
+
+#[cfg(target_os = "linux")]
+fn read_export_anchor(mut file: File, offset: u64, length: u32) -> Result<Vec<u8>> {
+    let end = offset
+        .checked_add(u64::from(length))
+        .context("legacy anchor range overflow")?;
+    ensure!(
+        end <= file.metadata()?.len() && end <= i64::MAX as u64,
+        "legacy anchor range is unavailable"
+    );
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0; length as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn render_sector_with_hint_update(
@@ -4295,6 +4352,24 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_export_anchor_ranges_reject_short_and_overflowing_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload");
+        fs::write(&path, b"prefixraw").unwrap();
+        assert_eq!(
+            read_export_anchor(File::open(&path).unwrap(), 6, 3).unwrap(),
+            b"raw"
+        );
+        for (offset, length) in [(7, 3), (u64::MAX, 3), (i64::MAX as u64, 3)] {
+            assert!(read_export_anchor(File::open(&path).unwrap(), offset, length).is_err());
+        }
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(7).unwrap();
+        assert!(read_export_anchor(File::open(path).unwrap(), 6, 3).is_err());
+    }
 
     #[test]
     fn private_catalog_page_source_rejects_scope_reference_and_page_substitution() {
