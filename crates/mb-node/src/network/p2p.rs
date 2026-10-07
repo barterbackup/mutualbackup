@@ -34334,8 +34334,13 @@ mod tests {
         let mut nodes = Vec::new();
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
+        let mut owner_directory = Some(Node::lock_data_dir(run_root.join("node-1")).unwrap());
         for (index, seed) in seeds.iter().cloned().enumerate() {
-            let node = Node::open(run_root.join(format!("node-{index}")), seed).unwrap();
+            let node = if index == 1 {
+                Node::open_locked(owner_directory.as_ref().unwrap().clone(), seed).unwrap()
+            } else {
+                Node::open(run_root.join(format!("node-{index}")), seed).unwrap()
+            };
             let node_id = node.keys().node_id();
             let node = Arc::new(Mutex::new(node));
             let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
@@ -34562,7 +34567,7 @@ mod tests {
         std::fs::remove_dir_all(&source).unwrap();
         wipe_owner_payload_areas();
         {
-            let owner = nodes[1].lock().unwrap();
+            let mut owner = nodes[1].lock().unwrap();
             // Force reconstruction from peers: control ownership survives,
             // while local packed caches, recovery downloads and READY payloads
             // are gone along with the native source and anchor areas.
@@ -34581,6 +34586,11 @@ mod tests {
                     )
                     .unwrap();
             }
+            // Reload all control/volume state through the normal startup path
+            // under the existing exclusive directory claim. The writer mutex
+            // prevents background jobs from observing the replacement halfway.
+            *owner = Node::open_locked(owner_directory.take().unwrap(), seeds[1].clone())
+                .expect("retained migration must reopen after source and anchor loss");
             for reference in &signed.value.data_sectors {
                 assert!(
                     owner
@@ -34589,9 +34599,7 @@ mod tests {
                 );
             }
         }
-        eprintln!(
-            "native Git retained migration: source and anchors erased with control preserved"
-        );
+        eprintln!("native Git retained migration: source and anchors erased; control reopened");
         tokio::time::timeout(
             Duration::from_secs(180),
             restore_snapshot_with_p2p(
