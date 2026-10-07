@@ -20,6 +20,14 @@ exact Git bytes, recoverable retention/prune, seed-only recovery where promised,
 and versioned local/wire compatibility as production requirements. Historical
 passing tests below apply only to their recorded source and exercised cases.
 
+Source review on 2026-10-07 through `5f8c789` confirms progress toward the
+capacity/recovery gates, with two open R3 corrections recorded below as
+`R3-MIGRATION-RECOVERY` and `R3-DISCOVERY-RESTART`. Prioritize their correction
+and an end-to-end retained-migration/source-loss recovery slice before exposing
+migration. Milestone 6 remains open, including the existing R1/R2/R3/R5/R7 and
+native platform gates. This review used source inspection only; it ran no builds,
+tests, daemons or runtime probes and supplies no new runtime qualification.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -1262,6 +1270,26 @@ passing tests below apply only to their recorded source and exercised cases.
     Btrfs fixtures; locked all-targets build, formatting and strict Clippy pass.
     Details and validation are recorded in ADR 0002. Full dataset/history quotas, other filesystem
     writers, scheduling and other platforms remain separate production gates.
+  - [ ] **R3-MIGRATION-RECOVERY / P2 — Preserve ordinary legacy recovery after
+    explicit retained migration.** Source review through `5f8c789` found that
+    migration retains the original flat head and data-sector IDs, but adds paged
+    ownership that intercepts ordinary snapshot repair. If the source anchor is
+    lost while the control catalog survives, network restore can reconstruct
+    authenticated ciphertext and still fail: the Data branch in
+    `crates/mb-node/src/snapshot.rs::install_recovered_sector_recipe` calls
+    `render_data_source` against the missing original anchor. The separate
+    `replace_local_data_source` API has no production recovery caller. This
+    requires the explicit Node/library migration API; unmigrated backups are
+    unaffected. Integrate verified stable-anchor replacement and atomic retained
+    ownership transfer, or preserve ordinary flat recovery until that integration
+    exists, without weakening authentication, generation fences or pin ownership.
+    Resolve this coexistence blocker before exposing migration.
+    Acceptance (pending): protect a flat native/Git revision, retain its paged
+    successor, lose the source/anchor while preserving control state, and restore
+    the original revision through ordinary peer recovery. Verify exact bytes,
+    source replacement and shared-owner pins across interruption/reopen/retry;
+    reject corrupt recovery bytes and stale replacement attempts. Source-only
+    finding; no corrective implementation or runtime validation yet.
   - [ ] Complete legacy retained-revision migration through normal native
     capture/restore, checkpoint/retention and seed-only consumers before
     enabling the new format.
@@ -1300,8 +1328,9 @@ passing tests below apply only to their recorded source and exercised cases.
     stable-source serving. Raw directory cookies reopen only after filesystem,
     inode and directory-change fences pass. A 576 KiB cursor cap and 32-job quota
     bound local work/state; attempt/generation CAS rejects stale publishers.
-    Filesystem work stays outside the SQL writer. Changed namespaces restart
-    safely; new mount roots are queued before absence. Verified hint publication
+    Filesystem work stays outside the SQL writer. Directory-frame changes restart
+    safely; candidate disappearance remains open under R3-DISCOVERY-RESTART.
+    New mount roots are queued before absence. Verified hint publication
     and cursor retirement share a fenced transaction. Read-only calls retain
     their nonmutating behavior; other filesystems retain process-local fallback.
     Validation and native qualification are recorded in ADR 0002.
@@ -1330,6 +1359,23 @@ passing tests below apply only to their recorded source and exercised cases.
     fences reject stale publishers across reset/completion and process reopen,
     including absent-to-present-to-absent races. Git maintenance avoids intent
     replay and backend re-probing/rebinding. Validation is recorded in ADR 0002.
+  - [ ] **R3-DISCOVERY-RESTART / P2 — Restart durable scans when a saved candidate
+    disappears.** Source review through `5f8c789` found that candidate publication
+    in `crates/mb-store/src/anchor/discovery.rs::Scan::advance` propagates
+    `PinnedDirectory::open` failures directly. Moving a candidate inside an
+    already-scanned subtree can leave the remaining directory fences unchanged;
+    reopening the saved candidate then returns `Io(NotFound)`. The database
+    discovery loop restarts only on `SourceChanged`, so retries and process
+    restarts keep loading the same stale cursor and block dependent operations.
+    Explicit `source-scan reset` is the current workaround. Apply the existing
+    missing/replaced-path error mapping to candidate reopens so namespace changes
+    restart bounded discovery while unrelated I/O errors still surface.
+    Acceptance (pending): persist a candidate after finishing its parent subtree
+    while a large sibling scan remains active, move the candidate within the
+    completed subtree, reopen the catalog and rediscover it through bounded
+    retries without reset. Retain replaced-inode/marker rejection and reset/CAS
+    fencing. Source-only finding; no corrective implementation or runtime
+    validation yet.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
     progress to remaining standalone capture/recovery and best-effort cleanup
     call paths; complete consumer lifecycle qualification;

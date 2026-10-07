@@ -1315,7 +1315,7 @@ uses that same live node rather than a parallel replacement. Pause for a focused
 source, runtime, security, and usability review at every gate before committing
 the next milestone's detailed scope.
 
-**Current position (2026-10-05):** Milestones 0 through 5 have recorded passing
+**Current position (2026-10-07):** Milestones 0 through 5 have recorded passing
 gates; Milestone 6 remains open. The accepted direction removes FUSE-backed
 guarded capture and Git integration. Prior milestone passes do not close the
 new non-FUSE production findings below. Continue native Git, source-backend,
@@ -1529,6 +1529,42 @@ and best-effort cleanup integration, operational retry/backoff, other
 filesystem/platform qualification,
 full physical lifecycle and real 1 TiB dataset/history qualification remain
 required.
+
+The 2026-10-07 source-only review through `5f8c789` confirms progress on R3 but
+leaves two recovery corrections open:
+
+- **R3-MIGRATION-RECOVERY:** Explicit Node/library retained migration shares
+  the original legacy data-sector IDs. With `control.db` retained after anchor
+  loss, ordinary network snapshot repair can reconstruct authenticated
+  ciphertext but its Data installer still calls `render_data_source` against
+  the missing original anchor (`crates/mb-node/src/snapshot.rs`), blocking the
+  original flat snapshot restore. Unmigrated backups are unaffected. Connect
+  verified stable-anchor replacement to recovered-data installation before
+  exposing migration, preserving authentication, generation fencing and atomic
+  anchor-pin transfer. Require an end-to-end migration/source-loss regression
+  that restores the original flat snapshot from peers after reopen, plus retry
+  and stale-replacement coverage.
+- **R3-DISCOVERY-RESTART:** Reopening a saved relocation candidate with
+  `PinnedDirectory::open` can return raw `Io(NotFound)` in
+  `crates/mb-store/src/anchor/discovery.rs`. If that candidate moves within an
+  already-scanned subtree while sibling traversal remains active, the remaining
+  directory fences can stay unchanged. Durable retry reloads the same stale
+  cursor because `crates/mb-store/src/database/anchor_discovery.rs` restarts only
+  on `SourceChanged`. Map missing/replaced candidate opens to `SourceChanged`
+  while preserving replacement identity fencing. Cover a saved candidate,
+  completed parent subtree, active sibling traversal, candidate move and
+  database reopen/retry without explicit reset, including a replaced-path case.
+
+Prioritize this end-to-end migration/source-loss recovery slice next. Milestone 6
+remains open for these R3 corrections, normal paged capture/packing/checkpoint/
+retention and seed-only recovery, shared admission limits and quotas, and real
+**1 TiB including retained history** qualification. Preserve the remaining R1
+legacy upgrade/export, R2 capacity, R5 topology/signature progress, R7 exact
+release-artifact and native-platform gates. The review identified no other severe
+regression in the inspected publication, native restore, Git graph validation,
+scratch allocation, coding bounds or atomic cache-write paths. It ran no builds,
+tests or runtime probes; existing validation remains historical evidence for
+the source it exercised.
 
 ### Historical implementation and validation record (before scope correction)
 
