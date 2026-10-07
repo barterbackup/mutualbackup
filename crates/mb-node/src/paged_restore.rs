@@ -13,7 +13,9 @@ use mb_core::{
     CatalogNativeFileReader, CatalogScope, CatalogSection, KeyMaterial, SectorId,
     canonical_bytes_bounded, decode_canonical, merkle_commit,
 };
-use mb_store::{CatalogBundleState, ControlStore, NativeFileId, PinnedDirectory};
+use mb_store::{
+    CatalogBundleState, ControlStore, NativeFileId, PinnedDirectory, RecordScratchStore,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -21,6 +23,16 @@ use crate::PagedPrivateMetadata;
 use crate::snapshot::{decrypt_reference, native_id_for_file, set_metadata_durable};
 
 const ENTRY_BYTES: usize = CATALOG_FILE_RECORD_BYTES + 128;
+
+#[cfg(test)]
+thread_local! {
+    static IGNORE_NEXT_INDEX_INSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn ignore_next_restore_index_insert() {
+    IGNORE_NEXT_INDEX_INSERT.with(|flag| flag.set(true));
+}
 
 #[derive(Serialize, Deserialize)]
 struct RestoredEntry {
@@ -37,19 +49,27 @@ struct RestoredLink {
 
 struct RestoreIndex<'a> {
     control: &'a ControlStore,
+    records: RecordScratchStore,
     kinds: [String; 4],
 }
 
 impl<'a> RestoreIndex<'a> {
-    fn new(control: &'a ControlStore, target: [u8; 32]) -> Self {
-        Self {
+    fn new(control: &'a ControlStore, target: [u8; 32]) -> Result<Self> {
+        let records = RecordScratchStore::new(mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
+        #[cfg(test)]
+        if IGNORE_NEXT_INDEX_INSERT.with(|flag| flag.replace(false)) {
+            records.database_shell_statement("CREATE TEMP TRIGGER ignore_restore_index BEFORE INSERT ON protocol_records WHEN NEW.kind LIKE 'paged-native-restore-entry-v1/%' BEGIN SELECT RAISE(IGNORE); END", false)?;
+        }
+        Ok(Self {
             control,
+            records,
             kinds: ["entry", "directory", "link", "alias"]
                 .map(|role| format!("paged-native-restore-{role}-v1/{}", hex::encode(target))),
-        }
+        })
     }
 
-    fn clear(&self) -> Result<()> {
+    // Reclaim rows left by versions that kept disposable indexes in control.db.
+    fn clear_legacy(&self) -> Result<()> {
         for kind in &self.kinds {
             while let Some((key, bytes)) = self.control.next_record_bounded(
                 kind,
@@ -64,10 +84,10 @@ impl<'a> RestoreIndex<'a> {
     }
 
     fn put(&self, role: usize, key: &[u8], bytes: &[u8]) -> Result<()> {
-        self.control
+        self.records
             .put_record_if_absent(&self.kinds[role], key, bytes)?;
         ensure!(
-            self.control
+            self.records
                 .get_record_bounded(&self.kinds[role], key, ENTRY_BYTES)?
                 .as_deref()
                 == Some(bytes),
@@ -78,7 +98,7 @@ impl<'a> RestoreIndex<'a> {
 
     fn entry(&self, path: &[u8]) -> Result<RestoredEntry> {
         let bytes = self
-            .control
+            .records
             .get_record_bounded(&self.kinds[0], path, ENTRY_BYTES)?
             .context("restored path has no tracked inode")?;
         let entry = Self::decode_entry(&bytes)?;
@@ -113,7 +133,7 @@ impl<'a> RestoreIndex<'a> {
 
     fn link(&self, group: u64) -> Result<Option<RestoredLink>> {
         let Some(bytes) =
-            self.control
+            self.records
                 .get_record_bounded(&self.kinds[2], &group.to_be_bytes(), 128)?
         else {
             return Ok(None);
@@ -192,7 +212,7 @@ impl<'a> RestoreIndex<'a> {
     fn verify_tree(&self, root: &PinnedDirectory) -> Result<()> {
         self.verify_children(root, &[])?;
         let mut after = None;
-        while let Some((key, bytes)) = self.control.next_record_bounded(
+        while let Some((key, bytes)) = self.records.next_record_bounded(
             &self.kinds[0],
             after.as_deref(),
             CATALOG_FILE_PATH_BYTES,
@@ -219,7 +239,7 @@ impl<'a> RestoreIndex<'a> {
 
     fn finish_directories(&self, root: &PinnedDirectory) -> Result<()> {
         let mut after = None;
-        while let Some((key, bytes)) = self.control.next_record_bounded(
+        while let Some((key, bytes)) = self.records.next_record_bounded(
             &self.kinds[1],
             after.as_deref(),
             CATALOG_FILE_PATH_BYTES + 1,
@@ -345,17 +365,26 @@ impl PagedPrivateMetadata {
             3,
             target,
             |root, target_id| {
-                let index = RestoreIndex::new(control, target_id);
-                index.clear()?;
-                private.build_native_restore(keys, revision_id, scope, root, &index, &mut load)?;
-                let current = Self::load_local_catalog(control, keys, revision_id, scope)?
-                    .context("retained root disappeared during restore")?;
-                ensure!(
-                    current.state == CatalogBundleState::Published
-                        && current.revision.value.hash()? == signed_hash,
-                    "retained authority changed during restore"
-                );
-                index.clear()
+                let index = RestoreIndex::new(control, target_id)?;
+                index.clear_legacy()?;
+                index.records.with_record_transaction(|| {
+                    private.build_native_restore(
+                        keys,
+                        revision_id,
+                        scope,
+                        root,
+                        &index,
+                        &mut load,
+                    )?;
+                    let current = Self::load_local_catalog(control, keys, revision_id, scope)?
+                        .context("retained root disappeared during restore")?;
+                    ensure!(
+                        current.state == CatalogBundleState::Published
+                            && current.revision.value.hash()? == signed_hash,
+                        "retained authority changed during restore"
+                    );
+                    Ok(())
+                })
             },
         )
     }
@@ -522,7 +551,7 @@ impl PagedPrivateMetadata {
             file.finish(root, &pool, index)?;
         }
         let mut after = None;
-        while let Some((key, bytes)) = control.next_record_bounded(
+        while let Some((key, bytes)) = index.records.next_record_bounded(
             &index.kinds[3],
             after.as_deref(),
             CATALOG_FILE_PATH_BYTES,
@@ -558,7 +587,9 @@ impl PagedPrivateMetadata {
         }
         let mut after = None;
         while let Some((key, bytes)) =
-            control.next_record_bounded(&index.kinds[2], after.as_deref(), 8, 128)?
+            index
+                .records
+                .next_record_bounded(&index.kinds[2], after.as_deref(), 8, 128)?
         {
             let group = u64::from_be_bytes(
                 key.as_slice()

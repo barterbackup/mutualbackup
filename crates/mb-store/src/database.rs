@@ -17,6 +17,7 @@ use crate::SCHEMA_VERSION;
 #[cfg(target_os = "linux")]
 mod anchor_discovery;
 mod catalog;
+mod scratch;
 #[cfg(target_os = "linux")]
 pub use anchor_discovery::{
     ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage, AnchorDiscoveryJobStatus,
@@ -29,6 +30,7 @@ pub use catalog::{
     PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
     PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
+pub use scratch::RecordScratchStore;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
 const CHECKPOINT_GENERATION_KIND: &str = "guild-checkpoint-generation";
@@ -52,6 +54,8 @@ pub enum DatabaseError {
     Sql(#[from] rusqlite::Error),
     #[error("the linked SQLite library is not SQLCipher")]
     SqlCipherUnavailable,
+    #[error("disk-backed encrypted scratch storage is unavailable or its budget is invalid")]
+    ScratchUnavailable,
     #[error("SQLCipher page HMAC is disabled")]
     HmacDisabled,
     #[error("stored object failed root or length verification")]

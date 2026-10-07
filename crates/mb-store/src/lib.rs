@@ -49,7 +49,8 @@ pub use database::{
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,
     ObjectAttemptState, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
     PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore,
-    ProtocolRecordRow, ReadyVariableObject, RecoveryShardLocator, VariableParityObject,
+    ProtocolRecordRow, ReadyVariableObject, RecordScratchStore, RecoveryShardLocator,
+    VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";

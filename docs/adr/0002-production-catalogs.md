@@ -1929,3 +1929,47 @@ Recorded source/test-binary hashes match after the final runs. The runs leave
 64 provisioned Git cases, 24 store cases and the selected Node native fixture
 ignored. No full Node suite, provisioned filesystems, daemon topology, release
 artifact, other-platform or real 1 TiB qualification ran in this increment.
+
+
+## Disposable encrypted record indexes (2026-10-07)
+
+`RecordScratchStore` uses a keyed unnamed attached SQLCipher database. It forces
+file-backed temporary storage before attachment and rejects SQLite builds that
+force all temporary databases into memory. A 1 MiB page cache, cache spilling,
+DELETE rollback journals and a checked page-count ceiling bound the database;
+synchronization is disabled for this disposable state. Each current consumer
+allows at most 64 GiB of database pages (four times the catalog stream ceiling).
+This is a finite implementation limit, not a qualified supported catalog size.
+Rollback-journal disk space and concurrent jobs need separate physical admission.
+
+Git graph admission uses this store and a libgit2 repository wrapping a memory
+ODB, removing both named scratch databases and parser directories. Native restore
+keeps inode/directory/link/alias indexes in the private store and batches their
+writes without holding the production catalog writer during page and sector I/O.
+The durable restore journal and pinned staging tree still drive crash recovery;
+a retry rebuilds the disposable index and removes rows from earlier versions that
+stored these indexes in the durable catalog. Publication still requires exact
+namespace/inode checks and a final retained-authority check.
+
+The Linux process-lifecycle test writes and replaces 8 MiB of payloads, spilling
+both database and rollback-journal pages, inspects their live descriptors for allocated blocks,
+zero hard links and absence of plaintext payloads/SQLite headers, then kills the
+child and verifies that no named scratch files survive. Separate tests exercise
+bounded reads, duplicate/ignored writes and rollback after the page budget is
+exhausted. Native retry coverage injects ignored writes in the private index and
+simulates old durable index rows across reopen.
+
+The explicitly provisioned Btrfs retained-native capture/migration/reopen/restore
+fixture passes (24.71 seconds), preserving sparse extents, raw bytes, hard links
+and directory metadata. Its loop device, mount and image were reclaimed. A sparse
+1 TiB logical file does not qualify the required 1 TiB retained dataset capacity.
+Formatting, strict locked workspace/all-targets Clippy and the locked all-targets
+test build pass. The final binaries pass all 144 ordinary store tests (25
+ignored), all 100 ordinary Git tests (64 ignored) and 25 paged Node tests (one
+ignored native fixture, run separately above). Source and binary hashes remained
+unchanged across qualification. The complete Node, topology, platform and release
+artifact gates were not rerun for this increment.
+
+Other operating systems/VFS implementations, aggregate scratch reservations,
+normal paged capture/Git-history installation/checkpoint/retention/seed-only
+consumers and real 1 TiB qualification remain open; R3 and M6 are not complete.

@@ -4302,3 +4302,9 @@ backends, application consistency, and final resource/headroom limits.
 Also settle Git format/hash support, ordinary-Git transport compatibility,
 byte-preserving attribute policy, source-backend migration, worktree safety,
 and history reachability before promising the Git-facing compatibility freeze.
+
+Paged Git validation and retained native restore now use disposable encrypted
+SQLite indexes with bounded page caches and per-job database ceilings. Linux
+process-kill coverage proves anonymous database/journal cleanup; the durable
+restore journal still owns staged filesystem recovery. Aggregate physical
+scratch reservations and cross-platform VFS qualification remain release gates.

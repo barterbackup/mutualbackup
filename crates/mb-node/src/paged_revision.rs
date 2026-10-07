@@ -1035,7 +1035,7 @@ mod tests {
                 .unwrap();
             let target = temp.path().join("restored");
             if fault == 1 {
-                store.database_shell_statement("CREATE TEMP TRIGGER ignore_restore_index BEFORE INSERT ON protocol_records WHEN NEW.kind LIKE 'paged-native-restore-entry-v1/%' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+                crate::paged_restore::ignore_next_restore_index_insert();
             }
             if fault == 2 {
                 store.database_shell_statement("CREATE TEMP TRIGGER ignore_restore_job BEFORE INSERT ON protocol_records WHEN NEW.kind = 'restore-job' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
@@ -1076,7 +1076,28 @@ mod tests {
                     },
                 );
             assert!(result.is_err(), "fault {fault}");
+            assert!(
+                !store
+                    .has_records_with_kind_prefix("paged-native-restore-")
+                    .unwrap()
+            );
             assert_eq!(target.exists(), fault == 3);
+            if fault == 0 {
+                // Simulate disposable rows left by the earlier durable-index
+                // implementation. Reopen/retry must reclaim every old role.
+                let jobs = store.records("restore-job").unwrap();
+                assert_eq!(jobs.len(), 1);
+                for role in ["entry", "directory", "link", "alias"] {
+                    store
+                        .put_record(
+                            &format!("paged-native-restore-{role}-v1/{}", hex::encode(&jobs[0].0)),
+                            b"stale",
+                            b"stale",
+                        )
+                        .unwrap();
+                }
+            }
+
             if fault == 2 {
                 assert!(store.records("restore-job").unwrap().is_empty());
             }

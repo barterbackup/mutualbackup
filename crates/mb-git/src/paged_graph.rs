@@ -1,16 +1,15 @@
 //! Streaming graph validation with bounded semantic parsing and an encrypted
 //! disposable disk index for edges, reachability and DFS frames.
 
-use std::path::Path;
-
 use anyhow::{Context, Result, ensure};
 use git2::{ObjectType, Oid, Repository};
 use mb_core::{
     CATALOG_MAX_RECORDS, CatalogPageRef, CatalogScope, CatalogSection, canonical_bytes_bounded,
     decode_canonical,
 };
-use mb_store::ControlStore;
+use mb_store::RecordScratchStore;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use uuid::Uuid;
 
 use crate::{
@@ -59,7 +58,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(canonical_bytes_bounded(value, ROW_BYTES)?)
 }
 
-fn put(store: &ControlStore, kind: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
+fn put(store: &RecordScratchStore, kind: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
     ensure!(
         store.put_record_if_absent(kind, key, bytes)?,
         "duplicate graph identity"
@@ -72,7 +71,7 @@ fn put(store: &ControlStore, kind: &str, key: &[u8], bytes: &[u8]) -> Result<()>
 }
 
 fn row<T: serde::de::DeserializeOwned + Serialize>(
-    store: &ControlStore,
+    store: &RecordScratchStore,
     kind: &str,
     key: &[u8],
 ) -> Result<(T, Vec<u8>)> {
@@ -92,7 +91,7 @@ fn edge_key(oid: &[u8; 20], index: u64) -> [u8; 28] {
 }
 
 struct GraphIndex<'a> {
-    store: &'a ControlStore,
+    store: &'a RecordScratchStore,
     edge_count: u64,
 }
 
@@ -634,12 +633,11 @@ impl GitCatalogRoot {
     ) -> Result<()> {
         self.validate()?;
         scope.validate(CatalogSection::GitGraph)?;
-        let temporary = tempfile::tempdir()?;
-        let mut material = [0; 32];
-        material[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-        material[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-        let store = ControlStore::open_with_key(temporary.path().join("graph.db"), &material)?;
-        let parser = Repository::init_bare(temporary.path().join("parser"))?;
+        // Explicit per-job ceiling, not aggregate physical-space admission.
+        let store = RecordScratchStore::new(mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
+        let odb = git2::Odb::new()?;
+        let _pack = odb.add_new_mempack_backend(1000)?;
+        let parser = Repository::from_odb(odb)?;
         store.with_record_transaction(|| {
             self.validate_graph_index(scope, &mut fetch, &store, &parser)
         })
@@ -649,7 +647,7 @@ impl GitCatalogRoot {
         &self,
         scope: CatalogScope,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
-        store: &ControlStore,
+        store: &RecordScratchStore,
         parser: &Repository,
     ) -> Result<()> {
         let mut graph = GraphIndex {
@@ -731,14 +729,6 @@ impl GitCatalogRoot {
             );
             Ok(true)
         })?;
-        // libgit2 stores parser metadata only in its current memory ODB.
-        ensure!(
-            !Path::new(parser.path())
-                .join("objects/pack")
-                .read_dir()?
-                .any(|entry| entry.is_ok()),
-            "parser wrote a Git object pack"
-        );
         Ok(())
     }
 }
@@ -1036,8 +1026,7 @@ mod tests {
 
     #[test]
     fn paged_graph_disk_traversal_rejects_cycles_and_ignored_index_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = ControlStore::open_with_key(temp.path().join("graph.db"), &[7; 32]).unwrap();
+        let store = RecordScratchStore::new(64 * 1024 * 1024).unwrap();
         let mut graph = GraphIndex {
             store: &store,
             edge_count: 0,
@@ -1111,7 +1100,7 @@ mod tests {
         let odb = git2::Odb::new().unwrap();
         let _pack = odb.add_new_mempack_backend(1000).unwrap();
         repository.set_odb(&odb).unwrap();
-        let store = ControlStore::open_with_key(temp.path().join("index.db"), &[7; 32]).unwrap();
+        let store = RecordScratchStore::new(64 * 1024 * 1024).unwrap();
         let mut graph = GraphIndex {
             store: &store,
             edge_count: 0,

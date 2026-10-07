@@ -1241,6 +1241,16 @@ passing tests below apply only to their recorded source and exercised cases.
     the production catalog writer during page I/O. Validation is recorded in
     ADR 0002. Blob plaintext verification, Git-history installation, physical
     scratch/quota lifecycle and normal production consumers remain open.
+  - [x] Reclaim disposable Git-validation and native-restore indexes on process
+    exit, including SIGKILL. Use an unnamed encrypted SQLite database with a
+    1 MiB page cache, an explicit 64 GiB per-job database ceiling, bounded record
+    reads and batched transactional writes. Keep native restore ownership in
+    the durable catalog, reclaim prior-version index rows on retry, and use a
+    memory-only libgit2 parser. Linux tests verify encrypted database/journal
+    spill, unlinked live files, kill cleanup, capacity rollback and ignored
+    writes; the provisioned native restore fixture passes. Validation details
+    are in ADR 0002. Aggregate physical reservations, concurrent-job admission,
+    other platform VFS behavior and real 1 TiB qualification remain open.
   - [ ] Complete legacy retained-revision migration through normal native
     capture/restore, checkpoint/retention and seed-only consumers before
     enabling the new format.
