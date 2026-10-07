@@ -60,6 +60,10 @@ pub(super) fn legacy_revision_scope(
 }
 
 impl PagedLegacyDataAuthority {
+    pub(super) fn contains_data(&self, id: [u8; 32]) -> bool {
+        self.sources.contains_key(&id)
+    }
+
     pub fn new(
         keys: &KeyMaterial,
         guild_id: [u8; 32],

@@ -1207,8 +1207,23 @@ passing tests below apply only to their recorded source and exercised cases.
     upgrade checks and migration-free reads for every known schema. Formatting
     and strict locked workspace/all-targets Clippy pass. This focused follow-up
     does not repeat or replace broader release-artifact/platform qualification.
-  - [ ] Integrate legacy private conversion with retained revision publication
-    and migrate native capture/restore consumers before enabling the new format.
+  - [x] Connect supported legacy private conversion to an explicit retained
+    Node migration operation. Require the current certified writer; retain an
+    immutable operation journal and deterministic per-role intents; order
+    source records with bounded indexed SQL reads. Publish converted native/Git
+    roots, bootstrap and authenticated stable data sources together, preserving
+    old signed records, source addresses and flat heads. Exact retries reopen
+    the publication; cancellation survives interruption and fences reuse, with
+    bounded pin/source/index cleanup preserving shared owners. All 20 paged,
+    141 ordinary store and 32 ordinary snapshot tests pass, plus the Node
+    certified-writer/reopen fixture. Final expanded unpublished/published
+    cancellation and Node cases pass again after the last test refinement.
+    Locked workspace/all-targets build, formatting and strict Clippy pass.
+    Details and limits are recorded in ADR 0002. This is explicit local
+    retention, not production checkpoint activation or 1 TiB qualification.
+  - [ ] Complete legacy retained-revision migration through normal native
+    capture/restore, checkpoint/retention and seed-only consumers before
+    enabling the new format.
   - [x] Bound existing per-attempt coding and packed-sector decoding by the
     supported geometry, including roles, roots, receipts, sampled openings,
     failure-domain bytes, Merkle proofs, packed slots/payloads and the aggregate

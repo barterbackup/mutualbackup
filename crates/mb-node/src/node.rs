@@ -5500,6 +5500,87 @@ impl Node {
         )
     }
 
+    /// Retain a verified paged successor alongside an existing flat revision.
+    /// This migration does not advance the flat head or advertise protection.
+    /// The operation ID is durable: reuse it for retry and cancellation.
+    pub fn migrate_retained_revision_catalog(
+        &mut self,
+        guild_id: [u8; 32],
+        revision_id: Uuid,
+        operation_id: Uuid,
+    ) -> Result<SignedRecord<mb_core::PagedUserRevision>> {
+        let bytes = self
+            .control
+            .get_record_bounded(
+                "user-revision",
+                revision_id.as_bytes(),
+                mb_core::V1_MAX_CATALOG_BYTES,
+            )?
+            .context("retained revision is unavailable")?;
+        let legacy: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            legacy.value.revision_id == revision_id,
+            "retained revision key differs"
+        );
+        let checkpoint = self
+            .current_checkpoint(guild_id)?
+            .context("migration requires a certified writer checkpoint")?;
+        checkpoint.verify()?;
+        anyhow::ensure!(
+            checkpoint.checkpoint.guild_id == guild_id,
+            "migration checkpoint guild differs"
+        );
+        let fence = checkpoint
+            .checkpoint
+            .writer_fences
+            .iter()
+            .filter(|fence| fence.owner == self.keys.node_id())
+            .max_by_key(|fence| fence.epoch)
+            .context("migration has no certified owner writer")?
+            .clone();
+        let writer: LocalWriterIncarnation = decode_canonical(
+            &self
+                .control
+                .get_record_bounded("writer-incarnation", &guild_id, 1024)?
+                .context("migration requires the certified local writer")?,
+        )?;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&writer.secret_key);
+        anyhow::ensure!(
+            writer.format_version == 1
+                && writer.epoch == fence.epoch
+                && writer.public_key == fence.public_key
+                && signing.verifying_key().to_bytes() == fence.public_key,
+            "migration local writer is not certified by the current checkpoint"
+        );
+        let migration = crate::RetainedLegacyMigration::new(
+            &self.keys,
+            guild_id,
+            &legacy,
+            fence,
+            operation_id,
+        )?;
+        migration.retain(&self.control, &self.keys, &legacy, &signing, &mut |id| {
+            render_sector(&self.control, &self.keys, id, Some(&guild_id))
+        })
+    }
+
+    /// Fence a retained migration without requiring its original sources or
+    /// old writer secret to remain available. Repeated cancellation resumes it.
+    pub fn cancel_retained_revision_catalog_migration(&mut self, operation_id: Uuid) -> Result<()> {
+        crate::RetainedLegacyMigration::load(&self.control, &self.keys, operation_id)?
+            .context("retained migration is unavailable")?
+            .cancel(&self.control)
+    }
+
+    pub fn cleanup_retained_revision_catalog_migration_step(
+        &mut self,
+        operation_id: Uuid,
+    ) -> Result<bool> {
+        crate::RetainedLegacyMigration::load(&self.control, &self.keys, operation_id)?
+            .context("retained migration is unavailable")?
+            .cleanup_step(&self.control)
+    }
+
     fn writer_incarnation(&mut self, guild_id: [u8; 32]) -> Result<LocalWriterIncarnation> {
         let current = self.current_checkpoint(guild_id)?;
         let current_hash = current.as_ref().map(QuorumCheckpoint::hash).transpose()?;
@@ -17377,6 +17458,89 @@ pub(crate) mod tests {
         assert!(
             sign_legacy_packing_binding(&keys, Uuid::from_u128(44), &wrong_reference, &bytes,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_catalog_migration_requires_certified_writer_and_reopens_without_advancing_heads() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([227; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let guild = [233; 32];
+        let legacy = install_empty_recovery_revision(&mut node, guild, Uuid::from_bytes([234; 16]));
+        let bytes = canonical_bytes(&legacy).unwrap();
+        node.control
+            .put_record("user-revision", legacy.value.revision_id.as_bytes(), &bytes)
+            .unwrap();
+        let id = Uuid::new_v4();
+        assert!(
+            node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, id)
+                .is_err()
+        );
+        assert!(
+            crate::RetainedLegacyMigration::load(&node.control, node.keys(), id)
+                .unwrap()
+                .is_none()
+        );
+        let installed = install_public_restore_fixture(&mut node, &seed);
+        assert_eq!(installed, legacy);
+        let checkpoint = node.current_checkpoint(guild).unwrap().unwrap();
+        let pending = node.writer_incarnation(guild).unwrap();
+        assert_eq!(pending.epoch, 2);
+        assert!(
+            node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, id)
+                .is_err()
+        );
+        assert!(
+            crate::RetainedLegacyMigration::load(&node.control, node.keys(), id)
+                .unwrap()
+                .is_none()
+        );
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        let current = LocalWriterIncarnation {
+            format_version: 1,
+            epoch: 1,
+            public_key: signing.verifying_key().to_bytes(),
+            secret_key: signing.to_bytes(),
+            base_checkpoint: Some(checkpoint.hash().unwrap()),
+        };
+        node.control
+            .put_record(
+                "writer-incarnation",
+                &guild,
+                &canonical_bytes(&current).unwrap(),
+            )
+            .unwrap();
+        let migrated = node
+            .migrate_retained_revision_catalog(guild, legacy.value.revision_id, id)
+            .unwrap();
+        assert_eq!(migrated.value.parent, Some(legacy.value.hash().unwrap()));
+        assert_eq!(node.current_checkpoint(guild).unwrap().unwrap(), checkpoint);
+        assert_eq!(
+            node.prepared_revision_bytes(guild, legacy.value.revision_id)
+                .unwrap(),
+            bytes
+        );
+        drop(node);
+        let mut node = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, id)
+                .unwrap(),
+            migrated
+        );
+        node.control
+            .delete_record("writer-incarnation", &guild)
+            .unwrap();
+        node.cancel_retained_revision_catalog_migration(id).unwrap();
+        while node
+            .cleanup_retained_revision_catalog_migration_step(id)
+            .unwrap()
+        {}
+        assert_eq!(node.current_checkpoint(guild).unwrap().unwrap(), checkpoint);
+        assert_eq!(
+            node.prepared_revision_bytes(guild, legacy.value.revision_id)
+                .unwrap(),
+            bytes
         );
     }
 

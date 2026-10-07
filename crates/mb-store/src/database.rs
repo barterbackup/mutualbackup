@@ -578,6 +578,49 @@ impl ControlStore {
         }
     }
 
+    /// Read one key/payload after an exclusive cursor using the record index.
+    /// Bounds are checked in SQL before either blob is materialized. The
+    /// cursor is not a snapshot: callers must fence writes to their namespace.
+    pub fn next_record_bounded(
+        &self,
+        kind: &str,
+        after: Option<&[u8]>,
+        key_limit: usize,
+        payload_limit: usize,
+    ) -> Result<Option<ProtocolRecordRow>, DatabaseError> {
+        let key_limit = i64::try_from(key_limit).map_err(|_| DatabaseError::Integrity)?;
+        let payload_limit = i64::try_from(payload_limit).map_err(|_| DatabaseError::Integrity)?;
+        let sql = if after.is_some() {
+            "SELECT CASE WHEN length(record_id) <= ?3 THEN record_id END,
+                    CASE WHEN length(bytes) <= ?4 THEN bytes END
+             FROM protocol_records WHERE kind = ?1 AND record_id > ?2
+             ORDER BY record_id LIMIT 1"
+        } else {
+            "SELECT CASE WHEN length(record_id) <= ?3 THEN record_id END,
+                    CASE WHEN length(bytes) <= ?4 THEN bytes END
+             FROM protocol_records WHERE kind = ?1 AND record_id >= ?2
+             ORDER BY record_id LIMIT 1"
+        };
+        let row = self
+            .connection
+            .prepare_cached(sql)?
+            .query_row(
+                params![kind, after.unwrap_or(&[]), key_limit, payload_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some((Some(key), Some(bytes))) => Ok(Some((key, bytes))),
+            Some(_) => Err(DatabaseError::Integrity),
+        }
+    }
+
     /// Visit one bounded key/payload at a time, stopping when the callback
     /// returns false. No complete history or unbounded damaged row is loaded.
     pub fn for_each_record_bounded(
@@ -4168,6 +4211,60 @@ fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indexed_record_cursor_bounds_rows_and_keeps_exclusive_order_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cursor.db");
+        let key = [74; 32];
+        let store = super::ControlStore::open_with_key(&path, &key).unwrap();
+        for id in [b"".as_slice(), b"a", b"b", b"c"] {
+            store.put_record("cursor", id, id).unwrap();
+        }
+        assert_eq!(
+            store.next_record_bounded("cursor", None, 1, 1).unwrap(),
+            Some((vec![], vec![]))
+        );
+        let first = store
+            .next_record_bounded("cursor", Some(b""), 1, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, (b"a".to_vec(), b"a".to_vec()));
+        store.delete_record("cursor", b"a").unwrap();
+        drop(store);
+        let store = super::ControlStore::open_with_key(&path, &key).unwrap();
+        assert_eq!(
+            store
+                .next_record_bounded("cursor", Some(&first.0), 1, 1)
+                .unwrap(),
+            Some((b"b".to_vec(), b"b".to_vec()))
+        );
+        store.put_record("cursor", b"b", &[0; 1024]).unwrap();
+        assert!(
+            store
+                .next_record_bounded("cursor", Some(b"a"), 1, 1)
+                .is_err()
+        );
+        store.delete_record("cursor", b"b").unwrap();
+        assert_eq!(
+            store
+                .next_record_bounded("cursor", Some(b"a"), 1, 1)
+                .unwrap(),
+            Some((b"c".to_vec(), b"c".to_vec()))
+        );
+        store.put_record("cursor", b"d-overlong", b"").unwrap();
+        assert!(
+            store
+                .next_record_bounded("cursor", Some(b"c"), 1, 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .next_record_bounded("cursor", Some(b"z"), 1, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn streamed_records_are_lazy_atomic_and_reject_ignored_writes() {
         use std::cell::Cell;

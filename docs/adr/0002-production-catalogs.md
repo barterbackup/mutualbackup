@@ -1744,3 +1744,64 @@ normal capture/restore/retention and seed-only migration, enclosing R2 admission
 and real 1 TiB dataset/history qualification remain open. Streaming the extra
 cache encoding alone does not demonstrate bounded whole-backup memory or close
 R2/R3.
+
+### Retained legacy revision migration (2026-10-07)
+
+An explicit Node operation now connects whole legacy private conversion to
+retained paged publication. It loads the original signed revision with the
+existing SQL byte bound, requires the local secret to match the owner writer
+fence in the current checkpoint, and preserves the original revision and flat
+head. The new signed body uses a separate caller-supplied operation ID, names
+the old signed body hash as its parent and advances its sequence by one.
+
+An immutable bounded migration journal binds the operation ID, old body hash,
+dataset scope and new writer. Deterministic per-role intent IDs retain staged
+pages across interruption. Conversion authenticates the complete supported
+legacy private schema, data and Git blob bytes before staging private pages.
+The operation adds their encrypted source references, the encrypted bootstrap
+and original data references to a per-operation SQL ordering queue. Indexed
+cursor reads bound both keys and payloads before allocation; the source builder
+holds one record at a time. Retrying reconstructs this disposable queue from
+authenticated inputs rather than trusting a stale tail. No converted-page map
+or complete source vector is assembled.
+
+Every original data sector requires an exact local stable native/Git recipe.
+The operation checks signed legacy membership, source offset and both ciphertext
+commitments before signing; root publication rechecks sources and retains
+physical anchor counts in its existing atomic writer transaction. Old data
+addresses remain unchanged. Missing stable sources, path-only and Inline data
+recipes fail explicitly. A completed retry reopens the verified retained
+publication without rereading original metadata. Original flat records and
+recipes remain available for the existing consumers.
+
+Cancellation first persists its operation fence, then uses typed atomic root
+cancellation or fences unfinished member intents and validation. Interrupted
+cancellation resumes after reopen; its ID cannot publish again. The queue is
+discarded and bounded cleanup releases one source binding, page binding, pin
+or native-index row per step. Shared retained roots and anchors preserve their
+ownership. Fencing tombstones remain until authenticated generation-floor
+retirement exists.
+
+This connects the explicit retained migration path; normal capture/restore,
+packing, coding/checkpoint, production head/retention and seed-only migration
+are still required before paged production activation. It does not qualify the
+1 TiB target or add physical quota reservation.
+
+Validation: all 20 paged Node tests, 141 ordinary store tests and 32 ordinary
+snapshot tests pass. The store suite retains 24 provisioned cases and the
+snapshot suite retains eight; they were not run here. New fixtures qualify
+native private versions 1/3 and Git-bearing versions 4/5, exact original data
+addresses, shared root/anchor retention, completed retry without old metadata
+reads, publication rollback after SQL IGNORE, missing stable recipes, changed
+legacy identity/writer rejection and catalog-ID collision rejection before a
+journal is claimed. Cancellation is exercised after publication and after
+staging private pages without a source publication, including interruption,
+reopen, retry fencing and bounded cleanup. A separate Node fixture verifies
+certified versus missing/pending local writers with a quorum-signed checkpoint,
+original flat record/checkpoint preservation, reopen/retry and
+cancellation after loss of the writer secret. The indexed cursor fixture covers
+exclusive ordering, deletion/reopen, empty keys and oversized keys/payloads.
+The final expanded interruption and Node fixtures pass again on the final
+test source. Locked workspace/all-targets build, formatting/diff checks and
+strict Clippy pass. No full Node, native-filesystem, topology, other-platform
+or real 1 TiB qualification ran in this increment.

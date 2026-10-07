@@ -562,6 +562,384 @@ mod tests {
         }
     }
 
+    fn retained_migration_source(
+        store: &ControlStore,
+        root: &std::path::Path,
+        reference: &SectorRef,
+    ) -> crate::PagedAnchorSectorSource {
+        std::fs::create_dir(root).unwrap();
+        let area = mb_store::StableAnchorAreaLocator::prepare_for_root(root).unwrap();
+        let anchor_id = Uuid::new_v4();
+        let directory = area.path_hint.join(anchor_id.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("payload"), PAYLOAD).unwrap();
+        let source = crate::PagedAnchorSectorSource {
+            locator: mb_store::StableAnchorFileLocator {
+                area,
+                anchor_id,
+                relative_path: "payload".into(),
+            },
+            offset: 0,
+        };
+        // Literal historical LocalSectorRecipe layout, stable-file variant 2.
+        store
+            .put_record(
+                "local-sector",
+                &reference.id,
+                &canonical_bytes(&(
+                    [73_u8; 32],
+                    reference,
+                    (2_u8, &source.locator, source.offset),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        source
+    }
+
+    #[test]
+    fn paged_retained_legacy_migration_publishes_all_roles_and_preserves_shared_sources_after_reopen()
+     {
+        for version in [1, 3, 4, 5] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (legacy, sources, _) = fixture(version, if version == 4 { 1 } else { 3 }, PAYLOAD);
+            let original = canonical_bytes(&legacy).unwrap();
+            store
+                .put_record(
+                    "user-revision",
+                    legacy.value.revision_id.as_bytes(),
+                    &original,
+                )
+                .unwrap();
+            store
+                .put_record("user-revision-head", b"sentinel", b"preserved")
+                .unwrap();
+            let anchor = retained_migration_source(
+                &store,
+                &temp.path().join("protected"),
+                &legacy.value.data_sectors[0],
+            );
+            let writer = SigningKey::from_bytes(&[72; 32]);
+            let fence = mb_core::WriterFence {
+                owner: keys().node_id(),
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            };
+            let id = Uuid::new_v4();
+            let migration =
+                crate::RetainedLegacyMigration::new(&keys(), [73; 32], &legacy, fence.clone(), id)
+                    .unwrap();
+            let migrated = migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| {
+                    Ok(sources[id].clone())
+                })
+                .unwrap();
+            assert_eq!(migrated.value.parent, Some(legacy.value.hash().unwrap()));
+            assert_eq!(migrated.value.sequence, legacy.value.sequence + 1);
+            assert!(
+                store
+                    .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .next_record_bounded(
+                        &format!("paged-legacy-migration-source-v1/{}", id.simple()),
+                        None,
+                        32,
+                        256
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            let shared = crate::RetainedLegacyMigration::new(
+                &keys(),
+                [73; 32],
+                &legacy,
+                fence,
+                Uuid::new_v4(),
+            )
+            .unwrap();
+            let retained = shared
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| {
+                    Ok(sources[id].clone())
+                })
+                .unwrap();
+            drop(store);
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let migration = crate::RetainedLegacyMigration::load(&store, &keys(), id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                migration
+                    .retain(&store, &keys(), &legacy, &writer, &mut |_| anyhow::bail!(
+                        "completed retry must not reopen old metadata"
+                    ))
+                    .unwrap(),
+                migrated
+            );
+            let opened = PagedPrivateMetadata::load_local_catalog(&store, &keys(), id, scope())
+                .unwrap()
+                .unwrap();
+            assert_eq!(opened.private.unwrap().git.is_some(), version >= 4);
+            assert_eq!(
+                crate::snapshot::render_sector(
+                    &store,
+                    &keys(),
+                    &legacy.value.data_sectors[0].id,
+                    Some(&[73; 32])
+                )
+                .unwrap(),
+                sources[&legacy.value.data_sectors[0].id]
+            );
+            migration.cancel(&store).unwrap();
+            while migration.cleanup_step(&store).unwrap() {}
+            assert!(
+                store
+                    .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                    .unwrap()
+            );
+            assert!(
+                migration
+                    .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                        sources[id].clone()
+                    ))
+                    .is_err()
+            );
+            assert_eq!(
+                PagedPrivateMetadata::load_local_catalog(
+                    &store,
+                    &keys(),
+                    retained.value.revision_id,
+                    scope()
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+                mb_store::CatalogBundleState::Published
+            );
+            shared.cancel(&store).unwrap();
+            while shared.cleanup_step(&store).unwrap() {}
+            assert!(
+                !store
+                    .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                    .unwrap()
+            );
+            while store.collect_catalog_page().unwrap() {}
+            assert_eq!(
+                store
+                    .get_record("user-revision", legacy.value.revision_id.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+            assert_eq!(
+                store
+                    .get_record("user-revision-head", b"sentinel")
+                    .unwrap()
+                    .unwrap(),
+                b"preserved"
+            );
+            assert!(anchor.locator.open().is_ok());
+        }
+    }
+
+    #[test]
+    fn paged_retained_migration_retries_failed_publication_and_fences_interrupted_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let (legacy, sources, _) = fixture(5, 3, PAYLOAD);
+        let original = canonical_bytes(&legacy).unwrap();
+        store
+            .put_record(
+                "user-revision",
+                legacy.value.revision_id.as_bytes(),
+                &original,
+            )
+            .unwrap();
+        let anchor = retained_migration_source(
+            &store,
+            &temp.path().join("protected"),
+            &legacy.value.data_sectors[0],
+        );
+        let writer = SigningKey::from_bytes(&[72; 32]);
+        let fence = mb_core::WriterFence {
+            owner: keys().node_id(),
+            epoch: 1,
+            public_key: writer.verifying_key().to_bytes(),
+        };
+        let id = Uuid::new_v4();
+        let migration =
+            crate::RetainedLegacyMigration::new(&keys(), [73; 32], &legacy, fence.clone(), id)
+                .unwrap();
+        assert!(
+            migration
+                .retain(
+                    &store,
+                    &keys(),
+                    &legacy,
+                    &SigningKey::from_bytes(&[99; 32]),
+                    &mut |id| Ok(sources[id].clone())
+                )
+                .is_err()
+        );
+        assert!(
+            crate::RetainedLegacyMigration::load(&store, &keys(), id)
+                .unwrap()
+                .is_none()
+        );
+        let reference = &legacy.value.data_sectors[0];
+        let original_recipe = store
+            .get_record("local-sector", &reference.id)
+            .unwrap()
+            .unwrap();
+        store.delete_record("local-sector", &reference.id).unwrap();
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        assert!(store.paged_revision_catalog(id).unwrap().is_none());
+        assert!(
+            !store
+                .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                .unwrap()
+        );
+        migration.cancel(&store).unwrap();
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let cancelled = crate::RetainedLegacyMigration::load(&store, &keys(), id)
+            .unwrap()
+            .unwrap();
+        while cancelled.cleanup_step(&store).unwrap() {}
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        assert!(store.paged_revision_catalog(id).unwrap().is_none());
+        assert!(anchor.locator.open().is_ok());
+        let id = Uuid::new_v4();
+        let migration =
+            crate::RetainedLegacyMigration::new(&keys(), [73; 32], &legacy, fence, id).unwrap();
+        store
+            .put_record("local-sector", &reference.id, &original_recipe)
+            .unwrap();
+        store.database_shell_statement("CREATE TEMP TRIGGER ignore_migration BEFORE INSERT ON protocol_records WHEN NEW.kind = 'paged-user-revision-v1' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        assert!(store.paged_revision_catalog(id).unwrap().is_none());
+        assert!(
+            !store
+                .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                .unwrap()
+        );
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        store
+            .database_shell_statement("DROP TRIGGER IF EXISTS ignore_migration", false)
+            .unwrap();
+        let migration = crate::RetainedLegacyMigration::load(&store, &keys(), id)
+            .unwrap()
+            .unwrap();
+        let mut altered = legacy.clone();
+        altered.value.sequence = 2;
+        altered.value.parent = Some(legacy.value.hash().unwrap());
+        altered.value.sign_writer(&writer).unwrap();
+        altered = SignedRecord::sign(USER_REVISION_DOMAIN, altered.value, &keys()).unwrap();
+        assert!(
+            migration
+                .retain(&store, &keys(), &altered, &writer, &mut |id| Ok(sources
+                    [id]
+                    .clone()))
+                .is_err()
+        );
+        let migrated = migration
+            .retain(&store, &keys(), &legacy, &writer, &mut |id| {
+                Ok(sources[id].clone())
+            })
+            .unwrap();
+        // An existing unrelated catalog ID cannot be adopted by first claiming
+        // a migration journal, nor then cancelled through that claim.
+        let journal = store
+            .get_record("paged-legacy-migration-v1", id.as_bytes())
+            .unwrap()
+            .unwrap();
+        store
+            .delete_record("paged-legacy-migration-v1", id.as_bytes())
+            .unwrap();
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        assert!(
+            crate::RetainedLegacyMigration::load(&store, &keys(), id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.paged_revision_catalog(id).unwrap().unwrap().state,
+            mb_store::CatalogBundleState::Published
+        );
+        store
+            .put_record("paged-legacy-migration-v1", id.as_bytes(), &journal)
+            .unwrap();
+        store.database_shell_statement("CREATE TEMP TRIGGER ignore_cancel BEFORE UPDATE ON protocol_records WHEN NEW.kind = 'catalog-intent-v1' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+        assert!(migration.cancel(&store).is_err());
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        store
+            .database_shell_statement("DROP TRIGGER IF EXISTS ignore_cancel", false)
+            .unwrap();
+        let migration = crate::RetainedLegacyMigration::load(&store, &keys(), id)
+            .unwrap()
+            .unwrap();
+        migration.cancel(&store).unwrap();
+        while migration.cleanup_step(&store).unwrap() {}
+        assert!(
+            !store
+                .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .paged_revision_catalog(migrated.value.revision_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            mb_store::CatalogBundleState::Cancelled
+        );
+        assert_eq!(
+            store
+                .get_record("user-revision", legacy.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+            original
+        );
+    }
+
     #[test]
     fn paged_legacy_sources_publish_reopen_replace_and_release_without_address_rewrite() {
         for version in [1, 4, 5] {

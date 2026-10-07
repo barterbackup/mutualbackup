@@ -1380,6 +1380,14 @@ extra batch of encoded cache records; complete flat packing/catalog collections
 still require paged replacements, quotas and end-to-end consumer migration.
 Validation is recorded in ADR 0002; the 1 TiB qualification remains open.
 
+Retained legacy conversion now uses an explicit Node migration operation.
+It keeps original signed revisions and flat heads, stages typed
+private streams, orders public sources through an indexed SQL queue, and binds
+authenticated stable data recipes with the new roots. The operation requires
+the current certified writer, retains immutable retry/cancellation identity and
+does not activate paged production checkpoints. Normal capture/restore and
+packing/checkpoint/retention migration remain required.
+
 The format-8 migration codec now authenticates a bounded public source root and
 one encrypted private root descriptor with distinct owner/writer signatures.
 The private descriptor carries typed native and optional Git roots without

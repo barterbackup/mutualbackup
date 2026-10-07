@@ -14,8 +14,10 @@ mod node;
 mod paged_data;
 #[cfg(target_os = "linux")]
 mod paged_legacy;
+mod paged_migration;
 #[cfg(target_os = "linux")]
 pub use paged_legacy::PagedPrivateStream;
+pub use paged_migration::RetainedLegacyMigration;
 mod paged_revision;
 pub use paged_data::{PagedAnchorSectorSource, PagedDataSource, PagedLegacyDataAuthority};
 mod snapshot;

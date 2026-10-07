@@ -389,6 +389,29 @@ enum LocalPlaintextSource {
     },
 }
 
+/// Preserve an exact native/Git data recipe while migrating retained metadata.
+/// Inline metadata and older path-only recipes need their own migration policy.
+pub(crate) fn stable_source_for_catalog_migration(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    reference: &SectorRef,
+) -> Result<crate::PagedAnchorSectorSource> {
+    let bytes = control
+        .get_record_bounded("local-sector", &reference.id, V1_SECTOR_SIZE + 4096)?
+        .context("retained migration source recipe is unavailable")?;
+    let recipe: LocalSectorRecipe = decode_canonical(&bytes)?;
+    ensure!(
+        recipe.guild_id == guild_id && recipe.reference == *reference,
+        "retained migration source differs from signed data"
+    );
+    match recipe.source {
+        LocalPlaintextSource::StableAnchorFile { locator, offset } => {
+            Ok(crate::PagedAnchorSectorSource { locator, offset })
+        }
+        _ => bail!("retained migration requires a stable native data source"),
+    }
+}
+
 struct PendingAnchor {
     manifest: mb_store::StableAnchorManifest,
     committed: bool,
