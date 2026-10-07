@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{ControlStore, DatabaseError};
 
 mod bundle;
+mod checkpoint_retention;
 mod native_validation;
 mod packing_authority;
 mod packing_validation;
@@ -24,6 +25,7 @@ pub use bundle::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
     CatalogBundleState,
 };
+pub use checkpoint_retention::{CatalogCheckpointRetention, CatalogCheckpointRetentionState};
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };

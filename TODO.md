@@ -1455,12 +1455,29 @@ separately below.
     checked-candidate streaming into the mixed builder. A deterministic 55-byte
     protocol root vector preserves the new layout. This is a staging codec;
     no enclosing paged checkpoint certificate or consumer is activated.
+  - [x] Retain public logical roots embedded in checkpoint authority records
+    through a durable bounded local journal. Pin the authority tree, original
+    legacy envelope trees and each signed paged source tree across dataset/guild
+    scopes; publish only after full typed authority/body/source-record EOF.
+    Use fixed journal/dependency records and short per-root transactions rather
+    than a whole-catalog root vector. Reopen interrupted builds, deduplicate
+    physical root ownership, preserve repeated-reference traversal accounting,
+    fence failures and retire one root per cleanup step. Six focused tests pass,
+    including 97 distinct shared roots, original capture-pin release, reopen at
+    build/cleanup boundaries, ignored writes, invalid signatures/bootstrap
+    entries, corrupt tails and scope/orphan/size rejection. All 140 core and 172
+    ordinary store tests pass (26 store tests ignored), with strict locked
+    workspace/all-targets Clippy and formatting/diff checks. This owns
+    public metadata trees only; native anchors/bootstrap ciphertext, coding
+    roots, current certified checkpoint ownership and normal consumers remain
+    separate required joins and lifecycles. See ADR 0002.
   - [ ] Complete the enclosing paged checkpoint certificate, coding codecs and
     full authority joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body
     and source/bootstrap EOFs and migration-evidence quorum. Retain and retire
-    logical root references inside authority/coding records through bounded
-    durable ownership; byte-tree root publication alone cannot pin them.
+    remaining logical root references inside coding records and source/native
+    payload owners through bounded durable ownership, and guard authority-root
+    retirement with the certified current checkpoint.
     Connect normal capture/packing/coding/checkpoint/retention/seed-only recovery
     under the full shared admission/quota policy and qualification gates.
   - [x] Replace the Linux whole-filesystem lookup under the global mutex with

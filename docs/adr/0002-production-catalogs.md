@@ -2466,3 +2466,58 @@ authority byte-tree root cannot retain its legacy/source closures. Enclosing
 certificate/coding codecs, that ownership/retirement path, normal
 capture/packing/checkpoint/retention/seed-only migration, incremental updates,
 quotas and real retained 1 TiB/release/platform qualification remain open.
+
+### Durable public authority-root retention (2026-10-07)
+
+`CatalogCheckpointRetention` gives local SQLCipher ownership to the logical
+roots embedded in checkpoint authority records. The existing fixed bundle
+holds at most sixteen roots; an authority stream can reference many more legacy
+envelopes and paged source trees. Byte-tree parent edges alone cannot preserve
+these references. The new journal pins its authority tree, each original legacy
+envelope tree in the guild Checkpoint scope, and each signed source tree in its
+dataset SectorReferences scope. All dependencies must belong to the same guild;
+private metadata is excluded from this public journal.
+
+The immutable descriptor and counters occupy one record bounded to 2 KiB.
+Dependencies are individually bounded to 256 bytes and indexed by root hash;
+there is no in-memory root collection. A separate seventeen-byte pin key cannot
+alias existing sixteen-byte capture pins, even when job and capture UUIDs match.
+Each root acquisition checks the local authenticated root and commits its pin,
+dependency and checked counters in one short writer transaction. Existing page
+parent links retain its immutable child closure. Full traversal runs without a
+held writer transaction. The typed authority reader checks complete ordered EOF;
+each legacy reference authenticates and verifies its original signed envelope;
+each paged source reader checks complete records and its declared bootstrap
+entry. Only then does a final checked state transition publish local retention.
+
+Interrupted Building jobs replay the same immutable descriptor from the start
+after reopening. Repeated roots share one dependency within a journal, while
+the signed root's aggregate bounds still count repeated traversal work. Separate
+journals hold independent pins. Failed traversal/publication fences a still
+Building job before cleanup; a concurrent successful replay is not retired by
+the failed worker. Cancelled IDs never resume. Retirement first fences further
+acquisition/publication, then releases at most one root in each transaction.
+Ordinary page GC preserves every remaining capture, checkpoint and parent owner.
+Counters and state use compare-and-swap with readback; ignored acquisition,
+publication and release writes fail without advancing partial ownership.
+
+Six focused fixtures pass. They cover 97 distinct roots, shared source roots
+across consecutive revisions, multi-page legacy/source trees, capture/journal
+UUID collision, original capture-pin release, independent shared journal
+ownership, reopen during build and retirement, invalid legacy signatures,
+missing bootstrap entries, corrupt authenticated tails, fresh publication after
+an ignored completion write, ignored acquisition/release rollback, orphan and
+oversized records, foreign guilds and private-scope rejection. All 140 core and
+172 ordinary store tests pass (26 store tests ignored), with strict locked
+workspace/all-targets Clippy and formatting/diff checks. The earlier complete
+workspace/native qualification still belongs to `b509ac4`; no new native,
+network, release-artifact or real retained 1 TiB result is implied by these
+local ownership checks.
+
+This journal preserves public metadata bytes locally. Bootstrap ciphertext,
+native source anchors/data, private roots and coding witnesses retain separate
+ownership requirements. A production checkpoint must join the complete current
+guild-event authority, tombstones, globally unique revisions and evidence quorum,
+and protect current checkpoint retention from retirement. Enclosing certificates,
+coding roots, normal capture/publication/retention/seed-only consumers, shared
+quotas and real retained 1 TiB/release/platform qualification remain open.

@@ -1668,6 +1668,21 @@ authority joins and durable logical-reference ownership remain required before
 normal publication/retention/seed-only activation. Capacity/quotas, incremental
 work, real retained 1 TiB and original platform/release gates remain open.
 
+Public logical authority roots now have a separate local retention journal.
+The journal pins the authority byte tree, original legacy envelope trees and
+signed paged source trees across scopes, verifies full typed control/body/source
+EOF, and publishes its completion state only afterward. Fixed bounded records
+and per-root transactions replace a whole-catalog root vector. Interrupted
+builds replay after reopen; shared roots retain independent owners; cancellation
+fences publication before one-root cleanup and ordinary bounded page GC. Six
+focused fixtures pass, including 97 distinct roots beyond fixed bundle capacity,
+capture-pin release, shared/reopened retirement, invalid signatures/bootstrap
+entries, corrupt tails and ignored publication/acquisition/release writes.
+All 140 core and 172 ordinary store tests pass (26 store tests ignored), with
+strict locked workspace/all-targets Clippy and formatting/diff checks. Native
+anchors/bootstrap ciphertext, coding roots, current certified checkpoint guards,
+complete authority joins and normal consumers remain required before activation.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

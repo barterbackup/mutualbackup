@@ -84,6 +84,14 @@ private joins, durable transitive root ownership, coding and the enclosing
 checkpoint certificate remain required before signing or activation. No new
 checkpoint certificate version or peer publication path is enabled here.
 
+Local SQLCipher retention now follows embedded authority references as well as
+byte-tree children: an incremental journal pins the control tree, original
+legacy envelope trees and signed paged source trees, and publishes local
+retention only after typed control/body/source-record EOF. Its cancellation and
+one-root cleanup preserve independent capture/checkpoint pins. This journal is
+local storage ownership; source payload/native-anchor ownership, current
+certificate guards and the protocol authorization joins above remain required.
+
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw
 Postcard or CBOR unless their extension says JSON.
