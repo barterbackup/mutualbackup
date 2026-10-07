@@ -1482,8 +1482,14 @@ use durable progress and saved raw-path hints; callbacks retain location hints
 without owning a SQL connection. Control-aware root/file/blob capture, reconcile
 and discard, Git staging/import/checkout replay, revision-anchor retirement and
 Git prune now resolve through durable assistance without rewriting persisted
-plans. Remaining standalone capture/recovery and best-effort cleanup integration,
-retry/backoff and abandoned-job cleanup, other filesystem/platform qualification,
+plans. Linux local control now provides bounded discovery-job inspection and
+explicit reset for node and registered Git catalogs. Reset releases abandoned
+quota slots and rotates a durable per-area fence, preventing old in-flight work
+from resurrecting assistance after reset or completion. Git maintenance checks
+existing registration/native ownership without replaying Git intents or
+re-probing/rebinding the source backend. Remaining standalone capture/recovery
+and best-effort cleanup integration, operational retry/backoff, other
+filesystem/platform qualification,
 full physical lifecycle and real 1 TiB dataset/history qualification remain
 required.
 

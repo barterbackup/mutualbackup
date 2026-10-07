@@ -80,6 +80,15 @@ enum Command {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    /// Inspect or reset unfinished scans for moved source anchors.
+    #[cfg(target_os = "linux")]
+    SourceScan {
+        /// Select a registered Git repository; defaults to the node catalog.
+        #[arg(long)]
+        repository: Option<Uuid>,
+        #[command(subcommand)]
+        command: SourceScanCommand,
+    },
     /// Verify the current guild layout and optionally repair missing shards.
     Audit {
         #[arg(long)]
@@ -262,6 +271,19 @@ enum StorageCommand {
     Reactivate { volume_id: Uuid },
     /// Finish interrupted cross-database writes.
     Reconcile,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum SourceScanCommand {
+    /// List up to 32 unfinished scans, including unreadable journals.
+    List {
+        /// Continue after the area ID returned by the previous page.
+        #[arg(long)]
+        after: Option<Uuid>,
+    },
+    /// Discard current scan progress and free its quota slot. Backup data is preserved.
+    Reset { area_id: Uuid },
 }
 
 #[tokio::main]
@@ -603,6 +625,72 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        Command::SourceScan {
+            repository,
+            command,
+        } => match command {
+            SourceScanCommand::List { after } => {
+                let response = local_control_call(
+                    &control_socket,
+                    &LocalRequest::AnchorDiscoveryStatus {
+                        repository_id: repository,
+                        after,
+                    },
+                )
+                .await?;
+                let LocalResponse::AnchorDiscoveryJobs(page) = response else {
+                    bail!("daemon returned the wrong response to source scan list");
+                };
+                if page.jobs.is_empty() {
+                    println!("no unfinished source scans");
+                }
+                for job in page.jobs {
+                    match (job.attempt, job.generation) {
+                        (Some(attempt), Some(generation)) => println!(
+                            "area {}: attempt {} generation {} ({} journal bytes)",
+                            job.area_id, attempt, generation, job.journal_bytes
+                        ),
+                        _ => println!(
+                            "area {}: unreadable journal ({} bytes); reset to retry",
+                            job.area_id, job.journal_bytes
+                        ),
+                    }
+                }
+                if let Some(after) = page.next_after {
+                    println!("more scans: repeat list with --after {after}");
+                }
+            }
+            SourceScanCommand::Reset { area_id } => {
+                let response = local_control_call(
+                    &control_socket,
+                    &LocalRequest::AnchorDiscoveryReset {
+                        repository_id: repository,
+                        area_id,
+                    },
+                )
+                .await?;
+                let LocalResponse::AnchorDiscoveryReset {
+                    area_id: returned_id,
+                    removed,
+                } = response
+                else {
+                    bail!("daemon returned the wrong response to source scan reset");
+                };
+                if returned_id != area_id {
+                    bail!("daemon reset response has the wrong area ID");
+                }
+                if removed {
+                    println!(
+                        "reset source scan for area {area_id}; retry the blocked operation to start a fresh scan"
+                    );
+                } else {
+                    println!(
+                        "no stored source scan for area {area_id}; earlier work has been fenced"
+                    );
+                }
+            }
+        },
         Command::Storage { command } => {
             let request = match command {
                 StorageCommand::List => LocalRequest::StorageStatus,
@@ -1069,6 +1157,48 @@ mod tests {
             .map(|command| command.get_name())
             .collect::<Vec<_>>();
         assert_eq!(commands, ["add", "help"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_source_scan_controls_and_rejects_invalid_ids() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        let parsed = Cli::try_parse_from(["mutualbackup", "source-scan", "list"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::SourceScan {
+                repository: None,
+                command: SourceScanCommand::List { after: None }
+            }
+        ));
+        let parsed = Cli::try_parse_from([
+            "mutualbackup",
+            "source-scan",
+            "--repository",
+            id,
+            "list",
+            "--after",
+            id,
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Command::SourceScan { repository: Some(repository), command: SourceScanCommand::List { after: Some(after) } } if repository == after && after == Uuid::from_u128(1))
+        );
+        let parsed = Cli::try_parse_from(["mutualbackup", "source-scan", "reset", id]).unwrap();
+        assert!(
+            matches!(parsed.command, Command::SourceScan { command: SourceScanCommand::Reset { area_id }, .. } if area_id == Uuid::from_u128(1))
+        );
+        for args in [
+            vec!["reset"],
+            vec!["reset", "invalid"],
+            vec!["list", "--after", "invalid"],
+            vec!["--repository", "invalid", "list"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["mutualbackup", "source-scan"].into_iter().chain(args))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

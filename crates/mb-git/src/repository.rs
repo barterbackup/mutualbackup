@@ -219,6 +219,55 @@ fn require_native_pinned_catalog_state(
 }
 
 impl GitRepository {
+    /// Inspect local discovery assistance without replaying Git operations.
+    pub fn anchor_discovery_jobs(
+        source_root: &PinnedDirectory,
+        repository_id: Uuid,
+        key: &[u8; 32],
+        after: Option<Uuid>,
+    ) -> anyhow::Result<mb_store::AnchorDiscoveryJobPage> {
+        Self::with_discovery_catalog(source_root, repository_id, key, false, |catalog| {
+            Ok(catalog.anchor_discovery_jobs(after)?)
+        })
+    }
+
+    pub fn reset_anchor_area_discovery(
+        source_root: &PinnedDirectory,
+        repository_id: Uuid,
+        key: &[u8; 32],
+        area_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        Self::with_discovery_catalog(source_root, repository_id, key, true, |catalog| {
+            Ok(catalog.reset_anchor_area_discovery(area_id)?)
+        })
+    }
+
+    fn with_discovery_catalog<T>(
+        source_root: &PinnedDirectory,
+        repository_id: Uuid,
+        key: &[u8; 32],
+        write: bool,
+        operation: impl FnOnce(&ControlStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let directory = source_root
+            .open_child_directory(GIT_CATALOG_DIRECTORY)?
+            .ok_or(RepositoryError::NotInitialized)?;
+        require_private_catalog(&directory)?;
+        if read_marker(&directory, GIT_CATALOG_MARKER_FILE)?.as_deref()
+            != Some(git_catalog_marker_bytes(repository_id).as_slice())
+        {
+            return Err(RepositoryError::Conflict.into());
+        }
+        require_native_pinned_catalog_state(&directory, repository_id, key)?;
+        let path = directory.descriptor_path().join(CATALOG_DATABASE);
+        let catalog = if write {
+            ControlStore::open_existing_with_key(path, key)?
+        } else {
+            ControlStore::open_existing_read_only_with_key(path, key)?
+        };
+        operation(&catalog)
+    }
+
     pub fn init(
         source_root: impl AsRef<Path>,
         repository_id: Uuid,
@@ -2106,6 +2155,102 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn discovery_maintenance_preserves_git_intents_and_rejects_withdrawn_catalogs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let pinned = PinnedDirectory::open(root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let area = Uuid::new_v4();
+        let key = [89; 32];
+        let directory = root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            directory.join(GIT_CATALOG_MARKER_FILE),
+            git_catalog_marker_bytes(repository_id),
+        )
+        .unwrap();
+        fs::write(root.join("payload"), b"preserved source").unwrap();
+        let path = directory.join(CATALOG_DATABASE);
+        let catalog = ControlStore::open_with_key(&path, &key).unwrap();
+        catalog
+            .put_record(
+                SOURCE_BACKEND_KIND,
+                repository_id.as_bytes(),
+                &mb_core::canonical_bytes(&GitSourceBackendRecord {
+                    format_version: 1,
+                    repository_id,
+                    backend: SourceBackendKind::ReflinkV1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        catalog
+            .put_record(
+                mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                area.as_bytes(),
+                b"unreadable journal",
+            )
+            .unwrap();
+        let intent_kind = format!("git-checkout-intent-v1/{repository_id}");
+        catalog
+            .put_record(&intent_kind, b"pending", b"blocked intent")
+            .unwrap();
+        drop(catalog);
+        let original = fs::read(&path).unwrap();
+        let page =
+            GitRepository::anchor_discovery_jobs(&pinned, repository_id, &key, None).unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].area_id, area);
+        assert_eq!(page.jobs[0].attempt, None);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            GitRepository::reset_anchor_area_discovery(&pinned, Uuid::new_v4(), &key, area)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            GitRepository::reset_anchor_area_discovery(&pinned, repository_id, &key, area).unwrap()
+        );
+        assert!(
+            GitRepository::anchor_discovery_jobs(&pinned, repository_id, &key, None)
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        assert_eq!(fs::read(root.join("payload")).unwrap(), b"preserved source");
+        let catalog = ControlStore::open_existing_with_key(&path, &key).unwrap();
+        assert_eq!(
+            catalog
+                .get_record(&intent_kind, b"pending")
+                .unwrap()
+                .unwrap(),
+            b"blocked intent"
+        );
+        catalog
+            .put_record(
+                "git-guarded-prune-intent-v1/test",
+                b"withdrawn",
+                b"preserved legacy",
+            )
+            .unwrap();
+        catalog
+            .put_record(
+                mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                area.as_bytes(),
+                b"preserved journal",
+            )
+            .unwrap();
+        drop(catalog);
+        let withdrawn = fs::read(&path).unwrap();
+        assert!(GitRepository::anchor_discovery_jobs(&pinned, repository_id, &key, None).is_err());
+        assert!(
+            GitRepository::reset_anchor_area_discovery(&pinned, repository_id, &key, area).is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), withdrawn);
     }
 
     #[test]

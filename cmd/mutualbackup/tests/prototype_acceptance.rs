@@ -274,6 +274,90 @@ impl ProcessNetworkTopology {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn source_scan_cli_resets_unreadable_progress_through_daemon_and_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let seed_file = temp.path().join("recovery.seed");
+    let socket = temp.path().join("control.sock");
+    let recovery = "source-scan-operational-recovery-fixture-2027!";
+    run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--data-dir"),
+            os(&data_dir),
+            os("--seed-file"),
+            os(&seed_file),
+        ],
+        recovery.as_bytes(),
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    drop(Node::open(&data_dir, Seed::from_recovery_string(recovery).unwrap()).unwrap());
+    run_cli(&[
+        os("db-shell"), os("--data-dir"), os(&data_dir), os("--seed-file"), os(&seed_file), os("--write"), os("--execute"),
+        os("INSERT INTO protocol_records(kind, record_id, bytes) VALUES ('anchor-area-discovery-v1', X'00000000000000000000000000000001', X'756e7265616461626c65')"),
+    ], CLI_TIMEOUT).unwrap();
+    let mut daemon = Daemon::with_args(
+        vec![
+            os("--data-dir"),
+            os(&data_dir),
+            os("--seed-file"),
+            os(&seed_file),
+            os("--control-socket"),
+            os(&socket),
+            os("--failure-domain"),
+            os("source-scan-test"),
+            os("--listen"),
+            os("/ip4/127.0.0.1/udp/0/quic-v1"),
+            os("--tor-mode"),
+            os("disable-tor"),
+        ],
+        temp.path().join("daemon.log"),
+    );
+    daemon.start();
+    wait_for_status(&socket, &mut daemon, CLI_TIMEOUT);
+    let area = "00000000-0000-0000-0000-000000000001";
+    let listed = cli(&socket, ["source-scan", "list"], CLI_TIMEOUT);
+    assert!(listed.contains(area));
+    assert!(listed.contains("unreadable journal (10 bytes)"));
+    assert!(
+        run_cli(
+            &[
+                os("--socket"),
+                os(&socket),
+                os("source-scan"),
+                os("--repository"),
+                os(area),
+                os("list")
+            ],
+            CLI_TIMEOUT
+        )
+        .is_err()
+    );
+    assert!(cli(&socket, ["source-scan", "list"], CLI_TIMEOUT).contains(area));
+    assert!(
+        cli(&socket, ["source-scan", "reset", area], CLI_TIMEOUT)
+            .contains("retry the blocked operation")
+    );
+    assert!(
+        cli(&socket, ["source-scan", "list"], CLI_TIMEOUT).contains("no unfinished source scans")
+    );
+    daemon.stop_gracefully();
+    daemon.start();
+    wait_for_status(&socket, &mut daemon, CLI_TIMEOUT);
+    assert!(
+        cli(&socket, ["source-scan", "list"], CLI_TIMEOUT).contains("no unfinished source scans")
+    );
+    assert!(
+        cli(&socket, ["source-scan", "reset", area], CLI_TIMEOUT).contains("no stored source scan")
+    );
+    daemon.stop_gracefully();
+}
+
 #[test]
 fn daemon_requires_an_initialized_identity_without_creating_state() {
     let temp = tempfile::tempdir().unwrap();

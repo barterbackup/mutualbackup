@@ -1257,10 +1257,17 @@ passing tests below apply only to their recorded source and exercised cases.
     ownership, source-version, content/OID and COW checks in their consumers.
     Fresh-process Btrfs capture/cleanup and moved-stage/checkout fixtures pass;
     validation is recorded in ADR 0002.
+  - [x] Expose bounded read-only discovery-job status and explicit reset through
+    the Linux daemon and `source-scan` CLI for node and registered Git catalogs.
+    Include unreadable/oversized journals in status; reset frees their quota slot
+    without touching source data, pins, hints or Git intents. Durable per-area
+    fences reject stale publishers across reset/completion and process reopen,
+    including absent-to-present-to-absent races. Git maintenance avoids intent
+    replay and backend re-probing/rebinding. Validation is recorded in ADR 0002.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
     progress to remaining standalone capture/recovery and best-effort cleanup
     call paths; complete consumer lifecycle qualification;
-    integrate operational retry/backoff and abandoned-job quota cleanup. Qualify
+    integrate operational retry/backoff. Qualify
     other filesystems/platforms and continuously changing namespaces, plus
     absent/moved areas, reopen and source loss across complete consumers,
     including the declared 1 TiB dataset/history geometry.

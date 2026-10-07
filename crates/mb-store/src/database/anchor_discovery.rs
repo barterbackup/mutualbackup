@@ -11,6 +11,21 @@ use uuid::Uuid;
 pub const ANCHOR_DISCOVERY_JOURNAL_KIND: &str = "anchor-area-discovery-v1";
 const MAX_JOBS: usize = 32;
 const JOURNAL_BYTES: usize = ANCHOR_DISCOVERY_CHECKPOINT_BYTES + 64;
+const FENCE_KIND: &str = "anchor-area-discovery-fence-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AnchorDiscoveryJobStatus {
+    pub area_id: Uuid,
+    pub journal_bytes: u64,
+    pub attempt: Option<Uuid>,
+    pub generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AnchorDiscoveryJobPage {
+    pub jobs: Vec<AnchorDiscoveryJobStatus>,
+    pub next_after: Option<Uuid>,
+}
 
 #[derive(Serialize, Deserialize)]
 struct Location(#[serde(with = "crate::raw_path_bytes")] PathBuf);
@@ -24,6 +39,109 @@ struct Journal {
 }
 
 impl ControlStore {
+    /// Inspect one bounded page without opening any source or changing progress.
+    /// An unreadable journal still appears, so operators can reset it explicitly.
+    pub fn anchor_discovery_jobs(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<AnchorDiscoveryJobPage, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN length(record_id) = 16 THEN record_id END, length(bytes), CASE WHEN length(bytes) <= ?3 THEN bytes END
+             FROM protocol_records WHERE kind = ?1 AND record_id > ?2
+             ORDER BY record_id LIMIT ?4")?;
+        let mut rows = statement.query(params![
+            ANCHOR_DISCOVERY_JOURNAL_KIND,
+            after.map(|id| id.as_bytes().to_vec()).unwrap_or_default(),
+            JOURNAL_BYTES as i64,
+            (MAX_JOBS + 1) as i64
+        ])?;
+        let mut jobs = Vec::new();
+        let mut next_after = None;
+        while let Some(row) = rows.next()? {
+            if jobs.len() == MAX_JOBS {
+                next_after = jobs
+                    .last()
+                    .map(|job: &AnchorDiscoveryJobStatus| job.area_id);
+                break;
+            }
+            let key: Vec<u8> = row
+                .get::<_, Option<Vec<u8>>>(0)?
+                .ok_or(DatabaseError::Integrity)?;
+            let area_id = Uuid::from_slice(&key).map_err(|_| DatabaseError::Integrity)?;
+            let size: i64 = row.get(1)?;
+            let journal = row.get::<_, Option<Vec<u8>>>(2)?.and_then(|bytes| {
+                let journal: Journal = mb_core::decode_canonical(&bytes).ok()?;
+                (journal.version == 1
+                    && !journal.attempt.is_nil()
+                    && mb_core::canonical_bytes_bounded(&journal, JOURNAL_BYTES).ok()? == bytes)
+                    .then_some(journal)
+            });
+            jobs.push(AnchorDiscoveryJobStatus {
+                area_id,
+                journal_bytes: u64::try_from(size).map_err(|_| DatabaseError::Integrity)?,
+                attempt: journal.as_ref().map(|job| job.attempt),
+                generation: journal.map(|job| job.generation),
+            });
+        }
+        Ok(AnchorDiscoveryJobPage { jobs, next_after })
+    }
+
+    /// Explicitly abandon current assistance and release its quota slot. The
+    /// durable epoch invalidates work started before this reset, including a
+    /// publisher that originally observed no journal. No source/pin is touched.
+    pub fn reset_anchor_area_discovery(&self, area_id: Uuid) -> Result<bool, DatabaseError> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let existed: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind = ?1 AND record_id = ?2)",
+            params![ANCHOR_DISCOVERY_JOURNAL_KIND, area_id.as_bytes()],
+            |row| row.get(0),
+        )?;
+        Self::rotate_discovery_fence(&transaction, area_id)?;
+        let removed = transaction.execute(
+            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+            params![ANCHOR_DISCOVERY_JOURNAL_KIND, area_id.as_bytes()],
+        )?;
+        if removed != usize::from(existed) {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(existed)
+    }
+
+    fn rotate_discovery_fence(
+        transaction: &rusqlite::Transaction<'_>,
+        area_id: Uuid,
+    ) -> Result<Vec<u8>, DatabaseError> {
+        let fence = Uuid::new_v4().as_bytes().to_vec();
+        if transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+            ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            params![FENCE_KIND, area_id.as_bytes(), &fence],
+        )? != 1
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(fence)
+    }
+
+    fn discovery_fence(&self, area_id: Uuid) -> Result<Vec<u8>, DatabaseError> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let existing: Option<Option<Vec<u8>>> = transaction.query_row("SELECT CASE WHEN length(bytes) = 16 THEN bytes END FROM protocol_records WHERE kind = ?1 AND record_id = ?2", params![FENCE_KIND, area_id.as_bytes()], |row| row.get(0)).optional()?;
+        let fence = match existing {
+            Some(Some(bytes)) if Uuid::from_slice(&bytes).is_ok_and(|id| !id.is_nil()) => bytes,
+            Some(_) => return Err(DatabaseError::Integrity),
+            None => Self::rotate_discovery_fence(&transaction, area_id)?,
+        };
+        transaction.commit()?;
+        Ok(fence)
+    }
+
     /// Bounded local assistance shared by capture, serving and cleanup.
     pub fn anchor_area_location_hint(&self, area_id: Uuid) -> anyhow::Result<Option<PathBuf>> {
         Ok(self
@@ -101,6 +219,7 @@ impl ControlStore {
         &self,
         area: &StableAnchorAreaLocator,
     ) -> anyhow::Result<AnchorAreaDiscoveryStep> {
+        let fence = self.discovery_fence(area.area_id)?;
         let expected = self.get_record_bounded(
             ANCHOR_DISCOVERY_JOURNAL_KIND,
             area.area_id.as_bytes(),
@@ -158,22 +277,44 @@ impl ControlStore {
                 JOURNAL_BYTES,
             )?)
         };
-        if !self.commit_anchor_discovery(area.area_id, expected.as_deref(), next.as_deref())? {
+        if !self.commit_anchor_discovery_fenced(
+            area.area_id,
+            expected.as_deref(),
+            next.as_deref(),
+            Some(&fence),
+        )? {
             return Ok(AnchorAreaDiscoveryStep::Pending);
         }
         Ok(step)
     }
 
+    #[cfg(test)]
     fn commit_anchor_discovery(
         &self,
         area_id: Uuid,
         expected: Option<&[u8]>,
         next: Option<&[u8]>,
     ) -> anyhow::Result<bool> {
+        self.commit_anchor_discovery_fenced(area_id, expected, next, None)
+    }
+
+    fn commit_anchor_discovery_fenced(
+        &self,
+        area_id: Uuid,
+        expected: Option<&[u8]>,
+        next: Option<&[u8]>,
+        fence: Option<&[u8]>,
+    ) -> anyhow::Result<bool> {
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        if let Some(expected_fence) = fence {
+            let current: Option<Option<Vec<u8>>> = transaction.query_row("SELECT CASE WHEN length(bytes) = 16 THEN bytes END FROM protocol_records WHERE kind = ?1 AND record_id = ?2", params![FENCE_KIND, area_id.as_bytes()], |row| row.get(0)).optional()?;
+            if current.as_ref().and_then(Option::as_deref) != Some(expected_fence) {
+                return Ok(false);
+            }
+        }
         let actual = transaction.query_row(
             "SELECT CASE WHEN length(bytes) <= ?3 THEN bytes END FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
             params![ANCHOR_DISCOVERY_JOURNAL_KIND, area_id.as_bytes(), JOURNAL_BYTES as i64],
@@ -202,6 +343,7 @@ impl ControlStore {
                 let removed = transaction.execute("DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
                     params![ANCHOR_DISCOVERY_JOURNAL_KIND, area_id.as_bytes(), expected])?;
                 if removed != usize::from(expected.is_some()) { return Err(DatabaseError::Conflict.into()); }
+                Self::rotate_discovery_fence(&transaction, area_id)?;
             }
         }
         transaction.commit()?;
@@ -227,6 +369,7 @@ impl ControlStore {
             params![ANCHOR_DISCOVERY_JOURNAL_KIND, area_id.as_bytes()],
             |row| row.get(0),
         )?;
+        Self::rotate_discovery_fence(&transaction, area_id)?;
         if transaction.execute("INSERT INTO protocol_records (kind, record_id, bytes) VALUES ('anchor-area-location', ?1, ?2)
             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
             params![area_id.as_bytes(), hint])? != 1 { return Err(DatabaseError::Conflict); }
@@ -246,6 +389,221 @@ impl ControlStore {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn discovery_status_pages_unreadable_jobs_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[8; 32]).unwrap();
+        let attempt = Uuid::new_v4();
+        let valid = mb_core::canonical_bytes(&Journal {
+            version: 1,
+            attempt,
+            generation: 7,
+            cursor: vec![],
+        })
+        .unwrap();
+        // Include over-quota imported state so listing must expose every page.
+        for n in 1..=34 {
+            let bytes = match n {
+                2 => vec![0; JOURNAL_BYTES + 1],
+                3 => b"corrupt".to_vec(),
+                _ => valid.clone(),
+            };
+            store
+                .put_record(
+                    ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    Uuid::from_u128(n).as_bytes(),
+                    &bytes,
+                )
+                .unwrap();
+        }
+        drop(store);
+        let original = fs::read(&path).unwrap();
+        let store = ControlStore::open_existing_read_only_with_key(&path, &[8; 32]).unwrap();
+        let first = store.anchor_discovery_jobs(None).unwrap();
+        assert_eq!(first.jobs.len(), MAX_JOBS);
+        assert_eq!(first.next_after, Some(Uuid::from_u128(32)));
+        assert_eq!(first.jobs[0].attempt, Some(attempt));
+        assert_eq!(first.jobs[0].generation, Some(7));
+        assert_eq!(first.jobs[1].journal_bytes, (JOURNAL_BYTES + 1) as u64);
+        assert_eq!(first.jobs[1].attempt, None);
+        assert_eq!(first.jobs[2].generation, None);
+        let second = store.anchor_discovery_jobs(first.next_after).unwrap();
+        assert_eq!(
+            second
+                .jobs
+                .iter()
+                .map(|job| job.area_id)
+                .collect::<Vec<_>>(),
+            vec![Uuid::from_u128(33), Uuid::from_u128(34)]
+        );
+        assert_eq!(second.next_after, None);
+        assert!(
+            store
+                .reset_anchor_area_discovery(Uuid::from_u128(2))
+                .is_err()
+        );
+        drop(store);
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn discovery_reset_fences_absence_aba_and_old_progress_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let old = ControlStore::open_with_key(&path, &[8; 32]).unwrap();
+        let area = Uuid::new_v4();
+        let original_fence = old.discovery_fence(area).unwrap();
+        let current = ControlStore::open_existing_with_key(&path, &[8; 32]).unwrap();
+        assert!(
+            current
+                .commit_anchor_discovery_fenced(
+                    area,
+                    None,
+                    Some(b"old progress"),
+                    Some(&original_fence)
+                )
+                .unwrap()
+        );
+        assert!(current.reset_anchor_area_discovery(area).unwrap());
+        drop(current);
+        let current = ControlStore::open_existing_with_key(&path, &[8; 32]).unwrap();
+        // Absence is the same as the stale publisher originally saw; its epoch isn't.
+        assert!(
+            !old.commit_anchor_discovery_fenced(
+                area,
+                None,
+                Some(b"resurrected"),
+                Some(&original_fence)
+            )
+            .unwrap()
+        );
+        assert!(
+            !old.commit_anchor_discovery_fenced(
+                area,
+                Some(b"old progress"),
+                Some(b"stale"),
+                Some(&original_fence)
+            )
+            .unwrap()
+        );
+        let fresh_fence = current.discovery_fence(area).unwrap();
+        assert_ne!(fresh_fence, original_fence);
+        assert!(
+            current
+                .commit_anchor_discovery_fenced(area, None, Some(b"fresh"), Some(&fresh_fence))
+                .unwrap()
+        );
+        current
+            .finish_anchor_area_discovery(area, b"verified hint")
+            .unwrap();
+        assert!(
+            !old.commit_anchor_discovery_fenced(
+                area,
+                None,
+                Some(b"late completion"),
+                Some(&fresh_fence)
+            )
+            .unwrap()
+        );
+        let completed_fence = current.discovery_fence(area).unwrap();
+        assert!(!current.reset_anchor_area_discovery(area).unwrap());
+        assert!(
+            !old.commit_anchor_discovery_fenced(
+                area,
+                None,
+                Some(b"late absence"),
+                Some(&completed_fence)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            current
+                .get_record("anchor-area-location", area.as_bytes())
+                .unwrap()
+                .unwrap(),
+            b"verified hint"
+        );
+        assert!(current.anchor_discovery_jobs(None).unwrap().jobs.is_empty());
+    }
+
+    #[test]
+    fn discovery_reset_releases_quota_and_rolls_back_ignored_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[8; 32]).unwrap();
+        let area = Uuid::from_u128(1);
+        let fence = store.discovery_fence(area).unwrap();
+        for n in 1..=MAX_JOBS {
+            assert!(
+                store
+                    .commit_anchor_discovery(Uuid::from_u128(n as u128), None, Some(b"unreadable"))
+                    .unwrap()
+            );
+        }
+        let next = Uuid::from_u128(100);
+        assert!(
+            store
+                .commit_anchor_discovery(next, None, Some(b"new"))
+                .is_err()
+        );
+        store
+            .put_record("anchor-area-location", area.as_bytes(), b"saved hint")
+            .unwrap();
+        store
+            .put_record("physical-pin", area.as_bytes(), b"preserved pin")
+            .unwrap();
+        for trigger in [
+            "CREATE TEMP TRIGGER deny_reset BEFORE UPDATE ON protocol_records WHEN NEW.kind = 'anchor-area-discovery-fence-v1' BEGIN SELECT RAISE(IGNORE); END;",
+            "CREATE TEMP TRIGGER deny_reset BEFORE DELETE ON protocol_records WHEN OLD.kind = 'anchor-area-discovery-v1' BEGIN SELECT RAISE(IGNORE); END;",
+        ] {
+            store.connection.execute_batch(trigger).unwrap();
+            assert!(store.reset_anchor_area_discovery(area).is_err());
+            assert_eq!(store.discovery_fence(area).unwrap(), fence);
+            assert_eq!(
+                store
+                    .get_record(ANCHOR_DISCOVERY_JOURNAL_KIND, area.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+                b"unreadable"
+            );
+            store
+                .connection
+                .execute_batch("DROP TRIGGER deny_reset")
+                .unwrap();
+        }
+        assert!(store.reset_anchor_area_discovery(area).unwrap());
+        assert!(
+            store
+                .commit_anchor_discovery(next, None, Some(b"new"))
+                .unwrap()
+        );
+        assert_eq!(
+            store.anchor_discovery_jobs(None).unwrap().jobs.len(),
+            MAX_JOBS
+        );
+        assert_eq!(
+            store
+                .get_record("anchor-area-location", area.as_bytes())
+                .unwrap()
+                .unwrap(),
+            b"saved hint"
+        );
+        assert_eq!(
+            store
+                .get_record("physical-pin", area.as_bytes())
+                .unwrap()
+                .unwrap(),
+            b"preserved pin"
+        );
+        // Explicit reset also repairs malformed assistance fences, without loading them.
+        store
+            .put_record(FENCE_KIND, area.as_bytes(), &vec![0; JOURNAL_BYTES + 1])
+            .unwrap();
+        assert!(store.discovery_fence(area).is_err());
+        assert!(!store.reset_anchor_area_discovery(area).unwrap());
+        assert_eq!(store.discovery_fence(area).unwrap().len(), 16);
+    }
 
     #[test]
     fn anchor_discovery_cursor_survives_fresh_processes() {
@@ -533,6 +891,7 @@ mod tests {
                 .commit_anchor_discovery(Uuid::new_v4(), None, Some(b"excess"))
                 .is_err()
         );
+        let original_fence = store.discovery_fence(id).unwrap();
         for target in ["hint", "cleanup"] {
             let trigger = if target == "hint" {
                 "CREATE TEMP TRIGGER deny_discovery BEFORE INSERT ON protocol_records WHEN NEW.kind = 'anchor-area-location' BEGIN SELECT RAISE(IGNORE); END;"
@@ -541,6 +900,7 @@ mod tests {
             };
             store.connection.execute_batch(trigger).unwrap();
             assert!(store.finish_anchor_area_discovery(id, b"location").is_err());
+            assert_eq!(store.discovery_fence(id).unwrap(), original_fence);
             assert_eq!(
                 store
                     .get_record(ANCHOR_DISCOVERY_JOURNAL_KIND, id.as_bytes())

@@ -70,6 +70,8 @@ mutualbackup snapshot list
 mutualbackup snapshot restore TARGET [--revision UUID]
 mutualbackup restore TARGET
 mutualbackup storage list|scrub|reclaim|drain|migrate|reactivate|reconcile
+mutualbackup source-scan [--repository UUID] list [--after UUID]
+mutualbackup source-scan [--repository UUID] reset AREA_UUID
 mutualbackup audit [--repair]
 mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 ```
@@ -78,6 +80,18 @@ mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 filesystems. Existing guarded roots and their retained history require the
 preservation procedure in [the withdrawal guide](docs/guarded-withdrawal.md).
 Verified historical export and retirement remain open in R1 of [`plan.md`](plan.md).
+
+On Linux, moved source anchors use resumable scans. If unfinished scans exhaust
+local scan capacity, `source-scan list` shows up to 32 jobs and a continuation
+cursor. Add `--repository UUID` before the subcommand to inspect a registered
+Git repository; otherwise the command inspects the node catalog. An unreadable
+journal remains visible. `source-scan reset AREA_UUID` discards that area's
+current scan progress and frees its quota slot, including after a restart.
+Earlier in-flight work cannot recreate the job. Reset preserves backup data,
+location hints, pins and Git intents; retry the blocked operation to start a
+fresh scan. Reset acts on current progress when the request executes, so a stale
+listing does not restrict it to the attempt previously displayed. Inspection
+reports journal headers, not verified source availability.
 
 Parity may span several configured filesystems. Each volume has a signed UUID,
 an independently wrapped SQLCipher key, a byte budget and repair headroom.

@@ -18,7 +18,9 @@ use crate::SCHEMA_VERSION;
 mod anchor_discovery;
 mod catalog;
 #[cfg(target_os = "linux")]
-pub use anchor_discovery::ANCHOR_DISCOVERY_JOURNAL_KIND;
+pub use anchor_discovery::{
+    ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage, AnchorDiscoveryJobStatus,
+};
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogIntentState,

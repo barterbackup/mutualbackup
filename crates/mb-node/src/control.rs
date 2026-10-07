@@ -307,6 +307,30 @@ async fn handle_request(
     request: LocalRequest,
 ) -> Result<LocalResponse> {
     match request {
+        #[cfg(target_os = "linux")]
+        LocalRequest::AnchorDiscoveryStatus {
+            repository_id,
+            after,
+        } => {
+            blocking_node(node, move |node| {
+                node.anchor_discovery_jobs(repository_id, after)
+                    .map(LocalResponse::AnchorDiscoveryJobs)
+            })
+            .await
+        }
+        #[cfg(target_os = "linux")]
+        LocalRequest::AnchorDiscoveryReset {
+            repository_id,
+            area_id,
+        } => {
+            blocking_node(node, move |node| {
+                Ok(LocalResponse::AnchorDiscoveryReset {
+                    area_id,
+                    removed: node.reset_anchor_area_discovery(repository_id, area_id)?,
+                })
+            })
+            .await
+        }
         LocalRequest::Unlock { .. } => bail!("daemon is already unlocked"),
         LocalRequest::Status => {
             let mut status = blocking_node(node, |node| node.status()).await?;

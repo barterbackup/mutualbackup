@@ -1459,6 +1459,77 @@ impl Node {
         mb_git::catalog_key(&self.keys, repository_id)
     }
 
+    #[cfg(target_os = "linux")]
+    fn discovery_git_root(&self, repository_id: Uuid) -> Result<mb_store::PinnedDirectory> {
+        let bytes = self
+            .control
+            .get_record("git-repository", repository_id.as_bytes())?
+            .context("Git repository is not registered with this daemon")?;
+        let info: GitRepositoryInfo = decode_canonical(&bytes)?;
+        let root = self.protected_root_by_id(repository_id)?;
+        if info.format_version != 1 || info.repository_id != repository_id || info.path != root.path
+        {
+            anyhow::bail!("Git repository registration is invalid");
+        }
+        let metadata = fs::symlink_metadata(&root.path)?;
+        let filesystem = filesystem_identity(&root.path)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || !root.matches_identity(filesystem, metadata.ino())
+        {
+            anyhow::bail!("protected Git root identity changed");
+        }
+        let pinned = mb_store::PinnedDirectory::open(&root.path)?;
+        let identity = pinned.identity()?;
+        if identity.filesystem_id != filesystem.stable_id || identity.inode != metadata.ino() {
+            anyhow::bail!("protected Git root identity changed while pinning it");
+        }
+        let binding: SourceBackendBinding = decode_canonical(
+            &self
+                .control
+                .get_record("source-backend", repository_id.as_bytes())?
+                .context("protected Git root has no source backend binding")?,
+        )?;
+        if !binding.is_supported_for(repository_id, filesystem.stable_id, metadata.ino()) {
+            anyhow::bail!("protected Git root has an incompatible source backend binding");
+        }
+        Ok(pinned)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn anchor_discovery_jobs(
+        &self,
+        repository_id: Option<Uuid>,
+        after: Option<Uuid>,
+    ) -> Result<mb_store::AnchorDiscoveryJobPage> {
+        match repository_id {
+            Some(id) => GitRepository::anchor_discovery_jobs(
+                &self.discovery_git_root(id)?,
+                id,
+                &self.git_catalog_key(id),
+                after,
+            ),
+            None => Ok(self.control.anchor_discovery_jobs(after)?),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn reset_anchor_area_discovery(
+        &self,
+        repository_id: Option<Uuid>,
+        area_id: Uuid,
+    ) -> Result<bool> {
+        match repository_id {
+            Some(id) => GitRepository::reset_anchor_area_discovery(
+                &self.discovery_git_root(id)?,
+                id,
+                &self.git_catalog_key(id),
+                area_id,
+            ),
+            None => Ok(self.control.reset_anchor_area_discovery(area_id)?),
+        }
+    }
+
     pub fn git_init(&mut self, source_root: &Path) -> Result<GitRepositoryInfo> {
         let source_root = source_root
             .canonicalize()
@@ -14616,6 +14687,170 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_maintenance_selects_catalog_without_replaying_git_or_rebinding_mount() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([121; 32]);
+        let mut node = Node::open(temp.path().join("state"), seed).unwrap();
+        let area = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let path = temp.path().join("source");
+        fs::create_dir(&path).unwrap();
+        let filesystem = filesystem_identity(&path).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        node.install_test_protected_root(ProtectedRoot {
+            format_version: 3,
+            root_id: repository_id,
+            path: path.clone(),
+            filesystem_id: filesystem.stable_id,
+            root_inode: inode,
+        })
+        .unwrap();
+        let binding = canonical_bytes(&SourceBackendBinding::reflink_v1(
+            repository_id,
+            filesystem.stable_id,
+            inode,
+            filesystem.mount_id.saturating_add(1),
+        ))
+        .unwrap();
+        node.control
+            .put_record("source-backend", repository_id.as_bytes(), &binding)
+            .unwrap();
+        node.control
+            .put_record(
+                "git-repository",
+                repository_id.as_bytes(),
+                &canonical_bytes(&GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id,
+                    path: path.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        node.control
+            .put_record(
+                mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                area.as_bytes(),
+                b"node job",
+            )
+            .unwrap();
+        let directory = path.join(mb_store::GIT_CATALOG_DIRECTORY);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            directory.join(mb_store::GIT_CATALOG_MARKER_FILE),
+            mb_store::git_catalog_marker_bytes(repository_id),
+        )
+        .unwrap();
+        let catalog = ControlStore::open_with_key(
+            directory.join("catalog.db"),
+            &node.git_catalog_key(repository_id),
+        )
+        .unwrap();
+        catalog
+            .put_record(
+                "git-source-backend-v1",
+                repository_id.as_bytes(),
+                &canonical_bytes(&(1_u16, repository_id, SourceBackendKind::ReflinkV1)).unwrap(),
+            )
+            .unwrap();
+        catalog
+            .put_record(
+                mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                area.as_bytes(),
+                b"git job",
+            )
+            .unwrap();
+        let intent_kind = format!("git-checkout-intent-v1/{repository_id}");
+        catalog
+            .put_record(&intent_kind, b"pending", b"blocked intent")
+            .unwrap();
+        drop(catalog);
+        assert_eq!(
+            node.anchor_discovery_jobs(None, None).unwrap().jobs.len(),
+            1
+        );
+        assert_eq!(
+            node.anchor_discovery_jobs(Some(repository_id), None)
+                .unwrap()
+                .jobs
+                .len(),
+            1
+        );
+        assert!(
+            node.reset_anchor_area_discovery(Some(repository_id), area)
+                .unwrap()
+        );
+        assert!(
+            node.anchor_discovery_jobs(Some(repository_id), None)
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        assert_eq!(
+            node.anchor_discovery_jobs(None, None).unwrap().jobs.len(),
+            1
+        );
+        assert_eq!(
+            node.control
+                .get_record("source-backend", repository_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+            binding
+        );
+        let catalog = ControlStore::open_existing_read_only_with_key(
+            directory.join("catalog.db"),
+            &node.git_catalog_key(repository_id),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog
+                .get_record(&intent_kind, b"pending")
+                .unwrap()
+                .unwrap(),
+            b"blocked intent"
+        );
+        assert!(
+            node.reset_anchor_area_discovery(Some(Uuid::new_v4()), area)
+                .is_err()
+        );
+        assert!(node.reset_anchor_area_discovery(None, area).unwrap());
+        assert!(
+            node.anchor_discovery_jobs(None, None)
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        // Once validated, maintenance keeps the same pinned root across rename.
+        let pinned = node.discovery_git_root(repository_id).unwrap();
+        fs::rename(&path, temp.path().join("moved")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(
+            GitRepository::anchor_discovery_jobs(
+                &pinned,
+                repository_id,
+                &node.git_catalog_key(repository_id),
+                None
+            )
+            .unwrap()
+            .jobs
+            .is_empty()
+        );
+        // A new request at the replaced registered path must reject its identity.
+        assert!(
+            node.anchor_discovery_jobs(Some(repository_id), None)
+                .is_err()
+        );
+        assert!(
+            node.reset_anchor_area_discovery(Some(repository_id), area)
+                .is_err()
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn legacy_export_peer_recovery_reads_real_survivors_without_opening_withdrawn_node() {

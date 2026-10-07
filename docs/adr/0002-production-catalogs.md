@@ -1607,3 +1607,71 @@ Remaining standalone capture/recovery and best-effort cleanup callers, complete
 consumer lifecycle qualification, retry/backoff and abandoned-job cleanup,
 other filesystems/platforms and real 1 TiB dataset/history qualification remain
 open. These changes do not close R3 or the broader production release gates.
+
+
+### Operator recovery for unfinished discovery (2026-10-07)
+
+Linux local control and `mutualbackup source-scan` now expose discovery status
+and explicit reset. The default catalog is the node control store; an optional
+registered repository UUID selects its private Git catalog. Listing uses an
+indexed UUID continuation cursor, returns at most 32 summaries and reads at
+most one bounded journal payload at a time. Oversized or undecodable journals
+still report their area and stored length. Attempt/generation fields describe a
+canonical version-1 journal envelope, not cursor usability, source availability
+or backup authority. Concurrent changes can alter the next page; this is an
+operational view, not a frozen backup snapshot.
+
+Reset abandons the current journal, including malformed or oversized progress,
+and frees its active-job quota slot. It does not delete source anchors, physical
+pins, saved location hints or Git operation intents. The request applies to
+current assistance when executed, even if the caller listed an older attempt.
+A blocked operation must be retried to begin fresh work; reset itself neither
+scans nor replays that operation. The 32-job admission limit remains in place,
+and no pending job is silently evicted.
+
+Every advancing writer reads a per-area durable random epoch before filesystem
+work, then compares it together with exact journal bytes inside the short SQL
+publication transaction. Reset rotates the epoch and deletes the journal
+atomically. Successful hint completion and exhausted scans rotate it as well.
+Thus a publisher that observed absence cannot revive a job after another
+process created and reset it, even though the journal is absent again. Ignored
+fence, hint or cleanup writes roll the transaction back. The epoch is a bounded
+16-byte record retained per encountered area, outside the active-job quota;
+keeping it prevents arbitrarily late publishers from matching an old absence.
+It is local assistance, not a recovery generation or signed authority floor.
+Malformed epochs fail closed until explicit reset repairs that assistance.
+
+Git maintenance carries the same validated, pinned source directory into the
+catalog operation; renaming/replacing its pathname cannot redirect that operation.
+It pins the private catalog directory and validates its marker, registration and
+native ownership classification. It opens existing state without normal
+repository replay, so blocked checkout intents can remain
+pending while scan progress is reset. Node-side maintenance validates existing
+stable root identity and backend binding without probing or rewriting it after
+a remount. Read-only listing leaves catalog bytes and backend bindings intact.
+Withdrawn guarded state and changed root identities are rejected before reset.
+
+The locked workspace/all-targets test build and strict Clippy pass, along with
+formatting and diff checks. The full ordinary store suite passes 139 tests
+(24 provisioned cases ignored) and the full ordinary Git suite passes 92 tests
+(64 provisioned cases ignored). Twelve local control/schema tests, six CLI tests
+and the Node catalog-selection/remount-binding fixture pass. A real CLI/daemon
+process fixture lists a malformed job, rejects an unregistered Git selection,
+resets the job and verifies its absence after daemon restart. Store regressions
+cover bounded paginated read-only status, oversized journals, quota release,
+absent/present/absent stale-publisher races across independent connections and
+reopen, preserved pins/hints, malformed fences and rollback of ignored writes.
+
+Three provisioned Btrfs regressions pass: cursor replay through independent
+processes, source-loss retirement of a missing job and Git stage replay using a
+saved area hint. The owned 512 MiB mount, loop device, image and fixture were
+removed, with mount absence and loop detachment verified. Final review then
+keeps the validated source-root pin across maintenance; targeted Git and Node
+maintenance, local control/schema and real CLI/daemon restart tests pass on that
+refinement, including rename/replacement of the registered pathname. The final
+locked all-targets build, formatting/diff checks and strict Clippy also pass.
+No full Node, topology, other-platform or real 1 TiB qualification ran.
+Operational retry/backoff, remaining standalone
+consumers, complete physical/filesystem lifecycle and platform qualification,
+and the real 1 TiB dataset/history gate remain open. This increment does not
+close R3 or the broader M6 production gates.

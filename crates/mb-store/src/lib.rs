@@ -38,7 +38,9 @@ pub use anchor::{
     GuardedViewMetadataEntry, GuardedViewMetadataV1,
 };
 #[cfg(target_os = "linux")]
-pub use database::ANCHOR_DISCOVERY_JOURNAL_KIND;
+pub use database::{
+    ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage, AnchorDiscoveryJobStatus,
+};
 pub use database::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogIntentState,

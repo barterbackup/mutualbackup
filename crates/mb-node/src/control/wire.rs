@@ -33,6 +33,16 @@ pub struct LocalResponseEnvelope {
 
 #[derive(Serialize, Deserialize)]
 pub enum LocalRequest {
+    #[cfg(target_os = "linux")]
+    AnchorDiscoveryStatus {
+        repository_id: Option<Uuid>,
+        after: Option<Uuid>,
+    },
+    #[cfg(target_os = "linux")]
+    AnchorDiscoveryReset {
+        repository_id: Option<Uuid>,
+        area_id: Uuid,
+    },
     Status,
     StorageStatus,
     StorageScrub,
@@ -479,6 +489,13 @@ pub enum LocalRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum LocalResponse {
+    #[cfg(target_os = "linux")]
+    AnchorDiscoveryJobs(mb_store::AnchorDiscoveryJobPage),
+    #[cfg(target_os = "linux")]
+    AnchorDiscoveryReset {
+        area_id: Uuid,
+        removed: bool,
+    },
     Locked {
         expected_node_id: NodeId,
     },
@@ -826,6 +843,79 @@ mod tests {
             "request": { "Recover": { "target": { "unix_bytes": "not-hex" } } }
         });
         assert!(serde_json::from_value::<LocalRequestEnvelope<LocalRequest>>(malformed).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_controls_match_schema_and_fit_local_frames() {
+        let id = Uuid::from_u128(1);
+        for repository_id in [None, Some(id)] {
+            for request in [
+                LocalRequest::AnchorDiscoveryStatus {
+                    repository_id,
+                    after: None,
+                },
+                LocalRequest::AnchorDiscoveryStatus {
+                    repository_id,
+                    after: Some(id),
+                },
+                LocalRequest::AnchorDiscoveryReset {
+                    repository_id,
+                    area_id: id,
+                },
+            ] {
+                let envelope = LocalRequestEnvelope {
+                    format_version: LOCAL_WIRE_FORMAT_VERSION,
+                    request_id: [9; 16],
+                    request,
+                };
+                let encoded = serde_json::to_string(&envelope).unwrap();
+                cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &encoded).unwrap();
+                let decoded: LocalRequestEnvelope<LocalRequest> =
+                    serde_json::from_str(&encoded).unwrap();
+                assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+            }
+        }
+        let job = mb_store::AnchorDiscoveryJobStatus {
+            area_id: id,
+            journal_bytes: u64::MAX,
+            attempt: Some(id),
+            generation: Some(u64::MAX),
+        };
+        for response in [
+            LocalResponse::AnchorDiscoveryJobs(mb_store::AnchorDiscoveryJobPage {
+                jobs: vec![job; 32],
+                next_after: Some(id),
+            }),
+            LocalResponse::AnchorDiscoveryJobs(mb_store::AnchorDiscoveryJobPage {
+                jobs: vec![mb_store::AnchorDiscoveryJobStatus {
+                    area_id: id,
+                    journal_bytes: 3,
+                    attempt: None,
+                    generation: None,
+                }],
+                next_after: None,
+            }),
+            LocalResponse::AnchorDiscoveryReset {
+                area_id: id,
+                removed: true,
+            },
+            LocalResponse::AnchorDiscoveryReset {
+                area_id: id,
+                removed: false,
+            },
+        ] {
+            let envelope = LocalResponseEnvelope {
+                format_version: LOCAL_WIRE_FORMAT_VERSION,
+                request_id: [9; 16],
+                result: Ok(response),
+            };
+            let encoded = serde_json::to_string(&envelope).unwrap();
+            assert!(encoded.len() < super::super::MAX_LOCAL_FRAME_BYTES);
+            cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
+            let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        }
     }
 
     #[test]

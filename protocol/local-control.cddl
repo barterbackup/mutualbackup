@@ -18,6 +18,8 @@ local-path = tstr / { unix_bytes: tstr }
 
 local-request =
     "Status"
+  / { "AnchorDiscoveryStatus": { repository_id: null / uuid-text, after: null / uuid-text } }
+  / { "AnchorDiscoveryReset": { repository_id: null / uuid-text, area_id: uuid-text } }
   / "StorageStatus"
   / "StorageScrub"
   / { "StorageReclaim": { volume_id: null / uuid-text } }
@@ -122,6 +124,8 @@ local-response =
     { "Locked": { expected_node_id: bytes32-array } }
   / { "Unlocked": { node_id: bytes32-array } }
   / { "Status": node-status }
+  / { "AnchorDiscoveryJobs": anchor-discovery-job-page }
+  / { "AnchorDiscoveryReset": { area_id: uuid-text, removed: bool } }
   / { "StorageVolumes": [* storage-volume-status] }
   / { "StorageScrubbed": [* storage-scrub-report] }
   / { "StorageReclaimed": { bytes: uint } }
@@ -497,3 +501,15 @@ uint8 = 0..255
 bytes16-array = [16*16 uint8]
 bytes32-array = [32*32 uint8]
 bytes20-array = [20*20 uint8]
+
+; Local assistance only; these summaries do not validate source contents.
+anchor-discovery-job-page = {
+  jobs: [0*32 anchor-discovery-job],
+  next_after: null / uuid-text
+}
+anchor-discovery-job = {
+  area_id: uuid-text,
+  journal_bytes: uint,
+  attempt: null / uuid-text,
+  generation: null / uint
+}
