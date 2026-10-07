@@ -1213,12 +1213,21 @@ passing tests below apply only to their recorded source and exercised cases.
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.
-  - [ ] Bound stable anchor relocation discovery. The current fallback walks
-    complete matching filesystems while holding the process-wide area-index
-    mutex. Replace it with bounded incremental discovery/indexing and durable
-    location hints, preserving ambiguity and mount identity checks. Qualify
-    absent/moved areas, reopen and source loss without blocking unrelated
-    lookups, including the declared large dataset/history geometry.
+  - [x] Replace the Linux whole-filesystem lookup under the global mutex with
+    bounded process-local relocation cursors. Each lookup advances at most 2,048
+    steps with a cooperative 25 ms deadline; incomplete work returns an explicit
+    retry error. The index has 32 slots; pinned streaming directory frames have
+    a shared 64-frame limit, with bounded depth, paths, roots and mount input.
+    Scans retain accessible-candidate ambiguity and filesystem/mount fences,
+    reject replaced candidate paths, and release handles after errors/eviction.
+    Busy scans do not block unrelated area lookups. Existing native-bound Git
+    catalogs retain unavailable sources for repair; unbound catalogs still fail
+    without native provenance. Validation is recorded in ADR 0002.
+  - [ ] Complete stable anchor relocation discovery integration. Persist useful
+    location hints for paged sources and provide restart/eviction-safe progress
+    for scans that outlive one process. Qualify absent/moved areas, reopen and
+    source loss without blocking unrelated lookups, including the declared
+    1 TiB dataset/history geometry and physical mount/remount lifecycle.
   - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,
     retention and seed-only recovery together; qualify the declared capacity
     and geometry policy on real data before enabling production admission.

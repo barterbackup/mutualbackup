@@ -234,11 +234,21 @@ impl NodeService {
     }
 
     fn checkout_reader(&self) -> Result<NodeReader> {
-        self.active_readers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.max_readers).then_some(active + 1)
-            })
-            .map_err(|_| anyhow::anyhow!("peer read capacity is exhausted"))?;
+        let mut active = self.active_readers.load(Ordering::Acquire);
+        loop {
+            if active >= self.max_readers {
+                anyhow::bail!("peer read capacity is exhausted");
+            }
+            match self.active_readers.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
         let reader = (|| {
             if let Some(reader) = self.readers.lock().map_err(lock_error)?.pop() {
                 Ok(reader)

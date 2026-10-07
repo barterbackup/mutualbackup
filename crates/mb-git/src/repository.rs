@@ -196,8 +196,12 @@ fn require_native_pinned_catalog_state(
             // A bound native catalog may retain damaged or unavailable copies
             // for repair. Its other verified copies remain usable. An unbound
             // catalog needs available provenance before backend migration.
-            Err(AnchorError::AnchorAreaCollision(_)) if native_binding => Ok(()),
-            Err(error @ AnchorError::AnchorAreaCollision(_)) => Err(anyhow::Error::new(error).context(
+            Err(AnchorError::AnchorAreaCollision(_)
+                | AnchorError::AnchorAreaDiscoveryPending
+                | AnchorError::AnchorAreaDiscoveryLimit) if native_binding => Ok(()),
+            Err(error @ (AnchorError::AnchorAreaCollision(_)
+                | AnchorError::AnchorAreaDiscoveryPending
+                | AnchorError::AnchorAreaDiscoveryLimit)) => Err(anyhow::Error::new(error).context(
                 "cannot classify an unbound Git anchor; preserve the original catalog and make its anchor area available",
             )),
             result => result.map_err(Into::into),
@@ -2318,7 +2322,9 @@ mod tests {
         unavailable.area.area_id = Uuid::new_v4();
         assert!(matches!(
             unavailable.require_native_ownership(),
-            Err(AnchorError::AnchorAreaCollision(_))
+            Err(AnchorError::AnchorAreaCollision(_)
+                | AnchorError::AnchorAreaDiscoveryPending
+                | AnchorError::AnchorAreaDiscoveryLimit)
         ));
         let repository_id = Uuid::new_v4();
         let key = [95; 32];

@@ -1360,3 +1360,54 @@ upgrade checks and read-only inspection of every known parity schema. Formatting
 and strict locked workspace/all-targets Clippy pass. The preceding serving
 commit records the full 761-case ordinary run; this focused follow-up does not
 rerun those unrelated suites or establish current R7/platform/1 TiB evidence.
+
+### Bounded process-local anchor discovery (2026-10-07)
+
+Linux relocation lookup now keeps an incremental cursor for each area/filesystem/
+volume-root key. The global index lock covers only bounded map operations;
+filesystem reads and cursor disposal occur outside it. A busy area's per-cursor
+lock returns an explicit pending error, allowing unrelated lookups to proceed.
+Each request advances at most 2,048 scan steps with a cooperative 25 ms deadline.
+This bounds scheduled work, not the duration of an individual kernel I/O call.
+Pending work and resource-limit errors never populate the negative cache.
+
+The index holds at most 32 entries. Inactive entries may be evicted, releasing
+cursor handles outside the index lock. Streaming directory enumeration uses
+pinned descriptor-relative child opens rather than WalkDir's directory buffering.
+At most 64 frames are retained across all cursors, each owning a pinned directory
+and an iterator; depth is also capped at 64. Paths are bounded at 4,096 bytes,
+mount input at 256 KiB and discovery roots at 256. Exhaustion returns an explicit
+location-required error. These are local discovery limits, not a new dataset
+capacity or supported capture geometry claim.
+
+Scans reject symlinks and mount crossings and check each pinned child's actual
+stable filesystem identity, including Btrfs subvolume identity. They keep the
+existing ordered-root policy and reject distinct accessible matching areas within
+the selected root. A candidate is returned only after that root completes and its
+path still resolves to the same native directory and marker. Existing explicit/
+catalog hints remain the fast path. Already native-bound Git catalogs preserve
+unavailable copies for repair; unbound catalogs fail with the preservation error
+before any binding migration. Wire locator encodings remain unchanged.
+
+Five new fixtures exercise incremental wide-directory progress, late duplicate
+markers, absent sources, symlinks, stale roots, wrong filesystem identity, exact
+candidate/EOF budgeting, depth/path/mount limits, busy-area independence, cached
+resolution and candidate replacement. The ordinary store suite passes 131 tests;
+the final child-identity check additionally passes all 30 ordinary anchor tests.
+The Git suite passes 90 ordinary tests, including unavailable-provenance database
+preservation. Node passes 18 paged, five anchor and one reader-capacity tests.
+Formatting, diff checks and strict locked workspace/all-targets Clippy pass on
+Rust 1.99. The reader permit counter uses equivalent compare-exchange operations
+to preserve the Rust 1.91 minimum; a redundant legacy-export closure borrow also
+needed removal under the newer Clippy. The workspace/all-targets test build passed
+before the final child-identity check; final anchor tests and Clippy compile that
+check. Nineteen store, 62 Git and three selected Node provisioned tests remain
+ignored. No physical Btrfs/remount, topology, platform or 1 TiB qualification ran.
+
+This completes bounded process-local discovery, not production relocation.
+Persisted hints for paged sources, restart/eviction-safe scan progress, operational
+retry/recovery integration and physical absent/moved/remount/source-loss gates
+remain open. Repeated short-lived commands can currently restart a long scan;
+valid durable hints avoid discovery, but the cursor itself is not durable. The
+first-release capacity target remains 1 TiB per dataset including retained history,
+subject to real-data qualification before production admission.

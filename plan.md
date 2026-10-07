@@ -1462,6 +1462,16 @@ Every supported legacy parity upgrade now checks its final schema-version write.
 Rejected metadata rolls back table conversion and reservation creation together;
 the old schema and shard bytes remain available for a clean reopen/retry.
 
+
+Linux stable-anchor relocation now advances bounded process-local cursors without
+holding the global area-index mutex during filesystem work. Streaming pinned
+reads enforce mount boundaries and retain accessible-candidate ambiguity checks;
+work/resource exhaustion returns explicit retry/location errors instead of source
+absence. The index and shared directory-handle budget are bounded. Already native
+Git catalogs keep unavailable copies for repair; unbound catalogs still require
+provenance. Durable paged hints, restart/eviction-safe progress, physical lifecycle
+and real 1 TiB dataset/history qualification remain required.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

@@ -291,7 +291,7 @@ fn recover_packed(
         if !descriptor
             .slots
             .iter()
-            .any(|slot| slot.source().is_some_and(&matches))
+            .any(|slot| slot.source().is_some_and(matches))
         {
             continue;
         }
