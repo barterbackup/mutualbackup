@@ -1623,8 +1623,10 @@ package-target retry passed in 193.62 seconds on a different feature-unified
 binary; this is not a passing workspace gate. Separate locked store tests and
 the workspace/all-targets build pass. Provisioned retained native Btrfs recovery
 passes in 33.95 seconds with all 235 tracked-file and both workspace test-binary
-hashes unchanged and resource cleanup independently checked. Correct and
-requalify the fixture's peer-loop scheduling while retaining the original R5
+hashes unchanged and resource cleanup independently checked. The fixture now
+uses two Tokio workers to keep peer loops scheduled during synchronous packing
+and certificate/GC work. Formatting and strict workspace/all-targets Clippy
+pass; workspace requalification remains pending. Retain the original R5
 progress and exact-release/platform requirements.
 
 ### Historical implementation and validation record (before scope correction)

@@ -1407,8 +1407,11 @@ separately below.
     locked store suite and workspace/all-targets build pass. Provisioned native
     Btrfs retained migration/recovery passes in 33.95 seconds, with all 235
     tracked-file and both workspace test-binary hashes unchanged and independent
-    resource cleanup verified. Correct/requalify the fixture's shared Tokio
-    scheduling; preserve the original R5 progress and release/platform gates.
+    resource cleanup verified. The fixture now uses two Tokio workers to keep
+    peer loops scheduled during synchronous packing/certificate/GC work;
+    formatting and strict workspace/all-targets Clippy pass. Full workspace
+    requalification is pending; preserve the original R5 progress and
+    release/platform gates.
   - [x] Replace the Linux whole-filesystem lookup under the global mutex with
     bounded process-local relocation cursors. Each lookup advances at most 2,048
     steps with a cooperative 25 ms deadline; incomplete work returns an explicit

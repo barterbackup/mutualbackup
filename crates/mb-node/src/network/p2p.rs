@@ -17881,7 +17881,10 @@ mod tests {
         assert!(plan_packed_lane_placements([141; 32], &[3, 3], &peers, &infeasible, 2).is_err());
     }
 
-    #[tokio::test]
+    // Packing and repeated proof verification can outlast the peer request
+    // deadline under parallel suite load. Keep peer loops scheduled during
+    // synchronous fixture preparation and certificate/GC checks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mixed_packed_group_replacement_reclaims_obsolete_ready_shards() {
         let temp = tempfile::tempdir().unwrap();
         let seeds = (211_u8..216)

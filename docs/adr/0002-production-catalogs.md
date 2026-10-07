@@ -2333,3 +2333,9 @@ and both workspace test-binary hashes match before/after native recovery.
 Disposable mount/image/loop cleanup and independent mount/loop/namespace checks
 pass. The full workspace gate and original R5 topology/signature issue remain
 open; these results do not qualify release artifacts or real retained 1 TiB data.
+
+The mixed packed-group fixture now uses two Tokio workers so its five peer
+loops can progress during synchronous packing and certificate/GC checks. No
+production timeout or reachability rule changes. Formatting, compilation and
+strict workspace/all-targets Clippy pass; full workspace requalification is
+pending. This fixture correction does not diagnose the original R5 stall.
