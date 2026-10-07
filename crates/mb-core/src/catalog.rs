@@ -34,8 +34,8 @@ pub use native_files::{
 };
 pub use packed_sectors::{
     CATALOG_PACKED_RECORD_BYTES, CATALOG_PACKED_ROOT_BYTES, CATALOG_PACKED_SLOTS,
-    CatalogPackedSectorBuilder, CatalogPackedSectorReader, CatalogPackedSectorRecord,
-    CatalogPackedSectorRoot,
+    CatalogPackedChunkReference, CatalogPackedSectorBuilder, CatalogPackedSectorReader,
+    CatalogPackedSectorRecord, CatalogPackedSectorRoot, CatalogPackedSlotReference,
 };
 pub use packed_sources::{
     CATALOG_PACKED_SOURCE_PROOFS, CATALOG_PACKED_SOURCE_RECORD_BYTES,

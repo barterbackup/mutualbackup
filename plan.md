@@ -1598,6 +1598,15 @@ enclosing aggregate capacity, signed publication and consumer migration remain
 the next production work; earlier workspace/native evidence above belongs to
 its recorded descriptor source.
 
+Compact packing roots now use stable 32-byte source keys and complete subtree
+streams, preserving original sector IDs and commitments. Source insertion does
+not renumber existing references. A fixed Merkle frontier verifies source and
+packed composition. All 134 core tests and strict workspace/all-targets Clippy
+pass; the conservative dense 1 TiB metadata calculation fits the existing 16 GiB
+budget including page/index overhead. This is codec evidence, separate from
+real retained data and full packing/coding/checkpoint admission. The bounded
+store join and certified authority integration remain required.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

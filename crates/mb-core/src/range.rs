@@ -85,18 +85,24 @@ pub fn merkle_commit(bytes: &[u8]) -> Result<MerkleCommitment, MerkleError> {
 /// Compute the canonical commitment for an authenticated virtual-zero shard
 /// without allocating the shard itself.
 pub fn merkle_zero_commitment(byte_len: u32) -> Result<MerkleCommitment, MerkleError> {
-    validate_data_len(byte_len as usize)?;
-    let mut tree_root = hash_leaf(&[0; MERKLE_LEAF_SIZE]);
-    let leaf_count = byte_len as usize / MERKLE_LEAF_SIZE;
-    for _ in 0..leaf_count.ilog2() {
-        tree_root = hash_node(&tree_root, &tree_root);
-    }
+    let tree_root = merkle_zero_subtree_root(byte_len)?;
     Ok(MerkleCommitment {
         format_version: MERKLE_SUITE_V1,
         leaf_size: MERKLE_LEAF_SIZE as u16,
         byte_len,
         root: bind_root(byte_len, tree_root),
     })
+}
+
+/// The unbound tree root of an all-zero aligned subtree, computed without a
+/// payload allocation. This is distinct from a complete length-bound commitment.
+pub fn merkle_zero_subtree_root(byte_len: u32) -> Result<[u8; 32], MerkleError> {
+    validate_data_len(byte_len as usize)?;
+    let mut root = hash_leaf(&[0; MERKLE_LEAF_SIZE]);
+    for _ in 0..(byte_len as usize / MERKLE_LEAF_SIZE).ilog2() {
+        root = hash_node(&root, &root);
+    }
+    Ok(root)
 }
 
 /// Open one aligned power-of-two range. A single-leaf proof carries exactly
@@ -226,31 +232,69 @@ pub fn merkle_commit_subtrees(
     subtree_byte_len: u32,
     subtree_roots: &[[u8; 32]],
 ) -> Result<MerkleCommitment, MerkleError> {
-    validate_data_len(byte_len as usize)?;
-    validate_data_len(subtree_byte_len as usize)?;
-    if subtree_byte_len > byte_len
-        || !byte_len.is_multiple_of(subtree_byte_len)
-        || subtree_roots.len() != (byte_len / subtree_byte_len) as usize
-        || !subtree_roots.len().is_power_of_two()
-        || subtree_roots.contains(&[0; 32])
-    {
-        return Err(MerkleError::InvalidProof);
+    let mut builder = MerkleSubtreeAccumulator::new(byte_len, subtree_byte_len)?;
+    for root in subtree_roots {
+        builder.push(*root)?;
     }
-    let mut nodes = subtree_roots.to_vec();
-    while nodes.len() > 1 {
-        nodes = nodes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| hash_node(&pair[0], &pair[1]))
-            .collect();
+    builder.finish()
+}
+
+/// Compose equal-size, ordered subtrees with a fixed frontier of at most 19
+/// hashes. Exact coverage is required; invalid input permanently fences reuse.
+pub struct MerkleSubtreeAccumulator {
+    byte_len: u32,
+    width: u32,
+    consumed: u32,
+    frontier: [Option<[u8; 32]>; (MAX_MERKLE_BYTES / MERKLE_LEAF_SIZE).ilog2() as usize + 1],
+    failed: bool,
+}
+
+impl MerkleSubtreeAccumulator {
+    pub fn new(byte_len: u32, subtree_byte_len: u32) -> Result<Self, MerkleError> {
+        validate_data_len(byte_len as usize)?;
+        validate_data_len(subtree_byte_len as usize)?;
+        if subtree_byte_len > byte_len {
+            return Err(MerkleError::InvalidProof);
+        }
+        Ok(Self {
+            byte_len,
+            width: byte_len / subtree_byte_len,
+            consumed: 0,
+            frontier: [None; (MAX_MERKLE_BYTES / MERKLE_LEAF_SIZE).ilog2() as usize + 1],
+            failed: false,
+        })
     }
-    Ok(MerkleCommitment {
-        format_version: MERKLE_SUITE_V1,
-        leaf_size: MERKLE_LEAF_SIZE as u16,
-        byte_len,
-        root: bind_root(byte_len, nodes[0]),
-    })
+
+    pub fn push(&mut self, mut root: [u8; 32]) -> Result<(), MerkleError> {
+        if self.failed || self.consumed == self.width || root == [0; 32] {
+            self.failed = true;
+            return Err(MerkleError::InvalidProof);
+        }
+        let mut level = 0;
+        let mut position = self.consumed;
+        while position & 1 != 0 {
+            let left = self.frontier[level].take().expect("occupied frontier bit");
+            root = hash_node(&left, &root);
+            position >>= 1;
+            level += 1;
+        }
+        self.frontier[level] = Some(root);
+        self.consumed += 1;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<MerkleCommitment, MerkleError> {
+        if self.failed || self.consumed != self.width {
+            return Err(MerkleError::InvalidProof);
+        }
+        let root = self.frontier[self.width.ilog2() as usize].ok_or(MerkleError::InvalidProof)?;
+        Ok(MerkleCommitment {
+            format_version: MERKLE_SUITE_V1,
+            leaf_size: MERKLE_LEAF_SIZE as u16,
+            byte_len: self.byte_len,
+            root: bind_root(self.byte_len, root),
+        })
+    }
 }
 
 /// Open one aligned range of a virtual all-zero shard without materializing
@@ -427,6 +471,86 @@ fn bind_root(byte_len: u32, tree_root: [u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtree_accumulator_matches_payload_commitments_and_bounds_maximum_frontier() {
+        for (byte_len, subtree_len) in [(16, 16), (64, 16), (1024, 64), (65536, 16384)] {
+            let bytes = (0..byte_len)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let mut accumulator = MerkleSubtreeAccumulator::new(byte_len, subtree_len).unwrap();
+            let mut roots = Vec::new();
+            for index in 0..byte_len / subtree_len {
+                let proof = merkle_open_subtree(&bytes, index * subtree_len / 16, subtree_len / 16)
+                    .unwrap();
+                roots.push(proof.subtree_root);
+                accumulator.push(proof.subtree_root).unwrap();
+            }
+            let expected = merkle_commit(&bytes).unwrap();
+            assert_eq!(accumulator.finish().unwrap(), expected);
+            assert_eq!(
+                merkle_commit_subtrees(byte_len, subtree_len, &roots).unwrap(),
+                expected
+            );
+            if roots.len() > 1 {
+                roots.swap(0, 1);
+                assert_ne!(
+                    merkle_commit_subtrees(byte_len, subtree_len, &roots).unwrap(),
+                    expected
+                );
+            }
+        }
+        let zero = merkle_zero_subtree_root(16).unwrap();
+        let mut maximum = MerkleSubtreeAccumulator::new(MAX_MERKLE_BYTES as u32, 16).unwrap();
+        for _ in 0..MAX_MERKLE_BYTES / 16 {
+            maximum.push(zero).unwrap();
+        }
+        assert_eq!(
+            maximum.finish().unwrap(),
+            merkle_zero_commitment(MAX_MERKLE_BYTES as u32).unwrap()
+        );
+        for len in [16, 64, 1024, 65536] {
+            let opening = merkle_open_subtree(&vec![0; len], 0, (len / 16) as u32).unwrap();
+            assert_eq!(
+                merkle_zero_subtree_root(len as u32).unwrap(),
+                opening.subtree_root
+            );
+        }
+    }
+
+    #[test]
+    fn subtree_accumulator_requires_exact_coverage_and_fences_invalid_pushes() {
+        let zero = merkle_zero_subtree_root(16).unwrap();
+        for count in 0..4 {
+            let mut accumulator = MerkleSubtreeAccumulator::new(64, 16).unwrap();
+            for _ in 0..count {
+                accumulator.push(zero).unwrap();
+            }
+            assert!(accumulator.finish().is_err());
+        }
+        let mut accumulator = MerkleSubtreeAccumulator::new(64, 16).unwrap();
+        accumulator.push(zero).unwrap();
+        assert!(accumulator.push([0; 32]).is_err());
+        assert!(accumulator.push(zero).is_err());
+        assert!(accumulator.finish().is_err());
+        let mut accumulator = MerkleSubtreeAccumulator::new(16, 16).unwrap();
+        accumulator.push(zero).unwrap();
+        assert!(accumulator.push(zero).is_err());
+        assert!(accumulator.finish().is_err());
+        for (byte_len, subtree_len) in [
+            (0, 16),
+            (17, 16),
+            (16, 32),
+            (64, 0),
+            (64, 17),
+            (MAX_MERKLE_BYTES as u32 * 2, 16),
+        ] {
+            assert!(MerkleSubtreeAccumulator::new(byte_len, subtree_len).is_err());
+        }
+        assert!(merkle_commit_subtrees(64, 16, &[zero; 3]).is_err());
+        assert!(merkle_commit_subtrees(64, 16, &[zero; 5]).is_err());
+        assert!(merkle_zero_subtree_root(0).is_err());
+    }
 
     #[test]
     fn every_aligned_power_of_two_range_opens() {

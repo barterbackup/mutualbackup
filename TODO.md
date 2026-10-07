@@ -1366,6 +1366,18 @@ separately below.
   - [ ] Derive and enforce the enclosing packing/coding metadata capacity across
     descriptor, source-proof and coding streams for the required retained 1 TiB
     geometry. Individual stream caps do not qualify their combined admission.
+  - [x] Add compact packing descriptors and complete-source subtree streams.
+    Stable 32-byte source keys replace repeated owner/root/object identities;
+    resolved slots reproduce original sector IDs, without dense ordinals that
+    shift after insertion. Complete ordered subtree roots recompose the source
+    commitment without repeated sibling paths. A fixed 19-hash accumulator
+    replaces sector-wide Merkle composition buffers. Versions one and legacy
+    signed bytes remain unchanged; compact roots use version two and append-only
+    record variants. All 134 core tests, formatting and strict locked
+    workspace/all-targets Clippy pass. A conservative dense 1 TiB codec-size
+    fixture includes full page/index overhead inside the existing 16 GiB budget;
+    it does not qualify real data, retained geometry, coding/checkpoint capacity,
+    authority joins, incremental edits or consumer activation. See ADR 0002.
   - [ ] Add quota reservations, remaining bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

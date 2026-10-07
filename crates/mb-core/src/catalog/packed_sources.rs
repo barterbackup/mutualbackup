@@ -29,6 +29,16 @@ pub struct CatalogPackedSourceId {
 }
 
 impl CatalogPackedSourceId {
+    /// Stable across insertion/removal of other sources. Compact descriptors
+    /// resolve this key against the authenticated source-proof stream.
+    pub fn key(self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new_derive_key("mutualbackup packed source identity v1");
+        hash.update(&self.owner.0);
+        hash.update(&self.protected_root);
+        hash.update(&self.object_id);
+        *hash.finalize().as_bytes()
+    }
+
     pub fn chunk(self, chunk_index: u32) -> SourceChunkId {
         SourceChunkId {
             owner: self.owner,
@@ -98,6 +108,17 @@ pub enum CatalogPackedSourceRecord {
         #[serde(deserialize_with = "decode_proofs")]
         proofs: Vec<CatalogPackedSourceProof>,
     },
+    /// Complete coverage allows authentication by recomposing the source root,
+    /// without repeating sibling paths for every chunk (root format two).
+    Subtrees {
+        first_chunk: u32,
+        #[serde(deserialize_with = "decode_subtrees")]
+        roots: Vec<[u8; 32]>,
+    },
+}
+
+fn decode_subtrees<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<[u8; 32]>, D::Error> {
+    crate::bounded::VecSeed::new(CATALOG_PACKED_SOURCE_PROOFS).deserialize(decoder)
 }
 
 fn decode_proofs<'de, D: Deserializer<'de>>(
@@ -128,6 +149,12 @@ impl CatalogPackedSourceRecord {
                     return Err(CatalogError::Bounds);
                 }
             }
+            Self::Subtrees { roots, .. }
+                if roots.is_empty() || roots.len() > CATALOG_PACKED_SOURCE_PROOFS =>
+            {
+                return Err(CatalogError::Bounds);
+            }
+            Self::Subtrees { .. } => {}
         }
         if canonical_bytes_bounded(&record, CATALOG_PACKED_SOURCE_RECORD_BYTES)? != bytes {
             return Err(CatalogError::InvalidPage);
@@ -169,7 +196,7 @@ impl CatalogPackedSourceRoot {
             .slots_per_sector()
             .map_err(|_| CatalogError::InvalidPage)?;
         let fragments = u64::from(width).div_ceil(CATALOG_PACKED_SOURCE_PROOFS as u64);
-        if self.format_version != 1
+        if !matches!(self.format_version, 1 | 2)
             || self.sources.checked_mul(1 + fragments) != Some(self.records.records)
             || self.sources.checked_mul(u64::from(width)) != Some(self.chunks)
             || self
@@ -186,6 +213,7 @@ impl CatalogPackedSourceRoot {
 struct ActiveSource {
     commitment: MerkleCommitment,
     consumed: u32,
+    accumulator: crate::MerkleSubtreeAccumulator,
 }
 
 struct SourceState {
@@ -229,6 +257,11 @@ impl SourceState {
                 self.active = Some(ActiveSource {
                     commitment: commitment.clone(),
                     consumed: 0,
+                    accumulator: crate::MerkleSubtreeAccumulator::new(
+                        self.profile.sector_size,
+                        self.profile.slot_size,
+                    )
+                    .map_err(|_| CatalogError::InvalidPage)?,
                 });
                 self.sources += 1;
             }
@@ -250,11 +283,43 @@ impl SourceState {
                     merkle_verify_subtree(&active.commitment, &opening)
                         .map_err(|_| CatalogError::InvalidPage)?;
                 }
-                active.consumed += proofs.len() as u32;
-                self.chunks += proofs.len() as u64;
-                if active.consumed == width {
-                    self.active = None;
-                }
+                self.accept_roots(*first_chunk, proofs.iter().map(|proof| proof.subtree_root))?;
+            }
+            CatalogPackedSourceRecord::Subtrees { first_chunk, roots } => {
+                self.accept_roots(*first_chunk, roots.iter().copied())?
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_roots(
+        &mut self,
+        first_chunk: u32,
+        roots: impl ExactSizeIterator<Item = [u8; 32]>,
+    ) -> Result<(), CatalogError> {
+        let width = self.profile.sector_size / self.profile.slot_size;
+        let active = self.active.as_mut().ok_or(CatalogError::InvalidPage)?;
+        let expected = (width - active.consumed).min(CATALOG_PACKED_SOURCE_PROOFS as u32);
+        if first_chunk != active.consumed || roots.len() != expected as usize || roots.len() == 0 {
+            return Err(CatalogError::InvalidPage);
+        }
+        for root in roots {
+            active
+                .accumulator
+                .push(root)
+                .map_err(|_| CatalogError::InvalidPage)?;
+            active.consumed += 1;
+            self.chunks += 1;
+        }
+        if active.consumed == width {
+            let active = self.active.take().expect("completed source");
+            if active
+                .accumulator
+                .finish()
+                .map_err(|_| CatalogError::InvalidPage)?
+                != active.commitment
+            {
+                return Err(CatalogError::InvalidPage);
             }
         }
         Ok(())
@@ -274,6 +339,7 @@ pub struct CatalogPackedSourceBuilder {
     records: CatalogRecordBuilder,
     state: SourceState,
     failed: bool,
+    format_version: u16,
 }
 
 impl CatalogPackedSourceBuilder {
@@ -282,7 +348,20 @@ impl CatalogPackedSourceBuilder {
             records: CatalogRecordBuilder::new(scope, CatalogSection::Packing)?,
             state: SourceState::new(profile)?,
             failed: false,
+            format_version: 1,
         })
+    }
+
+    /// Complete source subtrees authenticate through exact root composition.
+    /// Existing proof fragments may also be supplied and are compacted after
+    /// verifying their original openings. No signed legacy bytes are rewritten.
+    pub fn new_compact(
+        scope: CatalogScope,
+        profile: crate::PackingProfile,
+    ) -> Result<Self, CatalogError> {
+        let mut builder = Self::new(scope, profile)?;
+        builder.format_version = 2;
+        Ok(builder)
     }
 
     pub fn push<E>(
@@ -294,8 +373,28 @@ impl CatalogPackedSourceBuilder {
             return Err(CatalogError::Failed.into());
         }
         let result = (|| {
+            if self.format_version == 1
+                && matches!(record, CatalogPackedSourceRecord::Subtrees { .. })
+            {
+                return Err(CatalogError::InvalidPage.into());
+            }
             self.state.accept(record)?;
-            self.records.push(record, sink)
+            if self.format_version == 2
+                && let CatalogPackedSourceRecord::Proofs {
+                    first_chunk,
+                    proofs,
+                } = record
+            {
+                self.records.push(
+                    &CatalogPackedSourceRecord::Subtrees {
+                        first_chunk: *first_chunk,
+                        roots: proofs.iter().map(|proof| proof.subtree_root).collect(),
+                    },
+                    sink,
+                )
+            } else {
+                self.records.push(record, sink)
+            }
         })();
         self.failed = result.is_err();
         result
@@ -310,7 +409,7 @@ impl CatalogPackedSourceBuilder {
         }
         self.state.finish()?;
         let root = CatalogPackedSourceRoot {
-            format_version: 1,
+            format_version: self.format_version,
             profile: self.state.profile,
             records: self.records.finish(sink)?,
             sources: self.state.sources,
@@ -369,6 +468,13 @@ impl CatalogPackedSourceReader {
             return Ok(None);
         };
         let record = CatalogPackedSourceRecord::decode(&bytes)?;
+        if matches!(
+            (self.root.format_version, &record),
+            (1, CatalogPackedSourceRecord::Subtrees { .. })
+                | (2, CatalogPackedSourceRecord::Proofs { .. })
+        ) {
+            return Err(CatalogError::InvalidPage.into());
+        }
         self.state.accept(&record)?;
         self.consumed += 1;
         if self.state.sources > self.root.sources || self.state.chunks > self.root.chunks {
@@ -397,6 +503,88 @@ mod tests {
     use crate::{PackingProfile, canonical_bytes, merkle_commit, merkle_open_subtree};
 
     type Pages = HashMap<[u8; 32], Vec<u8>>;
+
+    #[test]
+    fn complete_subtree_stream_preserves_commitments_without_repeated_sibling_paths() {
+        let profile = PackingProfile {
+            format_version: 1,
+            sector_size: 4096,
+            slot_size: 16,
+        };
+        let original = records(0, profile);
+        let (full, _) = build(profile, &original);
+        let mut pages = Pages::new();
+        let mut sink = |reference: CatalogPageRef, bytes| {
+            pages.insert(reference.hash, bytes);
+            Ok::<_, ()>(())
+        };
+        let mut builder = CatalogPackedSourceBuilder::new_compact(scope(), profile).unwrap();
+        let mut expected = Vec::new();
+        for record in &original {
+            builder.push(record, &mut sink).unwrap();
+            expected.push(match record {
+                CatalogPackedSourceRecord::Proofs {
+                    first_chunk,
+                    proofs,
+                } => CatalogPackedSourceRecord::Subtrees {
+                    first_chunk: *first_chunk,
+                    roots: proofs.iter().map(|proof| proof.subtree_root).collect(),
+                },
+                header => header.clone(),
+            });
+        }
+        let root = builder.finish(&mut sink).unwrap();
+        assert_eq!(root.format_version, 2);
+        assert_eq!(root.chunks, full.chunks);
+        assert!(root.records.page.byte_len * 4 < full.records.page.byte_len);
+        assert_eq!(
+            CatalogPackedSourceRoot::decode(&canonical_bytes(&root).unwrap()).unwrap(),
+            root
+        );
+        let mut reader = CatalogPackedSourceReader::new(scope(), root).unwrap();
+        let mut fetch = |reference: CatalogPageRef| Ok::<_, ()>(pages[&reference.hash].clone());
+        for record in &expected {
+            assert_eq!(
+                reader.next_record(&mut fetch).unwrap().as_ref(),
+                Some(record)
+            );
+        }
+        assert_eq!(reader.next_record(&mut fetch).unwrap(), None);
+        // The direct subtree producer yields exactly the same authenticated root.
+        let mut builder = CatalogPackedSourceBuilder::new_compact(scope(), profile).unwrap();
+        for record in &expected {
+            builder.push(record, &mut |_, _| Ok::<_, ()>(())).unwrap();
+        }
+        assert_eq!(builder.finish(&mut |_, _| Ok::<_, ()>(())).unwrap(), root);
+        for bad_index in 1..expected.len() {
+            let mut altered = expected.clone();
+            let CatalogPackedSourceRecord::Subtrees { roots, .. } = &mut altered[bad_index] else {
+                unreachable!()
+            };
+            roots[0][0] ^= 1;
+            let (mut root, pages) = raw(profile, &altered, 1);
+            root.format_version = 2;
+            assert_rejected(root, &pages);
+        }
+        let (mut mismatched, pages) = raw(profile, &original, 1);
+        mismatched.format_version = 2;
+        assert_rejected(mismatched, &pages);
+        let (mismatched, pages) = raw(profile, &expected, 1);
+        assert_rejected(mismatched, &pages);
+        let mut builder = CatalogPackedSourceBuilder::new(scope(), profile).unwrap();
+        builder
+            .push(&expected[0], &mut |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert!(
+            builder
+                .push(&expected[1], &mut |_, _| Ok::<_, ()>(()))
+                .is_err()
+        );
+        assert!(builder.finish(&mut |_, _| Ok::<_, ()>(())).is_err());
+        let mut oversized = vec![2, 0];
+        oversized.extend(canonical_bytes(&65_usize).unwrap());
+        assert!(CatalogPackedSourceRecord::decode(&oversized).is_err());
+    }
 
     fn scope() -> CatalogScope {
         CatalogScope::Guild { guild_id: [7; 32] }
@@ -548,6 +736,9 @@ mod tests {
                             proof.subtree_root
                         );
                     }
+                }
+                CatalogPackedSourceRecord::Subtrees { .. } => {
+                    panic!("unexpected compact record in full-proof stream")
                 }
             }
         }

@@ -10,13 +10,78 @@ use super::{
     CatalogRecordRoot, CatalogScope, CatalogSection, CatalogStreamError,
 };
 use crate::{
-    MerkleCommitment, NodeId, PackedCatalog, PackedSectorDescriptor, PackedSlot, PackingProfile,
-    canonical_bytes_bounded, decode_canonical,
+    CatalogPackedSourceId, MerkleCommitment, NodeId, PackedCatalog, PackedSectorDescriptor,
+    PackedSlot, PackingProfile, canonical_bytes_bounded, decode_canonical,
 };
 
 pub const CATALOG_PACKED_SLOTS: usize = 128;
 pub const CATALOG_PACKED_RECORD_BYTES: usize = CATALOG_PACKED_SLOTS * 192 + 256;
 pub const CATALOG_PACKED_ROOT_BYTES: usize = 512;
+
+/// Full lengths and source offsets derive from the profile and chunk index.
+/// The stable source key resolves to the original owner/root/object identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CatalogPackedChunkReference {
+    pub source_key: [u8; 32],
+    pub chunk_index: u32,
+    pub content_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CatalogPackedSlotReference {
+    Data(CatalogPackedChunkReference),
+    VirtualZero {
+        source: Option<CatalogPackedChunkReference>,
+    },
+}
+
+impl CatalogPackedSlotReference {
+    fn from_slot(slot: &PackedSlot) -> Self {
+        let reference = slot.source().map(|source| CatalogPackedChunkReference {
+            source_key: CatalogPackedSourceId {
+                owner: source.id.owner,
+                protected_root: source.id.protected_root,
+                object_id: source.id.object_id,
+            }
+            .key(),
+            chunk_index: source.id.chunk_index,
+            content_hash: source.content_hash,
+        });
+        match slot {
+            PackedSlot::Data(_) => Self::Data(reference.expect("data source")),
+            PackedSlot::VirtualZero { .. } => Self::VirtualZero { source: reference },
+        }
+    }
+
+    fn expand<E>(
+        &self,
+        profile: PackingProfile,
+        resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, E>,
+    ) -> Result<PackedSlot, CatalogStreamError<E>> {
+        let reference = match self {
+            Self::Data(source) => Some(source),
+            Self::VirtualZero { source } => source.as_ref(),
+        };
+        let source = reference
+            .map(|reference| -> Result<_, CatalogStreamError<E>> {
+                let id = resolve(reference.source_key).map_err(CatalogStreamError::Storage)?;
+                if id.key() != reference.source_key {
+                    return Err(CatalogError::InvalidPage.into());
+                }
+                Ok(crate::PackedSourceChunk {
+                    id: id.chunk(reference.chunk_index),
+                    source_offset: u64::from(reference.chunk_index) * u64::from(profile.slot_size),
+                    logical_len: profile.slot_size,
+                    content_hash: reference.content_hash,
+                })
+            })
+            .transpose()?;
+        Ok(match self {
+            Self::Data(_) => PackedSlot::Data(source.expect("data source")),
+            Self::VirtualZero { .. } => PackedSlot::VirtualZero { source },
+        })
+    }
+}
 
 /// Discriminants are append-only within record version one. Sector headers
 /// occur in contiguous sector-index order, followed by exact-size fragments.
@@ -34,6 +99,17 @@ pub enum CatalogPackedSectorRecord {
         #[serde(deserialize_with = "decode_slots")]
         slots: Vec<PackedSlot>,
     },
+    CompactSlots {
+        offset: u32,
+        #[serde(deserialize_with = "decode_references")]
+        slots: Vec<CatalogPackedSlotReference>,
+    },
+}
+
+fn decode_references<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<CatalogPackedSlotReference>, D::Error> {
+    crate::bounded::VecSeed::new(CATALOG_PACKED_SLOTS).deserialize(decoder)
 }
 
 fn decode_slots<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<PackedSlot>, D::Error> {
@@ -55,6 +131,11 @@ impl CatalogPackedSectorRecord {
                 return Err(CatalogError::InvalidPage);
             }
             Self::Slots { slots, .. } if slots.is_empty() || slots.len() > CATALOG_PACKED_SLOTS => {
+                return Err(CatalogError::Bounds);
+            }
+            Self::CompactSlots { slots, .. }
+                if slots.is_empty() || slots.len() > CATALOG_PACKED_SLOTS =>
+            {
                 return Err(CatalogError::Bounds);
             }
             _ => {}
@@ -104,8 +185,9 @@ impl CatalogPackedSectorRoot {
             .slots_per_sector()
             .map_err(|_| CatalogError::InvalidPage)?;
         let fragments = u64::from(width).div_ceil(CATALOG_PACKED_SLOTS as u64);
-        if self.format_version != 1
+        if !matches!(self.format_version, 1 | 2)
             || !matches!(self.packing_version, 1..=5)
+            || self.format_version == 2 && self.packing_version < 2
             || self.sectors > CATALOG_MAX_RECORDS
             || self.sectors.checked_mul(1 + fragments) != Some(self.records.records)
             || self.sectors.checked_mul(u64::from(width)) != Some(self.slots)
@@ -267,6 +349,9 @@ impl SectorState {
                     self.last_has_source = active.has_source;
                 }
             }
+            CatalogPackedSectorRecord::CompactSlots { .. } => {
+                return Err(CatalogError::InvalidPage);
+            }
         }
         Ok(())
     }
@@ -286,6 +371,7 @@ pub struct CatalogPackedSectorBuilder {
     records: CatalogRecordBuilder,
     state: SectorState,
     failed: bool,
+    format_version: u16,
 }
 
 impl CatalogPackedSectorBuilder {
@@ -298,7 +384,23 @@ impl CatalogPackedSectorBuilder {
             records: CatalogRecordBuilder::new(scope, CatalogSection::Packing)?,
             state: SectorState::new(packing_version, profile)?,
             failed: false,
+            format_version: 1,
         })
+    }
+
+    /// Encode bounded full slots as compact references while hashing exactly
+    /// their original representation. Signed legacy sector IDs stay unchanged.
+    pub fn new_compact(
+        scope: CatalogScope,
+        packing_version: u16,
+        profile: PackingProfile,
+    ) -> Result<Self, CatalogError> {
+        if packing_version < 2 {
+            return Err(CatalogError::InvalidPage);
+        }
+        let mut builder = Self::new(scope, packing_version, profile)?;
+        builder.format_version = 2;
+        Ok(builder)
     }
 
     pub fn push<E>(
@@ -311,7 +413,22 @@ impl CatalogPackedSectorBuilder {
         }
         let result = (|| {
             self.state.accept(record)?;
-            self.records.push(record, sink)
+            if self.format_version == 2
+                && let CatalogPackedSectorRecord::Slots { offset, slots } = record
+            {
+                self.records.push(
+                    &CatalogPackedSectorRecord::CompactSlots {
+                        offset: *offset,
+                        slots: slots
+                            .iter()
+                            .map(CatalogPackedSlotReference::from_slot)
+                            .collect(),
+                    },
+                    sink,
+                )
+            } else {
+                self.records.push(record, sink)
+            }
         })();
         self.failed = result.is_err();
         result
@@ -362,7 +479,7 @@ impl CatalogPackedSectorBuilder {
         }
         self.state.finish()?;
         let root = CatalogPackedSectorRoot {
-            format_version: 1,
+            format_version: self.format_version,
             packing_version: self.state.packing_version,
             profile: self.state.profile,
             records: self.records.finish(sink)?,
@@ -406,7 +523,27 @@ impl CatalogPackedSectorReader {
         if self.failed {
             return Err(CatalogError::Failed.into());
         }
-        let result = self.next_inner(fetch);
+        if self.root.format_version != 1 {
+            self.failed = true;
+            return Err(CatalogError::InvalidPage.into());
+        }
+        self.next_record_with_sources(fetch, &mut |_| {
+            unreachable!("full descriptors do not resolve compact keys")
+        })
+    }
+
+    /// Compact records resolve through an authenticated source index. Every
+    /// returned slot uses its original identity, with checked key binding and
+    /// incremental verification of the unchanged legacy sector ID.
+    pub fn next_record_with_sources<E>(
+        &mut self,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+        resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, E>,
+    ) -> Result<Option<CatalogPackedSectorRecord>, CatalogStreamError<E>> {
+        if self.failed {
+            return Err(CatalogError::Failed.into());
+        }
+        let result = self.next_inner(fetch, resolve);
         self.failed = result.is_err();
         result
     }
@@ -414,12 +551,31 @@ impl CatalogPackedSectorReader {
     fn next_inner<E>(
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+        resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, E>,
     ) -> Result<Option<CatalogPackedSectorRecord>, CatalogStreamError<E>> {
         let Some(bytes) = self.records.next_record(fetch)? else {
             self.verify_totals()?;
             return Ok(None);
         };
-        let record = CatalogPackedSectorRecord::decode(&bytes)?;
+        let record = match (
+            self.root.format_version,
+            CatalogPackedSectorRecord::decode(&bytes)?,
+        ) {
+            (2, CatalogPackedSectorRecord::CompactSlots { offset, slots }) => {
+                CatalogPackedSectorRecord::Slots {
+                    offset,
+                    slots: slots
+                        .iter()
+                        .map(|slot| slot.expand(self.root.profile, resolve))
+                        .collect::<Result<_, _>>()?,
+                }
+            }
+            (1, CatalogPackedSectorRecord::Slots { offset, slots }) => {
+                CatalogPackedSectorRecord::Slots { offset, slots }
+            }
+            (_, header @ CatalogPackedSectorRecord::Header { .. }) => header,
+            _ => return Err(CatalogError::InvalidPage.into()),
+        };
         self.state.accept(&record)?;
         self.consumed += 1;
         if self.state.sectors > self.root.sectors
@@ -462,6 +618,175 @@ mod tests {
     };
 
     type Pages = HashMap<[u8; 32], Vec<u8>>;
+
+    #[test]
+    fn compact_descriptors_resolve_stable_keys_and_preserve_original_sector_ids() {
+        let profile = profile();
+        let sectors = (0..256)
+            .map(|index| descriptor(index, profile))
+            .collect::<Vec<_>>();
+        let (full, _) = build(&sectors, profile);
+        let mut sources = HashMap::new();
+        let mut pages = Pages::new();
+        let mut sink = |reference: CatalogPageRef, bytes| {
+            pages.insert(reference.hash, bytes);
+            Ok::<_, &'static str>(())
+        };
+        let mut builder = CatalogPackedSectorBuilder::new_compact(scope(), 3, profile).unwrap();
+        for sector in &sectors {
+            for source in sector.slots.iter().filter_map(PackedSlot::source) {
+                let id = CatalogPackedSourceId {
+                    owner: source.id.owner,
+                    protected_root: source.id.protected_root,
+                    object_id: source.id.object_id,
+                };
+                sources.insert(id.key(), id);
+                let mut original = id.owner.0.to_vec();
+                original.extend(id.protected_root);
+                original.extend(id.object_id);
+                assert_eq!(
+                    id.key(),
+                    blake3::derive_key("mutualbackup packed source identity v1", &original)
+                );
+            }
+            builder.push_sector(sector, &mut sink).unwrap();
+        }
+        let root = builder.finish(&mut sink).unwrap();
+        assert_eq!(root.format_version, 2);
+        assert_eq!(root.source_chunks, full.source_chunks);
+        assert!(root.records.page.byte_len < full.records.page.byte_len);
+        let mut reader = CatalogPackedSectorReader::new(scope(), root).unwrap();
+        let mut fetch =
+            |reference: CatalogPageRef| Ok::<_, &'static str>(pages[&reference.hash].clone());
+        let mut resolve = |key| sources.get(&key).copied().ok_or("missing source");
+        for expected in sectors.iter().flat_map(records) {
+            assert_eq!(
+                reader
+                    .next_record_with_sources(&mut fetch, &mut resolve)
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            reader
+                .next_record_with_sources(&mut fetch, &mut resolve)
+                .unwrap(),
+            None
+        );
+        for failed_resolver in [false, true] {
+            let mut reader = CatalogPackedSectorReader::new(scope(), root).unwrap();
+            let mut resolve = |_| {
+                if failed_resolver {
+                    Err("resolve failure")
+                } else {
+                    Ok(CatalogPackedSourceId {
+                        owner: NodeId([8; 32]),
+                        protected_root: [3; 32],
+                        object_id: [4; 32],
+                    })
+                }
+            };
+            assert!(
+                reader
+                    .next_record_with_sources(&mut fetch, &mut resolve)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                reader
+                    .next_record_with_sources(&mut fetch, &mut resolve)
+                    .is_err()
+            );
+            assert!(matches!(
+                reader.next_record_with_sources(&mut fetch, &mut resolve),
+                Err(CatalogStreamError::Catalog(CatalogError::Failed))
+            ));
+        }
+        let mut reader = CatalogPackedSectorReader::new(scope(), root).unwrap();
+        assert!(reader.next_record(&mut fetch).is_err());
+        assert!(
+            reader
+                .next_record_with_sources(&mut fetch, &mut resolve)
+                .is_err()
+        );
+        assert!(CatalogPackedSectorBuilder::new_compact(scope(), 1, profile).is_err());
+        let mut oversized = vec![2, 0];
+        oversized.extend(canonical_bytes(&129_usize).unwrap());
+        assert!(CatalogPackedSectorRecord::decode(&oversized).is_err());
+        // Adding a source changes neither an existing stable key nor its slot.
+        let slot = &sectors[0].slots[0];
+        let before = canonical_bytes(&CatalogPackedSlotReference::from_slot(slot)).unwrap();
+        let id = CatalogPackedSourceId {
+            owner: NodeId([2; 32]),
+            protected_root: [3; 32],
+            object_id: [1; 32],
+        };
+        sources.insert(id.key(), id);
+        assert_eq!(
+            canonical_bytes(&CatalogPackedSlotReference::from_slot(slot)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn compact_packing_metadata_bound_fits_dense_one_tib_geometry() {
+        let profile = PackingProfile {
+            format_version: 1,
+            sector_size: 65536,
+            slot_size: 16384,
+        };
+        let source_count = (1_u64 << 40) / u64::from(profile.sector_size);
+        let sector = descriptor(u32::MAX, profile);
+        let header_bytes = canonical_bytes(&records(&sector)[0]).unwrap().len() as u64;
+        let compact = CatalogPackedSectorRecord::CompactSlots {
+            offset: 0,
+            slots: sector
+                .slots
+                .iter()
+                .map(CatalogPackedSlotReference::from_slot)
+                .collect(),
+        };
+        let slot_bytes = canonical_bytes(&compact).unwrap().len() as u64;
+        let source_header = crate::CatalogPackedSourceRecord::Source {
+            format_version: 1,
+            id: CatalogPackedSourceId {
+                owner: NodeId([2; 32]),
+                protected_root: [3; 32],
+                object_id: [4; 32],
+            },
+            commitment: sector.commitment.clone(),
+        };
+        let subtrees = crate::CatalogPackedSourceRecord::Subtrees {
+            first_chunk: 0,
+            roots: vec![[5; 32]; 4],
+        };
+        let proof_bytes = canonical_bytes(&source_header).unwrap().len() as u64
+            + canonical_bytes(&subtrees).unwrap().len() as u64;
+        let stream_bytes = [
+            8 + source_count * (8 + header_bytes + slot_bytes),
+            8 + source_count * (8 + proof_bytes),
+        ];
+        let mut encoded_upper_bound = 0_u64;
+        let mut occurrences = 0_u64;
+        for bytes in stream_bytes {
+            assert!(bytes < super::super::CATALOG_MAX_STREAM_BYTES);
+            let mut nodes = bytes.div_ceil(CATALOG_LEAF_BYTES as u64);
+            occurrences += nodes;
+            encoded_upper_bound += nodes * crate::CATALOG_PAGE_BYTES as u64;
+            let mut height = 0;
+            while nodes > 1 {
+                nodes = nodes.div_ceil(crate::CATALOG_FANOUT as u64);
+                occurrences += nodes;
+                encoded_upper_bound += nodes * crate::CATALOG_PAGE_BYTES as u64;
+                height += 1;
+            }
+            assert!(height <= crate::CATALOG_MAX_HEIGHT);
+        }
+        assert!(encoded_upper_bound + 4096 < crate::CATALOG_MAX_STREAM_BYTES);
+        assert!(occurrences < crate::CATALOG_MAX_PAGE_OCCURRENCES);
+        assert!(source_count * 2 < crate::CATALOG_MAX_RECORDS);
+        // This is a conservative codec-size calculation, not a real-data gate.
+    }
 
     fn scope() -> CatalogScope {
         CatalogScope::Guild { guild_id: [9; 32] }

@@ -39,16 +39,16 @@ pub use catalog::{
     CatalogFileBuilder, CatalogFileEvent, CatalogFileExtent, CatalogFileKind, CatalogFileReader,
     CatalogFileRecipeBuilder, CatalogFileRecipeReader, CatalogFileRecipeRecord,
     CatalogFileRecipeRoot, CatalogFileRecord, CatalogFileRoot, CatalogFileStat,
-    CatalogNativeFileReader, CatalogNativeFileRoot, CatalogPackedSectorBuilder,
-    CatalogPackedSectorReader, CatalogPackedSectorRecord, CatalogPackedSectorRoot,
-    CatalogPackedSourceBuilder, CatalogPackedSourceId, CatalogPackedSourceProof,
-    CatalogPackedSourceReader, CatalogPackedSourceRecord, CatalogPackedSourceRoot,
-    CatalogPageContents, CatalogPageRef, CatalogRangeReader, CatalogReader, CatalogRecordBuilder,
-    CatalogRecordReader, CatalogRecordRoot, CatalogScope, CatalogSection, CatalogSectorBuilder,
-    CatalogSectorReader, CatalogSectorRecord, CatalogSectorRoot, CatalogStreamError,
-    PAGED_PRIVATE_METADATA_BYTES, PAGED_USER_REVISION_BYTES, PAGED_USER_REVISION_DOMAIN,
-    PAGED_USER_REVISION_VERSION, PagedRevisionSourceReader, PagedUserRevision,
-    catalog_file_path_order,
+    CatalogNativeFileReader, CatalogNativeFileRoot, CatalogPackedChunkReference,
+    CatalogPackedSectorBuilder, CatalogPackedSectorReader, CatalogPackedSectorRecord,
+    CatalogPackedSectorRoot, CatalogPackedSlotReference, CatalogPackedSourceBuilder,
+    CatalogPackedSourceId, CatalogPackedSourceProof, CatalogPackedSourceReader,
+    CatalogPackedSourceRecord, CatalogPackedSourceRoot, CatalogPageContents, CatalogPageRef,
+    CatalogRangeReader, CatalogReader, CatalogRecordBuilder, CatalogRecordReader,
+    CatalogRecordRoot, CatalogScope, CatalogSection, CatalogSectorBuilder, CatalogSectorReader,
+    CatalogSectorRecord, CatalogSectorRoot, CatalogStreamError, PAGED_PRIVATE_METADATA_BYTES,
+    PAGED_USER_REVISION_BYTES, PAGED_USER_REVISION_DOMAIN, PAGED_USER_REVISION_VERSION,
+    PagedRevisionSourceReader, PagedUserRevision, catalog_file_path_order,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
@@ -91,9 +91,9 @@ pub use packing::{
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
-    MerkleSubtreeProof, challenged_leaf, merkle_commit, merkle_commit_subtrees, merkle_open_range,
-    merkle_open_subtree, merkle_open_zero_range, merkle_verify_range, merkle_verify_subtree,
-    merkle_zero_commitment,
+    MerkleSubtreeAccumulator, MerkleSubtreeProof, challenged_leaf, merkle_commit,
+    merkle_commit_subtrees, merkle_open_range, merkle_open_subtree, merkle_open_zero_range,
+    merkle_verify_range, merkle_verify_subtree, merkle_zero_commitment, merkle_zero_subtree_root,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,

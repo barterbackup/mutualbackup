@@ -2214,3 +2214,48 @@ streams at the declared retained 1 TiB geometry; per-stream limits alone do not
 qualify the aggregate. Bounded scratch/index ownership, quota reservations,
 signed checkpoint publication and normal capture/retention/recovery activation
 remain required. R3 and M6 remain open.
+
+### Compact packing references and complete subtree streams (2026-10-07)
+
+Full source identities repeated in every descriptor slot, combined with repeated
+source-proof sibling paths, would exceed the existing metadata budget at the
+required dense 1 TiB geometry. Root format two addresses that representation
+cost while keeping format-one readers and all existing signed bytes intact.
+The record enums append compact variants; no existing discriminant changes.
+
+Compact slots carry a 32-byte source key, chunk index and content hash. The
+key domain-binds the complete owner/root/object identity and remains stable
+when another source is inserted or removed. It is not a dense ordinal. Source
+offset and full slot length derive from the validated profile. The descriptor
+reader resolves each key against its authenticated source index, verifies the
+key/identity binding, reconstructs bounded original slot fragments and hashes
+their exact original encoding. Historical sector IDs, version-specific roots
+and input geometry remain unchanged. Missing, substituted and failed resolution
+fence the reader. The full-record-only entry point rejects compact roots.
+
+Complete-source format-two records carry every chunk subtree root in order,
+up to 64 per fragment. Exact coverage and recomposition authenticate the source
+commitment without repeating sibling paths. A valid prefix remains staging
+data; source completion and full authenticated EOF are mandatory. Builders may
+accept original proofs, validate their openings and compact their roots, or
+accept direct subtree fragments. Readers reject mixed format-one/two bodies.
+
+`MerkleSubtreeAccumulator` composes both source and packed-sector commitments
+with at most 19 hashes. The original `merkle_commit_subtrees` helper now uses
+this frontier instead of copying all roots and intermediate levels. A separate
+virtual-zero subtree helper computes the unbound root without allocating a
+payload; complete commitments retain their original length binding. Invalid
+pushes fence reuse, and incomplete or excessive coverage cannot finish.
+
+Qualification: all 134 core tests and strict locked workspace/all-targets Clippy
+pass, with formatting/diff checks. Tests independently compare payload Merkle
+commitments, original descriptor records/IDs and stable-key hashes; exercise
+maximum frontier width, ordering, zero roots, incomplete coverage, source-path
+corruption, mixed formats, missing/substituted resolution, nested length bounds
+and failure fencing. A conservative size fixture accounts for worst-case
+descriptor indices, all source records, framing and full 64-KiB page ceilings
+at every index level for dense 1 TiB/64-KiB-source/16-KiB-slot geometry. Both
+record/page occurrence limits and the aggregate 16 GiB metadata budget hold.
+This is a structural codec calculation, not real 1 TiB data, retained-history,
+coding/checkpoint capacity or incremental-work qualification. Bounded store
+joins, certified authority, quotas and consumer activation remain open.
