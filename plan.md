@@ -4306,5 +4306,9 @@ and history reachability before promising the Git-facing compatibility freeze.
 Paged Git validation and retained native restore now use disposable encrypted
 SQLite indexes with bounded page caches and per-job database ceilings. Linux
 process-kill coverage proves anonymous database/journal cleanup; the durable
-restore journal still owns staged filesystem recovery. Aggregate physical
-scratch reservations and cross-platform VFS qualification remain release gates.
+restore journal still owns staged filesystem recovery. Linux consumers now pin
+the catalog workspace and reserve real anonymous database/journal extents before
+writes, preserving configured parity headroom and current checkpoint-copy space
+under shared process admission. Physical-limit failure/reopen/retry and Btrfs
+rewrite tests pass. Dataset/history quotas, other filesystem writers, scheduling
+and cross-platform VFS qualification remain release gates.

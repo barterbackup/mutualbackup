@@ -631,15 +631,25 @@ impl GitCatalogRoot {
         scope: CatalogScope,
         mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
     ) -> Result<()> {
+        let store = RecordScratchStore::new(mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
+        self.validate_graph_with_scratch(scope, &store, &mut fetch)
+    }
+
+    /// Use an explicitly placed/admitted disposable index. The index must be
+    /// private to this validation; errors roll back all semantic-index writes.
+    pub fn validate_graph_with_scratch(
+        &self,
+        scope: CatalogScope,
+        store: &RecordScratchStore,
+        mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
+    ) -> Result<()> {
         self.validate()?;
         scope.validate(CatalogSection::GitGraph)?;
-        // Explicit per-job ceiling, not aggregate physical-space admission.
-        let store = RecordScratchStore::new(mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
         let odb = git2::Odb::new()?;
         let _pack = odb.add_new_mempack_backend(1000)?;
         let parser = Repository::from_odb(odb)?;
         store.with_record_transaction(|| {
-            self.validate_graph_index(scope, &mut fetch, &store, &parser)
+            self.validate_graph_index(scope, &mut fetch, store, &parser)
         })
     }
 

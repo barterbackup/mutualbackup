@@ -3251,7 +3251,7 @@ fn ioctl_external_filesystem_uuid(file: &File) -> Result<Option<(u8, [u8; 16])>,
 }
 
 #[cfg(target_os = "linux")]
-fn btrfs_filesystem_uuid(file: &File) -> Result<[u8; 16], AnchorError> {
+pub(crate) fn btrfs_filesystem_uuid(file: &File) -> Result<[u8; 16], AnchorError> {
     let mut info = std::mem::MaybeUninit::<BtrfsFsInfo>::zeroed();
     let result = unsafe { ioctl_read(file, 0x94, 31, info.as_mut_ptr()) };
     if result != 0 {

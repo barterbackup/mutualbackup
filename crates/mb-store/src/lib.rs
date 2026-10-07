@@ -50,7 +50,7 @@ pub use database::{
     ObjectAttemptState, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
     PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore,
     ProtocolRecordRow, ReadyVariableObject, RecordScratchStore, RecoveryShardLocator,
-    VariableParityObject,
+    ScratchStorageLimits, VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
@@ -58,5 +58,8 @@ pub use source::{
     SourceBackendBinding, SourceBackendKind, SourceBlobImportPlan, SourceCapturePlan,
     SourceFileCaptureError, SourceFileCapturePlan, WITHDRAWN_GUARDED_BACKEND,
 };
+
+#[cfg(target_os = "linux")]
+pub use database::physical_allocation_domain;
 
 pub const SCHEMA_VERSION: u32 = 10;

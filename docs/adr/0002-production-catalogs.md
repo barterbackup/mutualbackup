@@ -1973,3 +1973,69 @@ artifact gates were not rerun for this increment.
 Other operating systems/VFS implementations, aggregate scratch reservations,
 normal paged capture/Git-history installation/checkpoint/retention/seed-only
 consumers and real 1 TiB qualification remain open; R3 and M6 are not complete.
+
+
+## Physical admission for anonymous Linux indexes (2026-10-07)
+
+Linux disposable record stores now use a dedicated SQLite VFS that accepts only
+anonymous temporary database/journal files. Durable catalogs retain their normal
+SQLCipher VFS. The adapter pins the chosen directory, delegates SQLite clock and
+randomness services to the original VFS, and closes every borrowed file before
+unregistering. File reads preserve SQLite's zero-filled short-read contract;
+logical EOF remains separate from physically reserved allocation tails.
+
+Every growing file reserves real extents with `fallocate(FALLOC_FL_KEEP_SIZE)`
+in 64 KiB increments before writing. Database and journal files share one physical
+job budget; the default is three times the database ceiling plus three allocation
+tails. The 64 GiB database ceiling therefore has a 192 GiB + 192 KiB physical
+ceiling, not a reservation of that entire amount at startup. Unsupported physical
+allocation fails closed. On anonymous Btrfs files, data CoW is disabled while the
+file is empty so rewrites stay inside reserved extents; SQLCipher authenticates
+the encrypted pages. The attached database is opened with file storage before
+restoring memory storage for SQLite's other temporary structures. Ordinary record
+queries use their primary index and do not materialize a sorting workspace.
+
+A private, owner-checked directory at
+`/tmp/.mutualbackup-scratch-allocation-<uid>` supplies the shared advisory lock for
+this host user. This small rendezvous remains across jobs; its inode is checked
+after acquisition and its timestamp refreshed. Actual index files remain unnamed
+and are reclaimed on normal exit or process death. Cooperating processes sharing
+this rendezvous serialize free-space checks and extent reservation, including
+workspaces in different Btrfs subvolumes. This does not control external writers,
+different users or isolated `/tmp` namespaces.
+
+Node Git admission and native restore place their indexes beside `control.db`,
+with at least 32 MiB of remaining headroom plus all configured parity headrooms
+in the same allocation pool and 64 KiB per volume. Runtime pool identity uses
+the Btrfs filesystem UUID across subvolumes/bind mounts and the current device
+ID on ordinary filesystems; it is not a durable source identity. Current control
+and parity WAL checkpoint-copy space is re-read before each allocation through
+pinned parent descriptors. Registry input is bounded to 4 MiB and at most 1,023
+volume records for this admission path; the durable registry format is unchanged.
+
+An actual temporary-file write failure can poison SQLite's private pager. Such
+an index is discarded rather than reused. The enclosing graph validation or
+native Building job fails before publication; retry creates a fresh index, while
+the durable restore journal still owns staged filesystem cleanup. Non-I/O batch
+errors continue to roll back normally. This admission does not reserve a whole
+future job, replace retained dataset/history quotas, or coordinate every source,
+restore and parity writer. Those consumer/scheduling/platform gates and real
+1 TiB qualification remain open; R3 and M6 are incomplete.
+
+Final qualification uses unchanged source and test binaries: all 148 ordinary
+store tests (26 ignored), 100 ordinary Git tests (64 ignored), 25 paged Node tests
+(one ignored) and 56 ordinary volume tests (one ignored) pass. The expanded
+2,000-directory native restore fixture configures parity headroom above free
+space, rejects actual index spill before publication, retains its Building job,
+reopens, lowers headroom and rebuilds the exact sparse/raw-name/hard-link tree.
+Other cases verify physical quota/headroom failure and fresh-index retry,
+checkpoint growth under renamed pinned parents, zero-filled short reads, EOF and
+truncate accounting, encrypted file/journal spill, SIGKILL reclamation and actual
+cross-process blocking/resumption at the admission lock.
+
+The provisioned Btrfs index rewrite/rollback/commit/quota-cleanup fixture passes
+in 1.20 seconds; native capture/migration/reopen/restore passes in 27.82 seconds.
+Their mount, loop device and image were reclaimed. Formatting, strict locked
+workspace/all-targets Clippy, the locked all-targets test build and acceptance
+script syntax pass. The complete acceptance script, topology, remaining platform,
+release-artifact and real retained 1 TiB gates were not rerun or closed.

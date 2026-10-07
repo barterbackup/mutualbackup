@@ -3032,18 +3032,75 @@ fn validate_volume_object_record_id(record_id: &[u8], receipt: &VolumeReceipt) -
     Ok(())
 }
 
-fn load_volume_records(control: &ControlStore) -> Result<Vec<VolumeRecord>> {
-    control
-        .get_record("node-config", b"storage-volumes")?
-        .map(|bytes| {
-            decode_canonical(&bytes).or_else(|_| {
-                decode_canonical::<Vec<VolumeRecordBeforeConfiguredState>>(&bytes)
-                    .map(|records| records.into_iter().map(Into::into).collect())
-            })
+/// Keep paged scratch on the catalog filesystem and protect every configured
+/// parity headroom on that device plus current database checkpoint-copy space.
+pub(crate) fn paged_scratch_store(
+    control: &ControlStore,
+    max_database_bytes: u64,
+) -> Result<mb_store::RecordScratchStore> {
+    #[cfg(target_os = "linux")]
+    {
+        let directory = control
+            .path()
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let device = mb_store::physical_allocation_domain(directory)?;
+        let mut limits = mb_store::ScratchStorageLimits::for_database(max_database_bytes)?;
+        let mut checkpoints = vec![control.path().to_path_buf()];
+        let records = control
+            .get_record_bounded("node-config", b"storage-volumes", 4 * 1024 * 1024)?
+            .map(|bytes| decode_volume_records(&bytes))
+            .transpose()?
+            .unwrap_or_default();
+        if records.len() > 1023 {
+            bail!("too many volumes for bounded scratch admission");
+        }
+        for record in records {
+            validate_volume_record(&record)?;
+            match fs::metadata(&record.path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if mb_store::physical_allocation_domain(&record.path)? == device {
+                limits.headroom_bytes = limits
+                    .headroom_bytes
+                    .checked_add(record.headroom_bytes)
+                    .and_then(|bytes| bytes.checked_add(PHYSICAL_WRITE_FIXED_RESERVE))
+                    .context("scratch headroom overflow")?;
+                checkpoints.push(record.path.join(&record.database_file));
+            }
+        }
+        Ok(
+            mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
+                directory,
+                limits,
+                &checkpoints,
+            )?,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(mb_store::RecordScratchStore::new(max_database_bytes)?)
+    }
+}
+
+fn decode_volume_records(bytes: &[u8]) -> Result<Vec<VolumeRecord>> {
+    decode_canonical(bytes)
+        .or_else(|_| {
+            decode_canonical::<Vec<VolumeRecordBeforeConfiguredState>>(bytes)
+                .map(|records| records.into_iter().map(Into::into).collect())
         })
-        .transpose()
         .map_err(Into::into)
-        .map(|records| records.unwrap_or_default())
+}
+
+fn load_volume_records(control: &ControlStore) -> Result<Vec<VolumeRecord>> {
+    Ok(control
+        .get_record("node-config", b"storage-volumes")?
+        .map(|bytes| decode_volume_records(&bytes))
+        .transpose()?
+        .unwrap_or_default())
 }
 
 fn store_volume_records(control: &ControlStore, records: &[VolumeRecord]) -> Result<()> {

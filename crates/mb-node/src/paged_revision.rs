@@ -186,7 +186,9 @@ impl PagedPrivateMetadata {
             fence,
         )?;
         if let Some(git) = &self.git {
-            git.validate_graph(bundle.scope, |page| {
+            let scratch =
+                crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
+            git.validate_graph_with_scratch(bundle.scope, &scratch, |page| {
                 Ok(control.catalog_page(bundle.scope, mb_core::CatalogSection::GitGraph, page)?)
             })?;
         }
@@ -962,11 +964,59 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
-        let (private, signed, intents) = owned_fixture_with_directories(&store, true, 0, 450);
+        let (private, signed, intents) = owned_fixture_with_directories(&store, true, 0, 2000);
         private
             .publish_local_catalog(&store, &keys(), &signed, &writer_fence(&signed), intents)
             .unwrap();
+        let parity = temp.path().join("parity");
+        std::fs::create_dir(&parity).unwrap();
+        let mut volumes =
+            crate::volume::StorageVolumes::open(temp.path(), std::sync::Arc::new(keys()), &store)
+                .unwrap();
+        let headroom = fs2::available_space(temp.path())
+            .unwrap()
+            .checked_add(32 * 1024 * 1024)
+            .unwrap();
+        volumes
+            .configure(
+                &store,
+                std::slice::from_ref(&parity),
+                headroom.checked_mul(2).unwrap(),
+                headroom,
+            )
+            .unwrap();
         let target = temp.path().join("restored");
+        let failure = PagedPrivateMetadata::restore_retained_native_catalog(
+            &store,
+            &keys(),
+            signed.value.revision_id,
+            scope(),
+            &target,
+            |id| Ok(encrypted_sector(&keys().guild_data_key(&[73; 32]), *id, b"raw\r\nbytes\0")?.1),
+        );
+        assert!(
+            failure.is_err(),
+            "configured headroom must reject scratch spill"
+        );
+        assert!(
+            !target.exists(),
+            "a failed private index must never publish the tree"
+        );
+        assert_eq!(store.records("restore-job").unwrap().len(), 1);
+        assert!(
+            !store
+                .has_records_with_kind_prefix("paged-native-restore-")
+                .unwrap()
+        );
+        drop(volumes);
+        drop(store);
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+        let mut volumes =
+            crate::volume::StorageVolumes::open(temp.path(), std::sync::Arc::new(keys()), &store)
+                .unwrap();
+        volumes
+            .configure(&store, std::slice::from_ref(&parity), 64 * 1024 * 1024, 0)
+            .unwrap();
         let mut reads = 0;
         PagedPrivateMetadata::restore_retained_native_catalog(
             &store,
@@ -996,7 +1046,7 @@ mod tests {
             raw.metadata().unwrap().ino(),
             target.join("alias").metadata().unwrap().ino()
         );
-        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 452);
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 2002);
         let directory = target.join(format!("z-00000000-{}", "d".repeat(128)));
         let stat = directory.metadata().unwrap();
         assert_eq!(stat.permissions().mode() & 0o777, 0o640);

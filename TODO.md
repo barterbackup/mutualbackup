@@ -1251,6 +1251,17 @@ passing tests below apply only to their recorded source and exercised cases.
     writes; the provisioned native restore fixture passes. Validation details
     are in ADR 0002. Aggregate physical reservations, concurrent-job admission,
     other platform VFS behavior and real 1 TiB qualification remain open.
+  - [x] Admit Linux disposable index allocations on the catalog filesystem.
+    Reserve actual anonymous data/journal extents before writes, enforce one
+    physical job budget, and serialize admission across cooperating processes.
+    Include configured parity headroom and recheck current checkpoint WAL space
+    through pinned parents. Group Btrfs subvolumes by their shared filesystem
+    UUID. Verify pressure rejection before native publication, reopen/retry,
+    encrypted spill, Btrfs rewrites and failed-job cleanup. All 148 ordinary
+    store, 100 Git, 25 paged Node and 56 volume tests pass, plus both provisioned
+    Btrfs fixtures; locked all-targets build, formatting and strict Clippy pass.
+    Details and validation are recorded in ADR 0002. Full dataset/history quotas, other filesystem
+    writers, scheduling and other platforms remain separate production gates.
   - [ ] Complete legacy retained-revision migration through normal native
     capture/restore, checkpoint/retention and seed-only consumers before
     enabling the new format.

@@ -55,7 +55,8 @@ struct RestoreIndex<'a> {
 
 impl<'a> RestoreIndex<'a> {
     fn new(control: &'a ControlStore, target: [u8; 32]) -> Result<Self> {
-        let records = RecordScratchStore::new(mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
+        let records =
+            crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
         #[cfg(test)]
         if IGNORE_NEXT_INDEX_INSERT.with(|flag| flag.replace(false)) {
             records.database_shell_statement("CREATE TEMP TRIGGER ignore_restore_index BEFORE INSERT ON protocol_records WHEN NEW.kind LIKE 'paged-native-restore-entry-v1/%' BEGIN SELECT RAISE(IGNORE); END", false)?;

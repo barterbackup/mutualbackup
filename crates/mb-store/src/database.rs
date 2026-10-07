@@ -19,6 +19,8 @@ mod anchor_discovery;
 mod catalog;
 mod scratch;
 #[cfg(target_os = "linux")]
+mod scratch_space;
+#[cfg(target_os = "linux")]
 pub use anchor_discovery::{
     ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage, AnchorDiscoveryJobStatus,
 };
@@ -30,7 +32,9 @@ pub use catalog::{
     PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
     PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
-pub use scratch::RecordScratchStore;
+pub use scratch::{RecordScratchStore, ScratchStorageLimits};
+#[cfg(target_os = "linux")]
+pub use scratch_space::physical_allocation_domain;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
 const CHECKPOINT_GENERATION_KIND: &str = "guild-checkpoint-generation";

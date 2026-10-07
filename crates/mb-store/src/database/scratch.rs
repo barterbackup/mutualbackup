@@ -2,21 +2,103 @@
 //! database and rollback journals with DELETEONCLOSE; Unix unlinks them while
 //! open, so a killed process cannot leave a large index awaiting application GC.
 
+#[cfg(target_os = "linux")]
+use super::scratch_space::ScratchVfs;
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use super::{ControlStore, DatabaseError, DatabaseShellResult, ProtocolRecordRow};
 
+/// Physical bounds for disposable indexes. Linux reserves actual filesystem
+/// extents before writes, sharing admission across scratch jobs on the mount.
+#[derive(Clone, Copy, Debug)]
+pub struct ScratchStorageLimits {
+    pub max_database_bytes: u64,
+    pub max_physical_bytes: u64,
+    pub headroom_bytes: u64,
+}
+
+impl ScratchStorageLimits {
+    pub fn for_database(max_database_bytes: u64) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            max_database_bytes,
+            // Database, rollback/subjournals and rounded allocation tails.
+            max_physical_bytes: max_database_bytes
+                .checked_mul(3)
+                .and_then(|bytes| bytes.checked_add(3 * 64 * 1024))
+                .ok_or(DatabaseError::ScratchUnavailable)?,
+            headroom_bytes: 32 * 1024 * 1024,
+        })
+    }
+}
+
 /// A private, nonpersistent record store with a 1 MiB page-cache budget and an
 /// explicit database-size limit. This is not a durable catalog and cannot be
-/// reopened. The limit excludes bounded caches and rollback-journal disk space;
-/// callers still need aggregate scratch-space admission for concurrent jobs.
+/// reopened. Linux additionally admits real database/journal allocations under
+/// a shared mount lock and a physical budget, preserving configured headroom.
 pub struct RecordScratchStore {
     records: ControlStore,
+    // Field order closes the SQLite connection before unregistering its VFS.
+    #[cfg(target_os = "linux")]
+    _vfs: Option<ScratchVfs>,
 }
 
 impl RecordScratchStore {
     pub fn new(max_database_bytes: u64) -> Result<Self, DatabaseError> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::new_in(
+                std::env::temp_dir(),
+                ScratchStorageLimits::for_database(max_database_bytes)?,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::open(max_database_bytes, Connection::open_in_memory()?)
+        }
+    }
+
+    /// Pin the chosen workspace directory. Renaming or replacing its pathname
+    /// cannot redirect subsequent SQLite files or free-space measurements.
+    #[cfg(target_os = "linux")]
+    pub fn new_in(
+        directory: impl AsRef<std::path::Path>,
+        limits: ScratchStorageLimits,
+    ) -> Result<Self, DatabaseError> {
+        Self::new_in_with_checkpoint_reservations(directory, limits, &[])
+    }
+
+    /// Include current checkpoint-copy space on every physical allocation.
+    /// Each database parent is pinned so path renames cannot hide its WAL.
+    #[cfg(target_os = "linux")]
+    pub fn new_in_with_checkpoint_reservations(
+        directory: impl AsRef<std::path::Path>,
+        limits: ScratchStorageLimits,
+        database_paths: &[std::path::PathBuf],
+    ) -> Result<Self, DatabaseError> {
+        let vfs = ScratchVfs::new(
+            directory.as_ref(),
+            limits.max_physical_bytes,
+            limits.headroom_bytes,
+            database_paths,
+        )?;
+        let connection = Connection::open_with_flags_and_vfs(
+            ":memory:",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            vfs.name(),
+        )?;
+        Self::open(Some(vfs), limits.max_database_bytes, connection)
+    }
+
+    fn open(
+        // Keep the VFS parameter before the connection: early errors drop
+        // parameters in reverse order, closing SQLite before its borrowed VFS.
+        #[cfg(target_os = "linux")] vfs: Option<ScratchVfs>,
+        max_database_bytes: u64,
+        connection: Connection,
+    ) -> Result<Self, DatabaseError> {
         const PAGE_BYTES: u64 = 4096;
         let pages = max_database_bytes / PAGE_BYTES;
         if !(16..=u32::MAX as u64 - 1).contains(&pages) {
@@ -25,8 +107,7 @@ impl RecordScratchStore {
         let mut key = [0; 32];
         key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
         key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-        let connection =
-            super::configure_encrypted_connection(Connection::open_in_memory()?, &key, false)?;
+        let connection = super::configure_encrypted_connection(connection, &key, false)?;
         let forced_memory: bool = connection.query_row(
             "SELECT sqlite_compileoption_used('TEMP_STORE=3')",
             [],
@@ -42,6 +123,10 @@ impl RecordScratchStore {
             "ATTACH DATABASE '' AS scratch KEY ?1",
             params![hex::encode(key)],
         )?;
+        // The attached pager is now fixed to file storage. Keep other SQLite
+        // temporary structures in memory, as on the durable SQLCipher store;
+        // bounded record queries use their primary index and need no sorter.
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
         let schema = Some("scratch");
         connection.pragma_update(schema, "cache_size", -1024)?;
         connection.pragma_update(schema, "cache_spill", true)?;
@@ -74,9 +159,13 @@ impl RecordScratchStore {
                 connection,
                 path: Default::default(),
             },
+            #[cfg(target_os = "linux")]
+            _vfs: vfs,
         })
     }
 
+    /// Roll back a failed batch. An actual temporary-file I/O failure can
+    /// invalidate SQLite's pager; discard this store and rebuild on retry.
     pub fn with_record_transaction<T, E: From<DatabaseError>>(
         &self,
         operation: impl FnOnce() -> Result<T, E>,
@@ -206,6 +295,142 @@ mod tests {
         );
     }
     #[cfg(target_os = "linux")]
+    fn write_payloads(store: &RecordScratchStore, rows: u32) -> Result<(), DatabaseError> {
+        store.with_record_transaction(|| {
+            for index in 0..rows {
+                if !store.put_record_if_absent("large", &index.to_be_bytes(), &[b'z'; 8192])? {
+                    return Err(DatabaseError::Conflict);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_physical_budget_and_headroom_fail_closed_and_allow_fresh_retry() {
+        for fault in 0..2 {
+            let temp = tempfile::tempdir().unwrap();
+            let mut limits = ScratchStorageLimits::for_database(32 * 1024 * 1024).unwrap();
+            if fault == 0 {
+                limits.max_physical_bytes = 1024 * 1024;
+            } else {
+                limits.headroom_bytes = u64::MAX;
+            }
+            let store = RecordScratchStore::new_in(temp.path(), limits).unwrap();
+            store
+                .database_shell_statement("PRAGMA scratch.cache_size=-64", false)
+                .unwrap();
+            assert!(
+                store
+                    .put_record_if_absent("saved", b"key", b"original")
+                    .unwrap()
+            );
+            let error = write_payloads(&store, 512).unwrap_err();
+            assert!(
+                matches!(error, DatabaseError::Sql(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DiskFull),
+                "fault {fault}: {error}"
+            );
+            // A failed temporary-file write can poison SQLite's private
+            // pager. Discard it; consumers must never publish from this index.
+            assert!(!matches!(
+                store.next_record_bounded("large", None, 4, 8192),
+                Ok(Some(_))
+            ));
+            drop(store);
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            let retry = RecordScratchStore::new_in(
+                temp.path(),
+                ScratchStorageLimits::for_database(32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+            write_payloads(&retry, 512).unwrap();
+            let mut count = 0;
+            retry
+                .for_each_record_bounded("large", 4, 8192, |_, _| {
+                    count += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            assert_eq!(count, 512);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_pins_workspace_and_rechecks_growing_checkpoint_after_parent_rename() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let wal = std::fs::File::create(original.join("control.db-wal")).unwrap();
+        let mut space = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::fstatvfs(wal.as_raw_fd(), space.as_mut_ptr()) },
+            0
+        );
+        let space = unsafe { space.assume_init() };
+        let available =
+            u64::try_from(u128::from(space.f_bavail) * u128::from(space.f_frsize)).unwrap();
+        let mut limits = ScratchStorageLimits::for_database(32 * 1024 * 1024).unwrap();
+        limits.headroom_bytes = available.saturating_sub(128 * 1024 * 1024);
+        let store = RecordScratchStore::new_in_with_checkpoint_reservations(
+            &original,
+            limits,
+            &[original.join("control.db")],
+        )
+        .unwrap();
+        let retry = RecordScratchStore::new_in_with_checkpoint_reservations(
+            &original,
+            ScratchStorageLimits::for_database(32 * 1024 * 1024).unwrap(),
+            &[original.join("control.db")],
+        )
+        .unwrap();
+        store
+            .database_shell_statement("PRAGMA scratch.cache_size=-64", false)
+            .unwrap();
+        store
+            .put_record_if_absent("saved", b"key", b"original")
+            .unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        // The reservation grows after constructor admission and under the old
+        // parent's new name. An empty replacement parent must not hide it.
+        wal.set_len(256 * 1024 * 1024).unwrap();
+        assert!(write_payloads(&store, 512).is_err());
+        drop(store);
+        wal.set_len(0).unwrap();
+        write_payloads(&retry, 512).unwrap();
+        let mut descriptors = 0;
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let path = entry.unwrap().path();
+            let Ok(name) = std::fs::read_link(path) else {
+                continue;
+            };
+            if name.starts_with(&moved) && name.to_string_lossy().ends_with(" (deleted)") {
+                descriptors += 1;
+            }
+            assert!(
+                !name.starts_with(&original),
+                "replacement parent acquired a scratch file"
+            );
+        }
+        assert!(descriptors > 0);
+        assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+        let link = temp.path().join("symlink");
+        symlink(&moved, &link).unwrap();
+        assert!(
+            RecordScratchStore::new_in(
+                &link,
+                ScratchStorageLimits::for_database(1024 * 1024).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn scratch_spills_encrypted_unlinked_files_and_reclaims_them_after_sigkill() {
         use std::io::{Read, Seek, SeekFrom};
@@ -292,11 +517,82 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn scratch_btrfs_reserves_rewrite_space_and_reclaims_failed_jobs() {
+        let root =
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").expect("provisioned Btrfs root");
+        let temp = tempfile::tempdir_in(&root).unwrap();
+        let store = RecordScratchStore::new_in(
+            temp.path(),
+            ScratchStorageLimits::for_database(64 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        write_payloads(&store, 1024).unwrap();
+        let result: Result<(), DatabaseError> = store.with_record_transaction(|| {
+            for index in 0u32..1024 {
+                store.replace_record_if_value(
+                    "large",
+                    &index.to_be_bytes(),
+                    &[b'z'; 8192],
+                    &[b'y'; 8192],
+                )?;
+            }
+            Err(DatabaseError::Conflict)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .get_record_bounded("large", &0u32.to_be_bytes(), 8192)
+                .unwrap()
+                .unwrap(),
+            [b'z'; 8192]
+        );
+        store
+            .with_record_transaction(|| -> Result<(), DatabaseError> {
+                for index in 0u32..1024 {
+                    store.replace_record_if_value(
+                        "large",
+                        &index.to_be_bytes(),
+                        &[b'z'; 8192],
+                        &[b'y'; 8192],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .get_record_bounded("large", &0u32.to_be_bytes(), 8192)
+                .unwrap()
+                .unwrap(),
+            [b'y'; 8192]
+        );
+        drop(store);
+        let mut limits = ScratchStorageLimits::for_database(64 * 1024 * 1024).unwrap();
+        limits.max_physical_bytes = 1024 * 1024;
+        let store = RecordScratchStore::new_in(temp.path(), limits).unwrap();
+        store
+            .database_shell_statement("PRAGMA scratch.cache_size=-64", false)
+            .unwrap();
+        assert!(write_payloads(&store, 1024).is_err());
+        drop(store);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "invoked only by the scratch process-lifecycle test"]
     fn scratch_lifecycle_child() {
         let root =
             std::env::var_os("MB_SCRATCH_LIFECYCLE_CHILD").expect("parent-owned scratch directory");
-        let store = RecordScratchStore::new(64 * 1024 * 1024).unwrap();
+        let store = RecordScratchStore::new_in(
+            &root,
+            ScratchStorageLimits::for_database(64 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        if std::env::var_os("MB_SCRATCH_ALLOCATION_LOCK_PROBE").is_some() {
+            std::fs::write(std::path::Path::new(&root).join("started"), b"started").unwrap();
+        }
         store
             .with_record_transaction(|| -> Result<(), DatabaseError> {
                 for index in 0u32..256 {
