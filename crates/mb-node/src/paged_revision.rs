@@ -55,6 +55,12 @@ impl PagedPrivateMetadata {
             "paged Git root/intents disagree"
         );
         let scope = signed.value.scope();
+        ensure!(
+            self.git
+                .as_ref()
+                .is_none_or(|git| git.repository_id == signed.value.protected_root_id),
+            "paged Git repository differs from protected root"
+        );
         let mut roots: Vec<_> = intents
             .native
             .into_iter()
@@ -179,6 +185,11 @@ impl PagedPrivateMetadata {
             keys.node_id(),
             fence,
         )?;
+        if let Some(git) = &self.git {
+            git.validate_graph(bundle.scope, |page| {
+                Ok(control.catalog_page(bundle.scope, mb_core::CatalogSection::GitGraph, page)?)
+            })?;
+        }
         // Full native/source validation is durable but remains a pending index
         // if later publication fails; callers can retry or cancel that index.
         let manifest = CatalogNativeValidation {
@@ -536,6 +547,12 @@ impl PagedPrivateMetadata {
             owner == keys.node_id(),
             "private descriptor belongs to another owner"
         );
+        ensure!(
+            self.git
+                .as_ref()
+                .is_none_or(|git| git.repository_id == protected_root_id),
+            "paged Git repository differs from protected root"
+        );
         let plaintext = canonical_bytes_bounded(self, PAGED_PRIVATE_METADATA_BYTES)?;
         let id = make_content_sector_id(
             &keys.guild_content_id_key(&guild_id),
@@ -591,6 +608,13 @@ impl PagedPrivateMetadata {
             "paged private metadata padding is not canonical"
         );
         let descriptor = Self::decode(&plaintext[..length])?;
+        ensure!(
+            descriptor
+                .git
+                .as_ref()
+                .is_none_or(|git| git.repository_id == revision.protected_root_id),
+            "paged Git repository differs from protected root"
+        );
         let id = make_content_sector_id(
             &keys.guild_content_id_key(&guild_id),
             revision.owner,
@@ -777,16 +801,57 @@ mod tests {
             recipes: recipes.finish(&mut sink).unwrap(),
         };
         let git = intents.git.map(|git_intents| {
+            let directory = tempfile::tempdir().unwrap();
+            let repository = git2::Repository::init_bare(directory.path()).unwrap();
+            let blob = repository.blob(payload).unwrap();
+            let mut tree = repository.treebuilder(None).unwrap();
+            tree.insert("payload", blob, 0o100644).unwrap();
+            let tree = tree.write().unwrap();
+            let signature =
+                git2::Signature::new("Author", "a@example.test", &git2::Time::new(0, 0)).unwrap();
+            let commit = repository
+                .commit(
+                    None,
+                    &signature,
+                    &signature,
+                    "fixture",
+                    &repository.find_tree(tree).unwrap(),
+                    &[],
+                )
+                .unwrap();
             let mut sink = |page, bytes| stage_page(store, git_intents[0], &mut pages, page, bytes);
-            let refs = GitRefCatalogBuilder::new(scope(), b"unborn")
-                .unwrap()
-                .finish(&mut sink)
-                .unwrap();
+            let mut refs = GitRefCatalogBuilder::new(scope(), b"main").unwrap();
+            refs.push_ref(
+                &mb_git::GitRefRecord {
+                    format_version: 1,
+                    name: b"refs/heads/main".to_vec(),
+                    oid: if damage == 5 { tree } else { commit }
+                        .as_bytes()
+                        .try_into()
+                        .unwrap(),
+                },
+                &mut sink,
+            )
+            .unwrap();
+            let refs = refs.finish(&mut sink).unwrap();
             let mut sink = |page, bytes| stage_page(store, git_intents[1], &mut pages, page, bytes);
-            let objects = GitObjectCatalogBuilder::new(scope())
-                .unwrap()
-                .finish(&mut sink)
-                .unwrap();
+            let mut objects = GitObjectCatalogBuilder::new(scope()).unwrap();
+            let mut entries = [(1, commit), (2, tree)];
+            entries.sort_by_key(|(_, oid)| *oid);
+            let odb = repository.odb().unwrap();
+            for (kind, oid) in entries {
+                let object = odb.read(oid).unwrap();
+                objects
+                    .push_object(
+                        oid.as_bytes().try_into().unwrap(),
+                        kind,
+                        object.len() as u64,
+                        &mut object.data(),
+                        &mut sink,
+                    )
+                    .unwrap();
+            }
+            let objects = objects.finish(&mut sink).unwrap();
             let mut sink = |page, bytes| stage_page(store, git_intents[2], &mut pages, page, bytes);
             let mut blobs = GitBlobCatalogBuilder::new(scope()).unwrap();
             let mut reference = sector.clone();
@@ -819,7 +884,7 @@ mod tests {
             }
             GitCatalogRoot {
                 format_version: 1,
-                repository_id: Uuid::from_bytes([77; 16]),
+                repository_id: Uuid::from_bytes([74; 16]),
                 refs,
                 objects,
                 blobs: blobs.finish(&mut sink).unwrap(),
@@ -2147,6 +2212,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn paged_git_publication_rejects_wrong_ref_target_before_validation_and_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let (private, signed, intents) = owned_fixture(&store, true, 5);
+        assert!(
+            private
+                .publish_local_catalog(&store, &keys(), &signed, &writer_fence(&signed), intents)
+                .is_err()
+        );
+        assert!(
+            store
+                .paged_revision_catalog(signed.value.revision_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .native_file_catalog_validation(signed.value.revision_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        assert!(
+            private
+                .publish_local_catalog(&store, &keys(), &signed, &writer_fence(&signed), intents)
+                .is_err()
+        );
+        for intent in intents
+            .native
+            .into_iter()
+            .chain([intents.sources])
+            .chain(intents.git.into_iter().flatten())
+        {
+            assert_eq!(
+                store.catalog_intent_state(intent).unwrap(),
+                mb_store::CatalogIntentState::Building
+            );
+        }
+        let (valid, valid_signed, valid_intents) = owned_fixture(&store, true, 0);
+        valid
+            .publish_local_catalog(
+                &store,
+                &keys(),
+                &valid_signed,
+                &writer_fence(&valid_signed),
+                valid_intents,
+            )
+            .unwrap();
+        assert!(
+            store
+                .paged_revision_catalog(valid_signed.value.revision_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .paged_revision_catalog(signed.value.revision_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn paged_git_repository_identity_is_bound_during_seal_and_authenticated_open() {
+        let mut private = descriptor(true);
+        private.git.as_mut().unwrap().repository_id = Uuid::from_bytes([77; 16]);
+        assert!(private.seal(&keys(), scope()).is_err());
+        // Construct an otherwise authenticated descriptor as an untrusted owner
+        // could, bypassing the local sealing API's admission check.
+        let bytes = canonical_bytes_bounded(&private, PAGED_PRIVATE_METADATA_BYTES).unwrap();
+        let id = make_content_sector_id(
+            &keys().guild_content_id_key(&[73; 32]),
+            keys().node_id(),
+            [73; 32],
+            Uuid::from_bytes([74; 16]),
+            SectorPurpose::Metadata,
+            &bytes,
+        )
+        .unwrap();
+        let (sector, ciphertext) =
+            encrypted_sector(&keys().guild_data_key(&[73; 32]), id, &bytes).unwrap();
+        let (signed, _) = signed(CatalogSectorRecord {
+            format_version: 1,
+            sector,
+            commitment: merkle_commit(&ciphertext).unwrap(),
+        });
+        PagedUserRevision::verify_signed(&signed).unwrap();
+        assert!(PagedPrivateMetadata::open(&keys(), [73; 32], &signed, &ciphertext).is_err());
+    }
+
     fn keys() -> KeyMaterial {
         KeyMaterial::from_seed(&Seed::from_bytes([71; 32]))
     }
@@ -2180,7 +2338,7 @@ mod tests {
         };
         let git = with_git.then(|| GitCatalogRoot {
             format_version: 1,
-            repository_id: Uuid::from_bytes([77; 16]),
+            repository_id: Uuid::from_bytes([74; 16]),
             refs: GitRefCatalogBuilder::new(scope(), b"unborn")
                 .unwrap()
                 .finish(&mut sink)

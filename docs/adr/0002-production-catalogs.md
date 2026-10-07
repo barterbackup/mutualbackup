@@ -1864,3 +1864,68 @@ after execution. Its owned disposable image, mount, loop and fixtures are
 removed with mount absence and loop detachment independently checked. Full
 Node/Git suites, daemon topology, release artifacts and other platforms were
 not qualified in this increment.
+
+### Streaming paged Git graph admission (2026-10-07)
+
+Retained paged publication now verifies the complete Git ref/commit/tree/tag
+graph and blob membership before creating native validation or publishing roots.
+Previously the paged readers checked framing, geometry and object hashes, but
+could accept a signed ref targeting a tree, missing graph members or unreachable
+objects. The enclosing descriptor now also requires its repository identity to
+match the protected root during sealing, bundle construction and authenticated
+opening. Existing signed formats and original retained revisions remain intact.
+
+The graph consumer streams original object fragments without reassembling a
+metadata object. Tree parsing retains one bounded component and its target OID;
+libgit2 parses each complete entry through a disposable memory ODB. Commit/tag
+parsing retains a 64-byte line prefix, fixed signature/timestamp state and a tag
+name hash. Large messages, signatures, optional headers and parent lists need no
+whole-object buffer. Original byte lengths and Git OIDs remain verified by the
+authenticated object reader. This adds no replacement whole-object ceiling.
+
+An encrypted private temporary SQLCipher index holds nodes, edges, per-tree name
+uniqueness and traversal frames. Indexed reads bound keys/payloads before
+allocation. Its mutations share one record transaction on that private store,
+avoiding a durable commit per scratch row and keeping external I/O outside the
+production catalog writer. A rejected validation rolls back the scratch batch.
+Depth-first traversal holds one frame at a time, checks target kinds
+and cycles, and computes expanded tree path lengths for shared subtrees. It
+rejects unsafe root names, conflicting tree entries, unsupported modes,
+invalid symlink lengths, incorrect annotated-tag names, missing targets and
+unreachable metadata/blobs. The edge budget uses the existing 64-million-record
+geometry; Git paths retain the current 4 KiB staging bound. Selected and unborn
+heads retain the paged ref codec's explicit semantics.
+
+Blob plaintext OIDs and symlink target contents still require the enclosing data
+consumer's verification; this graph pass does not fetch blob payloads. Legacy
+conversion already authenticates its original Git blob bytes. Paged Git-history
+installation, normal capture/admission, packing/checkpoint/retention and seed-only
+consumers, physical quota/scratch lifecycle and real 1 TiB qualification remain
+required before production activation.
+
+Validation: the final locked workspace/all-targets build, formatting/diff checks
+and strict Clippy pass. All 100 ordinary Git tests pass on the final source:
+the 1,200-entry/shared-history fixture ran separately in 1.26 seconds, and the
+remaining 99 cases passed together. The first complete run also passed before
+the scratch transaction refinement, but its per-row filesystem journal waits
+made the scale case unnecessarily slow. The final ordinary store suite passes
+142 cases, and all 25 ordinary tests selected by `paged_` in Node pass.
+
+Eight new graph fixtures cover shared DAGs, nested tags, raw names, unborn
+heads, missing/wrong/unreachable members, unsafe/conflicting tree entries,
+symlink lengths, expanded paths, cycles, unavailable/corrupt pages and ignored
+index writes. Generated graphs and individual commit objects above the old
+32 MiB flat bound pass without adding a new object-size ceiling. Text admission
+is compared directly with libgit2 for selected valid/invalid signatures and tag
+headers, signed timestamp boundaries, long leading-zero timestamps and non-UTF-8
+authors at chunk sizes 1, 7 and 32 KiB. The many-entry tree crosses fragment
+boundaries and shares history subtrees. A store fixture qualifies atomic commit,
+rollback after later errors or ignored writes, nested-transaction rejection and
+durable reopen. Two Node fixtures prove wrong ref targets fail before pending
+native validation and stay rejected after reopen, while a valid graph can still
+publish; sealing and authenticated open reject another repository identity.
+
+Recorded source/test-binary hashes match after the final runs. The runs leave
+64 provisioned Git cases, 24 store cases and the selected Node native fixture
+ignored. No full Node suite, provisioned filesystems, daemon topology, release
+artifact, other-platform or real 1 TiB qualification ran in this increment.

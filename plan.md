@@ -1490,6 +1490,15 @@ capture, remote/seed-only restore, checkpoint/retention activation, quota policy
 and real 1 TiB dataset/history qualification remain required. See ADR 0002 for
 the consumer contract and validation.
 
+Retained paged Git publication now requires complete ref/DAG/blob-membership
+validation before publishing roots, and binds the Git repository to its enclosing
+protected root. Streaming tree/header parsing and disk-backed graph traversal
+retain bounded working memory for large individual objects and shared histories.
+Blob plaintext verification, Git-history installation and the remaining normal
+capture/packing/checkpoint/retention/seed-only consumers still require migration;
+the first-release 1 TiB target remains unqualified. ADR 0002 records the graph
+contract and its targeted validation.
+
 
 Linux stable-anchor relocation now advances bounded process-local cursors without
 holding the global area-index mutex during filesystem work. Streaming pinned

@@ -37,6 +37,7 @@ mod merge;
 mod object_catalog;
 mod odb;
 mod paged_catalog;
+mod paged_graph;
 #[cfg(target_os = "linux")]
 mod prune;
 mod ref_catalog;

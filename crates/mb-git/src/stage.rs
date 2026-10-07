@@ -41,7 +41,7 @@ fn resolution_record_for_stage(
     })
 }
 
-const MAX_STAGE_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_STAGE_PATH_BYTES: usize = 4096;
 const INTENT_PREFIX: &str = "git-stage-intent-v1/";
 const SYMLINK_INTENT_PREFIX: &str = "git-symlink-stage-intent-v1/";
 const INDEX_PREFIX: &str = "git-index-entry-v1/";

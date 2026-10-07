@@ -202,6 +202,25 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Run record reads/writes under one writer transaction. Record CAS and
+    /// bounded cursor methods may use this connection; callbacks must check
+    /// write outcomes and must not begin nested transactions. Errors roll back
+    /// every write. Large external-I/O consumers should use a private scratch
+    /// store so their transaction does not hold the production catalog writer.
+    pub fn with_record_transaction<T, E: From<DatabaseError>>(
+        &self,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(DatabaseError::from)?;
+        let result = operation()?;
+        transaction.commit().map_err(DatabaseError::from)?;
+        Ok(result)
+    }
+
     pub fn put_record_if_absent(
         &self,
         kind: &str,
@@ -4211,6 +4230,66 @@ fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_transaction_commits_reopen_and_rolls_back_errors_ignored_writes_and_nesting() {
+        use super::{ControlStore, DatabaseError};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("transaction.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        store.put_record("batch", b"old", b"preserve").unwrap();
+        let result: Result<(), DatabaseError> = store.with_record_transaction(|| {
+            store.replace_record_if_value("batch", b"old", b"preserve", b"changed")?;
+            store.put_record_if_absent("batch", b"new", b"rollback")?;
+            Err(DatabaseError::Conflict)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store.get_record("batch", b"old").unwrap().unwrap(),
+            b"preserve"
+        );
+        assert!(store.get_record("batch", b"new").unwrap().is_none());
+        store.database_shell_statement("CREATE TEMP TRIGGER ignore_batch BEFORE INSERT ON protocol_records WHEN NEW.kind = 'ignored' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+        let result: Result<(), DatabaseError> = store.with_record_transaction(|| {
+            store.delete_record_if_value("batch", b"old", b"preserve")?;
+            if !store.put_record_if_absent("ignored", b"key", b"value")? {
+                return Err(DatabaseError::Conflict);
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store.get_record("batch", b"old").unwrap().unwrap(),
+            b"preserve"
+        );
+        let called = std::cell::Cell::new(false);
+        let result: Result<(), DatabaseError> = store.with_record_transaction(|| {
+            store.put_record("batch", b"new", b"rollback")?;
+            store.with_record_transaction(|| {
+                called.set(true);
+                Ok::<_, DatabaseError>(())
+            })
+        });
+        assert!(result.is_err());
+        assert!(!called.get());
+        assert!(store.get_record("batch", b"new").unwrap().is_none());
+        store
+            .with_record_transaction(|| -> Result<(), DatabaseError> {
+                store.replace_record_if_value("batch", b"old", b"preserve", b"committed")?;
+                for key in 0_u64..128 {
+                    assert!(store.put_record_if_absent("batch", &key.to_be_bytes(), b"durable")?);
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(store.records("batch").unwrap().len(), 129);
+        assert_eq!(
+            store.get_record("batch", b"old").unwrap().unwrap(),
+            b"committed"
+        );
+    }
+
     #[test]
     fn indexed_record_cursor_bounds_rows_and_keeps_exclusive_order_across_reopen() {
         let temp = tempfile::tempdir().unwrap();

@@ -1231,6 +1231,16 @@ passing tests below apply only to their recorded source and exercised cases.
     Details and validation are recorded in ADR 0002. This explicit native-only
     API does not activate normal paged capture, Git-history installation,
     remote/seed-only restore, checkpoint/retention or the 1 TiB production target.
+  - [x] Require complete paged Git graph admission before retained publication.
+    Stream large tree entries and commit/tag headers without a whole-object
+    buffer; use bounded encrypted disk joins and traversal frames for complete
+    ref/DAG/blob membership, cycles, shared-tree path lengths, safe modes/names
+    and annotated-tag identity. Bind repository identity to the enclosing
+    protected root during sealing, bundle construction and authenticated open.
+    Batch disposable index mutations in one private SQL transaction, preserving
+    the production catalog writer during page I/O. Validation is recorded in
+    ADR 0002. Blob plaintext verification, Git-history installation, physical
+    scratch/quota lifecycle and normal production consumers remain open.
   - [ ] Complete legacy retained-revision migration through normal native
     capture/restore, checkpoint/retention and seed-only consumers before
     enabling the new format.
