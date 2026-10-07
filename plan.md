@@ -1576,6 +1576,16 @@ scratch allocation, coding bounds or atomic cache-write paths. The review itself
 ran no builds, tests or runtime probes; the subsequent correction qualification
 above is separate evidence for its recorded source.
 
+The next packing increment adds guild-scoped packed-sector descriptor streams
+with 128-slot fragments, fixed record/root decode bounds and incremental checking
+of historical sector IDs. Existing flat hashing also consumes canonical bytes
+directly, preserving all five catalog layouts without a whole encoded copy.
+Core compatibility/adversarial tests and durable store ownership/reopen/shared
+root/cancellation tests pass (123 core, 153 ordinary store; strict Clippy passes).
+This implements a bounded codec prerequisite. Full source/proof/authority joins,
+paged checkpoint publication, normal consumer migration, quotas and the real
+retained 1 TiB gate remain required. ADR 0002 records the limits and evidence.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

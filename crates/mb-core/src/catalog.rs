@@ -11,6 +11,7 @@ use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 mod file_recipes;
 mod files;
 mod native_files;
+mod packed_sectors;
 mod privacy;
 mod range;
 mod records;
@@ -29,6 +30,11 @@ pub use files::{
 pub use native_files::{
     CATALOG_NATIVE_FILE_ROOT_BYTES, CatalogFileEvent, CatalogNativeFileReader,
     CatalogNativeFileRoot,
+};
+pub use packed_sectors::{
+    CATALOG_PACKED_RECORD_BYTES, CATALOG_PACKED_ROOT_BYTES, CATALOG_PACKED_SLOTS,
+    CatalogPackedSectorBuilder, CatalogPackedSectorReader, CatalogPackedSectorRecord,
+    CatalogPackedSectorRoot,
 };
 pub use range::CatalogRangeReader;
 pub use records::{

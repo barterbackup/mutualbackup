@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     MAX_PROFILE_SHARD_SIZE, MERKLE_LEAF_SIZE, MerkleCommitment, MerkleSubtreeProof, NodeId,
-    SignedRecord, canonical_bytes, merkle_commit, merkle_commit_subtrees, merkle_open_subtree,
+    SignedRecord, merkle_commit, merkle_commit_subtrees, merkle_open_subtree,
     merkle_verify_subtree,
 };
 
@@ -591,15 +591,47 @@ pub fn attach_legacy_packing_evidence(
 
 impl PackedSectorDescriptor {
     pub fn calculate_id(&self, profile: PackingProfile) -> Result<[u8; 32], PackingError> {
-        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup packed sector v1");
-        hasher.update(&canonical_bytes(&(
+        let mut hasher = PackedSectorIdHasher::new(
             profile,
             self.sector_index,
             self.flat_root,
             &self.commitment,
-            &self.slots,
-        ))?);
-        Ok(*hasher.finalize().as_bytes())
+            self.slots.len(),
+        )?;
+        for slot in &self.slots {
+            hasher.push(slot)?;
+        }
+        Ok(hasher.finish())
+    }
+}
+
+/// The original tuple/vector encoding, appended one bounded slot at a time.
+/// The paged descriptor reader supplies and verifies the declared slot count.
+pub(crate) struct PackedSectorIdHasher(blake3::Hasher);
+
+impl PackedSectorIdHasher {
+    pub(crate) fn new(
+        profile: PackingProfile,
+        index: u32,
+        flat_root: [u8; 32],
+        commitment: &MerkleCommitment,
+        slots: usize,
+    ) -> Result<Self, crate::ModelError> {
+        let mut hash = blake3::Hasher::new_derive_key("mutualbackup packed sector v1");
+        crate::canonical::update_canonical_hash(
+            &mut hash,
+            &(profile, index, flat_root, commitment),
+        )?;
+        crate::canonical::update_canonical_hash(&mut hash, &slots)?;
+        Ok(Self(hash))
+    }
+
+    pub(crate) fn push(&mut self, slot: &PackedSlot) -> Result<(), crate::ModelError> {
+        crate::canonical::update_canonical_hash(&mut self.0, slot)
+    }
+
+    pub(crate) fn finish(self) -> [u8; 32] {
+        *self.0.finalize().as_bytes()
     }
 }
 
@@ -1514,43 +1546,54 @@ fn catalog_id(
         _ => return Err(PackingError::InvalidCatalog),
     };
     let mut hasher = blake3::Hasher::new_derive_key(domain);
-    let bytes = if let (Some(authentication), Some(bindings), Some(attestations)) =
+    if let (Some(authentication), Some(bindings), Some(attestations)) =
         (source_authentication, legacy_bindings, legacy_attestations)
     {
-        canonical_bytes(&(
-            format_version,
-            revision,
-            parent,
-            profile,
-            sectors,
-            authentication,
-            bindings,
-            attestations,
-        ))?
+        crate::canonical::update_canonical_hash(
+            &mut hasher,
+            &(
+                format_version,
+                revision,
+                parent,
+                profile,
+                sectors,
+                authentication,
+                bindings,
+                attestations,
+            ),
+        )?
     } else if let (Some(authentication), Some(bindings)) = (source_authentication, legacy_bindings)
     {
-        canonical_bytes(&(
-            format_version,
-            revision,
-            parent,
-            profile,
-            sectors,
-            authentication,
-            bindings,
-        ))?
+        crate::canonical::update_canonical_hash(
+            &mut hasher,
+            &(
+                format_version,
+                revision,
+                parent,
+                profile,
+                sectors,
+                authentication,
+                bindings,
+            ),
+        )?
     } else if let Some(authentication) = source_authentication {
-        canonical_bytes(&(
-            format_version,
-            revision,
-            parent,
-            profile,
-            sectors,
-            authentication,
-        ))?
+        crate::canonical::update_canonical_hash(
+            &mut hasher,
+            &(
+                format_version,
+                revision,
+                parent,
+                profile,
+                sectors,
+                authentication,
+            ),
+        )?
     } else {
-        canonical_bytes(&(format_version, revision, parent, profile, sectors))?
+        crate::canonical::update_canonical_hash(
+            &mut hasher,
+            &(format_version, revision, parent, profile, sectors),
+        )?
     };
-    hasher.update(&bytes);
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -1574,7 +1617,10 @@ pub enum PackingError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{KeyMaterial, Seed, decode_canonical, merkle_open_range, merkle_verify_range};
+    use crate::{
+        KeyMaterial, Seed, canonical_bytes, decode_canonical, merkle_open_range,
+        merkle_verify_range,
+    };
 
     use super::*;
 

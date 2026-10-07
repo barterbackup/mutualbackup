@@ -5,6 +5,35 @@ use serde::Serialize;
 
 use crate::ModelError;
 
+struct HashUpdate<'a>(&'a mut blake3::Hasher);
+
+impl Flavor for HashUpdate<'_> {
+    type Output = ();
+
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        self.try_extend(&[byte])
+    }
+
+    fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+        self.0.update(bytes);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        Ok(())
+    }
+}
+
+/// Append the exact canonical encoding without retaining an encoded copy.
+/// Callers bound/validate their input independently and abandon the hash after
+/// an encoding error; a failed serializer may already have appended a prefix.
+pub(crate) fn update_canonical_hash<T: Serialize>(
+    hasher: &mut blake3::Hasher,
+    value: &T,
+) -> Result<(), ModelError> {
+    postcard::serialize_with_flavor(value, HashUpdate(hasher)).map_err(ModelError::Encode)
+}
+
 struct BoundedSize {
     size: usize,
     limit: usize,
@@ -152,6 +181,29 @@ mod tests {
         }
         assert!(matches!(
             canonical_size_bounded(&Invalid, usize::MAX),
+            Err(ModelError::Encode(postcard::Error::SerdeSerCustom))
+        ));
+    }
+
+    #[test]
+    fn streamed_canonical_hash_matches_nested_wire_bytes_and_preserves_errors() {
+        for length in [0, 1, 127, 128, 16_383, 16_384] {
+            let value = (u64::MAX, vec![0xab_u8; length], Some(vec!["ref", "nested"]));
+            let mut streamed = blake3::Hasher::new_derive_key("test canonical hash");
+            update_canonical_hash(&mut streamed, &value).unwrap();
+            let mut reference = blake3::Hasher::new_derive_key("test canonical hash");
+            reference.update(&canonical_bytes(&value).unwrap());
+            assert_eq!(streamed.finalize(), reference.finalize());
+        }
+        struct Invalid;
+        impl Serialize for Invalid {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let _ = serializer.serialize_seq(Some(1))?;
+                Err(serde::ser::Error::custom("injected encoding failure"))
+            }
+        }
+        assert!(matches!(
+            update_canonical_hash(&mut blake3::Hasher::new(), &Invalid),
             Err(ModelError::Encode(postcard::Error::SerdeSerCustom))
         ));
     }

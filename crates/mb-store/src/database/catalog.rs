@@ -572,6 +572,132 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn packed_descriptor_pages_reopen_publish_share_and_cancel_with_their_typed_root() {
+        use mb_core::{
+            CatalogPackedSectorBuilder, CatalogPackedSectorReader, CatalogPackedSectorRoot,
+            PackedSectorDescriptor, PackedSlot, PackedSourceChunk, PackingProfile, SourceChunkId,
+            merkle_zero_commitment,
+        };
+
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([88; 32]));
+        let profile = PackingProfile {
+            format_version: 1,
+            sector_size: mb_core::V1_SECTOR_SIZE as u32,
+            slot_size: mb_core::MERKLE_LEAF_SIZE as u32,
+        };
+        let scope = CatalogScope::Guild { guild_id: [7; 32] };
+        let commitment = merkle_zero_commitment(profile.sector_size).unwrap();
+        let mut sector = PackedSectorDescriptor {
+            id: [0; 32],
+            sector_index: 0,
+            flat_root: commitment.root,
+            commitment,
+            slots: (0..profile.sector_size / profile.slot_size)
+                .map(|chunk_index| {
+                    PackedSlot::Data(PackedSourceChunk {
+                        id: SourceChunkId {
+                            owner: keys.node_id(),
+                            protected_root: [3; 32],
+                            object_id: [4; 32],
+                            chunk_index,
+                        },
+                        source_offset: u64::from(chunk_index) * u64::from(profile.slot_size),
+                        logical_len: profile.slot_size,
+                        content_hash: [5; 32],
+                    })
+                })
+                .collect(),
+        };
+        sector.id = sector.calculate_id(profile).unwrap();
+        let mut pages = Vec::new();
+        let mut sink = |page, bytes| {
+            pages.push((page, bytes));
+            Ok::<_, ()>(())
+        };
+        let mut builder = CatalogPackedSectorBuilder::new(scope, 3, profile).unwrap();
+        builder.push_sector(&sector, &mut sink).unwrap();
+        let root = builder.finish(&mut sink).unwrap();
+        assert!(pages.len() > 4);
+        let operation = CatalogIntent {
+            id: Uuid::from_bytes([86; 16]),
+            scope,
+            section: CatalogSection::Packing,
+        };
+        let successor = CatalogIntent {
+            id: Uuid::from_bytes([87; 16]),
+            ..operation
+        };
+        let bundle = |intent: CatalogIntent| CatalogBundle {
+            id: intent.id,
+            scope,
+            roots: vec![CatalogBundleRoot {
+                intent,
+                root: root.records.page,
+            }],
+            descriptor: canonical_bytes(&root).unwrap(),
+        };
+        let verify = |store: &ControlStore, operation: CatalogIntent| {
+            let (saved, state) = store.catalog_bundle(operation.id).unwrap().unwrap();
+            assert_eq!(state, CatalogBundleState::Published);
+            assert_eq!(saved, bundle(operation));
+            let restored = CatalogPackedSectorRoot::decode(&saved.descriptor).unwrap();
+            assert_eq!(restored, root);
+            let mut reader = CatalogPackedSectorReader::new(scope, restored).unwrap();
+            let mut count = 0;
+            while reader
+                .next_record(&mut |page| store.catalog_page(scope, CatalogSection::Packing, page))
+                .unwrap()
+                .is_some()
+            {
+                count += 1;
+            }
+            assert_eq!(count, root.records.records);
+        };
+        for stopped in [0, 1, pages.len() - 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open(&path, &keys).unwrap();
+            store.begin_catalog(operation).unwrap();
+            for (page, bytes) in &pages[..stopped] {
+                store.stage_catalog_page(operation, *page, bytes).unwrap();
+            }
+            assert!(store.publish_catalog_bundle(&bundle(operation)).is_err());
+            assert!(store.catalog_bundle(operation.id).unwrap().is_none());
+            drop(store);
+            let store = ControlStore::open(&path, &keys).unwrap();
+            for (page, bytes) in &pages {
+                store.stage_catalog_page(operation, *page, bytes).unwrap();
+            }
+            store.publish_catalog_bundle(&bundle(operation)).unwrap();
+            drop(store);
+            let store = ControlStore::open(&path, &keys).unwrap();
+            verify(&store, operation);
+            let mut changed = bundle(operation);
+            changed.descriptor[0] ^= 1;
+            assert!(store.publish_catalog_bundle(&changed).is_err());
+            store.begin_catalog(successor).unwrap();
+            let (page, bytes) = pages.last().unwrap();
+            assert_eq!(*page, root.records.page);
+            store.stage_catalog_page(successor, *page, bytes).unwrap();
+            store.publish_catalog_bundle(&bundle(successor)).unwrap();
+            store.cancel_catalog_bundle(operation.id).unwrap();
+            while store.release_catalog_pin(operation).unwrap() {}
+            assert!(!store.collect_catalog_page().unwrap());
+            drop(store);
+            let store = ControlStore::open(&path, &keys).unwrap();
+            verify(&store, successor);
+            assert!(store.publish_catalog_bundle(&bundle(operation)).is_err());
+            store.cancel_catalog_bundle(successor.id).unwrap();
+            while store.release_catalog_pin(successor).unwrap() {}
+            while store.collect_catalog_page().unwrap() {}
+            assert!(store.records(PAGE).unwrap().is_empty());
+            assert!(store.records(META).unwrap().is_empty());
+            assert!(store.begin_catalog(operation).is_err());
+            assert!(store.begin_catalog(successor).is_err());
+        }
+    }
+
     fn intent(id: u8) -> CatalogIntent {
         CatalogIntent {
             id: Uuid::from_bytes([id; 16]),

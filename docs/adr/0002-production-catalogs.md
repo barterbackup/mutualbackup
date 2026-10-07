@@ -2108,3 +2108,59 @@ locked workspace/all-targets Clippy and the locked all-targets test build pass o
 the restart successor. These are Linux library gates, separate from the required
 five-daemon topology, exact release artifact, other platform and real retained
 1 TiB qualifications. R3 and M6 remain open.
+
+### Bounded packed-sector descriptor streams (2026-10-07)
+
+`CatalogPackedSectorRoot` authenticates a guild-scoped Packing record stream,
+packing version, profile and exact sector/slot/source-occurrence/byte summaries.
+The version-one grammar is one header followed by exactly the profile's number
+of slot fragments for each contiguous sector index. Each fragment contains at
+most 128 original `PackedSlot` values, bounded to 24,832 encoded bytes. Nested
+length declarations are checked during decode. The typed root has a 512-byte
+decode cap. Builders retain one partial catalog leaf and the tree frontier;
+semantic validation retains one active sector hash and fixed counters. Neither
+reader nor builder assembles a complete sector descriptor vector. A 4,096-slot
+descriptor larger than a catalog leaf is covered explicitly.
+
+The sector hash streams exactly the original Postcard tuple, including its
+vector-length prefix and original slot encodings. Existing flat catalog hashing
+also feeds Postcard directly into BLAKE3 instead of allocating a second complete
+encoding. Hash domains, signed layouts and IDs remain unchanged. Independent
+reference encodings verify all five historical catalog versions. The validated
+legacy adapter borrows descriptor vectors in bounded fragments; it converts only
+descriptors and does not rewrite or replace signed proofs/bindings/attestations.
+
+Readers enforce header and fragment versions, contiguous indices/offsets, exact
+fragment sizes, profile geometry, source offsets/lengths and nonzero identifiers,
+version-specific flat/Merkle roots, original sector IDs and the final nonempty
+sector rule. Exact summary checks occur before yielding the final record; full
+authenticated EOF remains required. Encoding, semantic, storage and fetch errors
+permanently fence their builder/reader. Root summaries count source occurrences;
+this stream alone cannot reject duplicate source chunks across sectors or prove
+complete source coverage, zero-subtree semantics, owner/member authority or the
+packed Merkle commitment's correspondence to authenticated source proofs. Those
+disk-backed joins and the enclosing packing/checkpoint root remain mandatory
+before protection can be claimed.
+
+A SQLCipher store fixture stages the multi-page descriptor child-first, rejects
+publication at incomplete boundaries, reopens and resumes idempotently, publishes
+the typed root through immutable bundle bindings and reads its complete stream.
+Two intents share the same closure; cancelling one preserves the other, while
+cancelling both permits bounded pin release and complete page reclamation.
+Retired intent IDs remain fenced. This exercises existing durable catalog
+ownership and does not activate a new Node/checkpoint format.
+
+Qualification: all 123 core and 153 ordinary store tests pass, with 26 provisioned
+store tests ignored. Cases include malformed nested lengths, noncanonical and
+truncated encodings, incorrect IDs/summaries/geometry, partial sectors, empty and
+interior-hole sectors, callback failures and failure fencing. Formatting and
+strict locked workspace/all-targets Clippy pass. The concurrent store run exposed
+a preexisting discovery fixture that deliberately exhausted the process frame
+pool; only saturating fixtures now use an isolated pool. Production scans and
+resumed scans still share 64 frames, and a regression verifies cap enforcement
+and capacity release across scan lifetimes.
+
+Source authentication, unique/complete source joins, coding records, enclosing
+packing/checkpoint publication, retained-history quota reservations, incremental
+edits and normal capture/recovery consumer activation remain open. This codec
+does not qualify real 1 TiB retained dataset capacity or close R3/M6.

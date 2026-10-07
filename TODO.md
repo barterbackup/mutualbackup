@@ -1331,7 +1331,22 @@ separately below.
     encoding and bound packed-cache SQL reads before allocation. Validation is
     recorded in ADR 0002. Whole flat packing/catalog materialization, paged
     packing/coding publication and full capture/recovery migration remain open.
-  - [ ] Add quota reservations, bounded packing/coding record
+  - [x] Add bounded packed-sector descriptor streams as the first paged packing
+    codec. Guild-scoped headers and fragments carry at most 128 slots and 24,832
+    encoded bytes per record; typed roots decode within 512 bytes. Readers verify
+    exact ordering, geometry, summaries, authenticated EOF and original sector
+    IDs incrementally. All five legacy layouts keep their signed bytes and IDs;
+    existing flat sector/catalog hashing streams canonical bytes without a
+    second whole encoding. Local bundle ownership qualifies interruption/reopen,
+    shared roots, cancellation and bounded reclamation. Validation: 123 core and
+    153 ordinary store tests pass (26 store tests ignored), formatting and strict
+    locked workspace/all-targets Clippy pass. The store run also exposed an
+    unrelated discovery exhaustion-fixture race; isolated fixture pools and a
+    shared-capacity release regression preserve the production 64-frame cap.
+    Full source uniqueness/coverage/proof and authority joins, enclosing paged
+    packing/checkpoint publication, quota reservations, normal consumer activation
+    and real retained 1 TiB qualification remain open. See ADR 0002.
+  - [ ] Add quota reservations, remaining bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.
