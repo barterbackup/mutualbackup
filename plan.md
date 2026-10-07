@@ -1617,6 +1617,16 @@ including spill, fault rollback, quota retry and durable reopen/cancellation.
 Certified paged authority, normal publication/retention/recovery activation,
 coding/checkpoint capacity, quotas and real retained 1 TiB gates remain open.
 
+The exact-source follow-up on `5841bd2` stopped at a Node coding-coordinator
+reachability fixture failure (417 passed, one failed, 21 ignored). Its isolated
+package-target retry passed in 193.62 seconds on a different feature-unified
+binary; this is not a passing workspace gate. Separate locked store tests and
+the workspace/all-targets build pass. Provisioned retained native Btrfs recovery
+passes in 33.95 seconds with all 235 tracked-file and both workspace test-binary
+hashes unchanged and resource cleanup independently checked. Correct and
+requalify the fixture's peer-loop scheduling while retaining the original R5
+progress and exact-release/platform requirements.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

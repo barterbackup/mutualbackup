@@ -2316,3 +2316,20 @@ Certified paged checkpoint/source authority integration, coding records, the
 complete enclosing capacity/quota contract, incremental edits, normal
 capture/checkpoint/retention/seed-only activation, filesystem/platform and real
 retained 1 TiB qualification remain open. R3 and M6 are not complete.
+
+Exact-source follow-up on `5841bd2`: the locked workspace run stopped in Node
+with 417 passed, one failed and 21 ignored. The mixed packed-group replacement
+fixture failed its initial coordinator reachability check. Earlier package
+suites, including all 134 core tests, passed. An isolated package-target retry
+on the unchanged source passed in 193.62 seconds; that retry uses a different
+feature-unified test binary and does not turn the failed workspace gate into a
+pass. Its synchronous large packing/proof work shares the default Tokio thread
+with all five peer loops, a scheduling concern to correct and requalify.
+
+The separate locked store run passes 158 tests with 26 ignored, and the locked
+workspace/all-targets test build passes. The provisioned Btrfs retained native
+migration/recovery fixture passes in 33.95 seconds. All 235 tracked-file hashes
+and both workspace test-binary hashes match before/after native recovery.
+Disposable mount/image/loop cleanup and independent mount/loop/namespace checks
+pass. The full workspace gate and original R5 topology/signature issue remain
+open; these results do not qualify release artifacts or real retained 1 TiB data.

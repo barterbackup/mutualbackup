@@ -1400,6 +1400,15 @@ separately below.
     external and mandatory; no active consumer or remote-protection claim is
     enabled. Full coding/checkpoint/retention/seed-only migration, quotas,
     incremental edits and real retained 1 TiB qualification remain open.
+    Follow-up on `5841bd2`: locked workspace execution stopped at a Node
+    coordinator-reachability fixture failure (417 passed, one failed, 21 ignored).
+    Its isolated package-target retry passes in 193.62 seconds on a different
+    feature-unified binary; the workspace gate remains failed. The separate
+    locked store suite and workspace/all-targets build pass. Provisioned native
+    Btrfs retained migration/recovery passes in 33.95 seconds, with all 235
+    tracked-file and both workspace test-binary hashes unchanged and independent
+    resource cleanup verified. Correct/requalify the fixture's shared Tokio
+    scheduling; preserve the original R5 progress and release/platform gates.
   - [x] Replace the Linux whole-filesystem lookup under the global mutex with
     bounded process-local relocation cursors. Each lookup advances at most 2,048
     steps with a cooperative 25 ms deadline; incomplete work returns an explicit
