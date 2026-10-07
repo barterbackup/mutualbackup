@@ -201,7 +201,8 @@ impl AnchorAreaDiscovery {
             .advance(&self.area, STEPS_PER_LOOKUP, LOOKUP_TIME)?
         {
             Some(path) => {
-                let directory = PinnedDirectory::open(&path)?;
+                let directory =
+                    PinnedDirectory::open(&path).map_err(|error| reopen_error(error, &path))?;
                 if directory.filesystem_id != self.area.filesystem_id
                     || marked_id(&directory, &path) != Some(self.area.area_id)
                 {
@@ -270,7 +271,7 @@ fn require_persistent_cookies(directory: &PinnedDirectory) -> Result<(), AnchorE
     Ok(())
 }
 
-fn reopen_error(error: AnchorError, path: &Path) -> AnchorError {
+pub(super) fn reopen_error(error: AnchorError, path: &Path) -> AnchorError {
     match &error {
         AnchorError::Io(io)
             if io.kind() == std::io::ErrorKind::NotFound
@@ -289,6 +290,145 @@ fn reopen_error(error: AnchorError, path: &Path) -> AnchorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_reopen_restarts_namespace_changes_and_preserves_other_io_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let area = fixture(temp.path());
+        let path = temp.path().join(format!("{AREA_PREFIX}-candidate"));
+        fs::create_dir(&path).unwrap();
+        write_anchor_area_marker(&path, area.area_id).unwrap();
+        // Keep the old inode allocated while testing replacement identities.
+        let original = PinnedDirectory::open(&path).unwrap();
+        let identity = original.identity().unwrap();
+        for replacement in ["missing", "file", "symlink", "inode", "marker"] {
+            if fs::symlink_metadata(&path).is_ok() {
+                if path.is_dir() && !path.is_symlink() {
+                    fs::remove_dir_all(&path).unwrap();
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+            match replacement {
+                "missing" => {}
+                "file" => fs::write(&path, []).unwrap(),
+                "symlink" => std::os::unix::fs::symlink(temp.path(), &path).unwrap(),
+                _ => {
+                    fs::create_dir(&path).unwrap();
+                    write_anchor_area_marker(
+                        &path,
+                        if replacement == "marker" {
+                            Uuid::new_v4()
+                        } else {
+                            area.area_id
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            let mut scan = Scan::new(vec![]);
+            scan.candidate = Some((identity, path.clone()));
+            assert!(
+                matches!(
+                    scan.advance(&area, 1, Duration::from_secs(1)),
+                    Err(AnchorError::SourceChanged(changed)) if changed == path
+                ),
+                "{replacement}"
+            );
+        }
+        for code in [libc::EACCES, libc::EIO, libc::EMFILE] {
+            assert!(matches!(
+                reopen_error(AnchorError::Io(std::io::Error::from_raw_os_error(code)), &path),
+                AnchorError::Io(error) if error.raw_os_error() == Some(code)
+            ));
+        }
+    }
+
+    #[test]
+    fn durable_scan_rediscovers_candidate_moved_inside_completed_subtree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scan");
+        fs::create_dir(&root).unwrap();
+        for name in ["first", "second"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        // Use the filesystem's enumeration order rather than assuming sorted names.
+        let directory = PinnedDirectory::open(&root).unwrap();
+        let mut entries = directory::DirectoryEntries::new(&directory).unwrap();
+        let mut parents = Vec::new();
+        while let Some(entry) = entries.next().unwrap() {
+            if entry.name != "." && entry.name != ".." {
+                parents.push(root.join(entry.name));
+            }
+        }
+        let completed = &parents[0];
+        let pending = &parents[1];
+        let original = completed.join(format!("{AREA_PREFIX}-original"));
+        fs::create_dir(&original).unwrap();
+        let area = fixture(&root);
+        write_anchor_area_marker(&original, area.area_id).unwrap();
+        for n in 0..6_000 {
+            fs::write(pending.join(format!("entry-{n}")), []).unwrap();
+        }
+        let mut discovery = AnchorAreaDiscovery::start(&area).unwrap();
+        for _ in 0..100 {
+            assert_eq!(
+                discovery
+                    .scan
+                    .advance(&area, 1, Duration::from_secs(1))
+                    .unwrap(),
+                None
+            );
+            if discovery.scan.candidate.is_some()
+                && discovery
+                    .scan
+                    .stack
+                    .last()
+                    .is_some_and(|frame| &frame.path == pending)
+            {
+                break;
+            }
+        }
+        assert_eq!(discovery.scan.candidate.as_ref().unwrap().1, original);
+        assert_eq!(&discovery.scan.stack.last().unwrap().path, pending);
+        let cursor = discovery.checkpoint().unwrap();
+        drop(discovery);
+        let database = temp.path().join("control.db");
+        let store = crate::ControlStore::open_with_key(&database, &[8; 32]).unwrap();
+        let attempt = Uuid::new_v4();
+        let journal = canonical_bytes(&(1_u8, attempt, 0_u64, &cursor)).unwrap();
+        store
+            .put_record(
+                crate::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                area.area_id.as_bytes(),
+                &journal,
+            )
+            .unwrap();
+        drop(store);
+        let moved = completed.join(format!("{AREA_PREFIX}-moved"));
+        fs::rename(&original, &moved).unwrap();
+        // No saved directory frame changed: only an already finished subtree did.
+        let mut resumed = AnchorAreaDiscovery::resume(&area, &cursor).unwrap();
+        assert!(matches!(
+            resumed.scan.advance(&area, 10_000, Duration::from_secs(10)),
+            Err(AnchorError::SourceChanged(path)) if path == original
+        ));
+        drop(resumed);
+        let mut found = None;
+        for _ in 0..30 {
+            // Every retry loses process-local handles and reopens durable state.
+            let store = crate::ControlStore::open_existing_with_key(&database, &[8; 32]).unwrap();
+            match store.advance_anchor_area_discovery(&area).unwrap() {
+                AnchorAreaDiscoveryStep::Found(path) => {
+                    found = Some(path);
+                    break;
+                }
+                AnchorAreaDiscoveryStep::Pending => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(found, Some(moved));
+    }
 
     fn fixture(root: &Path) -> StableAnchorAreaLocator {
         StableAnchorAreaLocator {

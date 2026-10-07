@@ -289,7 +289,8 @@ impl Scan {
             }
             if self.stack.is_empty() {
                 if let Some((identity, path)) = self.candidate.take() {
-                    let actual = PinnedDirectory::open(&path)?;
+                    let actual = PinnedDirectory::open(&path)
+                        .map_err(|error| checkpoint::reopen_error(error, &path))?;
                     if actual.identity()? != identity
                         || marked_id(&actual, &path) != Some(area.area_id)
                     {

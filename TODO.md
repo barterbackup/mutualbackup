@@ -1359,23 +1359,19 @@ tests, daemons or runtime probes and supplies no new runtime qualification.
     fences reject stale publishers across reset/completion and process reopen,
     including absent-to-present-to-absent races. Git maintenance avoids intent
     replay and backend re-probing/rebinding. Validation is recorded in ADR 0002.
-  - [ ] **R3-DISCOVERY-RESTART / P2 — Restart durable scans when a saved candidate
-    disappears.** Source review through `5f8c789` found that candidate publication
-    in `crates/mb-store/src/anchor/discovery.rs::Scan::advance` propagates
-    `PinnedDirectory::open` failures directly. Moving a candidate inside an
-    already-scanned subtree can leave the remaining directory fences unchanged;
-    reopening the saved candidate then returns `Io(NotFound)`. The database
-    discovery loop restarts only on `SourceChanged`, so retries and process
-    restarts keep loading the same stale cursor and block dependent operations.
-    Explicit `source-scan reset` is the current workaround. Apply the existing
-    missing/replaced-path error mapping to candidate reopens so namespace changes
-    restart bounded discovery while unrelated I/O errors still surface.
-    Acceptance (pending): persist a candidate after finishing its parent subtree
-    while a large sibling scan remains active, move the candidate within the
-    completed subtree, reopen the catalog and rediscover it through bounded
-    retries without reset. Retain replaced-inode/marker rejection and reset/CAS
-    fencing. Source-only finding; no corrective implementation or runtime
-    validation yet.
+  - [x] **R3-DISCOVERY-RESTART / P2 — Restart durable scans when a saved candidate
+    disappears.** Both candidate publication reopens now use the existing
+    namespace-change mapping: missing paths, symlinks, replaced non-directories
+    and mount crossings return `SourceChanged`; unrelated I/O errors propagate.
+    The durable discovery loop saves a fresh bounded cursor through its existing
+    attempt/generation/reset fence. A regression first reproduced the raw-I/O
+    failure, then verified a saved candidate moved inside a completed subtree
+    while a 6,000-entry sibling remained active. Reopening the catalog on every
+    retry rediscovered the moved area without reset. Separate checks reject
+    replaced inodes/markers/files/symlinks and preserve EACCES/EIO/EMFILE.
+    Validation: all 150 ordinary store tests pass (26 provisioned tests remain
+    ignored), including existing reset/CAS and pin-transfer regressions. This
+    slice does not qualify other discovery consumers/platforms or the full M6 gate.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
     progress to remaining standalone capture/recovery and best-effort cleanup
     call paths; complete consumer lifecycle qualification;

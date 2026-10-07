@@ -1530,8 +1530,9 @@ filesystem/platform qualification,
 full physical lifecycle and real 1 TiB dataset/history qualification remain
 required.
 
-The 2026-10-07 source-only review through `5f8c789` confirms progress on R3 but
-leaves two recovery corrections open:
+The 2026-10-07 source-only review through `5f8c789` identified two R3 recovery
+corrections. R3-DISCOVERY-RESTART is now corrected as recorded below;
+R3-MIGRATION-RECOVERY remains open:
 
 - **R3-MIGRATION-RECOVERY:** Explicit Node/library retained migration shares
   the original legacy data-sector IDs. With `control.db` retained after anchor
@@ -1544,16 +1545,19 @@ leaves two recovery corrections open:
   anchor-pin transfer. Require an end-to-end migration/source-loss regression
   that restores the original flat snapshot from peers after reopen, plus retry
   and stale-replacement coverage.
-- **R3-DISCOVERY-RESTART:** Reopening a saved relocation candidate with
+- **R3-DISCOVERY-RESTART (corrected):** Reopening a saved relocation candidate with
   `PinnedDirectory::open` can return raw `Io(NotFound)` in
   `crates/mb-store/src/anchor/discovery.rs`. If that candidate moves within an
   already-scanned subtree while sibling traversal remains active, the remaining
   directory fences can stay unchanged. Durable retry reloads the same stale
   cursor because `crates/mb-store/src/database/anchor_discovery.rs` restarts only
-  on `SourceChanged`. Map missing/replaced candidate opens to `SourceChanged`
-  while preserving replacement identity fencing. Cover a saved candidate,
-  completed parent subtree, active sibling traversal, candidate move and
-  database reopen/retry without explicit reset, including a replaced-path case.
+  on `SourceChanged`. Both candidate reopens now map namespace changes to
+  `SourceChanged`, preserving unrelated I/O errors and identity/marker fencing.
+  A regression reproduces the old failure and verifies database reopen/retry
+  without reset after a candidate moves inside its completed parent subtree
+  while a 6,000-entry sibling scan remains active. Replacement/error mapping,
+  existing reset/CAS and all other ordinary store tests pass (150 tests;
+  26 provisioned tests remain ignored).
 
 Prioritize this end-to-end migration/source-loss recovery slice next. Milestone 6
 remains open for these R3 corrections, normal paged capture/packing/checkpoint/
