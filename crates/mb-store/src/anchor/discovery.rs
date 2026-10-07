@@ -184,7 +184,7 @@ fn append_mount_roots(contents: &str, roots: &mut Vec<PathBuf>) -> Result<(), An
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(target_os = "linux")]
-static OPEN_FRAMES: AtomicUsize = AtomicUsize::new(0);
+static OPEN_FRAMES: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 struct Frame {
@@ -192,19 +192,24 @@ struct Frame {
     entries: directory::DirectoryEntries,
     path: PathBuf,
     stamp: checkpoint::DirectoryStamp,
+    open_frames: Arc<AtomicUsize>,
 }
 
 #[cfg(target_os = "linux")]
 impl Frame {
-    fn open(directory: PinnedDirectory, path: PathBuf) -> Result<Self, AnchorError> {
+    fn open(
+        directory: PinnedDirectory,
+        path: PathBuf,
+        open_frames: &Arc<AtomicUsize>,
+    ) -> Result<Self, AnchorError> {
         check_path(&path)?;
         let stamp = checkpoint::DirectoryStamp::read(&directory)?;
-        let mut count = OPEN_FRAMES.load(Ordering::Acquire);
+        let mut count = open_frames.load(Ordering::Acquire);
         loop {
             if count >= MAX_OPEN_FRAMES {
                 return Err(AnchorError::AnchorAreaDiscoveryLimit);
             }
-            match OPEN_FRAMES.compare_exchange_weak(
+            match open_frames.compare_exchange_weak(
                 count,
                 count + 1,
                 Ordering::AcqRel,
@@ -220,9 +225,10 @@ impl Frame {
                 entries,
                 path,
                 stamp,
+                open_frames: Arc::clone(open_frames),
             }),
             Err(error) => {
-                OPEN_FRAMES.fetch_sub(1, Ordering::AcqRel);
+                open_frames.fetch_sub(1, Ordering::AcqRel);
                 Err(error)
             }
         }
@@ -232,7 +238,7 @@ impl Frame {
 #[cfg(target_os = "linux")]
 impl Drop for Frame {
     fn drop(&mut self) {
-        OPEN_FRAMES.fetch_sub(1, Ordering::AcqRel);
+        self.open_frames.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -241,6 +247,8 @@ struct Scan {
     next_root: usize,
     #[cfg(target_os = "linux")]
     stack: Vec<Frame>,
+    #[cfg(target_os = "linux")]
+    open_frames: Arc<AtomicUsize>,
     candidate: Option<(NativeFileId, PathBuf)>,
 }
 
@@ -251,6 +259,8 @@ impl Scan {
             next_root: 0,
             #[cfg(target_os = "linux")]
             stack: Vec::new(),
+            #[cfg(target_os = "linux")]
+            open_frames: Arc::clone(OPEN_FRAMES.get_or_init(Default::default)),
             candidate: None,
         }
     }
@@ -328,7 +338,8 @@ impl Scan {
                     }
                     continue;
                 }
-                self.stack.push(Frame::open(directory, root)?);
+                self.stack
+                    .push(Frame::open(directory, root, &self.open_frames)?);
                 continue;
             }
             let frame = self.stack.last_mut().expect("nonempty stack");
@@ -388,7 +399,8 @@ impl Scan {
             if self.stack.len() == MAX_DEPTH {
                 return Err(AnchorError::AnchorAreaDiscoveryLimit);
             }
-            self.stack.push(Frame::open(directory, path)?);
+            self.stack
+                .push(Frame::open(directory, path, &self.open_frames)?);
         }
         Ok(None)
     }
@@ -518,6 +530,9 @@ mod tests {
             fs::create_dir(&deepest).unwrap();
         }
         let mut scan = Scan::new(vec![temp.path().to_path_buf()]);
+        // This deliberately saturates the frame budget. Give the fixture its
+        // own pool so parallel tests keep exercising the production pool.
+        scan.open_frames = Arc::new(AtomicUsize::new(0));
         assert!(matches!(
             complete(&mut scan, &area),
             Err(AnchorError::AnchorAreaDiscoveryLimit)
@@ -530,6 +545,42 @@ mod tests {
             append_mount_roots(&mounts, &mut Vec::new()),
             Err(AnchorError::AnchorAreaDiscoveryLimit)
         ));
+    }
+
+    #[test]
+    fn discovery_shared_frame_budget_releases_capacity_when_scans_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = Arc::new(AtomicUsize::new(0));
+        let mut first = Scan::new(vec![]);
+        let mut second = Scan::new(vec![]);
+        // Separate scans retain the same process-level budget in production.
+        assert!(Arc::ptr_eq(&first.open_frames, &second.open_frames));
+        first.open_frames = Arc::clone(&pool);
+        second.open_frames = Arc::clone(&pool);
+        let open = || {
+            Frame::open(
+                PinnedDirectory::open(temp.path()).unwrap(),
+                temp.path().to_path_buf(),
+                &pool,
+            )
+        };
+        for _ in 0..MAX_OPEN_FRAMES / 2 {
+            first.stack.push(open().unwrap());
+            second.stack.push(open().unwrap());
+        }
+        assert_eq!(pool.load(Ordering::Acquire), MAX_OPEN_FRAMES);
+        assert!(matches!(open(), Err(AnchorError::AnchorAreaDiscoveryLimit)));
+        assert_eq!(pool.load(Ordering::Acquire), MAX_OPEN_FRAMES);
+        drop(first);
+        assert_eq!(pool.load(Ordering::Acquire), MAX_OPEN_FRAMES / 2);
+        for _ in 0..MAX_OPEN_FRAMES / 2 {
+            second.stack.push(open().unwrap());
+        }
+        assert!(matches!(open(), Err(AnchorError::AnchorAreaDiscoveryLimit)));
+        drop(second);
+        assert_eq!(pool.load(Ordering::Acquire), 0);
+        drop(open().unwrap());
+        assert_eq!(pool.load(Ordering::Acquire), 0);
     }
 
     #[test]

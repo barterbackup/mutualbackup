@@ -168,7 +168,7 @@ impl AnchorAreaDiscovery {
                 return Err(AnchorError::SourceChanged(frame.path));
             }
             require_persistent_cookies(&directory)?;
-            let mut restored = Frame::open(directory, frame.path)?;
+            let mut restored = Frame::open(directory, frame.path, &scan.open_frames)?;
             restored.stamp = frame.stamp;
             restored.verify_unchanged()?;
             restored.entries.seek(frame.cookie)?;
