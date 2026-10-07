@@ -159,7 +159,7 @@ pub(super) fn bind(
     change_anchor_count(connection, anchor, previous, next)
 }
 
-fn read_source(
+pub(super) fn read_source(
     connection: &Connection,
     id: Uuid,
     sector: [u8; 32],

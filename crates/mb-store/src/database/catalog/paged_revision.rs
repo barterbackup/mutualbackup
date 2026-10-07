@@ -159,7 +159,7 @@ fn require_page_owner(
     Ok(())
 }
 
-fn page_source(
+pub(super) fn page_source(
     connection: &Connection,
     id: Uuid,
     sector: [u8; 32],
@@ -842,6 +842,231 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn paged_sector_lookup_migrates_v9_bindings_without_mutating_read_only_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let (bundle, bootstrap) = fixture(&store, 1, None);
+        publish(&store, &bundle, &bootstrap).unwrap();
+        let rows = store.records(&page_sources(bundle.id)).unwrap();
+        let sector = rows[0].0.as_slice().try_into().unwrap();
+        let expected = store
+            .paged_revision_page_source(bundle.id, sector)
+            .unwrap()
+            .unwrap();
+        store
+            .connection
+            .execute_batch("DROP INDEX protocol_records_paged_sector_sources;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [9_u32.to_be_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(store);
+        let original = std::fs::read(&path).unwrap();
+        let reader = ControlStore::open_existing_read_only_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(
+            reader
+                .paged_revision_page_source(bundle.id, sector)
+                .unwrap(),
+            Some(expected.clone())
+        );
+        assert!(reader.paged_sector_source(sector).unwrap().is_none());
+        drop(reader);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert_eq!(store.records(&page_sources(bundle.id)).unwrap(), rows);
+        assert_eq!(
+            store.paged_sector_source(sector).unwrap(),
+            Some(PagedCatalogSectorSource::Page(expected))
+        );
+        let details: String = store.connection.query_row(
+            "EXPLAIN QUERY PLAN SELECT kind FROM protocol_records
+             INDEXED BY protocol_records_paged_sector_sources
+             WHERE record_id = ?1 AND kind > ''
+               AND (kind GLOB 'catalog-paged-data-source-v1/*' OR kind GLOB 'catalog-paged-page-source-v1/*')
+             ORDER BY kind LIMIT 1", params![sector], |row| row.get(3)).unwrap();
+        assert!(
+            details.contains("SEARCH")
+                && details.contains("protocol_records_paged_sector_sources")
+                && details.contains("record_id=?"),
+            "{details}"
+        );
+        drop(store);
+        ControlStore::open_existing_read_only_with_key(&path, &[7; 32]).unwrap();
+    }
+
+    #[test]
+    fn paged_sector_index_migration_rolls_back_rejected_metadata_and_checks_index_schema() {
+        for key in ["database_kind", "schema_version"] {
+            for fault in ["ABORT", "IGNORE"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("control.db");
+                let mut store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+                store.put_record("preserved", b"id", b"original").unwrap();
+                store
+                    .connection
+                    .execute_batch("DROP INDEX protocol_records_paged_sector_sources;")
+                    .unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                        [9_u32.to_be_bytes().as_slice()],
+                    )
+                    .unwrap();
+                // TEMP triggers do not alter the persistent schema that is
+                // validated before migration, but fault its writer transaction.
+                let raise = if fault == "IGNORE" {
+                    "RAISE(IGNORE)"
+                } else {
+                    "RAISE(ABORT, 'injected')"
+                };
+                store.connection.execute_batch(&format!("CREATE TEMP TRIGGER reject_migration BEFORE UPDATE ON main.meta WHEN OLD.key = '{key}' BEGIN SELECT {raise}; END;")).unwrap();
+                assert!(super::super::super::migrate_control(&mut store.connection).is_err());
+                assert_eq!(
+                    super::super::super::stored_schema_version(&store.connection).unwrap(),
+                    9
+                );
+                assert!(!store.connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'protocol_records_paged_sector_sources')", [], |row| row.get::<_, bool>(0)).unwrap());
+                drop(store);
+                let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+                assert_eq!(
+                    store.get_record("preserved", b"id").unwrap(),
+                    Some(b"original".to_vec())
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        store.connection.execute_batch("DROP INDEX protocol_records_paged_sector_sources;
+            CREATE INDEX protocol_records_paged_sector_sources ON protocol_records(kind, record_id);").unwrap();
+        drop(store);
+        assert!(ControlStore::open_existing_read_only_with_key(&path, &[7; 32]).is_err());
+        assert!(ControlStore::open_existing_with_key(&path, &[7; 32]).is_err());
+    }
+
+    #[test]
+    fn paged_sector_lookup_tracks_shared_live_owners_and_rejects_damaged_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let (first, bootstrap) = fixture(&store, 1, None);
+        let (next, next_bootstrap) = fixture(
+            &store,
+            2,
+            Some(revision(&first).unwrap().value.hash().unwrap()),
+        );
+        publish(&store, &first, &bootstrap).unwrap();
+        publish(&store, &next, &next_bootstrap).unwrap();
+        let sector = store.records(&page_sources(first.id)).unwrap()[0]
+            .0
+            .as_slice()
+            .try_into()
+            .unwrap();
+        assert!(store.paged_sector_source([0; 32]).unwrap().is_none());
+        let selected = store.paged_sector_source(sector).unwrap().unwrap();
+        let selected_id = selected.catalog().bundle.id;
+        let remaining_id = if selected_id == first.id {
+            next.id
+        } else {
+            first.id
+        };
+        let kind = page_sources(selected_id);
+        let original = store.get_record(&kind, &sector).unwrap().unwrap();
+        for bytes in [b"bad".to_vec(), vec![0; CATALOG_SECTOR_RECIPE_BYTES + 1]] {
+            store.put_record(&kind, &sector, &bytes).unwrap();
+            assert!(store.paged_sector_source(sector).is_err());
+        }
+        store.put_record(&kind, &sector, &original).unwrap();
+        drop(store);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        store.cancel_paged_revision_catalog(selected_id).unwrap();
+        assert_eq!(
+            store
+                .paged_sector_source(sector)
+                .unwrap()
+                .unwrap()
+                .catalog()
+                .bundle
+                .id,
+            remaining_id
+        );
+        store.cancel_paged_revision_catalog(remaining_id).unwrap();
+        assert!(store.paged_sector_source(sector).unwrap().is_none());
+        for id in [selected_id, remaining_id] {
+            while store.release_paged_revision_page_source(id).unwrap() {}
+        }
+        assert!(store.paged_sector_source(sector).unwrap().is_none());
+        for suffix in [
+            "bogus".to_string(),
+            "f".repeat(4096),
+            Uuid::nil().simple().to_string(),
+            Uuid::new_v4().simple().to_string(),
+        ] {
+            let kind = format!("catalog-paged-page-source-v1/{suffix}");
+            store.put_record(&kind, &sector, b"orphaned").unwrap();
+            assert!(store.paged_sector_source(sector).is_err());
+            store.delete_record(&kind, &sector).unwrap();
+        }
+        let (live, bootstrap) = fixture(&store, 1, None);
+        publish(&store, &live, &bootstrap).unwrap();
+        assert!(store.paged_sector_source(sector).unwrap().is_some());
+        store
+            .connection
+            .execute_batch("DROP INDEX protocol_records_paged_sector_sources;")
+            .unwrap();
+        assert!(store.paged_sector_source(sector).is_err());
+    }
+
+    #[test]
+    fn paged_sector_lookup_bounds_retired_owner_work_until_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+        let mut ids = Vec::new();
+        let mut sector = None;
+        for _ in 0..65 {
+            let (bundle, bootstrap) = fixture(&store, 1, None);
+            publish(&store, &bundle, &bootstrap).unwrap();
+            sector = Some(
+                store.records(&page_sources(bundle.id)).unwrap()[0]
+                    .0
+                    .as_slice()
+                    .try_into()
+                    .unwrap(),
+            );
+            store.cancel_paged_revision_catalog(bundle.id).unwrap();
+            ids.push(bundle.id);
+        }
+        let sector = sector.unwrap();
+        assert!(matches!(
+            store.paged_sector_source(sector),
+            Err(CatalogStoreError::PagedSourceLookupLimit)
+        ));
+        assert!(store.release_paged_revision_page_source(ids[0]).unwrap());
+        // Exactly 64 retired owners reach authenticated absence, without an
+        // extra false budget error on the final indexed EOF query.
+        assert!(store.paged_sector_source(sector).unwrap().is_none());
+        assert!(store.release_paged_revision_page_source(ids[1]).unwrap());
+        let (live, bootstrap) = fixture(&store, 1, None);
+        publish(&store, &live, &bootstrap).unwrap();
+        assert_eq!(
+            store
+                .paged_sector_source(sector)
+                .unwrap()
+                .unwrap()
+                .catalog()
+                .bundle
+                .id,
+            live.id
+        );
     }
 
     #[test]

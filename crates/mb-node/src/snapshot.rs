@@ -1691,6 +1691,34 @@ pub(crate) fn install_recovered_sector_recipe(
     {
         bail!("recovered information shard does not match its descriptor");
     }
+    if let Some(source) = control.paged_sector_source(reference.id)? {
+        let scope = source.catalog().bundle.scope;
+        let opened =
+            crate::PagedPrivateMetadata::open_local_snapshot(keys, source.catalog(), scope)?;
+        ensure!(
+            opened.revision.value.guild_id == guild_id
+                && source.source().sector == reference
+                && merkle_commit(ciphertext)? == source.source().commitment,
+            "recovered information shard differs from its retained paged source"
+        );
+        match source {
+            mb_store::PagedCatalogSectorSource::Page(source) => {
+                crate::PagedPrivateMetadata::repair_catalog_source(
+                    control, keys, &source, scope, ciphertext,
+                )?;
+            }
+            mb_store::PagedCatalogSectorSource::Data(source) => {
+                // Lost file/blob sources must use the stable replacement API;
+                // do not create an independently retained Inline copy.
+                ensure!(
+                    crate::PagedPrivateMetadata::render_data_source(keys, &source, scope)?
+                        == ciphertext,
+                    "recovered data differs from its retained stable source"
+                );
+            }
+        }
+        return Ok(());
+    }
     if let Some(source) = control.catalog_sector_source(reference.id)? {
         let recipe: LocalSectorRecipe = decode_canonical(&source.recipe)?;
         ensure!(
@@ -2891,7 +2919,7 @@ fn render_sector_with_hint_update(
     expected_guild: Option<&[u8; 32]>,
     update_area_hint: bool,
 ) -> Result<Vec<u8>> {
-    if let Some(ciphertext) = crate::paged_revision::PagedPrivateMetadata::render_local_bootstrap(
+    if let Some(ciphertext) = crate::paged_revision::PagedPrivateMetadata::render_local_sector(
         control,
         keys,
         *sector_id,

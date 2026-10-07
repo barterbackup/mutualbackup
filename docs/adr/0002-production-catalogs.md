@@ -1278,3 +1278,66 @@ tests also pass, for 76 distinct cases. Formatting and strict locked workspace/
 all-targets Clippy pass. Eight provisioned snapshot cases remain ignored; full
 native capture/topology/platform, filesystem lifecycle and real 1 TiB
 qualification were not run for this source adapter.
+
+### Ordinary sector serving and owned-page recovery (2026-10-07)
+
+The ordinary sector renderer now routes paged bootstrap, private-page and
+native/Git data requests through retained root ownership before legacy recipes.
+`paged_sector_source` selects existing source rows by sector ID using a partial
+covering database index on `(record_id, kind)`. No duplicate source-owner journal
+or revision-history collection is introduced. Each candidate's complete signed
+root/source/pin state is checked in a read snapshot. Page rendering rechecks its
+immutable owner and payload together; data rendering retains its scoped or
+authenticated historical address policy and exact ciphertext commitments.
+Wrong seed/guild, malformed or orphaned rows and damaged selected live sources
+fail closed instead of using an independent legacy copy.
+Missing current-schema indexes also fail closed; only known read-only older
+schemas retain the pre-upgrade absence of automatic source lookup.
+
+Cancelled source rows remain owned until existing bounded cleanup. Lookup skips
+only valid cancellation journals and checks at most 64 candidates plus one
+bounded next-key/EOF query. Excess retired-owner backlog returns an explicit
+cleanup/retry error. It cannot turn budget exhaustion into authenticated absence
+or a legacy fallback. Background cleanup and generation-floor policy still need
+production integration before this limit can be qualified on retained history.
+
+Database schema 10 transactionally installs the exact partial-index definition
+over existing source bindings; old rows need no conversion or ownership replay.
+Known older control schemas migrate through the normal writer. Read-only old
+catalogs retain their exact schema and explicit-revision source APIs; automatic
+paged lookup becomes available after writable migration. Exact schema validation
+also checks approved index type, columns and predicate and rejects substitution.
+The global parity schema advances from 9 without changing shard or reservation
+tables, preserving live reservations and checking volume identity first. Control
+migration and this parity upgrade check metadata affected-row counts, rolling
+back SQL abort/ignore rather than committing partially relabeled state. Initial
+index construction is one transactional catalog scan; large-catalog upgrade
+cost/interruption remains part of release qualification.
+
+The recovered information-sector installer resolves paged ownership before
+legacy page or Inline recipes. It verifies the expected signed reference,
+Merkle commitment, seed/guild and private root authority, then repairs private
+page payloads through the existing exact-owner writer transaction. Native and
+Git private roles, including index pages, keep their root pins and source bytes.
+Matching live data needs no replacement; lost/damaged data must use the existing
+stable-anchor replacement API and cannot acquire an independent Inline lifetime.
+Complete data recovery orchestration, native capture/restore, full paged Git DAG
+verification, checkpoint/packing/retention and seed-only activation remain open,
+as do filesystem/platform and real 1 TiB dataset/history qualification.
+
+Validation: five new store and one Node fixtures cover exact indexed query
+plans, schema-9 source migration/read-only preservation, metadata abort/ignore
+rollback, index substitution/loss, parity reservations and volume identity,
+shared live owners, malformed/orphaned/damaged rows and the 64-owner work/EOF
+boundary with cleanup. Ordinary serving and recovery exercise native/Git private
+roles and index pages, stable data, wrong seed/guild/source/ciphertext, Inline
+fallback fencing, reopen and cancellation. Historical-address conversion also
+checks the ordinary renderer. Locked workspace/all-targets build and all 47
+paged tests pass. Full ordinary suites pass 109 core, 90 Git, 404 Node, 125 store
+and 33 CLI unit tests, for 761 distinct cases including the paged tests. Node ran
+with four test threads and completed in 1406.42 seconds; no observation timeout
+was treated as failure or used to restart the process. Formatting and strict
+locked workspace/all-targets Clippy pass. Sixty-two Git, 20 Node and 19 store
+provisioned tests remain ignored. Full native capture/topology/platform,
+filesystem lifecycle and real 1 TiB qualification were not run for this source
+routing integration; this is not current release-artifact R7 qualification.

@@ -215,7 +215,7 @@ passing tests below apply only to their recorded source and exercised cases.
     provisioned cases and full M6 upgrade/platform qualification were not rerun.
   - [x] Add a migration-free reader for preserved local parity volumes.
     Existing SQLCipher databases open read-only with exact volume identity and
-    supported schema checks (versions 2/3/5/6/7/8/9). Owner-signed manifests
+    supported schema checks (versions 2/3/5/6/7/8/9/10). Owner-signed manifests
     unwrap existing keys; seed-derived legacy keys and interrupted key-wrap
     publication are handled without rekeying, registry reconciliation, cleanup
     or shard retirement. Fixed and variable READY reads authenticate stored
@@ -1164,12 +1164,50 @@ passing tests below apply only to their recorded source and exercised cases.
     workspace/all-targets Clippy pass. Eight provisioned snapshot cases remain
     ignored; full native capture/topology/platform, filesystem lifecycle and real
     1 TiB qualification were not run for this source adapter.
+  - [x] Route ordinary sector requests and recovered private pages through
+    retained paged root ownership. Install a schema-10 partial index over
+    existing source rows without a duplicate ownership journal. Resolve page
+    and stable native/Git sources by sector ID, verifying signed roots, exact
+    sources and pins, and retain scoped/historical address policies. Skip only
+    valid cancellation journals, cap lookup at 64 candidates plus an indexed
+    next-key/EOF check and require cleanup on excess retired-owner backlog.
+    Missing current-schema indexes, damaged selected sources and malformed or
+    orphaned rows fail closed before legacy fallback. Preserve read-only older
+    catalogs; writable index migration validates exact schema and commits with
+    checked metadata updates. Schema-9 parity upgrade preserves reservations
+    and checks volume identity. The normal recovery installer authenticates
+    source/guild/seed/commitments and repairs private pages through the existing
+    owner-fenced writer, retaining roots and source bytes. Live data still uses
+    stable replacement rather than an independent Inline recovery lifetime.
+    Normal capture/restore, complete data recovery orchestration, full paged Git
+    verification, checkpoint/packing/retention and seed-only activation remain
+    required.
+    Validation: five new store and one Node fixture pass. They cover exact
+    index/query-plan and schema-9 source migration, read-only preservation,
+    rejected metadata/index substitution, reservation/volume identity, bounded
+    retired-owner work and cleanup, malformed/orphaned/damaged/shared owners,
+    missing current index, ordinary native/Git data and private index-page
+    serving/recovery, seed/guild/source rejection, Inline fallback fencing,
+    cancellation and reopen. Historical-ID conversion also exercises ordinary
+    rendering. Locked workspace/all-targets build and all 47 paged tests pass;
+    formatting and strict locked workspace/all-targets Clippy pass.
+    The broader ordinary suites pass 109 core, 90 Git, 404 Node, 125 store and
+    33 CLI unit tests (761 distinct cases, including those paged tests). The
+    run keeps 62 Git, 20 Node and 19 store provisioned cases ignored; full native
+    capture/topology/platform, filesystem lifecycle and real 1 TiB qualification
+    remain open. No production head or protection activation is introduced.
   - [ ] Integrate legacy private conversion with retained revision publication
     and migrate native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.
+  - [ ] Bound stable anchor relocation discovery. The current fallback walks
+    complete matching filesystems while holding the process-wide area-index
+    mutex. Replace it with bounded incremental discovery/indexing and durable
+    location hints, preserving ambiguity and mount identity checks. Qualify
+    absent/moved areas, reopen and source loss without blocking unrelated
+    lookups, including the declared large dataset/history geometry.
   - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,
     retention and seed-only recovery together; qualify the declared capacity
     and geometry policy on real data before enabling production admission.

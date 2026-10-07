@@ -338,6 +338,47 @@ impl PagedPrivateMetadata {
         })
     }
 
+    /// Route ordinary sector requests through authenticated retained ownership.
+    /// A damaged live source is an error, never a reason to use a legacy copy.
+    pub(crate) fn render_local_sector(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        sector_id: [u8; 32],
+        expected_guild: Option<&[u8; 32]>,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = Self::render_local_bootstrap(control, keys, sector_id, expected_guild)?
+        {
+            return Ok(Some(bytes));
+        }
+        let Some(source) = control.paged_sector_source(sector_id)? else {
+            return Ok(None);
+        };
+        let scope = source.catalog().bundle.scope;
+        let opened = Self::open_local_snapshot(keys, source.catalog(), scope)?;
+        ensure!(
+            expected_guild.is_none_or(|guild| *guild == opened.revision.value.guild_id),
+            "paged sector does not belong to the requested guild"
+        );
+        let bytes = match source {
+            mb_store::PagedCatalogSectorSource::Data(source) => {
+                Self::render_data_source(keys, &source, scope)?
+            }
+            mb_store::PagedCatalogSectorSource::Page(source) => {
+                // The second read rechecks this exact immutable owner together
+                // with its page payload; cancellation between reads fails closed.
+                Self::render_local_catalog_page(
+                    control,
+                    keys,
+                    source.catalog.bundle.id,
+                    sector_id,
+                    scope,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("paged page owner retired during serving"))?
+            }
+        };
+        Ok(Some(bytes))
+    }
+
     /// Serve retained bootstrap ciphertext through its live paged root owner;
     /// never copy it into an independently collected legacy Inline recipe.
     pub(crate) fn render_local_bootstrap(
@@ -404,6 +445,16 @@ impl PagedPrivateMetadata {
         let source = control
             .paged_revision_page_source(id, sector_id)?
             .ok_or_else(|| anyhow::anyhow!("paged catalog source is unavailable"))?;
+        Self::repair_catalog_source(control, keys, &source, expected_scope, ciphertext)
+    }
+
+    pub(super) fn repair_catalog_source(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        source: &mb_store::PagedCatalogPageSource,
+        expected_scope: CatalogScope,
+        ciphertext: &[u8],
+    ) -> Result<()> {
         Self::open_local_snapshot(keys, &source.catalog, expected_scope)?;
         let signed = PagedUserRevision::decode_signed(&source.catalog.bundle.descriptor)?;
         let guild = signed.value.guild_id;
@@ -419,7 +470,7 @@ impl PagedPrivateMetadata {
             &source.source.sector,
             ciphertext,
         )?;
-        control.repair_paged_revision_page(&source, &encoded)?;
+        control.repair_paged_revision_page(source, &encoded)?;
         Ok(())
     }
 
@@ -562,8 +613,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use mb_core::{
         CatalogFileBuilder, CatalogFileRecipeBuilder, CatalogFileStat, CatalogPageRef,
-        CatalogSectorBuilder, PAGED_USER_REVISION_DOMAIN, PagedRevisionSourceReader, Seed,
-        V1_CIPHER_PROFILE, WriterFence, canonical_bytes,
+        CatalogSection, CatalogSectorBuilder, PAGED_USER_REVISION_DOMAIN,
+        PagedRevisionSourceReader, Seed, V1_CIPHER_PROFILE, WriterFence, canonical_bytes,
     };
     use mb_git::{GitBlobCatalogBuilder, GitObjectCatalogBuilder, GitRefCatalogBuilder};
     use uuid::Uuid;
@@ -839,6 +890,246 @@ mod tests {
             owner: signed.value.owner,
             epoch: signed.value.writer_epoch,
             public_key: signed.value.writer_public_key,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn paged_ordinary_sector_serving_and_recovery_use_shared_root_owned_sources() {
+        for with_git in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("protected");
+            std::fs::create_dir(&root).unwrap();
+            let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+            let anchor_id = Uuid::new_v4();
+            let directory = area.path_hint.join(anchor_id.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let payload = b"raw\r\nbytes\0";
+            let file = directory.join("payload");
+            std::fs::write(&file, payload).unwrap();
+            let recipe = crate::PagedAnchorSectorSource {
+                locator: mb_store::StableAnchorFileLocator {
+                    area,
+                    anchor_id,
+                    relative_path: "payload".into(),
+                },
+                offset: 0,
+            };
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let mut ids = Vec::new();
+            let mut expected_pages = std::collections::BTreeMap::new();
+            let data_id = make_content_sector_id(
+                &keys().guild_content_id_key(&[73; 32]),
+                keys().node_id(),
+                [73; 32],
+                Uuid::from_bytes([74; 16]),
+                SectorPurpose::Data,
+                payload,
+            )
+            .unwrap();
+            let (data_ref, data_ciphertext) =
+                encrypted_sector(&keys().guild_data_key(&[73; 32]), data_id, payload).unwrap();
+            for _ in 0..2 {
+                let (private, signed, intents) =
+                    owned_fixture_with_directories(&store, with_git, 0, 1000);
+                private
+                    .publish_local_catalog_with_data_sources(
+                        &store,
+                        &keys(),
+                        &signed,
+                        &writer_fence(&signed),
+                        intents,
+                        |record| Ok((record.sector.id == data_id).then(|| recipe.clone())),
+                    )
+                    .unwrap();
+                ids.push(signed.value.revision_id);
+                for (section, root) in private
+                    .native
+                    .page_roots()
+                    .map(|root| (CatalogSection::FileMetadata, root))
+                    .into_iter()
+                    .chain(private.git.into_iter().flat_map(|git| {
+                        git.page_roots()
+                            .map(|root| (CatalogSection::GitGraph, root))
+                    }))
+                {
+                    let mut reader = mb_core::CatalogReader::new(scope(), section, root).unwrap();
+                    while reader
+                        .next_leaf(&mut |page| -> Result<Vec<u8>> {
+                            let encoded = store.catalog_page(scope(), section, page)?;
+                            let (reference, ciphertext) = page.seal_private_page(
+                                &keys().guild_content_id_key(&[73; 32]),
+                                &keys().guild_data_key(&[73; 32]),
+                                scope(),
+                                section,
+                                &encoded,
+                            )?;
+                            expected_pages.insert(reference.id, (reference, page, ciphertext));
+                            Ok(encoded)
+                        })
+                        .unwrap()
+                        .is_some()
+                    {}
+                }
+            }
+            drop(store);
+            let mut store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert_eq!(
+                crate::snapshot::render_sector(&store, &keys(), &data_id, Some(&[73; 32])).unwrap(),
+                data_ciphertext
+            );
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &data_id, Some(&[1; 32])).is_err()
+            );
+            assert!(
+                crate::snapshot::render_sector(
+                    &store,
+                    &KeyMaterial::from_seed(&Seed::from_bytes([1; 32])),
+                    &data_id,
+                    Some(&[73; 32])
+                )
+                .is_err()
+            );
+            crate::snapshot::install_recovered_sector_recipe(
+                &mut store,
+                &keys(),
+                [73; 32],
+                data_ref.clone(),
+                &data_ciphertext,
+            )
+            .unwrap();
+            for (sector, (reference, page, ciphertext)) in &expected_pages {
+                assert_eq!(
+                    crate::snapshot::render_sector(&store, &keys(), sector, None).unwrap(),
+                    *ciphertext
+                );
+                assert!(
+                    crate::snapshot::render_sector(&store, &keys(), sector, Some(&[1; 32]))
+                        .is_err()
+                );
+                store.delete_record("catalog-page-v1", &page.hash).unwrap();
+                assert!(
+                    crate::snapshot::render_sector(&store, &keys(), sector, Some(&[73; 32]))
+                        .is_err()
+                );
+                let mut bad = ciphertext.clone();
+                bad[0] ^= 1;
+                assert!(
+                    crate::snapshot::install_recovered_sector_recipe(
+                        &mut store,
+                        &keys(),
+                        [73; 32],
+                        reference.clone(),
+                        &bad
+                    )
+                    .is_err()
+                );
+                assert!(
+                    crate::snapshot::install_recovered_sector_recipe(
+                        &mut store,
+                        &keys(),
+                        [1; 32],
+                        reference.clone(),
+                        ciphertext
+                    )
+                    .is_err()
+                );
+                assert!(
+                    crate::snapshot::install_recovered_sector_recipe(
+                        &mut store,
+                        &KeyMaterial::from_seed(&Seed::from_bytes([1; 32])),
+                        [73; 32],
+                        reference.clone(),
+                        ciphertext
+                    )
+                    .is_err()
+                );
+                crate::snapshot::install_recovered_sector_recipe(
+                    &mut store,
+                    &keys(),
+                    [73; 32],
+                    reference.clone(),
+                    ciphertext,
+                )
+                .unwrap();
+                assert_eq!(
+                    crate::snapshot::render_sector(&store, &keys(), sector, Some(&[73; 32]))
+                        .unwrap(),
+                    *ciphertext
+                );
+            }
+            // An active damaged source cannot be obscured by a legacy Inline
+            // copy, and its recovery requires a durable stable replacement.
+            std::fs::write(&file, b"damaged stable data").unwrap();
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &data_id, Some(&[73; 32])).is_err()
+            );
+            crate::snapshot::install_inline_recipe(
+                &mut store,
+                [73; 32],
+                data_ref.clone(),
+                payload.to_vec(),
+            )
+            .unwrap();
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &data_id, Some(&[73; 32])).is_err()
+            );
+            store.delete_record("local-sector", &data_id).unwrap();
+            assert!(
+                crate::snapshot::install_recovered_sector_recipe(
+                    &mut store,
+                    &keys(),
+                    [73; 32],
+                    data_ref.clone(),
+                    &data_ciphertext
+                )
+                .is_err()
+            );
+            assert!(store.records("local-sector").unwrap().is_empty());
+            std::fs::write(&file, payload).unwrap();
+            let selected = store
+                .paged_sector_source(data_id)
+                .unwrap()
+                .unwrap()
+                .catalog()
+                .bundle
+                .id;
+            let remaining = *ids.iter().find(|id| **id != selected).unwrap();
+            store.cancel_paged_revision_catalog(selected).unwrap();
+            assert_eq!(
+                crate::snapshot::render_sector(&store, &keys(), &data_id, Some(&[73; 32])).unwrap(),
+                data_ciphertext
+            );
+            for (sector, (_, _, ciphertext)) in &expected_pages {
+                assert_eq!(
+                    crate::snapshot::render_sector(&store, &keys(), sector, Some(&[73; 32]))
+                        .unwrap(),
+                    *ciphertext
+                );
+            }
+            drop(store);
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert_eq!(
+                crate::snapshot::render_sector(&store, &keys(), &data_id, Some(&[73; 32])).unwrap(),
+                data_ciphertext
+            );
+            store.cancel_paged_revision_catalog(remaining).unwrap();
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &data_id, Some(&[73; 32])).is_err()
+            );
+            for sector in expected_pages.keys() {
+                assert!(
+                    crate::snapshot::render_sector(&store, &keys(), sector, Some(&[73; 32]))
+                        .is_err()
+                );
+            }
+            for id in ids {
+                while store.release_paged_revision_page_source(id).unwrap() {}
+                while store.release_paged_revision_data_source(id).unwrap() {}
+            }
+            assert!(store.paged_data_anchor_ids().unwrap().is_empty());
+            assert!(store.records("local-sector").unwrap().is_empty());
         }
     }
 

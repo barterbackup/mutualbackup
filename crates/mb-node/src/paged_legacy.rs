@@ -798,6 +798,11 @@ mod tests {
                 )
             };
             assert_eq!(read().unwrap(), Some(sources[&data.sector.id].clone()));
+            assert_eq!(
+                crate::snapshot::render_sector(&store, &keys(), &data.sector.id, Some(&[73; 32]))
+                    .unwrap(),
+                sources[&data.sector.id]
+            );
             assert!(
                 PagedPrivateMetadata::render_local_data_sector(
                     &store,

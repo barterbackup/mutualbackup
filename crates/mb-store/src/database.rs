@@ -20,7 +20,8 @@ pub use catalog::{
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogIntentState,
     CatalogNativeValidation, CatalogNativeValidationState, CatalogPublicationView,
     CatalogSectorSource, CatalogSourceSweep, CatalogStoreError, CatalogValidatedLink,
-    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource, PagedCatalogSnapshot,
+    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
+    PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
@@ -3305,6 +3306,7 @@ fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), Dat
             PRIMARY KEY(object_kind, object_id, page_index)
          ) STRICT;",
     )?;
+    transaction.execute_batch(PAGED_SECTOR_SOURCE_INDEX_SCHEMA)?;
     transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)",
         [b"control".as_slice()],
@@ -3388,7 +3390,7 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     if version == SCHEMA_VERSION {
         return validate_control_schema(connection, version);
     }
-    if !matches!(version, 1..=3 | 5..=8) {
+    if !matches!(version, 1..=3 | 5..=9) {
         return Err(DatabaseError::IncompatibleSchema);
     }
     if version >= 2 && meta_value(connection, "database_kind")?.as_deref() != Some(b"control") {
@@ -3455,16 +3457,23 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
             PRIMARY KEY(object_kind, object_id, page_index)
          ) STRICT;",
     )?;
-    transaction.execute(
+    transaction.execute_batch(PAGED_SECTOR_SOURCE_INDEX_SCHEMA)?;
+    if transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [b"control".as_slice()],
-    )?;
-    transaction.execute(
+    )? != 1
+    {
+        return Err(DatabaseError::Conflict);
+    }
+    if transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [SCHEMA_VERSION.to_be_bytes().as_slice()],
-    )?;
+    )? != 1
+    {
+        return Err(DatabaseError::Conflict);
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -3476,6 +3485,24 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
     let version = stored_schema_version(connection)?;
     if version == SCHEMA_VERSION {
         return validate_parity_schema(connection);
+    }
+    if version == 9 {
+        if meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
+            || meta_value(connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
+        {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        validate_parity_schema(connection)?;
+        let transaction = connection.transaction()?;
+        if transaction.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            [SCHEMA_VERSION.to_be_bytes().as_slice()],
+        )? != 1
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        return Ok(());
     }
     if !matches!(version, 2..=3 | 5..=8)
         || meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
@@ -3701,8 +3728,13 @@ const PARITY_OBJECTS_BEFORE_V7_SCHEMA: &str = "CREATE TABLE parity_objects (
     PRIMARY KEY(group_id, shard_index)
 ) STRICT";
 
+const PAGED_SECTOR_SOURCE_INDEX_SCHEMA: &str = "CREATE INDEX protocol_records_paged_sector_sources
+    ON protocol_records(record_id, kind)
+    WHERE kind GLOB 'catalog-paged-data-source-v1/*'
+       OR kind GLOB 'catalog-paged-page-source-v1/*'";
+
 fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), DatabaseError> {
-    let expected = match version {
+    let mut expected = match version {
         1 => vec![
             ("meta", META_SCHEMA),
             ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
@@ -3722,7 +3754,7 @@ fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), 
             ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
             ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
         ],
-        5 | 6 | 7 | 8 | SCHEMA_VERSION => vec![
+        5 | 6 | 7 | 8 | 9 | SCHEMA_VERSION => vec![
             ("meta", META_SCHEMA),
             ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
             ("operations", OPERATIONS_SCHEMA),
@@ -3733,6 +3765,12 @@ fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), 
         ],
         _ => return Err(DatabaseError::IncompatibleSchema),
     };
+    if version == SCHEMA_VERSION {
+        expected.push((
+            "protocol_records_paged_sector_sources",
+            PAGED_SECTOR_SOURCE_INDEX_SCHEMA,
+        ));
+    }
     require_exact_tables(connection, &expected)
 }
 
@@ -3751,7 +3789,7 @@ fn validate_parity_schema_version(
     connection: &Connection,
     version: u32,
 ) -> Result<(), DatabaseError> {
-    if version == SCHEMA_VERSION {
+    if matches!(version, 9 | SCHEMA_VERSION) {
         return validate_parity_schema(connection);
     }
     let objects = match version {
@@ -3790,7 +3828,14 @@ fn require_exact_tables(
         let Some((object_type, actual_sql)) = actual.get(*name) else {
             return Err(DatabaseError::IncompatibleSchema);
         };
-        if object_type != "table" || normalize_schema_sql(actual_sql) != normalize_schema_sql(sql) {
+        let expected_type = if sql.starts_with("CREATE INDEX") {
+            "index"
+        } else {
+            "table"
+        };
+        if object_type != expected_type
+            || normalize_schema_sql(actual_sql) != normalize_schema_sql(sql)
+        {
             return Err(DatabaseError::IncompatibleSchema);
         }
     }
@@ -4084,14 +4129,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paged_sector_schema_v9_parity_upgrade_preserves_live_reservations_and_fences_metadata() {
+        for fault in ["ABORT", "IGNORE"] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("parity.db");
+            let key = [112; 32];
+            let volume = [111; 16];
+            let mut store = ParityStore::open_with_key(&path, &volume, &key).unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO coding_reservations
+                (attempt_id, guild_id, shard_index, byte_length, written_until, bytes)
+                VALUES (?1, ?2, 0, 16, 0, ?3)",
+                    params![[1_u8; 16], [2_u8; 32], [3_u8; 16]],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                    [9_u32.to_be_bytes().as_slice()],
+                )
+                .unwrap();
+            let raise = if fault == "IGNORE" {
+                "RAISE(IGNORE)"
+            } else {
+                "RAISE(ABORT, 'injected')"
+            };
+            store.connection.execute_batch(&format!("CREATE TEMP TRIGGER reject_upgrade BEFORE UPDATE ON main.meta WHEN OLD.key = 'schema_version' BEGIN SELECT {raise}; END;")).unwrap();
+            assert!(migrate_parity(&mut store.connection, &volume).is_err());
+            assert_eq!(stored_schema_version(&store.connection).unwrap(), 9);
+            drop(store);
+            assert!(ParityStore::open_existing_with_key(&path, &[113; 16], &key).is_err());
+            let connection = open_encrypted_existing(&path, &key).unwrap();
+            assert_eq!(stored_schema_version(&connection).unwrap(), 9);
+            drop(connection);
+            let store = ParityStore::open_existing_with_key(&path, &volume, &key).unwrap();
+            assert_eq!(
+                stored_schema_version(&store.connection).unwrap(),
+                SCHEMA_VERSION
+            );
+            let reservation: (Vec<u8>, Vec<u8>, u8, u64, u64, Vec<u8>) = store.connection.query_row(
+                "SELECT attempt_id, guild_id, shard_index, byte_length, written_until, bytes FROM coding_reservations",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))).unwrap();
+            assert_eq!(
+                reservation,
+                (vec![1; 16], vec![2; 32], 0, 16, 0, vec![3; 16])
+            );
+            drop(store);
+            ParityStore::open_existing_read_only_with_key(&path, &volume, &key).unwrap();
+        }
+    }
+
+    #[test]
     fn read_only_parity_inspection_preserves_every_known_schema_without_migration() {
-        for version in [2, 3, 5, 6, 7, 8, SCHEMA_VERSION] {
+        for version in [2, 3, 5, 6, 7, 8, 9, SCHEMA_VERSION] {
             let temp = tempdir().unwrap();
             let path = temp.path().join("parity.db");
             let id = [111; 16];
             let key = [112; 32];
             let store = ParityStore::open_with_key(&path, &id, &key).unwrap();
-            if version != SCHEMA_VERSION {
+            if version < 9 {
                 let objects = match version {
                     8 => PARITY_OBJECTS_SCHEMA,
                     7 => PARITY_OBJECTS_BEFORE_V8_SCHEMA,
@@ -4103,14 +4202,14 @@ mod tests {
                     .execute_batch("DROP TABLE coding_reservations; DROP TABLE parity_objects;")
                     .unwrap();
                 store.connection.execute_batch(objects).unwrap();
-                store
-                    .connection
-                    .execute(
-                        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-                        [version.to_be_bytes().as_slice()],
-                    )
-                    .unwrap();
             }
+            store
+                .connection
+                .execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                    [version.to_be_bytes().as_slice()],
+                )
+                .unwrap();
             let bytes = vec![115; V1_SECTOR_SIZE];
             let object = ParityObject {
                 format_version: 1,
@@ -4266,6 +4365,10 @@ mod tests {
             let store = ControlStore::open_with_key(&path, &key).unwrap();
             store
                 .put_record("guarded-view-mount-v1", b"id", b"legacy")
+                .unwrap();
+            store
+                .connection
+                .execute_batch("DROP INDEX protocol_records_paged_sector_sources;")
                 .unwrap();
             store
                 .connection
@@ -5713,6 +5816,9 @@ mod tests {
         store.put_record("test", b"id", b"preserved").unwrap();
         drop(store);
         let connection = open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+        connection
+            .execute_batch("DROP INDEX protocol_records_paged_sector_sources;")
+            .unwrap();
         connection
             .execute(
                 "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",

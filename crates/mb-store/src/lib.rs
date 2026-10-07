@@ -42,8 +42,8 @@ pub use database::{
     CatalogSectorSource, CatalogSourceSweep, CatalogStoreError, CatalogValidatedLink,
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,
     ObjectAttemptState, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
-    PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
-    ReadyVariableObject, RecoveryShardLocator, VariableParityObject,
+    PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore,
+    ProtocolRecordRow, ReadyVariableObject, RecoveryShardLocator, VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
@@ -52,4 +52,4 @@ pub use source::{
     SourceFileCaptureError, SourceFileCapturePlan, WITHDRAWN_GUARDED_BACKEND,
 };
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;

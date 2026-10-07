@@ -16,6 +16,7 @@ mod bundle;
 mod native_validation;
 mod paged_data;
 mod paged_revision;
+mod paged_sector;
 mod source;
 pub use bundle::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
@@ -26,6 +27,7 @@ pub use native_validation::{
 };
 pub use paged_data::{PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource};
 pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCatalogSnapshot};
+pub use paged_sector::PagedCatalogSectorSource;
 pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSectorSource, CatalogSourceSweep};
 
 const INTENT: &str = "catalog-intent-v1";
@@ -36,6 +38,8 @@ const RECORD_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum CatalogStoreError {
+    #[error("too many retired paged sector owners; finish source cleanup before retrying")]
+    PagedSourceLookupLimit,
     #[error(transparent)]
     Database(#[from] DatabaseError),
     #[error(transparent)]

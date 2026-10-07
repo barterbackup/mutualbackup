@@ -1445,6 +1445,19 @@ Original revision/head state remains intact. This completes the source adapter,
 while whole retained-history migration, normal consumer activation, physical
 source lifecycle and capacity/platform qualification remain required.
 
+Ordinary sector serving now resolves retained paged private pages and stable
+native/Git data by sector ID, in addition to bootstraps. Schema 10 installs a
+partial source-row index transactionally over existing bindings; exact schema
+validation includes its definition. Read-only older catalogs remain unchanged.
+Lookup authenticates each candidate's root, source and pins in one snapshot,
+skips valid cancellation journals and caps retired-owner work at 64 candidates;
+excess backlog requires bounded source cleanup before retry. Missing or damaged
+live ownership fails closed. The recovered-sector installer repairs owned private
+pages through the existing fenced payload transaction and keeps live data under
+its stable replacement policy. Complete normal capture/restore, data-source
+recovery orchestration, packing/checkpoint/retention and seed-only migration are
+still required before production admission.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

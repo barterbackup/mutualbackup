@@ -341,13 +341,21 @@ impl PagedPrivateMetadata {
         let Some(source) = control.paged_revision_data_source(id, sector)? else {
             return Ok(None);
         };
+        Ok(Some(Self::render_data_source(
+            keys,
+            &source,
+            expected_scope,
+        )?))
+    }
+
+    pub(super) fn render_data_source(
+        keys: &KeyMaterial,
+        source: &mb_store::PagedCatalogDataSource,
+        expected_scope: CatalogScope,
+    ) -> Result<Vec<u8>> {
         Self::open_local_snapshot(keys, &source.catalog, expected_scope)?;
         let recipe = PagedDataSource::decode(&source.recipe, source.anchor)?;
-        Ok(Some(recipe.render(
-            keys,
-            source.catalog.bundle.scope,
-            &source.source,
-        )?))
+        recipe.render(keys, source.catalog.bundle.scope, &source.source)
     }
 }
 

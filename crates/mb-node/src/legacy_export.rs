@@ -1744,6 +1744,9 @@ pub(crate) mod tests {
             }
             // Extraction must not perform even an otherwise valid schema migration.
             store
+                .database_shell_statement("DROP INDEX protocol_records_paged_sector_sources", false)
+                .unwrap();
+            store
                 .database_shell_statement(
                     "UPDATE meta SET value = X'00000008' WHERE key = 'schema_version'",
                     false,
