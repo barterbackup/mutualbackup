@@ -27,7 +27,7 @@ use crate::history::{
 };
 use crate::interop::GitInteropError;
 use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
-use crate::{GitAnchorError, NativeSource, blob_oid_from_anchor};
+use crate::{GitAnchorError, NativeSource};
 
 const FETCH_PREFIX: &str = "git-bare-fetch-intent-v1/";
 const BLOB_PREFIX: &str = "git-bare-fetch-blob-intent-v1/";
@@ -567,12 +567,14 @@ fn validate_intent(
     Ok(())
 }
 
-fn validate_symlink(anchor: &FileAnchorManifest) -> Result<(), FetchError> {
+fn validate_symlink(control: &ControlStore, anchor: &FileAnchorManifest) -> Result<(), FetchError> {
     if !(1..=4095).contains(&anchor.logical_len) {
         return Err(FetchError::IncompatibleSource);
     }
     let mut bytes = Vec::with_capacity(anchor.logical_len as usize);
-    anchor.open_verified()?.read_to_end(&mut bytes)?;
+    crate::catalog_anchor::open(control, anchor)?
+        .0
+        .read_to_end(&mut bytes)?;
     if bytes.is_empty() || bytes.contains(&0) {
         return Err(FetchError::IncompatibleSource);
     }
@@ -580,6 +582,7 @@ fn validate_symlink(anchor: &FileAnchorManifest) -> Result<(), FetchError> {
 }
 
 fn verified_blob(
+    control: &ControlStore,
     blob: &FetchedBlob,
     anchors: &[FileAnchorManifest],
 ) -> Result<VerifiedBlob, FetchError> {
@@ -592,7 +595,7 @@ fn verified_blob(
             return Err(FetchError::IncompatibleSource);
         }
         if blob.symlink {
-            validate_symlink(anchor)?;
+            validate_symlink(control, anchor)?;
         }
         verified.push((anchor.anchor_id, anchor.content_hash));
     }
@@ -605,6 +608,7 @@ fn verified_blob(
 }
 
 fn capture_raw_blob(
+    control: &ControlStore,
     repository_path: &Path,
     oid: Oid,
     len: u64,
@@ -648,7 +652,9 @@ fn capture_raw_blob(
             return Err(FetchError::IncompatibleSource);
         }
         let mut bounded = output.by_ref().take(len);
-        let anchor = plan.capture(&mut bounded)?;
+        let anchor = plan
+            .capture_with_control(control, &mut bounded)
+            .map_err(StageError::from)?;
         if bounded.limit() != 0 {
             return Err(FetchError::IncompatibleSource);
         }
@@ -682,7 +688,7 @@ fn import_blob(
         let saved: VerifiedBlob = decode_canonical(&encoded)?;
         let anchors = anchors_for_oid(control, intent.repository_id, oid)?;
         if saved.format_version != 1
-            || saved != verified_blob(blob, &anchors)?
+            || saved != verified_blob(control, blob, &anchors)?
             || control.get_record(&kind, &blob.oid)?.is_some()
         {
             return Err(FetchError::IncompatibleSource);
@@ -698,14 +704,14 @@ fn import_blob(
                 &intent.source_root,
                 intent.format_version,
             )?;
-            let verified = verified_blob(blob, &existing)?;
+            let verified = verified_blob(control, blob, &existing)?;
             for anchor in &existing {
                 if !super::interop::matches_existing(
                     &source,
                     oid,
                     ObjectType::Blob,
                     blob.logical_len,
-                    anchor.open_verified()?,
+                    crate::catalog_anchor::open(control, anchor)?.0,
                 )? {
                     return Err(FetchError::IncompatibleSource);
                 }
@@ -749,26 +755,35 @@ fn import_blob(
     {
         return Err(FetchError::IncompatibleSource);
     }
-    state.plan.reconcile()?;
-    let anchor = match state.plan.capture(std::io::empty()) {
+    state
+        .plan
+        .reconcile_with_control(control)
+        .map_err(StageError::from)?;
+    let anchor = match state.plan.capture_with_control(control, std::io::empty()) {
         Ok(anchor) => anchor,
-        Err(AnchorError::SourceChanged(_)) => {
+        Err(mb_store::SourceFileCaptureError::Anchor(AnchorError::SourceChanged(_))) => {
             let repository = source_repository(
                 &intent.source_path,
                 &intent.source_root,
                 intent.format_version,
             )?;
-            capture_raw_blob(repository.path(), oid, blob.logical_len, &state.plan)?
+            capture_raw_blob(
+                control,
+                repository.path(),
+                oid,
+                blob.logical_len,
+                &state.plan,
+            )?
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(StageError::from(error).into()),
     };
-    if blob_oid_from_anchor(&anchor)? != oid {
+    if crate::catalog_anchor::identify(control, &anchor)?.0 != oid {
         return Err(FetchError::IncompatibleSource);
     }
     if blob.symlink {
-        validate_symlink(&anchor)?;
+        validate_symlink(control, &anchor)?;
     }
-    let verified = verified_blob(blob, std::slice::from_ref(&anchor))?;
+    let verified = verified_blob(control, blob, std::slice::from_ref(&anchor))?;
     control.put_records_and_retire_if_value(
         &[
             (
@@ -1878,6 +1893,7 @@ mod tests {
             )
             .unwrap();
         let anchor = capture_raw_blob(
+            &control,
             &remote_path,
             Oid::from_bytes(&blob.oid).unwrap(),
             blob.logical_len,

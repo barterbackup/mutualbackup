@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::blob_oid_from_anchor;
 use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
-use crate::{GitAnchorError, GitWorktreeScope, NativeOdb, NativeSource, blob_oid_from_anchor};
+use crate::{GitAnchorError, GitWorktreeScope, NativeOdb, NativeSource};
 
 const INTENT_PREFIX: &str = "git-merge-blob-intent-v1/";
 const LINKED_INTENT_PREFIX: &str = "git-worktree-merge-blob-intent-v1/";
@@ -967,7 +969,10 @@ pub(crate) fn resume_pending_merge_blob_for_scope(
     {
         return Err(MergeBlobError::IncompatibleRecord);
     }
-    intent.plan.reconcile()?;
+    intent
+        .plan
+        .reconcile_with_control(control)
+        .map_err(StageError::from)?;
     let result = merge_file_bytes(control, repository_id, &intent.path, intent.inputs)?
         .ok_or(MergeBlobError::IncompatibleRecord)?;
     if result.oid.as_bytes() != intent.result_oid
@@ -976,19 +981,27 @@ pub(crate) fn resume_pending_merge_blob_for_scope(
     {
         return Err(MergeBlobError::IncompatibleRecord);
     }
-    let anchor = match intent.plan.capture(std::io::empty()) {
+    let anchor = match intent.plan.capture_with_control(control, std::io::empty()) {
         Ok(anchor) => anchor,
-        Err(AnchorError::SourceChanged(_)) => intent.plan.capture(result.bytes.as_slice())?,
-        Err(error) => return Err(error.into()),
+        Err(mb_store::SourceFileCaptureError::Anchor(AnchorError::SourceChanged(_))) => intent
+            .plan
+            .capture_with_control(control, result.bytes.as_slice())
+            .map_err(StageError::from)?,
+        Err(error) => return Err(StageError::from(error).into()),
     };
     run_after_merge_blob_capture_hook();
     if anchor.logical_len != intent.plan.logical_len()
-        || blob_oid_from_anchor(&anchor)?.as_bytes() != intent.result_oid
+        || crate::catalog_anchor::identify(control, &anchor)?
+            .0
+            .as_bytes()
+            != intent.result_oid
     {
         return Err(MergeBlobError::IncompatibleRecord);
     }
     let mut captured = Vec::with_capacity(result.bytes.len());
-    anchor.open_verified()?.read_to_end(&mut captured)?;
+    crate::catalog_anchor::open(control, &anchor)?
+        .0
+        .read_to_end(&mut captured)?;
     if captured != result.bytes {
         return Err(MergeBlobError::IncompatibleRecord);
     }
@@ -1030,6 +1043,9 @@ pub(crate) fn discard_pending_merge_blob_for_scope(
     {
         return Err(MergeBlobError::IncompatibleRecord);
     }
-    intent.plan.discard()?;
+    intent
+        .plan
+        .discard_with_control(control)
+        .map_err(StageError::from)?;
     Ok(Some((kind, ACTIVE.to_vec())))
 }

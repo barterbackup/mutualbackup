@@ -26,6 +26,27 @@ use crate::{
 #[cfg(target_os = "linux")]
 use crate::{GuardedFileCapturePlan, GuardedRootCapturePlan, RawReflinkFileCapturePlanV2};
 
+/// The operation validates its own native ownership before assistance is
+/// completed. No persisted plan is rewritten with a discovered display path.
+fn native_operation<T>(
+    control: &ControlStore,
+    area: &crate::StableAnchorAreaLocator,
+    operation: impl FnOnce(Option<&Path>) -> Result<T, AnchorError>,
+) -> anyhow::Result<T> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = control.resolve_anchor_area_location(area)?;
+        let result = operation(Some(&path))?;
+        control.remember_anchor_area_location(area.area_id, &path)?;
+        Ok(result)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (control, area);
+        Ok(operation(None)?)
+    }
+}
+
 /// Local source capabilities never enter a signed peer record. ReflinkV1
 /// provides sparse reflink capture, raw imports, and reflink checkout.
 /// GuardedLinkFreezeV1 is withdrawn; retain its serialized identity so old
@@ -197,8 +218,21 @@ impl SourceBackendKind {
         anchor: &FileAnchorManifest,
         mode: u32,
     ) -> Result<(), AnchorError> {
+        self.publish_checkout_file_with_area_hint(staging, name, anchor, mode, None)
+    }
+
+    pub fn publish_checkout_file_with_area_hint(
+        self,
+        staging: &PinnedDirectory,
+        name: impl AsRef<Path>,
+        anchor: &FileAnchorManifest,
+        mode: u32,
+        hint: Option<&Path>,
+    ) -> Result<(), AnchorError> {
         match self {
-            Self::ReflinkV1 => staging.publish_reflink_child(name, anchor, mode),
+            Self::ReflinkV1 => {
+                staging.publish_reflink_child_with_area_hint(name, anchor, mode, hint)
+            }
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
                 WITHDRAWN_GUARDED_BACKEND,
@@ -227,9 +261,11 @@ impl SourceCapturePlan {
         }
     }
 
-    pub fn capture(&self, _control: &ControlStore) -> anyhow::Result<StableAnchorManifest> {
+    pub fn capture(&self, control: &ControlStore) -> anyhow::Result<StableAnchorManifest> {
         match self {
-            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_plan(plan)?),
+            Self::ReflinkV1(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::capture_plan_with_area_hint(plan, hint)
+            }),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
         }
@@ -250,17 +286,21 @@ impl SourceCapturePlan {
         }
     }
 
-    pub fn discard(&self, _control: &ControlStore) -> anyhow::Result<()> {
+    pub fn discard(&self, control: &ControlStore) -> anyhow::Result<()> {
         match self {
-            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::discard_capture(plan)?),
+            Self::ReflinkV1(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::discard_capture_with_area_hint(plan, hint)
+            }),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
         }
     }
 
-    pub fn reconcile(&self, _control: &ControlStore) -> anyhow::Result<()> {
+    pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
         match self {
-            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::reconcile_capture(plan)?),
+            Self::ReflinkV1(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::reconcile_capture_with_area_hint(plan, hint)
+            }),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
         }
@@ -280,11 +320,22 @@ pub enum SourceFileCapturePlan {
 
 #[derive(Debug, Error)]
 pub enum SourceFileCaptureError {
+    #[error("native anchor discovery failed: {0}")]
+    Discovery(anyhow::Error),
     #[error(transparent)]
     Anchor(#[from] AnchorError),
     #[cfg(target_os = "linux")]
     #[error("guarded file capture failed: {0}")]
     Guarded(#[from] anyhow::Error),
+}
+
+impl SourceFileCaptureError {
+    fn discovery(error: anyhow::Error) -> Self {
+        match error.downcast::<AnchorError>() {
+            Ok(error) => Self::Anchor(error),
+            Err(error) => Self::Discovery(error),
+        }
+    }
 }
 
 impl SourceFileCapturePlan {
@@ -328,12 +379,26 @@ impl SourceFileCapturePlan {
     /// Replay native captures; legacy plans remain decodable for rejection.
     pub fn capture_with_control(
         &self,
-        _control: &ControlStore,
+        control: &ControlStore,
     ) -> Result<FileAnchorManifest, SourceFileCaptureError> {
         match self {
-            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_file_plan(plan)?),
+            Self::ReflinkV1(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::capture_file_plan_encoding(
+                    plan,
+                    crate::anchor::FileManifestEncoding::Utf8V1,
+                    hint,
+                )
+            })
+            .map_err(SourceFileCaptureError::discovery),
             #[cfg(target_os = "linux")]
-            Self::ReflinkRawV2(plan) => Ok(plan.capture()?),
+            Self::ReflinkRawV2(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::capture_file_plan_encoding(
+                    &plan.as_legacy()?,
+                    crate::anchor::FileManifestEncoding::RawV2,
+                    hint,
+                )
+            })
+            .map_err(SourceFileCaptureError::discovery),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => {
                 Err(AnchorError::UnsupportedSourceOperation(WITHDRAWN_GUARDED_BACKEND).into())
@@ -421,12 +486,26 @@ impl SourceFileCapturePlan {
 
     pub fn reconcile_with_control(
         &self,
-        _control: &ControlStore,
+        control: &ControlStore,
     ) -> Result<(), SourceFileCaptureError> {
         match self {
-            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::reconcile_file_capture(plan)?),
+            Self::ReflinkV1(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::reconcile_file_capture_encoding(
+                    plan,
+                    crate::anchor::FileManifestEncoding::Utf8V1,
+                    hint,
+                )
+            })
+            .map_err(SourceFileCaptureError::discovery),
             #[cfg(target_os = "linux")]
-            Self::ReflinkRawV2(plan) => Ok(plan.reconcile()?),
+            Self::ReflinkRawV2(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::reconcile_file_capture_encoding(
+                    &plan.as_legacy()?,
+                    crate::anchor::FileManifestEncoding::RawV2,
+                    hint,
+                )
+            })
+            .map_err(SourceFileCaptureError::discovery),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => {
                 Err(AnchorError::UnsupportedSourceOperation(WITHDRAWN_GUARDED_BACKEND).into())
@@ -448,12 +527,18 @@ impl SourceFileCapturePlan {
 
     pub fn discard_with_control(
         &self,
-        _control: &ControlStore,
+        control: &ControlStore,
     ) -> Result<(), SourceFileCaptureError> {
         match self {
-            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::discard_file_capture(plan)?),
+            Self::ReflinkV1(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::discard_file_capture_with_area_hint(plan, hint)
+            })
+            .map_err(SourceFileCaptureError::discovery),
             #[cfg(target_os = "linux")]
-            Self::ReflinkRawV2(plan) => Ok(plan.discard()?),
+            Self::ReflinkRawV2(plan) => native_operation(control, plan.area(), |hint| {
+                ReflinkAnchor::discard_file_capture_with_area_hint(&plan.as_legacy()?, hint)
+            })
+            .map_err(SourceFileCaptureError::discovery),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => {
                 Err(AnchorError::UnsupportedSourceOperation(WITHDRAWN_GUARDED_BACKEND).into())
@@ -609,6 +694,45 @@ impl SourceBlobImportPlan {
     pub fn discard(&self) -> Result<(), AnchorError> {
         match self {
             Self::DirectV1(plan) => plan.discard(),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn capture_with_control(
+        &self,
+        control: &ControlStore,
+        source: impl Read,
+    ) -> Result<FileAnchorManifest, SourceFileCaptureError> {
+        match self {
+            Self::DirectV1(plan) => native_operation(control, plan.area(), |hint| {
+                plan.capture_with_area_hint(source, hint)
+            })
+            .map_err(SourceFileCaptureError::discovery),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn reconcile_with_control(
+        &self,
+        control: &ControlStore,
+    ) -> Result<(), SourceFileCaptureError> {
+        match self {
+            Self::DirectV1(plan) => native_operation(control, plan.area(), |hint| {
+                plan.reconcile_with_area_hint(hint)
+            })
+            .map_err(SourceFileCaptureError::discovery),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn discard_with_control(
+        &self,
+        control: &ControlStore,
+    ) -> Result<(), SourceFileCaptureError> {
+        match self {
+            Self::DirectV1(plan) => native_operation(control, plan.area(), |hint| {
+                plan.discard_with_area_hint(hint)
+            })
+            .map_err(SourceFileCaptureError::discovery),
         }
     }
 }

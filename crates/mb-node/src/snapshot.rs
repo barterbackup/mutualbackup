@@ -841,6 +841,13 @@ fn remove_revision_anchor(
         !control.paged_data_anchor_is_pinned(manifest.anchor_id)?,
         "revision anchor remains owned by a paged data source"
     );
+    #[cfg(target_os = "linux")]
+    {
+        let path = control.resolve_anchor_area_location(&manifest.area)?;
+        manifest.remove_with_area_hint(Some(&path))?;
+        control.remember_anchor_area_location(manifest.area.area_id, &path)?;
+    }
+    #[cfg(not(target_os = "linux"))]
     manifest.remove()?;
     Ok(())
 }

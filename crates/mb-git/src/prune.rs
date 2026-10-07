@@ -25,6 +25,8 @@ const MAX_BATCH_RECORDS: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum GitPruneError {
+    #[error("anchor discovery failed: {0}")]
+    Discovery(anyhow::Error),
     #[error("Git history cannot be traversed: {0}")]
     History(#[from] HistoryError),
     #[error("Git index or anchor mapping is invalid: {0}")]
@@ -155,7 +157,16 @@ pub(crate) fn resume_pending_prune(
         if anchor.format_version != 1 || !seen.insert(anchor.anchor_id) {
             return Err(GitPruneError::IncompatibleRecord);
         }
-        anchor.remove()?;
+        let path = control
+            .resolve_anchor_area_location(&anchor.area)
+            .map_err(|error| match error.downcast::<AnchorError>() {
+                Ok(error) => GitPruneError::Anchor(error),
+                Err(error) => GitPruneError::Discovery(error),
+            })?;
+        anchor.remove_with_area_hint(Some(&path))?;
+        control
+            .remember_anchor_area_location(anchor.area.area_id, &path)
+            .map_err(GitPruneError::Discovery)?;
     }
     control.delete_record_if_value(&kind, ACTIVE, &encoded)?;
     Ok(())

@@ -775,6 +775,7 @@ fn remove_staged_entry(
 }
 
 fn publish_staged_target(
+    control: &ControlStore,
     staging: &PinnedDirectory,
     name: &OsStr,
     anchor: &FileAnchorManifest,
@@ -783,14 +784,24 @@ fn publish_staged_target(
 ) -> Result<(), CheckoutError> {
     match entry_kind(mode)? {
         PinnedEntryKind::RegularFile => {
-            source_backend.publish_checkout_file(staging, name, anchor, mode)?
+            let hint = crate::catalog_anchor::hint(control, anchor)?;
+            source_backend.publish_checkout_file_with_area_hint(
+                staging,
+                name,
+                anchor,
+                mode,
+                hint.as_deref(),
+            )?
         }
         PinnedEntryKind::Symlink => {
             if anchor.logical_len == 0 || anchor.logical_len > 4095 {
                 return Err(CheckoutError::UnsupportedTopology);
             }
             let mut bytes = Vec::with_capacity(anchor.logical_len as usize);
-            anchor.open_verified()?.take(4096).read_to_end(&mut bytes)?;
+            crate::catalog_anchor::open(control, anchor)?
+                .0
+                .take(4096)
+                .read_to_end(&mut bytes)?;
             if bytes.len() as u64 != anchor.logical_len || bytes.contains(&0) {
                 return Err(CheckoutError::IncompatibleIntent);
             }
@@ -2899,6 +2910,7 @@ fn apply_intent(
                         .find(|anchor| anchor.anchor_id == target.anchor_id)
                         .ok_or(CheckoutError::MissingAnchor)?;
                 publish_staged_target(
+                    control,
                     &staging,
                     OsStr::new(&name),
                     &anchor,

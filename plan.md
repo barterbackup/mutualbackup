@@ -1479,10 +1479,13 @@ bounded records/job count and atomic verified-hint/cursor completion fence
 concurrent and interrupted writers. Native Git object lookup, catalog-backed
 libgit2 reads, diffs, existing merge-blob verification and stock Git export also
 use durable progress and saved raw-path hints; callbacks retain location hints
-without owning a SQL connection. Remaining Git capture/import/checkout/replay and
-retirement consumer integration, retry/backoff and abandoned-job cleanup, other
-filesystem/platform qualification, full physical lifecycle and real 1 TiB dataset/
-history qualification remain required.
+without owning a SQL connection. Control-aware root/file/blob capture, reconcile
+and discard, Git staging/import/checkout replay, revision-anchor retirement and
+Git prune now resolve through durable assistance without rewriting persisted
+plans. Remaining standalone capture/recovery and best-effort cleanup integration,
+retry/backoff and abandoned-job cleanup, other filesystem/platform qualification,
+full physical lifecycle and real 1 TiB dataset/history qualification remain
+required.
 
 ### Historical implementation and validation record (before scope correction)
 

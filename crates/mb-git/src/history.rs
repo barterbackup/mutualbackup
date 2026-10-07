@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::blob_oid_from_anchor;
 use crate::head::{
     HeadError, branch_selected_elsewhere, head_kind, linked_selected_branches,
     proposed_selected_branch, selected_branch, selected_branch_for_scope, selected_branch_record,
@@ -31,7 +33,6 @@ use crate::stage::{
 use crate::status::{StatusError, TreeFiles, files_for_commit};
 use crate::{
     GitAnchorError, GitBackupDescriptor, GitBackupError, GitWorktreeScope, NativeOdb, NativeSource,
-    blob_oid_from_anchor,
 };
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
@@ -2050,8 +2051,10 @@ pub fn import_graph_backup(
     let symlink_blobs = descriptor.symlink_blob_oids()?;
     require_empty_backup_destination(control, repository_id)?;
     let mut by_oid = HashMap::new();
+    let mut locations = HashMap::new();
     for anchor in anchors {
-        let oid = blob_oid_from_anchor(anchor)?;
+        let (oid, path) = crate::catalog_anchor::identify(control, anchor)?;
+        locations.insert(oid, path);
         if by_oid.insert(oid, anchor).is_some() {
             return Err(HistoryError::IncompatibleRecord);
         }
@@ -2071,14 +2074,16 @@ pub fn import_graph_backup(
             // cannot publish as a symlink. Reject it before catalog writes.
             let mut target = Vec::with_capacity(anchor.logical_len as usize);
             anchor
-                .open_verified()
+                .open_verified_with_area_hint(Some(&locations[&oid]))
                 .map_err(GitAnchorError::from)?
+                .0
                 .take(4096)
                 .read_to_end(&mut target)?;
             if target.len() as u64 != anchor.logical_len || target.contains(&0) {
                 return Err(HistoryError::IncompatibleRecord);
             }
         }
+        crate::catalog_anchor::remember(control, anchor, &locations[&oid])?;
         records.push((
             object_kind(repository_id, oid),
             anchor.anchor_id.as_bytes().to_vec(),

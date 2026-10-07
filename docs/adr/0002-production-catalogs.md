@@ -1551,3 +1551,59 @@ real 1 TiB qualification ran for this integration.
 Remaining Git capture/import/checkout/replay and source retirement, operational
 retry/backoff and abandoned-job cleanup, complete physical consumer lifecycle,
 other platforms/filesystems and the real 1 TiB dataset/history gate remain open.
+
+### Durable relocation during capture and cleanup (2026-10-07)
+
+Control-aware native root, file and blob-import operations now resolve local
+locations through bounded durable discovery. The resolved hint is passed
+separately into capture, reconciliation and discard; persisted plans and
+manifests retain their original area locator bytes. Reopening a published file
+or imported-blob manifest uses the currently pinned area location for content
+verification. Standalone APIs keep their existing process-local behavior.
+
+A shared control-store helper reads bounded raw-path assistance, respects both
+read-only open mode and query-only policy, and performs filesystem work outside
+the SQL writer. Successful native operations publish their location assistance
+and retire any discovery cursor together. Operation failure leaves assistance
+unfinished; publication failure leaves the caller's capture/cleanup intent
+available for idempotent replay. The operation still validates its own native
+ownership, source versions, manifest/content commitments and deletion scope.
+The location hint neither authorizes source bytes nor replaces the caller's
+capture, Git object or retirement authority.
+
+Git staging now hashes captured bytes through catalog-assisted opens, including
+after a moved-area capture succeeds. Fetch and generated-merge replay use the
+control-aware blob-import capture, reconcile and discard APIs. Backup import
+keeps verified locations while joining blob IDs against the descriptor.
+Checkout publication accepts a separate hint while preserving native ownership,
+content verification and creation of a distinct editable COW inode. Git prune
+and Node revision-anchor retirement resolve durable assistance before native,
+idempotent deletion; their existing pin/ownership checks remain in place.
+
+Two new provisioned Btrfs fixtures pass. One advances a wide-directory scan
+through independent executables, captures root, historical file, raw file and
+imported-blob plans, and reopens/reconciles them. After a second move beyond the
+scan prefix, separate processes replay every capture and cleanup through a saved
+hint, repeat discard, preserve the serialized input plans and leave the source
+bytes intact. The other reopens a pending Git stage after area relocation,
+verifies the original intent bytes and resulting Git ID, and publishes/edits a
+checkout without changing the anchor or source bytes. Four existing Btrfs cases
+also pass: checkout conflict safety, fetch replay after external source loss,
+interrupted dirty checkout and pruning with physical pins. These ran on an owned
+512 MiB loop filesystem, whose mount absence, loop detachment and image/fixture
+removal were verified afterward.
+
+The locked workspace/all-targets test build passes, as do the full ordinary Git
+suite (91 tests, 64 provisioned tests ignored), full ordinary store suite
+(136 tests, 24 provisioned tests ignored), 18 Node paged tests and 32 ordinary
+metadata/restore compatibility tests (eight provisioned cases ignored). Final
+Clippy cleanup removes an equivalent borrow and simplifies the native fixture's
+loop counter; package test builds and targeted anchor, stage, fetch and backup
+import tests cover those final sources. Formatting, diff checks and strict locked
+workspace/all-targets Clippy pass. No full Node, topology, other-platform or real
+1 TiB qualification ran for this integration.
+
+Remaining standalone capture/recovery and best-effort cleanup callers, complete
+consumer lifecycle qualification, retry/backoff and abandoned-job cleanup,
+other filesystems/platforms and real 1 TiB dataset/history qualification remain
+open. These changes do not close R3 or the broader production release gates.

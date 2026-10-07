@@ -13,6 +13,9 @@ const MAX_JOBS: usize = 32;
 const JOURNAL_BYTES: usize = ANCHOR_DISCOVERY_CHECKPOINT_BYTES + 64;
 
 #[derive(Serialize, Deserialize)]
+struct Location(#[serde(with = "crate::raw_path_bytes")] PathBuf);
+
+#[derive(Serialize, Deserialize)]
 struct Journal {
     version: u8,
     attempt: Uuid,
@@ -21,6 +24,77 @@ struct Journal {
 }
 
 impl ControlStore {
+    /// Bounded local assistance shared by capture, serving and cleanup.
+    pub fn anchor_area_location_hint(&self, area_id: Uuid) -> anyhow::Result<Option<PathBuf>> {
+        Ok(self
+            .get_record_bounded("anchor-area-location", area_id.as_bytes(), 4_112)?
+            .and_then(|bytes| mb_core::decode_canonical::<Location>(&bytes).ok())
+            .map(|path| path.0)
+            .filter(|path| path.as_os_str().as_encoded_bytes().len() <= 4_096))
+    }
+
+    /// Resolve assistance without authorizing source contents or publication.
+    pub fn resolve_anchor_area_location(
+        &self,
+        area: &StableAnchorAreaLocator,
+    ) -> anyhow::Result<PathBuf> {
+        let hint = self.anchor_area_location_hint(area.area_id)?;
+        if let Some(path) = area.known_path(hint.as_deref()) {
+            return Ok(path);
+        }
+        if !self.is_read_only()? {
+            match self.advance_anchor_area_discovery(area) {
+                Ok(AnchorAreaDiscoveryStep::Found(path)) => return Ok(path),
+                Ok(AnchorAreaDiscoveryStep::Pending) => {
+                    return Err(AnchorError::AnchorAreaDiscoveryPending.into());
+                }
+                Ok(AnchorAreaDiscoveryStep::Missing) => {
+                    return Err(AnchorError::AnchorAreaCollision(area.path_hint.clone()).into());
+                }
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<AnchorError>(),
+                        Some(AnchorError::UnsupportedSourceOperation(
+                            "persistent anchor directory cookies"
+                        ))
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(crate::anchor::resolve_anchor_area_with_hint(
+            area,
+            hint.as_deref(),
+        )?)
+    }
+
+    /// Complete assistance only after the caller's native operation validates
+    /// its own authority. Read-only inspection never changes local records.
+    pub fn remember_anchor_area_location(
+        &self,
+        area_id: Uuid,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if self.is_read_only()? {
+            return Ok(());
+        }
+        if path.as_os_str().as_encoded_bytes().len() > 4_096 {
+            return Err(AnchorError::AnchorAreaDiscoveryLimit.into());
+        }
+        if self.anchor_area_location_hint(area_id)?.as_deref() == Some(path)
+            && self
+                .get_record_bounded(
+                    ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area_id.as_bytes(),
+                    JOURNAL_BYTES,
+                )?
+                .is_none()
+        {
+            return Ok(());
+        }
+        let bytes = mb_core::canonical_bytes_bounded(&Location(path.to_path_buf()), 4_112)?;
+        Ok(self.finish_anchor_area_discovery(area_id, &bytes)?)
+    }
+
     /// Advance one durable relocation job. Pending work survives process/cache
     /// loss. A stale writer returns Pending and never overwrites newer progress.
     pub fn advance_anchor_area_discovery(

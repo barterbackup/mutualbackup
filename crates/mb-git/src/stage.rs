@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(not(target_os = "linux"))]
+use crate::blob_oid_from_anchor;
 use crate::merge::{MergeBlobError, SessionRecord, resolution_record_for_scope};
-use crate::{GitAnchorError, GitWorktreeScope, blob_oid_from_anchor};
+use crate::{GitAnchorError, GitWorktreeScope};
 
 fn resolution_record_for_stage(
     control: &ControlStore,
@@ -118,6 +120,7 @@ impl From<SourceFileCaptureError> for StageError {
     fn from(error: SourceFileCaptureError) -> Self {
         match error {
             SourceFileCaptureError::Anchor(error) => Self::Anchor(error),
+            SourceFileCaptureError::Discovery(error) => Self::Git(GitAnchorError::Discovery(error)),
             #[cfg(target_os = "linux")]
             SourceFileCaptureError::Guarded(error) => Self::Guarded(error),
         }
@@ -595,6 +598,9 @@ fn finish_symlink_stage(
     }
     let plan = intent.plan.as_ref().ok_or(StageError::IncompatibleRecord)?;
     let manifest = plan.capture_with_control(control)?;
+    #[cfg(target_os = "linux")]
+    let oid = crate::catalog_anchor::identify(control, &manifest)?.0;
+    #[cfg(not(target_os = "linux"))]
     let oid = blob_oid_from_anchor(&manifest)?;
     plan.reconcile_with_control(control)?;
     for existing in anchors_for_oid(control, scope.repository_id(), oid)? {
@@ -675,6 +681,9 @@ fn finish_stage_for_scope(
         return Err(StageError::BackendMismatch);
     }
     let manifest = intent.plan.capture_with_control(control)?;
+    #[cfg(target_os = "linux")]
+    let oid = crate::catalog_anchor::identify(control, &manifest)?.0;
+    #[cfg(not(target_os = "linux"))]
     let oid = blob_oid_from_anchor(&manifest)?;
     intent.plan.reconcile_with_control(control)?;
     for existing in anchors_for_oid(control, scope.repository_id(), oid)? {
@@ -1190,6 +1199,7 @@ pub fn anchors_for_oid(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     use std::{
@@ -1706,6 +1716,79 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn stage_capture_replays_from_saved_area_hint() {
+        let provisioned = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        let temp = tempfile::tempdir_in(provisioned).unwrap();
+        let work = temp.path().join("work");
+        let scan = temp.path().join("scan");
+        fs::create_dir(&work).unwrap();
+        fs::create_dir(&scan).unwrap();
+        fs::write(work.join("payload"), b"native payload").unwrap();
+        let existing = mb_store::SourceBlobImportPlan::plan_direct(&work, 14)
+            .unwrap()
+            .capture(b"native payload".as_slice())
+            .unwrap();
+        let db = temp.path().join("control.db");
+        let control = ControlStore::open_with_key(&db, &[42; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let (key, intent) =
+            begin_stage(&control, repository_id, &work, Path::new("payload")).unwrap();
+        let original = canonical_bytes(&intent).unwrap();
+        for n in 0..6_000 {
+            fs::write(scan.join(format!("entry-{n}")), []).unwrap();
+        }
+        let moved = scan.join(".mutualbackup-anchors-moved");
+        fs::rename(&existing.area.path_hint, &moved).unwrap();
+        existing.open_verified_with_area_hint(Some(&moved)).unwrap();
+        control
+            .remember_anchor_area_location(existing.area.area_id, &moved)
+            .unwrap();
+        drop(control);
+        let control = ControlStore::open_existing_with_key(&db, &[42; 32]).unwrap();
+        assert_eq!(
+            control
+                .get_record(
+                    &super::intent_kind_for_scope(GitWorktreeScope::primary(repository_id)),
+                    &key
+                )
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        let entries = resume_pending_stages(&control, repository_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        let oid = Oid::hash_object(git2::ObjectType::Blob, b"native payload").unwrap();
+        assert_eq!(entries[0].oid, oid.as_bytes());
+        assert!(!has_pending_stages(&control, repository_id).unwrap());
+        let anchors = anchors_for_oid(&control, repository_id, oid).unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].area, existing.area);
+        // Checkout consumes the same hint and publishes a distinct COW inode.
+        let staging_path = temp.path().join("checkout");
+        fs::create_dir(&staging_path).unwrap();
+        let staging = PinnedDirectory::open(&staging_path).unwrap();
+        SourceBackendKind::ReflinkV1
+            .publish_checkout_file_with_area_hint(
+                &staging,
+                "payload",
+                &anchors[0],
+                0o100644,
+                Some(&moved),
+            )
+            .unwrap();
+        fs::write(staging_path.join("payload"), b"edited checkout").unwrap();
+        let mut bytes = Vec::new();
+        crate::catalog_anchor::open(&control, &anchors[0])
+            .unwrap()
+            .0
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"native payload");
+        assert_eq!(fs::read(work.join("payload")).unwrap(), b"native payload");
     }
 
     #[test]

@@ -1248,9 +1248,18 @@ passing tests below apply only to their recorded source and exercised cases.
     catalogs consume saved hints without publishing them or retiring jobs.
     Native ownership preflight reads saved hints without migrating the catalog.
     Validation is recorded in ADR 0002.
+  - [x] Connect control-aware root/file/blob capture, reconciliation and discard
+    to durable relocation assistance. Pass hints separately from persisted plans
+    and use them when verifying published manifests during replay. Native Git
+    staging, fetch/merge import replay, backup import and checkout publication
+    consume the same hints; Node revision-anchor retirement and Git prune use
+    durable discovery before idempotent native deletion. Keep withdrawal,
+    ownership, source-version, content/OID and COW checks in their consumers.
+    Fresh-process Btrfs capture/cleanup and moved-stage/checkout fixtures pass;
+    validation is recorded in ADR 0002.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
-    progress to remaining direct native Git capture/import/checkout/replay and
-    retirement call paths;
+    progress to remaining standalone capture/recovery and best-effort cleanup
+    call paths; complete consumer lifecycle qualification;
     integrate operational retry/backoff and abandoned-job quota cleanup. Qualify
     other filesystems/platforms and continuously changing namespaces, plus
     absent/moved areas, reopen and source loss across complete consumers,

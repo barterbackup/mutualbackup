@@ -1018,6 +1018,16 @@ impl PinnedDirectory {
         anchor: &FileAnchorManifest,
         mode: u32,
     ) -> Result<(), AnchorError> {
+        self.publish_reflink_child_with_area_hint(name, anchor, mode, None)
+    }
+
+    pub fn publish_reflink_child_with_area_hint(
+        &self,
+        name: impl AsRef<Path>,
+        anchor: &FileAnchorManifest,
+        mode: u32,
+        hint: Option<&Path>,
+    ) -> Result<(), AnchorError> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
@@ -1029,7 +1039,7 @@ impl PinnedDirectory {
         validate_single_component(name)?;
         let encoded =
             CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
-        let source = anchor.open_verified()?;
+        let (source, _) = anchor.open_verified_with_area_hint(hint)?;
         let descriptor = unsafe {
             libc::openat(
                 self.file.as_raw_fd(),
@@ -1276,6 +1286,16 @@ impl PinnedDirectory {
     ) -> Result<(), AnchorError> {
         Err(unsupported_pinned_directory())
     }
+
+    pub fn publish_reflink_child_with_area_hint(
+        &self,
+        _name: impl AsRef<Path>,
+        _anchor: &FileAnchorManifest,
+        _mode: u32,
+        _hint: Option<&Path>,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1512,7 +1532,7 @@ pub struct ReflinkFileCapturePlan {
 }
 
 #[derive(Clone, Copy)]
-enum FileManifestEncoding {
+pub(crate) enum FileManifestEncoding {
     Utf8V1,
     #[cfg(target_os = "linux")]
     RawV2,
@@ -1650,6 +1670,10 @@ pub mod raw_path_bytes_option {
 
 #[cfg(target_os = "linux")]
 impl RawReflinkFileCapturePlanV2 {
+    pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
+        &self.root.area
+    }
+
     fn from_legacy(plan: ReflinkFileCapturePlan) -> Self {
         Self {
             format_version: 2,
@@ -1659,7 +1683,7 @@ impl RawReflinkFileCapturePlanV2 {
         }
     }
 
-    fn as_legacy(&self) -> Result<ReflinkFileCapturePlan, AnchorError> {
+    pub(crate) fn as_legacy(&self) -> Result<ReflinkFileCapturePlan, AnchorError> {
         if self.format_version != 2 {
             return Err(AnchorError::InvalidRoot);
         }
@@ -1692,13 +1716,18 @@ impl RawReflinkFileCapturePlanV2 {
     }
 
     pub fn capture(&self) -> Result<FileAnchorManifest, AnchorError> {
-        ReflinkAnchor::capture_file_plan_encoding(&self.as_legacy()?, FileManifestEncoding::RawV2)
+        ReflinkAnchor::capture_file_plan_encoding(
+            &self.as_legacy()?,
+            FileManifestEncoding::RawV2,
+            None,
+        )
     }
 
     pub fn reconcile(&self) -> Result<(), AnchorError> {
         ReflinkAnchor::reconcile_file_capture_encoding(
             &self.as_legacy()?,
             FileManifestEncoding::RawV2,
+            None,
         )
     }
 
@@ -1719,6 +1748,10 @@ pub struct ImportedBlobCapturePlan {
 }
 
 impl ImportedBlobCapturePlan {
+    pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
+        &self.root.area
+    }
+
     pub fn plan(source_root: impl AsRef<Path>, logical_len: u64) -> Result<Self, AnchorError> {
         Ok(Self {
             format_version: 1,
@@ -1765,11 +1798,20 @@ impl ImportedBlobCapturePlan {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn capture(&self, mut source: impl Read) -> Result<FileAnchorManifest, AnchorError> {
+    pub fn capture(&self, source: impl Read) -> Result<FileAnchorManifest, AnchorError> {
+        self.capture_with_area_hint(source, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capture_with_area_hint(
+        &self,
+        mut source: impl Read,
+        hint: Option<&Path>,
+    ) -> Result<FileAnchorManifest, AnchorError> {
         if self.format_version != 1 || self.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&self.root.area)?;
+        let area_path = resolve_anchor_area_with_hint(&self.root.area, hint)?;
         let area = open_stable_anchor_area(&area_path, &self.root.area)?;
         let anchor_name = self.anchor_id().to_string();
         let staging_name = format!(".staging-{}", self.anchor_id());
@@ -1881,10 +1923,15 @@ impl ImportedBlobCapturePlan {
 
     #[cfg(target_os = "linux")]
     pub fn reconcile(&self) -> Result<(), AnchorError> {
+        self.reconcile_with_area_hint(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reconcile_with_area_hint(&self, hint: Option<&Path>) -> Result<(), AnchorError> {
         if self.format_version != 1 || self.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&self.root.area)?;
+        let area_path = resolve_anchor_area_with_hint(&self.root.area, hint)?;
         let area = open_stable_anchor_area(&area_path, &self.root.area)?;
         let anchor_name = self.anchor_id().to_string();
         match open_path_no_xdev_beneath(&area, Path::new(&anchor_name)) {
@@ -1906,10 +1953,15 @@ impl ImportedBlobCapturePlan {
 
     #[cfg(target_os = "linux")]
     pub fn discard(&self) -> Result<(), AnchorError> {
+        self.discard_with_area_hint(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn discard_with_area_hint(&self, hint: Option<&Path>) -> Result<(), AnchorError> {
         if self.format_version != 1 || self.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&self.root.area)?;
+        let area_path = resolve_anchor_area_with_hint(&self.root.area, hint)?;
         let area = open_stable_anchor_area(&area_path, &self.root.area)?;
         for name in [
             format!(".staging-{}", self.anchor_id()),
@@ -1923,6 +1975,10 @@ impl ImportedBlobCapturePlan {
 }
 
 impl ReflinkFileCapturePlan {
+    pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
+        &self.root.area
+    }
+
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
     }
@@ -2347,10 +2403,14 @@ impl FileAnchorManifest {
     }
 
     pub fn remove(&self) -> Result<(), AnchorError> {
+        self.remove_with_area_hint(None)
+    }
+
+    pub fn remove_with_area_hint(&self, hint: Option<&Path>) -> Result<(), AnchorError> {
         if self.guarded_root_file.is_some() {
             return Err(AnchorError::InvalidRoot);
         }
-        let area = resolve_anchor_area(&self.area)?;
+        let area = resolve_anchor_area_with_hint(&self.area, hint)?;
         let area_file = open_stable_anchor_area(&area, &self.area)?;
         remove_directory_at(
             &area_file,
@@ -2363,6 +2423,10 @@ impl FileAnchorManifest {
 }
 
 impl ReflinkCapturePlan {
+    pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
+        &self.area
+    }
+
     pub fn source_root(&self) -> &Path {
         &self.source_root
     }
@@ -2472,10 +2536,14 @@ impl StableAnchorManifest {
     }
 
     pub fn remove(&self) -> Result<(), AnchorError> {
+        self.remove_with_area_hint(None)
+    }
+
+    pub fn remove_with_area_hint(&self, hint: Option<&Path>) -> Result<(), AnchorError> {
         if !matches!(self.format_version, 2 | 3) {
             return Err(AnchorError::UnsupportedAnchorFormat(self.format_version));
         }
-        let area = resolve_anchor_area(&self.area)?;
+        let area = resolve_anchor_area_with_hint(&self.area, hint)?;
         let area_file = open_stable_anchor_area(&area, &self.area)?;
         let guarded_marker = legacy_guarded::guarded_root_marker_name(self.anchor_id);
         match open_path_no_xdev_beneath(&area_file, Path::new(&guarded_marker)) {
@@ -2635,10 +2703,17 @@ impl ReflinkAnchor {
     }
 
     pub fn capture_plan(plan: &ReflinkCapturePlan) -> Result<StableAnchorManifest, AnchorError> {
+        Self::capture_plan_with_area_hint(plan, None)
+    }
+
+    pub(crate) fn capture_plan_with_area_hint(
+        plan: &ReflinkCapturePlan,
+        hint: Option<&Path>,
+    ) -> Result<StableAnchorManifest, AnchorError> {
         if plan.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&plan.area)?;
+        let area_path = resolve_anchor_area_with_hint(&plan.area, hint)?;
         let area_file = open_stable_anchor_area(&area_path, &plan.area)?;
         let staging_name = format!(".staging-{}", plan.anchor_id);
         let anchor_name = plan.anchor_id.to_string();
@@ -2765,10 +2840,17 @@ impl ReflinkAnchor {
     }
 
     pub fn discard_capture(plan: &ReflinkCapturePlan) -> Result<(), AnchorError> {
+        Self::discard_capture_with_area_hint(plan, None)
+    }
+
+    pub(crate) fn discard_capture_with_area_hint(
+        plan: &ReflinkCapturePlan,
+        hint: Option<&Path>,
+    ) -> Result<(), AnchorError> {
         if plan.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&plan.area)?;
+        let area_path = resolve_anchor_area_with_hint(&plan.area, hint)?;
         let area_file = open_stable_anchor_area(&area_path, &plan.area)?;
         let staging_name = format!(".staging-{}", plan.anchor_id);
         let link_pool_name = capture_link_pool_name(plan.anchor_id);
@@ -2786,10 +2868,17 @@ impl ReflinkAnchor {
     }
 
     pub fn reconcile_capture(plan: &ReflinkCapturePlan) -> Result<(), AnchorError> {
+        Self::reconcile_capture_with_area_hint(plan, None)
+    }
+
+    pub(crate) fn reconcile_capture_with_area_hint(
+        plan: &ReflinkCapturePlan,
+        hint: Option<&Path>,
+    ) -> Result<(), AnchorError> {
         if plan.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&plan.area)?;
+        let area_path = resolve_anchor_area_with_hint(&plan.area, hint)?;
         let area_file = open_stable_anchor_area(&area_path, &plan.area)?;
         let anchor_name = plan.anchor_id.to_string();
         let anchor_root = area_path.join(&anchor_name);
@@ -2851,18 +2940,19 @@ impl ReflinkAnchor {
     pub fn capture_file_plan(
         plan: &ReflinkFileCapturePlan,
     ) -> Result<FileAnchorManifest, AnchorError> {
-        Self::capture_file_plan_encoding(plan, FileManifestEncoding::Utf8V1)
+        Self::capture_file_plan_encoding(plan, FileManifestEncoding::Utf8V1, None)
     }
 
-    fn capture_file_plan_encoding(
+    pub(crate) fn capture_file_plan_encoding(
         plan: &ReflinkFileCapturePlan,
         encoding: FileManifestEncoding,
+        hint: Option<&Path>,
     ) -> Result<FileAnchorManifest, AnchorError> {
         if plan.format_version != 1 || plan.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
         validate_relative(&plan.relative_path)?;
-        let area_path = resolve_anchor_area(&plan.root.area)?;
+        let area_path = resolve_anchor_area_with_hint(&plan.root.area, hint)?;
         let area_file = open_stable_anchor_area(&area_path, &plan.root.area)?;
         let staging_name = format!(".staging-{}", plan.root.anchor_id);
         let anchor_name = plan.root.anchor_id.to_string();
@@ -2985,17 +3075,18 @@ impl ReflinkAnchor {
     }
 
     pub fn reconcile_file_capture(plan: &ReflinkFileCapturePlan) -> Result<(), AnchorError> {
-        Self::reconcile_file_capture_encoding(plan, FileManifestEncoding::Utf8V1)
+        Self::reconcile_file_capture_encoding(plan, FileManifestEncoding::Utf8V1, None)
     }
 
-    fn reconcile_file_capture_encoding(
+    pub(crate) fn reconcile_file_capture_encoding(
         plan: &ReflinkFileCapturePlan,
         encoding: FileManifestEncoding,
+        hint: Option<&Path>,
     ) -> Result<(), AnchorError> {
         if plan.format_version != 1 || plan.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&plan.root.area)?;
+        let area_path = resolve_anchor_area_with_hint(&plan.root.area, hint)?;
         let area_file = open_stable_anchor_area(&area_path, &plan.root.area)?;
         let anchor_name = plan.root.anchor_id.to_string();
         match open_path_no_xdev_beneath(&area_file, Path::new(&anchor_name)) {
@@ -3016,10 +3107,17 @@ impl ReflinkAnchor {
     }
 
     pub fn discard_file_capture(plan: &ReflinkFileCapturePlan) -> Result<(), AnchorError> {
+        Self::discard_file_capture_with_area_hint(plan, None)
+    }
+
+    pub(crate) fn discard_file_capture_with_area_hint(
+        plan: &ReflinkFileCapturePlan,
+        hint: Option<&Path>,
+    ) -> Result<(), AnchorError> {
         if plan.format_version != 1 || plan.root.format_version != 1 {
             return Err(AnchorError::InvalidRoot);
         }
-        let area_path = resolve_anchor_area(&plan.root.area)?;
+        let area_path = resolve_anchor_area_with_hint(&plan.root.area, hint)?;
         let area_file = open_stable_anchor_area(&area_path, &plan.root.area)?;
         for name in [
             format!(".staging-{}", plan.root.anchor_id),
@@ -4007,11 +4105,7 @@ fn validate_stable_anchor_area(path: &Path, expected_id: Uuid) -> Result<(), Anc
     Ok(())
 }
 
-fn resolve_anchor_area(area: &StableAnchorAreaLocator) -> Result<PathBuf, AnchorError> {
-    resolve_anchor_area_with_hint(area, None)
-}
-
-fn resolve_anchor_area_with_hint(
+pub(crate) fn resolve_anchor_area_with_hint(
     area: &StableAnchorAreaLocator,
     catalog_hint: Option<&Path>,
 ) -> Result<PathBuf, AnchorError> {
@@ -4805,7 +4899,7 @@ fn read_planned_file_manifest_at(
     {
         return Err(AnchorError::AnchorAreaCollision(anchor_root));
     }
-    manifest.open_verified()?;
+    manifest.open_verified_with_area_hint(Some(area_display))?;
     Ok(manifest)
 }
 
@@ -4846,7 +4940,7 @@ fn read_imported_blob_manifest_at(
     {
         return Err(AnchorError::AnchorAreaCollision(anchor_root));
     }
-    manifest.open_verified()?;
+    manifest.open_verified_with_area_hint(Some(area_display))?;
     Ok(manifest)
 }
 
@@ -5315,6 +5409,213 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn durable_capture_and_cleanup_survive_process_restarts() {
+        use crate::{ControlStore, SourceBlobImportPlan, SourceCapturePlan, SourceFileCapturePlan};
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            root: ReflinkCapturePlan,
+            file: ReflinkFileCapturePlan,
+            raw: RawReflinkFileCapturePlanV2,
+            import: ImportedBlobCapturePlan,
+        }
+        if let Some(input) = std::env::var_os("MB_NATIVE_CAPTURE_INPUT") {
+            let input = PathBuf::from(input);
+            let plans: Input = decode_canonical(&fs::read(&input).unwrap()).unwrap();
+            let state = input.parent().unwrap();
+            let control =
+                ControlStore::open_existing_with_key(state.join("control.db"), &[42; 32]).unwrap();
+            let phase = std::env::var("MB_NATIVE_CAPTURE_PHASE").unwrap();
+            let root = SourceCapturePlan::ReflinkV1(plans.root.clone());
+            let file = SourceFileCapturePlan::ReflinkV1(plans.file.clone());
+            let raw = SourceFileCapturePlan::ReflinkRawV2(plans.raw.clone());
+            let import = SourceBlobImportPlan::DirectV1(plans.import.clone());
+            let result: anyhow::Result<()> = (|| {
+                match phase.as_str() {
+                    "root-capture" => {
+                        let manifest = root.capture(&control)?;
+                        fs::write(state.join("root-manifest"), canonical_bytes(&manifest)?)?;
+                    }
+                    "file-capture" | "raw-capture" | "import-capture" => {
+                        let manifest = match phase.as_str() {
+                            "file-capture" => file.capture_with_control(&control)?,
+                            "raw-capture" => raw.capture_with_control(&control)?,
+                            _ => import
+                                .capture_with_control(&control, b"native payload".as_slice())?,
+                        };
+                        let hint = control
+                            .anchor_area_location_hint(manifest.area.area_id)?
+                            .unwrap();
+                        let mut actual = Vec::new();
+                        manifest
+                            .open_verified_with_area_hint(Some(&hint))?
+                            .0
+                            .read_to_end(&mut actual)?;
+                        assert_eq!(actual, b"native payload");
+                        fs::write(state.join(&phase), canonical_bytes(&manifest)?)?;
+                    }
+                    "reconcile" => {
+                        root.reconcile(&control)?;
+                        file.reconcile_with_control(&control)?;
+                        raw.reconcile_with_control(&control)?;
+                        import.reconcile_with_control(&control)?;
+                    }
+                    "discard" => {
+                        root.discard(&control)?;
+                        file.discard_with_control(&control)?;
+                        raw.discard_with_control(&control)?;
+                        import.discard_with_control(&control)?;
+                    }
+                    other => panic!("{other}"),
+                }
+                Ok(())
+            })();
+            let status = match result {
+                Ok(()) => "done",
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<AnchorError>(),
+                        Some(AnchorError::AnchorAreaDiscoveryPending)
+                    ) || matches!(
+                        error.downcast_ref::<crate::SourceFileCaptureError>(),
+                        Some(crate::SourceFileCaptureError::Anchor(
+                            AnchorError::AnchorAreaDiscoveryPending
+                        ))
+                    ) =>
+                {
+                    "pending"
+                }
+                Err(error) => panic!("{error:#}"),
+            };
+            fs::write(state.join("status"), status).unwrap();
+            return;
+        }
+        let provisioned = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        let temp = tempfile::tempdir_in(provisioned).unwrap();
+        let work = temp.path().join("work");
+        let scan = temp.path().join("scan");
+        let state = temp.path().join("state");
+        for path in [&work, &scan, &state] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::write(work.join("payload"), b"native payload").unwrap();
+        let mut plans = Input {
+            root: ReflinkAnchor::plan(&work).unwrap(),
+            file: ReflinkAnchor::plan_file(&work, "payload").unwrap(),
+            raw: ReflinkAnchor::plan_file_raw(&work, "payload").unwrap(),
+            import: ImportedBlobCapturePlan::plan(&work, 14).unwrap(),
+        };
+        let area = plans.root.area.clone();
+        for candidate in [
+            &mut plans.root.area,
+            &mut plans.file.root.area,
+            &mut plans.raw.root.area,
+            &mut plans.import.root.area,
+        ] {
+            assert_eq!(candidate.area_id, area.area_id);
+            candidate.volume_root_hint = scan.clone();
+        }
+        for n in 0..6_000 {
+            fs::write(scan.join(format!("entry-{n}")), []).unwrap();
+        }
+        let moved = scan.join(".mutualbackup-anchors-moved");
+        fs::rename(&area.path_hint, &moved).unwrap();
+        let input = state.join("input");
+        let original = canonical_bytes(&plans).unwrap();
+        fs::write(&input, &original).unwrap();
+        let db = state.join("control.db");
+        drop(ControlStore::open_with_key(&db, &[42; 32]).unwrap());
+        let run = |phase: &str| {
+            for pending in 0..30 {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "anchor::tests::durable_capture_and_cleanup_survive_process_restarts",
+                        "--test-threads=1",
+                    ])
+                    .env("MB_NATIVE_CAPTURE_INPUT", &input)
+                    .env("MB_NATIVE_CAPTURE_PHASE", phase)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if fs::read_to_string(state.join("status")).unwrap() == "done" {
+                    return pending;
+                }
+            }
+            panic!("{phase} never completed");
+        };
+        assert!(run("root-capture") > 0);
+        for phase in ["file-capture", "raw-capture", "import-capture", "reconcile"] {
+            run(phase);
+        }
+        let manifest: StableAnchorManifest =
+            decode_canonical(&fs::read(state.join("root-manifest")).unwrap()).unwrap();
+        assert_eq!(manifest.area, plans.root.area);
+        let mut bytes = Vec::new();
+        manifest
+            .file_locator("payload".into())
+            .unwrap()
+            .open_with_area_hint(Some(&moved))
+            .unwrap()
+            .0
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"native payload");
+        // Move again beyond the scan prefix. Replay and cleanup must consume the
+        // shared durable hint rather than alter their original serialized plans.
+        let outside = temp.path().join("outside");
+        fs::rename(&moved, &outside).unwrap();
+        let control = ControlStore::open_existing_with_key(&db, &[42; 32]).unwrap();
+        manifest
+            .file_locator("payload".into())
+            .unwrap()
+            .open_with_area_hint(Some(&outside))
+            .unwrap();
+        control
+            .remember_anchor_area_location(area.area_id, &outside)
+            .unwrap();
+        drop(control);
+        for phase in [
+            "root-capture",
+            "file-capture",
+            "raw-capture",
+            "import-capture",
+            "reconcile",
+            "discard",
+            "discard",
+        ] {
+            assert_eq!(run(phase), 0);
+        }
+        assert_eq!(fs::read(&input).unwrap(), original);
+        for id in [
+            plans.root.anchor_id,
+            plans.file.root.anchor_id,
+            plans.raw.root.anchor_id,
+            plans.import.anchor_id(),
+        ] {
+            assert!(!outside.join(id.to_string()).exists());
+        }
+        assert_eq!(fs::read(work.join("payload")).unwrap(), b"native payload");
+        let control = ControlStore::open_existing_read_only_with_key(&db, &[42; 32]).unwrap();
+        assert!(
+            control
+                .get_record(
+                    crate::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area.area_id.as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
