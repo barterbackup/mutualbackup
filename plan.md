@@ -1458,6 +1458,10 @@ its stable replacement policy. Complete normal capture/restore, data-source
 recovery orchestration, packing/checkpoint/retention and seed-only migration are
 still required before production admission.
 
+Every supported legacy parity upgrade now checks its final schema-version write.
+Rejected metadata rolls back table conversion and reservation creation together;
+the old schema and shard bytes remain available for a clean reopen/retry.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

@@ -3571,10 +3571,13 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
             PRIMARY KEY(attempt_id, shard_index)
          ) STRICT;",
     )?;
-    transaction.execute(
+    if transaction.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
         [SCHEMA_VERSION.to_be_bytes().as_slice()],
-    )?;
+    )? != 1
+    {
+        return Err(DatabaseError::Conflict);
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -4127,6 +4130,78 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn legacy_parity_schema_upgrades_roll_back_ignored_or_aborted_version_writes() {
+        for version in [2_u32, 3, 5, 6, 7, 8] {
+            for fault in ["ABORT", "IGNORE"] {
+                let temp = tempdir().unwrap();
+                let path = temp.path().join("parity.db");
+                let key = [122; 32];
+                let volume = [123; 16];
+                let mut store = ParityStore::open_with_key(&path, &volume, &key).unwrap();
+                let schema = match version {
+                    8 => PARITY_OBJECTS_SCHEMA,
+                    7 => PARITY_OBJECTS_BEFORE_V8_SCHEMA,
+                    6 => PARITY_OBJECTS_BEFORE_V7_SCHEMA,
+                    _ => PARITY_OBJECTS_BEFORE_V6_SCHEMA,
+                };
+                store
+                    .connection
+                    .execute_batch("DROP TABLE coding_reservations; DROP TABLE parity_objects;")
+                    .unwrap();
+                store.connection.execute_batch(schema).unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                        [version.to_be_bytes().as_slice()],
+                    )
+                    .unwrap();
+                let bytes = vec![124; V1_SECTOR_SIZE];
+                let expected = ParityObject {
+                    format_version: 1,
+                    guild_id: [125; 32],
+                    group_id: [126; 32],
+                    shard_index: 3,
+                    root: sector_root(&bytes),
+                    bytes,
+                };
+                store.connection.execute("INSERT INTO parity_objects
+                    (format_version, guild_id, group_id, shard_index, root, byte_length, state, bytes)
+                    VALUES (1, ?1, ?2, 3, ?3, 65536, 'READY', ?4)",
+                    params![expected.guild_id, expected.group_id, expected.root, &expected.bytes]).unwrap();
+                let raise = if fault == "IGNORE" {
+                    "RAISE(IGNORE)"
+                } else {
+                    "RAISE(ABORT, 'injected')"
+                };
+                store.connection.execute_batch(&format!("CREATE TEMP TRIGGER deny_legacy_metadata BEFORE UPDATE ON main.meta WHEN OLD.key = 'schema_version' BEGIN SELECT {raise}; END;")).unwrap();
+                assert!(
+                    migrate_parity(&mut store.connection, &volume).is_err(),
+                    "schema {version}, {fault}"
+                );
+                assert_eq!(stored_schema_version(&store.connection).unwrap(), version);
+                validate_parity_schema_version(&store.connection, version).unwrap();
+                let retained: Vec<u8> = store
+                    .connection
+                    .query_row(
+                        "SELECT bytes FROM parity_objects WHERE group_id = ?1 AND shard_index = 3",
+                        params![expected.group_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, expected.bytes);
+                drop(store);
+                let store = ParityStore::open_existing_with_key(&path, &volume, &key).unwrap();
+                assert_eq!(
+                    stored_schema_version(&store.connection).unwrap(),
+                    SCHEMA_VERSION
+                );
+                assert_eq!(store.load_ready(&expected.group_id, 3).unwrap(), expected);
+            }
+        }
+    }
 
     #[test]
     fn paged_sector_schema_v9_parity_upgrade_preserves_live_reservations_and_fences_metadata() {

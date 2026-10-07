@@ -1196,6 +1196,17 @@ passing tests below apply only to their recorded source and exercised cases.
     run keeps 62 Git, 20 Node and 19 store provisioned cases ignored; full native
     capture/topology/platform, filesystem lifecycle and real 1 TiB qualification
     remain open. No production head or protection activation is introduced.
+  - [x] Fence the final schema-version write in every supported legacy parity
+    upgrade, extending the schema-9 checks to versions 2/3/5/6/7/8. A rejected
+    metadata update now aborts the same transaction as table conversion and
+    reservation creation, preserving the exact old schema and shard bytes for
+    safe reopen/retry. One new regression exercises abort and ignore at all six
+    old versions, verifies rollback and retained bytes, then reopens and checks
+    successful migration and authenticated READY reads. All 15 targeted parity
+    tests pass, including schema-9 reservation/identity fencing, existing older
+    upgrade checks and migration-free reads for every known schema. Formatting
+    and strict locked workspace/all-targets Clippy pass. This focused follow-up
+    does not repeat or replace broader release-artifact/platform qualification.
   - [ ] Integrate legacy private conversion with retained revision publication
     and migrate native capture/restore consumers before enabling the new format.
   - [ ] Add quota reservations, bounded packing/coding record

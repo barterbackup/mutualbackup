@@ -1341,3 +1341,22 @@ locked workspace/all-targets Clippy pass. Sixty-two Git, 20 Node and 19 store
 provisioned tests remain ignored. Full native capture/topology/platform,
 filesystem lifecycle and real 1 TiB qualification were not run for this source
 routing integration; this is not current release-artifact R7 qualification.
+
+### Legacy parity upgrade metadata fence (2026-10-07)
+
+The final version update in parity migrations from schemas 2/3/5/6/7/8 now
+requires exactly one affected row, matching the schema-9 upgrade fence. An
+ignored write previously could commit converted tables/reservation state while
+leaving the old schema version. Rejection now returns a conflict before commit,
+rolling back all schema/data changes and retaining the exact old catalog for
+safe reopen/retry. This hardens the existing upgrade paths without changing
+their accepted versions, shard identities or successful conversion semantics.
+
+One new fixture injects SQL abort/ignore at all six older versions. It checks
+the old exact schema and version after failure, unchanged shard bytes and
+successful reopen with authenticated READY reads. All 15 targeted parity tests
+pass, including the schema-9 reservation/volume identity fixture, existing
+upgrade checks and read-only inspection of every known parity schema. Formatting
+and strict locked workspace/all-targets Clippy pass. The preceding serving
+commit records the full 761-case ordinary run; this focused follow-up does not
+rerun those unrelated suites or establish current R7/platform/1 TiB evidence.
