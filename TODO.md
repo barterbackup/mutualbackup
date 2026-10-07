@@ -1412,6 +1412,26 @@ separately below.
     formatting and strict workspace/all-targets Clippy pass. Full workspace
     requalification is pending; preserve the original R5 progress and
     release/platform gates.
+  - [x] Anchor the bounded packing join to a trusted legacy checkpoint and
+    eligible signed paged source candidates. Bound and verify the legacy
+    certificate, import retained sources/member/fence/chain authority into
+    encrypted scratch, and require exact source coverage. Preserve removed
+    owners' history; new candidates require base membership/latest writer fence,
+    exact chain continuation, unique revision IDs, both signatures and full
+    source/bootstrap EOF. Flat-only history requires matching owner bindings,
+    epoch-quorum evidence or new signed paged roots. Expose bounded source,
+    candidate and checked placement cursors. The represented legacy envelope,
+    new roots/pages, evidence and packing streams share aggregate admission.
+    The locked store suite passes 165 ordinary tests (26 ignored) before the
+    final spill fixture; all eight final focused authority tests and strict
+    locked workspace/all-targets Clippy pass. Fixtures include 16,002 sources,
+    real spill, late-fetch failure/fresh rebuild, all legacy certificate evidence
+    paths, stale/removed authority, retained tombstones, chain continuation,
+    source omission/substitution and ignored writes. Full workspace
+    requalification is pending. This is a migration/proposal bridge; paged
+    checkpoint authority, private joins, current guild-event fence rechecks,
+    coding, quotas, normal publication/retention/seed-only activation and real
+    retained 1 TiB qualification remain open. See ADR 0002.
   - [x] Replace the Linux whole-filesystem lookup under the global mutex with
     bounded process-local relocation cursors. Each lookup advances at most 2,048
     steps with a cooperative 25 ms deadline; incomplete work returns an explicit

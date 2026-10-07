@@ -2339,3 +2339,64 @@ loops can progress during synchronous packing and certificate/GC checks. No
 production timeout or reachability rule changes. Formatting, compilation and
 strict workspace/all-targets Clippy pass; full workspace requalification is
 pending. This fixture correction does not diagnose the original R5 stall.
+
+### Trusted legacy packing authority and paged candidates (2026-10-07)
+
+`CatalogPackingAuthority::from_legacy_checkpoint` imports an existing legacy
+certificate only after bounding its canonical envelope to the unchanged 32 MiB
+legacy cap, matching a caller-supplied trusted checkpoint hash, and verifying
+its complete quorum/revision/fence/packing joins. This is a bounded migration
+bridge; it does not replace the flat legacy verifier with a scalable consumer.
+Membership, latest base fences, retained chain heads, revision IDs and unique
+source authority go into the same private encrypted scratch store used by the
+subsequent packing join. Source rows use owner/root/object order and have a
+bounded exclusive cursor; no dataset-sized map or dense source ordinal is needed.
+
+All retained sources remain required, including those owned by removed members
+or signed under historical writer fences. Legacy authenticated catalogs already
+bind their source commitments through the verified certificate. Flat-only
+history requires an owner-signed binding, matching epoch-quorum attestations,
+or a new owner/writer-signed paged source root binding the same flat source.
+Migration evidence must match the exact source and signed flat root. Attesters
+must be current base members, agree on the commitment and reach the base quorum;
+duplicate signers and wrong epochs fail. Legacy certificates without an epoch
+accept owner bindings but cannot supply epoch-bound attestation authority.
+
+New paged candidates verify both signatures, base membership and the latest
+writer fence in that base, globally unique revision IDs and exact continuation
+of each retained chain. Every signed source root must reach authenticated EOF,
+including its exact bootstrap-sector join. Identical shared source commitments
+deduplicate; conflicting flat roots or commitments fail. Mutation methods
+consume the owned job, so cancellation, corrupt tails, ignored writes and quota
+failure cannot leave an adoptable authority prefix. Retry rebuilds a fresh job.
+
+The final join requires exactly the unique source cardinality in the authority
+pool. Together with ordered unique source records and exact commitment lookup,
+this rejects omitted retained sources and same-count substitutions. Both source
+and descriptor EOFs and complete chunk placement remain mandatory. The checked
+result retains its trusted base and exposes bounded signed-candidate and
+placement cursors. The legacy envelope, new signed roots/source pages, migration
+evidence and both packing streams share the existing aggregate byte budget;
+new page closures also share the page-occurrence budget. Physical scratch
+placement, checkpoint reservations and headroom remain caller admission duties.
+
+Qualification: the full locked store suite passes 165 ordinary tests with 26
+ignored before the final spill fixture was added. All eight final focused
+authority tests pass, including 16,002 sources, real spill beyond the fixed
+1 MiB cache, ordered traversal and a fresh rebuild after the final source-page
+fetch fails. Tests also cover trusted-hash/quorum/signature rejection, stale
+writers, removed owners, retained tombstones, two chained paged candidates,
+all existing authenticated packing-certificate evidence paths, incomplete
+bootstrap joins, wrong source cardinality/substitution, duplicate attesters,
+wrong epochs/roots, orphan rows, ignored candidate insertion and aggregate
+byte/page budgets. Formatting/diff checks and strict locked workspace/all-targets
+Clippy pass; full workspace requalification is pending.
+
+This establishes source authority for a proposal under the supplied trusted
+base. It does not authorize active revision or checkpoint publication. Private
+namespace/Git joins, coding receipts, retention/quota policy and rechecking both
+the checkpoint base and current certified guild-event membership/writer fences
+remain mandatory. A concurrent rotation/removal may supersede the base without
+changing its checkpoint hash. A paged checkpoint authority constructor and
+normal capture/packing/coding/checkpoint/retention/seed-only consumer migration,
+incremental edits, real retained 1 TiB and release/platform gates remain open.

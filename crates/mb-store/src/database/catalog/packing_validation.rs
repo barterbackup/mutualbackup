@@ -130,7 +130,7 @@ fn row<T: serde::de::DeserializeOwned + Serialize>(
     Ok(Some((value, bytes)))
 }
 
-fn unwrap_stream<T>(
+pub(super) fn unwrap_stream<T>(
     result: Result<T, CatalogStreamError<CatalogStoreError>>,
 ) -> Result<T, CatalogStoreError> {
     result.map_err(|error| match error {
@@ -155,8 +155,8 @@ fn zero_content_hash(byte_len: u32) -> [u8; 32] {
 /// database/journals. The completed index retains one placement per source
 /// chunk with bounded reads; callers own its physical limits and headroom.
 pub struct CatalogPackingIndex {
-    manifest: CatalogPackingValidation,
-    store: RecordScratchStore,
+    pub(super) manifest: CatalogPackingValidation,
+    pub(super) store: RecordScratchStore,
 }
 
 impl CatalogPackingIndex {
@@ -215,7 +215,7 @@ impl CatalogPackingIndex {
         Ok(bundle)
     }
 
-    fn require_complete(&self) -> Result<(), CatalogStoreError> {
+    pub(super) fn require_complete(&self) -> Result<(), CatalogStoreError> {
         let expected = canonical_bytes_bounded(&self.manifest, ROOT_BYTES)?;
         if self
             .store
@@ -254,7 +254,7 @@ impl CatalogPackingIndex {
     }
 }
 
-fn build_index(
+pub(super) fn build_index(
     manifest: CatalogPackingValidation,
     store: &RecordScratchStore,
     fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,

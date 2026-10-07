@@ -1629,6 +1629,22 @@ and certificate/GC work. Formatting and strict workspace/all-targets Clippy
 pass; workspace requalification remains pending. Retain the original R5
 progress and exact-release/platform requirements.
 
+The packing join now has a trusted legacy-certificate authority bridge. It
+bounds and verifies the existing certificate, preserves every retained source
+and accepts eligible paged candidates only after owner/writer signatures,
+base membership/fence/chain checks and complete source/bootstrap traversal.
+Flat-only history needs matching owner or epoch-quorum evidence, or a new
+signed paged source root. Exact source cardinality and commitment joins prevent
+silent history omission. Source/candidate/placement cursors remain bounded in
+the admitted encrypted index; aggregate admission includes the legacy envelope,
+new source roots/pages, migration evidence and packing streams. Eight focused
+authority tests and strict workspace/all-targets Clippy pass, including 16,002
+sources, real spill and late-failure rebuild; full workspace requalification is
+pending. This remains a proposal/migration bridge. Paged checkpoint authority,
+private joins, current guild-event membership/writer fence rechecks, coding,
+quotas, normal retention/seed-only consumers and real retained 1 TiB gates
+remain required.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to
