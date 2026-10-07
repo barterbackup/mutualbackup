@@ -1209,6 +1209,16 @@ passing tests below apply only to their recorded source and exercised cases.
     does not repeat or replace broader release-artifact/platform qualification.
   - [ ] Integrate legacy private conversion with retained revision publication
     and migrate native capture/restore consumers before enabling the new format.
+  - [x] Bound existing per-attempt coding and packed-sector decoding by the
+    supported geometry, including roles, roots, receipts, sampled openings,
+    failure-domain bytes, Merkle proofs, packed slots/payloads and the aggregate
+    512 KiB full-information witness. Preserve signed Postcard layouts and legacy
+    CBOR map/array/byte-string compatibility. Stream packed-cache encoding and
+    SQL writes one record at a time in the existing atomic transaction; producer
+    errors and ignored writes roll back the entire batch. Borrow payloads during
+    encoding and bound packed-cache SQL reads before allocation. Validation is
+    recorded in ADR 0002. Whole flat packing/catalog materialization, paged
+    packing/coding publication and full capture/recovery migration remain open.
   - [ ] Add quota reservations, bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

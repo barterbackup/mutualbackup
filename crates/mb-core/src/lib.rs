@@ -5,6 +5,7 @@
 //! cryptographic operations.
 
 mod attempt;
+mod bounded;
 mod canonical;
 mod catalog;
 mod coding;

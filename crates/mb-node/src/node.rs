@@ -5720,20 +5720,12 @@ impl Node {
         result: &PackingResult,
     ) -> Result<()> {
         result.validate()?;
-        let mut records = Vec::with_capacity(result.sectors.len());
-        for sector in &result.sectors {
-            records.push((
-                "packed-sector".to_owned(),
-                packed_record_id(&guild_id, &sector.descriptor.id),
-                canonical_bytes(&PackedSectorRecord {
-                    format_version: 1,
-                    guild_id,
-                    sector: sector.clone(),
-                })?,
-            ));
-        }
-        self.control.put_records(&records)?;
-        Ok(())
+        self.control.put_records_iter(
+            result
+                .sectors
+                .iter()
+                .map(|sector| encode_packed_sector_record(guild_id, sector)),
+        )
     }
 
     pub(crate) fn store_packing_update(
@@ -5742,7 +5734,7 @@ impl Node {
         update: &PackingUpdate,
     ) -> Result<()> {
         update.catalog.validate()?;
-        let mut records = Vec::with_capacity(update.changed_sectors.len());
+        // Authenticate every supplied sector before acquiring the SQL writer.
         for sector in &update.changed_sectors {
             validate_packed_sector(update.catalog.profile, sector)?;
             if update
@@ -5753,18 +5745,13 @@ impl Node {
             {
                 anyhow::bail!("packed update sector is absent from its catalog");
             }
-            records.push((
-                "packed-sector".to_owned(),
-                packed_record_id(&guild_id, &sector.descriptor.id),
-                canonical_bytes(&PackedSectorRecord {
-                    format_version: 1,
-                    guild_id,
-                    sector: sector.clone(),
-                })?,
-            ));
         }
-        self.control.put_records(&records)?;
-        Ok(())
+        self.control.put_records_iter(
+            update
+                .changed_sectors
+                .iter()
+                .map(|sector| encode_packed_sector_record(guild_id, sector)),
+        )
     }
 
     pub(crate) fn store_packed_sector(
@@ -5774,16 +5761,9 @@ impl Node {
         sector: PackedSector,
     ) -> Result<()> {
         validate_packed_sector(profile, &sector)?;
-        self.control.put_record(
-            "packed-sector",
-            &packed_record_id(&guild_id, &sector.descriptor.id),
-            &canonical_bytes(&PackedSectorRecord {
-                format_version: 1,
-                guild_id,
-                sector,
-            })?,
-        )?;
-        Ok(())
+        self.control.put_records_iter(std::iter::once_with(|| {
+            encode_packed_sector_record(guild_id, &sector)
+        }))
     }
 
     pub(crate) fn release_distributed_packed_sectors(
@@ -7900,9 +7880,10 @@ impl Node {
             if role.sector.virtual_zero {
                 continue;
             }
-            if let Some(bytes) = self.control.get_record(
+            if let Some(bytes) = self.control.get_record_bounded(
                 "packed-sector",
                 &packed_record_id(&plan.value.geometry.guild_id, &role.sector.id),
+                PACKED_SECTOR_RECORD_BYTES,
             )? {
                 let record: PackedSectorRecord = decode_canonical(&bytes)?;
                 load_packed_sector(
@@ -13791,6 +13772,24 @@ fn validate_packed_sector(profile: PackingProfile, sector: &PackedSector) -> Res
     Ok(())
 }
 
+// Maximum existing packing geometry: 4 MiB payload plus at most 262,144
+// fixed-field slots (16-byte minimum slot). Includes conservative varint and
+// enclosing-record overhead, without changing historical profile support.
+const PACKED_SECTOR_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+fn encode_packed_sector_record(
+    guild_id: [u8; 32],
+    sector: &PackedSector,
+) -> Result<(&'static str, Vec<u8>, Vec<u8>)> {
+    // Borrow the sector: serializing the tuple has the original struct's exact
+    // Postcard field layout without cloning the ciphertext or descriptor.
+    Ok((
+        "packed-sector",
+        packed_record_id(&guild_id, &sector.descriptor.id),
+        mb_core::canonical_bytes_bounded(&(1_u16, guild_id, sector), PACKED_SECTOR_RECORD_BYTES)?,
+    ))
+}
+
 fn load_packed_sector(
     control: &ControlStore,
     guild_id: &[u8; 32],
@@ -13798,7 +13797,11 @@ fn load_packed_sector(
 ) -> Result<Vec<u8>> {
     let record: PackedSectorRecord = decode_canonical(
         &control
-            .get_record("packed-sector", &packed_record_id(guild_id, sector_id))?
+            .get_record_bounded(
+                "packed-sector",
+                &packed_record_id(guild_id, sector_id),
+                PACKED_SECTOR_RECORD_BYTES,
+            )?
             .context("packed sector is unavailable")?,
     )?;
     if record.format_version != 1
@@ -18792,6 +18795,96 @@ pub(crate) mod tests {
             blob.anchor.remove().unwrap();
         }
         fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    fn streamed_packed_cache_preserves_bytes_and_rolls_back_late_sector_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([219; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let guild = [218; 32];
+        let profile = mb_core::PackingProfile {
+            format_version: 1,
+            sector_size: 64,
+            slot_size: 16,
+        };
+        let input = vec![7; 64];
+        let result = mb_core::pack_incremental(
+            profile,
+            None,
+            [2, 3]
+                .into_iter()
+                .map(|object| mb_core::PackingInput {
+                    owner: node.keys.node_id(),
+                    protected_root: [1; 32],
+                    object_id: [object; 32],
+                    source_commitment: Some(merkle_commit(&input).unwrap()),
+                    bytes: input.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert!(result.sectors.len() >= 2);
+        let first = packed_record_id(&guild, &result.sectors[0].descriptor.id);
+        let second = packed_record_id(&guild, &result.sectors[1].descriptor.id);
+        node.control
+            .put_record("packed-sector", &first, b"preserved prior cache")
+            .unwrap();
+        node.control.database_shell_statement(&format!("CREATE TEMP TRIGGER ignore_packed BEFORE INSERT ON protocol_records WHEN NEW.kind = 'packed-sector' AND NEW.record_id = X'{}' BEGIN SELECT RAISE(IGNORE); END", hex::encode(&second)), false).unwrap();
+        assert!(node.store_packing_result(guild, &result).is_err());
+        let mut update = PackingUpdate {
+            catalog: result.catalog.clone(),
+            changed_sectors: result.sectors.clone(),
+            metrics: result.metrics,
+        };
+        assert!(node.store_packing_update(guild, &update).is_err());
+        update.changed_sectors[1].bytes[0] ^= 1;
+        assert!(node.store_packing_update(guild, &update).is_err());
+        assert_eq!(
+            node.control
+                .get_record("packed-sector", &first)
+                .unwrap()
+                .unwrap(),
+            b"preserved prior cache"
+        );
+        assert!(
+            node.control
+                .get_record("packed-sector", &second)
+                .unwrap()
+                .is_none()
+        );
+        node.control
+            .database_shell_statement("DROP TRIGGER ignore_packed", false)
+            .unwrap();
+        node.store_packing_result(guild, &result).unwrap();
+        for sector in &result.sectors {
+            let encoded = node
+                .control
+                .get_record(
+                    "packed-sector",
+                    &packed_record_id(&guild, &sector.descriptor.id),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                encoded,
+                canonical_bytes(&PackedSectorRecord {
+                    format_version: 1,
+                    guild_id: guild,
+                    sector: sector.clone()
+                })
+                .unwrap()
+            );
+        }
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
+        for sector in &result.sectors {
+            assert_eq!(
+                node.sector_for_guild(&guild, &sector.descriptor.id)
+                    .unwrap(),
+                sector.bytes
+            );
+        }
     }
 
     #[test]

@@ -251,6 +251,7 @@ pub struct RangeSectorRef {
 pub struct InformationRoleV2 {
     pub owner: NodeId,
     /// The certified hard-domain claim at placement time.
+    #[serde(deserialize_with = "crate::bounded::failure_domain")]
     pub failure_domain: String,
     pub sector: RangeSectorRef,
 }
@@ -259,6 +260,7 @@ pub struct InformationRoleV2 {
 pub struct ParityRoleV2 {
     pub holder: NodeId,
     /// The certified hard-domain claim at placement time.
+    #[serde(deserialize_with = "crate::bounded::failure_domain")]
     pub failure_domain: String,
     pub row: u16,
     pub commitment: MerkleCommitment,
@@ -280,6 +282,7 @@ pub struct CodingGroupV2 {
     pub format_version: u16,
     pub guild_id: [u8; 32],
     pub profile: CodingProfile,
+    #[serde(deserialize_with = "crate::bounded::coding")]
     pub roles: Vec<ShardRoleV2>,
 }
 

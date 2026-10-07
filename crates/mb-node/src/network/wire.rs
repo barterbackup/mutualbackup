@@ -1178,6 +1178,26 @@ mod tests {
             .unwrap(),
             legacy
         );
+        // Both historical array witnesses and compact byte strings apply one
+        // aggregate budget before accepting a map-shaped CBOR manifest.
+        for version in [2, 3] {
+            let mut oversized = manifest.value.clone();
+            oversized.format_version = version;
+            oversized.information_bytes.as_mut().unwrap()[0]
+                .as_mut()
+                .unwrap()
+                .push(0);
+            let cbor = cbor4ii::serde::to_vec(Vec::new(), &oversized).unwrap();
+            assert!(cbor4ii::serde::from_slice::<CodingRootManifest>(&cbor).is_err());
+        }
+        let mut compact = manifest.value.clone();
+        compact.format_version = 1;
+        compact.information_bytes = None;
+        let encoded = cbor4ii::serde::to_vec(Vec::new(), &compact).unwrap();
+        assert_eq!(
+            cbor4ii::serde::from_slice::<CodingRootManifest>(&encoded).unwrap(),
+            compact
+        );
         let range_bytes = coding_parity_range_bytes(&signed_plan, &manifest).unwrap();
         assert!(range_bytes < profile.shard_size as usize);
         // Exercise the holder's actual durable range preconditions, including

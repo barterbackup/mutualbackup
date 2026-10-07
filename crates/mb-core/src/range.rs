@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeSeed;
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 pub const MERKLE_LEAF_SIZE: usize = 16;
@@ -23,8 +24,10 @@ impl MerkleCommitment {
 pub struct MerkleRangeProof {
     pub format_version: u16,
     pub start_leaf: u32,
+    #[serde(deserialize_with = "decode_leaves")]
     pub leaves: Vec<[u8; MERKLE_LEAF_SIZE]>,
     /// Siblings ordered from the proved subtree toward the root.
+    #[serde(deserialize_with = "decode_siblings")]
     pub siblings: Vec<[u8; 32]>,
 }
 
@@ -38,7 +41,20 @@ pub struct MerkleSubtreeProof {
     pub leaf_count: u32,
     pub subtree_root: [u8; 32],
     /// Siblings ordered from the proved subtree toward the root.
+    #[serde(deserialize_with = "decode_siblings")]
     pub siblings: Vec<[u8; 32]>,
+}
+
+fn decode_leaves<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<[u8; MERKLE_LEAF_SIZE]>, D::Error> {
+    crate::bounded::VecSeed::new(MAX_MERKLE_BYTES / MERKLE_LEAF_SIZE).deserialize(decoder)
+}
+pub(crate) fn decode_siblings<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<[u8; 32]>, D::Error> {
+    crate::bounded::VecSeed::new((MAX_MERKLE_BYTES / MERKLE_LEAF_SIZE).ilog2() as usize)
+        .deserialize(decoder)
 }
 
 #[derive(Debug, Error)]

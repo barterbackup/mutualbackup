@@ -1,4 +1,4 @@
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -112,7 +112,16 @@ pub struct PackedSectorDescriptor {
     pub sector_index: u32,
     pub flat_root: [u8; 32],
     pub commitment: MerkleCommitment,
+    #[serde(deserialize_with = "decode_packed_slots")]
     pub slots: Vec<PackedSlot>,
+}
+
+fn decode_packed_slots<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<PackedSlot>, D::Error> {
+    crate::bounded::VecSeed::new(MAX_PROFILE_SHARD_SIZE as usize / MERKLE_LEAF_SIZE)
+        .deserialize(decoder)
+}
+fn decode_packed_bytes<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
+    crate::bounded::VecSeed::new(MAX_PROFILE_SHARD_SIZE as usize).deserialize(decoder)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -597,6 +606,7 @@ impl PackedSectorDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackedSector {
     pub descriptor: PackedSectorDescriptor,
+    #[serde(deserialize_with = "decode_packed_bytes")]
     pub bytes: Vec<u8>,
 }
 

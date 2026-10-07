@@ -1,4 +1,4 @@
-use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, SerializeStruct, SerializeTuple};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -27,6 +27,7 @@ const MAX_FULL_ROOT_BINDING_BYTES: u64 = 512 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParityPlacementV2 {
     pub holder: NodeId,
+    #[serde(deserialize_with = "crate::bounded::failure_domain")]
     pub failure_domain: String,
     pub row: u16,
 }
@@ -36,7 +37,9 @@ pub struct CodingPlanGeometry {
     pub format_version: u16,
     pub guild_id: [u8; 32],
     pub profile: CodingProfile,
+    #[serde(deserialize_with = "crate::bounded::coding")]
     pub information: Vec<InformationRoleV2>,
+    #[serde(deserialize_with = "crate::bounded::coding")]
     pub parity: Vec<ParityPlacementV2>,
 }
 
@@ -201,7 +204,13 @@ impl<'de> Deserialize<'de> for CodingAttemptPlan {
                 let expires_at_unix_seconds = next_plan_field(&mut sequence, "expiry")?;
                 let information_roots = match format_version {
                     1 => None,
-                    2 | 3 => Some(next_plan_field(&mut sequence, "information roots")?),
+                    2 | 3 => Some(
+                        sequence
+                            .next_element_seed(crate::bounded::VecSeed::new(
+                                crate::MAX_CODING_SHARDS as usize,
+                            ))?
+                            .ok_or_else(|| serde::de::Error::missing_field("information roots"))?,
+                    ),
                     _ => return Err(serde::de::Error::custom("invalid coding plan version")),
                 };
                 Ok(CodingAttemptPlan {
@@ -369,35 +378,133 @@ impl Serialize for InformationByteStrings<'_> {
     }
 }
 
-#[derive(Deserialize)]
-struct InformationByteString(#[serde(deserialize_with = "deserialize_byte_string")] Vec<u8>);
-
-fn deserialize_byte_string<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<u8>, D::Error> {
-    struct BytesVisitor;
-    impl<'de> Visitor<'de> for BytesVisitor {
-        type Value = Vec<u8>;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an information byte string")
-        }
-        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
-            Ok(bytes.to_vec())
-        }
-        fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
-            Ok(bytes)
-        }
-    }
-    deserializer.deserialize_byte_buf(BytesVisitor)
+#[derive(Clone, Copy)]
+enum WitnessEncoding {
+    Sequence,
+    ByteString,
+    Any,
 }
 
-fn unwrap_information_byte_strings(
-    bytes: Vec<Option<InformationByteString>>,
-) -> Vec<Option<Vec<u8>>> {
-    bytes
-        .into_iter()
-        .map(|bytes| bytes.map(|bytes| bytes.0))
-        .collect()
+// Apply the existing 512 KiB witness budget to the entire nested collection,
+// including map-shaped legacy CBOR, before copying/decoding the next payload.
+struct WitnessSeed(WitnessEncoding);
+impl<'de> DeserializeSeed<'de> for WitnessSeed {
+    type Value = Vec<Option<Vec<u8>>>;
+    fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+        struct Witness(WitnessEncoding);
+        impl<'de> Visitor<'de> for Witness {
+            type Value = Vec<Option<Vec<u8>>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("bounded information witnesses")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                if seq
+                    .size_hint()
+                    .is_some_and(|count| count > crate::MAX_CODING_SHARDS as usize)
+                {
+                    return Err(serde::de::Error::custom("too many information witnesses"));
+                }
+                let mut remaining = MAX_FULL_ROOT_BINDING_BYTES as usize;
+                let mut values = Vec::new();
+                while values.len() < crate::MAX_CODING_SHARDS as usize {
+                    let Some(value) = seq.next_element_seed(OptionalWitness {
+                        encoding: self.0,
+                        remaining,
+                    })?
+                    else {
+                        return Ok(values);
+                    };
+                    remaining -= value.as_ref().map_or(0, Vec::len);
+                    values.push(value);
+                }
+                seq.next_element_seed(crate::bounded::Extra)?;
+                Ok(values)
+            }
+        }
+        decoder.deserialize_seq(Witness(self.0))
+    }
+}
+
+struct OptionalWitness {
+    encoding: WitnessEncoding,
+    remaining: usize,
+}
+impl<'de> DeserializeSeed<'de> for OptionalWitness {
+    type Value = Option<Vec<u8>>;
+    fn deserialize<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+        decoder.deserialize_option(self)
+    }
+}
+impl<'de> Visitor<'de> for OptionalWitness {
+    type Value = Option<Vec<u8>>;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an optional bounded information witness")
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_some<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+        struct Bytes(usize);
+        impl<'de> Visitor<'de> for Bytes {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "at most {} witness bytes", self.0)
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+                if bytes.len() > self.0 {
+                    return Err(E::custom("information witness exceeds aggregate budget"));
+                }
+                Ok(bytes.to_vec())
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+                if bytes.len() > self.0 {
+                    return Err(E::custom("information witness exceeds aggregate budget"));
+                }
+                Ok(bytes)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Vec<u8>, A::Error> {
+                crate::bounded::VecSeed::new(self.0)
+                    .deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+            }
+        }
+        let bytes = match self.encoding {
+            WitnessEncoding::Sequence => {
+                crate::bounded::VecSeed::new(self.remaining).deserialize(decoder)
+            }
+            WitnessEncoding::ByteString => decoder.deserialize_bytes(Bytes(self.remaining)),
+            WitnessEncoding::Any => decoder.deserialize_any(Bytes(self.remaining)),
+        }?;
+        Ok(Some(bytes))
+    }
+}
+
+type InformationWitnesses = Vec<Option<Vec<u8>>>;
+
+fn deserialize_optional_witness<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<InformationWitnesses>, D::Error> {
+    struct Optional;
+    impl<'de> Visitor<'de> for Optional {
+        type Value = Option<Vec<Option<Vec<u8>>>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("optional information witnesses")
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: Deserializer<'de>>(self, decoder: D) -> Result<Self::Value, D::Error> {
+            WitnessSeed(WitnessEncoding::Any)
+                .deserialize(decoder)
+                .map(Some)
+        }
+    }
+    decoder.deserialize_option(Optional)
 }
 
 impl Serialize for CodingRootManifest {
@@ -453,11 +560,15 @@ impl<'de> Deserialize<'de> for CodingRootManifest {
                 let group = next_plan_field(&mut sequence, "group")?;
                 let information_bytes = match format_version {
                     1 => None,
-                    2 => Some(next_plan_field(&mut sequence, "information bytes")?),
-                    3 => Some(unwrap_information_byte_strings(next_plan_field(
-                        &mut sequence,
-                        "information byte strings",
-                    )?)),
+                    2 | 3 => Some(
+                        sequence
+                            .next_element_seed(WitnessSeed(if format_version == 2 {
+                                WitnessEncoding::Sequence
+                            } else {
+                                WitnessEncoding::ByteString
+                            }))?
+                            .ok_or_else(|| serde::de::Error::missing_field("information bytes"))?,
+                    ),
                     _ => return Err(serde::de::Error::custom("invalid coding manifest version")),
                 };
                 Ok(CodingRootManifest {
@@ -474,18 +585,13 @@ impl<'de> Deserialize<'de> for CodingRootManifest {
                 A: MapAccess<'de>,
             {
                 #[derive(Deserialize)]
-                #[serde(untagged)]
-                enum WireBytes {
-                    ByteString(InformationByteString),
-                    Sequence(Vec<u8>),
-                }
-                #[derive(Deserialize)]
                 struct Fields {
                     format_version: u16,
                     attempt_id: [u8; 16],
                     plan_hash: [u8; 32],
                     group: CodingGroupV2,
-                    information_bytes: Option<Vec<Option<WireBytes>>>,
+                    #[serde(default, deserialize_with = "deserialize_optional_witness")]
+                    information_bytes: Option<Vec<Option<Vec<u8>>>>,
                 }
                 let fields =
                     Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
@@ -500,17 +606,7 @@ impl<'de> Deserialize<'de> for CodingRootManifest {
                     attempt_id: fields.attempt_id,
                     plan_hash: fields.plan_hash,
                     group: fields.group,
-                    information_bytes: fields.information_bytes.map(|bytes| {
-                        bytes
-                            .into_iter()
-                            .map(|bytes| {
-                                bytes.map(|bytes| match bytes {
-                                    WireBytes::ByteString(bytes) => bytes.0,
-                                    WireBytes::Sequence(bytes) => bytes,
-                                })
-                            })
-                            .collect()
-                    }),
+                    information_bytes: fields.information_bytes,
                 })
             }
         }
@@ -612,7 +708,34 @@ pub struct CodingShardOpening {
     pub challenge: [u8; 32],
     pub shard_index: u16,
     pub commitment: MerkleCommitment,
+    #[serde(deserialize_with = "deserialize_sample_proof")]
     pub proof: MerkleRangeProof,
+}
+
+fn deserialize_sample_leaves<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<[u8; MERKLE_LEAF_SIZE]>, D::Error> {
+    crate::bounded::VecSeed::new(1).deserialize(decoder)
+}
+fn deserialize_sample_proof<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<MerkleRangeProof, D::Error> {
+    #[derive(Deserialize)]
+    struct Sample {
+        format_version: u16,
+        start_leaf: u32,
+        #[serde(deserialize_with = "deserialize_sample_leaves")]
+        leaves: Vec<[u8; MERKLE_LEAF_SIZE]>,
+        #[serde(deserialize_with = "crate::range::decode_siblings")]
+        siblings: Vec<[u8; 32]>,
+    }
+    let sample = Sample::deserialize(decoder)?;
+    Ok(MerkleRangeProof {
+        format_version: sample.format_version,
+        start_leaf: sample.start_leaf,
+        leaves: sample.leaves,
+        siblings: sample.siblings,
+    })
 }
 
 /// All evidence needed for any checkpoint signer to replay the verifier's
@@ -627,8 +750,10 @@ pub struct CodingVerificationTranscript {
     pub plan: SignedRecord<CodingAttemptPlan>,
     pub manifest: SignedRecord<CodingRootManifest>,
     pub challenge_commitment: SignedRecord<CodingChallengeCommitment>,
+    #[serde(deserialize_with = "crate::bounded::coding")]
     pub staged_receipts: Vec<SignedRecord<StagedStorageReceipt>>,
     pub challenge_reveal: SignedRecord<CodingChallengeReveal>,
+    #[serde(deserialize_with = "crate::bounded::coding")]
     pub openings: Vec<SignedRecord<CodingShardOpening>>,
 }
 
@@ -1044,6 +1169,84 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn bounded_coding_records_preserve_signatures_and_reject_excess_evidence() {
+        let (signed, _, _) = signed_transcript();
+        let encoded = canonical_bytes(&signed).unwrap();
+        let decoded: SignedRecord<CodingVerificationTranscript> =
+            crate::decode_canonical(&encoded).unwrap();
+        assert_eq!(canonical_bytes(&decoded).unwrap(), encoded);
+        decoded.verify(CODING_TRANSCRIPT_DOMAIN).unwrap();
+        replay_coding_transcript(&decoded).unwrap();
+        for receipts in [true, false] {
+            let mut value = signed.value.clone();
+            if receipts {
+                value.staged_receipts =
+                    vec![value.staged_receipts[0].clone(); crate::MAX_CODING_SHARDS as usize + 1];
+            } else {
+                value.openings =
+                    vec![value.openings[0].clone(); crate::MAX_CODING_SHARDS as usize + 1];
+            }
+            assert!(
+                crate::decode_canonical::<CodingVerificationTranscript>(
+                    &canonical_bytes(&value).unwrap()
+                )
+                .is_err()
+            );
+        }
+        let mut opening = signed.value.openings[0].value.clone();
+        opening.proof.leaves = vec![[0; MERKLE_LEAF_SIZE]; 2];
+        assert!(
+            crate::decode_canonical::<CodingShardOpening>(&canonical_bytes(&opening).unwrap())
+                .is_err()
+        );
+        let mut geometry = signed.value.plan.value.geometry;
+        let record = geometry.information[0].clone();
+        geometry.information = vec![record; crate::MAX_CODING_SHARDS as usize + 1];
+        assert!(
+            crate::decode_canonical::<CodingPlanGeometry>(&canonical_bytes(&geometry).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn information_witness_decode_enforces_the_aggregate_budget_for_both_versions() {
+        let (signed, _, _) = signed_transcript();
+        let group = signed.value.manifest.value.group;
+        for version in [2, 3] {
+            let mut manifest = CodingRootManifest {
+                format_version: version,
+                attempt_id: [1; 16],
+                plan_hash: [2; 32],
+                group: group.clone(),
+                information_bytes: Some(vec![
+                    Some(vec![
+                        7;
+                        MAX_FULL_ROOT_BINDING_BYTES as usize / 2
+                    ]);
+                    2
+                ]),
+            };
+            let encoded = canonical_bytes(&manifest).unwrap();
+            let decoded: CodingRootManifest = crate::decode_canonical(&encoded).unwrap();
+            assert_eq!(decoded, manifest);
+            assert_eq!(canonical_bytes(&decoded).unwrap(), encoded);
+            manifest.information_bytes.as_mut().unwrap()[1]
+                .as_mut()
+                .unwrap()
+                .push(7);
+            assert!(
+                crate::decode_canonical::<CodingRootManifest>(&canonical_bytes(&manifest).unwrap())
+                    .is_err()
+            );
+            manifest.information_bytes = Some(vec![None; crate::MAX_CODING_SHARDS as usize + 1]);
+            assert!(
+                crate::decode_canonical::<CodingRootManifest>(&canonical_bytes(&manifest).unwrap())
+                    .is_err()
+            );
+        }
+    }
 
     fn signed_transcript() -> (
         SignedRecord<CodingVerificationTranscript>,

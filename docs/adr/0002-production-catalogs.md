@@ -1675,3 +1675,72 @@ Operational retry/backoff, remaining standalone
 consumers, complete physical/filesystem lifecycle and platform qualification,
 and the real 1 TiB dataset/history gate remain open. This increment does not
 close R3 or the broader M6 production gates.
+
+### Bounded compatibility records and streamed packed-cache writes (2026-10-07)
+
+Existing coding records now bound collections to the supported 64-shard profile.
+When the decoder supplies a count hint, oversized declarations are rejected
+before allocating or reading their elements. This covers plan
+information/parity roles, root vectors, group roles, transcript storage receipts
+and sampled openings. Failure domains are bounded to 256 UTF-8 bytes. Sampled
+openings admit at most one 16-byte leaf. General range proofs retain the full
+4 MiB geometry (262,144 leaves) and at most 18 sibling hashes; packed-sector
+slots and payloads retain the existing 4 MiB sector/16-byte minimum-slot bounds.
+The collection visitor caps initial capacity independently of the supplied size
+hint and rejects an extra element in unknown-length sequences before decoding
+its nested payload. Postcard withholds a count hint when a truncated input has
+fewer remaining bytes than declared elements; decoding still has bounded initial
+capacity and a bounded element count. These bounds preserve existing valid
+shapes, wire versions and signed identities.
+
+Full-information witnesses apply the existing 512 KiB plan budget across the
+entire nested collection, reducing the remaining budget before each following
+payload is decoded/copied. Both historical byte arrays and compact byte strings
+remain supported in Postcard and self-describing CBOR maps. Map decoding no
+longer constructs an intermediate untagged representation for each witness.
+Version-one maps still accept the absent optional witness field. Semantic plan,
+proof, authority and signature verification remain the consumers' responsibility.
+
+The local packed-sector cache now borrows each sector while encoding and emits
+one owned record at a time into a single SQL transaction. It no longer clones
+all payloads and descriptors or constructs a second batch-sized encoding vector.
+All supplied changed sectors are authenticated before the writer is acquired.
+A producer error or ignored SQL write rolls back the preceding cache writes;
+the ordinary batch helper uses the same affected-row checks. The iterator may
+only perform bounded local encoding while holding the writer, without external
+I/O or re-entering that connection. Atomicity and existing cache record bytes
+are preserved across restart.
+
+Packed-cache encoders and SQL reads use a conservative 64 MiB per-record cap.
+The largest existing shape is a 4 MiB payload plus 262,144 fixed-field slots;
+its Postcard record fits this cap including worst-case varints and the enclosing
+record. This local cache bound does not raise any private metadata, frame,
+checkpoint or dataset admission limit.
+
+Validation: all 114 core, 140 ordinary store and 92 ordinary Git tests pass
+(24 store and 64 Git provisioned cases remain ignored). The eight transport
+codec tests, two existing packed-cache cases, the new cache atomicity/reopen
+fixture and the retry-input pin/cleanup fixture pass. Coverage includes
+oversized declarations and unknown-length collections, exact/over-budget
+witnesses in both versions, preserved signed bytes and transcript replay,
+late producer/SQL-ignore rollback, authentication before cache writes and exact
+historical cache bytes after reopen. The final locked workspace/all-targets
+build, formatting/diff checks and strict Clippy pass.
+
+The provisioned five-peer native Git packed-checkpoint fixture passes on
+disposable Btrfs in 574.39 seconds. It verifies exact Git history and bytes,
+checkpoint grace retention, obsolete group retirement, expired packed-cache
+and READY-shard deletion, physical history reclamation and two seed-only
+recoveries after complete owner loss. The second recovery follows that cleanup
+and erases the ordinary Git export too. Recorded source and test-binary hashes
+match after execution. The owned 2 GiB image, mount, loop device and fixture
+were removed, with mount absence and loop detachment independently verified.
+This is a single in-process five-peer fixture; no full Node suite,
+five-daemon topology, other-platform or real 1 TiB qualification ran here.
+
+The packing result, flat catalog and checkpoint still materialize complete
+collections. Their paged replacements, quota reservations, generation floors,
+normal capture/restore/retention and seed-only migration, enclosing R2 admission
+and real 1 TiB dataset/history qualification remain open. Streaming the extra
+cache encoding alone does not demonstrate bounded whole-backup memory or close
+R2/R3.

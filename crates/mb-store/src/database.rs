@@ -306,17 +306,47 @@ impl ControlStore {
         &mut self,
         records: &[(String, Vec<u8>, Vec<u8>)],
     ) -> Result<(), DatabaseError> {
-        let transaction = self.connection.transaction()?;
+        self.put_records_iter(
+            records
+                .iter()
+                .map(|(kind, id, bytes)| Ok((kind.as_str(), id.as_slice(), bytes.as_slice()))),
+        )
+    }
+
+    /// Encode/produce one record at a time while retaining all-or-nothing
+    /// publication. The iterator must perform bounded local work, without
+    /// external I/O or operations on this connection while it owns the writer.
+    /// Producer errors and ignored writes roll back every preceding record.
+    pub fn put_records_iter<E, K, I, B>(
+        &mut self,
+        records: impl IntoIterator<Item = Result<(K, I, B), E>>,
+    ) -> Result<(), E>
+    where
+        E: From<DatabaseError>,
+        K: AsRef<str>,
+        I: AsRef<[u8]>,
+        B: AsRef<[u8]>,
+    {
+        let transaction = self.connection.transaction().map_err(DatabaseError::from)?;
         {
-            let mut statement = transaction.prepare_cached(
-                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+            let mut statement = transaction
+                .prepare_cached(
+                    "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
                  ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
-            )?;
-            for (kind, record_id, bytes) in records {
-                statement.execute(params![kind, record_id, bytes])?;
+                )
+                .map_err(DatabaseError::from)?;
+            for record in records {
+                let (kind, id, bytes) = record?;
+                if statement
+                    .execute(params![kind.as_ref(), id.as_ref(), bytes.as_ref()])
+                    .map_err(DatabaseError::from)?
+                    != 1
+                {
+                    return Err(DatabaseError::Conflict.into());
+                }
             }
         }
-        transaction.commit()?;
+        transaction.commit().map_err(DatabaseError::from)?;
         Ok(())
     }
 
@@ -4138,6 +4168,65 @@ fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streamed_records_are_lazy_atomic_and_reject_ignored_writes() {
+        use std::cell::Cell;
+        let temp = tempfile::tempdir().unwrap();
+        let key = [73; 32];
+        let path = temp.path().join("control.db");
+        let mut store = super::ControlStore::open_with_key(&path, &key).unwrap();
+        store.put_record("stream", b"prior", b"preserved").unwrap();
+        let produced = Cell::new(0);
+        let records = (0_u8..4).map(|index| -> anyhow::Result<_> {
+            produced.set(produced.get() + 1);
+            if index == 2 {
+                anyhow::bail!("late producer failure");
+            }
+            Ok((
+                "stream",
+                if index == 0 {
+                    b"prior".to_vec()
+                } else {
+                    vec![index]
+                },
+                b"replacement".to_vec(),
+            ))
+        });
+        assert!(store.put_records_iter(records).is_err());
+        assert_eq!(produced.get(), 3);
+        assert_eq!(
+            store.get_record("stream", b"prior").unwrap().unwrap(),
+            b"preserved"
+        );
+        assert!(store.get_record("stream", &[1]).unwrap().is_none());
+        store.connection.execute_batch("CREATE TEMP TRIGGER ignore_stream BEFORE INSERT ON protocol_records WHEN NEW.kind = 'stream' AND NEW.record_id = X'01' BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        let records = vec![
+            (
+                "stream".to_owned(),
+                b"prior".to_vec(),
+                b"replacement".to_vec(),
+            ),
+            ("stream".to_owned(), vec![1], b"late".to_vec()),
+        ];
+        assert!(store.put_records(&records).is_err());
+        assert_eq!(
+            store.get_record("stream", b"prior").unwrap().unwrap(),
+            b"preserved"
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER ignore_stream")
+            .unwrap();
+        store.put_records(&records).unwrap();
+        drop(store);
+        let store = super::ControlStore::open_existing_read_only_with_key(path, &key).unwrap();
+        assert_eq!(
+            store.get_record("stream", b"prior").unwrap().unwrap(),
+            b"replacement"
+        );
+        assert_eq!(store.get_record("stream", &[1]).unwrap().unwrap(), b"late");
+    }
+
     use std::io::Read;
 
     use mb_core::Seed;

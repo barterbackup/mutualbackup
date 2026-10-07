@@ -1371,6 +1371,15 @@ recorded in [the production catalog design](docs/adr/0002-production-catalogs.md
 The primitive is qualified independently; it does not change existing runtime
 admission limits or close R2/R3.
 
+Existing per-attempt coding and packed-sector decoders now bound collections
+to their supported geometry, including the aggregate full-information witness
+budget. Packed-cache writes borrow and encode one sector per SQL iteration in
+one atomic transaction, with bounded local cache reads. Historical signed and
+cache encodings remain unchanged. These compatibility safeguards remove an
+extra batch of encoded cache records; complete flat packing/catalog collections
+still require paged replacements, quotas and end-to-end consumer migration.
+Validation is recorded in ADR 0002; the 1 TiB qualification remains open.
+
 The format-8 migration codec now authenticates a bounded public source root and
 one encrypted private root descriptor with distinct owner/writer signatures.
 The private descriptor carries typed native and optional Git roots without
