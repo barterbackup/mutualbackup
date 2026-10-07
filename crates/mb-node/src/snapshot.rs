@@ -3169,6 +3169,39 @@ where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
     validate_restore_revision(keys, guild_id, revision)?;
+    restore_from_builder(
+        control,
+        guild_id,
+        revision.value.revision_id,
+        2,
+        target,
+        |staging, _| {
+            build_revision_restore(
+                keys,
+                guild_id,
+                revision,
+                staging,
+                &mut load_ciphertext,
+                true,
+            )
+        },
+    )
+}
+
+/// Shared no-replace publication and inode-bound replay. Version 3 reserves
+/// paged native restores; version 2 keeps ordinary legacy job identities.
+pub(crate) fn restore_from_builder(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    job_version: u16,
+    target: &Path,
+    build: impl FnOnce(&PinnedDirectory, [u8; 32]) -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        matches!(job_version, 2 | 3),
+        "unsupported restore job version"
+    );
     let _operation = lock_restore_operations(control)?;
     let (target, target_name, parent) = pinned_restore_parent(target)?;
     let parent_identity = parent.identity()?;
@@ -3182,7 +3215,8 @@ where
             &target,
             &parent,
             guild_id,
-            revision.value.revision_id,
+            revision_id,
+            job_version,
         )? {
             break reserved;
         }
@@ -3190,9 +3224,9 @@ where
             bail!("restore target already exists: {}", target.display());
         }
         let job = RestoreJob {
-            format_version: 2,
+            format_version: job_version,
             guild_id,
-            revision_id: revision.value.revision_id,
+            revision_id,
             target: target.clone(),
             parent_identity,
             staging_name: format!(".mutualbackup-restore-{}", Uuid::new_v4()),
@@ -3208,13 +3242,20 @@ where
                 job,
             };
         }
+        ensure!(
+            control
+                .get_record_bounded(RESTORE_JOB_KIND, &record_id, V1_SECTOR_SIZE)?
+                .is_some(),
+            "restore target reservation was not stored"
+        );
         // A non-cooperating writer changed the journal despite the operation
         // lock. Reload the durable owner and fail closed below.
     };
     validate_reserved_restore_job(
         &job,
         guild_id,
-        revision.value.revision_id,
+        revision_id,
+        job_version,
         &target,
         parent_identity,
     )?;
@@ -3285,14 +3326,7 @@ where
         }
     }
 
-    build_revision_restore(
-        keys,
-        guild_id,
-        revision,
-        &staging,
-        &mut load_ciphertext,
-        true,
-    )?;
+    build(&staging, record_id)?;
     if parent.entry_identity(&job.staging_name, true)? != Some(staged_identity) {
         bail!("restore staging directory changed during construction");
     }
@@ -3309,6 +3343,16 @@ pub(crate) fn resume_restore_publication(
     target: &Path,
 ) -> Result<bool> {
     validate_restore_revision(keys, guild_id, revision)?;
+    resume_restore_from_identity(control, guild_id, revision.value.revision_id, 2, target)
+}
+
+pub(crate) fn resume_restore_from_identity(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    job_version: u16,
+    target: &Path,
+) -> Result<bool> {
     let _operation = lock_restore_operations(control)?;
     let (target, target_name, parent) = pinned_restore_parent(target)?;
     let parent_identity = parent.identity()?;
@@ -3321,7 +3365,8 @@ pub(crate) fn resume_restore_publication(
         &target,
         &parent,
         guild_id,
-        revision.value.revision_id,
+        revision_id,
+        job_version,
     )?
     else {
         return Ok(false);
@@ -3329,7 +3374,8 @@ pub(crate) fn resume_restore_publication(
     validate_reserved_restore_job(
         &job,
         guild_id,
-        revision.value.revision_id,
+        revision_id,
+        job_version,
         &target,
         parent_identity,
     )?;
@@ -3370,10 +3416,12 @@ fn validate_reserved_restore_job(
     job: &RestoreJob,
     guild_id: [u8; 32],
     revision_id: Uuid,
+    job_version: u16,
     target: &Path,
     parent_identity: NativeFileId,
 ) -> Result<()> {
-    if job.guild_id != guild_id
+    if job.format_version != job_version
+        || job.guild_id != guild_id
         || job.revision_id != revision_id
         || job.target != target
         || job.parent_identity != parent_identity
@@ -3422,21 +3470,32 @@ fn reserved_restore_job(
     parent: &PinnedDirectory,
     guild_id: [u8; 32],
     revision_id: Uuid,
+    job_version: u16,
 ) -> Result<Option<ReservedRestoreJob>> {
     let target_record_id = restore_job_record_id(target)?;
     for _ in 0..2 {
         let mut matching = Vec::new();
-        for (record_id, bytes) in control.records(RESTORE_JOB_KIND)? {
-            let job: RestoreJob = decode_canonical(&bytes)?;
-            match job.format_version {
-                1 if record_id.as_slice() == job.revision_id.as_bytes() => {}
-                2 if record_id.as_slice() == restore_job_record_id(&job.target)? => {}
-                _ => bail!("unfinished durable restore job is inconsistent"),
-            }
-            if job.target == target {
-                matching.push((record_id, bytes, job));
-            }
-        }
+        control.for_each_record_bounded(
+            RESTORE_JOB_KIND,
+            32,
+            V1_SECTOR_SIZE,
+            |record_id, bytes| {
+                let job: RestoreJob = decode_canonical(bytes)?;
+                match job.format_version {
+                    1 if record_id == job.revision_id.as_bytes() => {}
+                    2 | 3 if record_id == restore_job_record_id(&job.target)? => {}
+                    _ => bail!("unfinished durable restore job is inconsistent"),
+                }
+                if job.target == target {
+                    ensure!(
+                        job_version != 3 || job.format_version == 3,
+                        "paged restore target is reserved by a legacy restore"
+                    );
+                    matching.push((record_id.to_vec(), bytes.to_vec(), job));
+                }
+                Ok(true)
+            },
+        )?;
         if matching.len() > 1 {
             return reconcile_legacy_restore_jobs(
                 control,
@@ -3451,7 +3510,7 @@ fn reserved_restore_job(
         let Some((record_id, bytes, mut job)) = matching.pop() else {
             return Ok(None);
         };
-        if job.format_version == 2 {
+        if matches!(job.format_version, 2 | 3) {
             return Ok(Some(ReservedRestoreJob {
                 record_id: target_record_id,
                 bytes,
@@ -4403,7 +4462,7 @@ fn open_expected_restore_directory(
     Ok(directory)
 }
 
-fn native_id_for_file(root: &PinnedDirectory, file: &File) -> Result<NativeFileId> {
+pub(crate) fn native_id_for_file(root: &PinnedDirectory, file: &File) -> Result<NativeFileId> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -4489,7 +4548,7 @@ fn safe_relative_path(relative: &str) -> Result<PathBuf> {
     Ok(relative.to_path_buf())
 }
 
-fn set_metadata_durable(
+pub(crate) fn set_metadata_durable(
     file: &File,
     mode: u32,
     modified_secs: i64,
@@ -4531,6 +4590,47 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paged_and_legacy_restore_reservations_cannot_adopt_each_others_identity() {
+        for version in [2, 3] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let target = temp.path().join("restored");
+            let revision = Uuid::new_v4();
+            assert!(
+                restore_from_builder(&store, [73; 32], revision, version, &target, |root, _| {
+                    root.create_child_file("partial")?;
+                    anyhow::bail!("injected construction failure")
+                })
+                .is_err()
+            );
+            drop(store);
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            assert!(
+                restore_from_builder(
+                    &store,
+                    [73; 32],
+                    revision,
+                    if version == 2 { 3 } else { 2 },
+                    &target,
+                    |_, _| panic!("conflicting restore must not build")
+                )
+                .is_err()
+            );
+            assert!(!target.exists());
+            restore_from_builder(&store, [73; 32], revision, version, &target, |root, _| {
+                root.create_child_file("complete")?.sync_all()?;
+                root.sync_all()?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(target.join("complete").is_file());
+            assert!(!target.join("partial").exists());
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

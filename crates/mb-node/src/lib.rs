@@ -16,6 +16,8 @@ mod paged_data;
 mod paged_legacy;
 mod paged_migration;
 #[cfg(target_os = "linux")]
+mod paged_restore;
+#[cfg(target_os = "linux")]
 pub use paged_legacy::PagedPrivateStream;
 pub use paged_migration::RetainedLegacyMigration;
 mod paged_revision;

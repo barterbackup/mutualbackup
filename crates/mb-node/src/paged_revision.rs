@@ -611,6 +611,8 @@ impl PagedPrivateMetadata {
 mod tests {
     use std::collections::HashMap;
 
+    #[cfg(target_os = "linux")]
+    use anyhow::Context;
     use ed25519_dalek::SigningKey;
     use mb_core::{
         CatalogFileBuilder, CatalogFileRecipeBuilder, CatalogFileStat, CatalogPageRef,
@@ -884,6 +886,171 @@ mod tests {
             sources,
         };
         (private, body.sign(&writer, &keys()).unwrap(), intents)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paged_native_restore_streams_raw_names_sparse_files_forward_links_and_directory_metadata() {
+        use std::os::unix::{
+            ffi::OsStringExt,
+            fs::{MetadataExt, PermissionsExt},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+        let (private, signed, intents) = owned_fixture_with_directories(&store, true, 0, 450);
+        private
+            .publish_local_catalog(&store, &keys(), &signed, &writer_fence(&signed), intents)
+            .unwrap();
+        let target = temp.path().join("restored");
+        let mut reads = 0;
+        PagedPrivateMetadata::restore_retained_native_catalog(
+            &store,
+            &keys(),
+            signed.value.revision_id,
+            scope(),
+            &target,
+            |id| {
+                reads += 1;
+                Ok(encrypted_sector(&keys().guild_data_key(&[73; 32]), *id, b"raw\r\nbytes\0")?.1)
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 1);
+        assert_eq!(
+            target.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(target.metadata().unwrap().mtime(), 123);
+        assert_eq!(target.metadata().unwrap().mtime_nsec(), 456);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let raw = target.join(std::ffi::OsString::from_vec(b"payload-\xff".to_vec()));
+        let mut expected = vec![0; 4096];
+        expected.extend(b"raw\r\nbytes\0");
+        assert_eq!(std::fs::read(&raw).unwrap(), expected);
+        assert_eq!(
+            raw.metadata().unwrap().ino(),
+            target.join("alias").metadata().unwrap().ino()
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 452);
+        let directory = target.join(format!("z-00000000-{}", "d".repeat(128)));
+        let stat = directory.metadata().unwrap();
+        assert_eq!(stat.permissions().mode() & 0o777, 0o640);
+        assert_eq!((stat.mtime(), stat.mtime_nsec()), (123, 456));
+        assert!(store.records("restore-job").unwrap().is_empty());
+        assert!(
+            !store
+                .has_records_with_kind_prefix("paged-native-restore-")
+                .unwrap()
+        );
+        assert!(
+            PagedPrivateMetadata::restore_retained_native_catalog(
+                &store,
+                &keys(),
+                signed.value.revision_id,
+                scope(),
+                &target,
+                |_| anyhow::bail!("existing target must not fetch data")
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(raw).unwrap(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paged_native_restore_reopens_failures_and_finishes_renamed_tree_after_source_retirement() {
+        use std::os::unix::fs::PermissionsExt;
+        for fault in 0..5 {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (private, signed, intents) = owned_fixture(&store, false, 0);
+            private
+                .publish_local_catalog(&store, &keys(), &signed, &writer_fence(&signed), intents)
+                .unwrap();
+            let target = temp.path().join("restored");
+            if fault == 1 {
+                store.database_shell_statement("CREATE TEMP TRIGGER ignore_restore_index BEFORE INSERT ON protocol_records WHEN NEW.kind LIKE 'paged-native-restore-entry-v1/%' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+            }
+            if fault == 2 {
+                store.database_shell_statement("CREATE TEMP TRIGGER ignore_restore_job BEFORE INSERT ON protocol_records WHEN NEW.kind = 'restore-job' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+            }
+            if fault == 3 {
+                crate::snapshot::interrupt_next_restore_after_rename();
+            }
+            let result =
+                PagedPrivateMetadata::restore_retained_native_catalog(
+                    &store,
+                    &keys(),
+                    signed.value.revision_id,
+                    scope(),
+                    &target,
+                    |id| {
+                        if fault == 0 {
+                            return Ok(vec![0; V1_SECTOR_SIZE]);
+                        }
+                        if fault == 4 {
+                            let staging = std::fs::read_dir(temp.path())?
+                                .find_map(|entry| {
+                                    let entry = entry.ok()?;
+                                    entry
+                                        .file_name()
+                                        .to_str()?
+                                        .starts_with(".mutualbackup-restore-")
+                                        .then(|| entry.path())
+                                })
+                                .context("missing staged restore")?;
+                            std::fs::write(staging.join("untracked"), b"must not publish")?;
+                        }
+                        Ok(encrypted_sector(
+                            &keys().guild_data_key(&[73; 32]),
+                            *id,
+                            b"raw\r\nbytes\0",
+                        )?
+                        .1)
+                    },
+                );
+            assert!(result.is_err(), "fault {fault}");
+            assert_eq!(target.exists(), fault == 3);
+            if fault == 2 {
+                assert!(store.records("restore-job").unwrap().is_empty());
+            }
+            if fault == 3 {
+                store
+                    .cancel_paged_revision_catalog(signed.value.revision_id)
+                    .unwrap();
+            }
+            drop(store);
+            let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            PagedPrivateMetadata::restore_retained_native_catalog(
+                &store,
+                &keys(),
+                signed.value.revision_id,
+                scope(),
+                &target,
+                |id| {
+                    ensure!(fault != 3, "publishing replay must not fetch retired data");
+                    Ok(
+                        encrypted_sector(
+                            &keys().guild_data_key(&[73; 32]),
+                            *id,
+                            b"raw\r\nbytes\0",
+                        )?
+                        .1,
+                    )
+                },
+            )
+            .unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+            assert!(target.join("alias").is_file());
+            assert!(!target.join("untracked").exists());
+            assert!(store.records("restore-job").unwrap().is_empty());
+            assert!(
+                !store
+                    .has_records_with_kind_prefix("paged-native-restore-")
+                    .unwrap()
+            );
+        }
     }
 
     fn writer_fence(signed: &SignedRecord<PagedUserRevision>) -> WriterFence {

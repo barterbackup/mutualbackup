@@ -12762,6 +12762,32 @@ impl Node {
         Ok((publishers, required))
     }
 
+    /// Restore the native tree of an explicitly retained local paged revision.
+    /// Git history and remote paged recovery require their remaining migrations.
+    #[cfg(target_os = "linux")]
+    pub fn restore_retained_native_catalog(
+        &mut self,
+        revision_id: Uuid,
+        target: &Path,
+    ) -> Result<()> {
+        let snapshot = self
+            .control
+            .paged_revision_catalog(revision_id)?
+            .context("retained paged revision is unavailable")?;
+        let scope = snapshot.bundle.scope;
+        let mb_core::CatalogScope::Dataset { guild_id, .. } = scope else {
+            anyhow::bail!("retained native restore requires dataset scope");
+        };
+        crate::PagedPrivateMetadata::restore_retained_native_catalog(
+            &self.control,
+            &self.keys,
+            revision_id,
+            scope,
+            target,
+            |sector| self.sector_for_guild(&guild_id, sector),
+        )
+    }
+
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
         let installed = self
             .installed_guild()?
@@ -17541,6 +17567,101 @@ pub(crate) mod tests {
             node.prepared_revision_bytes(guild, legacy.value.revision_id)
                 .unwrap(),
             bytes
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn native_capture_migrates_and_restores_retained_paged_sparse_tree() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root =
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").expect("provisioned Btrfs root");
+        let temp = tempfile::tempdir_in(root).unwrap();
+        let seed = Seed::from_bytes([227; 32]);
+        let state = temp.path().join("node");
+        let mut node = Node::open(&state, seed.clone()).unwrap();
+        let certified = install_public_restore_fixture(&mut node, &seed);
+        let guild = certified.value.guild_id;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        node.control
+            .put_record(
+                "writer-incarnation",
+                &guild,
+                &canonical_bytes(&LocalWriterIncarnation {
+                    format_version: 1,
+                    epoch: 1,
+                    public_key: signing.verifying_key().to_bytes(),
+                    secret_key: signing.to_bytes(),
+                    base_checkpoint: Some(
+                        node.current_checkpoint(guild)
+                            .unwrap()
+                            .unwrap()
+                            .hash()
+                            .unwrap(),
+                    ),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("nested/deeper")).unwrap();
+        let dense = b"exact\r\n\0native bytes".repeat(32_000);
+        std::fs::write(source.join("nested/dense"), &dense).unwrap();
+        std::fs::hard_link(source.join("nested/dense"), source.join("linked")).unwrap();
+        let length = 1_u64 << 40;
+        let mut sparse = std::fs::File::create(source.join("nested/deeper/sparse")).unwrap();
+        sparse.set_len(length).unwrap();
+        sparse.seek(SeekFrom::Start(length - 4096)).unwrap();
+        sparse.write_all(b"tail\r\n\0").unwrap();
+        sparse.sync_all().unwrap();
+        drop(sparse);
+        for (path, mode, seconds) in [
+            (source.join("nested"), 0o550, 1_700_000_001),
+            (source.join("nested/deeper"), 0o500, 1_700_000_002),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(seconds, 123))
+                .unwrap();
+        }
+        let protected = node.add_protected_root(&source).unwrap();
+        let legacy = node
+            .prepare_revision(guild, protected.root_id, &source, 1, None)
+            .unwrap();
+        std::fs::write(source.join("nested/dense"), b"changed working bytes").unwrap();
+        let operation = Uuid::new_v4();
+        node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, operation)
+            .unwrap();
+        drop(node);
+        let mut node = Node::open(&state, seed).unwrap();
+        let target = temp.path().join("restored");
+        node.restore_retained_native_catalog(operation, &target)
+            .unwrap();
+        assert_eq!(std::fs::read(target.join("nested/dense")).unwrap(), dense);
+        assert_eq!(
+            target.join("linked").metadata().unwrap().ino(),
+            target.join("nested/dense").metadata().unwrap().ino()
+        );
+        let mut sparse = std::fs::File::open(target.join("nested/deeper/sparse")).unwrap();
+        assert_eq!(sparse.metadata().unwrap().len(), length);
+        assert!(sparse.metadata().unwrap().blocks() * 512 < 1024 * 1024);
+        sparse.seek(SeekFrom::Start(length - 4096)).unwrap();
+        let mut tail = [0; 7];
+        sparse.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"tail\r\n\0");
+        for (path, mode, seconds) in [
+            (target.join("nested"), 0o550, 1_700_000_001),
+            (target.join("nested/deeper"), 0o500, 1_700_000_002),
+        ] {
+            let stat = path.metadata().unwrap();
+            assert_eq!(stat.mode() & 0o777, mode);
+            assert_eq!((stat.mtime(), stat.mtime_nsec()), (seconds, 123));
+        }
+        assert_eq!(
+            node.prepared_revision_bytes(guild, legacy.value.revision_id)
+                .unwrap(),
+            canonical_bytes(&legacy).unwrap()
         );
     }
 

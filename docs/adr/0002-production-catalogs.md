@@ -1805,3 +1805,62 @@ The final expanded interruption and Node fixtures pass again on the final
 test source. Locked workspace/all-targets build, formatting/diff checks and
 strict Clippy pass. No full Node, native-filesystem, topology, other-platform
 or real 1 TiB qualification ran in this increment.
+
+### Retained paged native restore (2026-10-07)
+
+Linux can now restore the native tree from an explicitly retained local paged
+revision through the Node API. The consumer streams the authenticated namespace
+and file recipes, resolves each source against the published native validation
+index and verifies both ciphertext commitments before decrypting a sector.
+Sparse extents seek directly to their signed offsets. Raw path bytes survive
+without UTF-8 conversion. Forward hard-link aliases wait for their primary
+inode; repeated file recipes reuse that inode without fetching its bytes twice.
+This restores the native portion of Git-bearing revisions without installing
+their Git history.
+
+Per-target SQL indexes retain expected paths, inode identities, link groups and
+deferred aliases. Cursor reads bound keys and payloads before allocation; the
+restore holds one file recipe record and sector at a time. Parent traversal
+checks pinned directory identities without retaining a descriptor stack. An
+exact namespace check rejects untracked or replaced children before directory
+metadata is applied in descendant-before-parent order, with root metadata last.
+The temporary hard-link pool is removed before publication. These indexes are
+disposable and rebuilt after an interrupted construction.
+
+Publication reuses the existing serialized, inode-bound restore journal,
+no-replace rename and parent-directory sync. Version-3 jobs bind the paged
+signed-body hash through a domain-separated identity and cannot adopt a legacy
+reservation, even with the same UUID. An ignored initial journal insertion now
+fails explicitly instead of repeatedly trying to reserve the target. Journal
+enumeration bounds individual SQL records. A Publishing job can finish after
+retained-root cancellation without fetching retired metadata or data; unfinished
+construction still requires live retained authority.
+
+This is an explicit local Linux native-tree consumer. Normal paged capture,
+Git-history installation, remote/seed-only paged restore, checkpoint/retention
+activation, quota reservation and real 1 TiB dataset/history qualification remain
+required before production admission.
+
+Validation: the locked workspace/all-targets build and strict Clippy pass. All
+23 ordinary tests selected by `paged_` pass, along with 33 ordinary snapshot
+tests and the separate Node certified-writer/reopen fixture. The shared
+reservation-isolation test appears in both ordinary selections. Eight
+provisioned snapshot cases remain ignored; they were not rerun in this slice.
+The new restore fixtures qualify multiple namespace pages with 450 directories,
+raw names, sparse extents, forward hard links, exact mode/timestamps, existing
+target refusal, corrupt data, ignored index/journal inserts, unexpected children
+and interruption after rename followed by cancellation/reopen. The final
+strengthened directory-stat assertions and failure/replay fixture pass again.
+
+The new explicitly provisioned Btrfs Node fixture passes capture, working-file
+edits, retained conversion, reopen and native restore. It verifies original
+CRLF/NUL bytes, hard-link inode equality, nested restrictive directory modes and
+exact nanosecond timestamps, plus a 1 TiB logical sparse file with less than
+1 MiB allocated after restore. This is sparse-offset correctness, not a real
+1 TiB retained-data capacity qualification. The reflink acceptance script now
+selects this exact fixture; its shell syntax passes, while the complete script
+was not rerun here. Source and test-binary hashes match
+after execution. Its owned disposable image, mount, loop and fixtures are
+removed with mount absence and loop detachment independently checked. Full
+Node/Git suites, daemon topology, release artifacts and other platforms were
+not qualified in this increment.

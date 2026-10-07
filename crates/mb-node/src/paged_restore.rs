@@ -1,0 +1,578 @@
+//! Bounded Linux native-tree restore from retained paged ownership. Git history
+//! and remote/seed-only paged recovery are separate consumer migration gates.
+
+use std::fs::{self, File};
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+use mb_core::{
+    CATALOG_FILE_PATH_BYTES, CATALOG_FILE_RECORD_BYTES, CatalogFileEvent, CatalogFileKind,
+    CatalogFileReader, CatalogFileRecipeRecord, CatalogFileRecord, CatalogFileStat,
+    CatalogNativeFileReader, CatalogScope, CatalogSection, KeyMaterial, SectorId,
+    canonical_bytes_bounded, decode_canonical, merkle_commit,
+};
+use mb_store::{CatalogBundleState, ControlStore, NativeFileId, PinnedDirectory};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::PagedPrivateMetadata;
+use crate::snapshot::{decrypt_reference, native_id_for_file, set_metadata_durable};
+
+const ENTRY_BYTES: usize = CATALOG_FILE_RECORD_BYTES + 128;
+
+#[derive(Serialize, Deserialize)]
+struct RestoredEntry {
+    record: CatalogFileRecord,
+    identity: NativeFileId,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+struct RestoredLink {
+    identity: NativeFileId,
+    stat: CatalogFileStat,
+    logical_len: u64,
+}
+
+struct RestoreIndex<'a> {
+    control: &'a ControlStore,
+    kinds: [String; 4],
+}
+
+impl<'a> RestoreIndex<'a> {
+    fn new(control: &'a ControlStore, target: [u8; 32]) -> Self {
+        Self {
+            control,
+            kinds: ["entry", "directory", "link", "alias"]
+                .map(|role| format!("paged-native-restore-{role}-v1/{}", hex::encode(target))),
+        }
+    }
+
+    fn clear(&self) -> Result<()> {
+        for kind in &self.kinds {
+            while let Some((key, bytes)) = self.control.next_record_bounded(
+                kind,
+                None,
+                CATALOG_FILE_PATH_BYTES + 1,
+                ENTRY_BYTES,
+            )? {
+                self.control.delete_record_if_value(kind, &key, &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn put(&self, role: usize, key: &[u8], bytes: &[u8]) -> Result<()> {
+        self.control
+            .put_record_if_absent(&self.kinds[role], key, bytes)?;
+        ensure!(
+            self.control
+                .get_record_bounded(&self.kinds[role], key, ENTRY_BYTES)?
+                .as_deref()
+                == Some(bytes),
+            "restore index write was ignored or conflicts with another inode"
+        );
+        Ok(())
+    }
+
+    fn entry(&self, path: &[u8]) -> Result<RestoredEntry> {
+        let bytes = self
+            .control
+            .get_record_bounded(&self.kinds[0], path, ENTRY_BYTES)?
+            .context("restored path has no tracked inode")?;
+        let entry = Self::decode_entry(&bytes)?;
+        ensure!(
+            entry.record.path == path,
+            "restore entry key differs from its path"
+        );
+        Ok(entry)
+    }
+
+    fn decode_entry(bytes: &[u8]) -> Result<RestoredEntry> {
+        let entry: RestoredEntry = decode_canonical(bytes)?;
+        entry.record.validate()?;
+        ensure!(
+            canonical_bytes_bounded(&entry, ENTRY_BYTES)? == bytes,
+            "noncanonical restore entry"
+        );
+        Ok(entry)
+    }
+
+    fn track(&self, entry: &RestoredEntry) -> Result<()> {
+        let bytes = canonical_bytes_bounded(entry, ENTRY_BYTES)?;
+        self.put(0, &entry.record.path, &bytes)?;
+        if matches!(entry.record.kind, CatalogFileKind::Directory) {
+            // Descendants precede their parents. The terminator sorts after
+            // every complemented non-NUL path byte, reversing prefix order too.
+            let key = directory_key(&entry.record.path);
+            self.put(1, &key, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn link(&self, group: u64) -> Result<Option<RestoredLink>> {
+        let Some(bytes) =
+            self.control
+                .get_record_bounded(&self.kinds[2], &group.to_be_bytes(), 128)?
+        else {
+            return Ok(None);
+        };
+        let link: RestoredLink = decode_canonical(&bytes)?;
+        link.stat.validate()?;
+        ensure!(
+            canonical_bytes_bounded(&link, 128)? == bytes,
+            "noncanonical restore link"
+        );
+        Ok(Some(link))
+    }
+
+    fn directory(&self, root: &PinnedDirectory, path: &[u8]) -> Result<PinnedDirectory> {
+        let mut directory = root.try_clone()?;
+        let mut prefix = Vec::new();
+        for component in path
+            .split(|byte| *byte == b'/')
+            .filter(|part| !part.is_empty())
+        {
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            prefix.extend(component);
+            let expected = self.entry(&prefix)?;
+            ensure!(
+                matches!(expected.record.kind, CatalogFileKind::Directory),
+                "restore parent is not a directory"
+            );
+            directory = directory
+                .open_child_directory(raw_path(component))?
+                .context("restored parent directory disappeared")?;
+            ensure!(
+                directory.identity()? == expected.identity,
+                "restored parent directory was replaced"
+            );
+        }
+        Ok(directory)
+    }
+
+    fn destination(
+        &self,
+        root: &PinnedDirectory,
+        path: &[u8],
+    ) -> Result<(PinnedDirectory, PathBuf)> {
+        let split = path.iter().rposition(|byte| *byte == b'/');
+        let (parent, name) = split.map_or((&[][..], path), |index| {
+            (&path[..index], &path[index + 1..])
+        });
+        Ok((self.directory(root, parent)?, raw_path(name)))
+    }
+
+    fn verify_children(&self, directory: &PinnedDirectory, prefix: &[u8]) -> Result<()> {
+        for child in fs::read_dir(directory.descriptor_path())? {
+            let child = child?;
+            let name = child.file_name();
+            let mut path = prefix.to_vec();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend(name.as_bytes());
+            ensure!(
+                path.len() <= CATALOG_FILE_PATH_BYTES,
+                "unexpected overlong restored path"
+            );
+            let expected = self.entry(&path)?;
+            let is_directory = matches!(expected.record.kind, CatalogFileKind::Directory);
+            ensure!(
+                directory.entry_identity(&name, is_directory)? == Some(expected.identity),
+                "restored child was replaced"
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_tree(&self, root: &PinnedDirectory) -> Result<()> {
+        self.verify_children(root, &[])?;
+        let mut after = None;
+        while let Some((key, bytes)) = self.control.next_record_bounded(
+            &self.kinds[0],
+            after.as_deref(),
+            CATALOG_FILE_PATH_BYTES,
+            ENTRY_BYTES,
+        )? {
+            let entry = Self::decode_entry(&bytes)?;
+            ensure!(entry.record.path == key, "restore index path changed");
+            let (parent, name) = self.destination(root, &key)?;
+            let is_directory = matches!(entry.record.kind, CatalogFileKind::Directory);
+            ensure!(
+                parent.entry_identity(&name, is_directory)? == Some(entry.identity),
+                "restored inode was replaced"
+            );
+            if is_directory {
+                let directory = parent
+                    .open_child_directory(&name)?
+                    .context("restored directory disappeared")?;
+                self.verify_children(&directory, &key)?;
+            }
+            after = Some(key);
+        }
+        Ok(())
+    }
+
+    fn finish_directories(&self, root: &PinnedDirectory) -> Result<()> {
+        let mut after = None;
+        while let Some((key, bytes)) = self.control.next_record_bounded(
+            &self.kinds[1],
+            after.as_deref(),
+            CATALOG_FILE_PATH_BYTES + 1,
+            ENTRY_BYTES,
+        )? {
+            let entry = Self::decode_entry(&bytes)?;
+            ensure!(
+                matches!(entry.record.kind, CatalogFileKind::Directory)
+                    && directory_key(&entry.record.path) == key,
+                "invalid restore directory index"
+            );
+            let directory = self.directory(root, &entry.record.path)?;
+            apply_stat(directory.as_file(), entry.record.stat)?;
+            after = Some(key);
+        }
+        Ok(())
+    }
+}
+
+fn raw_path(bytes: &[u8]) -> PathBuf {
+    std::ffi::OsString::from_vec(bytes.to_vec()).into()
+}
+
+fn directory_key(path: &[u8]) -> Vec<u8> {
+    path.iter().map(|byte| !byte).chain([255]).collect()
+}
+
+fn apply_stat(file: &File, stat: CatalogFileStat) -> Result<()> {
+    set_metadata_durable(file, stat.mode, stat.modified_secs, stat.modified_nanos)
+}
+
+struct PendingFile {
+    record: CatalogFileRecord,
+    file: Option<File>,
+    identity: NativeFileId,
+    group: Option<u64>,
+    remaining_extent: u64,
+}
+
+impl PendingFile {
+    fn finish(
+        self,
+        root: &PinnedDirectory,
+        pool: &PinnedDirectory,
+        index: &RestoreIndex<'_>,
+    ) -> Result<()> {
+        ensure!(self.remaining_extent == 0, "restored extent is incomplete");
+        if let Some(file) = &self.file {
+            apply_stat(file, self.record.stat)?;
+            if let Some(group) = self.group {
+                let (parent, name) = index.destination(root, &self.record.path)?;
+                ensure!(
+                    parent.entry_identity(&name, false)? == Some(self.identity),
+                    "hard-link primary was replaced"
+                );
+                parent.hard_link_child_from(&name, pool, group.to_string())?;
+                pool.sync_all()?;
+                let CatalogFileKind::File { logical_len, .. } = self.record.kind else {
+                    anyhow::bail!("missing file kind");
+                };
+                index.put(
+                    2,
+                    &group.to_be_bytes(),
+                    &canonical_bytes_bounded(
+                        &RestoredLink {
+                            identity: self.identity,
+                            stat: self.record.stat,
+                            logical_len,
+                        },
+                        128,
+                    )?,
+                )?;
+            }
+        }
+        index.track(&RestoredEntry {
+            record: self.record,
+            identity: self.identity,
+        })
+    }
+}
+
+impl PagedPrivateMetadata {
+    /// Restore the native filesystem portion of a retained local paged
+    /// revision. Git-history installation and remote paged restore remain
+    /// separate migrations. Caller serializes retained-root cancellation.
+    pub fn restore_retained_native_catalog(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        revision_id: Uuid,
+        scope: CatalogScope,
+        target: &Path,
+        mut load: impl FnMut(&SectorId) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        let snapshot = Self::load_local_catalog(control, keys, revision_id, scope)?
+            .context("retained paged revision is unavailable")?;
+        let signed_hash = snapshot.revision.value.hash()?;
+        let guild = snapshot.revision.value.guild_id;
+        let mut identity =
+            blake3::Hasher::new_derive_key("mutualbackup paged native restore identity v1");
+        identity.update(&signed_hash);
+        let mut operation = [0; 16];
+        operation.copy_from_slice(&identity.finalize().as_bytes()[..16]);
+        if snapshot.state != CatalogBundleState::Published {
+            ensure!(
+                crate::snapshot::resume_restore_from_identity(
+                    control,
+                    guild,
+                    Uuid::from_bytes(operation),
+                    3,
+                    target
+                )?,
+                "retained paged revision is cancelled"
+            );
+            return Ok(());
+        }
+        let private = snapshot
+            .private
+            .context("retained private roots are unavailable")?;
+        crate::snapshot::restore_from_builder(
+            control,
+            guild,
+            Uuid::from_bytes(operation),
+            3,
+            target,
+            |root, target_id| {
+                let index = RestoreIndex::new(control, target_id);
+                index.clear()?;
+                private.build_native_restore(keys, revision_id, scope, root, &index, &mut load)?;
+                let current = Self::load_local_catalog(control, keys, revision_id, scope)?
+                    .context("retained root disappeared during restore")?;
+                ensure!(
+                    current.state == CatalogBundleState::Published
+                        && current.revision.value.hash()? == signed_hash,
+                    "retained authority changed during restore"
+                );
+                index.clear()
+            },
+        )
+    }
+
+    fn build_native_restore(
+        &self,
+        keys: &KeyMaterial,
+        revision_id: Uuid,
+        scope: CatalogScope,
+        root: &PinnedDirectory,
+        index: &RestoreIndex<'_>,
+        load: &mut impl FnMut(&SectorId) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        let control = index.control;
+        let CatalogScope::Dataset { guild_id, .. } = scope else {
+            anyhow::bail!("restore requires dataset scope");
+        };
+        let mut fetch = |page| control.catalog_page(scope, CatalogSection::FileMetadata, page);
+        let pool_name = loop {
+            let name = format!(".mutualbackup-restore-links-{}", Uuid::new_v4());
+            let mut namespace = CatalogFileReader::new(scope, self.native.namespace)?;
+            let mut conflict = false;
+            while let Some(entry) = namespace.next_file(&mut fetch)? {
+                conflict |= entry.path.split(|byte| *byte == b'/').next() == Some(name.as_bytes());
+            }
+            if !conflict {
+                break name;
+            }
+        };
+        let pool = root.create_child_directory(&pool_name)?;
+        let pool_identity = pool.identity()?;
+        let mut reader = CatalogNativeFileReader::new(scope, self.native)?;
+        let encryption = keys.guild_data_key(&guild_id);
+        let mut pending: Option<PendingFile> = None;
+        while let Some(event) = reader.next_event(&mut fetch)? {
+            match event {
+                CatalogFileEvent::Entry(entry) => {
+                    if let Some(file) = pending.take() {
+                        file.finish(root, &pool, index)?;
+                    }
+                    let (parent, name) = index.destination(root, &entry.path)?;
+                    match entry.kind {
+                        CatalogFileKind::Directory => {
+                            let directory = parent.create_child_directory(&name)?;
+                            index.track(&RestoredEntry {
+                                identity: directory.identity()?,
+                                record: entry,
+                            })?;
+                        }
+                        CatalogFileKind::HardLink {
+                            logical_len,
+                            link_group,
+                        } => {
+                            let group = control
+                                .native_file_catalog_link(revision_id, link_group)?
+                                .context("hard-link group is not validated")?;
+                            ensure!(
+                                group.stat == entry.stat && group.logical_len == logical_len,
+                                "hard-link attributes differ from validated group"
+                            );
+                            index.put(
+                                3,
+                                &entry.path,
+                                &canonical_bytes_bounded(&entry, CATALOG_FILE_RECORD_BYTES)?,
+                            )?;
+                        }
+                        CatalogFileKind::File {
+                            logical_len,
+                            link_group,
+                            ..
+                        } => {
+                            let existing = if let Some(group) = link_group {
+                                let validated = control
+                                    .native_file_catalog_link(revision_id, group)?
+                                    .context("file link group is not validated")?;
+                                ensure!(
+                                    validated.stat == entry.stat
+                                        && validated.logical_len == logical_len,
+                                    "file attributes differ from validated group"
+                                );
+                                index.link(group)?
+                            } else {
+                                None
+                            };
+                            let (file, identity) = if let Some(link) = existing {
+                                ensure!(
+                                    link.stat == entry.stat && link.logical_len == logical_len,
+                                    "restored hard-link attributes differ"
+                                );
+                                let group = link_group.context("missing file link group")?;
+                                ensure!(
+                                    pool.entry_identity(group.to_string(), false)?
+                                        == Some(link.identity),
+                                    "restored link pool inode was replaced"
+                                );
+                                pool.hard_link_child_from(group.to_string(), &parent, &name)?;
+                                (None, link.identity)
+                            } else {
+                                let file = parent.create_child_file(&name)?;
+                                file.set_len(logical_len)?;
+                                let identity = native_id_for_file(root, &file)?;
+                                (Some(file), identity)
+                            };
+                            pending = Some(PendingFile {
+                                record: entry,
+                                file,
+                                identity,
+                                group: link_group,
+                                remaining_extent: 0,
+                            });
+                        }
+                    }
+                }
+                CatalogFileEvent::Recipe(recipe) => {
+                    let file = pending.as_mut().context("recipe has no restored file")?;
+                    match recipe {
+                        CatalogFileRecipeRecord::File { .. } => {}
+                        CatalogFileRecipeRecord::Extent {
+                            offset,
+                            logical_len,
+                            ..
+                        } => {
+                            ensure!(
+                                file.remaining_extent == 0,
+                                "previous restored extent is incomplete"
+                            );
+                            if let Some(output) = &mut file.file {
+                                output.seek(SeekFrom::Start(offset))?;
+                            }
+                            file.remaining_extent = logical_len;
+                        }
+                        CatalogFileRecipeRecord::Sectors { references, .. } => {
+                            for reference in references {
+                                let source = control
+                                    .native_file_catalog_source(revision_id, reference.id)?
+                                    .context("file source is not validated")?;
+                                ensure!(
+                                    source.sector == reference,
+                                    "file source differs from signed catalog"
+                                );
+                                file.remaining_extent = file
+                                    .remaining_extent
+                                    .checked_sub(u64::from(reference.logical_len))
+                                    .context("restored extent overflow")?;
+                                if let Some(output) = &mut file.file {
+                                    let plaintext =
+                                        decrypt_reference(&encryption, &reference, &mut |id| {
+                                            let bytes = load(id)?;
+                                            ensure!(
+                                                merkle_commit(&bytes)? == source.commitment,
+                                                "restored source Merkle commitment differs"
+                                            );
+                                            Ok(bytes)
+                                        })?;
+                                    output.write_all(&plaintext)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(file) = pending {
+            file.finish(root, &pool, index)?;
+        }
+        let mut after = None;
+        while let Some((key, bytes)) = control.next_record_bounded(
+            &index.kinds[3],
+            after.as_deref(),
+            CATALOG_FILE_PATH_BYTES,
+            CATALOG_FILE_RECORD_BYTES,
+        )? {
+            let entry = CatalogFileRecord::decode(&bytes)?;
+            ensure!(key == entry.path, "deferred alias path changed");
+            let CatalogFileKind::HardLink {
+                logical_len,
+                link_group,
+            } = entry.kind
+            else {
+                anyhow::bail!("invalid deferred hard link");
+            };
+            let link = index
+                .link(link_group)?
+                .context("deferred alias has no restored primary")?;
+            ensure!(
+                entry.stat == link.stat && logical_len == link.logical_len,
+                "deferred alias differs from primary"
+            );
+            let (parent, name) = index.destination(root, &entry.path)?;
+            ensure!(
+                pool.entry_identity(link_group.to_string(), false)? == Some(link.identity),
+                "deferred hard-link primary was replaced"
+            );
+            pool.hard_link_child_from(link_group.to_string(), &parent, &name)?;
+            index.track(&RestoredEntry {
+                record: entry,
+                identity: link.identity,
+            })?;
+            after = Some(key);
+        }
+        let mut after = None;
+        while let Some((key, bytes)) =
+            control.next_record_bounded(&index.kinds[2], after.as_deref(), 8, 128)?
+        {
+            let group = u64::from_be_bytes(
+                key.as_slice()
+                    .try_into()
+                    .context("invalid restored link key")?,
+            );
+            let link: RestoredLink = decode_canonical(&bytes)?;
+            pool.remove_child_file_if_identity(group.to_string(), link.identity)?;
+            after = Some(key);
+        }
+        pool.sync_all()?;
+        root.remove_child_directory(&pool_name, pool_identity)?;
+        index.verify_tree(root)?;
+        index.finish_directories(root)?;
+        apply_stat(root.as_file(), self.native.namespace.root_stat)
+    }
+}

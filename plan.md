@@ -1479,6 +1479,17 @@ Every supported legacy parity upgrade now checks its final schema-version write.
 Rejected metadata rolls back table conversion and reservation creation together;
 the old schema and shard bytes remain available for a clean reopen/retry.
 
+The explicit retained paged Node API now restores Linux native trees by streaming
+namespace and recipe pages with bounded disk-backed inode/link tracking. Sparse
+offsets, raw names and forward hard links survive; an exact namespace check and
+postorder directory metadata precede publication. The existing durable no-replace
+publication journal distinguishes paged signed-body identities from legacy jobs
+and can complete a rename after retained-source retirement. Git-bearing revisions
+can restore their native portion, while Git-history installation, normal paged
+capture, remote/seed-only restore, checkpoint/retention activation, quota policy
+and real 1 TiB dataset/history qualification remain required. See ADR 0002 for
+the consumer contract and validation.
+
 
 Linux stable-anchor relocation now advances bounded process-local cursors without
 holding the global area-index mutex during filesystem work. Streaming pinned

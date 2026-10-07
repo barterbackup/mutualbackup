@@ -25,6 +25,7 @@ cargo test -p mb-git repository::tests::linked_restore_uses_its_own_index_and_le
 cargo test -p mb-git repository::tests::hard_reset_replays_worktree_before_index_and_preserves_untracked_files --locked -- --ignored --exact
 cargo test -p mb-git checkout::tests::btrfs_replay_rejects_wrong_native_anchor_and_unverifiable_legacy_restore --locked -- --ignored --exact
 cargo test -p mb-node node::tests::git_repository_init_and_add_survive_daemon_reopen --locked -- --ignored --exact
+cargo test -p mb-node node::tests::native_capture_migrates_and_restores_retained_paged_sparse_tree --locked -- --ignored --exact
 cargo test -p mb-node snapshot::metadata_compatibility_tests::git_history_enters_encrypted_revision_sectors_without_changing_root_restore --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::nested_btrfs_subvolumes_are_rejected_before_and_during_capture --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_remains_bound_to_the_open_root --locked -- --ignored --exact

@@ -1221,6 +1221,16 @@ passing tests below apply only to their recorded source and exercised cases.
     Locked workspace/all-targets build, formatting and strict Clippy pass.
     Details and limits are recorded in ADR 0002. This is explicit local
     retention, not production checkpoint activation or 1 TiB qualification.
+  - [x] Restore Linux native trees from explicitly retained local paged roots.
+    Stream namespace/recipe pages and authenticated data sectors, with bounded
+    SQL indexes for inode identities, hard-link groups and forward aliases.
+    Preserve raw names, sparse extents, exact bytes and directory metadata;
+    reject unexpected/replaced children before no-replace durable publication.
+    Keep paged and legacy journal ownership distinct, reject ignored reservation
+    writes and finish an already Publishing tree after retained-root cancellation.
+    Details and validation are recorded in ADR 0002. This explicit native-only
+    API does not activate normal paged capture, Git-history installation,
+    remote/seed-only restore, checkpoint/retention or the 1 TiB production target.
   - [ ] Complete legacy retained-revision migration through normal native
     capture/restore, checkpoint/retention and seed-only consumers before
     enabling the new format.
