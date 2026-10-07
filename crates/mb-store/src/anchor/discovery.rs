@@ -3,6 +3,14 @@
 use super::*;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+mod checkpoint;
+#[cfg(target_os = "linux")]
+mod directory;
+#[cfg(target_os = "linux")]
+pub use checkpoint::{
+    ANCHOR_DISCOVERY_CHECKPOINT_BYTES, AnchorAreaDiscovery, AnchorAreaDiscoveryStep,
+};
 
 const INDEX_ENTRIES: usize = 32;
 const STEPS_PER_LOOKUP: usize = 2_048;
@@ -17,6 +25,26 @@ const MAX_OPEN_FRAMES: usize = 64;
 type IndexKey = (Uuid, u64, PathBuf);
 type Index = BTreeMap<IndexKey, Arc<Mutex<State>>>;
 static INDEX: OnceLock<Mutex<Index>> = OnceLock::new();
+
+pub(super) fn cached(area: &StableAnchorAreaLocator) -> Option<PathBuf> {
+    let key = (
+        area.area_id,
+        area.filesystem_id,
+        area.volume_root_hint.clone(),
+    );
+    let state = INDEX.get()?.lock().ok()?.get(&key).cloned()?;
+    let state = state.try_lock().ok()?;
+    let State::Resolved(path) = &*state else {
+        return None;
+    };
+    if validate_stable_anchor_area(path, area.area_id).is_ok()
+        && filesystem_identity(path).is_ok_and(|identity| identity.stable_id == area.filesystem_id)
+    {
+        Some(path.clone())
+    } else {
+        None
+    }
+}
 
 #[derive(Default)]
 enum State {
@@ -161,14 +189,16 @@ static OPEN_FRAMES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "linux")]
 struct Frame {
     directory: PinnedDirectory,
-    entries: fs::ReadDir,
+    entries: directory::DirectoryEntries,
     path: PathBuf,
+    stamp: checkpoint::DirectoryStamp,
 }
 
 #[cfg(target_os = "linux")]
 impl Frame {
     fn open(directory: PinnedDirectory, path: PathBuf) -> Result<Self, AnchorError> {
         check_path(&path)?;
+        let stamp = checkpoint::DirectoryStamp::read(&directory)?;
         let mut count = OPEN_FRAMES.load(Ordering::Acquire);
         loop {
             if count >= MAX_OPEN_FRAMES {
@@ -184,15 +214,16 @@ impl Frame {
                 Err(current) => count = current,
             }
         }
-        match fs::read_dir(directory.descriptor_path()) {
+        match directory::DirectoryEntries::new(&directory) {
             Ok(entries) => Ok(Self {
                 directory,
                 entries,
                 path,
+                stamp,
             }),
             Err(error) => {
                 OPEN_FRAMES.fetch_sub(1, Ordering::AcqRel);
-                Err(error.into())
+                Err(error)
             }
         }
     }
@@ -206,7 +237,8 @@ impl Drop for Frame {
 }
 
 struct Scan {
-    roots: std::collections::VecDeque<PathBuf>,
+    roots: Vec<PathBuf>,
+    next_root: usize,
     #[cfg(target_os = "linux")]
     stack: Vec<Frame>,
     candidate: Option<(NativeFileId, PathBuf)>,
@@ -215,7 +247,8 @@ struct Scan {
 impl Scan {
     fn new(roots: Vec<PathBuf>) -> Self {
         Self {
-            roots: roots.into(),
+            roots,
+            next_root: 0,
             #[cfg(target_os = "linux")]
             stack: Vec::new(),
             candidate: None,
@@ -227,7 +260,7 @@ impl Scan {
         if !self.stack.is_empty() {
             return false;
         }
-        self.roots.is_empty() && self.candidate.is_none()
+        self.next_root == self.roots.len() && self.candidate.is_none()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -264,9 +297,10 @@ impl Scan {
                     }
                     return Ok(Some(path));
                 }
-                let Some(root) = self.roots.pop_front() else {
+                let Some(root) = self.roots.get(self.next_root).cloned() else {
                     return Ok(None);
                 };
+                self.next_root += 1;
                 check_path(&root)?;
                 let directory = match PinnedDirectory::open(&root) {
                     Ok(directory) => directory,
@@ -297,24 +331,20 @@ impl Scan {
                 continue;
             }
             let frame = self.stack.last_mut().expect("nonempty stack");
-            let Some(entry) = frame.entries.next() else {
+            let entry = match frame.entries.next() {
+                Ok(entry) => entry,
+                Err(AnchorError::Io(error)) if ignorable(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let Some(entry) = entry else {
+                frame.verify_unchanged()?;
                 self.stack.pop();
                 continue;
             };
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if ignorable(&error) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(error) if ignorable(&error) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if !kind.is_dir() {
+            if !entry.may_be_directory || entry.name == "." || entry.name == ".." {
                 continue;
             }
-            let name = entry.file_name();
+            let name = entry.name;
             let path = frame.path.join(&name);
             check_path(&path)?;
             let directory = match frame.directory.open_child_directory(Path::new(&name)) {
@@ -329,6 +359,7 @@ impl Scan {
                 {
                     continue;
                 }
+                Err(AnchorError::UnsupportedObject(_)) => continue,
                 Err(error) => return Err(error),
             };
             // Btrfs subvolumes also have distinct stable identities even when

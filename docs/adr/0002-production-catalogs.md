@@ -1450,3 +1450,59 @@ Valid saved locations survive database reopen, but scan cursors remain
 process-local. Restart/eviction-safe progress, operational retry/recovery and
 physical relocation/source-loss qualification remain required before production
 admission. The 1 TiB target includes retained history and is still unqualified.
+
+### Restart-safe native anchor discovery (2026-10-07)
+
+Ordinary Node stable-source serving, including retained paged native/Git data,
+now persists Linux Btrfs/ext4 relocation progress in local control records.
+Directory enumeration uses bounded 8 KiB `getdents64` buffers and saves the last
+consumed directory cookie, rather than the end of a partially consumed buffer.
+Resume reopens pinned directories beneath their parents, rejects mount/symlink
+crossings, and verifies stable filesystem/inode identity and directory modification,
+change and size metadata before seeking. Changed directories restart discovery;
+unrelated mount-table changes do not discard completed work. Newly visible roots
+are queued before declaring absence. Locator and signed source encodings remain
+unchanged. These checks are local location assistance, not data authority or an
+atomic snapshot of an actively changing namespace.
+
+Cursors are bounded at 576 KiB, with at most 32 durable jobs, 256 roots, depth 64
+and 64 simultaneously open scan frames across the process. Attempt UUIDs and
+monotonic generations participate in exact-record CAS publication. Filesystem
+work runs outside the SQLite writer; stale publishers return pending rather than
+overwriting newer progress. Oversized, corrupt, unknown-version and overflowing
+journals fail closed without replacing their records. A terminal found location
+can survive a crash before source authentication. Only a verified sector read
+publishes its durable location hint and retires the cursor, together in a checked
+transaction. Ignored writes or cleanup roll back both changes. Missing areas
+retire their jobs without publishing a hint. Explicit/read-only rendering stays
+nonmutating. Unsupported filesystems retain process-local discovery.
+
+Validation on Rust 1.99 and Linux 7.2.5-1.qubes.fc41.x86_64:
+
+- The final store library suite passes 136 tests, with 23 provisioned tests
+  ignored. Fresh-process fixtures prove saved-cookie progress, attempt identity
+  and increasing generations across independent executables. Fault fixtures cover
+  stale CAS, the job quota, ignored SQL writes, malformed journals and absence.
+- Node passes all 18 paged tests and 32 ordinary metadata/restore compatibility
+  tests (eight provisioned cases ignored). A moved legacy source with incorrect
+  bytes retains its discovery job without publishing a hint; correcting the bytes
+  after database reopen authenticates the source and completes the job. Git
+  passes all 90 ordinary tests, with 62 provisioned cases ignored.
+- On a disposable 512 MiB Btrfs loop image, targeted tests pass for fresh-process
+  progress, nested-subvolume and bind-mount exclusion, and source loss followed by
+  missing-job retirement. The existing moved-anchor remount fixture passes both
+  phases. A new cursor fixture also passes both phases around an actual external
+  unmount/remount: the reopened checkpoint is byte-identical before continued
+  progress reaches the target. The owned mount was verified absent, loop device
+  detached and image/fixtures removed afterward.
+- The locked workspace/all-targets test build passes. The subsequent final
+  store-only test additions compile and pass, and strict locked workspace/
+  all-targets Clippy, formatting and diff checks pass on the final sources.
+
+The 25 ms scan deadline remains cooperative: individual kernel I/O, reopening
+bounded frames and SQL commits can take longer. Direct native Git catalog,
+capture/replay and retirement consumers still need durable-discovery integration.
+Operational retry/backoff and abandoned-job quota cleanup, continuously changing
+namespaces, other filesystems/platforms, complete consumer lifecycle tests and
+real 1 TiB dataset/history qualification remain open. This evidence does not
+complete R3 or the production release gates.

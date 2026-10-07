@@ -40,6 +40,10 @@ const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
 #[cfg(target_os = "linux")]
 const CLEANUP_BATCH_ENTRIES: usize = 64;
 mod discovery;
+#[cfg(target_os = "linux")]
+pub use discovery::{
+    ANCHOR_DISCOVERY_CHECKPOINT_BYTES, AnchorAreaDiscovery, AnchorAreaDiscoveryStep,
+};
 
 #[cfg(test)]
 type CaptureDirectoryHook = Box<dyn FnMut(&Path)>;
@@ -2353,6 +2357,19 @@ pub(crate) struct CaptureVersion {
 }
 
 impl StableAnchorFileLocator {
+    /// Try supplied/original/cached locations without starting discovery.
+    pub fn open_at_known_area(
+        &self,
+        area_hint: Option<&Path>,
+    ) -> Result<Option<(File, PathBuf)>, AnchorError> {
+        validate_relative(&self.relative_path)?;
+        let Some(area) = known_anchor_area(&self.area, area_hint) else {
+            return Ok(None);
+        };
+        let file = open_anchor_beneath(&area, self.anchor_id, &self.relative_path)?;
+        Ok(Some((file, area)))
+    }
+
     /// Open a stable source. Relocation discovery does bounded work per call;
     /// `AnchorAreaDiscoveryPending` requests a retry in this process or a current
     /// area hint. Exhausted resource bounds do not establish source absence.
@@ -3975,6 +3992,16 @@ fn resolve_anchor_area_with_hint(
     area: &StableAnchorAreaLocator,
     catalog_hint: Option<&Path>,
 ) -> Result<PathBuf, AnchorError> {
+    if let Some(path) = known_anchor_area(area, catalog_hint) {
+        return Ok(path);
+    }
+    discovery::resolve(area)
+}
+
+fn known_anchor_area(
+    area: &StableAnchorAreaLocator,
+    catalog_hint: Option<&Path>,
+) -> Option<PathBuf> {
     let mut hints = Vec::with_capacity(2);
     if let Some(hint) = catalog_hint {
         hints.push(hint.to_path_buf());
@@ -3984,11 +4011,11 @@ fn resolve_anchor_area_with_hint(
     }
     for hint in hints {
         if validate_stable_anchor_area(&hint, area.area_id).is_ok() {
-            return Ok(hint);
+            return Some(hint);
         }
     }
 
-    discovery::resolve(area)
+    discovery::cached(area)
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -80,15 +80,55 @@ pub(super) fn remember_anchor_area_location(
         path.as_os_str().as_encoded_bytes().len() <= MAX_ANCHOR_LOCATION_BYTES,
         "anchor location exceeds its bounded local encoding"
     );
-    control.put_record(
-        ANCHOR_AREA_LOCATION_KIND,
-        area_id.as_bytes(),
-        &mb_core::canonical_bytes_bounded(
-            &RawLocalPath(path.to_path_buf()),
-            MAX_ENCODED_ANCHOR_LOCATION_BYTES,
-        )?,
+    let encoded = mb_core::canonical_bytes_bounded(
+        &RawLocalPath(path.to_path_buf()),
+        MAX_ENCODED_ANCHOR_LOCATION_BYTES,
     )?;
+    #[cfg(target_os = "linux")]
+    control.finish_anchor_area_discovery(area_id, &encoded)?;
+    #[cfg(not(target_os = "linux"))]
+    control.put_record(ANCHOR_AREA_LOCATION_KIND, area_id.as_bytes(), &encoded)?;
     Ok(())
+}
+
+pub(super) fn open_stable_anchor_with_discovery(
+    control: &ControlStore,
+    locator: &StableAnchorFileLocator,
+    hint: Option<&Path>,
+) -> Result<(File, PathBuf)> {
+    if let Some(opened) = locator.open_at_known_area(hint)? {
+        return Ok(opened);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match control.advance_anchor_area_discovery(&locator.area) {
+            Ok(mb_store::AnchorAreaDiscoveryStep::Found(path)) => {
+                return locator
+                    .open_at_known_area(Some(&path))?
+                    .context("discovered anchor area changed before source open");
+            }
+            Ok(mb_store::AnchorAreaDiscoveryStep::Pending) => {
+                return Err(mb_store::AnchorError::AnchorAreaDiscoveryPending.into());
+            }
+            Ok(mb_store::AnchorAreaDiscoveryStep::Missing) => {
+                return Err(mb_store::AnchorError::AnchorAreaCollision(
+                    locator.area.path_hint.clone(),
+                )
+                .into());
+            }
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<mb_store::AnchorError>(),
+                    Some(mb_store::AnchorError::UnsupportedSourceOperation(
+                        "persistent anchor directory cookies"
+                    ))
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = control;
+    Ok(locator.open_with_area_hint(hint)?)
 }
 
 #[cfg(test)]
@@ -2987,9 +3027,11 @@ fn render_sector_with_hint_update(
         }
         LocalPlaintextSource::StableAnchorFile { locator, offset } => {
             let area_hint = anchor_area_hint(control, locator.area.area_id)?;
-            let (mut file, resolved_area) = locator
-                .open_with_area_hint(area_hint.as_deref())
-                .context("open stable source anchor")?;
+            let (mut file, resolved_area) = if update_area_hint {
+                open_stable_anchor_with_discovery(control, locator, area_hint.as_deref())?
+            } else {
+                locator.open_with_area_hint(area_hint.as_deref())?
+            };
             if update_area_hint && area_hint.as_ref() != Some(&resolved_area) {
                 resolved_hint = Some((locator.area.area_id, resolved_area));
             }
@@ -4459,6 +4501,100 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_source_discovery_reopens_without_publishing_unverified_locations() {
+        let temp = tempfile::tempdir().unwrap();
+        let scan = temp.path().join("scan");
+        let root = scan.join("root");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        let mut area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        area.volume_root_hint = scan.clone();
+        let area_id = area.area_id;
+        let anchor_id = Uuid::new_v4();
+        fs::create_dir(area.path_hint.join(anchor_id.to_string())).unwrap();
+        fs::write(
+            area.path_hint.join(anchor_id.to_string()).join("payload"),
+            b"modified",
+        )
+        .unwrap();
+        for n in 0..5_000 {
+            fs::write(scan.join(format!("entry-{n}")), []).unwrap();
+        }
+        let moved = scan.join(".mutualbackup-anchors-moved");
+        fs::rename(&area.path_hint, &moved).unwrap();
+        let path = state.join("control.db");
+        let control = ControlStore::open_with_key(&path, &[9; 32]).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([8; 32]));
+        let guild = [7; 32];
+        let (reference, ciphertext) =
+            encrypted_sector(&keys.guild_data_key(&guild), [6; 32], b"verified").unwrap();
+        let recipe = LocalSectorRecipe {
+            guild_id: guild,
+            reference: reference.clone(),
+            source: LocalPlaintextSource::StableAnchorFile {
+                locator: StableAnchorFileLocator {
+                    area,
+                    anchor_id,
+                    relative_path: "payload".into(),
+                },
+                offset: 0,
+            },
+        };
+        control
+            .put_record(
+                "local-sector",
+                &reference.id,
+                &canonical_bytes(&recipe).unwrap(),
+            )
+            .unwrap();
+        let mut rejected = false;
+        for _ in 0..30 {
+            let error = render_sector(&control, &keys, &reference.id, Some(&guild)).unwrap_err();
+            if matches!(
+                error.downcast_ref::<mb_store::AnchorError>(),
+                Some(mb_store::AnchorError::AnchorAreaDiscoveryPending)
+            ) {
+                continue;
+            }
+            assert!(
+                error.to_string().contains("signed sector")
+                    || error.to_string().contains("committed sector root"),
+                "{error:#}"
+            );
+            rejected = true;
+            break;
+        }
+        assert!(rejected);
+        assert!(anchor_area_hint(&control, area_id).unwrap().is_none());
+        assert!(
+            control
+                .get_record(mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND, area_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        drop(control);
+        fs::write(
+            moved.join(anchor_id.to_string()).join("payload"),
+            b"verified",
+        )
+        .unwrap();
+        let control = ControlStore::open_existing_with_key(&path, &[9; 32]).unwrap();
+        assert_eq!(
+            render_sector(&control, &keys, &reference.id, Some(&guild)).unwrap(),
+            ciphertext
+        );
+        assert_eq!(anchor_area_hint(&control, area_id).unwrap(), Some(moved));
+        assert!(
+            control
+                .get_record(mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND, area_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

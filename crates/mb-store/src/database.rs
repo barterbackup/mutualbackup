@@ -14,7 +14,11 @@ use thiserror::Error;
 
 use crate::SCHEMA_VERSION;
 
+#[cfg(target_os = "linux")]
+mod anchor_discovery;
 mod catalog;
+#[cfg(target_os = "linux")]
+pub use anchor_discovery::ANCHOR_DISCOVERY_JOURNAL_KIND;
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogIntentState,

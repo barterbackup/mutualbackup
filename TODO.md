@@ -1230,11 +1230,21 @@ passing tests below apply only to their recorded source and exercised cases.
     stable reads also delay writes until source verification succeeds. Saved
     hint reads bound SQL payload allocation; malformed paths are ignored and
     oversized records fail closed. Validation is recorded in ADR 0002.
-  - [ ] Complete stable anchor relocation discovery integration. Provide
-    restart/eviction-safe progress for scans that outlive one process and
-    integrate operational retry/recovery. Qualify absent/moved areas, reopen and
-    source loss without blocking unrelated lookups, including the declared
-    1 TiB dataset/history geometry and physical mount/remount lifecycle.
+  - [x] Persist bounded Linux Btrfs/ext4 discovery cursors for ordinary Node
+    stable-source serving. Raw directory cookies reopen only after filesystem,
+    inode and directory-change fences pass. A 576 KiB cursor cap and 32-job quota
+    bound local work/state; attempt/generation CAS rejects stale publishers.
+    Filesystem work stays outside the SQL writer. Changed namespaces restart
+    safely; new mount roots are queued before absence. Verified hint publication
+    and cursor retirement share a fenced transaction. Read-only calls retain
+    their nonmutating behavior; other filesystems retain process-local fallback.
+    Validation and native qualification are recorded in ADR 0002.
+  - [ ] Complete stable anchor relocation discovery integration. Extend durable
+    progress to direct native Git, capture/replay and retirement call paths;
+    integrate operational retry/backoff and abandoned-job quota cleanup. Qualify
+    other filesystems/platforms and continuously changing namespaces, plus
+    absent/moved areas, reopen and source loss across complete consumers,
+    including the declared 1 TiB dataset/history geometry.
   - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,
     retention and seed-only recovery together; qualify the declared capacity
     and geometry policy on real data before enabling production admission.

@@ -231,7 +231,7 @@ impl PagedDataSource {
         scope: CatalogScope,
         record: &CatalogSectorRecord,
     ) -> Result<Vec<u8>> {
-        self.render_at_hint(keys, scope, record, None)
+        self.render_at_hint(keys, scope, record, None, None)
             .map(|(bytes, _)| bytes)
     }
 
@@ -241,6 +241,7 @@ impl PagedDataSource {
         scope: CatalogScope,
         record: &CatalogSectorRecord,
         hint: Option<&std::path::Path>,
+        discovery: Option<&ControlStore>,
     ) -> Result<(Vec<u8>, std::path::PathBuf)> {
         if let Some(binding) = &self.legacy {
             ensure!(
@@ -249,7 +250,7 @@ impl PagedDataSource {
             );
         }
         self.anchor
-            .render_with_binding(keys, scope, record, self.legacy.as_ref(), hint)
+            .render_with_binding(keys, scope, record, self.legacy.as_ref(), hint, discovery)
     }
 }
 
@@ -261,6 +262,7 @@ impl PagedAnchorSectorSource {
         record: &CatalogSectorRecord,
         legacy: Option<&LegacyDataBinding>,
         hint: Option<&std::path::Path>,
+        discovery: Option<&ControlStore>,
     ) -> Result<(Vec<u8>, std::path::PathBuf)> {
         let CatalogScope::Dataset {
             guild_id,
@@ -282,7 +284,11 @@ impl PagedAnchorSectorSource {
             .offset
             .checked_add(len as u64)
             .ok_or_else(|| anyhow::anyhow!("stable data range overflows"))?;
-        let (mut file, resolved_area) = self.locator.open_with_area_hint(hint)?;
+        let (mut file, resolved_area) = if let Some(control) = discovery {
+            crate::snapshot::open_stable_anchor_with_discovery(control, &self.locator, hint)?
+        } else {
+            self.locator.open_with_area_hint(hint)?
+        };
         ensure!(
             end <= file.metadata()?.len(),
             "stable source range exceeds its file"
@@ -379,6 +385,7 @@ impl PagedPrivateMetadata {
             source.catalog.bundle.scope,
             &source.source,
             hint.as_deref(),
+            update_area_hint.then_some(control),
         )?;
         if update_area_hint && hint.as_ref() != Some(&resolved) {
             crate::snapshot::remember_anchor_area_location(control, area_id, &resolved)?;

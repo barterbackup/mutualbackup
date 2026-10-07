@@ -16,6 +16,8 @@ pub use anchor::raw_path_bytes;
 pub use anchor::raw_path_bytes_option;
 #[cfg(target_os = "linux")]
 pub use anchor::raw_path_bytes_vec;
+#[cfg(target_os = "linux")]
+pub use anchor::{ANCHOR_DISCOVERY_CHECKPOINT_BYTES, AnchorAreaDiscovery, AnchorAreaDiscoveryStep};
 pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
     FileAnchorManifest, FileExtent, FilesystemIdentity, GIT_CATALOG_DIRECTORY,
@@ -35,6 +37,8 @@ pub use anchor::{
     GuardedRevisionCaptureV1, GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewEntryKind,
     GuardedViewMetadataEntry, GuardedViewMetadataV1,
 };
+#[cfg(target_os = "linux")]
+pub use database::ANCHOR_DISCOVERY_JOURNAL_KIND;
 pub use database::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogIntent, CatalogIntentState,
