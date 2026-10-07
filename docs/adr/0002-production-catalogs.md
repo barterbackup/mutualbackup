@@ -1319,8 +1319,10 @@ legacy page or Inline recipes. It verifies the expected signed reference,
 Merkle commitment, seed/guild and private root authority, then repairs private
 page payloads through the existing exact-owner writer transaction. Native and
 Git private roles, including index pages, keep their root pins and source bytes.
-Matching live data needs no replacement; lost/damaged data must use the existing
-stable-anchor replacement API and cannot acquire an independent Inline lifetime.
+Matching live data needs no replacement; scoped paged-only lost/damaged data
+must use the existing stable-anchor replacement API and cannot acquire an
+independent Inline lifetime. The historical migration coexistence correction
+below permits the original flat recovery recipe while native ownership is rebuilt.
 Complete data recovery orchestration, native capture/restore, full paged Git DAG
 verification, checkpoint/packing/retention and seed-only activation remain open,
 as do filesystem/platform and real 1 TiB dataset/history qualification.
@@ -2039,3 +2041,50 @@ Their mount, loop device and image were reclaimed. Formatting, strict locked
 workspace/all-targets Clippy, the locked all-targets test build and acceptance
 script syntax pass. The complete acceptance script, topology, remaining platform,
 release-artifact and real retained 1 TiB gates were not rerun or closed.
+
+### Retained migration and ordinary flat recovery coexistence (2026-10-07)
+
+Retaining a paged successor preserves its original flat revision and sector IDs.
+Historical data bindings now keep ordinary flat repair usable after native anchor
+loss: a downloaded flat recipe must match the live retained owner's complete
+sector reference, guild, signed ciphertext root and Merkle commitment. The
+fallback is limited to authenticated historical data bindings. Private pages,
+bootstrap sectors and scoped paged-only data retain their existing strict repair
+and replacement rules. Arbitrary Inline rows cannot override retained authority.
+
+Ordinary snapshot restore and resumed publication re-anchor unavailable retained
+historical sources before reporting completion. Healthy native sources do not
+require recapture. Recovery enumerates data owners through the existing partial
+sector index, reading one checked owner/tombstone at a time. Every live owner is
+rebound through the exact catalog/source/generation fence, authenticating the
+replacement native range and transferring both anchor counts atomically. Valid
+cancelled owners keep their pins until their own cleanup runs. Repeated sector
+references do not create duplicate source bindings.
+
+The durable recovery intent owns a completed capture before any retained source
+moves. Interruption can therefore leave different owners on different verified
+anchors without losing either capture. If the restored tree disappears, recovery
+reads the completed manifest without replaying capture or accessing the lost
+source, then atomically moves ownership into the existing anchor-retirement
+journal while retiring the exact intent. A fresh restore can build a new capture;
+retirement waits for all retained and flat recipe pins to move. Capture discard
+also rejects pinned output. Final flat recipe/manifest publication rejects SQL
+IGNORE and keeps its intent on any incomplete write.
+
+This corrects coexistence with original flat backup/recovery. It does not
+activate paged capture, packing, checkpoint/retention or seed-only paged recovery,
+and does not qualify the retained 1 TiB production target or other platforms.
+
+Initial qualification: four supported historical private layouts (1/3/4/5)
+pass authenticated flat data repair after anchor loss and reopen, including corrupt
+bytes, wrong guild and altered fallback rejection. The indexed owner cursor
+passes cancelled-owner, reopen and malformed-key cases; flat finalization passes
+stale intent and ignored insert/delete rollback. Disposable Btrfs passes native
+capture, two retained owners, a 1 TiB sparse file, source/anchor loss, ordinary
+restore, interruption after one transfer, loss of that restored tree, durable
+capture retirement and another restore after reopen. Exact bytes, hard links,
+source generations, stale replacement rejection, shared pins, retirement cleanup
+and original flat revision preservation are checked. The disposable mount, image
+and loop device were reclaimed. Strict workspace/all-targets Clippy and the locked
+all-targets test build pass. Full ordinary workspace and the expanded five-peer
+native Git source-loss qualification are pending at this increment.

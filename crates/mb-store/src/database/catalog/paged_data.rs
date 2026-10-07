@@ -189,6 +189,52 @@ pub(super) fn read_source(
 }
 
 impl ControlStore {
+    /// Visit one indexed owner of a data sector, including cancelled owners
+    /// whose pins await cleanup. The cursor advances over tombstones without
+    /// materializing history or imposing a total owner-count limit.
+    pub fn next_paged_revision_data_source(
+        &self,
+        sector: [u8; 32],
+        after: Option<Uuid>,
+    ) -> Result<Option<(Uuid, Option<PagedCatalogDataSource>)>, CatalogStoreError> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let prefix = "catalog-paged-data-source-v1/";
+        let cursor = after.map(sources).unwrap_or_default();
+        let kind: Option<Option<String>> = tx
+            .query_row(
+                "SELECT CASE WHEN length(kind) <= ?3 THEN kind END
+             FROM protocol_records INDEXED BY protocol_records_paged_sector_sources
+             WHERE record_id = ?1 AND kind > ?2
+               AND kind GLOB 'catalog-paged-data-source-v1/*'
+             ORDER BY kind LIMIT 1",
+                params![sector, cursor, prefix.len() + 32],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let result = if let Some(kind) = kind {
+            let kind = kind.ok_or(DatabaseError::Integrity)?;
+            let suffix = kind.strip_prefix(prefix).ok_or(DatabaseError::Integrity)?;
+            let id = Uuid::parse_str(suffix).map_err(|_| DatabaseError::Integrity)?;
+            if id.is_nil() || id.simple().to_string() != suffix {
+                return Err(DatabaseError::Integrity.into());
+            }
+            let source = read_source(&tx, id, sector)?;
+            if source.is_none()
+                && paged_revision::snapshot(&tx, id)?
+                    .ok_or(DatabaseError::Integrity)?
+                    .state
+                    != CatalogBundleState::Cancelled
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+            Some((id, source))
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Replace one authenticated source under an exact ownership/generation
     /// fence, transferring physical pins in the same writer transaction.
     /// The callback verifies replacement bytes using this current snapshot.

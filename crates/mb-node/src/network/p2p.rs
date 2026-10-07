@@ -34544,6 +34544,115 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
+        // Retained migration must coexist with ordinary flat peer recovery
+        // when control state survives loss of native files and Git anchors.
+        let migration_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        {
+            let mut owner = nodes[1].lock().unwrap();
+            for id in migration_ids {
+                owner
+                    .migrate_retained_revision_catalog(
+                        genesis.genesis.guild_id,
+                        signed.value.revision_id,
+                        id,
+                    )
+                    .unwrap();
+            }
+        }
+        std::fs::remove_dir_all(&source).unwrap();
+        wipe_owner_payload_areas();
+        {
+            let owner = nodes[1].lock().unwrap();
+            // Force reconstruction from peers: control ownership survives,
+            // while local packed caches, recovery downloads and READY payloads
+            // are gone along with the native source and anchor areas.
+            for sql in [
+                "DELETE FROM protocol_records WHERE kind = 'packed-sector'",
+                "DELETE FROM recovery_shards",
+            ] {
+                owner.database_shell_statement(None, sql, true).unwrap();
+            }
+            for volume in owner.storage_status().unwrap() {
+                owner
+                    .database_shell_statement(
+                        Some(volume.volume_id),
+                        "DELETE FROM parity_objects",
+                        true,
+                    )
+                    .unwrap();
+            }
+            for reference in &signed.value.data_sectors {
+                assert!(
+                    owner
+                        .sector_for_guild(&genesis.genesis.guild_id, &reference.id)
+                        .is_err()
+                );
+            }
+        }
+        eprintln!(
+            "native Git retained migration: source and anchors erased with control preserved"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(180),
+            restore_snapshot_with_p2p(
+                nodes[1].clone(),
+                &clients[1],
+                Some(signed.value.revision_id),
+                &source,
+            ),
+        )
+        .await
+        .expect("retained migration flat peer restore timed out")
+        .unwrap();
+        assert_eq!(std::fs::read(source.join("first")).unwrap(), first);
+        assert_eq!(std::fs::read(source.join("second")).unwrap(), second);
+        assert_eq!(std::fs::read(source.join("edited")).unwrap(), edited);
+        assert!(!source.join("history-only").exists());
+        {
+            let owner = nodes[1].lock().unwrap();
+            let recovered = native_git_graph(&owner, root_id);
+            assert_eq!(recovered.refs, original_graph.refs);
+            assert_eq!(recovered.objects, original_graph.objects);
+            let store = crate::volume::inspect_control_store(owner.data_dir(), owner.keys())
+                .unwrap()
+                .unwrap();
+            for id in migration_ids {
+                for reference in &signed.value.data_sectors {
+                    let source = store
+                        .paged_revision_data_source(id, reference.id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(source.generation, 1);
+                    assert!(store.paged_data_anchor_is_pinned(source.anchor).unwrap());
+                    assert!(
+                        !crate::snapshot::local_recipe_is_inline(&store, &reference.id).unwrap()
+                    );
+                    let ciphertext = crate::PagedPrivateMetadata::render_local_data_sector(
+                        &store,
+                        owner.keys(),
+                        id,
+                        reference.id,
+                        source.catalog.bundle.scope,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(sector_root(&ciphertext), reference.root);
+                }
+            }
+            assert_eq!(
+                owner
+                    .current_checkpoint(genesis.genesis.guild_id)
+                    .unwrap()
+                    .unwrap()
+                    .hash()
+                    .unwrap(),
+                checkpoint_hash
+            );
+        }
+        eprintln!(
+            "native Git retained migration: ordinary flat peer restore and shared pins verified"
+        );
+
         clients[1].shutdown().await.unwrap();
         tasks.remove(1).await.unwrap().unwrap();
         for group in [

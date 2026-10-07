@@ -288,8 +288,28 @@ impl SourceCapturePlan {
 
     pub fn discard(&self, control: &ControlStore) -> anyhow::Result<()> {
         match self {
+            Self::ReflinkV1(plan) => {
+                anyhow::ensure!(
+                    !control.paged_data_anchor_is_pinned(plan.anchor_id())?,
+                    "capture remains owned by a paged data source"
+                );
+                native_operation(control, plan.area(), |hint| {
+                    ReflinkAnchor::discard_capture_with_area_hint(plan, hint)
+                })
+            }
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),
+        }
+    }
+
+    /// Read completed ownership without capture replay or source access.
+    pub fn captured_manifest(
+        &self,
+        control: &ControlStore,
+    ) -> anyhow::Result<StableAnchorManifest> {
+        match self {
             Self::ReflinkV1(plan) => native_operation(control, plan.area(), |hint| {
-                ReflinkAnchor::discard_capture_with_area_hint(plan, hint)
+                ReflinkAnchor::read_capture_manifest_with_area_hint(plan, hint)
             }),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(_) => anyhow::bail!("{WITHDRAWN_GUARDED_BACKEND}"),

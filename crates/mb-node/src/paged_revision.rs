@@ -352,7 +352,8 @@ impl PagedPrivateMetadata {
     }
 
     /// Route ordinary sector requests through authenticated retained ownership.
-    /// A damaged live source is an error, never a reason to use a legacy copy.
+    /// Scoped paged sources fail closed on damage. Historical bindings may use
+    /// an exact authenticated flat recovery recipe until native re-anchoring.
     pub(crate) fn render_local_sector(
         control: &ControlStore,
         keys: &KeyMaterial,

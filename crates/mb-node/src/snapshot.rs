@@ -140,8 +140,15 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static INTERRUPT_AFTER_LEGACY_RESTORE_RETIRE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static INTERRUPT_RETAINED_SOURCE_AFTER_REPLACEMENT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static AFTER_RESTORE_RENAME: std::cell::RefCell<Option<RestoreRenameHook>> =
         std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn interrupt_retained_source_replacement_once() {
+    INTERRUPT_RETAINED_SOURCE_AFTER_REPLACEMENT.with(|interrupt| interrupt.set(true));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -951,6 +958,32 @@ pub(crate) fn abandon_recovered_anchor_capture(
     let (intent, _) = decode_recovery_anchor_intent(&bytes)?;
     if intent.guild_id != guild_id || intent.revision_id != revision_id {
         bail!("pending recovered-anchor capture conflicts with the recovery job");
+    }
+    let pinned = match &intent.plan {
+        SourceCapturePlan::ReflinkV1(plan) => {
+            control.paged_data_anchor_is_pinned(plan.anchor_id())?
+        }
+        #[cfg(target_os = "linux")]
+        SourceCapturePlan::GuardedLinkFreezeV1(_) => {
+            bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND)
+        }
+    };
+    if pinned {
+        // A partial transfer already owns this capture. Preserve it through the
+        // ordinary retirement journal while a fresh restore builds another
+        // replacement. Cleanup waits until all retained/flat owners move away.
+        let manifest = intent.plan.captured_manifest(control)?;
+        control.put_records_and_retire_if_value(
+            &[(
+                ANCHOR_RETIREMENT_KIND.to_owned(),
+                manifest.anchor_id.as_bytes().to_vec(),
+                canonical_bytes(&manifest)?,
+            )],
+            RECOVERY_ANCHOR_INTENT_KIND,
+            revision_id.as_bytes(),
+            &bytes,
+        )?;
+        return Ok(());
     }
     intent
         .plan
@@ -1811,19 +1844,30 @@ pub(crate) fn install_recovered_sector_recipe(
                 crate::PagedPrivateMetadata::repair_catalog_source(
                     control, keys, &source, scope, ciphertext,
                 )?;
+                return Ok(());
             }
             mb_store::PagedCatalogSectorSource::Data(source) => {
-                // Lost file/blob sources must use the stable replacement API;
-                // do not create an independently retained Inline copy.
-                ensure!(
-                    crate::PagedPrivateMetadata::render_data_source(
-                        control, keys, &source, scope, true
-                    )? == ciphertext,
-                    "recovered data differs from its retained stable source"
-                );
+                match crate::PagedPrivateMetadata::render_data_source(
+                    control, keys, &source, scope, true,
+                ) {
+                    Ok(existing) => {
+                        ensure!(
+                            existing == ciphertext,
+                            "recovered data differs from its retained stable source"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        // Keep ordinary legacy recovery available while its
+                        // native source is rebuilt. Re-anchor transfers every
+                        // live retained pin before retiring the old recipe.
+                        if !crate::PagedPrivateMetadata::has_legacy_data_binding(&source, scope)? {
+                            return Err(error);
+                        }
+                    }
+                }
             }
         }
-        return Ok(());
     }
     if let Some(source) = control.catalog_sector_source(reference.id)? {
         let recipe: LocalSectorRecipe = decode_canonical(&source.recipe)?;
@@ -1876,8 +1920,46 @@ pub(crate) fn install_recovered_sector_recipe(
     install_inline_recipe(control, guild_id, reference, plaintext)
 }
 
+pub(crate) fn reanchor_retained_legacy_recovery(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    target: &Path,
+) -> Result<()> {
+    if control
+        .get_record(
+            RECOVERY_ANCHOR_INTENT_KIND,
+            revision.value.revision_id.as_bytes(),
+        )?
+        .is_some()
+    {
+        return reanchor_recovered_revision(control, keys, guild_id, revision, target);
+    }
+    for reference in &revision.value.data_sectors {
+        let mut after = None;
+        while let Some((id, source)) =
+            control.next_paged_revision_data_source(reference.id, after)?
+        {
+            after = Some(id);
+            if let Some(source) = source
+                && crate::PagedPrivateMetadata::has_legacy_data_binding(
+                    &source,
+                    source.catalog.bundle.scope,
+                )?
+                && !crate::PagedPrivateMetadata::native_data_source_available(
+                    control, keys, &source,
+                )?
+            {
+                return reanchor_recovered_revision(control, keys, guild_id, revision, target);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn reanchor_recovered_revision(
-    control: &mut ControlStore,
+    control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
@@ -1928,26 +2010,34 @@ pub(crate) fn reanchor_recovered_revision(
             git_repository.as_ref(),
         )
     {
-        if let Some(bytes) = control.get_record(
+        let pending = control.get_record(
             RECOVERY_ANCHOR_INTENT_KIND,
             revision.value.revision_id.as_bytes(),
-        )? {
-            let (intent, _) = decode_recovery_anchor_intent(&bytes)?;
+        )?;
+        if let Some(bytes) = &pending {
+            let (intent, _) = decode_recovery_anchor_intent(bytes)?;
             if intent.guild_id != guild_id || intent.revision_id != revision.value.revision_id {
                 bail!("pending recovered-anchor capture conflicts with the revision");
             }
+        }
+        // Move retained ownership before discarding a previously captured
+        // replacement, which may already own pins after an interrupted retry.
+        replace_retained_recovery_sources(control, keys, &records)?;
+        if let Some(bytes) = pending {
+            let (intent, _) = decode_recovery_anchor_intent(&bytes)?;
             intent
                 .plan
                 .discard(control)
                 .context("discard redundant recovered-anchor capture")?;
-            if !control.delete_record(
+            control.delete_record_if_value(
                 RECOVERY_ANCHOR_INTENT_KIND,
                 revision.value.revision_id.as_bytes(),
-            )? {
-                bail!("pending recovered-anchor capture disappeared");
-            }
+                &bytes,
+            )?;
         }
-        control.put_records(&records)?;
+        control.put_records_and_delete_checked(&records, &[], || {
+            Ok::<_, mb_store::DatabaseError>(())
+        })?;
         return Ok(());
     }
 
@@ -2032,12 +2122,59 @@ pub(crate) fn reanchor_recovered_revision(
     // The durable intent now owns this completed anchor. Keep it for an exact
     // retry if the following SQL transaction fails or the process stops.
     anchor.commit();
+    replace_retained_recovery_sources(control, keys, &records)?;
     control.finalize_recovery_anchor_records(
         revision.value.revision_id.as_bytes(),
         &intent_bytes,
         &records,
     )?;
     reconcile_anchor_retirements(control)?;
+    Ok(())
+}
+
+/// Each owner moves under its exact generation fence, with source bytes and
+/// both anchor counts checked in the same transaction. The recovery intent
+/// owns the completed replacement across interruption between owners and final
+/// flat-recipe publication. Cancelled owners retain pins for their own cleanup.
+fn replace_retained_recovery_sources(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    records: &[RecordWrite],
+) -> Result<()> {
+    for (kind, _, bytes) in records {
+        if kind != "local-sector" {
+            continue;
+        }
+        let recipe: LocalSectorRecipe = decode_canonical(bytes)?;
+        let LocalPlaintextSource::StableAnchorFile { locator, offset } = recipe.source else {
+            bail!("recovered data has no stable replacement");
+        };
+        let replacement = crate::PagedAnchorSectorSource { locator, offset };
+        let mut after = None;
+        while let Some((id, source)) =
+            control.next_paged_revision_data_source(recipe.reference.id, after)?
+        {
+            after = Some(id);
+            let Some(source) = source else { continue };
+            ensure!(
+                source.source.sector == recipe.reference,
+                "retained owner differs from recovered data"
+            );
+            crate::PagedPrivateMetadata::replace_local_data_source(
+                control,
+                keys,
+                &source,
+                source.catalog.bundle.scope,
+                &replacement,
+            )?;
+            #[cfg(test)]
+            if INTERRUPT_RETAINED_SOURCE_AFTER_REPLACEMENT
+                .with(|interrupt| interrupt.replace(false))
+            {
+                bail!("injected interruption after retained source replacement");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3034,10 +3171,32 @@ fn render_sector_with_hint_update(
     )? {
         return Ok(ciphertext);
     }
+    render_flat_sector_with_hint_update(
+        control,
+        keys,
+        sector_id,
+        expected_guild,
+        None,
+        update_area_hint,
+    )
+}
+
+pub(super) fn render_flat_sector_with_hint_update(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    sector_id: &SectorId,
+    expected_guild: Option<&[u8; 32]>,
+    expected_reference: Option<&SectorRef>,
+    update_area_hint: bool,
+) -> Result<Vec<u8>> {
     let encoded = control
-        .get_record("local-sector", sector_id)?
+        .get_record_bounded("local-sector", sector_id, V1_SECTOR_SIZE + 4096)?
         .context("local sector recipe is unavailable")?;
     let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
+    ensure!(
+        expected_reference.is_none_or(|reference| reference == &recipe.reference),
+        "flat recovery recipe differs from retained data"
+    );
     if expected_guild.is_some_and(|guild_id| recipe.guild_id != *guild_id) {
         bail!("local sector does not belong to the requested guild");
     }
@@ -6714,7 +6873,7 @@ mod metadata_compatibility_tests {
             blob.anchor.remove().unwrap();
         }
         fs::remove_dir_all(&source).unwrap();
-        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored).unwrap();
+        reanchor_recovered_revision(&control, &keys, guild_id, &revision, &restored).unwrap();
         let first_backup_blob = metadata
             .git
             .blobs
@@ -7173,8 +7332,7 @@ mod metadata_compatibility_tests {
 
         INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE.with(|interrupt| interrupt.set(true));
         assert!(
-            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored)
-                .is_err()
+            reanchor_recovered_revision(&control, &keys, guild_id, &revision, &restored).is_err()
         );
         assert!(
             control
@@ -7186,7 +7344,7 @@ mod metadata_compatibility_tests {
                 .is_some()
         );
 
-        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored).unwrap();
+        reanchor_recovered_revision(&control, &keys, guild_id, &revision, &restored).unwrap();
         assert!(
             control
                 .get_record(
@@ -7289,7 +7447,7 @@ mod metadata_compatibility_tests {
         assert!(!retire_revision_anchor(&mut control, revision.value.revision_id).unwrap());
         bind_mount_for_recovery_test(&external, &old_root);
 
-        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored).unwrap();
+        reanchor_recovered_revision(&control, &keys, guild_id, &revision, &restored).unwrap();
         assert_eq!(control.records(ANCHOR_RETIREMENT_KIND).unwrap().len(), 1);
         let mut pinned_reference = revision.value.data_sectors[0].clone();
         pinned_reference.id = [240; 32];

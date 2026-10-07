@@ -747,6 +747,148 @@ mod tests {
     }
 
     #[test]
+    fn retained_migration_keeps_authenticated_flat_recovery_after_anchor_loss() {
+        for version in [1, 3, 4, 5] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.db");
+            let mut store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let (legacy, ciphertexts, _) =
+                fixture(version, if version == 4 { 1 } else { 3 }, PAYLOAD);
+            let reference = legacy.value.data_sectors[0].clone();
+            let ciphertext = &ciphertexts[&reference.id];
+            let anchor =
+                retained_migration_source(&store, &temp.path().join("protected"), &reference);
+            let writer = SigningKey::from_bytes(&[72; 32]);
+            let fence = mb_core::WriterFence {
+                owner: keys().node_id(),
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            };
+            let migration = crate::RetainedLegacyMigration::new(
+                &keys(),
+                [73; 32],
+                &legacy,
+                fence,
+                Uuid::new_v4(),
+            )
+            .unwrap();
+            let retained = migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| {
+                    Ok(ciphertexts[id].clone())
+                })
+                .unwrap();
+            let owner = store
+                .paged_revision_data_source(retained.value.revision_id, reference.id)
+                .unwrap()
+                .unwrap();
+            std::fs::remove_file(
+                anchor
+                    .locator
+                    .area
+                    .path_hint
+                    .join(anchor.locator.anchor_id.to_string())
+                    .join(&anchor.locator.relative_path),
+            )
+            .unwrap();
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &reference.id, Some(&[73; 32]))
+                    .is_err()
+            );
+            let original = store.get_record("local-sector", &reference.id).unwrap();
+            let mut corrupt = ciphertext.clone();
+            corrupt[0] ^= 1;
+            assert!(
+                crate::snapshot::install_recovered_sector_recipe(
+                    &mut store,
+                    &keys(),
+                    [73; 32],
+                    reference.clone(),
+                    &corrupt
+                )
+                .is_err()
+            );
+            assert!(
+                crate::snapshot::install_recovered_sector_recipe(
+                    &mut store,
+                    &keys(),
+                    [1; 32],
+                    reference.clone(),
+                    ciphertext
+                )
+                .is_err()
+            );
+            assert_eq!(
+                store.get_record("local-sector", &reference.id).unwrap(),
+                original
+            );
+            crate::snapshot::install_recovered_sector_recipe(
+                &mut store,
+                &keys(),
+                [73; 32],
+                reference.clone(),
+                ciphertext,
+            )
+            .unwrap();
+            assert!(crate::snapshot::local_recipe_is_inline(&store, &reference.id).unwrap());
+            assert_eq!(
+                store
+                    .paged_revision_data_source(retained.value.revision_id, reference.id)
+                    .unwrap(),
+                Some(owner.clone())
+            );
+            drop(store);
+            let mut store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            crate::snapshot::install_recovered_sector_recipe(
+                &mut store,
+                &keys(),
+                [73; 32],
+                reference.clone(),
+                ciphertext,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::snapshot::render_sector(&store, &keys(), &reference.id, Some(&[73; 32]))
+                    .unwrap(),
+                *ciphertext
+            );
+            assert_eq!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &store,
+                    &keys(),
+                    retained.value.revision_id,
+                    reference.id,
+                    scope()
+                )
+                .unwrap(),
+                Some(ciphertext.clone())
+            );
+            assert!(
+                store
+                    .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                    .unwrap()
+            );
+            // A foreign or altered flat row never overrides signed ownership.
+            store
+                .put_record(
+                    "local-sector",
+                    &reference.id,
+                    &canonical_bytes(&([73_u8; 32], &reference, (1_u8, b"bad".to_vec()))).unwrap(),
+                )
+                .unwrap();
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &reference.id, Some(&[73; 32]))
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .paged_revision_data_source(retained.value.revision_id, reference.id)
+                    .unwrap(),
+                Some(owner)
+            );
+        }
+    }
+
+    #[test]
     fn paged_retained_migration_retries_failed_publication_and_fences_interrupted_cancellation() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("control.db");

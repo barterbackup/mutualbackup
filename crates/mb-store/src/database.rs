@@ -857,19 +857,21 @@ impl ControlStore {
     }
 
     pub fn finalize_recovery_anchor_records(
-        &mut self,
+        &self,
         revision_id: &[u8; 16],
         expected_intent: &[u8],
         records: &[(String, Vec<u8>, Vec<u8>)],
     ) -> Result<(), DatabaseError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
         {
             let mut statement = transaction.prepare_cached(
                 "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
                  ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
             )?;
             for (kind, record_id, bytes) in records {
-                statement.execute(params![kind, record_id, bytes])?;
+                if statement.execute(params![kind, record_id, bytes])? != 1 {
+                    return Err(DatabaseError::Conflict);
+                }
             }
         }
         let removed = transaction.execute(
@@ -5581,7 +5583,7 @@ mod tests {
     fn recovered_anchor_finalization_is_compare_and_atomic() {
         let temp = tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([32; 32]));
-        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
         let revision_id = [33; 16];
         store
             .put_record("recovery-anchor-intent", &revision_id, b"current")
@@ -5612,6 +5614,42 @@ mod tests {
                 .unwrap(),
             b"current"
         );
+
+        for trigger in [
+            "CREATE TEMP TRIGGER deny_recovered_anchor BEFORE INSERT ON protocol_records WHEN NEW.kind = 'anchor-manifest' BEGIN SELECT RAISE(IGNORE); END;",
+            "CREATE TEMP TRIGGER deny_recovered_anchor BEFORE DELETE ON protocol_records WHEN OLD.kind = 'recovery-anchor-intent' BEGIN SELECT RAISE(IGNORE); END;",
+        ] {
+            store.connection.execute_batch(trigger).unwrap();
+            assert!(matches!(
+                store.finalize_recovery_anchor_records(
+                    &revision_id,
+                    b"current",
+                    &[(
+                        "anchor-manifest".to_owned(),
+                        revision_id.to_vec(),
+                        b"rejected".to_vec()
+                    )],
+                ),
+                Err(DatabaseError::Conflict)
+            ));
+            assert!(
+                store
+                    .get_record("anchor-manifest", &revision_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .get_record("recovery-anchor-intent", &revision_id)
+                    .unwrap()
+                    .unwrap(),
+                b"current"
+            );
+            store
+                .connection
+                .execute_batch("DROP TRIGGER deny_recovered_anchor")
+                .unwrap();
+        }
 
         store
             .finalize_recovery_anchor_records(

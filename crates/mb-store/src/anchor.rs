@@ -2423,6 +2423,10 @@ impl FileAnchorManifest {
 }
 
 impl ReflinkCapturePlan {
+    pub fn anchor_id(&self) -> Uuid {
+        self.anchor_id
+    }
+
     pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
         &self.area
     }
@@ -2841,6 +2845,20 @@ impl ReflinkAnchor {
 
     pub fn discard_capture(plan: &ReflinkCapturePlan) -> Result<(), AnchorError> {
         Self::discard_capture_with_area_hint(plan, None)
+    }
+
+    /// Inspect a completed capture without replaying or removing any output.
+    /// Recovery may still own its immutable files after the source disappears.
+    pub(crate) fn read_capture_manifest_with_area_hint(
+        plan: &ReflinkCapturePlan,
+        hint: Option<&Path>,
+    ) -> Result<StableAnchorManifest, AnchorError> {
+        if plan.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let area_path = resolve_anchor_area_with_hint(&plan.area, hint)?;
+        let area_file = open_stable_anchor_area(&area_path, &plan.area)?;
+        read_planned_manifest_at(&area_file, &area_path, plan)
     }
 
     pub(crate) fn discard_capture_with_area_hint(

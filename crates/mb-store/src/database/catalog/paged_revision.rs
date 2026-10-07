@@ -1070,6 +1070,77 @@ mod tests {
     }
 
     #[test]
+    fn paged_data_owner_cursor_reopens_and_visits_cancelled_pins_without_scanning_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let anchor = Uuid::new_v4();
+        let owners = [
+            data_fixture(&store, anchor),
+            data_fixture(&store, anchor),
+            data_fixture(&store, anchor),
+        ];
+        let sector = owners[0].source.sector.id;
+        store
+            .cancel_paged_revision_catalog(owners[1].catalog.bundle.id)
+            .unwrap();
+        let mut expected = owners
+            .iter()
+            .map(|owner| owner.catalog.bundle.id)
+            .collect::<Vec<_>>();
+        expected.sort();
+        drop(store);
+        let mut after = None;
+        let mut visited = Vec::new();
+        loop {
+            let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            let Some((id, source)) = store
+                .next_paged_revision_data_source(sector, after)
+                .unwrap()
+            else {
+                break;
+            };
+            assert_eq!(source.is_none(), id == owners[1].catalog.bundle.id);
+            if let Some(source) = source {
+                assert_eq!(
+                    source,
+                    *owners
+                        .iter()
+                        .find(|owner| owner.catalog.bundle.id == id)
+                        .unwrap()
+                );
+            }
+            visited.push(id);
+            after = Some(id);
+        }
+        assert_eq!(visited, expected);
+        let store = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+        assert!(store.paged_data_anchor_is_pinned(anchor).unwrap());
+        assert!(
+            store
+                .next_paged_revision_data_source([0; 32], None)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .put_record("catalog-paged-data-source-v1/invalid", &sector, b"invalid")
+            .unwrap();
+        assert!(
+            store
+                .next_paged_revision_data_source(sector, after)
+                .is_err()
+        );
+        store
+            .put_record("catalog-paged-data-source-v1/", &[1; 32], b"invalid")
+            .unwrap();
+        assert!(
+            store
+                .next_paged_revision_data_source([1; 32], None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn paged_data_source_replacement_fences_stale_attempts_and_transfers_shared_pins() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("control.db");

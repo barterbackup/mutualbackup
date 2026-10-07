@@ -328,6 +328,39 @@ impl PagedAnchorSectorSource {
 }
 
 impl PagedPrivateMetadata {
+    pub(super) fn native_data_source_available(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        source: &mb_store::PagedCatalogDataSource,
+    ) -> Result<bool> {
+        let scope = source.catalog.bundle.scope;
+        Self::open_local_snapshot(keys, &source.catalog, scope)?;
+        let recipe = PagedDataSource::decode(&source.recipe, source.anchor)?;
+        let hint = crate::snapshot::anchor_area_hint(control, recipe.anchor.locator.area.area_id)?;
+        Ok(recipe
+            .render_at_hint(keys, scope, &source.source, hint.as_deref(), None)
+            .is_ok())
+    }
+
+    /// Historical data keeps its ordinary flat recovery recipe until native
+    /// replacement transfers retained ownership. Scoped paged-only data has no
+    /// such alternate authority and must use the replacement API directly.
+    pub(super) fn has_legacy_data_binding(
+        source: &mb_store::PagedCatalogDataSource,
+        scope: CatalogScope,
+    ) -> Result<bool> {
+        let recipe = PagedDataSource::decode(&source.recipe, source.anchor)?;
+        if let Some(binding) = recipe.legacy {
+            ensure!(
+                binding.scope == scope && binding.source == source.source,
+                "legacy data binding differs from its signed dataset source"
+            );
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Rebind a lost local source to verified replacement anchor bytes. The
     /// writer rechecks ownership/generation before authentication and pin transfer.
     pub fn replace_local_data_source(
@@ -380,17 +413,43 @@ impl PagedPrivateMetadata {
         expected_scope: CatalogScope,
         update_area_hint: bool,
     ) -> Result<Vec<u8>> {
-        Self::open_local_snapshot(keys, &source.catalog, expected_scope)?;
+        let opened = Self::open_local_snapshot(keys, &source.catalog, expected_scope)?;
         let recipe = PagedDataSource::decode(&source.recipe, source.anchor)?;
         let area_id = recipe.anchor.locator.area.area_id;
         let hint = crate::snapshot::anchor_area_hint(control, area_id)?;
-        let (ciphertext, resolved) = recipe.render_at_hint(
+        let rendered = recipe.render_at_hint(
             keys,
             source.catalog.bundle.scope,
             &source.source,
             hint.as_deref(),
             update_area_hint.then_some(control),
-        )?;
+        );
+        let (ciphertext, resolved) = match rendered {
+            Ok(value) => value,
+            Err(error) => {
+                if !Self::has_legacy_data_binding(source, expected_scope)? {
+                    return Err(error);
+                }
+                // Ordinary recovery may have downloaded an Inline recipe or
+                // installed a replacement native recipe. Authenticate it against
+                // this live signed owner before using it; arbitrary flat rows
+                // never override scoped paged sources or their commitments.
+                let ciphertext = crate::snapshot::render_flat_sector_with_hint_update(
+                    control,
+                    keys,
+                    &source.source.sector.id,
+                    Some(&opened.revision.value.guild_id),
+                    Some(&source.source.sector),
+                    update_area_hint,
+                )?;
+                ensure!(
+                    merkle_commit(&ciphertext)? == source.source.commitment
+                        && mb_core::sector_root(&ciphertext) == source.source.sector.root,
+                    "flat recovery source differs from its retained commitments"
+                );
+                return Ok(ciphertext);
+            }
+        };
         if update_area_hint && hint.as_ref() != Some(&resolved) {
             crate::snapshot::remember_anchor_area_location(control, area_id, &resolved)?;
         }

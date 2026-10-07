@@ -12852,6 +12852,13 @@ impl Node {
             target,
             |sector_id| self.sector_for_guild(&guild_id, sector_id),
         )?;
+        crate::snapshot::reanchor_retained_legacy_recovery(
+            &self.control,
+            &self.keys,
+            guild_id,
+            revision,
+            target,
+        )?;
         Ok(SnapshotInfo {
             protected_root_id: revision.value.protected_root_id,
             revision_id: revision.value.revision_id,
@@ -12896,6 +12903,13 @@ impl Node {
         if !resume_restore_publication(&self.control, &self.keys, guild_id, revision, target)? {
             return Ok(None);
         }
+        crate::snapshot::reanchor_retained_legacy_recovery(
+            &self.control,
+            &self.keys,
+            guild_id,
+            revision,
+            target,
+        )?;
         Ok(Some(SnapshotInfo {
             protected_root_id: revision.value.protected_root_id,
             revision_id: revision.value.revision_id,
@@ -13550,7 +13564,7 @@ impl Node {
                             Some(expected),
                         )?;
                         reanchor_recovered_revision(
-                            &mut self.control,
+                            &self.control,
                             &self.keys,
                             guild_id,
                             revision,
@@ -17633,6 +17647,9 @@ pub(crate) mod tests {
         let operation = Uuid::new_v4();
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, operation)
             .unwrap();
+        let shared_operation = Uuid::new_v4();
+        node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, shared_operation)
+            .unwrap();
         drop(node);
         let mut node = Node::open(&state, seed).unwrap();
         let target = temp.path().join("restored");
@@ -17658,6 +17675,253 @@ pub(crate) mod tests {
             assert_eq!(stat.mode() & 0o777, mode);
             assert_eq!((stat.mtime(), stat.mtime_nsec()), (seconds, 123));
         }
+        assert_eq!(
+            node.prepared_revision_bytes(guild, legacy.value.revision_id)
+                .unwrap(),
+            canonical_bytes(&legacy).unwrap()
+        );
+        let ciphertexts = legacy
+            .value
+            .data_sectors
+            .iter()
+            .map(|reference| {
+                (
+                    reference.id,
+                    node.sector_for_guild(&guild, &reference.id).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut originals = Vec::new();
+        let mut seen_sources = BTreeSet::new();
+        for id in [operation, shared_operation] {
+            for reference in &legacy.value.data_sectors {
+                if !seen_sources.insert((id, reference.id)) {
+                    continue;
+                }
+                originals.push(
+                    node.control
+                        .paged_revision_data_source(id, reference.id)
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+        }
+        let old_manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &node
+                .control
+                .get_record("anchor-manifest", legacy.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        for directory in [source.join("nested"), source.join("nested/deeper")] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::remove_dir_all(&source).unwrap();
+        std::fs::remove_dir_all(
+            old_manifest
+                .area
+                .path_hint
+                .join(old_manifest.anchor_id.to_string()),
+        )
+        .unwrap();
+        for reference in &legacy.value.data_sectors {
+            let ciphertext = &ciphertexts[&reference.id];
+            let mut corrupt = ciphertext.clone();
+            corrupt[0] ^= 1;
+            assert!(
+                node.install_repaired_information_sector(guild, reference.clone(), &corrupt)
+                    .is_err()
+            );
+            node.install_repaired_information_sector(guild, reference.clone(), ciphertext)
+                .unwrap();
+        }
+        drop(node);
+        let node = Node::open(&state, Seed::from_bytes([227; 32])).unwrap();
+        let ordinary = temp.path().join("ordinary-restored");
+        crate::snapshot::restore_revision_from_source(
+            &node.control,
+            &node.keys,
+            guild,
+            &legacy,
+            &ordinary,
+            |sector| node.sector_for_guild(&guild, sector),
+        )
+        .unwrap();
+        crate::snapshot::interrupt_retained_source_replacement_once();
+        let error = crate::snapshot::reanchor_recovered_revision(
+            &node.control,
+            &node.keys,
+            guild,
+            &legacy,
+            &ordinary,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected interruption after retained source replacement"),
+            "{error:#}"
+        );
+        assert!(
+            node.control
+                .get_record(
+                    "recovery-anchor-intent",
+                    legacy.value.revision_id.as_bytes()
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            node.control
+                .paged_data_anchor_is_pinned(old_manifest.anchor_id)
+                .unwrap()
+        );
+        let partial = originals
+            .iter()
+            .find_map(|original| {
+                let current = node
+                    .control
+                    .paged_revision_data_source(
+                        original.catalog.bundle.id,
+                        original.source.sector.id,
+                    )
+                    .unwrap()
+                    .unwrap();
+                (current.generation == 1).then_some(current)
+            })
+            .unwrap();
+        // Lose the restored tree too. Its already captured bytes must remain
+        // owned while a fresh restore retries the interrupted transfer.
+        for directory in [ordinary.join("nested"), ordinary.join("nested/deeper")] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::remove_dir_all(&ordinary).unwrap();
+        crate::snapshot::abandon_recovered_anchor_capture(
+            &node.control,
+            guild,
+            legacy.value.revision_id,
+        )
+        .unwrap();
+        assert!(
+            node.control
+                .get_record(
+                    "recovery-anchor-intent",
+                    legacy.value.revision_id.as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            node.control
+                .get_record("anchor-retirement", partial.anchor.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            node.control
+                .paged_data_anchor_is_pinned(partial.anchor)
+                .unwrap()
+        );
+        drop(node);
+        let node = Node::open(&state, Seed::from_bytes([227; 32])).unwrap();
+        let ordinary = temp.path().join("ordinary-retry");
+        crate::snapshot::restore_revision_from_source(
+            &node.control,
+            &node.keys,
+            guild,
+            &legacy,
+            &ordinary,
+            |sector| node.sector_for_guild(&guild, sector),
+        )
+        .unwrap();
+        crate::snapshot::reanchor_recovered_revision(
+            &node.control,
+            &node.keys,
+            guild,
+            &legacy,
+            &ordinary,
+        )
+        .unwrap();
+        assert!(
+            node.control
+                .get_record(
+                    "recovery-anchor-intent",
+                    legacy.value.revision_id.as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !node
+                .control
+                .paged_data_anchor_is_pinned(old_manifest.anchor_id)
+                .unwrap()
+        );
+        assert!(
+            !node
+                .control
+                .paged_data_anchor_is_pinned(partial.anchor)
+                .unwrap()
+        );
+        assert!(
+            node.control
+                .get_record("anchor-retirement", partial.anchor.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        let mut advanced_twice = 0;
+        for original in originals {
+            let current = node
+                .control
+                .paged_revision_data_source(original.catalog.bundle.id, original.source.sector.id)
+                .unwrap()
+                .unwrap();
+            if original.catalog.bundle.id == partial.catalog.bundle.id
+                && original.source.sector.id == partial.source.sector.id
+            {
+                assert_eq!(current.generation, 2);
+                advanced_twice += 1;
+            } else {
+                assert_eq!(current.generation, 1);
+            }
+            assert_ne!(current.anchor, original.anchor);
+            assert!(
+                node.control
+                    .paged_data_anchor_is_pinned(current.anchor)
+                    .unwrap()
+            );
+            assert_eq!(
+                crate::PagedPrivateMetadata::render_local_data_sector(
+                    &node.control,
+                    &node.keys,
+                    current.catalog.bundle.id,
+                    current.source.sector.id,
+                    current.catalog.bundle.scope
+                )
+                .unwrap(),
+                Some(ciphertexts[&current.source.sector.id].clone())
+            );
+            assert!(
+                !crate::snapshot::local_recipe_is_inline(&node.control, &current.source.sector.id)
+                    .unwrap()
+            );
+            let retry = crate::PagedPrivateMetadata::replace_local_data_source(
+                &node.control,
+                &node.keys,
+                &original,
+                original.catalog.bundle.scope,
+                &crate::snapshot::stable_source_for_catalog_migration(
+                    &node.control,
+                    guild,
+                    &current.source.sector,
+                )
+                .unwrap(),
+            );
+            assert_eq!(retry.is_ok(), current.generation == 1);
+        }
+        assert_eq!(advanced_twice, 1);
+        assert_eq!(std::fs::read(ordinary.join("nested/dense")).unwrap(), dense);
         assert_eq!(
             node.prepared_revision_bytes(guild, legacy.value.revision_id)
                 .unwrap(),

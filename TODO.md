@@ -20,10 +20,10 @@ exact Git bytes, recoverable retention/prune, seed-only recovery where promised,
 and versioned local/wire compatibility as production requirements. Historical
 passing tests below apply only to their recorded source and exercised cases.
 
-Source review on 2026-10-07 through `5f8c789` confirms progress toward the
-capacity/recovery gates, with two open R3 corrections recorded below as
-`R3-MIGRATION-RECOVERY` and `R3-DISCOVERY-RESTART`. Prioritize their correction
-and an end-to-end retained-migration/source-loss recovery slice before exposing
+Source review on 2026-10-07 through `5f8c789` identified two R3 corrections
+recorded below as `R3-MIGRATION-RECOVERY` and `R3-DISCOVERY-RESTART`. Discovery
+restart is corrected; retained migration/recovery coexistence is implemented
+with peer qualification pending. Finish that qualification before exposing
 migration. Milestone 6 remains open, including the existing R1/R2/R3/R5/R7 and
 native platform gates. This review used source inspection only; it ran no builds,
 tests, daemons or runtime probes and supplies no new runtime qualification.
@@ -1284,12 +1284,30 @@ tests, daemons or runtime probes and supplies no new runtime qualification.
     ownership transfer, or preserve ordinary flat recovery until that integration
     exists, without weakening authentication, generation fences or pin ownership.
     Resolve this coexistence blocker before exposing migration.
-    Acceptance (pending): protect a flat native/Git revision, retain its paged
+    Implemented: historical data alone may use a flat recovery recipe whose
+    reference, scope and ciphertext commitments match its live retained owner.
+    Scoped paged-only data still requires explicit stable replacement. Ordinary
+    restore/replay re-anchors missing retained sources and visits every owner
+    through an indexed bounded cursor, transferring each source/generation and
+    both anchor counts atomically. The recovery intent owns a completed capture
+    across interruption; if the restored tree disappears, its pinned capture
+    moves atomically to the existing retirement journal before a fresh restore.
+    Discard refuses pinned captures; cleanup waits for replacement ownership.
+    Final flat publication rejects ignored writes without retiring its intent.
+    Acceptance (peer qualification pending): protect a flat native/Git revision, retain its paged
     successor, lose the source/anchor while preserving control state, and restore
     the original revision through ordinary peer recovery. Verify exact bytes,
     source replacement and shared-owner pins across interruption/reopen/retry;
-    reject corrupt recovery bytes and stale replacement attempts. Source-only
-    finding; no corrective implementation or runtime validation yet.
+    reject corrupt recovery bytes and stale replacement attempts.
+    Current validation: the four-layout historical data recovery fixture,
+    indexed owner/tombstone cursor and ignored-write finalization fixtures pass.
+    Disposable Btrfs passes shared-owner native migration, source/anchor loss,
+    corrupt repair rejection, interruption after one transfer, loss of the
+    restored tree, capture retirement, reopen/retry, exact sparse/hard-link bytes,
+    generation fences and unchanged flat revision records. Mount/image/loop
+    cleanup is verified. Strict workspace/all-targets Clippy and the locked
+    all-targets test build pass. The full ordinary workspace and expanded
+    five-peer native Git source-loss gate are being qualified; R3 remains open.
   - [ ] Complete legacy retained-revision migration through normal native
     capture/restore, checkpoint/retention and seed-only consumers before
     enabling the new format.
