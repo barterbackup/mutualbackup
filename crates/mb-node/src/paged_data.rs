@@ -231,6 +231,17 @@ impl PagedDataSource {
         scope: CatalogScope,
         record: &CatalogSectorRecord,
     ) -> Result<Vec<u8>> {
+        self.render_at_hint(keys, scope, record, None)
+            .map(|(bytes, _)| bytes)
+    }
+
+    fn render_at_hint(
+        &self,
+        keys: &KeyMaterial,
+        scope: CatalogScope,
+        record: &CatalogSectorRecord,
+        hint: Option<&std::path::Path>,
+    ) -> Result<(Vec<u8>, std::path::PathBuf)> {
         if let Some(binding) = &self.legacy {
             ensure!(
                 binding.scope == scope && &binding.source == record,
@@ -238,7 +249,7 @@ impl PagedDataSource {
             );
         }
         self.anchor
-            .render_with_binding(keys, scope, record, self.legacy.as_ref())
+            .render_with_binding(keys, scope, record, self.legacy.as_ref(), hint)
     }
 }
 
@@ -249,7 +260,8 @@ impl PagedAnchorSectorSource {
         scope: CatalogScope,
         record: &CatalogSectorRecord,
         legacy: Option<&LegacyDataBinding>,
-    ) -> Result<Vec<u8>> {
+        hint: Option<&std::path::Path>,
+    ) -> Result<(Vec<u8>, std::path::PathBuf)> {
         let CatalogScope::Dataset {
             guild_id,
             owner,
@@ -270,7 +282,7 @@ impl PagedAnchorSectorSource {
             .offset
             .checked_add(len as u64)
             .ok_or_else(|| anyhow::anyhow!("stable data range overflows"))?;
-        let mut file = self.locator.open()?;
+        let (mut file, resolved_area) = self.locator.open_with_area_hint(hint)?;
         ensure!(
             end <= file.metadata()?.len(),
             "stable source range exceeds its file"
@@ -301,7 +313,7 @@ impl PagedAnchorSectorSource {
             reference == record.sector && merkle_commit(&ciphertext)? == record.commitment,
             "stable source differs from its signed ciphertext commitments"
         );
-        Ok(ciphertext)
+        Ok((ciphertext, resolved_area))
     }
 }
 
@@ -331,6 +343,7 @@ impl PagedPrivateMetadata {
         )
     }
 
+    /// Read retained data using saved location hints without updating the catalog.
     pub fn render_local_data_sector(
         control: &ControlStore,
         keys: &KeyMaterial,
@@ -342,20 +355,35 @@ impl PagedPrivateMetadata {
             return Ok(None);
         };
         Ok(Some(Self::render_data_source(
+            control,
             keys,
             &source,
             expected_scope,
+            false,
         )?))
     }
 
     pub(super) fn render_data_source(
+        control: &ControlStore,
         keys: &KeyMaterial,
         source: &mb_store::PagedCatalogDataSource,
         expected_scope: CatalogScope,
+        update_area_hint: bool,
     ) -> Result<Vec<u8>> {
         Self::open_local_snapshot(keys, &source.catalog, expected_scope)?;
         let recipe = PagedDataSource::decode(&source.recipe, source.anchor)?;
-        recipe.render(keys, source.catalog.bundle.scope, &source.source)
+        let area_id = recipe.anchor.locator.area.area_id;
+        let hint = crate::snapshot::anchor_area_hint(control, area_id)?;
+        let (ciphertext, resolved) = recipe.render_at_hint(
+            keys,
+            source.catalog.bundle.scope,
+            &source.source,
+            hint.as_deref(),
+        )?;
+        if update_area_hint && hint.as_ref() != Some(&resolved) {
+            crate::snapshot::remember_anchor_area_location(control, area_id, &resolved)?;
+        }
+        Ok(ciphertext)
     }
 }
 

@@ -1223,9 +1223,16 @@ passing tests below apply only to their recorded source and exercised cases.
     Busy scans do not block unrelated area lookups. Existing native-bound Git
     catalogs retain unavailable sources for repair; unbound catalogs still fail
     without native provenance. Validation is recorded in ADR 0002.
-  - [ ] Complete stable anchor relocation discovery integration. Persist useful
-    location hints for paged sources and provide restart/eviction-safe progress
-    for scans that outlive one process. Qualify absent/moved areas, reopen and
+  - [x] Use bounded durable area hints when rendering retained paged data.
+    Ordinary serving remembers a resolved raw path only after authenticating
+    source addresses and ciphertext commitments. Explicit data reads and the
+    propagated read-only renderer consume hints without updating them. Legacy
+    stable reads also delay writes until source verification succeeds. Saved
+    hint reads bound SQL payload allocation; malformed paths are ignored and
+    oversized records fail closed. Validation is recorded in ADR 0002.
+  - [ ] Complete stable anchor relocation discovery integration. Provide
+    restart/eviction-safe progress for scans that outlive one process and
+    integrate operational retry/recovery. Qualify absent/moved areas, reopen and
     source loss without blocking unrelated lookups, including the declared
     1 TiB dataset/history geometry and physical mount/remount lifecycle.
   - [ ] Migrate revision/Git admission, packing, coding/checkpoint replay,

@@ -345,6 +345,7 @@ impl PagedPrivateMetadata {
         keys: &KeyMaterial,
         sector_id: [u8; 32],
         expected_guild: Option<&[u8; 32]>,
+        update_area_hint: bool,
     ) -> Result<Option<Vec<u8>>> {
         if let Some(bytes) = Self::render_local_bootstrap(control, keys, sector_id, expected_guild)?
         {
@@ -361,7 +362,7 @@ impl PagedPrivateMetadata {
         );
         let bytes = match source {
             mb_store::PagedCatalogSectorSource::Data(source) => {
-                Self::render_data_source(keys, &source, scope)?
+                Self::render_data_source(control, keys, &source, scope, update_area_hint)?
             }
             mb_store::PagedCatalogSectorSource::Page(source) => {
                 // The second read rechecks this exact immutable owner together
@@ -1342,7 +1343,11 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("protected");
             std::fs::create_dir(&root).unwrap();
-            let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+            let mut area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+            // Keep fallback qualification within this disposable namespace.
+            area.volume_root_hint = temp.path().to_path_buf();
+            let original_area = area.path_hint.clone();
+            let area_id = area.area_id;
             let anchor_id = Uuid::new_v4();
             let directory = area.path_hint.join(anchor_id.to_string());
             std::fs::create_dir(&directory).unwrap();
@@ -1403,6 +1408,81 @@ mod tests {
                 )
             };
             assert_eq!(render().unwrap(), Some(ciphertext.clone()));
+            assert_eq!(
+                crate::snapshot::render_sector(&store, &keys(), &sector, Some(&[73; 32])).unwrap(),
+                ciphertext
+            );
+            assert_eq!(
+                crate::snapshot::anchor_area_hint(&store, area_id).unwrap(),
+                Some(original_area.clone())
+            );
+            let saved_hint = store
+                .get_record("anchor-area-location", area_id.as_bytes())
+                .unwrap();
+            use std::os::unix::ffi::OsStringExt;
+            let moved = temp.path().join(std::ffi::OsString::from_vec(
+                b".mutualbackup-anchors-moved-\xff".to_vec(),
+            ));
+            std::fs::rename(&original_area, &moved).unwrap();
+            let readonly = ControlStore::open_existing_read_only_with_key(&path, &[7; 32]).unwrap();
+            let mut readonly_bytes = None;
+            for _ in 0..100 {
+                match PagedPrivateMetadata::render_local_sector(
+                    &readonly,
+                    &keys(),
+                    sector,
+                    Some(&[73; 32]),
+                    false,
+                ) {
+                    Ok(bytes) => {
+                        readonly_bytes = bytes;
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<mb_store::AnchorError>(),
+                            Some(mb_store::AnchorError::AnchorAreaDiscoveryPending)
+                        ) => {}
+                    Err(error) => panic!("{error:#}"),
+                }
+            }
+            drop(readonly);
+            assert_eq!(readonly_bytes, Some(ciphertext.clone()));
+            assert_eq!(
+                store
+                    .get_record("anchor-area-location", area_id.as_bytes())
+                    .unwrap(),
+                saved_hint
+            );
+            assert_eq!(render().unwrap(), Some(ciphertext.clone()));
+            assert_eq!(
+                crate::snapshot::render_sector(&store, &keys(), &sector, Some(&[73; 32])).unwrap(),
+                ciphertext
+            );
+            assert_eq!(
+                crate::snapshot::anchor_area_hint(&store, area_id).unwrap(),
+                Some(moved.clone())
+            );
+            // A second rename uses a durable hint outside automatic discovery's
+            // name prefix. Neither the old locator nor its cached path works.
+            let final_area = temp
+                .path()
+                .join(std::ffi::OsString::from_vec(b"relocated-\xfe".to_vec()));
+            std::fs::rename(&moved, &final_area).unwrap();
+            crate::snapshot::remember_anchor_area_location(&store, area_id, &final_area).unwrap();
+            let readonly = ControlStore::open_existing_read_only_with_key(&path, &[7; 32]).unwrap();
+            assert_eq!(
+                PagedPrivateMetadata::render_local_data_sector(
+                    &readonly,
+                    &keys(),
+                    signed.value.revision_id,
+                    sector,
+                    scope(),
+                )
+                .unwrap(),
+                Some(ciphertext.clone())
+            );
+            drop(readonly);
             let other = KeyMaterial::from_seed(&Seed::from_bytes([1; 32]));
             assert!(
                 PagedPrivateMetadata::render_local_data_sector(
@@ -1431,10 +1511,23 @@ mod tests {
                 )
                 .is_err()
             );
+            store
+                .delete_record("anchor-area-location", area_id.as_bytes())
+                .unwrap();
+            std::fs::rename(&final_area, &original_area).unwrap();
+            let file = original_area.join(anchor_id.to_string()).join("payload");
             let mut changed = contents.clone();
             changed[4] ^= 1;
             std::fs::write(&file, changed).unwrap();
             assert!(render().is_err());
+            assert!(
+                crate::snapshot::render_sector(&store, &keys(), &sector, Some(&[73; 32])).is_err()
+            );
+            assert!(
+                crate::snapshot::anchor_area_hint(&store, area_id)
+                    .unwrap()
+                    .is_none()
+            );
             std::fs::write(&file, &contents).unwrap();
             assert_eq!(render().unwrap(), Some(ciphertext));
             std::fs::remove_file(&file).unwrap();

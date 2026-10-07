@@ -56,6 +56,41 @@ struct RawLocalPath(
     #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))] PathBuf,
 );
 
+const MAX_ANCHOR_LOCATION_BYTES: usize = 4_096;
+const MAX_ENCODED_ANCHOR_LOCATION_BYTES: usize = MAX_ANCHOR_LOCATION_BYTES + 16;
+
+pub(super) fn anchor_area_hint(control: &ControlStore, area_id: Uuid) -> Result<Option<PathBuf>> {
+    Ok(control
+        .get_record_bounded(
+            ANCHOR_AREA_LOCATION_KIND,
+            area_id.as_bytes(),
+            MAX_ENCODED_ANCHOR_LOCATION_BYTES,
+        )?
+        .and_then(|bytes| decode_canonical::<RawLocalPath>(&bytes).ok())
+        .map(|path| path.0)
+        .filter(|path| path.as_os_str().as_encoded_bytes().len() <= MAX_ANCHOR_LOCATION_BYTES))
+}
+
+pub(super) fn remember_anchor_area_location(
+    control: &ControlStore,
+    area_id: Uuid,
+    path: &Path,
+) -> Result<()> {
+    ensure!(
+        path.as_os_str().as_encoded_bytes().len() <= MAX_ANCHOR_LOCATION_BYTES,
+        "anchor location exceeds its bounded local encoding"
+    );
+    control.put_record(
+        ANCHOR_AREA_LOCATION_KIND,
+        area_id.as_bytes(),
+        &mb_core::canonical_bytes_bounded(
+            &RawLocalPath(path.to_path_buf()),
+            MAX_ENCODED_ANCHOR_LOCATION_BYTES,
+        )?,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 type RestoreRenameHook = Box<dyn FnOnce() -> Result<()>>;
 
@@ -1711,8 +1746,9 @@ pub(crate) fn install_recovered_sector_recipe(
                 // Lost file/blob sources must use the stable replacement API;
                 // do not create an independently retained Inline copy.
                 ensure!(
-                    crate::PagedPrivateMetadata::render_data_source(keys, &source, scope)?
-                        == ciphertext,
+                    crate::PagedPrivateMetadata::render_data_source(
+                        control, keys, &source, scope, true
+                    )? == ciphertext,
                     "recovered data differs from its retained stable source"
                 );
             }
@@ -2924,6 +2960,7 @@ fn render_sector_with_hint_update(
         keys,
         *sector_id,
         expected_guild,
+        update_area_hint,
     )? {
         return Ok(ciphertext);
     }
@@ -2939,6 +2976,7 @@ fn render_sector_with_hint_update(
             && recipe.reference.logical_len as usize <= V1_SECTOR_SIZE,
         "local sector recipe has an invalid source ID or length"
     );
+    let mut resolved_hint = None;
     let plaintext = match &recipe.source {
         LocalPlaintextSource::AnchorFile { locator, offset } => {
             let mut file = locator.open().context("open source anchor")?;
@@ -2948,19 +2986,12 @@ fn render_sector_with_hint_update(
             plaintext
         }
         LocalPlaintextSource::StableAnchorFile { locator, offset } => {
-            let area_hint = control
-                .get_record(ANCHOR_AREA_LOCATION_KIND, locator.area.area_id.as_bytes())?
-                .and_then(|bytes| decode_canonical::<RawLocalPath>(&bytes).ok())
-                .map(|path| path.0);
+            let area_hint = anchor_area_hint(control, locator.area.area_id)?;
             let (mut file, resolved_area) = locator
                 .open_with_area_hint(area_hint.as_deref())
                 .context("open stable source anchor")?;
             if update_area_hint && area_hint.as_ref() != Some(&resolved_area) {
-                control.put_record(
-                    ANCHOR_AREA_LOCATION_KIND,
-                    locator.area.area_id.as_bytes(),
-                    &canonical_bytes(&RawLocalPath(resolved_area.clone()))?,
-                )?;
+                resolved_hint = Some((locator.area.area_id, resolved_area));
             }
             file.seek(SeekFrom::Start(*offset))?;
             let mut plaintext = vec![0_u8; recipe.reference.logical_len as usize];
@@ -3000,6 +3031,9 @@ fn render_sector_with_hint_update(
     )?;
     if actual_reference != recipe.reference {
         bail!("source anchor no longer matches the committed sector root");
+    }
+    if let Some((area_id, path)) = resolved_hint {
+        remember_anchor_area_location(control, area_id, &path)?;
     }
     Ok(ciphertext)
 }
@@ -4425,6 +4459,90 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_source_location_hints_are_bounded_and_written_only_after_verified_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        let area_id = area.area_id;
+        let anchor_id = Uuid::new_v4();
+        let directory = area.path_hint.join(anchor_id.to_string());
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("payload");
+        fs::write(&file, b"modified").unwrap();
+        let path = temp.path().join("control.db");
+        let control = ControlStore::open_with_key(&path, &[9; 32]).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([8; 32]));
+        let guild = [7; 32];
+        let (reference, ciphertext) =
+            encrypted_sector(&keys.guild_data_key(&guild), [6; 32], b"verified").unwrap();
+        let recipe = LocalSectorRecipe {
+            guild_id: guild,
+            reference: reference.clone(),
+            source: LocalPlaintextSource::StableAnchorFile {
+                locator: StableAnchorFileLocator {
+                    area: area.clone(),
+                    anchor_id,
+                    relative_path: "payload".into(),
+                },
+                offset: 0,
+            },
+        };
+        control
+            .put_record(
+                "local-sector",
+                &reference.id,
+                &canonical_bytes(&recipe).unwrap(),
+            )
+            .unwrap();
+        assert!(render_sector(&control, &keys, &reference.id, Some(&guild)).is_err());
+        assert!(anchor_area_hint(&control, area_id).unwrap().is_none());
+        fs::write(&file, b"verified").unwrap();
+        let readonly = ControlStore::open_existing_read_only_with_key(&path, &[9; 32]).unwrap();
+        assert_eq!(
+            render_sector_with_hint_update(&readonly, &keys, &reference.id, Some(&guild), false)
+                .unwrap(),
+            ciphertext
+        );
+        drop(readonly);
+        assert!(anchor_area_hint(&control, area_id).unwrap().is_none());
+        assert_eq!(
+            render_sector(&control, &keys, &reference.id, Some(&guild)).unwrap(),
+            ciphertext
+        );
+        assert_eq!(
+            anchor_area_hint(&control, area_id).unwrap(),
+            Some(area.path_hint)
+        );
+
+        control
+            .put_record(ANCHOR_AREA_LOCATION_KIND, area_id.as_bytes(), &[255])
+            .unwrap();
+        assert!(anchor_area_hint(&control, area_id).unwrap().is_none());
+        control
+            .put_record(
+                ANCHOR_AREA_LOCATION_KIND,
+                area_id.as_bytes(),
+                &vec![0; MAX_ENCODED_ANCHOR_LOCATION_BYTES + 1],
+            )
+            .unwrap();
+        assert!(anchor_area_hint(&control, area_id).is_err());
+        control
+            .delete_record(ANCHOR_AREA_LOCATION_KIND, area_id.as_bytes())
+            .unwrap();
+        assert!(
+            remember_anchor_area_location(
+                &control,
+                area_id,
+                Path::new(&"x".repeat(MAX_ANCHOR_LOCATION_BYTES + 1))
+            )
+            .is_err()
+        );
+        assert!(anchor_area_hint(&control, area_id).unwrap().is_none());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -1411,3 +1411,42 @@ remain open. Repeated short-lived commands can currently restart a long scan;
 valid durable hints avoid discovery, but the cursor itself is not durable. The
 first-release capacity target remains 1 TiB per dataset including retained history,
 subject to real-data qualification before production admission.
+
+### Durable paged source location hints (2026-10-07)
+
+Retained paged data rendering now consults the existing `anchor-area-location`
+records before relocation discovery. Ordinary sector serving remembers the
+resolved raw path only after dataset/root authority, the selected address policy,
+exact sector reference and Merkle commitment have all passed. The explicit
+revision/data read API remains nonmutating. The ordinary renderer's read-only
+flag now propagates through paged routing, so a read-only control catalog can
+consume a hint or advance process-local discovery without attempting a SQL write.
+Hints remain local location assistance; they do not replace source authority or
+change signed revision, source recipe, pin or wire locator bytes.
+
+Shared hint reads use SQL-bounded payload allocation (4,112 encoded bytes) and
+accept paths of at most 4,096 bytes. Malformed encodings are ignored as before;
+oversized records fail closed before payload allocation. Writes use the same
+canonical raw-path encoding and size bounds. Legacy stable-source rendering also
+uses these helpers and now delays hint publication until its ciphertext reference
+has been verified. Previously a source that opened but produced invalid bytes
+could update its location hint before rendering failed.
+
+The native/Git paged fixture now moves an area to a raw Unix path, exercises
+incremental discovery through an actual read-only database, checks unchanged
+saved hints, and verifies ordinary serving's authenticated update. A second move
+invalidates both the serialized and cached paths and uses a durable raw-path hint
+outside the discovery prefix after database reopen. Corrupt bytes cannot create
+a new hint. A new legacy fixture covers the same verification-before-write and
+read-only behavior, malformed/oversized SQL records and overlong write paths.
+All 47 locked workspace/all-targets paged tests pass (five core, seven Git,
+18 Node and 17 store), as do all 31 ordinary metadata/restore compatibility tests;
+eight provisioned compatibility cases remain ignored. The full all-targets test
+build, formatting, diff checks and strict locked workspace/all-targets Clippy
+pass. No complete ordinary Node rerun or physical Btrfs/remount, topology,
+platform or real 1 TiB release qualification ran for this hint integration.
+
+Valid saved locations survive database reopen, but scan cursors remain
+process-local. Restart/eviction-safe progress, operational retry/recovery and
+physical relocation/source-loss qualification remain required before production
+admission. The 1 TiB target includes retained history and is still unqualified.

@@ -1469,8 +1469,12 @@ reads enforce mount boundaries and retain accessible-candidate ambiguity checks;
 work/resource exhaustion returns explicit retry/location errors instead of source
 absence. The index and shared directory-handle budget are bounded. Already native
 Git catalogs keep unavailable copies for repair; unbound catalogs still require
-provenance. Durable paged hints, restart/eviction-safe progress, physical lifecycle
-and real 1 TiB dataset/history qualification remain required.
+provenance. Retained paged rendering now consults bounded durable raw-path hints;
+ordinary serving remembers locations only after source authentication, and
+explicit/read-only reads keep the catalog unchanged. Legacy stable rendering
+also delays hint writes until successful verification. Restart/eviction-safe
+progress, operational retry/recovery, physical lifecycle and real 1 TiB dataset/
+history qualification remain required.
 
 ### Historical implementation and validation record (before scope correction)
 
