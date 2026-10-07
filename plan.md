@@ -1589,6 +1589,15 @@ This implements a bounded codec prerequisite. Full source/proof/authority joins,
 paged checkpoint publication, normal consumer migration, quotas and the real
 retained 1 TiB gate remain required. ADR 0002 records the limits and evidence.
 
+The source-proof codec now groups a single identity/commitment with bounded
+64-proof fragments, verifying unique source order, complete chunk coverage and
+every Merkle opening. Exact counts and EOF are mandatory; failures fence further
+use. All 129 core tests and strict workspace/all-targets Clippy pass. This supplies
+the second packing stream. Bounded disk-backed descriptor/proof/authority joins,
+enclosing aggregate capacity, signed publication and consumer migration remain
+the next production work; earlier workspace/native evidence above belongs to
+its recorded descriptor source.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

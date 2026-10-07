@@ -1348,9 +1348,24 @@ separately below.
     Btrfs retained native migration/recovery passes in 28.07 seconds. All 233
     tracked file and both test-binary hashes match before/after; mount/image/loop
     cleanup and independent resource checks pass.
-    Full source uniqueness/coverage/proof and authority joins, enclosing paged
+    Full descriptor/source uniqueness, coverage, proof and authority joins, enclosing paged
     packing/checkpoint publication, quota reservations, normal consumer activation
     and real retained 1 TiB qualification remain open. See ADR 0002.
+  - [x] Add ordered complete-source proof streams for paged packing. Each
+    source identity/commitment appears once, followed by exact-size fragments
+    of at most 64 compact proofs. Records decode within 39,232 bytes; typed roots
+    within 512 bytes. Readers reject duplicate/out-of-order source identities,
+    incomplete/reordered chunks and altered Merkle openings with constant
+    catalog state. Counts cover unique complete ciphertext sources, and do not
+    establish descriptor coverage or signed source authority. Validation: all
+    129 core tests and strict locked workspace/all-targets Clippy pass, including
+    multi-page sources, 16-byte/4-MiB profile boundaries, maximum proof depth,
+    malformed nested lengths and failure fencing. No normal consumer is
+    activated. Descriptor/proof/source-authority joins and enclosing
+    packing/checkpoint/coding publication remain open; see ADR 0002.
+  - [ ] Derive and enforce the enclosing packing/coding metadata capacity across
+    descriptor, source-proof and coding streams for the required retained 1 TiB
+    geometry. Individual stream caps do not qualify their combined admission.
   - [ ] Add quota reservations, remaining bounded packing/coding record
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,

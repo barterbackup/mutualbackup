@@ -2173,3 +2173,44 @@ Source authentication, unique/complete source joins, coding records, enclosing
 packing/checkpoint publication, retained-history quota reservations, incremental
 edits and normal capture/recovery consumer activation remain open. This codec
 does not qualify real 1 TiB retained dataset capacity or close R3/M6.
+
+### Ordered complete-source packing proofs (2026-10-07)
+
+`CatalogPackedSourceRoot` supplies the second guild-scoped Packing stream. Each
+source header binds owner, protected root, object ID and one complete ciphertext
+Merkle commitment. Headers occur in strictly increasing source-ID order, so
+duplicate sources reject with fixed state. Exactly the profile's number of
+chunk proofs follow in fragments of at most 64 entries. Each entry contains its
+subtree root and at most 18 siblings; chunk/start-leaf/leaf-count fields derive
+from the fragment position and validated profile. Every reconstructed version-one
+opening must verify against that source's commitment. Thus complete proof
+coverage and one consistent commitment are checked without a catalog-sized map
+or repeated per-chunk source identities/commitments.
+
+Nested proof and sibling lengths are bounded during decode. Records have a
+39,232-byte cap within the existing generic record limit; fixed roots have a
+512-byte decode cap. Roots bind the profile, exact record/source/chunk counts and
+complete ciphertext byte total. Those byte counts are distinct from retained
+plaintext size or quota accounting. Readers verify totals and complete active
+sources before yielding the declared final record; authenticated EOF remains
+mandatory. All semantic, encode, storage and fetch errors fence further use.
+
+Qualification: all 129 core tests and strict locked workspace/all-targets Clippy
+pass, with formatting and diff checks. Tests cover 512 ordered sources across
+many pages, one source whose proofs cross page boundaries, incomplete fragments,
+duplicate/out-of-order identities, wrong offsets and reordered/corrupt openings,
+substituted summaries, unfulfilled record counts, oversized nested declarations,
+truncation/noncanonical bytes and callback/page corruption. Minimum one-leaf
+sources and the maximum 4-MiB/16-byte profile's 18-sibling paths are exercised;
+incomplete maximum-profile sources cannot finish. This increment changes no
+existing signed catalog or active consumer. The preceding 911-test workspace
+and native recovery gate qualified `5579541`, before this new codec was added.
+
+The next consumer must join every descriptor slot to exactly one source proof,
+reject incomplete/duplicate descriptor coverage, check virtual-zero and packed
+Merkle composition and bind each source commitment to verified revision/member
+authority. Enclosing packing/coding metadata capacity must account for all
+streams at the declared retained 1 TiB geometry; per-stream limits alone do not
+qualify the aggregate. Bounded scratch/index ownership, quota reservations,
+signed checkpoint publication and normal capture/retention/recovery activation
+remain required. R3 and M6 remain open.
