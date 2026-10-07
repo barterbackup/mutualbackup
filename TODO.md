@@ -1432,6 +1432,14 @@ separately below.
     checkpoint authority, private joins, current guild-event fence rechecks,
     coding, quotas, normal publication/retention/seed-only activation and real
     retained 1 TiB qualification remain open. See ADR 0002.
+    Exact-source follow-up on `b509ac4`: locked workspace passes 935 tests,
+    zero failed, 116 ignored (418 ordinary Node and 166 ordinary store); the
+    corrected packed-group fixture and locked all-targets test build pass.
+    Provisioned retained native Btrfs recovery passes in 29.68 seconds, with all
+    236 tracked-file and both workspace test-binary hashes unchanged. Runner and
+    independent mount/loop/namespace/disposable-directory checks pass. This
+    supersedes pending workspace requalification above; original R5, exact
+    release/platform and real retained 1 TiB gates remain open.
   - [x] Replace the Linux whole-filesystem lookup under the global mutex with
     bounded process-local relocation cursors. Each lookup advances at most 2,048
     steps with a cooperative 25 ms deadline; incomplete work returns an explicit

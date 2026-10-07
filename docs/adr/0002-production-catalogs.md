@@ -2400,3 +2400,14 @@ remain mandatory. A concurrent rotation/removal may supersede the base without
 changing its checkpoint hash. A paged checkpoint authority constructor and
 normal capture/packing/coding/checkpoint/retention/seed-only consumer migration,
 incremental edits, real retained 1 TiB and release/platform gates remain open.
+
+Exact-source qualification on `b509ac4`: the locked workspace passes 935 tests,
+zero failed, 116 ignored, including all 418 ordinary Node and 166 ordinary store
+tests. The corrected mixed packed-group fixture passes in the workspace run.
+The locked workspace/all-targets test build passes. Provisioned retained native
+Btrfs migration/recovery passes in 29.68 seconds. All 236 tracked-file and both
+workspace test-binary hashes match before/after native recovery; runner cleanup
+and independent mount/loop/namespace/disposable-directory checks pass. This
+supersedes the pending workspace requalification above. It does not diagnose
+the original R5 stall or qualify release artifacts, other platforms or real
+retained 1 TiB data.

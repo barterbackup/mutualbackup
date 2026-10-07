@@ -1645,6 +1645,15 @@ private joins, current guild-event membership/writer fence rechecks, coding,
 quotas, normal retention/seed-only consumers and real retained 1 TiB gates
 remain required.
 
+Exact-source qualification on `b509ac4` passes the locked workspace with 935
+tests, zero failed, 116 ignored (418 ordinary Node and 166 ordinary store),
+including the corrected mixed packed-group fixture. The locked all-targets
+test build and provisioned retained native Btrfs recovery pass; recovery takes
+29.68 seconds. All 236 tracked-file and both workspace test-binary hashes match
+before/after, with runner and independent resource cleanup verified. This
+supersedes pending workspace requalification above while preserving the original
+R5, release/platform and real retained 1 TiB gates.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to
