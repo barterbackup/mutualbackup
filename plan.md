@@ -1531,20 +1531,26 @@ full physical lifecycle and real 1 TiB dataset/history qualification remain
 required.
 
 The 2026-10-07 source-only review through `5f8c789` identified two R3 recovery
-corrections. R3-DISCOVERY-RESTART is now corrected as recorded below;
-R3-MIGRATION-RECOVERY remains open:
+corrections. Both are now corrected and qualified as recorded below:
 
-- **R3-MIGRATION-RECOVERY:** Explicit Node/library retained migration shares
-  the original legacy data-sector IDs. With `control.db` retained after anchor
-  loss, ordinary network snapshot repair can reconstruct authenticated
-  ciphertext but its Data installer still calls `render_data_source` against
-  the missing original anchor (`crates/mb-node/src/snapshot.rs`), blocking the
-  original flat snapshot restore. Unmigrated backups are unaffected. Connect
-  verified stable-anchor replacement to recovered-data installation before
-  exposing migration, preserving authentication, generation fencing and atomic
-  anchor-pin transfer. Require an end-to-end migration/source-loss regression
-  that restores the original flat snapshot from peers after reopen, plus retry
-  and stale-replacement coverage.
+- **R3-MIGRATION-RECOVERY (corrected):** Explicit Node/library retained migration
+  shares original flat data-sector IDs. Repair previously retried the missing
+  native anchor even after reconstructing authenticated ciphertext. Historical
+  bindings now permit an exact authenticated flat recovery recipe; ordinary
+  restore/replay transfers retained sources to verified native replacements.
+  Per-owner generation fencing and both anchor counts commit atomically, while
+  a durable capture intent owns partially transferred output. Loss of the
+  restored tree moves its pinned capture to retirement before a fresh retry.
+  Native Btrfs verifies shared ownership, corrupt repair rejection, interruption,
+  reopen, lost staging, stale replacements and unchanged signed flat records.
+  The complete five-peer native Git gate verifies ordinary flat peer restore
+  after normal owner startup with control preserved and source/anchors erased,
+  then both complete owner losses, seed-only recoveries, exact Git interop and
+  physical history/shard reclamation. The locked ordinary workspace passes
+  900 tests on `270c040`; the test-only restart successor `b6e52bc` passes its
+  complete peer gate in 527.82 seconds. Exact-source/binary and cleanup audits,
+  formatting, strict Clippy and the all-targets build pass. ADR 0002 records the
+  implementation and qualification scope.
 - **R3-DISCOVERY-RESTART (corrected):** Reopening a saved relocation candidate with
   `PinnedDirectory::open` can return raw `Io(NotFound)` in
   `crates/mb-store/src/anchor/discovery.rs`. If that candidate moves within an
@@ -1559,16 +1565,16 @@ R3-MIGRATION-RECOVERY remains open:
   existing reset/CAS and all other ordinary store tests pass (150 tests;
   26 provisioned tests remain ignored).
 
-Prioritize this end-to-end migration/source-loss recovery slice next. Milestone 6
-remains open for these R3 corrections, normal paged capture/packing/checkpoint/
-retention and seed-only recovery, shared admission limits and quotas, and real
-**1 TiB including retained history** qualification. Preserve the remaining R1
+Continue normal paged capture/packing/checkpoint/retention and seed-only recovery
+migration next. Milestone 6 remains open for that production pipeline, shared
+admission limits and quotas, and real **1 TiB including retained history**
+qualification. Preserve the remaining R1
 legacy upgrade/export, R2 capacity, R5 topology/signature progress, R7 exact
 release-artifact and native-platform gates. The review identified no other severe
 regression in the inspected publication, native restore, Git graph validation,
-scratch allocation, coding bounds or atomic cache-write paths. It ran no builds,
-tests or runtime probes; existing validation remains historical evidence for
-the source it exercised.
+scratch allocation, coding bounds or atomic cache-write paths. The review itself
+ran no builds, tests or runtime probes; the subsequent correction qualification
+above is separate evidence for its recorded source.
 
 ### Historical implementation and validation record (before scope correction)
 

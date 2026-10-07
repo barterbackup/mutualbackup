@@ -21,12 +21,11 @@ and versioned local/wire compatibility as production requirements. Historical
 passing tests below apply only to their recorded source and exercised cases.
 
 Source review on 2026-10-07 through `5f8c789` identified two R3 corrections
-recorded below as `R3-MIGRATION-RECOVERY` and `R3-DISCOVERY-RESTART`. Discovery
-restart is corrected; retained migration/recovery coexistence is implemented
-with peer qualification pending. Finish that qualification before exposing
-migration. Milestone 6 remains open, including the existing R1/R2/R3/R5/R7 and
-native platform gates. This review used source inspection only; it ran no builds,
-tests, daemons or runtime probes and supplies no new runtime qualification.
+recorded below as `R3-MIGRATION-RECOVERY` and `R3-DISCOVERY-RESTART`. Both
+corrections are now implemented and qualified below. Milestone 6 remains open,
+including the existing R1/R2/R3/R5/R7 and native platform gates. The review itself
+used source inspection only; the corrections' runtime evidence is recorded
+separately below.
 
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
@@ -1270,7 +1269,7 @@ tests, daemons or runtime probes and supplies no new runtime qualification.
     Btrfs fixtures; locked all-targets build, formatting and strict Clippy pass.
     Details and validation are recorded in ADR 0002. Full dataset/history quotas, other filesystem
     writers, scheduling and other platforms remain separate production gates.
-  - [ ] **R3-MIGRATION-RECOVERY / P2 — Preserve ordinary legacy recovery after
+  - [x] **R3-MIGRATION-RECOVERY / P2 — Preserve ordinary legacy recovery after
     explicit retained migration.** Source review through `5f8c789` found that
     migration retains the original flat head and data-sector IDs, but adds paged
     ownership that intercepts ordinary snapshot repair. If the source anchor is
@@ -1294,10 +1293,10 @@ tests, daemons or runtime probes and supplies no new runtime qualification.
     moves atomically to the existing retirement journal before a fresh restore.
     Discard refuses pinned captures; cleanup waits for replacement ownership.
     Final flat publication rejects ignored writes without retiring its intent.
-    Acceptance (peer qualification pending): protect a flat native/Git revision, retain its paged
-    successor, lose the source/anchor while preserving control state, and restore
-    the original revision through ordinary peer recovery. Verify exact bytes,
-    source replacement and shared-owner pins across interruption/reopen/retry;
+    Acceptance qualified on Linux: protect a flat native/Git revision, retain its
+    paged successor, lose the source/anchor while preserving control state, reopen,
+    and restore the original revision through ordinary peer recovery. Verify
+    exact bytes, source replacement and shared-owner pins across interruption/reopen/retry;
     reject corrupt recovery bytes and stale replacement attempts.
     Current validation: the four-layout historical data recovery fixture,
     indexed owner/tombstone cursor and ignored-write finalization fixtures pass.
@@ -1305,9 +1304,20 @@ tests, daemons or runtime probes and supplies no new runtime qualification.
     corrupt repair rejection, interruption after one transfer, loss of the
     restored tree, capture retirement, reopen/retry, exact sparse/hard-link bytes,
     generation fences and unchanged flat revision records. Mount/image/loop
-    cleanup is verified. Strict workspace/all-targets Clippy and the locked
-    all-targets test build pass. The full ordinary workspace and expanded
-    five-peer native Git source-loss gate are being qualified; R3 remains open.
+    cleanup is verified. The locked workspace run on `270c040` passes 900 tests,
+    zero failed, 116 ignored (including 418 ordinary Node and 151 ordinary store
+    tests). The native fixture passes in 32.10 seconds; the complete expanded
+    five-peer Git gate passes in 680.38 seconds. Test-only successor `b6e52bc`
+    adds normal owner startup after source/anchor loss and before peer repair;
+    its complete gate passes in 527.82 seconds. Both retained owners acquire
+    verified replacement sources and pins, exact working/history bytes and refs
+    survive, and the existing two complete owner losses, seed-only recovery,
+    Git interoperability, grace retention and physical reclamation all pass.
+    Source and binary hashes match before/after each peer run; disposable
+    mount/image/loop cleanup and independent resource checks pass. Formatting,
+    strict locked workspace/all-targets Clippy and the locked all-targets test
+    build pass. These Linux library gates do not qualify the five-daemon topology,
+    release artifact, other platforms or real retained 1 TiB data; R3 remains open.
   - [ ] Complete legacy retained-revision migration through normal native
     capture/restore, checkpoint/retention and seed-only consumers before
     enabling the new format.

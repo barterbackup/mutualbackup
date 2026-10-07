@@ -2075,7 +2075,7 @@ This corrects coexistence with original flat backup/recovery. It does not
 activate paged capture, packing, checkpoint/retention or seed-only paged recovery,
 and does not qualify the retained 1 TiB production target or other platforms.
 
-Initial qualification: four supported historical private layouts (1/3/4/5)
+Qualification: four supported historical private layouts (1/3/4/5)
 pass authenticated flat data repair after anchor loss and reopen, including corrupt
 bytes, wrong guild and altered fallback rejection. The indexed owner cursor
 passes cancelled-owner, reopen and malformed-key cases; flat finalization passes
@@ -2084,7 +2084,27 @@ capture, two retained owners, a 1 TiB sparse file, source/anchor loss, ordinary
 restore, interruption after one transfer, loss of that restored tree, durable
 capture retirement and another restore after reopen. Exact bytes, hard links,
 source generations, stale replacement rejection, shared pins, retirement cleanup
-and original flat revision preservation are checked. The disposable mount, image
-and loop device were reclaimed. Strict workspace/all-targets Clippy and the locked
-all-targets test build pass. Full ordinary workspace and the expanded five-peer
-native Git source-loss qualification are pending at this increment.
+and original flat revision preservation are checked. This native gate passes in
+32.10 seconds on `270c040`. The locked ordinary workspace on that source passes
+900 tests, zero failed, 116 ignored, including 418 ordinary Node and 151 ordinary
+store tests. Ignored provisioned cases remain separate qualification obligations.
+
+The expanded complete five-peer native Git gate also passes on `270c040` in
+680.38 seconds. Test-only successor `b6e52bc` reloads the owner's control and
+volume state through normal startup after deleting its source and external
+anchors, retaining the existing exclusive data-directory claim. Local packed
+caches, recovery downloads and READY payloads are erased too, forcing ordinary
+flat peer reconstruction. That complete gate passes in 527.82 seconds: both
+retained owners move to generation-one native bindings with shared pins; exact
+working bytes, historical objects and refs survive; the signed checkpoint stays
+unchanged. The existing two subsequent complete owner losses, seed-only recovery,
+stock Git interoperability, grace-window protection, history-anchor reclamation,
+and expired packed-cache/READY-shard deletion continue to pass.
+
+Tracked source and test-binary hashes match before and after both peer runs.
+Disposable mounts, images and loops were reclaimed; independent checks find no
+remaining fixture mount, loop device or network namespace. Formatting, strict
+locked workspace/all-targets Clippy and the locked all-targets test build pass on
+the restart successor. These are Linux library gates, separate from the required
+five-daemon topology, exact release artifact, other platform and real retained
+1 TiB qualifications. R3 and M6 remain open.
