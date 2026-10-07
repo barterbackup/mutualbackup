@@ -90,6 +90,32 @@ pub(crate) fn failure_domain<'de, D: Deserializer<'de>>(decoder: D) -> Result<St
     decoder.deserialize_string(Domain)
 }
 
+// Preserve the generic SignedRecord layout while bounding signatures before
+// allocating from new paged authority records. Legacy decoders stay unchanged.
+fn signature<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
+    VecSeed::new(64).deserialize(decoder)
+}
+
+pub(crate) fn signed_record<'de, D, T>(decoder: D) -> Result<crate::SignedRecord<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    struct BoundedSigned<T> {
+        signer: crate::NodeId,
+        value: T,
+        #[serde(deserialize_with = "signature")]
+        signature: Vec<u8>,
+    }
+    let signed = BoundedSigned::<T>::deserialize(decoder)?;
+    Ok(crate::SignedRecord {
+        signer: signed.signer,
+        value: signed.value,
+        signature: signed.signature,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

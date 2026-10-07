@@ -1654,6 +1654,20 @@ before/after, with runner and independent resource cleanup verified. This
 supersedes pending workspace requalification above while preserving the original
 R5, release/platform and real retained 1 TiB gates.
 
+The checkpoint authority codec now streams ordered members, fences, retained
+tombstones, mixed legacy/paged revisions and migration evidence. Original
+legacy envelopes retain their signed bytes and identities behind bounded
+authenticated references. Exact summaries include authority pages, fixed root,
+legacy envelopes and paged source closures. The packing candidate cursor uses
+the same numeric chain order with bounded indexed reads. All 140 core and 166
+ordinary store tests and strict workspace/all-targets Clippy pass, including
+1,000 chained revisions, member/signature limits, original legacy signatures,
+corrupt tails and direct checked-candidate streaming; a fixed protocol root
+vector records the layout. Enclosing paged certificates/coding, complete
+authority joins and durable logical-reference ownership remain required before
+normal publication/retention/seed-only activation. Capacity/quotas, incremental
+work, real retained 1 TiB and original platform/release gates remain open.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

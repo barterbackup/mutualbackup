@@ -27,6 +27,8 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `PackedCatalog` | `id`, `format_version`, `revision`, `parent`, `profile`, `sectors`; each sector descriptor is ordered as `id`, `sector_index`, `flat_root`, `commitment`, `slots` | embedded in checkpoint version 7; the catalog ID and each sector ID are domain-separated BLAKE3 hashes of their canonical bodies |
 | `GuildCheckpoint` | versions 3–4: `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `writer_fences`, `revision_tombstones`, `revisions`, `coding_groups`; versions 5–6 append `authority`; version 7 appends `authority`, `packing_catalog` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes; version 6 introduces root-scoped revision/tombstone records and version 7 maps every retained signed sector through authenticated stable slots to packed coding sectors |
 | `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures; versions 3–4 require every listed member, while versions 5–7 require their epoch-bound guild quorum |
+| `CatalogCheckpointAuthorityRoot` (staging codec, format 1) | `format_version`, `generation`, `membership_epoch`, `records`, `summary` | must be authenticated by the future enclosing paged checkpoint; no standalone signature or activation |
+| `CatalogLegacyRevisionRef` (format 1) | `format_version`, `guild_id`, `owner`, `protected_root_id`, `revision_id`, `sequence`, `parent`, `writer_epoch`, `writer_public_key`, `revision_hash`, `body` | `body` authenticates the original signed legacy envelope through guild-scoped Checkpoint pages; original owner/writer domains and revision body hash remain unchanged |
 | `MemberSignature` | `signer`, `signature` | signature domain belongs to containing certificate |
 | `StorageAcknowledgement` | `format_version`, `operation_id`, `guild_id`, `group_id`, `shard_index`, `row`, `root`, `holder` | `mutualbackup/storage-acknowledgement/v1` |
 | `EndpointRecord` | `format_version`, `publisher`, `sequence`, `expires_at_unix_seconds`, `endpoints` | `mutualbackup/endpoint-record/v1` |
@@ -52,6 +54,35 @@ authenticate the roots; checkpoint authorization of the writer fence, complete
 private/source joins and durable ownership remain separate activation checks.
 Flat revision formats 3–5 and withdrawn private formats 6/7 are unchanged.
 Normal capture/checkpoint/recovery does not yet activate this migration codec.
+
+Checkpoint authority staging uses the appended public guild page section
+`Checkpoint` (Postcard discriminant 5). Authority record variants, in positional
+order, are `Member`, `WriterFence`, `Tombstone`, `LegacyRevision`, `PagedRevision`,
+`LegacyBinding`, `LegacyAttestation`. Legacy and paged revisions share one
+owner/protected-root/sequence/revision-ID order. Other phases are ordered by
+member ID, owner/epoch, owner/root, source identity and source identity/signer,
+respectively. The bounded local revision cursor uses a fixed 72-byte key with
+a big-endian sequence; it agrees with numeric ordering across varint boundaries.
+
+Authority records are bounded to 4 KiB, the root to 1 KiB, members to 256 and
+failure-domain strings to 256 UTF-8 bytes. New signed record signature vectors
+are bounded to 64 bytes before allocation. The summary fields are ordered as
+`members`, `writer_fences`, `tombstones`, `revisions`, `legacy_revisions`,
+`legacy_bytes`, `legacy_pages`, `source_bytes`, `source_pages`, `bindings`,
+`attestations`. The record stream, fixed root, referenced legacy envelopes and
+paged source roots share the existing 16 GiB represented-metadata and one-million
+page-occurrence budget. Repeated references count toward traversal work.
+`checkpoint-authority-v1.postcard.hex` freezes a deterministic 55-byte root
+binding mixed revisions and both legacy evidence variants.
+
+Each legacy envelope keeps its original 32 MiB cap and signed bytes; readers
+authenticate all referenced pages before decoding and matching the exact
+revision summary. Ordered authority-record EOF does not establish full source
+or legacy-body availability. Complete body/source traversal, membership/fence
+and tombstone joins, global revision-ID uniqueness, migration evidence quorum,
+private joins, durable transitive root ownership, coding and the enclosing
+checkpoint certificate remain required before signing or activation. No new
+checkpoint certificate version or peer publication path is enabled here.
 
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw

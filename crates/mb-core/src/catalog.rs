@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
+mod checkpoint_authority;
 mod file_recipes;
 mod files;
 mod native_files;
@@ -19,6 +20,12 @@ mod records;
 mod revision;
 mod sectors;
 mod splice;
+pub use checkpoint_authority::{
+    CATALOG_CHECKPOINT_RECORD_BYTES, CATALOG_CHECKPOINT_ROOT_BYTES,
+    CatalogCheckpointAuthorityBuilder, CatalogCheckpointAuthorityReader,
+    CatalogCheckpointAuthorityRecord, CatalogCheckpointAuthorityRoot,
+    CatalogCheckpointAuthoritySummary, CatalogCheckpointRevisionKey, CatalogLegacyRevisionRef,
+};
 pub use file_recipes::{
     CATALOG_FILE_SECTOR_REFS, CatalogFileExtent, CatalogFileRecipeBuilder, CatalogFileRecipeReader,
     CatalogFileRecipeRecord, CatalogFileRecipeRoot,
@@ -87,7 +94,10 @@ impl CatalogScope {
                 | CatalogSection::GitGraph
                 | CatalogSection::SectorReferences,
             ) if !protected_root_id.is_nil() => Ok(()),
-            (Self::Guild { .. }, CatalogSection::Packing | CatalogSection::Coding) => Ok(()),
+            (
+                Self::Guild { .. },
+                CatalogSection::Packing | CatalogSection::Coding | CatalogSection::Checkpoint,
+            ) => Ok(()),
             _ => Err(CatalogError::InvalidPage),
         }
     }
@@ -101,6 +111,7 @@ pub enum CatalogSection {
     SectorReferences,
     Packing,
     Coding,
+    Checkpoint,
 }
 
 impl CatalogSection {
@@ -859,7 +870,11 @@ mod tests {
     #[test]
     fn catalog_guild_sections_do_not_require_an_invented_dataset_owner() {
         let guild = CatalogScope::Guild { guild_id: [1; 32] };
-        for section in [CatalogSection::Packing, CatalogSection::Coding] {
+        for section in [
+            CatalogSection::Packing,
+            CatalogSection::Coding,
+            CatalogSection::Checkpoint,
+        ] {
             let mut builder = CatalogBuilder::new(guild, section).unwrap();
             assert!(CatalogBuilder::new(scope(), section).is_err());
             let mut encoded = Vec::new();

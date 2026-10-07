@@ -48,7 +48,7 @@ impl CatalogPackedSourceId {
         }
     }
 
-    fn validate(self) -> Result<(), CatalogError> {
+    pub(super) fn validate(self) -> Result<(), CatalogError> {
         if self.owner == NodeId([0; 32])
             || self.protected_root == [0; 32]
             || self.object_id == [0; 32]

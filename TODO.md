@@ -1440,6 +1440,29 @@ separately below.
     independent mount/loop/namespace/disposable-directory checks pass. This
     supersedes pending workspace requalification above; original R5, exact
     release/platform and real retained 1 TiB gates remain open.
+  - [x] Add ordered paged checkpoint authority records and original legacy
+    envelope references. Append a public guild Checkpoint section; stream
+    bounded members, writer fences, tombstones, mixed revisions and migration
+    evidence with exact phase/key/chain order, signatures and EOF summaries.
+    Keep original signed format-3/4/5 bytes and IDs behind authenticated bounded
+    references. Count authority records, fixed root, legacy bodies and paged
+    source closures together. Align the packing candidate cursor with numeric
+    checkpoint chain order using a fixed big-endian index key. All 140 core and
+    166 ordinary store tests pass (26 store tests ignored), with strict locked
+    workspace/all-targets Clippy and formatting/diff checks. Fixtures include
+    1,000 chained revisions, 256-member/domain boundaries, nested signature
+    bounds, legacy EOF/signature checks, corrupt tails, sink failure and direct
+    checked-candidate streaming into the mixed builder. A deterministic 55-byte
+    protocol root vector preserves the new layout. This is a staging codec;
+    no enclosing paged checkpoint certificate or consumer is activated.
+  - [ ] Complete the enclosing paged checkpoint certificate, coding codecs and
+    full authority joins, including current guild-event membership/writer
+    fences, retained tombstones, globally unique revision IDs, all legacy/body
+    and source/bootstrap EOFs and migration-evidence quorum. Retain and retire
+    logical root references inside authority/coding records through bounded
+    durable ownership; byte-tree root publication alone cannot pin them.
+    Connect normal capture/packing/coding/checkpoint/retention/seed-only recovery
+    under the full shared admission/quota policy and qualification gates.
   - [x] Replace the Linux whole-filesystem lookup under the global mutex with
     bounded process-local relocation cursors. Each lookup advances at most 2,048
     steps with a cooperative 25 ms deadline; incomplete work returns an explicit

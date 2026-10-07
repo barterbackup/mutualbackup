@@ -5,11 +5,11 @@
 //! membership/writer fences remain separate gates.
 
 use mb_core::{
-    CATALOG_MAX_RECORDS, CATALOG_MAX_STREAM_BYTES, CatalogPackedSourceId,
-    LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingAttestation,
-    LegacyPackingBinding, MerkleCommitment, NodeId, PAGED_USER_REVISION_BYTES,
-    PagedRevisionSourceReader, PagedUserRevision, QuorumCheckpoint, SignedRecord,
-    V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, WriterFence, canonical_bytes_bounded,
+    CATALOG_MAX_RECORDS, CATALOG_MAX_STREAM_BYTES, CatalogCheckpointRevisionKey,
+    CatalogPackedSourceId, LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN,
+    LegacyPackingAttestation, LegacyPackingBinding, MerkleCommitment, NodeId,
+    PAGED_USER_REVISION_BYTES, PagedRevisionSourceReader, PagedUserRevision, QuorumCheckpoint,
+    SignedRecord, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, WriterFence, canonical_bytes_bounded,
     canonical_size_bounded, packing_protected_root,
 };
 
@@ -474,7 +474,7 @@ impl CatalogPackingAuthority {
                 insert(
                     &self.store,
                     CANDIDATES,
-                    body.revision_id.as_bytes(),
+                    &CatalogCheckpointRevisionKey::from(body).index_key(),
                     signed,
                     PAGED_USER_REVISION_BYTES,
                 )?;
@@ -680,24 +680,25 @@ impl CatalogCertifiedPackingIndex {
         self.index.placement(source)
     }
 
-    /// Exclusive UUID order, independent of arrival order. Reaching this EOF is
-    /// necessary when building the future enclosing retained revision stream.
+    /// Exclusive owner/root/sequence/UUID order for the checkpoint stream.
+    /// Reaching this EOF is necessary before using the full candidate set.
     pub fn next_paged_revision(
         &self,
-        after: Option<Uuid>,
+        after: Option<CatalogCheckpointRevisionKey>,
     ) -> Result<Option<SignedRecord<PagedUserRevision>>, CatalogStoreError> {
         self.index.require_complete()?;
+        let after = after.map(CatalogCheckpointRevisionKey::index_key);
         let Some((key, bytes)) = self.index.store.next_record_bounded(
             CANDIDATES,
-            after.as_ref().map(|id| id.as_bytes().as_slice()),
-            16,
+            after.as_ref().map(|key| key.as_slice()),
+            72,
             PAGED_USER_REVISION_BYTES,
         )?
         else {
             return Ok(None);
         };
         let signed = PagedUserRevision::decode_signed(&bytes)?;
-        if key != signed.value.revision_id.as_bytes() {
+        if key != CatalogCheckpointRevisionKey::from(&signed.value).index_key() {
             return Err(DatabaseError::Integrity.into());
         }
         Ok(Some(signed))
@@ -1072,20 +1073,96 @@ mod tests {
         assert_eq!(checked.candidate_count(), 2);
         assert_eq!(
             checked.next_paged_revision(None).unwrap(),
-            Some(next.clone())
+            Some(candidate.clone())
         );
         assert_eq!(
             checked
-                .next_paged_revision(Some(next.value.revision_id))
+                .next_paged_revision(Some((&candidate.value).into()))
                 .unwrap(),
-            Some(candidate.clone())
+            Some(next.clone())
         );
         assert!(
             checked
-                .next_paged_revision(Some(candidate.value.revision_id))
+                .next_paged_revision(Some((&next.value).into()))
                 .unwrap()
                 .is_none()
         );
+        // Checkpoint order follows the signed chain even when UUID order is
+        // reversed. Feed the cursor directly into the mixed authority codec.
+        let scope = manifest.scope;
+        let mut control_pages = candidate_pages.clone();
+        let mut sink = |page: CatalogPageRef, bytes| {
+            control_pages.insert(page.hash, bytes);
+            Ok::<_, CatalogStoreError>(())
+        };
+        let mut body_builder =
+            mb_core::CatalogBuilder::new(scope, CatalogSection::Checkpoint).unwrap();
+        let legacy = &fixture.certificate.checkpoint.revisions[0];
+        body_builder
+            .push(
+                &canonical_bytes_bounded(legacy, V1_MAX_CATALOG_BYTES).unwrap(),
+                &mut sink,
+            )
+            .unwrap();
+        let body = body_builder.finish(&mut sink).unwrap();
+        let reference = mb_core::CatalogLegacyRevisionRef::from_signed(
+            fixture.certificate.checkpoint.guild_id,
+            legacy,
+            body,
+        )
+        .unwrap();
+        let mut control = mb_core::CatalogCheckpointAuthorityBuilder::new(scope, 2, 2).unwrap();
+        for member in &fixture.certificate.checkpoint.members {
+            control
+                .push(
+                    &mb_core::CatalogCheckpointAuthorityRecord::Member(member.clone()),
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        for fence in &fixture.certificate.checkpoint.writer_fences {
+            control
+                .push(
+                    &mb_core::CatalogCheckpointAuthorityRecord::WriterFence(fence.clone()),
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        control
+            .push(
+                &mb_core::CatalogCheckpointAuthorityRecord::LegacyRevision(reference),
+                &mut sink,
+            )
+            .unwrap();
+        let mut after = None;
+        while let Some(signed) = checked.next_paged_revision(after).unwrap() {
+            after = Some((&signed.value).into());
+            control
+                .push(
+                    &mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed),
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        let control = control.finish(&mut sink).unwrap();
+        assert_eq!(control.summary.revisions, 3);
+        let mut reader = mb_core::CatalogCheckpointAuthorityReader::new(scope, control).unwrap();
+        let mut read = 0;
+        while let Some(record) = reader
+            .next_record(&mut |page| fetch(&control_pages, page))
+            .unwrap()
+        {
+            if let mb_core::CatalogCheckpointAuthorityRecord::LegacyRevision(reference) = record {
+                assert_eq!(
+                    reference
+                        .read_signed(&mut |page| fetch(&control_pages, page))
+                        .unwrap(),
+                    *legacy
+                );
+            }
+            read += 1;
+        }
+        assert_eq!(read, control.records.records);
         for record in records {
             for chunk in 0..4 {
                 assert!(

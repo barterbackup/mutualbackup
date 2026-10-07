@@ -2411,3 +2411,58 @@ and independent mount/loop/namespace/disposable-directory checks pass. This
 supersedes the pending workspace requalification above. It does not diagnose
 the original R5 stall or qualify release artifacts, other platforms or real
 retained 1 TiB data.
+
+### Ordered paged checkpoint authority records (2026-10-07)
+
+The public guild `Checkpoint` page section appends discriminant five, preserving
+all existing page/record layouts. `CatalogCheckpointAuthorityBuilder` and its
+reader stream bounded members, writer fences, retained tombstones, mixed legacy
+and paged revisions, owner bindings and epoch attestations. Records decode
+within 4 KiB, roots within 1 KiB, signatures within 64 bytes and member domains
+within 256 UTF-8 bytes. At most 256 members are accepted. Phase/key order,
+contiguous writer epochs, consecutive revisions within each chain, exact parent
+hashes, nondecreasing writer epochs, individual signatures and exact EOF counts
+are checked with constant catalog state.
+
+Legacy revision records reference the original signed canonical envelope in
+bounded public byte pages. `CatalogLegacyRevisionRef` binds the guild, owner,
+root/revision IDs, sequence/parent, writer fence and original body hash. Reading
+it authenticates every referenced byte page, applies the unchanged 32 MiB old
+per-object cap, verifies both original signatures, source geometry and exact
+summary, and preserves original signed bytes for formats 3/4/5. Legacy decoding
+retains one bounded old envelope and its existing per-object allocations; it
+does not collect every retained revision. New paged revisions retain their
+bounded signed source roots. A reference header alone cannot authorize a source.
+
+The typed authority root counts the control stream, its fixed descriptor, every
+legacy envelope and every referenced paged source closure against the existing
+aggregate byte/page limits. Duplicate source-root references count repeatedly,
+so this accounts for traversal rather than deduplicated physical storage. This
+is authority-stream admission, not the complete packing/coding/checkpoint
+capacity policy or the retained-data quota. The local packing candidate cursor
+now uses the same owner/root/sequence/UUID order, with a fixed big-endian indexed
+key. Reversed UUID order cannot reorder a signed chain or require a whole-catalog
+sort before constructing the checkpoint authority stream.
+
+Qualification: all 140 core and 166 ordinary store tests pass (26 store tests
+ignored); formatting/diff checks and strict locked workspace/all-targets Clippy
+pass. Six new core fixtures cover all three legacy formats with original
+signatures/identities, 1,000 chained paged revisions across multiple pages,
+retained tombstones, 256-member/domain boundaries, malformed nested signature
+lengths, wrong phase/chain/fence/evidence, aggregate budgets, corrupt tails,
+failed sinks, complete legacy byte traversal and failure fencing. A deterministic
+55-byte protocol root vector binds mixed records and both evidence variants.
+The store fixture directly feeds checked candidates with reversed UUID order
+into the mixed authority builder and reads its original legacy envelope back.
+The earlier full workspace/native qualification belongs to `b509ac4`; it is not
+new runtime evidence for this codec.
+
+This codec does not issue a paged checkpoint certificate or activate a consumer.
+Complete membership/current guild-event fence authorization, retained-prefix
+tombstone and global revision-ID joins, every source/bootstrap EOF and migration
+evidence quorum remain mandatory. Durable ownership must follow logical root
+references inside records as well as byte-tree children; publishing only the
+authority byte-tree root cannot retain its legacy/source closures. Enclosing
+certificate/coding codecs, that ownership/retirement path, normal
+capture/packing/checkpoint/retention/seed-only migration, incremental updates,
+quotas and real retained 1 TiB/release/platform qualification remain open.
