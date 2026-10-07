@@ -2259,3 +2259,60 @@ record/page occurrence limits and the aggregate 16 GiB metadata budget hold.
 This is a structural codec calculation, not real 1 TiB data, retained-history,
 coding/checkpoint capacity or incremental-work qualification. Bounded store
 joins, certified authority, quotas and consumer activation remain open.
+
+### Bounded local packing joins and checked bundle roles (2026-10-07)
+
+`CatalogPackingValidation` binds the guild scope, exact descriptor/source roots
+and compatible profiles/counts. Both streams and the fixed descriptor share the
+existing 16 GiB represented-metadata and one-million page-occurrence budget.
+The local descriptor decodes within 2 KiB. This is a local validation manifest,
+separate from a signed checkpoint and the complete packing/coding capacity policy.
+
+`CatalogPackingIndex::build` takes ownership of a caller-placed/admitted
+`RecordScratchStore`, a bounded page fetcher and a required source-authority
+callback. The caller must authenticate the roots and bind each source identity
+and exact commitment to certified revision/member/writer authority. The source
+stream is verified through full EOF before descriptor traversal. Its stable
+source keys and chunk subtree roots populate primary indexes. Compact descriptor
+resolution reads one bounded source row. Each original slot consumes exactly one
+unused source chunk, records its sector/slot/content-hash placement and adds its
+subtree to the fixed Merkle frontier. Virtual-zero mappings require the canonical
+zero subtree and flat content hash; empty slots contribute the same zero root.
+Every completed sector must reproduce its declared commitment, and its original
+ID is independently checked by the descriptor reader.
+
+Completion requires descriptor EOF, no partial sector and no unused source
+chunk. Insertion, placement CAS and the final marker check affected writes and
+exact bounded readback. The private scratch transaction rolls back every prefix
+on semantic, authority, fetch, physical/quota or SQL failure. A failed owned job
+drops its anonymous database/journals; retry builds a fresh index. Memory retains
+bounded fragments, one active sector/frontier and checked SQL rows with a 1 MiB
+page cache. It holds no production catalog writer during external page work.
+The caller can use existing workspace/checkpoint-reservation/headroom admission.
+
+Only a completed index can construct its checked local bundle. Descriptor and
+source roles bind to exactly their typed roots and two durable intents. Ordinary
+atomic publication rechecks intent ownership; incomplete trees, immutable
+descriptor changes and cancelled intents cannot publish. The disposable index
+does not survive reopen: a consumer must rebuild validation before relying on
+the reopened bundle. This adds no signed authority, data-payload verification,
+retained-history quota or remote protection claim and activates no Node consumer.
+
+Qualification: all 134 core and 158 ordinary store tests pass (26 provisioned
+store tests ignored), with formatting/diff checks and strict locked
+workspace/all-targets Clippy. Tests cover both full and compact codecs, 2,048
+sources/8,192 exact placements across multiple pages, real database spill beyond
+the fixed cache, canonical manifest decode and aggregate root/page-budget bounds.
+Adversarial cases recompute individually valid descriptor IDs while substituting
+duplicate/missing sources, virtual zeros, content hashes or packed commitments;
+the cross-stream join rejects them. Source authority denial, late cancellation,
+corrupt source/descriptor tails and ignored chunk insert/update/completion writes
+cannot leave completed state. Database quota exhaustion fails closed and a fresh
+larger index succeeds. Durable two-role staging rejects partial publication,
+reopens/rebuilds, publishes immutable bindings, reopens again and cancels/reclaims
+both closures. Orphan scratch prefixes cannot be adopted as validation evidence.
+
+Certified paged checkpoint/source authority integration, coding records, the
+complete enclosing capacity/quota contract, incremental edits, normal
+capture/checkpoint/retention/seed-only activation, filesystem/platform and real
+retained 1 TiB qualification remain open. R3 and M6 are not complete.

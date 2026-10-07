@@ -14,6 +14,7 @@ use super::{ControlStore, DatabaseError};
 
 mod bundle;
 mod native_validation;
+mod packing_validation;
 mod paged_data;
 mod paged_revision;
 mod paged_sector;
@@ -24,6 +25,9 @@ pub use bundle::{
 };
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
+};
+pub use packing_validation::{
+    CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingValidation,
 };
 pub use paged_data::{PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource};
 pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCatalogSnapshot};

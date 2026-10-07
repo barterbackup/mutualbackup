@@ -1607,6 +1607,16 @@ budget including page/index overhead. This is codec evidence, separate from
 real retained data and full packing/coding/checkpoint admission. The bounded
 store join and certified authority integration remain required.
 
+The bounded store join now verifies full/compact descriptor and source streams
+in a private encrypted scratch index. Every source chunk has exactly one checked
+placement; virtual-zero hashes/roots and packed Merkle composition must match.
+Both EOFs and an external source-authority callback are required before the
+completion marker. Local bundles retain exactly both stream roles. All 134 core
+and 158 ordinary store tests and strict workspace/all-targets Clippy pass,
+including spill, fault rollback, quota retry and durable reopen/cancellation.
+Certified paged authority, normal publication/retention/recovery activation,
+coding/checkpoint capacity, quotas and real retained 1 TiB gates remain open.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

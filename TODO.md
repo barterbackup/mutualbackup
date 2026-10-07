@@ -1382,6 +1382,24 @@ separately below.
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.
+  - [x] Join full/compact packing descriptors and source streams through a
+    disposable encrypted index. Require a source-authority callback; reject
+    duplicate/missing mappings, incomplete coverage, false virtual zeros and
+    incorrect packed Merkle composition. Preserve original sector IDs, retain
+    bounded source/placement lookups and mark completion only after both EOFs.
+    The two streams and fixed local descriptor share the existing aggregate
+    metadata/page budget. The caller supplies scratch placement, physical limits,
+    checkpoint reservations and headroom. Checked indexes bind exactly both
+    durable page roles through the ordinary atomic bundle API. Validation:
+    all 134 core and 158 ordinary store tests pass (26 store tests ignored),
+    formatting/diff checks and strict locked workspace/all-targets Clippy pass.
+    Fixtures prove real spill beyond the 1 MiB cache, original placements,
+    authority denial, cancellation/corrupt tails, ignored insert/update/completion
+    rollback, quota failure/fresh rebuild and durable bundle reopen/cancellation.
+    Certified paged checkpoint/revision/member authority integration remains
+    external and mandatory; no active consumer or remote-protection claim is
+    enabled. Full coding/checkpoint/retention/seed-only migration, quotas,
+    incremental edits and real retained 1 TiB qualification remain open.
   - [x] Replace the Linux whole-filesystem lookup under the global mutex with
     bounded process-local relocation cursors. Each lookup advances at most 2,048
     steps with a cooperative 25 ms deadline; incomplete work returns an explicit
