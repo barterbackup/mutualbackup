@@ -1582,6 +1582,9 @@ of historical sector IDs. Existing flat hashing also consumes canonical bytes
 directly, preserving all five catalog layouts without a whole encoded copy.
 Core compatibility/adversarial tests and durable store ownership/reopen/shared
 root/cancellation tests pass (123 core, 153 ordinary store; strict Clippy passes).
+The complete locked workspace passes 911 tests on `5579541`; its exact-source
+Btrfs retained native recovery fixture passes in 28.07 seconds, with unchanged
+source/binary hashes and verified resource cleanup. The all-targets build passes.
 This implements a bounded codec prerequisite. Full source/proof/authority joins,
 paged checkpoint publication, normal consumer migration, quotas and the real
 retained 1 TiB gate remain required. ADR 0002 records the limits and evidence.

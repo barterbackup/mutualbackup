@@ -1343,6 +1343,11 @@ separately below.
     locked workspace/all-targets Clippy pass. The store run also exposed an
     unrelated discovery exhaustion-fixture race; isolated fixture pools and a
     shared-capacity release regression preserve the production 64-frame cap.
+    Exact-source follow-up on `5579541`: the locked workspace passes 911 tests,
+    zero failed, 116 ignored; the locked all-targets test build passes. Disposable
+    Btrfs retained native migration/recovery passes in 28.07 seconds. All 233
+    tracked file and both test-binary hashes match before/after; mount/image/loop
+    cleanup and independent resource checks pass.
     Full source uniqueness/coverage/proof and authority joins, enclosing paged
     packing/checkpoint publication, quota reservations, normal consumer activation
     and real retained 1 TiB qualification remain open. See ADR 0002.

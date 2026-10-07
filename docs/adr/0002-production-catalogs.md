@@ -2160,6 +2160,15 @@ pool; only saturating fixtures now use an isolated pool. Production scans and
 resumed scans still share 64 frames, and a regression verifies cap enforcement
 and capacity release across scan lifetimes.
 
+The complete locked workspace on `5579541` passes 911 tests, zero failed, 116
+ignored, including 418 ordinary Node tests. The locked all-targets test build
+passes. Disposable Btrfs retained native migration/source-loss/recovery passes
+in 28.07 seconds. All 233 tracked-file hashes and both store/Node test-binary
+hashes match before and after that native run. The mount, image and loop device
+were reclaimed; independent mount/loop/network-namespace checks pass. This is a
+Linux library recovery gate, separate from full peer topology, installed release,
+other-platform and real retained 1 TiB qualification.
+
 Source authentication, unique/complete source joins, coding records, enclosing
 packing/checkpoint publication, retained-history quota reservations, incremental
 edits and normal capture/recovery consumer activation remain open. This codec
