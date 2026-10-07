@@ -1460,6 +1460,11 @@ pub struct StableAnchorAreaLocator {
 }
 
 impl StableAnchorAreaLocator {
+    /// Validate supplied, original or cached locations without starting a scan.
+    pub fn known_path(&self, hint: Option<&Path>) -> Option<PathBuf> {
+        known_anchor_area(self, hint)
+    }
+
     /// Prepare a same-mount anchor area without selecting a capture backend.
     /// Each backend must still pass its own full source/edit/restore probe.
     pub fn prepare_for_root(source_root: impl AsRef<Path>) -> Result<Self, AnchorError> {
@@ -2251,6 +2256,15 @@ impl FileAnchorManifest {
     /// native Git can treat their potentially mutable hard links as anchors.
     /// This reads ownership markers without modifying the area or payload.
     pub fn require_native_ownership(&self) -> Result<(), AnchorError> {
+        self.require_native_ownership_with_area_hint(None)
+    }
+
+    pub fn require_native_ownership_with_area_hint(
+        &self,
+        area_hint: Option<&Path>,
+    ) -> Result<(), AnchorError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = area_hint;
         if self.guarded_root_file.is_some() {
             return Err(AnchorError::UnsupportedSourceOperation(
                 crate::WITHDRAWN_GUARDED_BACKEND,
@@ -2258,7 +2272,7 @@ impl FileAnchorManifest {
         }
         #[cfg(target_os = "linux")]
         {
-            let area = resolve_anchor_area(&self.area)?;
+            let area = resolve_anchor_area_with_hint(&self.area, area_hint)?;
             let parent = open_stable_anchor_area(&area, &self.area)?;
             for marker in [
                 legacy_guarded::guarded_file_marker_name(self.anchor_id),
@@ -2280,12 +2294,21 @@ impl FileAnchorManifest {
 
     /// Verify the immutable anchor before giving its bytes to another format.
     pub fn open_verified(&self) -> Result<File, AnchorError> {
+        self.open_verified_with_area_hint(None)
+            .map(|(file, _)| file)
+    }
+
+    /// A location hint changes neither native ownership nor content checks.
+    pub fn open_verified_with_area_hint(
+        &self,
+        area_hint: Option<&Path>,
+    ) -> Result<(File, PathBuf), AnchorError> {
         if !matches!(self.format_version, 1 | 2)
             || (self.format_version == 1) != self.guarded_root_file.is_none()
         {
             return Err(AnchorError::InvalidRoot);
         }
-        self.require_native_ownership()?;
+        self.require_native_ownership_with_area_hint(area_hint)?;
         validate_relative(&self.source_relative_path)?;
         if let Some(backing) = &self.guarded_root_file {
             validate_relative(&backing.captured_relative_path)?;
@@ -2298,7 +2321,7 @@ impl FileAnchorManifest {
                 return Err(AnchorError::InvalidRoot);
             }
         }
-        let mut file = self.file_locator().open()?;
+        let (mut file, area) = self.file_locator().open_with_area_hint(area_hint)?;
         let metadata = file.metadata()?;
         if metadata.len() != self.logical_len {
             return Err(AnchorError::SourceChanged(
@@ -2320,7 +2343,7 @@ impl FileAnchorManifest {
             ));
         }
         file.seek(SeekFrom::Start(0))?;
-        Ok(file)
+        Ok((file, area))
     }
 
     pub fn remove(&self) -> Result<(), AnchorError> {

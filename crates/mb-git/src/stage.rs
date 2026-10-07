@@ -1151,22 +1151,39 @@ pub fn anchors_for_oid(
     oid: Oid,
 ) -> Result<Vec<FileAnchorManifest>, StageError> {
     let mut anchors = Vec::new();
+    let mut discovery_error = None;
     for (key, encoded) in control.records(&object_kind(repository_id, oid))? {
         let manifest: FileAnchorManifest = decode_canonical(&encoded)?;
         if key != manifest.anchor_id.as_bytes() || !matches!(manifest.format_version, 1 | 2) {
             return Err(StageError::IncompatibleRecord);
         }
-        match blob_oid_from_anchor(&manifest) {
-            Ok(actual) if actual == oid => {
+        #[cfg(target_os = "linux")]
+        let identified = crate::catalog_anchor::identify(control, &manifest);
+        #[cfg(not(target_os = "linux"))]
+        let identified = blob_oid_from_anchor(&manifest).map(|oid| (oid, PathBuf::new()));
+        match identified {
+            Ok((actual, path)) if actual == oid => {
                 if let Some(existing) = anchors.first() {
                     require_same_blob_bytes(existing, &manifest)?;
                 }
+                #[cfg(target_os = "linux")]
+                crate::catalog_anchor::remember(control, &manifest, &path)?;
                 anchors.push(manifest);
             }
             Ok(_) => return Err(StageError::IncompatibleRecord),
+            Err(GitAnchorError::Anchor(
+                error @ (AnchorError::AnchorAreaDiscoveryPending
+                | AnchorError::AnchorAreaDiscoveryLimit
+                | AnchorError::AnchorAreaIndexUnavailable),
+            )) => discovery_error = Some(error),
             Err(GitAnchorError::Anchor(_)) => {}
             Err(error) => return Err(error.into()),
         }
+    }
+    if anchors.is_empty()
+        && let Some(error) = discovery_error
+    {
+        return Err(error.into());
     }
     Ok(anchors)
 }
@@ -1430,6 +1447,265 @@ mod tests {
         })
         .unwrap();
         mb_core::decode_canonical(&encoded).unwrap()
+    }
+
+    #[test]
+    fn catalog_anchor_discovery_survives_process_restarts() {
+        catalog_anchor_discovery_fixture(None);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn btrfs_catalog_anchor_discovery_survives_process_restarts() {
+        let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        catalog_anchor_discovery_fixture(Some(Path::new(&root)));
+    }
+
+    fn catalog_anchor_discovery_fixture(root: Option<&Path>) {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Input {
+            repository_id: Uuid,
+            oid: [u8; 20],
+            anchor: mb_store::FileAnchorManifest,
+        }
+        if let Some(input) = std::env::var_os("MB_GIT_DISCOVERY_CHILD") {
+            let input = PathBuf::from(input);
+            let fixture: Input = mb_core::decode_canonical(&fs::read(&input).unwrap()).unwrap();
+            let state = input.parent().unwrap();
+            let control =
+                ControlStore::open_existing_with_key(state.join("catalog.db"), &[41; 32]).unwrap();
+            let oid = Oid::from_bytes(&fixture.oid).unwrap();
+            let status = match anchors_for_oid(&control, fixture.repository_id, oid) {
+                Err(StageError::Anchor(AnchorError::AnchorAreaDiscoveryPending)) => "pending",
+                Err(StageError::IncompatibleRecord) => "wrong-oid",
+                Ok(anchors) => {
+                    assert_eq!(anchors, vec![fixture.anchor]);
+                    let odb = crate::NativeOdb::from_catalog_anchors(&control, anchors).unwrap();
+                    assert_eq!(odb.odb().read(oid).unwrap().data(), b"exact Git bytes\r\n");
+                    "found"
+                }
+                result => panic!("{result:?}"),
+            };
+            fs::write(state.join("status"), status).unwrap();
+            return;
+        }
+        let temp = match root {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let scan = temp.path().join("scan");
+        let state = temp.path().join("state");
+        let root = scan.join("work");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        let mut area = StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        area.volume_root_hint = scan.clone();
+        let payload = b"exact Git bytes\r\n";
+        let anchor = test_anchor(&area, &root, payload, payload);
+        let canonical = canonical_bytes(&anchor).unwrap();
+        let oid = Oid::hash_object(git2::ObjectType::Blob, payload).unwrap();
+        let wrong = Oid::hash_object(git2::ObjectType::Blob, b"wrong mapping").unwrap();
+        let repository_id = Uuid::new_v4();
+        let input = state.join("input");
+        let db = state.join("catalog.db");
+        let control = ControlStore::open_with_key(&db, &[41; 32]).unwrap();
+        control
+            .put_record(
+                &super::object_kind(repository_id, wrong),
+                anchor.anchor_id.as_bytes(),
+                &canonical,
+            )
+            .unwrap();
+        for n in 0..6_000 {
+            fs::write(scan.join(format!("file-{n}")), []).unwrap();
+        }
+        let moved = scan.join(".mutualbackup-anchors-moved");
+        fs::rename(&area.path_hint, &moved).unwrap();
+        fs::write(
+            &input,
+            canonical_bytes(&Input {
+                repository_id,
+                oid: wrong.as_bytes().try_into().unwrap(),
+                anchor: anchor.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        drop(control);
+        let run_child = || {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stage::tests::catalog_anchor_discovery_survives_process_restarts",
+                    "--test-threads=1",
+                ])
+                .env("MB_GIT_DISCOVERY_CHILD", &input)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::read_to_string(state.join("status")).unwrap()
+        };
+        let mut completed = false;
+        let mut pending = 0;
+        for _ in 0..30 {
+            match run_child().as_str() {
+                "pending" => pending += 1,
+                "wrong-oid" => {
+                    completed = true;
+                    break;
+                }
+                other => panic!("{other}"),
+            }
+        }
+        assert!(completed && pending > 0);
+        let control = ControlStore::open_existing_with_key(&db, &[41; 32]).unwrap();
+        assert!(
+            control
+                .get_record("anchor-area-location", area.area_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            control
+                .get_record(
+                    mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area.area_id.as_bytes()
+                )
+                .unwrap()
+                .is_some()
+        );
+        control
+            .put_record(
+                &super::object_kind(repository_id, oid),
+                anchor.anchor_id.as_bytes(),
+                &canonical,
+            )
+            .unwrap();
+        fs::write(
+            &input,
+            canonical_bytes(&Input {
+                repository_id,
+                oid: oid.as_bytes().try_into().unwrap(),
+                anchor: anchor.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        drop(control);
+        assert_eq!(run_child(), "found");
+        let control = ControlStore::open_existing_with_key(&db, &[41; 32]).unwrap();
+        assert!(
+            control
+                .get_record(
+                    mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area.area_id.as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            control
+                .get_record(
+                    &super::object_kind(repository_id, oid),
+                    anchor.anchor_id.as_bytes()
+                )
+                .unwrap()
+                .unwrap(),
+            canonical
+        );
+        // A saved hint outside every scan prefix remains usable by a read-only
+        // catalog and by callbacks after the connection itself has closed.
+        use std::os::unix::ffi::OsStringExt;
+        let outside = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"outside-\xff".to_vec()));
+        fs::rename(&moved, &outside).unwrap();
+        let (actual, resolved) = {
+            let (file, resolved) = anchor.open_verified_with_area_hint(Some(&outside)).unwrap();
+            use std::os::fd::AsRawFd;
+            (
+                Oid::hash_file(
+                    git2::ObjectType::Blob,
+                    format!("/proc/self/fd/{}", file.as_raw_fd()),
+                )
+                .unwrap(),
+                resolved,
+            )
+        };
+        assert_eq!(actual, oid);
+        crate::catalog_anchor::remember(&control, &anchor, &resolved).unwrap();
+        assert_eq!(
+            control.advance_anchor_area_discovery(&area).unwrap(),
+            mb_store::AnchorAreaDiscoveryStep::Pending
+        );
+        let job = control
+            .get_record(
+                mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                area.area_id.as_bytes(),
+            )
+            .unwrap()
+            .unwrap();
+        let before = control.records("anchor-area-location").unwrap();
+        control.make_query_only().unwrap();
+        assert_eq!(
+            anchors_for_oid(&control, repository_id, oid).unwrap(),
+            vec![anchor.clone()]
+        );
+        assert_eq!(
+            control
+                .get_record(
+                    mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area.area_id.as_bytes()
+                )
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        drop(control);
+        let control = ControlStore::open_existing_read_only_with_key(&db, &[41; 32]).unwrap();
+        let found = anchors_for_oid(&control, repository_id, oid).unwrap();
+        assert_eq!(found, vec![anchor.clone()]);
+        let odb = crate::NativeOdb::from_catalog_anchors(&control, found).unwrap();
+        assert_eq!(control.records("anchor-area-location").unwrap(), before);
+        assert_eq!(
+            control
+                .get_record(
+                    mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area.area_id.as_bytes()
+                )
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        drop(control);
+        assert!(odb.odb().exists(oid));
+        assert_eq!(odb.odb().read_header(oid).unwrap().0, payload.len());
+        assert_eq!(odb.odb().read(oid).unwrap().data(), payload);
+        let (mut reader, _, _) = odb.odb().reader(oid).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        assert_eq!(bytes, payload);
+        drop(reader);
+        drop(odb);
+        let control = ControlStore::open_existing_with_key(&db, &[41; 32]).unwrap();
+        assert_eq!(
+            anchors_for_oid(&control, repository_id, oid).unwrap(),
+            vec![anchor]
+        );
+        assert!(
+            control
+                .get_record(
+                    mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area.area_id.as_bytes()
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

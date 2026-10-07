@@ -822,12 +822,14 @@ fn verify_existing_blob(
     let anchors = anchors_for_oid(control, repository_id, blob.oid)?;
     for anchor in &anchors {
         if anchor.logical_len != blob.bytes.len() as u64
-            || blob_oid_from_anchor(anchor)? != blob.oid
+            || crate::catalog_anchor::identify(control, anchor)?.0 != blob.oid
         {
             return Err(MergeBlobError::IncompatibleRecord);
         }
         let mut bytes = Vec::with_capacity(blob.bytes.len());
-        anchor.open_verified()?.read_to_end(&mut bytes)?;
+        crate::catalog_anchor::open(control, anchor)?
+            .0
+            .read_to_end(&mut bytes)?;
         if bytes != blob.bytes {
             return Err(MergeBlobError::IncompatibleRecord);
         }

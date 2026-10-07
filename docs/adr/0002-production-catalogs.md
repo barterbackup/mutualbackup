@@ -1506,3 +1506,48 @@ Operational retry/backoff and abandoned-job quota cleanup, continuously changing
 namespaces, other filesystems/platforms, complete consumer lifecycle tests and
 real 1 TiB dataset/history qualification remain open. This evidence does not
 complete R3 or the production release gates.
+
+### Durable discovery in native Git catalog reads (2026-10-07)
+
+Git object-to-anchor lookup now advances the same bounded, restart-safe Linux
+discovery journal as Node serving. It consumes bounded raw-path location hints
+and verifies native ownership, the manifest content root and the expected Git
+object ID before publishing a hint and retiring discovery. Wrong Git mappings
+preserve their original records and leave assistance unpublished. Pending or
+resource-limited discovery remains retryable when no verified physical copy is
+available; a different verified copy can still satisfy the lookup. Corrupt local
+catalog assistance fails closed. Manifest serialization and signed bytes do not
+change.
+
+Native manifests now accept a local area hint for ownership and verified opens.
+Catalog-backed libgit2 construction saves each verified location beside its
+manifest; callbacks revalidate ownership and bytes using that hint without
+retaining a SQL connection. Both commit constructors use this backend. Diffs,
+existing merge-blob verification and stock Git object exports use catalog-assisted
+opens as well. Read-only native-ownership preflight can consume saved hints
+without migrating the catalog. Read-only and query-only connections never
+publish hints or retire discovery jobs. An authenticated writable lookup retires
+a leftover job even when its location hint is already current.
+
+The new fixture drives wide-directory discovery through independent Git test
+executables, first using a wrong Git mapping and then correcting the mapping.
+It checks unpublished hints, preserved manifest bytes, job completion, movement
+to a raw Unix path outside the discovery prefix, query-only and read-only job
+preservation, and writable cleanup. Libgit2 existence, header, whole-object and
+streaming callbacks still read the exact bytes after the catalog connection has
+closed. The same fixture passes on both the ext4 host and a disposable 512 MiB
+Btrfs loop filesystem. The owned mount was verified absent, its loop detached,
+and its image and fixtures removed after testing.
+
+The locked workspace/all-targets test build passes; the subsequent expanded Git
+fixture compiles in the package test build and strict locked workspace/all-targets
+Clippy. All 18 Node paged tests and 32 ordinary metadata/restore compatibility
+tests pass (eight provisioned compatibility tests ignored). This is consumer
+integration evidence, not full relocation or production capacity qualification.
+The full Git library suite passes 91 tests (63 provisioned tests ignored), and
+the full store library suite passes 136 tests (23 provisioned tests ignored).
+Formatting and diff checks also pass. No full Node, topology, other-platform or
+real 1 TiB qualification ran for this integration.
+Remaining Git capture/import/checkout/replay and source retirement, operational
+retry/backoff and abandoned-job cleanup, complete physical consumer lifecycle,
+other platforms/filesystems and the real 1 TiB dataset/history gate remain open.

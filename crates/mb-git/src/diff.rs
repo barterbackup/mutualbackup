@@ -75,7 +75,7 @@ fn read_anchor(
     if anchor.logical_len > MAX_DIFF_FILE_BYTES {
         return Err(DiffError::TooLarge);
     }
-    let mut file = anchor.open_verified()?;
+    let (mut file, _) = crate::catalog_anchor::open(control, &anchor).map_err(StageError::from)?;
     let mut bytes = Vec::with_capacity(anchor.logical_len as usize);
     file.read_to_end(&mut bytes)?;
     if bytes.len() as u64 != anchor.logical_len {

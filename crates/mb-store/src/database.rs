@@ -170,6 +170,14 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Whether writes are prohibited by the open mode or connection policy.
+    pub fn is_read_only(&self) -> Result<bool, DatabaseError> {
+        let query_only: bool = self
+            .connection
+            .pragma_query_value(None, "query_only", |row| row.get(0))?;
+        Ok(query_only || self.connection.is_readonly("main")?)
+    }
+
     pub fn database_shell_statement(
         &self,
         sql: &str,

@@ -192,7 +192,8 @@ fn require_native_pinned_catalog_state(
     // Inspect its historical manifest rather than inferring native ownership.
     catalog.for_each_record_value_with_kind_prefix("git-object-anchor-v1/", |bytes| {
         let anchor: FileAnchorManifest = mb_core::decode_canonical(bytes)?;
-        match anchor.require_native_ownership() {
+        let hint = crate::catalog_anchor::hint(&catalog, &anchor)?;
+        match anchor.require_native_ownership_with_area_hint(hint.as_deref()) {
             // A bound native catalog may retain damaged or unavailable copies
             // for repair. Its other verified copies remain usable. An unbound
             // catalog needs available provenance before backend migration.

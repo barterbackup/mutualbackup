@@ -1215,7 +1215,7 @@ pub(crate) fn commit_index_for_scope(
 
     let temporary = tempfile::tempdir()?;
     let repository = Repository::init_bare(temporary.path())?;
-    let native_odb = NativeOdb::from_anchors(anchors)?;
+    let native_odb = NativeOdb::from_catalog_anchors(control, anchors)?;
     let _metadata_pack = native_odb.odb().add_new_mempack_backend(1000)?;
     repository.set_odb(native_odb.odb())?;
     load_metadata(control, repository_id, &repository)?;
@@ -1462,7 +1462,7 @@ pub(crate) fn create_pathwise_merge_commit(
             .ok_or(HistoryError::IncompatibleRecord)?;
         anchors.push(anchor);
     }
-    let native_odb = NativeOdb::from_anchors(anchors)?;
+    let native_odb = NativeOdb::from_catalog_anchors(control, anchors)?;
     let _metadata_pack = native_odb.odb().add_new_mempack_backend(1000)?;
     // Generated text is already bounded by the per-file and aggregate merge
     // limits. Only this disposable memory backend sees it before admission;

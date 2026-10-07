@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 use git2::{Binding, Odb};
 use libgit2_sys as raw;
@@ -28,7 +29,20 @@ pub struct NativeOdb {
 #[repr(C)]
 struct AnchorBackend {
     base: raw::git_odb_backend,
-    anchors: HashMap<[u8; 20], FileAnchorManifest>,
+    anchors: HashMap<[u8; 20], LocatedAnchor>,
+}
+
+struct LocatedAnchor {
+    manifest: FileAnchorManifest,
+    area_hint: Option<PathBuf>,
+}
+
+impl LocatedAnchor {
+    fn open_verified(&self) -> Result<std::fs::File, mb_store::AnchorError> {
+        self.manifest
+            .open_verified_with_area_hint(self.area_hint.as_deref())
+            .map(|(file, _)| file)
+    }
 }
 
 #[repr(C)]
@@ -41,18 +55,47 @@ impl NativeOdb {
     pub fn from_anchors(
         anchors: impl IntoIterator<Item = FileAnchorManifest>,
     ) -> Result<Self, GitAnchorError> {
-        let mut indexed = HashMap::<[u8; 20], FileAnchorManifest>::new();
+        Self::build(anchors, |anchor| Ok((blob_oid_from_anchor(anchor)?, None)))
+    }
+
+    /// Preserve each catalog's verified relocation hint for subsequent libgit2
+    /// callbacks, without retaining a SQL connection across the C interface.
+    #[cfg(target_os = "linux")]
+    pub fn from_catalog_anchors(
+        control: &mb_store::ControlStore,
+        anchors: impl IntoIterator<Item = FileAnchorManifest>,
+    ) -> Result<Self, GitAnchorError> {
+        Self::build(anchors, |anchor| {
+            let (oid, path) = crate::catalog_anchor::identify(control, anchor)?;
+            crate::catalog_anchor::remember(control, anchor, &path)?;
+            Ok((oid, Some(path)))
+        })
+    }
+
+    fn build(
+        anchors: impl IntoIterator<Item = FileAnchorManifest>,
+        mut identify: impl FnMut(
+            &FileAnchorManifest,
+        ) -> Result<(git2::Oid, Option<PathBuf>), GitAnchorError>,
+    ) -> Result<Self, GitAnchorError> {
+        let mut indexed = HashMap::<[u8; 20], LocatedAnchor>::new();
         for anchor in anchors {
-            let oid = blob_oid_from_anchor(&anchor)?;
+            let (oid, area_hint) = identify(&anchor)?;
             let key: [u8; 20] = oid.as_bytes().try_into().expect("SHA-1 OID has 20 bytes");
             if let Some(existing) = indexed.get(&key) {
-                if existing.content_hash != anchor.content_hash
-                    || existing.logical_len != anchor.logical_len
+                if existing.manifest.content_hash != anchor.content_hash
+                    || existing.manifest.logical_len != anchor.logical_len
                 {
                     return Err(GitAnchorError::OidCollision);
                 }
             } else {
-                indexed.insert(key, anchor);
+                indexed.insert(
+                    key,
+                    LocatedAnchor {
+                        manifest: anchor,
+                        area_hint,
+                    },
+                );
             }
         }
 
@@ -100,7 +143,7 @@ unsafe fn backend_ref<'a>(base: *mut raw::git_odb_backend) -> &'a AnchorBackend 
     unsafe { &*base.cast::<AnchorBackend>() }
 }
 
-fn lookup(backend: &AnchorBackend, oid: *const raw::git_oid) -> Option<&FileAnchorManifest> {
+fn lookup(backend: &AnchorBackend, oid: *const raw::git_oid) -> Option<&LocatedAnchor> {
     if oid.is_null() {
         return None;
     }
@@ -134,7 +177,7 @@ extern "C" fn read_header(
     if manifest.open_verified().is_err() {
         return raw::GIT_ERROR;
     }
-    let Ok(length) = usize::try_from(manifest.logical_len) else {
+    let Ok(length) = usize::try_from(manifest.manifest.logical_len) else {
         return raw::GIT_ERROR;
     };
     // SAFETY: The checked output pointers belong to libgit2.
@@ -160,13 +203,13 @@ extern "C" fn read_blob(
     let Some(manifest) = lookup(backend, oid) else {
         return raw::GIT_ENOTFOUND;
     };
-    if manifest.logical_len > MAX_MATERIALIZED_BLOB {
+    if manifest.manifest.logical_len > MAX_MATERIALIZED_BLOB {
         return raw::GIT_ERROR;
     }
     let Ok(mut file) = manifest.open_verified() else {
         return raw::GIT_ERROR;
     };
-    let Ok(length) = usize::try_from(manifest.logical_len) else {
+    let Ok(length) = usize::try_from(manifest.manifest.logical_len) else {
         return raw::GIT_ERROR;
     };
     // SAFETY: libgit2 allocates and later frees buffers from this allocator.
@@ -212,14 +255,14 @@ extern "C" fn open_read_stream(
     if file.seek(SeekFrom::Start(0)).is_err() {
         return raw::GIT_ERROR;
     }
-    let Ok(length) = usize::try_from(manifest.logical_len) else {
+    let Ok(length) = usize::try_from(manifest.manifest.logical_len) else {
         return raw::GIT_ERROR;
     };
     // SAFETY: The C stream is initialized field-by-field before publication.
     let mut c_stream: raw::git_odb_stream = unsafe { std::mem::zeroed() };
     c_stream.backend = base;
     c_stream.mode = raw::GIT_STREAM_RDONLY;
-    c_stream.declared_size = manifest.logical_len;
+    c_stream.declared_size = manifest.manifest.logical_len;
     c_stream.read = Some(read_stream_chunk);
     c_stream.free = Some(free_read_stream);
     let stream = Box::new(AnchorReadStream {

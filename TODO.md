@@ -1239,8 +1239,18 @@ passing tests below apply only to their recorded source and exercised cases.
     and cursor retirement share a fenced transaction. Read-only calls retain
     their nonmutating behavior; other filesystems retain process-local fallback.
     Validation and native qualification are recorded in ADR 0002.
+  - [x] Use durable discovery and authenticated raw-path hints for native Git
+    object-to-anchor lookup, catalog-backed libgit2 object reads, diffs, existing
+    merge-blob verification and stock Git export. Preserve original manifest
+    bytes; keep SQL outside libgit2 callbacks and retain per-object location
+    hints for their lifetime. Pending/limited discovery remains retryable when
+    no usable copy exists; another verified copy can still be used. Read-only
+    catalogs consume saved hints without publishing them or retiring jobs.
+    Native ownership preflight reads saved hints without migrating the catalog.
+    Validation is recorded in ADR 0002.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
-    progress to direct native Git, capture/replay and retirement call paths;
+    progress to remaining direct native Git capture/import/checkout/replay and
+    retirement call paths;
     integrate operational retry/backoff and abandoned-job quota cleanup. Qualify
     other filesystems/platforms and continuously changing namespaces, plus
     absent/moved areas, reopen and source loss across complete consumers,

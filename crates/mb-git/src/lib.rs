@@ -19,6 +19,8 @@ mod backup;
 mod backup_size;
 mod blob_catalog;
 #[cfg(target_os = "linux")]
+mod catalog_anchor;
+#[cfg(target_os = "linux")]
 mod checkout;
 #[cfg(target_os = "linux")]
 mod diff;
@@ -111,6 +113,10 @@ pub(crate) struct NativeSource<'a> {
 
 #[derive(Debug, Error)]
 pub enum GitAnchorError {
+    #[error("anchor discovery catalog error: {0}")]
+    Database(#[from] mb_store::DatabaseError),
+    #[error("anchor relocation failed: {0}")]
+    Discovery(anyhow::Error),
     #[error("native anchor failed verification: {0}")]
     Anchor(#[from] AnchorError),
     #[error("libgit2 could not hash the immutable anchor: {0}")]

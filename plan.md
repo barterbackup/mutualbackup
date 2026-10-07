@@ -1476,10 +1476,13 @@ also delays hint writes until successful verification. Ordinary Node serving now
 checkpoints Linux Btrfs/ext4 scan cookies with filesystem/inode/change fences;
 process/cache loss does not discard those cursors. Attempt/generation CAS,
 bounded records/job count and atomic verified-hint/cursor completion fence
-concurrent and interrupted writers. Direct native Git/capture/retirement consumer
-integration, retry/backoff and abandoned-job cleanup, other filesystem/platform
-qualification, full physical lifecycle and real 1 TiB dataset/history qualification
-remain required.
+concurrent and interrupted writers. Native Git object lookup, catalog-backed
+libgit2 reads, diffs, existing merge-blob verification and stock Git export also
+use durable progress and saved raw-path hints; callbacks retain location hints
+without owning a SQL connection. Remaining Git capture/import/checkout/replay and
+retirement consumer integration, retry/backoff and abandoned-job cleanup, other
+filesystem/platform qualification, full physical lifecycle and real 1 TiB dataset/
+history qualification remain required.
 
 ### Historical implementation and validation record (before scope correction)
 

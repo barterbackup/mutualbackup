@@ -305,11 +305,15 @@ fn publish_object<R: Read>(
     Ok(())
 }
 
-fn export_objects(destination: &Repository, graph: &GitGraphSource) -> Result<(), GitInteropError> {
+fn export_objects(
+    control: &ControlStore,
+    destination: &Repository,
+    graph: &GitGraphSource,
+) -> Result<(), GitInteropError> {
     for blob in &graph.blobs {
         let oid = Oid::from_bytes(&blob.oid)?;
         let anchor: &FileAnchorManifest = &blob.anchor;
-        let source = anchor.open_verified().map_err(GitAnchorError::from)?;
+        let (source, _) = crate::catalog_anchor::open(control, anchor)?;
         publish_object(
             destination,
             oid,
@@ -409,7 +413,7 @@ pub(crate) fn export_graph_to_git_repository(
             return Err(GitInteropError::StaleAdvertisement);
         }
     }
-    export_objects(&destination, &graph)?;
+    export_objects(control, &destination, &graph)?;
     u32::try_from(graph.blobs.len() + graph.objects.len())
         .map_err(|_| GitInteropError::IncompatibleGraph)
 }
@@ -453,7 +457,7 @@ pub(crate) fn export_all_refs_to_bare(
     if destination.references()?.next().transpose()?.is_some() {
         return Err(GitInteropError::DestinationNotEmpty);
     }
-    export_objects(&destination, &graph)?;
+    export_objects(control, &destination, &graph)?;
     for reference in &graph.refs {
         let name =
             std::str::from_utf8(&reference.name).map_err(|_| GitInteropError::IncompatibleGraph)?;
@@ -569,7 +573,7 @@ pub fn push_branch_to_bare(
     {
         return Err(GitInteropError::NonFastForward);
     }
-    export_objects(&destination, &graph)?;
+    export_objects(control, &destination, &graph)?;
     if let Some(old) = previous {
         if old == target {
             return Ok(target);
@@ -627,7 +631,7 @@ pub fn push_tag_to_bare(
     if previous.is_some_and(|old| old != target) {
         return Err(GitInteropError::TagExists);
     }
-    export_objects(&destination, &graph)?;
+    export_objects(control, &destination, &graph)?;
     if let Some(old) = previous {
         destination.reference_matching(&reference_name, target, true, old, "mutualgit push tag")?;
     } else {
