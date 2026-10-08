@@ -2183,6 +2183,25 @@ remain active.
     1 TiB geometry and other platforms remain separate open release gates; the
     hosted packaged CI job has not been run here.
 
+  - [x] Requalify the installed signature-diagnostics candidate on `92f9103`.
+    The actual musl build and optional Git alias pass, followed by all three
+    isolated-PATH Git packaging scenarios, 19 ordinary process cases, raw Unix
+    paths, the stock-Git bridge and five-daemon topology/seed recovery. The
+    provisioned test passes in 802.64 seconds; the provisioning caller completes
+    in 900.25 seconds with verified cleanup. Five live `/proc/PID/exe` observations
+    identify the installed static payload. A separate final audit rechecks all
+    276 tracked source files, eight wrapper/payload files and both frozen drivers;
+    all eight named daemon logs survive with 0700 directories and 0600 files.
+    No fixture daemon, namespace, firewall rule, mount, loop association or image
+    remains. The archived logs include the new signature request, signer,
+    event/lock and connection/routing-authority diagnostics across recovered-peer
+    and relay transitions. Evidence is retained in the private
+    `/tmp/mb-m6-signature-packaged-92f9103-1id16ljw` qualification and audit records.
+    This qualifies the listed installed Linux slice on that exact source; it
+    does not explain the historical R5 stall, qualify repeated fault/retry runs,
+    or close the remaining native, upgrade, multi-volume, private-Tor, platform
+    and retained-capacity release matrix.
+
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
   source-loss matrix on the release source. Record repeated topology evidence
@@ -2265,6 +2284,13 @@ remain active.
     workspace/all-targets Clippy pass.
     These are diagnostic and deterministic source-level checks;
     the historical stall's cause and repeated provisioned fault matrix stay open.
+
+    The installed musl diagnostics candidate on `92f9103` subsequently passes
+    five-daemon topology/seed recovery in 802.64 seconds. Its private logs retain
+    the correlated request and routing-authority fields through recovery and
+    relay transitions; source, candidate and frozen driver identities are
+    independently rechecked after verified resource cleanup under R7. This
+    positive run leaves the historical cause and repeated fault matrix open.
 
   Existing investigation and validation record:
 
