@@ -3355,6 +3355,260 @@ pub(crate) fn for_each_preserved_volume_registration(
     Ok(())
 }
 
+/// Saved volume custody metadata; these records do not verify stored payloads.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyVolumeReceipt {
+    pub format_version: u16,
+    pub volume_id: Uuid,
+    pub guild_id: String,
+    pub group_id: String,
+    pub shard_index: u8,
+    pub root: String,
+}
+
+#[cfg(target_os = "linux")]
+impl From<&VolumeReceipt> for LegacyVolumeReceipt {
+    fn from(receipt: &VolumeReceipt) -> Self {
+        Self {
+            format_version: receipt.format_version,
+            volume_id: receipt.volume_id,
+            guild_id: hex::encode(receipt.guild_id),
+            group_id: hex::encode(receipt.group_id),
+            shard_index: receipt.shard_index,
+            root: hex::encode(receipt.root),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyVolumeOwnershipEvidence {
+    Receipt(LegacyVolumeReceipt),
+    WriteIntent {
+        format_version: u16,
+        receipt: LegacyVolumeReceipt,
+    },
+    Attempt {
+        format_version: u16,
+        attempt_id: String,
+        receipt: LegacyVolumeReceipt,
+    },
+    Reservation {
+        format_version: u16,
+        attempt_id: String,
+        volume_id: Uuid,
+        guild_id: String,
+        shard_index: u8,
+        byte_length: u32,
+    },
+    Retirement {
+        format_version: u16,
+        volume_id: Uuid,
+        attempt_id: String,
+        group_id: String,
+        shard_index: u8,
+        cleanup_verification_hash: Option<String>,
+    },
+    Migration {
+        format_version: u16,
+        source_volume_id: Uuid,
+        destination: LegacyVolumeReceipt,
+        attempt_id: String,
+        verification_hash: String,
+        commitment: MerkleCommitment,
+        staged_receipt_hash: String,
+        destination_attempt_id: String,
+        destination_receipt_hash: String,
+        cancelled: bool,
+    },
+    CopyCleanup {
+        group_id: String,
+        shard_index: u8,
+        volume_ids: Vec<Uuid>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl LegacyVolumeOwnershipEvidence {
+    pub(crate) fn for_each_volume(&self, mut visit: impl FnMut(Uuid)) {
+        match self {
+            Self::Receipt(receipt)
+            | Self::WriteIntent { receipt, .. }
+            | Self::Attempt { receipt, .. } => visit(receipt.volume_id),
+            Self::Reservation { volume_id, .. } | Self::Retirement { volume_id, .. } => {
+                visit(*volume_id)
+            }
+            Self::Migration {
+                source_volume_id,
+                destination,
+                ..
+            } => {
+                visit(*source_volume_id);
+                visit(destination.volume_id);
+            }
+            Self::CopyCleanup { volume_ids, .. } => {
+                for id in volume_ids {
+                    visit(*id);
+                }
+            }
+        }
+    }
+}
+
+/// Decode original records with bounded SQL rows; never open a volume or replay work.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_volume_ownership(
+    control: &ControlStore,
+    mut visit: impl FnMut(&str, &[u8], &[u8], LegacyVolumeOwnershipEvidence) -> Result<()>,
+) -> Result<()> {
+    fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T> {
+        let record = decode_canonical(bytes)?;
+        if mb_core::canonical_bytes_bounded(&record, bytes.len())? != bytes {
+            bail!("preserved volume ownership record is not canonical");
+        }
+        Ok(record)
+    }
+    for kind in [
+        "volume-receipt",
+        "volume-write-intent",
+        "volume-attempt-intent",
+        "volume-attempt-receipt",
+        "volume-attempt-reservation",
+        "volume-attempt-retirement",
+        VARIABLE_MIGRATION_KIND,
+        "volume-copy-cleanup",
+    ] {
+        // Cleanup obligations are historical UUID lists; keep the existing local
+        // row budget. All other original record layouts fit the receipt bound.
+        let limit = if kind == "volume-copy-cleanup" {
+            mb_core::V1_MAX_CATALOG_BYTES
+        } else {
+            MAX_VOLUME_RECEIPT_BYTES
+        };
+        control.for_each_record_bounded(kind, 49, limit, |key, bytes| {
+            let evidence = match kind {
+                "volume-receipt" => {
+                    let record: VolumeReceipt = decode(bytes)?;
+                    validate_receipt(&record)?;
+                    validate_volume_object_record_id(key, &record)?;
+                    LegacyVolumeOwnershipEvidence::Receipt((&record).into())
+                }
+                "volume-write-intent" => {
+                    let record: VolumeWriteIntent = decode(bytes)?;
+                    validate_receipt(&record.receipt)?;
+                    validate_volume_object_record_id(key, &record.receipt)?;
+                    if record.format_version != 1 {
+                        bail!("invalid preserved volume write intent");
+                    }
+                    LegacyVolumeOwnershipEvidence::WriteIntent {
+                        format_version: record.format_version,
+                        receipt: (&record.receipt).into(),
+                    }
+                }
+                "volume-attempt-intent" | "volume-attempt-receipt" => {
+                    let record: AttemptVolumeRecord = decode(bytes)?;
+                    validate_attempt_volume_record(&record)?;
+                    if key
+                        != attempt_volume_object_id(
+                            &record.attempt_id,
+                            &record.receipt.group_id,
+                            record.receipt.shard_index,
+                        )
+                    {
+                        bail!("preserved volume attempt conflicts with its record key");
+                    }
+                    LegacyVolumeOwnershipEvidence::Attempt {
+                        format_version: record.format_version,
+                        attempt_id: hex::encode(record.attempt_id),
+                        receipt: (&record.receipt).into(),
+                    }
+                }
+                "volume-attempt-reservation" => {
+                    let record: AttemptReservationRecord = decode(bytes)?;
+                    validate_attempt_reservation_record(&record)?;
+                    if key != attempt_reservation_id(&record.attempt_id, record.shard_index) {
+                        bail!("preserved volume reservation conflicts with its record key");
+                    }
+                    LegacyVolumeOwnershipEvidence::Reservation {
+                        format_version: record.format_version,
+                        attempt_id: hex::encode(record.attempt_id),
+                        volume_id: record.volume_id,
+                        guild_id: hex::encode(record.guild_id),
+                        shard_index: record.shard_index,
+                        byte_length: record.byte_length,
+                    }
+                }
+                "volume-attempt-retirement" => {
+                    let record: AttemptRetirement = decode(bytes)?;
+                    if record.format_version != 1
+                        || record.volume_id.is_nil()
+                        || record.attempt_id == [0; 16]
+                        || record.group_id == [0; 32]
+                        || record.shard_index >= mb_core::MAX_CODING_SHARDS as u8
+                        || key
+                            != attempt_volume_object_id(
+                                &record.attempt_id,
+                                &record.group_id,
+                                record.shard_index,
+                            )
+                        || record.cleanup_verification_hash == Some([0; 32])
+                    {
+                        bail!("invalid preserved volume attempt retirement");
+                    }
+                    LegacyVolumeOwnershipEvidence::Retirement {
+                        format_version: record.format_version,
+                        volume_id: record.volume_id,
+                        attempt_id: hex::encode(record.attempt_id),
+                        group_id: hex::encode(record.group_id),
+                        shard_index: record.shard_index,
+                        cleanup_verification_hash: record
+                            .cleanup_verification_hash
+                            .map(hex::encode),
+                    }
+                }
+                VARIABLE_MIGRATION_KIND => {
+                    let record: VariableVolumeMigration = decode(bytes)?;
+                    validate_variable_migration(key, &record)?;
+                    LegacyVolumeOwnershipEvidence::Migration {
+                        format_version: record.format_version,
+                        source_volume_id: record.source_volume_id,
+                        destination: (&record.destination).into(),
+                        attempt_id: hex::encode(record.attempt_id),
+                        verification_hash: hex::encode(record.verification_hash),
+                        commitment: record.commitment,
+                        staged_receipt_hash: hex::encode(record.staged_receipt_hash),
+                        destination_attempt_id: hex::encode(record.destination_attempt_id),
+                        destination_receipt_hash: hex::encode(record.destination_receipt_hash),
+                        cancelled: record.cancelled,
+                    }
+                }
+                "volume-copy-cleanup" => {
+                    let volumes: Vec<Uuid> = decode(bytes)?;
+                    if key.len() != 33
+                        || key[..32] == [0; 32]
+                        || key[32] >= mb_core::MAX_CODING_SHARDS as u8
+                        || volumes.iter().any(Uuid::is_nil)
+                        || volumes.iter().collect::<BTreeSet<_>>().len() != volumes.len()
+                    {
+                        bail!("invalid preserved volume copy cleanup obligation");
+                    }
+                    LegacyVolumeOwnershipEvidence::CopyCleanup {
+                        group_id: hex::encode(&key[..32]),
+                        shard_index: key[32],
+                        volume_ids: volumes,
+                    }
+                }
+                _ => unreachable!(),
+            };
+            visit(kind, key, bytes, evidence)?;
+            Ok(true)
+        })?;
+    }
+    Ok(())
+}
+
 fn load_volume_records(control: &ControlStore) -> Result<Vec<VolumeRecord>> {
     Ok(control
         .get_record("node-config", b"storage-volumes")?
@@ -3580,6 +3834,286 @@ mod tests {
     use tempfile::TempDir;
 
     #[cfg(target_os = "linux")]
+    fn preserved_ownership_fixture() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+        let volume_id = Uuid::from_u128(1);
+        let old = VolumeReceipt {
+            format_version: 1,
+            volume_id,
+            guild_id: [86; 32],
+            group_id: [87; 32],
+            shard_index: 4,
+            root: [88; 32],
+        };
+        let commitment = mb_core::merkle_zero_commitment(mb_core::MIN_PROFILE_SHARD_SIZE).unwrap();
+        let receipt = VolumeReceipt {
+            format_version: 2,
+            group_id: [89; 32],
+            shard_index: 6,
+            root: commitment.root,
+            ..old.clone()
+        };
+        let attempt = AttemptVolumeRecord {
+            format_version: 1,
+            attempt_id: [90; 16],
+            receipt: receipt.clone(),
+        };
+        let reservation = AttemptReservationRecord {
+            format_version: 1,
+            attempt_id: attempt.attempt_id,
+            volume_id,
+            guild_id: receipt.guild_id,
+            shard_index: receipt.shard_index,
+            byte_length: commitment.byte_len,
+        };
+        let retirement = AttemptRetirement {
+            format_version: 1,
+            volume_id,
+            attempt_id: attempt.attempt_id,
+            group_id: receipt.group_id,
+            shard_index: receipt.shard_index,
+            cleanup_verification_hash: None,
+        };
+        let migration = VariableVolumeMigration {
+            format_version: 1,
+            source_volume_id: Uuid::from_u128(2),
+            destination: receipt.clone(),
+            attempt_id: attempt.attempt_id,
+            verification_hash: [91; 32],
+            commitment,
+            staged_receipt_hash: [92; 32],
+            destination_attempt_id: [93; 16],
+            destination_receipt_hash: [94; 32],
+            cancelled: true,
+        };
+        let object_key = volume_object_id(&receipt.group_id, receipt.shard_index);
+        let attempt_key =
+            attempt_volume_object_id(&attempt.attempt_id, &receipt.group_id, receipt.shard_index);
+        vec![
+            (
+                "volume-receipt",
+                volume_object_id(&old.group_id, old.shard_index),
+                canonical_bytes(&old).unwrap(),
+            ),
+            (
+                "volume-receipt",
+                object_key.clone(),
+                canonical_bytes(&receipt).unwrap(),
+            ),
+            (
+                "volume-write-intent",
+                object_key.clone(),
+                canonical_bytes(&VolumeWriteIntent {
+                    format_version: 1,
+                    receipt: receipt.clone(),
+                })
+                .unwrap(),
+            ),
+            (
+                "volume-attempt-intent",
+                attempt_key.clone(),
+                canonical_bytes(&attempt).unwrap(),
+            ),
+            (
+                "volume-attempt-receipt",
+                attempt_key.clone(),
+                canonical_bytes(&attempt).unwrap(),
+            ),
+            (
+                "volume-attempt-reservation",
+                attempt_reservation_id(&attempt.attempt_id, receipt.shard_index),
+                canonical_bytes(&reservation).unwrap(),
+            ),
+            (
+                "volume-attempt-retirement",
+                attempt_key,
+                canonical_bytes(&retirement).unwrap(),
+            ),
+            (
+                VARIABLE_MIGRATION_KIND,
+                object_key.clone(),
+                canonical_bytes(&migration).unwrap(),
+            ),
+            (
+                "volume-copy-cleanup",
+                object_key,
+                canonical_bytes(&vec![volume_id, migration.source_volume_id]).unwrap(),
+            ),
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_volume_ownership_uses_original_records_without_opening_payloads() {
+        for mode in ["closed", "wal-only", "live"] {
+            let area = TempDir::new().unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([85; 32]));
+            let database = area.path().join("control.db");
+            let control = ControlStore::open(&database, &keys).unwrap();
+            let records = preserved_ownership_fixture();
+            for (kind, key, bytes) in &records {
+                control.put_record(kind, key, bytes).unwrap();
+            }
+            let registry = preserved_registry_record(area.path().join("unavailable-volume"), 1);
+            store_volume_records(&control, &[registry]).unwrap();
+            let mut writer = Some(control);
+            if mode == "closed" {
+                drop(writer.take());
+            }
+            if mode == "wal-only" {
+                fs::remove_file(database.with_extension("db-shm")).unwrap();
+            }
+            let names = || {
+                let mut names = fs::read_dir(area.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            };
+            let before_names = names();
+            let before_main = fs::read(&database).unwrap();
+            let before_wal = fs::read(database.with_extension("db-wal")).ok();
+            let report =
+                crate::inventory_withdrawn_revisions_from_catalog(&keys, area.path()).unwrap();
+            assert_eq!(report.format_version, 6);
+            assert!(!report.retained_history_complete);
+            let json = serde_json::to_vec(&report).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<crate::LegacyRevisionInventory>(&json).unwrap(),
+                report
+            );
+            let entries = &report.local_state.volume_ownership;
+            assert_eq!(entries.len(), records.len(), "{mode}");
+            for (kind, key, bytes) in &records {
+                let entry = entries
+                    .iter()
+                    .find(|entry| {
+                        entry.record_kind == *kind && entry.record_id_hex == hex::encode(key)
+                    })
+                    .unwrap();
+                assert_eq!(entry.record_bytes, bytes.len() as u64);
+                assert_eq!(
+                    entry.record_hash,
+                    hex::encode(blake3::hash(bytes).as_bytes())
+                );
+                assert!(!entry.payloads_verified);
+                assert_eq!(
+                    entry.unregistered_volume_ids,
+                    if matches!(*kind, VARIABLE_MIGRATION_KIND | "volume-copy-cleanup") {
+                        vec![Uuid::from_u128(2)]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+            assert!(entries.iter().any(|entry| matches!(&entry.evidence, LegacyVolumeOwnershipEvidence::Receipt(receipt) if receipt.format_version == 1 && receipt.shard_index == 4)));
+            assert!(entries.iter().any(|entry| matches!(&entry.evidence, LegacyVolumeOwnershipEvidence::Receipt(receipt) if receipt.format_version == 2 && receipt.shard_index == 6)));
+            let migration = entries
+                .iter()
+                .find_map(|entry| match &entry.evidence {
+                    LegacyVolumeOwnershipEvidence::Migration {
+                        cancelled,
+                        verification_hash,
+                        destination_attempt_id,
+                        commitment,
+                        ..
+                    } => Some((
+                        cancelled,
+                        verification_hash,
+                        destination_attempt_id,
+                        commitment,
+                    )),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(*migration.0);
+            assert_eq!(*migration.1, hex::encode([91; 32]));
+            assert_eq!(*migration.2, hex::encode([93; 16]));
+            assert_eq!(migration.3.byte_len, mb_core::MIN_PROFILE_SHARD_SIZE);
+            assert_eq!(names(), before_names, "{mode}");
+            assert_eq!(fs::read(&database).unwrap(), before_main, "{mode}");
+            assert_eq!(
+                fs::read(database.with_extension("db-wal")).ok(),
+                before_wal,
+                "{mode}"
+            );
+            assert!(!area.path().join("unavailable-volume").exists());
+            drop(writer);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_volume_ownership_rejects_wrong_keys_noncanonical_and_oversized_rows() {
+        let area = TempDir::new().unwrap();
+        let control =
+            ControlStore::open_with_key(area.path().join("control.db"), &[95; 32]).unwrap();
+        for (kind, key, bytes) in preserved_ownership_fixture() {
+            let mut wrong = key.clone();
+            wrong[0] ^= 1;
+            // Cleanup's group key is its only group evidence, so an alternate
+            // nonzero group remains valid. Its malformed key is truncated.
+            if kind == "volume-copy-cleanup" {
+                wrong.pop();
+            }
+            let invalid_shape = match kind {
+                "volume-receipt" => {
+                    let mut record: VolumeReceipt = decode_canonical(&bytes).unwrap();
+                    record.root = [0; 32];
+                    canonical_bytes(&record).unwrap()
+                }
+                "volume-write-intent" => {
+                    let mut record: VolumeWriteIntent = decode_canonical(&bytes).unwrap();
+                    record.format_version = 2;
+                    canonical_bytes(&record).unwrap()
+                }
+                "volume-attempt-intent" | "volume-attempt-receipt" => {
+                    let mut record: AttemptVolumeRecord = decode_canonical(&bytes).unwrap();
+                    record.receipt.format_version = 1;
+                    canonical_bytes(&record).unwrap()
+                }
+                "volume-attempt-reservation" => {
+                    let mut record: AttemptReservationRecord = decode_canonical(&bytes).unwrap();
+                    record.byte_length = 17;
+                    canonical_bytes(&record).unwrap()
+                }
+                "volume-attempt-retirement" => {
+                    let mut record: AttemptRetirement = decode_canonical(&bytes).unwrap();
+                    record.cleanup_verification_hash = Some([0; 32]);
+                    canonical_bytes(&record).unwrap()
+                }
+                VARIABLE_MIGRATION_KIND => {
+                    let mut record: VariableVolumeMigration = decode_canonical(&bytes).unwrap();
+                    record.destination.root = [1; 32];
+                    canonical_bytes(&record).unwrap()
+                }
+                "volume-copy-cleanup" => canonical_bytes(&vec![Uuid::nil()]).unwrap(),
+                _ => unreachable!(),
+            };
+            for (key, bytes) in [
+                (wrong, bytes.clone()),
+                (vec![1; 50], bytes.clone()),
+                (key.clone(), invalid_shape),
+                (key.clone(), [bytes.clone(), vec![0]].concat()),
+                (key.clone(), vec![0; MAX_VOLUME_RECEIPT_BYTES + 1]),
+            ] {
+                control.put_record(kind, &key, &bytes).unwrap();
+                let mut visits = 0;
+                assert!(
+                    for_each_preserved_volume_ownership(&control, |_, _, _, _| {
+                        visits += 1;
+                        Ok(())
+                    })
+                    .is_err(),
+                    "{kind}"
+                );
+                assert_eq!(visits, 0, "{kind}");
+                control.delete_record(kind, &key).unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn preserved_registry_record(path: PathBuf, number: u128) -> VolumeRecord {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([81; 32]));
         let volume_id = Uuid::from_u128(number);
@@ -3687,7 +4221,7 @@ mod tests {
             assert!(paths.iter().all(|path| !path.exists()));
             let inventory =
                 crate::inventory_withdrawn_revisions_from_catalog(&keys, area.path()).unwrap();
-            assert_eq!(inventory.format_version, 5);
+            assert_eq!(inventory.format_version, 6);
             assert!(!inventory.retained_history_complete);
             let volumes = &inventory.local_state.storage_volumes;
             assert_eq!(volumes.len(), records.len());

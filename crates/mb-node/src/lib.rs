@@ -44,7 +44,7 @@ pub use legacy_export::{
     LegacyPeerInventoryCoverage, LegacyPeerSources, LegacyPendingCapture, LegacyPendingFilePin,
     LegacyPendingGitGraph, LegacyPreservedRecord, LegacyRetainedAnchor, LegacyRevisionInventory,
     LegacyRevisionInventoryEntry, LegacyRootRegistration, LegacySourceBinding,
-    LegacyStorageVolumeRegistration, export_withdrawn_revision_from_catalog,
+    LegacyStorageVolumeRegistration, LegacyVolumeOwnership, export_withdrawn_revision_from_catalog,
     export_withdrawn_revision_from_catalog_over_network,
     export_withdrawn_revision_from_catalog_with_anchor_areas,
     export_withdrawn_revision_from_catalog_with_preserved_sources,
@@ -80,6 +80,8 @@ pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,
     restore_revision_from_source,
 };
+#[cfg(target_os = "linux")]
+pub use volume::{LegacyVolumeOwnershipEvidence, LegacyVolumeReceipt};
 pub use volume::{
     PreservedParityVolume, StorageScrubReport, StorageVolumeState, StorageVolumeStatus,
 };

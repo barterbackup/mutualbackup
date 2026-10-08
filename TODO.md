@@ -750,6 +750,35 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory saved volume custody records in `legacy-list` report format 6.
+    Share the original bounded decoder and validation between inventory and
+    placement for fixed/variable receipts, write intents, staged attempt
+    intents/receipts, reservations, retirements, variable migrations and copy
+    cleanup obligations. Report original keys/hashes and decoded ownership,
+    including source/destination volume IDs, attempts, commitment and cleanup
+    evidence, cancellation and references lacking a saved registry entry.
+    No volume payload is opened or pending work replayed; record hashes do not
+    certify custody. Payload verification and retained-history completeness
+    remain false. Include each entry in the complete 32 MiB report budget.
+    Original-wire fixtures cover closed/WAL-only/live catalogs, both receipt
+    formats, every record family, missing registrations, exact/over report
+    budgets, JSON round trips, invalid shapes/keys, oversized rows and late corruption that
+    stops client/export placement before creation. Preserve original file sets
+    and main/WAL bytes. Volume custody inventory qualification passes 131 unique cases: 41 export/peer
+    cases, all 63 ordinary volume cases, 20 CLI process cases,
+    retained-graph/discovery/withdrawal/graph-intent regressions, and two
+    provisioned Btrfs identity/retained-capture cases. All four debug programs
+    build; format and strict locked workspace/all-targets Clippy pass. All 284
+    source-file and six program/test-driver hashes remain unchanged, and
+    native mount/loop/image cleanup is verified. Evidence and the distinct
+    passing-case inventory are retained under
+    `/tmp/mb-m6-volume-ownership-validation-o4_qqllw`; the post-commit audit
+    binds the code to the commit. This is a focused debug-source
+    qualification; complete ordinary/native suites and installed artifacts
+    were not rerun.
+    Full receipt-to-payload/recipe/local-sector/native-pin ownership joins,
+    external Git catalogs, relocated volumes/aliases, atomic writer handoff,
+    installed artifacts and full R1/R2/R3/release gates remain open.
   - [x] Include saved storage-volume registrations in `legacy-list` report
     format 5. Reuse placement's bounded current/historical decoder and one
     local snapshot. Report raw paths, volume IDs, database names, state,

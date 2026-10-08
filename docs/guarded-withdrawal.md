@@ -159,7 +159,7 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
-Report format 5 includes preserved local protected-root registrations, backend
+Report format 6 includes preserved local protected-root registrations, backend
 bindings, Git registrations, guarded stopped/revision-capture anchor ownership,
 pending source-capture and recovery-anchor intents, pending Git graph intents,
 retained revision/retirement anchors and remembered anchor-area locations.
@@ -246,6 +246,32 @@ the code to the commit. This is a focused debug-source qualification; complete
 ordinary/native suites and installed artifacts were not rerun. Complete receipt,
 recipe, local-sector, native-pin and pending-intent reconciliation, external
 Git catalogs and relocated volume discovery remain open.
+
+The `volume_ownership` entries decode saved receipt, write-intent, staged-attempt,
+reservation, retirement, variable-migration and copy-cleanup records using the
+original layouts. Record keys, sizes and hashes accompany the ownership and
+attempt/commitment/cleanup metadata. `unregistered_volume_ids` identifies references
+without a saved registry entry; it does not assert that a volume or its data is
+missing. Inventory and placement share canonical/shape/key validation and SQL row
+bounds: 512 bytes for fixed-size records and the existing 32 MiB local-row bound
+for historical cleanup UUID lists. Every report entry also contributes to the
+complete 32 MiB encoded-report budget. Corrupt late records reject before client
+or output creation. No volume is opened or pending operation replayed. Metadata
+hashes identify preserved records; they do not authenticate READY custody or
+resolve conflicting attempts. Payload verification and history completeness
+remain false. Volume custody inventory qualification passes 131 unique cases: 41 export/peer
+cases, all 63 ordinary volume cases, 20 CLI process cases,
+retained-graph/discovery/withdrawal/graph-intent regressions, and two
+provisioned Btrfs identity/retained-capture cases. All four debug programs
+build; format and strict locked workspace/all-targets Clippy pass. All 284
+source-file and six program/test-driver hashes remain unchanged, and native
+mount/loop/image cleanup is verified. Evidence and the distinct passing-case
+inventory are retained under
+`/tmp/mb-m6-volume-ownership-validation-o4_qqllw`; the post-commit audit binds
+the code to the commit. This is a focused debug-source qualification; complete
+ordinary/native suites and installed artifacts were not rerun. Complete
+receipt-to-payload/recipe/local-sector/native-pin joins, external Git catalogs,
+relocated volume discovery and atomic admission/writer handoff remain open.
 
 Native root plan format 1 predates stable filesystem IDs, and its wire layout did
 not change when the filesystem word changed from `st_dev` to a stable identity.

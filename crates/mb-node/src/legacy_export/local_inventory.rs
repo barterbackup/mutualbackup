@@ -31,6 +31,7 @@ pub struct LegacyLocalStateInventory {
     pub source_backends: Vec<LegacySourceBinding>,
     pub git_repositories: Vec<LegacyGitRegistration>,
     pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
+    pub volume_ownership: Vec<LegacyVolumeOwnership>,
     pub guarded_captures: Vec<LegacyGuardedCapture>,
     pub pending_captures: Vec<LegacyPendingCapture>,
     pub pending_git_graphs: Vec<LegacyPendingGitGraph>,
@@ -83,6 +84,18 @@ pub struct LegacyStorageVolumeRegistration {
     pub configured_recorded: bool,
     pub budget_bytes: u64,
     pub headroom_bytes: u64,
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyVolumeOwnership {
+    pub record_kind: String,
+    pub record_id_hex: String,
+    pub record_bytes: u64,
+    pub record_hash: String,
+    pub evidence: crate::volume::LegacyVolumeOwnershipEvidence,
+    /// Saved references lacking a current registry entry; no payload lookup occurs.
+    pub unregistered_volume_ids: Vec<Uuid>,
     pub payloads_verified: bool,
 }
 
@@ -183,6 +196,12 @@ pub(super) enum PreservedLocalRecord<'a> {
     Binding(SourceBackendBinding),
     Git(GitRepositoryInfo),
     Volume(crate::volume::PreservedVolumeRegistration<'a>),
+    VolumeOwnership {
+        kind: &'a str,
+        key: &'a [u8],
+        bytes: &'a [u8],
+        evidence: crate::volume::LegacyVolumeOwnershipEvidence,
+    },
     Capture {
         kind: &'a str,
         revision_id: Uuid,
@@ -240,6 +259,7 @@ impl PreservedLocalRecord<'_> {
             }))?,
             Self::Git(registration) => visit(PreservedInput::PathHint(&registration.path))?,
             Self::Volume(volume) => visit(PreservedInput::PathHint(volume.path))?,
+            Self::VolumeOwnership { .. } => {}
             Self::Capture { capture, .. } => {
                 visit(PreservedInput::NativeRoot(capture.metadata.lower_root_id))?;
                 for file in &capture.files {
@@ -448,6 +468,14 @@ pub(super) fn for_each_record(
     crate::volume::for_each_preserved_volume_registration(control, |volume| {
         visit(PreservedLocalRecord::Volume(volume))
     })?;
+    crate::volume::for_each_preserved_volume_ownership(control, |kind, key, bytes, evidence| {
+        visit(PreservedLocalRecord::VolumeOwnership {
+            kind,
+            key,
+            bytes,
+            evidence,
+        })
+    })?;
     for kind in ["capture-intent", "recovery-anchor-intent"] {
         control.for_each_record_bounded(kind, 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
             let intent = crate::snapshot::preserved::decode_capture_intent(kind, key, bytes)?;
@@ -556,6 +584,7 @@ pub(super) fn collect(
         source_backends: Vec::new(),
         git_repositories: Vec::new(),
         storage_volumes: Vec::new(),
+        volume_ownership: Vec::new(),
         guarded_captures: Vec::new(),
         pending_captures: Vec::new(),
         pending_git_graphs: Vec::new(),
@@ -625,6 +654,36 @@ pub(super) fn collect(
                 };
                 account(&entry, used, limit)?;
                 report.storage_volumes.push(entry);
+            }
+            PreservedLocalRecord::VolumeOwnership {
+                kind,
+                key,
+                bytes,
+                evidence,
+            } => {
+                let mut unregistered_volume_ids = Vec::new();
+                evidence.for_each_volume(|id| {
+                    if !report
+                        .storage_volumes
+                        .iter()
+                        .any(|volume| volume.volume_id == id)
+                    {
+                        unregistered_volume_ids.push(id);
+                    }
+                });
+                unregistered_volume_ids.sort_unstable();
+                unregistered_volume_ids.dedup();
+                let entry = LegacyVolumeOwnership {
+                    record_kind: kind.to_owned(),
+                    record_id_hex: hex::encode(key),
+                    record_bytes: bytes.len() as u64,
+                    record_hash: hex::encode(blake3::hash(bytes).as_bytes()),
+                    evidence,
+                    unregistered_volume_ids,
+                    payloads_verified: false,
+                };
+                account(&entry, used, limit)?;
+                report.volume_ownership.push(entry);
             }
             PreservedLocalRecord::Capture {
                 kind,
@@ -863,6 +922,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_volume_ownership_accounts_report_and_rejects_late_corruption_before_placement() {
+        let area = tempfile::tempdir().unwrap();
+        let data = area.path().join("state");
+        let safe = area.path().join("safe");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&safe).unwrap();
+        let keys = mb_core::KeyMaterial::from_seed(&mb_core::Seed::from_bytes([96; 32]));
+        let control = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        let receipt = crate::volume::VolumeReceipt {
+            format_version: 1,
+            volume_id: Uuid::from_u128(99),
+            guild_id: [97; 32],
+            group_id: [98; 32],
+            shard_index: 4,
+            root: [99; 32],
+        };
+        let mut key = receipt.group_id.to_vec();
+        key.push(receipt.shard_index);
+        control
+            .put_record("volume-receipt", &key, &canonical_bytes(&receipt).unwrap())
+            .unwrap();
+        drop(control);
+        let before = preserved_files(&data);
+        let report =
+            super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+        assert_eq!(report.format_version, 6);
+        assert!(!report.retained_history_complete);
+        assert_eq!(report.local_state.volume_ownership.len(), 1);
+        let entry = &report.local_state.volume_ownership[0];
+        assert_eq!(entry.unregistered_volume_ids, vec![receipt.volume_id]);
+        assert!(!entry.payloads_verified);
+        let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+        assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+        assert!(super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err());
+        let first = canonical_size_bounded(entry, V1_MAX_CATALOG_BYTES).unwrap();
+        crate::volume::with_inspected_control_snapshot(&data, &keys, |control| {
+            let mut used = 0;
+            assert!(collect(control, &mut used, first - 1).is_err());
+            assert_eq!(used, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert_preserved_files(&data, &before);
+        let control = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        control
+            .put_record("volume-write-intent", &key, &[0; 513])
+            .unwrap();
+        drop(control);
+        let corrupted_before = preserved_files(&data);
+        assert!(super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).is_err());
+        assert!(
+            super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false).is_err()
+        );
+        assert!(super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_err());
+        assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+        assert_preserved_files(&data, &corrupted_before);
+    }
+
+    #[test]
     fn legacy_volume_inventory_accounts_registry_entries_without_opening_volumes() {
         use std::os::unix::ffi::OsStringExt;
 
@@ -882,7 +1000,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 5);
+        assert_eq!(report.format_version, 6);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -1301,7 +1419,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 5);
+            assert_eq!(report.format_version, 6);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

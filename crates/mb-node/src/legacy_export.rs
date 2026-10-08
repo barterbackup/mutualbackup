@@ -15,7 +15,7 @@ pub use local_inventory::{
     LegacyGitGraphRef, LegacyGitRegistration, LegacyGuardedAnchorPin, LegacyGuardedCapture,
     LegacyLocalStateInventory, LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitGraph,
     LegacyPreservedRecord, LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
-    LegacyStorageVolumeRegistration,
+    LegacyStorageVolumeRegistration, LegacyVolumeOwnership,
 };
 pub use remote::{
     LegacyExportPeer, LegacyPeerInventoryCoverage, LegacyPeerSources,
