@@ -750,6 +750,39 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory original local-sector recipes in `legacy-list` report format 7.
+    Decode the original unversioned recipe and its four append-only source
+    variants: legacy/stable anchor files, Inline and private catalog pages.
+    Inventory and placement share canonical/key/shape checks with the existing
+    68 KiB SQL row bound. Report guild/sector/ciphertext-root identity, geometry
+    and source metadata; Inline reports its length only, including valid
+    zero-length synthetic filler. No plaintext, anchor payload or page is
+    opened or returned. Absolute recipe-only area hints and aliases exclude
+    client/export placement. Relative historical hints retain their status;
+    filesystem-root discovery hints do not exclude the whole filesystem.
+    Recorded filesystem words do not prove stable relocated ownership.
+    Entries share the complete 32 MiB report budget; payload verification and
+    retained-history completeness remain false. Fixtures cover original wire
+    records, closed/WAL-only/live catalogs, raw paths, JSON/Inline privacy,
+    malformed paths/ranges/keys/rows, relative hints, exact/over budgets, late
+    corruption before placement, recipe-only aliases and real CLI filler listing.
+    The initial qualification retained under
+    `/tmp/mb-m6-local-sector-validation-rvsv40wf` exposed a CLI fixture write
+    after read-only shell inspection. Filler creation now precedes inspection;
+    recipe production code is unchanged. Local-sector recipe qualification passes 135 unique cases: 45 export/peer
+    cases, all 63 ordinary volume cases, 20 CLI process cases,
+    retained-graph/discovery/withdrawal/graph-intent regressions, and two
+    provisioned Btrfs identity/retained-capture cases. All four debug programs
+    build; format and strict locked workspace/all-targets Clippy pass. All 284
+    source-file and six program/test-driver hashes remain unchanged, and
+    native mount/loop/image cleanup is verified. Evidence and the distinct
+    passing-case inventory are retained under
+    `/tmp/mb-m6-local-sector-validation-m858b2w1`; the post-commit audit binds
+    the code to the commit. This is a focused debug-source qualification;
+    complete ordinary/native suites and installed artifacts were not rerun. Complete retained
+    recipe/native-pin/paged-source/custody joins, external Git catalogs,
+    relocated owners, atomic writer handoff, installed artifacts and full
+    R1/R2/R3/release gates remain open.
   - [x] Inventory saved volume custody records in `legacy-list` report format 6.
     Share the original bounded decoder and validation between inventory and
     placement for fixed/variable receipts, write intents, staged attempt

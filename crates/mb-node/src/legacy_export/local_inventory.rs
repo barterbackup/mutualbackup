@@ -19,7 +19,10 @@ use uuid::Uuid;
 
 use super::inventory::LegacyRevisionInventoryEntry;
 use crate::control::{GitRepositoryInfo, ProtectedRoot};
-use crate::snapshot::preserved::{PreservedCaptureIntent, PreservedGitGraphIntent};
+pub use crate::snapshot::preserved::{LegacyLocalSectorRecipe, LegacyLocalSectorSource};
+use crate::snapshot::preserved::{
+    PreservedCaptureIntent, PreservedGitGraphIntent, PreservedLocalSectorRecipe,
+};
 use anchors::PreservedAnchor;
 pub use git_intents::{
     LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef, LegacyPendingGitGraph,
@@ -32,6 +35,7 @@ pub struct LegacyLocalStateInventory {
     pub git_repositories: Vec<LegacyGitRegistration>,
     pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
     pub volume_ownership: Vec<LegacyVolumeOwnership>,
+    pub local_sectors: Vec<LegacyLocalSectorRecipe>,
     pub guarded_captures: Vec<LegacyGuardedCapture>,
     pub pending_captures: Vec<LegacyPendingCapture>,
     pub pending_git_graphs: Vec<LegacyPendingGitGraph>,
@@ -196,6 +200,7 @@ pub(super) enum PreservedLocalRecord<'a> {
     Binding(SourceBackendBinding),
     Git(GitRepositoryInfo),
     Volume(crate::volume::PreservedVolumeRegistration<'a>),
+    LocalSector(&'a PreservedLocalSectorRecipe),
     VolumeOwnership {
         kind: &'a str,
         key: &'a [u8],
@@ -260,6 +265,9 @@ impl PreservedLocalRecord<'_> {
             Self::Git(registration) => visit(PreservedInput::PathHint(&registration.path))?,
             Self::Volume(volume) => visit(PreservedInput::PathHint(volume.path))?,
             Self::VolumeOwnership { .. } => {}
+            Self::LocalSector(recipe) => {
+                recipe.for_each_path(|path| visit(PreservedInput::PathHint(path)))?
+            }
             Self::Capture { capture, .. } => {
                 visit(PreservedInput::NativeRoot(capture.metadata.lower_root_id))?;
                 for file in &capture.files {
@@ -476,6 +484,16 @@ pub(super) fn for_each_record(
             evidence,
         })
     })?;
+    control.for_each_record_bounded(
+        "local-sector",
+        32,
+        mb_core::V1_SECTOR_SIZE + 4096,
+        |key, bytes| {
+            let recipe = crate::snapshot::preserved::decode_local_sector(key, bytes)?;
+            visit(PreservedLocalRecord::LocalSector(&recipe))?;
+            Ok(true)
+        },
+    )?;
     for kind in ["capture-intent", "recovery-anchor-intent"] {
         control.for_each_record_bounded(kind, 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
             let intent = crate::snapshot::preserved::decode_capture_intent(kind, key, bytes)?;
@@ -585,6 +603,7 @@ pub(super) fn collect(
         git_repositories: Vec::new(),
         storage_volumes: Vec::new(),
         volume_ownership: Vec::new(),
+        local_sectors: Vec::new(),
         guarded_captures: Vec::new(),
         pending_captures: Vec::new(),
         pending_git_graphs: Vec::new(),
@@ -654,6 +673,11 @@ pub(super) fn collect(
                 };
                 account(&entry, used, limit)?;
                 report.storage_volumes.push(entry);
+            }
+            PreservedLocalRecord::LocalSector(recipe) => {
+                let entry = recipe.report();
+                account(&entry, used, limit)?;
+                report.local_sectors.push(entry);
             }
             PreservedLocalRecord::VolumeOwnership {
                 kind,
@@ -922,6 +946,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_export_local_sector_inventory_accounts_budget_and_rejects_late_corruption() {
+        let area = tempfile::tempdir().unwrap();
+        let data = area.path().join("state");
+        let safe = area.path().join("safe");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&safe).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([112; 32]));
+        let mut control = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        crate::snapshot::install_inline_recipe(
+            &mut control,
+            [113; 32],
+            mb_core::SectorRef {
+                id: [114; 32],
+                root: [115; 32],
+                logical_len: 4,
+            },
+            b"hide".to_vec(),
+        )
+        .unwrap();
+        drop(control);
+        let before = preserved_files(&data);
+        let report =
+            super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+        assert_eq!(report.format_version, 7);
+        assert!(!report.retained_history_complete);
+        assert_eq!(report.local_state.local_sectors.len(), 1);
+        let entry = &report.local_state.local_sectors[0];
+        assert!(!entry.payloads_verified);
+        let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+        assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+        assert!(super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err());
+        let first = canonical_size_bounded(entry, V1_MAX_CATALOG_BYTES).unwrap();
+        crate::volume::with_inspected_control_snapshot(&data, &keys, |control| {
+            let mut used = 0;
+            assert!(collect(control, &mut used, first - 1).is_err());
+            assert_eq!(used, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert_preserved_files(&data, &before);
+        let control = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        control
+            .put_record("local-sector", &[255; 32], b"damaged late recipe")
+            .unwrap();
+        drop(control);
+        let corrupted_before = preserved_files(&data);
+        assert!(super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).is_err());
+        assert!(
+            super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false).is_err()
+        );
+        assert!(super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_err());
+        assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+        assert_preserved_files(&data, &corrupted_before);
+    }
+
+    #[test]
+    fn legacy_export_local_sector_placement_excludes_recipe_only_areas_and_aliases() {
+        let area = tempfile::tempdir().unwrap();
+        let data = area.path().join("state");
+        std::fs::create_dir(&data).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([111; 32]));
+        let control = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        let fixtures = crate::snapshot::preserved::local_sector_test_records(area.path());
+        for (key, bytes) in &fixtures {
+            control.put_record("local-sector", key, bytes).unwrap();
+        }
+        drop(control);
+        let safe = area.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        for (key, bytes) in fixtures {
+            let preserved = crate::snapshot::preserved::decode_local_sector(&key, &bytes).unwrap();
+            preserved
+                .for_each_path(|path| {
+                    std::fs::create_dir_all(path.join("nested"))?;
+                    std::fs::write(path.join("original"), b"retained payload")?;
+                    let alias = area.path().join(format!("alias-{}", key[0]));
+                    std::os::unix::fs::symlink(path, &alias)?;
+                    for parent in [
+                        path.to_path_buf(),
+                        path.join("nested"),
+                        alias.clone(),
+                        alias.join("nested"),
+                    ] {
+                        assert!(
+                            crate::legacy_export::remote::peer_client_preflight(
+                                &keys,
+                                &data,
+                                &parent,
+                                &[],
+                                false
+                            )
+                            .is_err()
+                        );
+                        assert!(
+                            crate::legacy_export::remote::export_parent_preflight(
+                                &keys,
+                                &data,
+                                &parent,
+                                &[]
+                            )
+                            .is_err()
+                        );
+                    }
+                    assert_eq!(std::fs::read(path.join("original"))?, b"retained payload");
+                    assert_eq!(std::fs::read_dir(path.join("nested"))?.count(), 0);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(
+            crate::legacy_export::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                .is_ok()
+        );
+        assert!(
+            crate::legacy_export::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_ok()
+        );
+        assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+    }
+
+    #[test]
     fn legacy_volume_ownership_accounts_report_and_rejects_late_corruption_before_placement() {
         let area = tempfile::tempdir().unwrap();
         let data = area.path().join("state");
@@ -947,7 +1091,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 6);
+        assert_eq!(report.format_version, 7);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.volume_ownership.len(), 1);
         let entry = &report.local_state.volume_ownership[0];
@@ -1000,7 +1144,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 6);
+        assert_eq!(report.format_version, 7);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -1419,7 +1563,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 6);
+            assert_eq!(report.format_version, 7);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

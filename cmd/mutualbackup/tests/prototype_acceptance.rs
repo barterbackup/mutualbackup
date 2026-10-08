@@ -3601,16 +3601,25 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     registry_node
         .configure_storage_volumes(std::slice::from_ref(&volume), 65536, 0)
         .unwrap();
+    let (filler, _) = registry_node
+        .ensure_filler(guild, Uuid::new_v4(), 0)
+        .unwrap();
     let registry = registry_node.database_shell_statement(
         None,
         "SELECT hex(bytes) FROM protocol_records WHERE kind='node-config' AND record_id=X'73746f726167652d766f6c756d6573'",
         false,
     ).unwrap();
     let registry_bytes = hex::decode(&registry.rows[0][0]).unwrap();
+    let filler_rows = registry_node.database_shell_statement(None, &format!(
+        "SELECT hex(bytes) FROM protocol_records WHERE kind='local-sector' AND record_id=X'{}'", hex::encode(filler.id)), false).unwrap();
+    let filler_bytes = hex::decode(&filler_rows.rows[0][0]).unwrap();
     drop(registry_node);
     let mut store = mb_store::ControlStore::open(catalog.join("control.db"), &keys).unwrap();
     store
         .put_record("node-config", b"storage-volumes", &registry_bytes)
+        .unwrap();
+    store
+        .put_record("local-sector", &filler.id, &filler_bytes)
         .unwrap();
     store
         .put_record("user-revision", revision_id.as_bytes(), &signed)
@@ -3694,7 +3703,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 6);
+    assert_eq!(inventory.format_version, 7);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -3711,6 +3720,15 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(saved_volume.configured && saved_volume.configured_recorded);
     assert_eq!(saved_volume.budget_bytes, 65536);
     assert!(!saved_volume.payloads_verified);
+    assert_eq!(inventory.local_state.local_sectors.len(), 1);
+    let filler_entry = &inventory.local_state.local_sectors[0];
+    assert_eq!(filler_entry.sector_id, hex::encode(filler.id));
+    assert_eq!(filler_entry.logical_len, 0);
+    assert!(matches!(
+        &filler_entry.source,
+        mb_node::LegacyLocalSectorSource::Inline { byte_length: 0 }
+    ));
+    assert!(!filler_entry.payloads_verified);
     assert!(!inventory.local_state.git_repositories[0].registered_root);
     let preserved = &inventory.local_state.unclassified_guarded_records[0];
     assert_eq!(preserved.kind, "guarded-view-mount-v1");

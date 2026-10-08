@@ -210,7 +210,7 @@ fn pending_capture_inventory_preserves_all_envelopes_raw_pins_and_old_identity_a
         let report =
             super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                 .unwrap();
-        assert_eq!(report.format_version, 6);
+        assert_eq!(report.format_version, 7);
         assert!(!report.retained_history_complete);
         let captures = report.local_state.pending_captures;
         assert_eq!(captures.len(), 7);

@@ -159,7 +159,7 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
-Report format 6 includes preserved local protected-root registrations, backend
+Report format 7 includes preserved local protected-root registrations, backend
 bindings, Git registrations, guarded stopped/revision-capture anchor ownership,
 pending source-capture and recovery-anchor intents, pending Git graph intents,
 retained revision/retirement anchors and remembered anchor-area locations.
@@ -272,6 +272,35 @@ the code to the commit. This is a focused debug-source qualification; complete
 ordinary/native suites and installed artifacts were not rerun. Complete
 receipt-to-payload/recipe/local-sector/native-pin joins, external Git catalogs,
 relocated volume discovery and atomic admission/writer handoff remain open.
+
+The `local_sectors` entries decode the original unversioned recipes and all four
+append-only source variants. They report guild/sector/ciphertext-root identity,
+logical length and legacy/stable anchor or private-page metadata. Inline data is
+represented by its byte length only, including zero-length synthetic filler.
+No inline plaintext, anchor payload or private page is returned or opened. The
+shared inventory/placement reader validates canonical encoding, keys, geometry,
+relative anchor paths and overflow within the existing 68 KiB SQL row bound.
+Absolute recipe-only area hints and aliases exclude client/export locations;
+relative historical hints do not acquire the current process cwd. Volume-root
+hints remain discovery starting points rather than ownership of a filesystem.
+Recorded filesystem words do not establish a stable relocated identity. Each
+entry contributes to the complete 32 MiB encoded-report budget, and payload
+verification/history completeness remain false. The initial qualification retained under
+`/tmp/mb-m6-local-sector-validation-rvsv40wf` exposed a CLI fixture write
+after read-only shell inspection. Filler creation now precedes inspection;
+recipe production code is unchanged. Local-sector recipe qualification passes 135 unique cases: 45 export/peer
+cases, all 63 ordinary volume cases, 20 CLI process cases,
+retained-graph/discovery/withdrawal/graph-intent regressions, and two
+provisioned Btrfs identity/retained-capture cases. All four debug programs
+build; format and strict locked workspace/all-targets Clippy pass. All 284
+source-file and six program/test-driver hashes remain unchanged, and native
+mount/loop/image cleanup is verified. Evidence and the distinct passing-case
+inventory are retained under `/tmp/mb-m6-local-sector-validation-m858b2w1`;
+the post-commit audit binds the code to the commit. This is a focused
+debug-source qualification; complete ordinary/native suites and installed
+artifacts were not rerun. Complete recipe/native-pin/paged-source/custody joins,
+external Git catalogs, relocated owner discovery and atomic admission/writer
+handoff remain open.
 
 Native root plan format 1 predates stable filesystem IDs, and its wire layout did
 not change when the filesystem word changed from `st_dev` to a stable identity.
