@@ -1746,6 +1746,20 @@ the full enclosing capacity/quota policy, normal consumers and the original
 Milestone 6 closure gates remain required. Validation is recorded in ADR 0002
 and TODO.md; the enclosing checkpoint-ownership item remains open.
 
+The public authority stream now has a complete disposable join into that same
+packing/coding index. It checks exact supplied certified-event membership,
+historical/latest writer fences, first retained chains and tombstone suffixes,
+global retained/retired revision IDs, original legacy/source/bootstrap EOFs,
+source identity/geometry consistency and necessary owner/quorum migration
+evidence. Its byte/page/record ledger survives every join; nested work is checked
+before exposing an understated reference. Bounded mixed-revision and source
+cursors preserve original identities without a flat legacy checkpoint or a
+second scratch store. The event snapshot and fence authorization still require
+independent certified history and live rechecks; the quorum-signed paged
+certificate, previous-checkpoint transition, coding lifecycle, private/payload
+joins and complete publication/retirement ownership remain open. This does not
+activate normal producers or change the required retained 1 TiB policy or gates.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

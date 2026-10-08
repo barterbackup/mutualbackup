@@ -48,7 +48,9 @@ impl CatalogPackedSourceId {
         }
     }
 
-    pub(super) fn validate(self) -> Result<(), CatalogError> {
+    /// Validate a decoded identity before using it as an authenticated lookup key.
+    /// This checks its shape; enclosing signed source authority is still required.
+    pub fn validate(self) -> Result<(), CatalogError> {
         if self.owner == NodeId([0; 32])
             || self.protected_root == [0; 32]
             || self.object_id == [0; 32]

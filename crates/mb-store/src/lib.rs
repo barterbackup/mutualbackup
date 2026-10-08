@@ -44,8 +44,11 @@ pub use database::{
 pub use database::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingDirectoryIndex,
-    CatalogCertifiedCodingIndex, CatalogCertifiedPackingIndex, CatalogCheckpointRetention,
-    CatalogCheckpointRetentionState, CatalogCodingAuthorization, CatalogCodingCoverage,
+    CatalogCertifiedCodingIndex, CatalogCertifiedPackingIndex, CatalogCheckpointAuthorityContext,
+    CatalogCheckpointAuthorityIndex, CatalogCheckpointAuthorityValidation,
+    CatalogCheckpointCodingDirectoryIndex, CatalogCheckpointPackingIndex,
+    CatalogCheckpointRetention, CatalogCheckpointRetentionState,
+    CatalogCheckpointWriterAuthorization, CatalogCodingAuthorization, CatalogCodingCoverage,
     CatalogCodingCoveragePolicy, CatalogCodingRetention, CatalogCodingRetentionState,
     CatalogCodingValidation, CatalogIndexedCodingGroup, CatalogIndexedDirectoryCodingGroup,
     CatalogIntent, CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,

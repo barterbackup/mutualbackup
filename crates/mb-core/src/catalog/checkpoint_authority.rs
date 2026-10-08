@@ -230,6 +230,27 @@ pub struct CatalogCheckpointAuthoritySummary {
 }
 
 impl CatalogCheckpointAuthoritySummary {
+    fn within(self, maximum: Self) -> bool {
+        let values = |summary: Self| {
+            [
+                u64::from(summary.members),
+                summary.writer_fences,
+                summary.tombstones,
+                summary.revisions,
+                summary.legacy_revisions,
+                summary.legacy_bytes,
+                summary.legacy_pages,
+                summary.source_bytes,
+                summary.source_pages,
+                summary.bindings,
+                summary.attestations,
+            ]
+        };
+        values(self)
+            .into_iter()
+            .zip(values(maximum))
+            .all(|(actual, limit)| actual <= limit)
+    }
     fn records(self) -> Result<u64, CatalogError> {
         [
             u64::from(self.members),
@@ -680,6 +701,12 @@ impl CatalogCheckpointAuthorityReader {
                 return Err(CatalogError::InvalidPage.into());
             }
             self.state.accept(&record)?;
+            // Nested closures are consumed by callers after this record is
+            // returned. Reject understated counts/work before exposing the
+            // offending reference, not only at the final authority EOF.
+            if !self.state.summary.within(self.root.summary) {
+                return Err(CatalogError::InvalidPage.into());
+            }
             Ok(Some(record))
         })();
         self.failed = result.is_err();
@@ -939,6 +966,56 @@ mod tests {
             assert!(
                 root.represented_bytes().unwrap()
                     > root.records.page.byte_len + reference.body.byte_len
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_authority_rejects_understated_nested_work_before_exposing_references() {
+        let mut fixture = Fixture::new(5);
+        let mut builder = CatalogSectorBuilder::new(fixture.paged.value.scope()).unwrap();
+        let mut sink = |page: CatalogPageRef, bytes| {
+            fixture.pages.insert(page.hash, bytes);
+            Ok::<_, &'static str>(())
+        };
+        for index in 0..640_u32 {
+            let mut record = fixture.paged.value.metadata.clone();
+            record.sector.id = [0; 32];
+            record.sector.id[..4].copy_from_slice(&index.to_be_bytes());
+            builder.push(&record, &mut sink).unwrap();
+        }
+        builder
+            .push(&fixture.paged.value.metadata, &mut sink)
+            .unwrap();
+        let mut value = fixture.paged.value.clone();
+        value.sources = builder.finish(&mut sink).unwrap();
+        fixture.paged = value.sign(&fixture.writer, &fixture.owner).unwrap();
+        fixture.records[4] = CatalogCheckpointAuthorityRecord::PagedRevision(fixture.paged.clone());
+        let (root, pages, control_pages) = fixture.build(&fixture.records);
+        assert!(root.summary.source_pages > 1);
+        for dimension in 0..3 {
+            let mut bad = root;
+            match dimension {
+                0 => bad.summary.legacy_bytes -= 1,
+                1 => bad.summary.source_bytes -= 1,
+                _ => bad.summary.source_pages -= 1,
+            }
+            bad.validate().unwrap();
+            let mut reader = CatalogCheckpointAuthorityReader::new(fixture.scope(), bad).unwrap();
+            let mut fetch = |page| {
+                assert!(control_pages.contains(&page));
+                self::fetch(&pages, page)
+            };
+            for _ in 0..if dimension == 0 { 3 } else { 4 } {
+                assert!(reader.next_record(&mut fetch).unwrap().is_some());
+            }
+            assert!(reader.next_record(&mut fetch).is_err());
+            assert!(
+                reader
+                    .next_record(&mut |_| -> Result<Vec<u8>, &'static str> {
+                        panic!("failed reader fetched another page")
+                    })
+                    .is_err()
             );
         }
     }

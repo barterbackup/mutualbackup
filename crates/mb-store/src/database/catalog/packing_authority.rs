@@ -18,18 +18,18 @@ use super::packing_validation::{build_index, unwrap_stream};
 use super::*;
 use crate::RecordScratchStore;
 
-const ROW_BYTES: usize = 256;
-const EVIDENCE_BYTES: usize = 512;
-const MEMBERS: &str = "packing-authority-member";
-const FENCES: &str = "packing-authority-fence";
-const HEADS: &str = "packing-authority-head";
-const IDS: &str = "packing-authority-revision-id";
-const SOURCES: &str = "packing-authority-source";
+pub(super) const ROW_BYTES: usize = 256;
+pub(super) const EVIDENCE_BYTES: usize = 512;
+pub(super) const MEMBERS: &str = "packing-authority-member";
+pub(super) const FENCES: &str = "packing-authority-fence";
+pub(super) const HEADS: &str = "packing-authority-head";
+pub(super) const IDS: &str = "packing-authority-revision-id";
+pub(super) const SOURCES: &str = "packing-authority-source";
 const CANDIDATES: &str = "packing-authority-candidate";
-const BINDINGS: &str = "packing-authority-binding";
-const ATTESTATIONS: &str = "packing-authority-attestation";
-const TALLIES: &str = "packing-authority-tally";
-const KINDS: [&str; 9] = [
+pub(super) const BINDINGS: &str = "packing-authority-binding";
+pub(super) const ATTESTATIONS: &str = "packing-authority-attestation";
+pub(super) const TALLIES: &str = "packing-authority-tally";
+pub(super) const KINDS: [&str; 9] = [
     MEMBERS,
     FENCES,
     HEADS,
@@ -60,7 +60,7 @@ pub struct CatalogPackingAuthorizedSource {
     pub commitment: MerkleCommitment,
 }
 
-fn source_key(id: CatalogPackedSourceId) -> [u8; 96] {
+pub(super) fn source_key(id: CatalogPackedSourceId) -> [u8; 96] {
     let mut key = [0; 96];
     key[..32].copy_from_slice(&id.owner.0);
     key[32..64].copy_from_slice(&id.protected_root);
@@ -69,30 +69,30 @@ fn source_key(id: CatalogPackedSourceId) -> [u8; 96] {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Source {
-    id: CatalogPackedSourceId,
-    flat_root: [u8; 32],
-    commitment: Option<MerkleCommitment>,
+pub(super) struct Source {
+    pub(super) id: CatalogPackedSourceId,
+    pub(super) flat_root: [u8; 32],
+    pub(super) commitment: Option<MerkleCommitment>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Head {
-    sequence: u64,
-    hash: [u8; 32],
-    writer_epoch: u64,
+pub(super) struct Head {
+    pub(super) sequence: u64,
+    pub(super) hash: [u8; 32],
+    pub(super) writer_epoch: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Tally {
-    commitment: MerkleCommitment,
-    signers: u16,
+pub(super) struct Tally {
+    pub(super) commitment: MerkleCommitment,
+    pub(super) signers: u16,
 }
 
-fn encoded<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, CatalogStoreError> {
+pub(super) fn encoded<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, CatalogStoreError> {
     Ok(canonical_bytes_bounded(value, limit)?)
 }
 
-fn insert<T: Serialize>(
+pub(super) fn insert<T: Serialize>(
     store: &RecordScratchStore,
     kind: &str,
     key: &[u8],
@@ -108,7 +108,7 @@ fn insert<T: Serialize>(
     Ok(())
 }
 
-fn read<T: serde::de::DeserializeOwned + Serialize>(
+pub(super) fn read<T: serde::de::DeserializeOwned + Serialize>(
     store: &RecordScratchStore,
     kind: &str,
     key: &[u8],
@@ -123,7 +123,7 @@ fn read<T: serde::de::DeserializeOwned + Serialize>(
     Ok(Some((value, bytes)))
 }
 
-fn replace<T: Serialize>(
+pub(super) fn replace<T: Serialize>(
     store: &RecordScratchStore,
     kind: &str,
     key: &[u8],
@@ -138,7 +138,7 @@ fn replace<T: Serialize>(
     Ok(())
 }
 
-fn source(
+pub(super) fn source(
     store: &RecordScratchStore,
     id: CatalogPackedSourceId,
 ) -> Result<(Source, Vec<u8>), CatalogStoreError> {
@@ -150,7 +150,7 @@ fn source(
     Ok((source, bytes))
 }
 
-fn add_source(
+pub(super) fn add_source(
     store: &RecordScratchStore,
     id: CatalogPackedSourceId,
     flat_root: [u8; 32],
@@ -203,7 +203,7 @@ fn add_source(
     Ok((1, authenticated))
 }
 
-fn chain(owner: NodeId, root: Uuid) -> [u8; 48] {
+pub(super) fn chain(owner: NodeId, root: Uuid) -> [u8; 48] {
     let mut key = [0; 48];
     key[..32].copy_from_slice(&owner.0);
     key[32..].copy_from_slice(root.as_bytes());
@@ -879,7 +879,7 @@ impl CatalogCertifiedCodingIndex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use mb_core::{
@@ -893,16 +893,16 @@ mod tests {
 
     type Pages = BTreeMap<[u8; 32], Vec<u8>>;
 
-    struct Fixture {
-        keys: Vec<KeyMaterial>,
-        writer: SigningKey,
-        certificate: QuorumCheckpoint,
-        records: Vec<CatalogSectorRecord>,
-        bytes: Vec<Vec<u8>>,
+    pub(crate) struct Fixture {
+        pub(crate) keys: Vec<KeyMaterial>,
+        pub(crate) writer: SigningKey,
+        pub(crate) certificate: QuorumCheckpoint,
+        pub(crate) records: Vec<CatalogSectorRecord>,
+        pub(crate) bytes: Vec<Vec<u8>>,
     }
 
     impl Fixture {
-        fn new(authenticated: bool, removed: bool) -> Self {
+        pub(crate) fn new(authenticated: bool, removed: bool) -> Self {
             let keys = (11..14)
                 .map(|seed| KeyMaterial::from_seed(&Seed::from_bytes([seed; 32])))
                 .collect::<Vec<_>>();
@@ -1019,7 +1019,7 @@ mod tests {
             .unwrap()
         }
 
-        fn candidate(
+        pub(crate) fn candidate(
             &self,
             records: &[CatalogSectorRecord],
         ) -> (SignedRecord<PagedUserRevision>, Pages) {
@@ -1059,7 +1059,7 @@ mod tests {
             (signed, pages)
         }
 
-        fn packing(
+        pub(crate) fn packing(
             &self,
             records: &[CatalogSectorRecord],
             payloads: &[Vec<u8>],
@@ -1146,7 +1146,7 @@ mod tests {
             )
         }
 
-        fn binding(&self, index: usize) -> SignedRecord<LegacyPackingBinding> {
+        pub(crate) fn binding(&self, index: usize) -> SignedRecord<LegacyPackingBinding> {
             let old = &self.certificate.checkpoint.revisions[0].value;
             SignedRecord::sign(
                 LEGACY_PACKING_BINDING_DOMAIN,
@@ -1163,7 +1163,7 @@ mod tests {
             .unwrap()
         }
 
-        fn attestation(
+        pub(crate) fn attestation(
             &self,
             index: usize,
             signer: usize,

@@ -1585,6 +1585,25 @@ separately below.
     checks. See ADR 0002. This owns packing/coding metadata only; the enclosing
     checkpoint ownership, certified-current guards and payload owners below
     remain required. No normal consumer or real retained 1 TiB gate is qualified.
+  - [x] Join complete authenticated public authority streams to packing and
+    coding directories in one admitted encrypted index. Match the independently
+    supplied certified-event membership and required historical/latest writer
+    authorization; check retained tombstone suffixes, global retained/retired
+    revision IDs, original legacy/source/bootstrap EOFs, source identity/geometry
+    and necessary owner/quorum migration evidence. Preserve bounded original
+    mixed-revision/source cursors and carry the complete byte/page/record ledger
+    through both joins. Reject understated nested summaries before exposing the
+    offending body reference. Eight store fixtures cover before-fetch admission,
+    source/fence/tombstone conflicts, missing bootstrap, late corrupt control EOF,
+    ignored writes, event mismatch and real scratch spill/exhaustion/rebuild with
+    4,098 indexed sources. The new core fixture checks nested work before yield.
+    All 162 core and 213 ordinary store tests pass (26 store tests ignored), with
+    strict locked workspace/all-targets Clippy and formatting/diff checks.
+    Existing signed formats/vectors and legacy-base APIs remain unchanged.
+    See ADR 0002. This is public metadata validation against supplied event trust;
+    previous-checkpoint transition, paged quorum certification, live event
+    rechecks, coding lifecycle, private/payload joins and the enclosing ownership
+    and production/retained-capacity qualification gates remain open.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

@@ -2940,3 +2940,92 @@ The full locked regression passes all 161 core and 205 ordinary store tests
 initial-failure checks. Strict locked workspace/all-targets Clippy and
 formatting/diff checks pass. No network/native/release, other-platform or real
 retained 1 TiB runtime gate was rerun for this local ownership slice.
+
+### Complete public authority joins into packing and coding (2026-10-08)
+
+`CatalogCheckpointAuthorityIndex` now validates the complete mixed authority
+stream in an admitted encrypted scratch store. Unlike the existing migration
+bridge, it does not first materialize a flat legacy checkpoint. Its authenticated
+authority root and separately supplied `CatalogCheckpointAuthorityContext` bind
+the guild, intended generation, certified event sequence/head, membership epoch
+and quorum policy. The context and exact active member slice must come from
+independently certified guild history, never from the proposed root's own claims.
+Every decoded member must match that slice, including recovery keys and failure
+domains. A mandatory writer callback verifies every historical fence and each
+owner's latest retained fence against the same event snapshot. Removed owners
+may retain previously authorized history; this does not authorize a new mutation
+by a removed owner or replace comparison with the previous checkpoint.
+
+Mixed legacy and paged chains now join their first retained revision to sequence
+one or an exact tombstone suffix. Later revisions retain contiguous sequence,
+parent hash and nondecreasing writer epochs. All listed latest fences need a
+retained head, and every tombstone needs a retained suffix. The disposable global
+ID table reserves both retained revision IDs and tombstones' last retired IDs,
+rejecting reuse across owners, roots or formats. Every revision's writer epoch
+and key must match an admitted historical fence. Legacy envelopes retain their
+original signatures, identities and individually bounded decoding; paged sources
+require complete authenticated EOF and the exact signed bootstrap sector.
+
+The source table joins repeated references without weakening identity or
+geometry. A global object-ID index rejects cross-owner/root reuse and changed
+logical lengths or flat roots. Merkle commitments must agree across retained
+references; an initially uncommitted legacy source can gain its commitment from
+an exact signed paged source, owner binding, or current-epoch quorum attestation.
+Migration evidence must name a retained source and its exact flat root and
+commitment. Redundant/unusable evidence and incomplete current-member tallies
+fail the join. An identity's public `validate` method checks shape only; signed
+source authority and eventual payload verification remain separate requirements.
+
+One required trusted byte/page/record budget survives authority, packing and
+directory construction. Authority work reserves a fixed 2048-byte descriptor,
+control pages and every legacy/source closure occurrence. The record ledger
+charges authority frames, each separately decoded legacy envelope, every flat
+legacy source entry and every paged-source frame, including repeated trees.
+This ledger is explicit for the new streaming authority path; the older bounded
+legacy-certificate bridge retains its existing accounting. Declared nested
+paged-source records are admitted before fetching source pages; legacy entries
+are admitted after their bounded envelope decode and before indexing entries.
+Bytes/pages are admitted from the authority root before traversal.
+
+The core authority reader now compares every cumulative summary dimension with
+the root's declaration before returning a record. An understated nested byte or
+page summary therefore cannot expose a body reference whose fetch would exceed
+the enclosing admission. Exact final EOF checks still apply. This strengthens
+validation without changing any existing root, signed envelope or protocol
+vector layout. Original per-tree, forest and authority-root caps remain intact.
+
+`CatalogCheckpointPackingIndex` joins exactly all authenticated retained sources
+to both packing streams in that same scratch store. The directory join debits
+the complete authority work, binds the event sequence, replays all original
+witnesses and establishes exact eligible packed-input coverage under the shared
+budget. `CatalogCheckpointCodingDirectoryIndex` preserves the authority
+descriptor and bounded mixed-revision cursor. Cursor reads require completion,
+check original keys, scope and signatures, and never scan or materialize the
+whole retained revision/source set. Source rows, original legacy references,
+and signed paged revisions retain their bounded schemas. Existing legacy-base
+source-authority APIs and serialized layouts remain unchanged.
+
+All authority acquisition uses one private scratch transaction; no production
+database writer spans traversal or external callbacks. Ignored writes and late
+authorization, framing, bootstrap, page or summary failures produce no completed
+index. Failed jobs discard their scratch store and rebuild. Completion remains
+mandatory after the packing/coding join as well. This is not a quorum-signed
+paged checkpoint, a certified transition or a publication/retirement guard.
+Current event rechecks, historical coding lifecycle/delegation, fixed legacy
+coding migration, owner-private/native/bootstrap joins and information/parity
+payload custody still need the enclosing checkpoint. Full admission/quotas,
+normal producer/retention/seed consumers and all retained 1 TiB, release and
+platform gates remain open.
+
+Validation: all eight focused store fixtures pass, as does the new core check
+for understated nested work before reference exposure. The full locked
+regression passes 162 core and 213 ordinary store tests (26 store tests ignored).
+Fixtures exercise exact mixed/source cursors, tombstones and retired IDs,
+historical/latest authorization, removed owners, source geometry conflicts,
+owner/quorum evidence, before-fetch rejection in every budget dimension,
+ignored writes, orphan markers, missing bootstrap, corrupted cursors and a late
+control-page failure across 162 mixed revisions. A 4,098-source metadata fixture
+spills beyond the 1 MiB cache, exhausts a smaller admitted store and rebuilds;
+it does not materialize or qualify large payload data. Strict locked
+workspace/all-targets Clippy and formatting/diff checks pass. No network/native,
+release/platform or real retained 1 TiB runtime gate was rerun for this join.
