@@ -39,10 +39,10 @@ pub use catalog::{
     CatalogPackingCodingDirectoryIndex, CatalogPackingCodingDirectoryValidation,
     CatalogPackingCodingIndex, CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
     CatalogPackingCodingValidation, CatalogPackingIndex, CatalogPackingPlacement,
-    CatalogPackingSector, CatalogPackingValidation, CatalogPublicationView, CatalogSectorSource,
-    CatalogSourceSweep, CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink,
-    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
-    PagedCatalogSectorSource, PagedCatalogSnapshot,
+    CatalogPackingSector, CatalogPackingValidation, CatalogPublicationView,
+    CatalogQuorumPagedCheckpointIndex, CatalogSectorSource, CatalogSourceSweep, CatalogStoreError,
+    CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource,
+    PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
 #[cfg(target_os = "linux")]

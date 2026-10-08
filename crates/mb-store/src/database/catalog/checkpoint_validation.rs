@@ -26,7 +26,17 @@ const USED: &str = "checkpoint-authority-latest-writer-used";
 const TOMBSTONES: &str = "checkpoint-authority-tombstone";
 const OBJECTS: &str = "checkpoint-authority-source-object";
 const REVISIONS: &str = "checkpoint-authority-revision";
-const KINDS: [&str; 6] = [COMPLETE, HISTORY, USED, TOMBSTONES, OBJECTS, REVISIONS];
+pub(super) const MEMBER_RECORDS: &str = "checkpoint-authority-member";
+pub(super) const MEMBER_BYTES: usize = 512;
+const KINDS: [&str; 7] = [
+    COMPLETE,
+    HISTORY,
+    USED,
+    TOMBSTONES,
+    OBJECTS,
+    REVISIONS,
+    MEMBER_RECORDS,
+];
 
 /// Trusted enclosing event snapshot, not a claim learned from the proposed
 /// root. Callers must obtain this and the active members from certified guild
@@ -319,6 +329,13 @@ impl CatalogCheckpointAuthorityIndex {
                             return Err(DatabaseError::Conflict.into());
                         }
                         insert(&store, MEMBERS, &member.node_id.0, &true, ROW_BYTES)?;
+                        insert(
+                            &store,
+                            MEMBER_RECORDS,
+                            &member.node_id.0,
+                            member,
+                            MEMBER_BYTES,
+                        )?;
                         member_index += 1;
                     }
                     R::WriterFence(fence) => {
@@ -794,10 +811,7 @@ impl CatalogCheckpointCodingDirectoryIndex {
     pub fn index(&self) -> &CatalogPackingCodingDirectoryIndex {
         &self.index
     }
-    pub fn next_revision(
-        &self,
-        after: Option<CatalogCheckpointRevisionKey>,
-    ) -> Result<Option<CatalogCheckpointAuthorityRecord>, CatalogStoreError> {
+    pub(super) fn require_complete(&self) -> Result<(), CatalogStoreError> {
         self.index.require_complete()?;
         require_authority(
             &self.index.packing().store,
@@ -805,7 +819,13 @@ impl CatalogCheckpointCodingDirectoryIndex {
             self.index.manifest().prior_work,
             self.source_count,
             self.index.budget(),
-        )?;
+        )
+    }
+    pub fn next_revision(
+        &self,
+        after: Option<CatalogCheckpointRevisionKey>,
+    ) -> Result<Option<CatalogCheckpointAuthorityRecord>, CatalogStoreError> {
+        self.require_complete()?;
         next_revision(
             &self.index.packing().store,
             self.authority.context.guild_id,
@@ -815,7 +835,7 @@ impl CatalogCheckpointCodingDirectoryIndex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::packing_authority::tests::Fixture as Sources;
     use super::*;
     use mb_core::{
@@ -829,9 +849,9 @@ mod tests {
     type Pages = BTreeMap<[u8; 32], Vec<u8>>;
     type R = CatalogCheckpointAuthorityRecord;
 
-    struct Fixture {
-        sources: Sources,
-        context: CatalogCheckpointAuthorityContext,
+    pub(crate) struct Fixture {
+        pub(crate) sources: Sources,
+        pub(crate) context: CatalogCheckpointAuthorityContext,
         records: Vec<R>,
         pages: Pages,
     }
@@ -884,7 +904,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(authenticated: bool, removed: bool) -> Self {
+        pub(crate) fn new(authenticated: bool, removed: bool) -> Self {
             let sources = Sources::new(authenticated, removed);
             let checkpoint = &sources.certificate.checkpoint;
             let context = CatalogCheckpointAuthorityContext {
@@ -1023,6 +1043,86 @@ mod tests {
                     }
                 },
             )
+        }
+        pub(crate) fn trust(&self) -> mb_core::PagedCheckpointTrust {
+            let old = &self.sources.certificate;
+            mb_core::PagedCheckpointTrust {
+                guild_id: self.context.guild_id,
+                genesis_hash: old.checkpoint.genesis_hash,
+                event_sequence: self.context.event_sequence,
+                event_head: self.context.event_head,
+                authority: self.context.authority,
+                members: self.members().to_vec(),
+                previous: Some(mb_core::PagedCheckpointParent {
+                    generation: old.checkpoint.generation,
+                    hash: old.hash().unwrap(),
+                }),
+            }
+        }
+        pub(crate) fn joined(
+            &mut self,
+            budget: CatalogCodingTraversalBudget,
+            policy: CatalogCodingCoveragePolicy,
+        ) -> CatalogCheckpointCodingDirectoryIndex {
+            let (packing, packing_pages) = self
+                .sources
+                .packing(&self.sources.records, &self.sources.bytes);
+            let old = &self.sources.certificate.checkpoint.revisions[0].value;
+            let packed = pack_incremental(
+                packing.descriptors.profile,
+                None,
+                self.sources
+                    .records
+                    .iter()
+                    .zip(&self.sources.bytes)
+                    .map(|(record, bytes)| PackingInput {
+                        owner: old.owner,
+                        protected_root: packing_protected_root(old.protected_root_id),
+                        object_id: record.sector.id,
+                        source_commitment: Some(record.commitment.clone()),
+                        bytes: bytes.clone(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let inputs = super::super::packing_validation::tests::Fixture {
+                manifest: packing,
+                pages: Default::default(),
+                roles: [Vec::new(), Vec::new()],
+                authority: Default::default(),
+                sectors: packed.catalog.sectors,
+                bytes: packed
+                    .sectors
+                    .into_iter()
+                    .map(|sector| sector.bytes)
+                    .collect(),
+            };
+            let entry =
+                super::super::coding_coverage::tests::entry(&inputs, [0, 1, 2], 701, 2, None);
+            let mut pages = Pages::new();
+            let mut sink = |page: CatalogPageRef, bytes| {
+                pages.insert(page.hash, bytes);
+                Ok::<_, ()>(())
+            };
+            let mut builder = CatalogCodingDirectoryBuilder::new(
+                self.scope(),
+                self.context.event_sequence,
+                budget,
+            )
+            .unwrap();
+            builder.push_group(&entry, &mut sink).unwrap();
+            let coding = builder.finish(&mut sink).unwrap();
+            self.build(budget)
+                .unwrap()
+                .validate_packing(packing, |page| fetch(&packing_pages, page))
+                .unwrap()
+                .validate_coding_directory(
+                    coding,
+                    policy,
+                    |page| fetch(&pages, page),
+                    |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
+                )
+                .unwrap()
         }
     }
 
@@ -1468,7 +1568,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(source_fetches.get(), 0);
-        for kind in [COMPLETE, SOURCES] {
+        for kind in [COMPLETE, SOURCES, MEMBER_RECORDS] {
             let store = RecordScratchStore::new(4 << 20).unwrap();
             store.put_record_if_absent(kind, b"orphan", b"").unwrap();
             assert!(
@@ -1485,6 +1585,7 @@ mod tests {
             );
         }
         for (operation, kind) in [
+            ("INSERT", MEMBER_RECORDS),
             ("INSERT", HISTORY),
             ("INSERT", SOURCES),
             ("UPDATE", HEADS),

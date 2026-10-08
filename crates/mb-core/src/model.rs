@@ -1623,7 +1623,7 @@ pub enum ModelError {
     Merkle(#[from] crate::MerkleError),
 }
 
-fn validate_members(members: &[Member]) -> Result<(), ModelError> {
+pub(crate) fn validate_members(members: &[Member]) -> Result<(), ModelError> {
     let mut previous = None;
     let mut node_ids = std::collections::BTreeSet::new();
     let mut failure_domains = std::collections::BTreeSet::new();

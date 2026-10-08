@@ -1755,10 +1755,25 @@ evidence. Its byte/page/record ledger survives every join; nested work is checke
 before exposing an understated reference. Bounded mixed-revision and source
 cursors preserve original identities without a flat legacy checkpoint or a
 second scratch store. The event snapshot and fence authorization still require
-independent certified history and live rechecks; the quorum-signed paged
-certificate, previous-checkpoint transition, coding lifecycle, private/payload
+independent certified history and live rechecks; full production certification,
+previous-checkpoint transition, coding lifecycle, private/payload
 joins and complete publication/retirement ownership remain open. This does not
 activate normal producers or change the required retained 1 TiB policy or gates.
+
+A fixed version-eight public quorum header now binds the completed authority,
+both packing roots, the coding directory and exact nested authority record
+ledger. Its independent trust snapshot carries the certified event head and
+sequence, active members/quorum, genesis and original previous checkpoint hash.
+Store signing/binding requires completed current coverage, exact original member
+records and fresh equal trust snapshots before and after the operation. One
+32 KiB certificate envelope replaces local descriptor reservations under the
+same shared admission; signatures and the roster have fixed 256-member bounds.
+Header verification is explicitly separate from complete body validation and
+the previous-state transition. This draft bridge has no normal producer or
+publication/retirement capability; all remaining transition, private/payload,
+ownership, quota and release qualification gates above still apply. Protocol
+formats 3–7 and original signed identities stay unchanged. Validation is recorded
+in ADR 0002 and TODO.md.
 
 ### Historical implementation and validation record (before scope correction)
 

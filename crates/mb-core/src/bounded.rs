@@ -92,7 +92,7 @@ pub(crate) fn failure_domain<'de, D: Deserializer<'de>>(decoder: D) -> Result<St
 
 // Preserve the generic SignedRecord layout while bounding signatures before
 // allocating from new paged authority records. Legacy decoders stay unchanged.
-fn signature<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
+pub(crate) fn signature<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
     VecSeed::new(64).deserialize(decoder)
 }
 

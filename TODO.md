@@ -1601,9 +1601,30 @@ separately below.
     strict locked workspace/all-targets Clippy and formatting/diff checks.
     Existing signed formats/vectors and legacy-base APIs remain unchanged.
     See ADR 0002. This is public metadata validation against supplied event trust;
-    previous-checkpoint transition, paged quorum certification, live event
-    rechecks, coding lifecycle, private/payload joins and the enclosing ownership
+    previous-checkpoint transition, production quorum certification, atomic
+    event/publication guards, coding lifecycle, private/payload joins and the
+    enclosing ownership
     and production/retained-capacity qualification gates remain open.
+  - [x] Bind a fixed version-eight public quorum header to the completed
+    authority/packing/coding-directory proof. Require current coverage and
+    independently reread certified event/membership and previous-checkpoint
+    snapshots before and after signing or binding; compare exact original
+    member recovery keys/domains, all roots and the complete authority record
+    ledger. Bound the header to 4 KiB and certificate to 32 KiB with at most
+    256 ordered active-member signatures, bounded before nested allocation.
+    Preserve legacy hashes/signatures and use separate new signing/hash domains.
+    Charge one certificate envelope and every public byte/page/record occurrence
+    under the original trusted proof budget. Seven core and six store fixtures
+    cover full 256-member quorum geometry, malformed signatures, independent
+    event/base trust, quorum-valid root/ledger substitutions, exhausted admission,
+    stale callbacks, historical coverage and missing proof/member rows. See
+    ADR 0002 and the new protocol vector. All 169 core and 219 ordinary store
+    tests pass (26 store tests ignored), with strict locked workspace/all-targets
+    Clippy and formatting/diff checks. This is a draft public header bridge,
+    with no normal producer or publication capability. Full previous-state
+    transitions, coding lifecycle/fixed legacy migration, private/payload joins,
+    certified-current durable ownership and retained 1 TiB/release gates below
+    remain required.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

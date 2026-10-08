@@ -27,7 +27,9 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `PackedCatalog` | `id`, `format_version`, `revision`, `parent`, `profile`, `sectors`; each sector descriptor is ordered as `id`, `sector_index`, `flat_root`, `commitment`, `slots` | embedded in checkpoint version 7; the catalog ID and each sector ID are domain-separated BLAKE3 hashes of their canonical bodies |
 | `GuildCheckpoint` | versions 3–4: `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `writer_fences`, `revision_tombstones`, `revisions`, `coding_groups`; versions 5–6 append `authority`; version 7 appends `authority`, `packing_catalog` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes; version 6 introduces root-scoped revision/tombstone records and version 7 maps every retained signed sector through authenticated stable slots to packed coding sectors |
 | `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures; versions 3–4 require every listed member, while versions 5–7 require their epoch-bound guild quorum |
-| `CatalogCheckpointAuthorityRoot` (staging codec, format 1) | `format_version`, `generation`, `membership_epoch`, `records`, `summary` | must be authenticated by the future enclosing paged checkpoint; no standalone signature or activation |
+| `PagedGuildCheckpoint` (draft public header, format 8) | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `event_sequence`, `event_head`, `authority`, `authority_root`, `authority_records`, `packed_sectors`, `packed_sources`, `coding` | `mutualbackup/paged-guild-checkpoint/v1`; hash derive-key context `mutualbackup paged guild checkpoint body v1`; body/transition and production activation remain separate gates |
+| `QuorumPagedCheckpoint` | `checkpoint`, `signatures` | bounded certificate of paged header signatures under independently trusted current membership/quorum; no member roster is learned from the proposal |
+| `CatalogCheckpointAuthorityRoot` (staging codec, format 1) | `format_version`, `generation`, `membership_epoch`, `records`, `summary` | authenticated by the paged header; no standalone signature or activation |
 | `CatalogLegacyRevisionRef` (format 1) | `format_version`, `guild_id`, `owner`, `protected_root_id`, `revision_id`, `sequence`, `parent`, `writer_epoch`, `writer_public_key`, `revision_hash`, `body` | `body` authenticates the original signed legacy envelope through guild-scoped Checkpoint pages; original owner/writer domains and revision body hash remain unchanged |
 | `MemberSignature` | `signer`, `signature` | signature domain belongs to containing certificate |
 | `StorageAcknowledgement` | `format_version`, `operation_id`, `guild_id`, `group_id`, `shard_index`, `row`, `root`, `holder` | `mutualbackup/storage-acknowledgement/v1` |
@@ -80,9 +82,10 @@ authenticate all referenced pages before decoding and matching the exact
 revision summary. Ordered authority-record EOF does not establish full source
 or legacy-body availability. Complete body/source traversal, membership/fence
 and tombstone joins, global revision-ID uniqueness, migration evidence quorum,
-private joins, durable transitive root ownership, coding and the enclosing
-checkpoint certificate remain required before signing or activation. No new
-checkpoint certificate version or peer publication path is enabled here.
+private joins, durable transitive root ownership, coding and the full
+previous-checkpoint transition remain required before production signing or
+activation. The draft public header bridge below does not enable a peer
+publication path.
 
 Local SQLCipher retention now follows embedded authority references as well as
 byte-tree children: an incremental journal pins the control tree, original
@@ -157,3 +160,42 @@ composite checkpoint ownership and current certified authority remain required.
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw
 Postcard or CBOR unless their extension says JSON.
+
+Paged checkpoint format eight is a separate draft public header, rather than an
+extension of the legacy positional checkpoint decoder. Its 4 KiB header binds
+the original genesis and previous checkpoint hash, certified event sequence and
+head, epoch/quorum, authority root, exact authority record ledger, both packing
+roots and coding directory. The authority ledger includes control frames,
+separately decoded legacy envelopes, flat legacy source entries and every nested
+paged-source frame occurrence. Header validation checks its bounds; exact
+identity, counts and full body EOF require the completed store proof.
+Owner-private plaintext root hashes are absent from the public header.
+
+The certificate reserves 32 KiB, with at most 256 strictly ordered distinct
+active-member signatures of exactly 64 bytes. List and nested signature limits
+apply before allocation. Its signing domain and body-hash derive-key context
+are distinct from all legacy checkpoints; collecting a different quorum subset
+does not change the checkpoint hash. Verification requires an independently
+trusted event roster/quorum, genesis and previous checkpoint identity. It never
+learns trust from the proposed authority root. Generation one requires no
+parent; later generations require the exact trusted predecessor and increment.
+
+One separately supplied trusted byte/page/record budget charges the fixed
+certificate envelope plus every logical public closure occurrence. Embedded
+root/local descriptor reservations are not charged twice. Existing per-tree,
+authority and packing aggregate limits remain; directory forest boundaries
+cannot reset the budget. Private/payload work and retained quotas still need
+the enclosing policy. `paged-checkpoint-v1.postcard.hex` freezes the new header
+and ordered quorum signature layout; it is a header codec fixture, not evidence
+of a complete body/coverage or state-transition validation.
+
+The store bridge signs and binds only a completed current-coverage public proof,
+compares exact member records and roots/ledger, and rereads independent event and
+previous-checkpoint snapshots before and after the operation. The private
+wrapper preserves the original certificate and indexed body; a raw header or
+manifest cannot create it. These draft APIs do not authorize production
+activation: legal previous-state retention/mutations, original coding lifecycle
+and fixed legacy-group migration, private/bootstrap/native joins, payload
+custody, durable transitive ownership and an atomic current-state publication
+or retirement guard remain mandatory. No normal producer, peer version or
+seed-only consumer is enabled by this header.

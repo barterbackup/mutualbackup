@@ -3029,3 +3029,82 @@ spills beyond the 1 MiB cache, exhausts a smaller admitted store and rebuilds;
 it does not materialize or qualify large payload data. Strict locked
 workspace/all-targets Clippy and formatting/diff checks pass. No network/native,
 release/platform or real retained 1 TiB runtime gate was rerun for this join.
+
+## Paged public quorum headers bind the completed proof (2026-10-08)
+
+A separate `PagedGuildCheckpoint` format eight now binds the completed public
+checkpoint proof without materializing a flat legacy checkpoint. Its fixed
+4 KiB header contains guild/genesis, generation and original predecessor hash,
+certified event sequence/head and epoch/quorum, the original authority root and
+complete authority record ledger, both packing roots and the coding directory.
+The public header contains no owner-private plaintext root hashes. Legacy
+checkpoint formats 3–7, signed revision/evidence layouts and hashes are unchanged.
+New header signatures use `mutualbackup/paged-guild-checkpoint/v1`; body identity
+uses the BLAKE3 derive-key context `mutualbackup paged guild checkpoint body v1`
+and excludes the collected signer subset.
+
+`QuorumPagedCheckpoint` is bounded to 32 KiB and 256 strictly ordered distinct
+active-member signatures, each exactly 64 bytes. Its nested decoder rejects
+oversized list/signature declarations before allocating their bodies. Header
+verification requires a separate `PagedCheckpointTrust` snapshot containing the
+independently certified event roster/quorum and exact trusted previous state.
+That local trust type deliberately has no wire decoder. Trust bounds validate
+member keys, recovery keys, unique domains and ordering before quorum replay;
+no trust is learned from the proposed root. Parent identity/generation, genesis,
+event head/sequence and policy must match exactly. The unchanged previous hash
+can refer to a legacy checkpoint. Header/quorum verification alone establishes
+neither full body EOF nor a legal previous-state transition.
+
+The original trusted proof budget admits one fixed 32 KiB certificate envelope
+plus every public byte/page/record occurrence. This replaces the 2048-byte
+local authority and 4096-byte local combined descriptor reservations, adding
+26,624 bytes to that completed local ledger without changing page/record debt.
+Embedded directory/packing/root descriptors are not charged again. The exact
+authority record count includes nested paged frames and flat legacy source
+entries; the core checks its declared bounds and the store bridge requires its
+exact equality to the completed proof. Existing tree/authority/packing caps
+remain intact, and all coding forests share this original budget. This is not
+a complete retained-history quota or private/payload admission policy.
+
+`CatalogCheckpointCodingDirectoryIndex::sign_paged_checkpoint_header` requires
+current coverage and every authority/packing/coding completion marker. Full
+original member records now have bounded disposable rows so it can recompare
+recovery keys and domains, as well as IDs, with the independently read roster.
+The supplied callback rereads certified event state and the trusted predecessor
+before and after the operation; changed/error snapshots or missing completion
+and member rows fail closed. The final check rereads the bounded member rows as
+well as markers. No production writer spans traversal or callbacks.
+
+`bind_paged_checkpoint_header` requires the exact original roots and authority
+ledger plus an independently valid current-member quorum, and returns a private
+`CatalogQuorumPagedCheckpointIndex` preserving the original certificate, trust
+snapshot and complete indexed body/cursors. Cryptographically valid substituted
+roots or record counts cannot acquire this wrapper. Its later `recheck_header`
+checks the same exact live snapshot and proof again. Historical coverage cannot
+sign or bind a current checkpoint; a removed owner can retain authorized history
+but cannot sign a new current-member header.
+
+These are explicitly draft public header APIs with no normal producer or
+production publication/retirement capability. Full previous-state omission,
+retention and current-candidate writer rules, original coding lifecycle and
+fixed legacy-group migration, private/bootstrap/native and information/parity
+payload custody, complete durable ownership, atomic certified-current guards,
+full quota policy and all retained 1 TiB/platform/release gates remain required.
+The enclosing checkpoint TODOs remain open.
+
+Seven core fixtures cover deterministic header/quorum bytes, distinct legacy
+signing domains, stable signer-subset identity, exact independent event/base
+trust, malformed/duplicate/nonmember signatures, before-allocation list limits,
+noncanonical/trailing bytes, all three admission dimensions and arithmetic
+bounds. A real authority builder with 256 members and 256-byte domains confirms
+that the full unanimous quorum fits the envelope. Six store fixtures construct
+real mixed legacy/paged sources, packing and full-byte coding witnesses. They
+cover exact proof/cursor preservation, quorum-valid root/ledger substitutions,
+current/historical/removed-owner rules, changed/error trust callbacks, exact
+certificate-envelope admission and missing completion/member rows. The new
+member namespace also joins ignored-write and orphan rejection coverage.
+
+Validation: the full locked regression passes all 169 core and 219 ordinary
+store tests (26 store tests ignored). Strict locked workspace/all-targets
+Clippy and formatting/diff checks pass. No network/native, release/platform or
+real retained 1 TiB runtime gate was rerun for this header bridge.

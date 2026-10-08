@@ -14,6 +14,7 @@ mod guild;
 mod keys;
 mod model;
 mod packing;
+mod paged_checkpoint;
 mod range;
 mod recovery;
 
@@ -100,6 +101,11 @@ pub use packing::{
     SourceChunkId, attach_legacy_packing_bindings, attach_legacy_packing_evidence,
     pack_incremental, pack_incremental_authenticated, packing_protected_root, unpack_object,
     unpack_object_from_sectors,
+};
+pub use paged_checkpoint::{
+    PAGED_GUILD_CHECKPOINT_BYTES, PAGED_GUILD_CHECKPOINT_DOMAIN, PAGED_GUILD_CHECKPOINT_VERSION,
+    PAGED_QUORUM_CHECKPOINT_BYTES, PagedCheckpointParent, PagedCheckpointTrust,
+    PagedGuildCheckpoint, QuorumPagedCheckpoint,
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
