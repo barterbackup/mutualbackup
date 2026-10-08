@@ -787,9 +787,9 @@ impl DynamicGuildState {
     pub fn writer_epoch_is_current(&self, owner: NodeId, epoch: u64) -> bool {
         self.writer_keys
             .iter()
-            .filter(|entry| entry.owner == owner && entry.revoked_at_event.is_none())
+            .filter(|entry| entry.owner == owner)
             .max_by_key(|entry| entry.epoch)
-            .is_some_and(|entry| entry.epoch == epoch)
+            .is_some_and(|entry| entry.epoch == epoch && entry.revoked_at_event.is_none())
     }
 
     fn require_active_member(&self, node_id: NodeId) -> Result<&DynamicMember, GuildStateError> {
@@ -1670,6 +1670,59 @@ mod tests {
             state.apply_event(&early_forget),
             Err(GuildStateError::RetentionActive)
         ));
+    }
+
+    #[test]
+    fn revoking_latest_writer_never_reactivates_older_epoch() {
+        let keys = keys(6);
+        let mut state = state(&keys);
+        let owner = keys[0].node_id();
+        let writers = [9, 10, 11].map(|value| {
+            ed25519_dalek::SigningKey::from_bytes(&[value; 32])
+                .verifying_key()
+                .to_bytes()
+        });
+        for (epoch, public_key) in [(1, writers[0]), (2, writers[1])] {
+            let event = certify(
+                &state,
+                GuildEventKind::RotateWriterKey {
+                    owner,
+                    epoch,
+                    public_key,
+                },
+                &keys[..3],
+            );
+            state.apply_event(&event).unwrap();
+        }
+        assert!(!state.writer_epoch_is_current(owner, 1));
+        assert!(state.writer_epoch_is_current(owner, 2));
+        let revoke = certify(
+            &state,
+            GuildEventKind::RevokeWriterKey { owner, epoch: 2 },
+            &keys[..3],
+        );
+        state.apply_event(&revoke).unwrap();
+        assert!(!state.writer_epoch_is_current(owner, 1));
+        assert!(!state.writer_epoch_is_current(owner, 2));
+        for (epoch, public_key) in [(1, writers[0]), (2, writers[1])] {
+            assert_eq!(
+                state.writer_key_for_retained_revision(owner, epoch),
+                Some(public_key)
+            );
+        }
+        let rotate = certify(
+            &state,
+            GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 3,
+                public_key: writers[2],
+            },
+            &keys[..3],
+        );
+        state.apply_event(&rotate).unwrap();
+        assert!(state.writer_epoch_is_current(owner, 3));
+        assert!(!state.writer_epoch_is_current(owner, 1));
+        assert!(!state.writer_epoch_is_current(owner, 2));
     }
 
     #[test]

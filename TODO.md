@@ -1791,6 +1791,15 @@ separately below.
     mutations, job queue scans, remote recovery-history materialization,
     checkpoint bodies/joins/ownership, full metadata/quota and all retained
     1 TiB/platform/release qualification remain required.
+  - [x] Apply the existing no-fallback writer rule to the original full-state
+    fresh-checkpoint gate as well as the paged history reader. Select the
+    greatest registered epoch before checking revocation; revoking it must
+    never reactivate an older key. Keep exact original writer lookup for
+    retained revisions unchanged. Regressions reproduce both the old helper
+    result and fresh-checkpoint admission, and preserve historical recovery,
+    retained heads/successors across reopen and later valid rotation. See
+    ADR 0002 for red/green validation. This does not complete bounded checkpoint
+    production, ownership, quota or retained-capacity/platform qualification.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

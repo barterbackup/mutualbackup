@@ -18162,6 +18162,121 @@ pub(crate) mod tests {
         (seeds, checkpoint)
     }
 
+    #[test]
+    fn revoked_latest_writer_rejects_fresh_checkpoints_but_preserves_retained_revisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seeds, mut checkpoint) = signed_recovery_checkpoint_fixture();
+        let keys = seeds.iter().map(KeyMaterial::from_seed).collect::<Vec<_>>();
+        let owner = keys[0].node_id();
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id: checkpoint.checkpoint.guild_id,
+            coordinator: owner,
+            members: checkpoint.checkpoint.members.clone(),
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|key| genesis.member_signature(key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let certificate = QuorumGuildGenesis {
+            genesis,
+            signatures,
+        };
+        let peers = certificate
+            .genesis
+            .members
+            .iter()
+            .cloned()
+            .map(|member| GuildPeer {
+                member,
+                endpoints: Vec::new(),
+            })
+            .collect();
+        checkpoint.checkpoint.format_version = 4;
+        checkpoint.checkpoint.genesis_hash = certificate.hash().unwrap();
+        checkpoint.signatures.clear();
+        for key in &keys {
+            checkpoint.add_signature(key).unwrap();
+        }
+        checkpoint.verify().unwrap();
+        let mut node = Node::open(temp.path(), seeds[0].clone()).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let install = |node: &mut Node, kind| {
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id: state.guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind,
+            };
+            let mut signatures = keys
+                .iter()
+                .map(|key| sign_guild_event(&event, key).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            node.install_guild_event(QuorumGuildEvent { event, signatures })
+                .unwrap();
+        };
+        install(
+            &mut node,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: checkpoint.checkpoint.writer_fences[0].public_key,
+            },
+        );
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+            .unwrap();
+        install(
+            &mut node,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 2,
+                public_key: keys[1].node_id().0,
+            },
+        );
+        assert!(
+            node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+                .is_err()
+        );
+        install(
+            &mut node,
+            mb_core::GuildEventKind::RevokeWriterKey { owner, epoch: 2 },
+        );
+        let error = node
+            .validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("superseded writer epoch"));
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
+            .unwrap();
+
+        // Restore the original certificate as a retained historical head.
+        // Its existing revision must also survive in the next generation.
+        let hash = checkpoint.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &checkpoint.checkpoint.guild_id,
+                checkpoint.checkpoint.generation,
+                None,
+                &hash,
+                &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                &canonical_bytes(&checkpoint).unwrap(),
+                false,
+            )
+            .unwrap();
+        drop(node);
+        let node = Node::open(temp.path(), seeds[0].clone()).unwrap();
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+            .unwrap();
+        let mut successor = checkpoint.checkpoint.clone();
+        successor.generation += 1;
+        successor.parent = Some(hash);
+        node.validate_variable_checkpoint_coverage(&successor, false)
+            .unwrap();
+    }
+
     pub(crate) fn recovery_guild_fixture() -> (Seed, QuorumGuildGenesis, Vec<GuildPeer>) {
         let mut identities = (0_u8..5)
             .map(|index| {

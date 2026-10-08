@@ -226,7 +226,10 @@ copies. Every Add verifies the original event-bound signed witness, historical
 delegation and placement; legacy Adds require an original-signers quorum
 binding. Fixed final coding facts preserve original IDs/profiles/witness hashes
 and lifecycle; current writers use the latest incarnation with no revoked-key
-fallback. The scoped decoders preserve all original signed layouts and hashes.
+fallback. The original full-state fresh-checkpoint gate applies the same rule:
+select the greatest registered epoch before testing revocation. Exact original
+writer lookup for historical or previously retained revisions is unchanged.
+The scoped decoders preserve all original signed layouts and hashes.
 The concrete coding-join entry point carries the history reader's complete
 replay/prior work into successor validation. Missing original evidence or stale
 trust fails closed, with atomic disposable completion.

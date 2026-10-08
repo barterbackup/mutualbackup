@@ -1901,6 +1901,14 @@ Actual key registration and event mutation, job queue scans, remote history
 recovery and enclosing checkpoint production/ownership still need bounded
 integration, quota admission and the complete retained-capacity/platform gates.
 
+The original full-state fresh-checkpoint gate follows the same current-writer
+rule as the paged original-history reader: select the greatest registered
+epoch first, then reject it if revoked. Revoking the latest key never
+reactivates an older epoch. Exact historical writer lookup is unchanged, so
+certified historical recovery and revisions retained by a committed head or
+its successor survive rotation/revocation. This corrects the legacy gate;
+bounded enclosing checkpoint production and qualification remain required.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

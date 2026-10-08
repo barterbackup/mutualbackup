@@ -3796,3 +3796,41 @@ joins and ownership/publication, migration throughput, archive retention and
 full metadata/physical quota policy remain required. These authority reads do
 not qualify a retained 1 TiB dataset or the remaining native/platform/topology/
 release gates. Normal paged checkpoint producers remain disabled.
+
+## Original full-state current-writer revocation rule (2026-10-08)
+
+Review of the normal key consumers found that the original
+`DynamicGuildState::writer_epoch_is_current` filtered revoked keys before
+selecting the greatest epoch. With unrevoked epoch one and revoked epoch two,
+it incorrectly made epoch one current again. The paged original-history reader
+and protocol already require no fallback. The helper now selects the greatest
+registered epoch first and tests that exact epoch's revocation afterward.
+
+Two new regressions first failed against the old helper. The Core fixture
+replays original signed rotations/revocation, observes no current older writer,
+preserves both exact historical public keys and permits a later valid rotation.
+The Node fixture reaches the actual fresh-checkpoint coverage gate with an
+original genesis, signed key events and a signed checkpoint. The old gate
+accepted the superseded revision after revoking the latest key. The fixture
+also checks original historical checkpoint coverage and unchanged retained-head/
+successor validation after reopening the store. Historical key lookup, signed
+layouts, certificate identities and wire versions are unchanged.
+
+Validation: both new cases reproduced the old bug before the helper change
+(one failing Core case and one failing Node case). After the fix, the locked
+full Core library suite passed all 175 tests. A locked Node selection passed
+all 24 cases: both normal key consumers and their authority fixtures, the new
+fresh/retained checkpoint regression, resumable authority-epoch catch-up and
+legacy checkpoint membership/quorum transitions. A locked Store selection
+passed all eight durable-history/current-writer cases. The preceding full
+Node/Store runs recorded above qualify the bounded-reader change; this
+subsequent two-line helper correction is qualified by the full Core and
+targeted Node/Store runs, not a repeated full Node/Store run. Ignored platform/
+provisioned/topology cases remain unqualified. Strict locked workspace/
+all-targets Clippy and formatting/diff checks pass.
+
+This is a correction to the existing original checkpoint gate. It does not
+replace its full-state history materialization or complete paged checkpoint
+ownership/publication, full quota admission, retained 1 TiB or native/platform/
+topology/release qualification. Normal paged checkpoint producers remain
+disabled.
