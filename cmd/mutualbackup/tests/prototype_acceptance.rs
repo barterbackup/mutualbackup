@@ -547,6 +547,143 @@ fn automatic_unlock_rejects_withdrawn_catalog_before_lock_or_socket_mutation() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn manual_unlock_preserves_withdrawn_catalog_before_and_after_rejected_secrets() {
+    use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
+    for journal in 0..3 {
+        for socket_state in ["absent", "file", "missing-parent"] {
+            let temp = tempfile::tempdir().unwrap();
+            set_private(temp.path());
+            let data = temp.path().join("state");
+            let recovery = "correct-horse-battery-staple-2026!";
+            run_cli_with_input(
+                &[os("init"), os("--seed-stdin"), os("--data-dir"), os(&data)],
+                recovery.as_bytes(),
+                CLI_TIMEOUT,
+            )
+            .unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_recovery_string(recovery).unwrap());
+            let control = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+            control
+                .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                .unwrap();
+            control
+                .put_record("guarded-view-mount-v1", b"legacy", b"preserve")
+                .unwrap();
+            let data = if journal == 1 {
+                let copy = temp.path().join("preserved");
+                fs::create_dir(&copy).unwrap();
+                for entry in fs::read_dir(&data).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_name() != "control.db-shm" {
+                        fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+                    }
+                }
+                copy
+            } else {
+                data
+            };
+            let _writer = if journal == 2 {
+                Some(control)
+            } else {
+                drop(control);
+                None
+            };
+            let socket = if socket_state == "missing-parent" {
+                data.join("absent/control.sock")
+            } else {
+                data.join("control.sock")
+            };
+            if socket_state == "file" {
+                fs::write(&socket, b"preserved socket-path file").unwrap();
+            }
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o750)).unwrap();
+            let snapshot = || {
+                let metadata = fs::metadata(&data).unwrap();
+                let version = (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                );
+                let files = fs::read_dir(&data)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                (version, files)
+            };
+            let before = snapshot();
+            let mut daemon = Daemon::with_args(
+                vec![
+                    os("--data-dir"),
+                    os(&data),
+                    os("--control-socket"),
+                    os(&socket),
+                    os("--failure-domain"),
+                    os("manual-withdrawal-admission"),
+                    os("--listen"),
+                    os("/ip4/127.0.0.1/udp/0/quic-v1"),
+                    os("--tor-mode"),
+                    os("disable-tor"),
+                ],
+                temp.path().join("daemon.log"),
+            );
+            daemon.start();
+            assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+            for (secret, expected) in [
+                ("another-long-recovery-string-for-testing-2027!", "expected"),
+                (recovery, mb_store::WITHDRAWN_GUARDED_BACKEND),
+                (recovery, mb_store::WITHDRAWN_GUARDED_BACKEND),
+            ] {
+                let error = run_cli_with_input(
+                    &[
+                        os("--socket"),
+                        os(&socket),
+                        os("unlock"),
+                        os("--seed-stdin"),
+                    ],
+                    secret.as_bytes(),
+                    CLI_TIMEOUT,
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains(expected),
+                    "{journal}/{socket_state}: {error}"
+                );
+                assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+            }
+            daemon.stop_gracefully();
+            let after = snapshot();
+            assert_eq!(before.0, after.0, "{journal}/{socket_state}");
+            assert_eq!(
+                before.1.keys().collect::<Vec<_>>(),
+                after.1.keys().collect::<Vec<_>>()
+            );
+            for (name, bytes) in before.1 {
+                if name == "control.db-shm" {
+                    assert_eq!(bytes.len(), after.1[&name].len());
+                } else {
+                    assert_eq!(bytes, after.1[&name], "{journal}/{socket_state}/{name:?}");
+                }
+            }
+            assert!(!data.join(".node.lock").exists());
+            if socket_state == "file" {
+                assert_eq!(fs::read(&socket).unwrap(), b"preserved socket-path file");
+            } else {
+                assert!(!socket.exists());
+            }
+            assert!(!data.join("absent").exists());
+        }
+    }
+}
+
 #[test]
 fn init_resumes_after_seed_install_without_replacing_outputs() {
     let temp = tempfile::tempdir().unwrap();

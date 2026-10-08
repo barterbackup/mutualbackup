@@ -8,11 +8,12 @@ use libp2p::Multiaddr;
 use mb_node::{
     AutomaticBackupPolicy, ClaimedTorTransportConfig, LocalControlListener, LocalRequest,
     LocalResponse, LockedDataDir, Node, P2pConfig, P2pStartup, TorShutdownHandle, TorTransport,
-    TorTransportConfig, UnlockSecret, WireError, bind_local_control, build_p2p_with_tor,
-    onion_listener_address, run_automatic_backups, run_coding_holder_cleanup_jobs,
-    run_coordinator_jobs, run_delegated_coding_jobs, run_dht_publications, run_peer_exchange,
-    run_periodic_audits, run_port_mapping, run_relay_membership_sync, run_root_watcher,
-    serve_local_control_on, validate_bootstrap_addresses, wait_for_onion_service_shutdown,
+    TorTransportConfig, UnlockSecret, WireError, bind_local_control, bind_locked_local_control,
+    build_p2p_with_tor, onion_listener_address, run_automatic_backups,
+    run_coding_holder_cleanup_jobs, run_coordinator_jobs, run_delegated_coding_jobs,
+    run_dht_publications, run_peer_exchange, run_periodic_audits, run_port_mapping,
+    run_relay_membership_sync, run_root_watcher, serve_local_control_on,
+    validate_bootstrap_addresses, wait_for_onion_service_shutdown,
 };
 use mutualbackup::{
     DaemonOptions, DaemonOptionsError, IdentityManifest, InitializationIntent, read_daemon_options,
@@ -46,15 +47,21 @@ async fn main() -> Result<()> {
     let locked_data_dir = match automatic_seed.as_ref() {
         Some(seed) => {
             require_seed_identity(&identity, seed)?;
-            Node::lock_data_dir_with_seed(&config.data_dir, seed)?
+            Some(Node::lock_data_dir_with_seed(&config.data_dir, seed)?)
         }
-        None => Node::lock_data_dir(&config.data_dir)?,
+        None => None,
     };
-    let listener = bind_local_control(&config.control_socket)?;
+    let listener = if locked_data_dir.is_some() {
+        bind_local_control(&config.control_socket)?
+    } else {
+        bind_locked_local_control(&config.control_socket)?
+    };
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let (node, p2p_client, mut p2p_task, startup, tor_shutdown) = match automatic_seed {
         Some(seed) => {
+            let locked_data_dir =
+                locked_data_dir.context("automatic unlock did not acquire its data directory")?;
             let open_config = config.clone();
             let open_identity = identity.clone();
             let mut open_task = tokio::task::spawn_blocking(move || {
@@ -88,7 +95,6 @@ async fn main() -> Result<()> {
                     result = await_manual_node(
                         &config,
                         &identity,
-                        locked_data_dir.clone(),
                         &listener,
                     ) => result?,
                     result = shutdown.as_mut() => return result,
@@ -595,7 +601,6 @@ fn open_configured_node(
 async fn await_manual_node(
     config: &DaemonOptions,
     identity: &IdentityManifest,
-    locked_data_dir: LockedDataDir,
     listener: &LocalControlListener,
 ) -> Result<(Node, mb_node::LocalControlConnection)> {
     loop {
@@ -619,7 +624,7 @@ async fn await_manual_node(
                 }
             }
             LocalRequest::Unlock { secret } => {
-                match try_manual_unlock(config, identity, locked_data_dir.clone(), secret).await {
+                match try_manual_unlock(config, identity, secret).await {
                     Ok(node) => return Ok((node, connection)),
                     Err(error) => {
                         tracing::warn!(%error, "manual daemon unlock rejected");
@@ -644,13 +649,15 @@ async fn await_manual_node(
 async fn try_manual_unlock(
     config: &DaemonOptions,
     identity: &IdentityManifest,
-    locked_data_dir: LockedDataDir,
     secret: UnlockSecret,
 ) -> Result<Node> {
     let config = config.clone();
     let identity = identity.clone();
     tokio::task::spawn_blocking(move || {
-        open_configured_node(&config, &identity, locked_data_dir, secret.seed())
+        let seed = secret.seed();
+        require_seed_identity(&identity, &seed)?;
+        let locked_data_dir = Node::lock_data_dir_with_seed(&config.data_dir, &seed)?;
+        open_configured_node(&config, &identity, locked_data_dir, seed)
     })
     .await
     .context("unlock worker failed")?

@@ -31,8 +31,8 @@ mod wire;
 pub use automation::{run_automatic_backups, run_periodic_audits};
 pub use control::{
     GitRepositoryInfo, GitStagedFile, LocalControlConnection, LocalControlListener, LocalRequest,
-    LocalResponse, NodeStatus, ProtectedRoot, UnlockSecret, bind_local_control, local_control_call,
-    serve_local_control, serve_local_control_on,
+    LocalResponse, NodeStatus, ProtectedRoot, UnlockSecret, bind_local_control,
+    bind_locked_local_control, local_control_call, serve_local_control, serve_local_control_on,
 };
 #[cfg(target_os = "linux")]
 pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6};

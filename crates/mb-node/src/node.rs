@@ -768,8 +768,8 @@ pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
 
 /// An exclusive, process-lifetime claim on one initialized data directory.
 ///
-/// The daemon acquires this before accepting an unlock secret, then moves a
-/// clone into `Node` after the secret has been verified.
+/// Keyed catalog admission precedes creation of this claim. A manual daemon
+/// waits for its unlock secret before acquiring it.
 #[derive(Clone)]
 pub struct LockedDataDir {
     path: PathBuf,
@@ -1220,7 +1220,7 @@ impl Node {
     pub fn git_retire_empty_guarded_repository(&mut self, _repository_id: Uuid) -> Result<()> {
         anyhow::bail!("{}", mb_store::WITHDRAWN_GUARDED_BACKEND);
     }
-    pub fn lock_data_dir(data_dir: impl AsRef<Path>) -> Result<LockedDataDir> {
+    pub(crate) fn lock_data_dir(data_dir: impl AsRef<Path>) -> Result<LockedDataDir> {
         let data_dir = data_dir.as_ref();
         fs::create_dir_all(data_dir)?;
         let data_dir = data_dir

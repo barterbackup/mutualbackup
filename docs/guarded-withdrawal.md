@@ -21,6 +21,36 @@ Source-loss recovery cannot enroll a guarded revision as a new root.
 Decoded legacy capture plans cannot capture, replay, detach edits, or discard
 anchors through the versioned source-backend API.
 
+Linux manual daemon unlock now waits for the seed identity and read-only
+catalog admission before directory permission changes or data-lock creation.
+Its control listener uses a process-lifetime abstract Unix address derived
+from the configured socket location and UID; the existing CLI socket argument
+still finds it without creating parents, replacing a saved control-path file
+or cleaning it on shutdown. Server and client both verify peer UID; clients
+reject a foreign owner before sending the unlock secret. The raw data-lock
+helper is crate-internal, so public callers acquire a lock through
+`Node::lock_data_dir_with_seed`; `open_locked` still repeats admission. Wrong
+identities and withdrawn catalogs leave the manual daemon locked and
+retryable. Closed/WAL-only/live catalogs, absent/file/missing-parent control
+paths and repeated rejected unlocks preserve original directory
+identity/mode/timestamps, file sets and catalog/key/journal bytes, with no new
+lock or socket. Actual manual native unlock, network/Tor startup retry and
+SIGTERM cleanup regressions remain in the process suite. Abstract listener
+exclusivity/release, aliases and saved control files have direct protocol
+tests; a privileged foreign-UID server checks zero received secret bytes.
+Manual daemon admission qualification passes 51 unique cases: 12
+source-policy, 8 control protocol, 3 daemon startup and 21 CLI process cases,
+single-owner/discovery regressions, four provisioned Btrfs
+reopen/backend/capture cases and a privileged foreign-UID control server. All
+four debug programs build; format and strict locked workspace/all-targets
+Clippy pass. All 284 source-file and seven program/test-driver hashes remain
+unchanged, and native mount/loop/image cleanup is verified. Evidence and the
+distinct passing-case inventory are retained under
+`/tmp/mb-m6-manual-admission-validation-3r5sj2py`; the post-commit audit binds
+the code to the commit. This is focused debug-source qualification; complete
+ordinary/native suites, installed artifacts and other platforms were not
+rerun.
+
 The mount runtime, supervisor, capture/publication paths, guarded Git operations,
 link-freeze machinery, and `fuser` dependency have been removed. Minimal historical
 record decoding and marker recognition remain for rejection and preservation.
@@ -629,8 +659,7 @@ inventory are retained under `/tmp/mb-m6-early-admission-validation-u30_afvh`;
 the post-commit audit binds the code to the commit. This is a focused
 debug-source qualification; complete ordinary/native suites and installed
 artifacts were not rerun.
-Raw `lock_data_dir` and manual daemon lock/socket setup still precede
-keyed admission; atomic writer/path/ownership handoff and rejection before every
+Manual daemon ordering is handled by the keyed admission described above; atomic writer/path/ownership handoff and rejection before every
 filesystem mutation remain open.
 The private WAL index uses memory proportional to its frame count; common R2/R3
 metadata/resource budgets remain open.

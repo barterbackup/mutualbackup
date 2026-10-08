@@ -95,7 +95,7 @@ pub struct NodeStatus {
 
 pub struct LocalControlListener {
     listener: UnixListener,
-    _cleanup: SocketCleanup,
+    _cleanup: Option<SocketCleanup>,
 }
 
 pub struct LocalControlConnection {
@@ -231,8 +231,50 @@ pub fn bind_local_control(socket_path: &Path) -> Result<LocalControlListener> {
 
     Ok(LocalControlListener {
         listener,
-        _cleanup: cleanup,
+        _cleanup: Some(cleanup),
     })
+}
+
+/// Serve pre-unlock requests without creating or replacing a filesystem path.
+/// Linux abstract sockets are released by the kernel when the listener closes.
+pub fn bind_locked_local_control(socket_path: &Path) -> Result<LocalControlListener> {
+    #[cfg(target_os = "linux")]
+    {
+        let address = locked_control_address(socket_path)?;
+        let listener = UnixListener::bind(address)
+            .context("cannot bind the locked daemon's local control address")?;
+        Ok(LocalControlListener {
+            listener,
+            _cleanup: None,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    bind_local_control(socket_path)
+}
+
+#[cfg(target_os = "linux")]
+fn locked_control_address(socket_path: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    // Resolve existing ancestors so relative paths and directory aliases name
+    // the same listener. Missing parents remain absent before keyed admission.
+    let absolute = std::path::absolute(socket_path)?;
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        suffix.push(ancestor.file_name().context("invalid local control path")?);
+        ancestor = ancestor.parent().context("invalid local control parent")?;
+    }
+    let mut location = ancestor.canonicalize()?;
+    for component in suffix.iter().rev() {
+        location.push(component);
+    }
+    let mut hash = blake3::Hasher::new_derive_key("mutualbackup locked local control v1");
+    hash.update(&unsafe { libc::geteuid() }.to_le_bytes());
+    hash.update(location.as_os_str().as_bytes());
+    let mut address = vec![0];
+    address.extend_from_slice(b"mutualbackup-locked-v1-");
+    address.extend_from_slice(hash.finalize().to_hex().as_bytes());
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(address)))
 }
 
 fn containing_directory(path: &Path) -> &Path {
@@ -265,9 +307,25 @@ pub async fn local_control_call(
     socket_path: &Path,
     request: &LocalRequest,
 ) -> Result<LocalResponse> {
-    let mut stream = UnixStream::connect(socket_path)
-        .await
+    let connection = UnixStream::connect(socket_path).await;
+    #[cfg(target_os = "linux")]
+    let connection = match connection {
+        Ok(stream) => Ok(stream),
+        Err(filesystem_error) => {
+            match UnixStream::connect(locked_control_address(socket_path)?).await {
+                Ok(stream) => Ok(stream),
+                Err(_) => Err(filesystem_error),
+            }
+        }
+    };
+    let mut stream = connection
         .with_context(|| format!("cannot connect to daemon at {}", socket_path.display()))?;
+    let credentials = stream
+        .peer_cred()
+        .context("cannot read local control server credentials")?;
+    if credentials.uid() != unsafe { libc::geteuid() } {
+        bail!("local control server is owned by another user");
+    }
     let request_id = *Uuid::new_v4().as_bytes();
     write_frame(
         &mut stream,
@@ -1678,6 +1736,152 @@ impl Drop for SocketCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn locked_control_never_creates_parents_and_releases_exclusive_listener_on_drop() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().join("absent/parents");
+        let path = parent.join("control.sock");
+        let listener = bind_locked_local_control(&path).unwrap();
+        assert!(!parent.exists());
+        assert!(bind_locked_local_control(&path).is_err());
+        let expected =
+            mb_core::KeyMaterial::from_seed(&mb_core::Seed::from_bytes([231; 32])).node_id();
+        let server = async {
+            let mut connection = listener.accept().await.unwrap();
+            assert!(matches!(
+                connection.read_request().await.unwrap(),
+                LocalRequest::Status
+            ));
+            connection
+                .respond(LocalResponse::Locked {
+                    expected_node_id: expected,
+                })
+                .await
+                .unwrap();
+        };
+        let client = async {
+            assert!(
+                matches!(local_control_call(&path, &LocalRequest::Status).await.unwrap(), LocalResponse::Locked { expected_node_id } if expected_node_id == expected)
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client);
+        })
+        .await
+        .unwrap();
+        assert!(!parent.exists());
+        drop(listener);
+        drop(bind_locked_local_control(&path).unwrap());
+        assert!(!parent.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn locked_control_preserves_existing_control_files_and_accepts_directory_aliases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("run");
+        fs::create_dir(&directory).unwrap();
+        let alias = temporary.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        let path = directory.join("control.sock");
+        fs::write(&path, b"preserved control input").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let before = fs::symlink_metadata(&path).unwrap();
+        let listener = bind_locked_local_control(&path).unwrap();
+        assert!(bind_locked_local_control(&alias.join("control.sock")).is_err());
+        let server = async {
+            let mut connection = listener.accept().await.unwrap();
+            assert!(matches!(
+                connection.read_request().await.unwrap(),
+                LocalRequest::Status
+            ));
+            connection.respond_error(WireError::locked()).await.unwrap();
+        };
+        let client = async {
+            assert!(
+                local_control_call(&alias.join("control.sock"), &LocalRequest::Status)
+                    .await
+                    .is_err()
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client);
+        })
+        .await
+        .unwrap();
+        drop(listener);
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (
+                before.dev(),
+                before.ino(),
+                before.mode(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec()
+            ),
+            (
+                after.dev(),
+                after.ino(),
+                after.mode(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec()
+            )
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"preserved control input");
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root to run a foreign-UID abstract control server"]
+    async fn local_control_rejects_foreign_uid_before_sending_an_unlock_secret() {
+        use std::{
+            io::{BufRead, BufReader},
+            os::unix::{ffi::OsStrExt, process::CommandExt},
+            process::{Command, Stdio},
+        };
+        assert_eq!(unsafe { libc::geteuid() }, 0, "provision this test as root");
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("control.sock");
+        let address = locked_control_address(&path).unwrap();
+        let name = hex::encode(&address.as_os_str().as_bytes()[1..]);
+        let script = "import socket,sys\ns=socket.socket(socket.AF_UNIX);s.settimeout(10);s.bind(bytes([0])+bytes.fromhex(sys.argv[1]));s.listen(1);print('ready',flush=True)\nc,_=s.accept();c.settimeout(10);assert c.recv(4096)==b'', 'client sent data to a foreign user';c.close();s.close()\n";
+        let mut child = Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(name)
+            .current_dir("/tmp")
+            .uid(65534)
+            .gid(65534)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let error = local_control_call(
+            &path,
+            &LocalRequest::Unlock {
+                secret: UnlockSecret::new([0x41; 32]),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("owned by another user"),
+            "{error:#}"
+        );
+        assert!(child.wait().unwrap().success());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn local_protocol_round_trips() {
