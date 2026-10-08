@@ -17,6 +17,8 @@ use uuid::Uuid;
 use super::DatabaseError;
 
 const CHUNK: u64 = 64 * 1024;
+// Linux filesystem IDs are 32-bit; glibc and musl expose different f_type types.
+const BTRFS_TYPE: u32 = libc::BTRFS_SUPER_MAGIC as u32;
 
 /// Runtime allocation-pool identity. Btrfs subvolumes and bind mounts share
 /// their filesystem UUID; ordinary filesystems use their current device ID.
@@ -37,7 +39,7 @@ fn domain_for_file(file: &File) -> Result<[u8; 32], DatabaseError> {
     }
     let mut digest =
         blake3::Hasher::new_derive_key("mutualbackup runtime physical allocation domain v1");
-    if unsafe { filesystem.assume_init() }.f_type == libc::BTRFS_SUPER_MAGIC {
+    if unsafe { filesystem.assume_init() }.f_type as u32 == BTRFS_TYPE {
         digest.update(b"btrfs");
         digest.update(
             &crate::anchor::btrfs_filesystem_uuid(file)
@@ -361,7 +363,7 @@ unsafe extern "C" fn open(
         if libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) != 0 {
             return ffi::SQLITE_IOERR_FSTAT;
         }
-        if filesystem.assume_init().f_type == libc::BTRFS_SUPER_MAGIC {
+        if filesystem.assume_init().f_type as u32 == BTRFS_TYPE {
             let mut attributes: libc::c_long = 0;
             if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut attributes) != 0 {
                 return ffi::SQLITE_IOERR;

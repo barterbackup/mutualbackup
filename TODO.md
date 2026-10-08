@@ -2149,6 +2149,16 @@ remain active.
     do not qualify the release artifact or close R7's remaining native, upgrade,
     multi-volume and platform matrix.
 
+  - [x] Normalize scratch filesystem IDs across glibc and musl. The actual Nix
+    release build on `4f3773f` failed because musl exposes `statfs.f_type` as
+    unsigned while libc's Btrfs magic constant is signed. Both physical allocation
+    domain selection and anonymous scratch-file setup now compare the Linux
+    32-bit filesystem identifier, matching the existing native anchor reader.
+    Seven ordinary scratch/allocation tests and the separately provisioned Btrfs
+    rewrite/rollback/reclamation fixture pass, with mount, loop and image cleanup
+    verified. Formatting and strict workspace/all-targets Clippy pass. The
+    corrected musl release build and installed-process qualification are pending.
+
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
   source-loss matrix on the release source. Record repeated topology evidence
