@@ -452,6 +452,481 @@ struct LinkedMergeBlobIntentV1 {
     intent: MergeBlobIntent,
 }
 
+/// Original merge-session metadata without author or message plaintext.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedMergeSession {
+    pub scope: GitWorktreeScope,
+    pub record_format: u16,
+    pub envelope_format: Option<u16>,
+    pub branch: String,
+    pub ours: [u8; 20],
+    pub theirs: [u8; 20],
+    pub source_ref: Vec<u8>,
+    pub author_name_bytes: u64,
+    pub author_name_hash: [u8; 32],
+    pub author_email_bytes: u64,
+    pub author_email_hash: [u8; 32],
+    pub message_bytes: u64,
+    pub message_hash: [u8; 32],
+    pub conflicts: Vec<Vec<u8>>,
+    pub resolved: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreservedMergeInput {
+    pub oid: [u8; 20],
+    pub mode: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreservedMergeBlob {
+    pub scope: GitWorktreeScope,
+    pub record_format: u16,
+    pub envelope_format: Option<u16>,
+    pub path: Vec<u8>,
+    pub base: PreservedMergeInput,
+    pub ours: PreservedMergeInput,
+    pub theirs: PreservedMergeInput,
+    pub result_oid: [u8; 20],
+    pub result_mode: u32,
+    pub plan: SourceBlobImportPlan,
+}
+
+/// Inventory original primary/linked merge journals without reading anchors,
+/// opening a worktree or resuming a merge. Missing surrounding joins remain.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_record(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    for (primary, linked) in [
+        (SESSION_PREFIX, LINKED_SESSION_PREFIX),
+        (INTENT_PREFIX, LINKED_INTENT_PREFIX),
+    ] {
+        for prefix in [primary, linked] {
+            control.for_each_record_with_kind_prefix_bounded(
+                prefix,
+                512,
+                ACTIVE.len(),
+                mb_core::V1_MAX_CATALOG_BYTES,
+                |kind, key, bytes| {
+                    let scope = GitWorktreeScope::preserved_from_kind(
+                        kind,
+                        repository_id,
+                        primary,
+                        linked,
+                    )?;
+                    ensure!(key == ACTIVE, "invalid preserved Git merge key");
+                    let envelope_format = (scope.worktree_id() != repository_id).then_some(1);
+                    if primary == SESSION_PREFIX {
+                        let session = if envelope_format.is_none() {
+                            let session: MergeSession = decode_canonical(bytes)?;
+                            ensure!(
+                                mb_core::canonical_bytes_bounded(&session, bytes.len())? == bytes,
+                                "noncanonical preserved Git merge session"
+                            );
+                            session
+                        } else {
+                            let wrapper: LinkedMergeSessionV1 = decode_canonical(bytes)?;
+                            ensure!(
+                                wrapper.format_version == 1
+                                    && wrapper.worktree_id == scope.worktree_id()
+                                    && mb_core::canonical_bytes_bounded(&wrapper, bytes.len())?
+                                        == bytes,
+                                "invalid preserved linked Git merge session"
+                            );
+                            wrapper.session
+                        };
+                        validate_session(&session, repository_id)?;
+                        for path in &session.conflicts {
+                            ensure!(
+                                path.len() <= crate::stage::MAX_STAGE_PATH_BYTES
+                                    && !path.contains(&0),
+                                "invalid preserved Git merge conflict path"
+                            );
+                        }
+                        let record = PreservedMergeSession {
+                            scope,
+                            record_format: session.format_version,
+                            envelope_format,
+                            branch: session.branch,
+                            ours: session.ours,
+                            theirs: session.theirs,
+                            source_ref: session.source_ref,
+                            author_name_bytes: session.author_name.len() as u64,
+                            author_name_hash: *blake3::hash(session.author_name.as_bytes())
+                                .as_bytes(),
+                            author_email_bytes: session.author_email.len() as u64,
+                            author_email_hash: *blake3::hash(session.author_email.as_bytes())
+                                .as_bytes(),
+                            message_bytes: session.message.len() as u64,
+                            message_hash: *blake3::hash(session.message.as_bytes()).as_bytes(),
+                            conflicts: session.conflicts,
+                            resolved: session.resolved,
+                        };
+                        visit(crate::PreservedGitRecord::MergeSession(Box::new(record)))?;
+                    } else {
+                        let intent = if envelope_format.is_none() {
+                            let intent: MergeBlobIntent = decode_canonical(bytes)?;
+                            ensure!(
+                                mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                                "noncanonical preserved Git merge blob"
+                            );
+                            intent
+                        } else {
+                            let wrapper: LinkedMergeBlobIntentV1 = decode_canonical(bytes)?;
+                            ensure!(
+                                wrapper.format_version == 1
+                                    && wrapper.worktree_id == scope.worktree_id()
+                                    && mb_core::canonical_bytes_bounded(&wrapper, bytes.len())?
+                                        == bytes,
+                                "invalid preserved linked Git merge blob"
+                            );
+                            wrapper.intent
+                        };
+                        let path = PathBuf::from(OsString::from_vec(intent.path.clone()));
+                        ensure!(
+                            intent.format_version == 1
+                                && intent.repository_id == repository_id
+                                && intent.path.len() <= crate::stage::MAX_STAGE_PATH_BYTES
+                                && !intent.path.contains(&0)
+                                && stage_path_key(&path)? == intent.path
+                                && intent.plan.logical_len() <= MAX_AUTOMERGE_FILE_BYTES
+                                && matches!(intent.result_mode, 0o100644 | 0o100755)
+                                && [intent.inputs.base, intent.inputs.ours, intent.inputs.theirs]
+                                    .iter()
+                                    .all(|input| input.mode == intent.result_mode),
+                            "invalid preserved Git merge blob ownership"
+                        );
+                        intent.plan.preserved_ownership()?;
+                        let input = |input: MergeFileInput| PreservedMergeInput {
+                            oid: input.oid,
+                            mode: input.mode,
+                        };
+                        visit(crate::PreservedGitRecord::MergeBlobIntent(Box::new(
+                            PreservedMergeBlob {
+                                scope,
+                                record_format: intent.format_version,
+                                envelope_format,
+                                path: intent.path,
+                                base: input(intent.inputs.base),
+                                ours: input(intent.inputs.ours),
+                                theirs: input(intent.inputs.theirs),
+                                result_oid: intent.result_oid,
+                                result_mode: intent.result_mode,
+                                plan: intent.plan,
+                            },
+                        )))?;
+                    }
+                    Ok(true)
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod preserved_tests {
+    use super::*;
+    use std::{fs, os::unix::ffi::OsStrExt};
+
+    #[test]
+    fn preserved_merge_sessions_and_blobs_keep_original_scopes_and_owners_without_replay() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&database, &[247; 32]).unwrap();
+        let repository_id = Uuid::from_u128(247);
+        let scopes = [
+            GitWorktreeScope::primary(repository_id),
+            GitWorktreeScope::linked(repository_id, Uuid::from_u128(248)).unwrap(),
+        ];
+        let session_wire = canonical_bytes(&(
+            1_u16,
+            repository_id,
+            "topic",
+            [1_u8; 20],
+            [2_u8; 20],
+            b"refs/heads/source".to_vec(),
+            "private author",
+            "private@example.test",
+            "private merge message",
+            vec![b"conflict-\xff".to_vec(), b"resolved".to_vec()],
+            vec![b"resolved".to_vec()],
+        ))
+        .unwrap();
+        let session: MergeSession = decode_canonical(&session_wire).unwrap();
+        assert_eq!(canonical_bytes(&session).unwrap(), session_wire);
+        let source = temporary.path().join("missing-source");
+        let area = mb_store::StableAnchorAreaLocator {
+            area_id: Uuid::from_u128(249),
+            filesystem_id: 7,
+            path_hint: temporary.path().join("missing-area"),
+            volume_root_hint: temporary.path().join("missing-volume"),
+        };
+        let root: mb_store::ReflinkCapturePlan = decode_canonical(
+            &canonical_bytes(&(
+                1_u16,
+                Uuid::from_u128(250),
+                source.as_os_str().as_bytes().to_vec(),
+                area.clone(),
+                (7_u64, 8_u64, 0_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+                libc::S_IFDIR | 0o700,
+                0_i64,
+                0_u32,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        #[derive(Serialize)]
+        enum OriginalPlan {
+            DirectV1((u16, mb_store::ReflinkCapturePlan, u64)),
+        }
+        let input = |oid| (oid, 0o100755_u32);
+        let blob_wire = canonical_bytes(&(
+            1_u16,
+            repository_id,
+            b"generated-\xfe".to_vec(),
+            (input([3_u8; 20]), input([4_u8; 20]), input([5_u8; 20])),
+            [6_u8; 20],
+            0o100755_u32,
+            OriginalPlan::DirectV1((1, root.clone(), 17)),
+        ))
+        .unwrap();
+        let blob: MergeBlobIntent = decode_canonical(&blob_wire).unwrap();
+        assert_eq!(canonical_bytes(&blob).unwrap(), blob_wire);
+        for scope in scopes {
+            let session_bytes = if scope == scopes[0] {
+                session_wire.clone()
+            } else {
+                canonical_bytes(&(1_u16, scope.worktree_id(), &session)).unwrap()
+            };
+            let blob_bytes = if scope == scopes[0] {
+                blob_wire.clone()
+            } else {
+                canonical_bytes(&(1_u16, scope.worktree_id(), &blob)).unwrap()
+            };
+            assert_eq!(
+                encode_session_for_scope(scope, &session).unwrap(),
+                session_bytes
+            );
+            assert_eq!(
+                encode_blob_intent_for_scope(scope, &blob).unwrap(),
+                blob_bytes
+            );
+            control
+                .put_record(&session_kind_for_scope(scope), ACTIVE, &session_bytes)
+                .unwrap();
+            control
+                .put_record(&intent_kind_for_scope(scope), ACTIVE, &blob_bytes)
+                .unwrap();
+        }
+        let snapshot = || {
+            [database.clone(), database.with_extension("db-wal")].map(|path| fs::read(path).ok())
+        };
+        let before = snapshot();
+        let mut seen = 0;
+        for_each_preserved_record(&control, repository_id, |record| {
+            match record {
+                crate::PreservedGitRecord::MergeSession(actual) => {
+                    assert!(scopes.contains(&actual.scope));
+                    assert_eq!(
+                        actual.envelope_format,
+                        (actual.scope == scopes[1]).then_some(1)
+                    );
+                    assert_eq!(actual.record_format, 1);
+                    assert_eq!(actual.conflicts, session.conflicts);
+                    assert_eq!(actual.resolved, session.resolved);
+                    assert_eq!(actual.branch, session.branch);
+                    assert_eq!(actual.source_ref, session.source_ref);
+                    assert_eq!(actual.message_bytes, session.message.len() as u64);
+                    assert_eq!(
+                        actual.message_hash,
+                        *blake3::hash(session.message.as_bytes()).as_bytes()
+                    );
+                    assert_eq!(
+                        actual.author_name_hash,
+                        *blake3::hash(session.author_name.as_bytes()).as_bytes()
+                    );
+                    assert_eq!(
+                        actual.author_email_hash,
+                        *blake3::hash(session.author_email.as_bytes()).as_bytes()
+                    );
+                }
+                crate::PreservedGitRecord::MergeBlobIntent(actual) => {
+                    assert!(scopes.contains(&actual.scope));
+                    assert_eq!(
+                        actual.envelope_format,
+                        (actual.scope == scopes[1]).then_some(1)
+                    );
+                    assert_eq!(actual.path, blob.path);
+                    assert_eq!(actual.result_oid, blob.result_oid);
+                    assert_eq!(actual.result_mode, blob.result_mode);
+                    assert_eq!(actual.base.oid, blob.inputs.base.oid);
+                    assert_eq!(actual.ours.oid, blob.inputs.ours.oid);
+                    assert_eq!(actual.theirs.oid, blob.inputs.theirs.oid);
+                    assert_eq!(actual.plan.preserved_ownership()?.area, &area);
+                    assert_eq!(actual.plan.logical_len(), 17);
+                }
+                _ => panic!("wrong preserved record"),
+            }
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 4);
+        assert_eq!(snapshot(), before);
+        for scope in scopes {
+            control
+                .delete_record(&session_kind_for_scope(scope), ACTIVE)
+                .unwrap();
+        }
+        let mut orphans = 0;
+        for_each_preserved_record(&control, repository_id, |_| {
+            orphans += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(orphans, 2);
+        for scope in scopes {
+            control
+                .delete_record(&intent_kind_for_scope(scope), ACTIVE)
+                .unwrap();
+        }
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        for index in 0..12 {
+            let mut bad = session.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.repository_id = Uuid::nil(),
+                2 => bad.branch = "bad..branch".into(),
+                3 => bad.source_ref = b"refs/tags/unsupported".to_vec(),
+                4 => bad.author_name.clear(),
+                5 => bad.author_email.clear(),
+                6 => bad.conflicts.clear(),
+                7 => bad.conflicts.reverse(),
+                8 => bad.conflicts.push(bad.conflicts[1].clone()),
+                9 => bad.resolved = vec![b"absent".to_vec()],
+                10 => bad.conflicts[0] = b"bad\0path".to_vec(),
+                _ => bad.conflicts[0] = b"../escape".to_vec(),
+            }
+            reject(
+                &session_kind(repository_id),
+                ACTIVE,
+                &canonical_bytes(&bad).unwrap(),
+            );
+        }
+        for count in [8192, 8193] {
+            let mut bounded = session.clone();
+            bounded.conflicts = (0..count)
+                .map(|index| format!("path-{index:05}").into_bytes())
+                .collect();
+            bounded.resolved = bounded.conflicts.clone();
+            let bytes = canonical_bytes(&bounded).unwrap();
+            control
+                .put_record(&session_kind(repository_id), ACTIVE, &bytes)
+                .unwrap();
+            assert_eq!(
+                for_each_preserved_record(&control, repository_id, |_| Ok(())).is_ok(),
+                count == 8192
+            );
+            control
+                .delete_record(&session_kind(repository_id), ACTIVE)
+                .unwrap();
+        }
+        for length in [
+            crate::stage::MAX_STAGE_PATH_BYTES,
+            crate::stage::MAX_STAGE_PATH_BYTES + 1,
+        ] {
+            let mut bounded = session.clone();
+            bounded.conflicts = vec![vec![b'a'; length]];
+            bounded.resolved = Vec::new();
+            control
+                .put_record(
+                    &session_kind(repository_id),
+                    ACTIVE,
+                    &canonical_bytes(&bounded).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                for_each_preserved_record(&control, repository_id, |_| Ok(())).is_ok(),
+                length == crate::stage::MAX_STAGE_PATH_BYTES
+            );
+            control
+                .delete_record(&session_kind(repository_id), ACTIVE)
+                .unwrap();
+        }
+        for index in 0..8 {
+            let mut bad = blob.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.repository_id = Uuid::nil(),
+                2 => bad.path = b"/absolute".to_vec(),
+                3 => bad.path = b"bad\0path".to_vec(),
+                4 => bad.result_mode = 0o120000,
+                5 => bad.inputs.ours.mode = 0o100644,
+                6 => bad.path = vec![b'a'; crate::stage::MAX_STAGE_PATH_BYTES + 1],
+                _ => bad.path = b"../escape".to_vec(),
+            }
+            reject(
+                &intent_kind(repository_id),
+                ACTIVE,
+                &canonical_bytes(&bad).unwrap(),
+            );
+        }
+        for length in [MAX_AUTOMERGE_FILE_BYTES, MAX_AUTOMERGE_FILE_BYTES + 1] {
+            let plan: SourceBlobImportPlan = decode_canonical(
+                &canonical_bytes(&OriginalPlan::DirectV1((1, root.clone(), length))).unwrap(),
+            )
+            .unwrap();
+            let mut bounded = blob.clone();
+            bounded.plan = plan;
+            control
+                .put_record(
+                    &intent_kind(repository_id),
+                    ACTIVE,
+                    &canonical_bytes(&bounded).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                for_each_preserved_record(&control, repository_id, |_| Ok(())).is_ok(),
+                length == MAX_AUTOMERGE_FILE_BYTES
+            );
+            control
+                .delete_record(&intent_kind(repository_id), ACTIVE)
+                .unwrap();
+        }
+        for (kind, bytes) in [
+            (session_kind(repository_id), &session_wire),
+            (intent_kind(repository_id), &blob_wire),
+        ] {
+            reject(&kind, b"wrong", bytes);
+            reject(&kind, ACTIVE, &[bytes.as_slice(), &[0]].concat());
+            reject(&kind, ACTIVE, &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1]);
+        }
+        reject(
+            &session_kind_for_scope(scopes[1]),
+            ACTIVE,
+            &canonical_bytes(&(2_u16, scopes[1].worktree_id(), &session)).unwrap(),
+        );
+        reject(
+            &intent_kind_for_scope(scopes[1]),
+            ACTIVE,
+            &canonical_bytes(&(1_u16, Uuid::from_u128(999), &blob)).unwrap(),
+        );
+        reject(&session_kind(Uuid::from_u128(999)), ACTIVE, &session_wire);
+        assert!(!source.exists() && !area.path_hint.exists() && !area.volume_root_hint.exists());
+    }
+}
+
 fn intent_kind(repository_id: Uuid) -> String {
     format!("{INTENT_PREFIX}{repository_id}")
 }

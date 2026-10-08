@@ -2,6 +2,119 @@
 use super::*;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitPrivateText {
+    pub bytes: u64,
+    pub hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitMergeSession {
+    pub repository_id: Uuid,
+    pub worktree_id: Uuid,
+    pub record_format: u16,
+    pub envelope_format: Option<u16>,
+    pub branch: String,
+    pub ours: String,
+    pub theirs: String,
+    pub source_ref_hex: String,
+    pub author_name: LegacyGitPrivateText,
+    pub author_email: LegacyGitPrivateText,
+    pub message: LegacyGitPrivateText,
+    pub conflict_paths_hex: Vec<String>,
+    pub resolved_paths_hex: Vec<String>,
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitMergeInput {
+    pub oid: String,
+    pub mode: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitMergeBlob {
+    pub repository_id: Uuid,
+    pub worktree_id: Uuid,
+    pub record_format: u16,
+    pub envelope_format: Option<u16>,
+    pub relative_path_hex: String,
+    pub base: LegacyGitMergeInput,
+    pub ours: LegacyGitMergeInput,
+    pub theirs: LegacyGitMergeInput,
+    pub result_oid: String,
+    pub result_mode: u32,
+    pub plan: LegacyBlobImportPlan,
+    pub payloads_verified: bool,
+}
+
+pub(super) fn report_merge_session(
+    session: mb_git::PreservedMergeSession,
+    used: &mut usize,
+    limit: usize,
+) -> Result<LegacyPendingGitMergeSession> {
+    let mut report = LegacyPendingGitMergeSession {
+        repository_id: session.scope.repository_id(),
+        worktree_id: session.scope.worktree_id(),
+        record_format: session.record_format,
+        envelope_format: session.envelope_format,
+        branch: session.branch,
+        ours: hex::encode(session.ours),
+        theirs: hex::encode(session.theirs),
+        source_ref_hex: hex::encode(session.source_ref),
+        author_name: LegacyGitPrivateText {
+            bytes: session.author_name_bytes,
+            hash: hex::encode(session.author_name_hash),
+        },
+        author_email: LegacyGitPrivateText {
+            bytes: session.author_email_bytes,
+            hash: hex::encode(session.author_email_hash),
+        },
+        message: LegacyGitPrivateText {
+            bytes: session.message_bytes,
+            hash: hex::encode(session.message_hash),
+        },
+        conflict_paths_hex: Vec::new(),
+        resolved_paths_hex: Vec::new(),
+        payloads_verified: false,
+    };
+    account(&report, used, limit)?;
+    for path in session.conflicts {
+        let path = hex::encode(path);
+        account(&path, used, limit)?;
+        report.conflict_paths_hex.push(path);
+    }
+    for path in session.resolved {
+        let path = hex::encode(path);
+        account(&path, used, limit)?;
+        report.resolved_paths_hex.push(path);
+    }
+    Ok(report)
+}
+
+pub(super) fn report_merge_blob(
+    intent: mb_git::PreservedMergeBlob,
+) -> Result<LegacyPendingGitMergeBlob> {
+    let input = |input: mb_git::PreservedMergeInput| LegacyGitMergeInput {
+        oid: hex::encode(input.oid),
+        mode: input.mode,
+    };
+    Ok(LegacyPendingGitMergeBlob {
+        repository_id: intent.scope.repository_id(),
+        worktree_id: intent.scope.worktree_id(),
+        record_format: intent.record_format,
+        envelope_format: intent.envelope_format,
+        relative_path_hex: hex::encode(intent.path),
+        base: input(intent.base),
+        ours: input(intent.ours),
+        theirs: input(intent.theirs),
+        result_oid: hex::encode(intent.result_oid),
+        result_mode: intent.result_mode,
+        plan: blob_import_plan(&intent.plan)?,
+        payloads_verified: false,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyPendingGitFetch {
     pub repository_id: Uuid,
     pub fetch_id: Uuid,

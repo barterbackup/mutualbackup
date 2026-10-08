@@ -290,6 +290,20 @@ impl PreservedParentCheck {
                     self.check_hint(&intent.source_path)?;
                 }
                 PreservedExternalGitRecord::Record(
+                    mb_git::PreservedGitRecord::MergeBlobIntent(intent),
+                ) => {
+                    let ownership = intent.plan.preserved_ownership()?;
+                    self.check_hint(ownership.source_root)?;
+                    self.check_hint(&ownership.area.path_hint)?;
+                    if let Some(identity) = ownership.stable_root_identity {
+                        self.check_native(identity)?;
+                    } else {
+                        self.check_recorded_native(ownership.recorded_root_identity)?;
+                    }
+                }
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::MergeSession(_)) => {
+                }
+                PreservedExternalGitRecord::Record(
                     mb_git::PreservedGitRecord::BlobImportIntent { plan, .. },
                 ) => {
                     let ownership = plan.preserved_ownership()?;

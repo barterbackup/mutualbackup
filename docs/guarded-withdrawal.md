@@ -221,6 +221,35 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+`legacy-list` format 16 adds original primary and linked-worktree merge
+sessions and generated-blob intents. Pure canonical v1 session/blob codecs
+retain linked envelope identity, branch/source-ref/commit scope, sorted
+conflict and resolved paths, generated input/result OIDs and modes, and
+original blob-import root/area ownership. Session author names, email
+addresses and messages expose only byte lengths and hashes. Readers reuse
+original session rules, the 8,192-conflict limit, normalized 4,096-byte paths,
+original 1 MiB generated-blob bound and 32 MiB rows; they neither open
+anchors/worktrees nor resume or regenerate a merge. Missing
+session/index/worktree/payload joins stay visible, and family coverage leaves
+full catalog/history and payload verification false. Every nested projection
+shares the full report limit. Placement excludes original source/area hints
+and recorded renamed import roots in both filesystem-ID eras, including
+aliases; relocation without a recorded directory identity remains unresolved.
+Original-wire primary/linked/orphan cases, malformed
+scope/key/envelope/path/mode/session data, exact/over path/count/size limits,
+closed/WAL-only/live catalogs, private-text/JSON/report limits, late
+corruption and actual CLI exclusion checks preserve original inputs. External Git merge qualification passes 258 unique cases: 53 export/peer
+cases, all 63 ordinary volume and 114 Git cases, 21 CLI process cases,
+retained-graph/discovery/withdrawal/graph-intent regressions and two
+provisioned Btrfs identity/retained-capture cases. All four debug programs
+build; format and strict locked workspace/all-targets Clippy pass. All 284
+source-file and seven program/test-driver hashes remain unchanged, and native
+mount/loop/image cleanup is verified. Evidence and the distinct passing-case
+inventory are retained under `/tmp/mb-m6-merge-inventory-validation-0oas_ncm`;
+the post-commit audit binds the code to the commit. This is focused
+debug-source qualification; complete ordinary/native Node suites, installed
+artifacts and other platforms were not rerun.
+
 `legacy-list` format 15 includes original external Git fetch versions 1/3/5/6,
 branch/tag push wrappers, standalone blob-import plans and fetch-verification
 rows. Pure bounded readers validate canonical original

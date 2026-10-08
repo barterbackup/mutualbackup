@@ -26,8 +26,10 @@ use crate::snapshot::preserved::{
 use anchors::PreservedAnchor;
 pub use git_intents::{
     LegacyBlobImportPlan, LegacyFetchedBlob, LegacyGitBlobPin, LegacyGitGraphObject,
-    LegacyGitGraphRef, LegacyPendingGitBlobImport, LegacyPendingGitFetch, LegacyPendingGitGraph,
-    LegacyPendingGitPush, LegacyVerifiedFetchAnchor, LegacyVerifiedFetchBlob,
+    LegacyGitGraphRef, LegacyGitMergeInput, LegacyGitPrivateText, LegacyPendingGitBlobImport,
+    LegacyPendingGitFetch, LegacyPendingGitGraph, LegacyPendingGitMergeBlob,
+    LegacyPendingGitMergeSession, LegacyPendingGitPush, LegacyVerifiedFetchAnchor,
+    LegacyVerifiedFetchBlob,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -48,6 +50,8 @@ pub struct LegacyLocalStateInventory {
     pub pending_git_prunes: Vec<LegacyPendingGitPrune>,
     pub pending_git_worktree_removals: Vec<LegacyPendingGitWorktreeRemoval>,
     pub pending_git_fetches: Vec<LegacyPendingGitFetch>,
+    pub pending_git_merge_sessions: Vec<LegacyPendingGitMergeSession>,
+    pub pending_git_merge_blobs: Vec<LegacyPendingGitMergeBlob>,
     pub pending_git_blob_imports: Vec<LegacyPendingGitBlobImport>,
     pub verified_git_fetch_blobs: Vec<LegacyVerifiedFetchBlob>,
     pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
@@ -107,6 +111,8 @@ pub struct LegacyGitRegistration {
     pub push_intents_inventoried: bool,
     pub blob_import_intents_inventoried: bool,
     pub fetch_verification_records_inventoried: bool,
+    pub merge_sessions_inventoried: bool,
+    pub merge_blob_intents_inventoried: bool,
     pub signed_revision_ids: Vec<Uuid>,
 }
 
@@ -905,6 +911,20 @@ pub(super) fn collect_external_git_records(
                     .pending_git_fetches
                     .push(git_intents::report_fetch(*intent, used, limit)?);
             }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::MergeSession(
+                session,
+            )) => {
+                report
+                    .pending_git_merge_sessions
+                    .push(git_intents::report_merge_session(*session, used, limit)?);
+            }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::MergeBlobIntent(
+                intent,
+            )) => {
+                let entry = git_intents::report_merge_blob(*intent)?;
+                account(&entry, used, limit)?;
+                report.pending_git_merge_blobs.push(entry);
+            }
             PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::BlobImportIntent {
                 repository_id,
                 record_format,
@@ -1049,6 +1069,8 @@ pub(super) fn collect_external_git_records(
                 registration.push_intents_inventoried = available;
                 registration.blob_import_intents_inventoried = available;
                 registration.fetch_verification_records_inventoried = available;
+                registration.merge_sessions_inventoried = available;
+                registration.merge_blob_intents_inventoried = available;
             }
         }
         Ok(())
@@ -1246,6 +1268,8 @@ pub(super) fn collect(
         pending_git_prunes: Vec::new(),
         pending_git_worktree_removals: Vec::new(),
         pending_git_fetches: Vec::new(),
+        pending_git_merge_sessions: Vec::new(),
+        pending_git_merge_blobs: Vec::new(),
         pending_git_blob_imports: Vec::new(),
         verified_git_fetch_blobs: Vec::new(),
         storage_volumes: Vec::new(),
@@ -1317,6 +1341,8 @@ pub(super) fn collect(
                     push_intents_inventoried: false,
                     blob_import_intents_inventoried: false,
                     fetch_verification_records_inventoried: false,
+                    merge_sessions_inventoried: false,
+                    merge_blob_intents_inventoried: false,
                     signed_revision_ids: Vec::new(),
                 };
                 account(&entry, used, limit)?;
@@ -1610,6 +1636,384 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_export_merge_journals_preserve_private_metadata_and_renamed_blob_owners() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        #[derive(Serialize)]
+        enum OriginalPlan {
+            DirectV1((u16, mb_store::ReflinkCapturePlan, u64)),
+        }
+        for journal in ["closed", "wal-only", "live"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let data = temporary.path().join("state");
+            let repository = temporary.path().join("repository");
+            let safe = temporary.path().join("safe");
+            for path in [&data, &repository, &safe] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([251; 32]));
+            let repository_id = Uuid::from_u128(251);
+            let worktree_id = Uuid::from_u128(252);
+            let control_path = data.join("control.db");
+            let control = ControlStore::open(&control_path, &keys).unwrap();
+            control
+                .put_record(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: repository.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let directory = repository.join(mb_store::GIT_CATALOG_DIRECTORY);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = directory.join(mb_store::GIT_CATALOG_MARKER_FILE);
+            std::fs::write(&marker, mb_store::git_catalog_marker_bytes(repository_id)).unwrap();
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let external_path = directory.join("catalog.db");
+            let external = ControlStore::open_with_key(
+                &external_path,
+                &mb_git::catalog_key(&keys, repository_id),
+            )
+            .unwrap();
+            let session = (
+                1_u16,
+                repository_id,
+                "topic",
+                [1_u8; 20],
+                [2_u8; 20],
+                b"refs/heads/source".to_vec(),
+                "private author",
+                "private@example.test",
+                "private merge message",
+                vec![b"conflict-\xff".to_vec(), b"resolved".to_vec()],
+                vec![b"resolved".to_vec()],
+            );
+            external
+                .put_record(
+                    &format!("git-merge-session-v1/{repository_id}"),
+                    b"active",
+                    &canonical_bytes(&session).unwrap(),
+                )
+                .unwrap();
+            external
+                .put_record(
+                    &format!("git-worktree-merge-session-v1/{repository_id}/{worktree_id}"),
+                    b"active",
+                    &canonical_bytes(&(1_u16, worktree_id, &session)).unwrap(),
+                )
+                .unwrap();
+            let mut excluded = Vec::new();
+            let mut originals = Vec::new();
+            for era in 0..2 {
+                let root = temporary.path().join(format!("merge-root-{era}"));
+                let area_path = temporary.path().join(format!("merge-area-{era}"));
+                for path in [&root, &area_path] {
+                    std::fs::create_dir(path).unwrap();
+                }
+                let metadata = std::fs::metadata(&root).unwrap();
+                let identity = if era == 0 {
+                    NativeFileId {
+                        filesystem_id: metadata.dev(),
+                        inode: metadata.ino(),
+                    }
+                } else {
+                    mb_store::PinnedDirectory::open(&root)
+                        .unwrap()
+                        .identity()
+                        .unwrap()
+                };
+                let anchor_id = Uuid::from_u128(253 + era);
+                let area_id = Uuid::from_u128(255 + era);
+                let area = mb_store::StableAnchorAreaLocator {
+                    area_id,
+                    filesystem_id: identity.filesystem_id,
+                    path_hint: area_path.clone(),
+                    volume_root_hint: area_path.clone(),
+                };
+                let root_plan: mb_store::ReflinkCapturePlan = decode_canonical(
+                    &canonical_bytes(&(
+                        1_u16,
+                        anchor_id,
+                        root.as_os_str().as_bytes().to_vec(),
+                        area.clone(),
+                        (
+                            identity.filesystem_id,
+                            identity.inode,
+                            0_u64,
+                            0_i64,
+                            0_i64,
+                            0_i64,
+                            0_i64,
+                        ),
+                        libc::S_IFDIR | 0o700,
+                        0_i64,
+                        0_u32,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                let input = |oid| (oid, 0o100755_u32);
+                let blob = (
+                    1_u16,
+                    repository_id,
+                    b"generated-\xfe".to_vec(),
+                    (input([3_u8; 20]), input([4_u8; 20]), input([5_u8; 20])),
+                    [6_u8; 20],
+                    0o100755_u32,
+                    OriginalPlan::DirectV1((1, root_plan, 17)),
+                );
+                let bytes = if era == 0 {
+                    canonical_bytes(&blob).unwrap()
+                } else {
+                    canonical_bytes(&(1_u16, worktree_id, &blob)).unwrap()
+                };
+                let kind = if era == 0 {
+                    format!("git-merge-blob-intent-v1/{repository_id}")
+                } else {
+                    format!("git-worktree-merge-blob-intent-v1/{repository_id}/{worktree_id}")
+                };
+                external.put_record(&kind, b"active", &bytes).unwrap();
+                let renamed = temporary.path().join(format!("renamed-merge-root-{era}"));
+                std::fs::rename(&root, &renamed).unwrap();
+                originals.push((
+                    if era == 0 { repository_id } else { worktree_id },
+                    root,
+                    identity,
+                    anchor_id,
+                    area,
+                ));
+                excluded.extend([renamed, area_path]);
+            }
+            let mut aliases = Vec::new();
+            for (index, path) in excluded.iter().enumerate() {
+                std::fs::create_dir(path.join("child")).unwrap();
+                std::fs::write(path.join("original"), b"preserve merge owner").unwrap();
+                let alias = temporary.path().join(format!("alias-{index}"));
+                std::os::unix::fs::symlink(path, &alias).unwrap();
+                aliases.push(alias);
+            }
+            let mut writers = Some((control, external));
+            if journal == "closed" {
+                drop(writers.take());
+            }
+            if journal == "wal-only" {
+                for path in [&control_path, &external_path] {
+                    std::fs::remove_file(path.with_extension("db-shm")).unwrap();
+                }
+            }
+            let snapshot = |path: &Path| {
+                let mut files = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        let bytes = if entry.file_name().as_bytes().ends_with(b"-shm") {
+                            std::fs::metadata(entry.path())
+                                .unwrap()
+                                .len()
+                                .to_le_bytes()
+                                .to_vec()
+                        } else {
+                            std::fs::read(entry.path()).unwrap()
+                        };
+                        (entry.file_name(), bytes)
+                    })
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
+            };
+            let before = (snapshot(&data), snapshot(&directory));
+            let report =
+                super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+            assert_eq!(report.format_version, 16);
+            assert!(!report.retained_history_complete);
+            assert!(
+                report.local_state.git_worktrees.is_empty()
+                    && report.local_state.git_indexes.is_empty()
+            );
+            assert_eq!(report.local_state.pending_git_merge_sessions.len(), 2);
+            assert_eq!(report.local_state.pending_git_merge_blobs.len(), 2);
+            let registration = &report.local_state.git_repositories[0];
+            assert!(
+                registration.merge_sessions_inventoried
+                    && registration.merge_blob_intents_inventoried
+            );
+            assert!(!registration.catalog_inventoried);
+            for entry in &report.local_state.pending_git_merge_sessions {
+                assert_eq!(entry.repository_id, repository_id);
+                assert!([repository_id, worktree_id].contains(&entry.worktree_id));
+                assert_eq!(
+                    entry.envelope_format,
+                    (entry.worktree_id == worktree_id).then_some(1)
+                );
+                assert_eq!(entry.branch, "topic");
+                assert_eq!(entry.ours, hex::encode([1; 20]));
+                assert_eq!(entry.theirs, hex::encode([2; 20]));
+                assert_eq!(entry.source_ref_hex, hex::encode(b"refs/heads/source"));
+                assert_eq!(
+                    entry.conflict_paths_hex,
+                    vec![hex::encode(b"conflict-\xff"), hex::encode(b"resolved")]
+                );
+                assert_eq!(entry.resolved_paths_hex, vec![hex::encode(b"resolved")]);
+                assert_eq!(
+                    entry.message,
+                    LegacyGitPrivateText {
+                        bytes: 21,
+                        hash: hex::encode(blake3::hash(b"private merge message").as_bytes())
+                    }
+                );
+                assert!(!entry.payloads_verified);
+            }
+            for (worktree, root, identity, anchor_id, area) in &originals {
+                let entry = report
+                    .local_state
+                    .pending_git_merge_blobs
+                    .iter()
+                    .find(|entry| entry.worktree_id == *worktree)
+                    .unwrap();
+                assert_eq!(
+                    entry.envelope_format,
+                    (*worktree == worktree_id).then_some(1)
+                );
+                assert_eq!(entry.relative_path_hex, hex::encode(b"generated-\xfe"));
+                assert_eq!(entry.plan.recorded_root_identity, *identity);
+                assert_eq!(entry.plan.stable_root_identity, None);
+                assert_eq!(entry.plan.anchor_id, *anchor_id);
+                assert_eq!(
+                    entry.plan.source_root_hint_hex,
+                    hex::encode(root.as_os_str().as_bytes())
+                );
+                assert_eq!(
+                    entry.plan.area_path_hint_hex,
+                    hex::encode(area.path_hint.as_os_str().as_bytes())
+                );
+                assert_eq!(entry.plan.logical_len, 17);
+                assert_eq!(entry.base.oid, hex::encode([3; 20]));
+                assert_eq!(entry.ours.oid, hex::encode([4; 20]));
+                assert_eq!(entry.theirs.oid, hex::encode([5; 20]));
+                assert_eq!(entry.result_oid, hex::encode([6; 20]));
+                assert_eq!(entry.result_mode, 0o100755);
+                assert!(!entry.payloads_verified);
+            }
+            let json = serde_json::to_vec(&report).unwrap();
+            let text = String::from_utf8_lossy(&json);
+            for private in [
+                "private author",
+                "private@example.test",
+                "private merge message",
+            ] {
+                assert!(!text.contains(private));
+                assert!(!text.contains(&hex::encode(private)));
+            }
+            assert_eq!(
+                serde_json::from_slice::<super::super::LegacyRevisionInventory>(&json).unwrap(),
+                report
+            );
+            for path in excluded.iter().chain(&aliases) {
+                for parent in [path.clone(), path.join("child")] {
+                    assert!(
+                        super::super::remote::export_parent_preflight(&keys, &data, &parent, &[])
+                            .is_err(),
+                        "{journal}: {}",
+                        parent.display()
+                    );
+                    assert!(
+                        super::super::remote::peer_client_preflight(
+                            &keys,
+                            &data,
+                            &parent,
+                            &[],
+                            false
+                        )
+                        .is_err()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(path.join("original")).unwrap(),
+                    b"preserve merge owner"
+                );
+                assert_eq!(std::fs::read_dir(path.join("child")).unwrap().count(), 0);
+            }
+            assert!(
+                super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_ok()
+            );
+            let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+            assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+            assert!(
+                super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err()
+            );
+            crate::volume::with_inspected_control_snapshot(&data, &keys, |control| {
+                let mut local = collect(control, &mut 0, V1_MAX_CATALOG_BYTES)?;
+                let mut used = 0;
+                collect_external_git_records(
+                    control,
+                    &keys,
+                    &mut local,
+                    &mut used,
+                    V1_MAX_CATALOG_BYTES,
+                )?;
+                let mut expected = 0;
+                for entry in &local.pending_git_merge_sessions {
+                    let mut envelope = entry.clone();
+                    envelope.conflict_paths_hex.clear();
+                    envelope.resolved_paths_hex.clear();
+                    account(&envelope, &mut expected, V1_MAX_CATALOG_BYTES)?;
+                    for path in entry
+                        .conflict_paths_hex
+                        .iter()
+                        .chain(&entry.resolved_paths_hex)
+                    {
+                        account(path, &mut expected, V1_MAX_CATALOG_BYTES)?;
+                    }
+                }
+                for entry in &local.pending_git_merge_blobs {
+                    account(entry, &mut expected, V1_MAX_CATALOG_BYTES)?;
+                }
+                assert_eq!(used, expected);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!((snapshot(&data), snapshot(&directory)), before);
+            if journal == "closed" {
+                let external = ControlStore::open_with_key(
+                    &external_path,
+                    &mb_git::catalog_key(&keys, repository_id),
+                )
+                .unwrap();
+                external
+                    .put_record(
+                        &format!(
+                            "git-worktree-merge-session-v1/{repository_id}/{}",
+                            Uuid::from_u128(999)
+                        ),
+                        b"active",
+                        b"corrupt late merge",
+                    )
+                    .unwrap();
+                drop(external);
+                let corrupted = (snapshot(&data), snapshot(&directory));
+                assert!(
+                    super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).is_err()
+                );
+                assert!(
+                    super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                        .is_err()
+                );
+                assert!(
+                    super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                        .is_err()
+                );
+                assert_eq!((snapshot(&data), snapshot(&directory)), corrupted);
+            }
+            assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+            drop(writers);
+        }
+    }
+
+    #[test]
     fn legacy_export_fetch_and_push_journals_preserve_original_import_owners_without_replay() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         #[derive(Serialize)]
@@ -1846,7 +2250,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.pending_git_fetches.len(), 2);
             assert_eq!(report.local_state.pending_git_blob_imports.len(), 2);
@@ -2183,7 +2587,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -2489,7 +2893,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -2912,7 +3316,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -3289,7 +3693,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&catalog_directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             assert!(report.local_state.git_worktrees.is_empty());
             assert!(report.local_state.git_indexes.is_empty());
@@ -3640,7 +4044,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_object_anchors.len(), 3);
             assert_eq!(report.local_state.git_indexes.len(), 3);
@@ -4003,7 +4407,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_worktrees.len(), 3);
             let json = serde_json::to_vec(&report).unwrap();
@@ -4130,7 +4534,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 15);
+        assert_eq!(report.format_version, 16);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.local_sectors.len(), 1);
         let entry = &report.local_state.local_sectors[0];
@@ -4252,7 +4656,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 15);
+        assert_eq!(report.format_version, 16);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.volume_ownership.len(), 1);
         let entry = &report.local_state.volume_ownership[0];
@@ -4305,7 +4709,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 15);
+        assert_eq!(report.format_version, 16);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -4724,7 +5128,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 15);
+            assert_eq!(report.format_version, 16);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

@@ -75,7 +75,9 @@ pub use history::{
 #[cfg(target_os = "linux")]
 pub use interop::GitInteropError;
 #[cfg(target_os = "linux")]
-pub use merge::{GitMergeState, MergeBlobError};
+pub use merge::{
+    GitMergeState, MergeBlobError, PreservedMergeBlob, PreservedMergeInput, PreservedMergeSession,
+};
 pub use object_catalog::{
     GIT_OBJECT_FRAGMENT_BYTES, GitObjectCatalogBuilder, GitObjectCatalogReader,
     GitObjectCatalogRoot, GitObjectRecord,

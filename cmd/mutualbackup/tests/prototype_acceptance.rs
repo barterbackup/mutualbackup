@@ -3847,6 +3847,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let fetch_target = temp.path().join("preserved-fetch-target");
     let import_source = temp.path().join("preserved-blob-import-source");
     let import_area = temp.path().join("preserved-blob-import-area");
+    let merge_source = temp.path().join("preserved-merge-blob-source");
+    let merge_area = temp.path().join("preserved-merge-blob-area");
     for path in [
         &object_source,
         &object_area,
@@ -3866,6 +3868,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &fetch_target,
         &import_source,
         &import_area,
+        &merge_source,
+        &merge_area,
     ] {
         fs::create_dir(path).unwrap();
         fs::create_dir(path.join("nested")).unwrap();
@@ -3877,6 +3881,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     std::os::unix::fs::symlink(&stage_source, &stage_alias).unwrap();
     let import_alias = temp.path().join("blob-import-source-alias");
     std::os::unix::fs::symlink(&import_source, &import_alias).unwrap();
+    let merge_alias = temp.path().join("merge-blob-source-alias");
+    std::os::unix::fs::symlink(&merge_source, &merge_alias).unwrap();
     let stage_root_id = mb_store::PinnedDirectory::open(&stage_source)
         .unwrap()
         .identity()
@@ -4220,6 +4226,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         )
         .unwrap();
     let import_root_id = directory_id(&import_source);
+    let merge_root_id = directory_id(&merge_source);
+    let merge_anchor_id = Uuid::new_v4();
+    let merge_area_id = Uuid::new_v4();
     let fetch_anchor_id = Uuid::new_v4();
     let import_area_id = Uuid::new_v4();
     let import_root_plan: mb_store::ReflinkCapturePlan = mb_core::decode_canonical(
@@ -4253,6 +4262,85 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     enum OriginalFetchBlobPlan {
         DirectV1((u16, mb_store::ReflinkCapturePlan, u64)),
     }
+    let merge_root_plan: mb_store::ReflinkCapturePlan = mb_core::decode_canonical(
+        &canonical_bytes(&(
+            1_u16,
+            merge_anchor_id,
+            merge_source.as_os_str().as_bytes().to_vec(),
+            mb_store::StableAnchorAreaLocator {
+                area_id: merge_area_id,
+                filesystem_id: merge_root_id.filesystem_id,
+                path_hint: merge_area.clone(),
+                volume_root_hint: merge_area.clone(),
+            },
+            (
+                merge_root_id.filesystem_id,
+                merge_root_id.inode,
+                0_u64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+            ),
+            libc::S_IFDIR | 0o700,
+            0_i64,
+            0_u32,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let merge_session = (
+        1_u16,
+        repository_id,
+        "topic",
+        commit_sha1,
+        [40_u8; 20],
+        b"refs/heads/source".to_vec(),
+        "private cli author",
+        "private-cli@example.test",
+        "private merge cli message",
+        vec![b"conflict-\xf4".to_vec(), b"resolved".to_vec()],
+        vec![b"resolved".to_vec()],
+    );
+    external_store
+        .put_record(
+            &format!("git-merge-session-v1/{repository_id}"),
+            b"active",
+            &canonical_bytes(&merge_session).unwrap(),
+        )
+        .unwrap();
+    external_store
+        .put_record(
+            &format!("git-worktree-merge-session-v1/{repository_id}/{worktree_id}"),
+            b"active",
+            &canonical_bytes(&(1_u16, worktree_id, &merge_session)).unwrap(),
+        )
+        .unwrap();
+    let merge_input = |oid| (oid, 0o100755_u32);
+    external_store
+        .put_record(
+            &format!("git-worktree-merge-blob-intent-v1/{repository_id}/{worktree_id}"),
+            b"active",
+            &canonical_bytes(&(
+                1_u16,
+                worktree_id,
+                (
+                    1_u16,
+                    repository_id,
+                    b"generated-\xf3".to_vec(),
+                    (
+                        merge_input([41_u8; 20]),
+                        merge_input([42_u8; 20]),
+                        merge_input([43_u8; 20]),
+                    ),
+                    [39_u8; 20],
+                    0o100755_u32,
+                    OriginalFetchBlobPlan::DirectV1((1, merge_root_plan, 17)),
+                ),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
     external_store
         .put_record(
             &format!("git-bare-fetch-blob-intent-v1/{repository_id}"),
@@ -4381,7 +4469,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 15);
+    assert_eq!(inventory.format_version, 16);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -4507,6 +4595,54 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert_eq!(verified.anchors[0].anchor_id, fetch_anchor_id);
     assert_eq!(verified.anchors[0].content_hash, hex::encode([38; 32]));
     assert!(!verified.payloads_verified);
+    assert!(
+        git_registration.merge_sessions_inventoried
+            && git_registration.merge_blob_intents_inventoried
+    );
+    assert_eq!(inventory.local_state.pending_git_merge_sessions.len(), 2);
+    for session in &inventory.local_state.pending_git_merge_sessions {
+        assert_eq!(session.record_format, 1);
+        assert!([repository_id, worktree_id].contains(&session.worktree_id));
+        assert_eq!(
+            session.envelope_format,
+            (session.worktree_id == worktree_id).then_some(1)
+        );
+        assert_eq!(
+            session.conflict_paths_hex,
+            vec![hex::encode(b"conflict-\xf4"), hex::encode(b"resolved")]
+        );
+        assert_eq!(session.resolved_paths_hex, vec![hex::encode(b"resolved")]);
+        assert_eq!(
+            session.message.bytes,
+            b"private merge cli message".len() as u64
+        );
+        assert_eq!(
+            session.message.hash,
+            hex::encode(blake3::hash(b"private merge cli message").as_bytes())
+        );
+        assert!(!session.payloads_verified);
+    }
+    assert_eq!(inventory.local_state.pending_git_merge_blobs.len(), 1);
+    let merge = &inventory.local_state.pending_git_merge_blobs[0];
+    assert_eq!(merge.worktree_id, worktree_id);
+    assert_eq!(merge.record_format, 1);
+    assert_eq!(merge.envelope_format, Some(1));
+    assert_eq!(merge.relative_path_hex, hex::encode(b"generated-\xf3"));
+    assert_eq!(merge.plan.anchor_id, merge_anchor_id);
+    assert_eq!(merge.plan.area_id, merge_area_id);
+    assert_eq!(merge.plan.recorded_root_identity, merge_root_id);
+    assert_eq!(merge.result_oid, hex::encode([39; 20]));
+    assert_eq!(merge.result_mode, 0o100755);
+    assert_eq!(merge.plan.logical_len, 17);
+    assert!(!merge.payloads_verified);
+    for private in [
+        "private cli author",
+        "private-cli@example.test",
+        "private merge cli message",
+    ] {
+        assert!(!String::from_utf8_lossy(&listed.stdout).contains(private));
+        assert!(!String::from_utf8_lossy(&listed.stdout).contains(&hex::encode(private)));
+    }
     assert_eq!(inventory.local_state.pending_git_symlinks.len(), 1);
     let saved_symlink = &inventory.local_state.pending_git_symlinks[0];
     assert_eq!(saved_symlink.repository_id, repository_id);
@@ -4671,6 +4807,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         import_source.join("nested"),
         import_area.join("nested"),
         import_alias.join("nested"),
+        merge_source.join("nested"),
+        merge_area.join("nested"),
+        merge_alias.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -4806,6 +4945,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &import_source.join("nested"),
         &import_area.join("nested"),
         &import_alias.join("nested"),
+        &merge_source.join("nested"),
+        &merge_area.join("nested"),
+        &merge_alias.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -4862,6 +5004,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &fetch_target,
         &import_source,
         &import_area,
+        &merge_source,
+        &merge_area,
     ] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),
