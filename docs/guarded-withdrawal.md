@@ -159,8 +159,14 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
-Report format 2 includes preserved local protected-root registrations, backend
-bindings, Git registrations and guarded stopped/revision-capture anchor ownership.
+Report format 3 includes preserved local protected-root registrations, backend
+bindings, Git registrations, guarded stopped/revision-capture anchor ownership,
+and pending source-capture and recovery-anchor intents. Capture envelopes 1/2/3
+and recovery envelopes 1/2 are checked against their original canonical layouts;
+inventory never migrates or replays them. Pending ownership includes the planned
+root anchor and guarded per-file capture IDs, plus any anchor retained during
+recovery replacement. Relative historical requests are reported as bytes without
+resolving them against the inventory process's working directory.
 Raw Unix paths are reported as hex bytes. These records and the local signed
 revisions come from one read-only SQLite snapshot, released before peer requests.
 The complete canonical encoded report has a 32 MiB metadata limit; exceeding it fails the
@@ -169,8 +175,26 @@ are unknown for missing roots and older registration formats 1/2. Git registrati
 can be history-only: `catalog_inventoried` remains false because the external Git
 catalog is not opened. Unknown guarded/link-freeze records are listed with their
 kind, ID, payload size and digest for preservation; they are not decoded ownership.
+Native root plan format 1 predates stable filesystem IDs, and its wire layout did
+not change when the filesystem word changed from `st_dev` to a stable identity.
+A newer intent envelope may contain a migrated old plan. Its recorded root/area
+identity is therefore reported without asserting a stable root identity. Guarded
+root plans were introduced after that change and retain stable identities.
+Available signed metadata is linked to pending records only for the same revision
+and guild; it does not authenticate a pending plan or verify its payloads.
 Source paths, mount paths and anchor payloads are not opened during inventory,
 so `payloads_verified` remains false even when signed revision metadata is available.
+
+The pending-intent increment was qualified on Linux on 2026-10-08 with 336
+unique passing cases: the full ordinary store suite, inventory/export/peer and
+CLI process slices, discovery, withdrawal and separately provisioned native
+Btrfs regressions. Closed catalog bytes and file sets, raw Unix pins, malformed
+intents, report budget rejection, pending-only moved sources and old native
+intent migration are covered. Both disposable Btrfs filesystems, loop devices
+and images were removed with cleanup verified. All four debug programs build;
+formatting and strict workspace/all-targets Clippy pass. This qualifies the exercised source slice; other ignored fixtures,
+installed artifacts and the complete
+upgrade/source-loss/platform matrix remain release gates.
 
 Inventory opens forbid database/journal creation and deletion. A catalog with no
 journal files uses an immutable read only while its file identity, size, mtime,
@@ -264,23 +288,28 @@ identity's authenticated transport. It never starts the original installation,
 publishes recovery state, repairs shards, enrolls a root or retires source data.
 Original catalog, key and selected local volume state remain read-only.
 `TMPDIR` must resolve outside the preserved installation, selected anchor/parity
-areas, registered source roots, Git repository paths and typed guarded capture
-anchor-area hints. Peer mode uses inventory's non-creating snapshot reader and
+areas, registered source roots, Git repository paths, typed guarded capture
+anchor-area hints, pending capture source/area hints and recovery-replacement
+source/area hints. Peer mode uses inventory's non-creating snapshot reader and
 shared canonical/shape validation, with a 32 MiB limit per local record. It streams
 all relevant rows without building the inventory report or applying its aggregate
 32 MiB report ceiling to placement checks. Placement state retains the temporary
 parent's ancestry and one recent path hint; it does not grow with retained capture
 count. Directory identities also reject aliases of existing inputs and renamed
-roots identified by stable root/backend/
-stopped-capture records. Missing old paths remain compatible with recovery;
+roots identified by stable root/backend/stopped-capture and guarded plan records.
+Ambiguous native plan identities conservatively exclude both current device/inode
+and stable filesystem/inode matches; that exclusion does not certify which
+historical meaning was used. Missing old paths remain compatible with recovery;
 registration formats 1/2 are not interpreted as stable filesystem/inode IDs.
 If an inode could match a preserved root and its stable filesystem identity
 cannot be verified, select another `TMPDIR`; client creation is refused.
 The parent's ancestor identities are checked again after the scan, so replacement
 during inspection fails before client creation.
 Volume-root hints are discovery locations, not ownership of the entire volume.
-These checks cover known local records. External Git worktrees, other pending
-owners, relocated anchor-area discovery and concurrent path replacement still
+An old device-based plan with a missing hint cannot identify a relocated root
+after its device number changes. These checks cover known local records. External
+Git catalogs/worktrees and their graph intents, other anchor/volume owners,
+relocated anchor-area discovery and concurrent path replacement still
 require the remaining R1 isolation qualification. Preserve those inputs too.
 
 Local shards and authenticated zeros are considered first. If insufficient,

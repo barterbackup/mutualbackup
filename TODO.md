@@ -526,6 +526,34 @@ remain active.
     Clippy pass. Disposable Btrfs mount, loop and image cleanup is verified.
     This is local known-owner placement work, not complete ownership inventory,
     retained conversion, installed artifact or 1 TiB capacity qualification.
+  - [x] Inventory pending root capture and recovery-anchor ownership without
+    replay or migration. The shared scanner checks original canonical capture
+    envelope versions 1/2/3 and recovery envelope versions 1/2, revision keys,
+    plan namespaces, per-file capture IDs and replaced-anchor paths/extents.
+    Format-3 inventory reports raw source/area paths, anchor identities, guarded
+    file pins, retained replacement anchors and available same-revision/guild
+    signed metadata. Native plan format 1 reused the same wire field for device
+    and stable filesystem IDs; report that ambiguity even in migrated current
+    envelopes. Peer placement excludes source/area hints and guarded stable
+    identities, and conservatively checks both meanings of native recorded
+    identities. Relative historical requests do not inherit the current cwd.
+    Validation: 336 unique cases pass: 282 ordinary store cases, 29 inventory/
+    export/range/peer cases, two discovery cases, 19 ordinary CLI process cases,
+    one withdrawal case and three separately provisioned Btrfs cases. Closed
+    wrapped/legacy catalogs and source file sets remain unchanged across valid,
+    malformed and budget-rejected reads; raw path pins and missing registrations
+    are covered. Guarded namespace corruption is rejected before any pin visit.
+    Real Btrfs covers pending-only renamed roots and native intent migration;
+    both disposable filesystems, loops and images have verified cleanup. All
+    four programs build; format and strict locked workspace/all-targets Clippy
+    pass. Source and seven program/test-driver hashes remain unchanged during
+    qualification. The driver rejected three empty selections; corrected module
+    names and explicitly provisioned ignored migrations have positive exact
+    test counts. Twenty-six store and three CLI process fixtures remain ignored.
+    Known graph intents, native/revision/volume and other owners, ambiguous
+    device identities after remount with missing hints, relocated anchor areas, full conversion,
+    upgrade/source-loss, installed releases and native platform gates remain
+    open; this does not close R1 or M6.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

@@ -268,6 +268,127 @@ impl GuardedStoppedCaptureV1 {
 }
 
 impl GuardedRootCapturePlan {
+    pub fn preserved_ownership(&self) -> anyhow::Result<super::PreservedRootCapture<'_>> {
+        super::validate_preserved_capture_root(
+            self.format_version,
+            self.anchor_id,
+            &self.source_root,
+            &self.area,
+            &self.root_version,
+            self.root_modified_nanos,
+        )?;
+        ensure!(
+            self.root_mode & libc::S_IFMT == libc::S_IFDIR
+                && self.root_modified_secs == self.root_version.modified_secs
+                && i64::from(self.root_modified_nanos) == self.root_version.modified_nanos
+                && self.entries.len() <= super::MAX_CAPTURE_ENTRIES,
+            "invalid preserved guarded root metadata"
+        );
+        let root = self.root_version.recorded_identity();
+        let mut directories = std::collections::BTreeSet::new();
+        let mut captures = std::collections::BTreeSet::from([self.anchor_id]);
+        let mut inodes = std::collections::BTreeSet::from([root.inode]);
+        let mut previous = None::<&Path>;
+        for entry in &self.entries {
+            let (path, version, mode, secs, nanos, directory) = match entry {
+                GuardedRootEntry::Directory {
+                    path,
+                    version,
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                } => (path, version, mode, modified_secs, modified_nanos, true),
+                GuardedRootEntry::File {
+                    path,
+                    capture_id,
+                    version,
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                } => {
+                    ensure!(
+                        !capture_id.is_nil() && captures.insert(*capture_id),
+                        "invalid preserved file capture ownership"
+                    );
+                    (path, version, mode, modified_secs, modified_nanos, false)
+                }
+            };
+            super::validate_relative(path)?;
+            let normalized: PathBuf = path.components().collect();
+            let bytes = path.as_os_str().as_bytes();
+            ensure!(
+                !bytes.contains(&0)
+                    && normalized.as_os_str().as_bytes() == bytes
+                    && bytes.len() <= super::MAX_RELATIVE_PATH_BYTES
+                    && path.components().count() <= super::MAX_CAPTURE_DEPTH
+                    && (self.format_version == 2 || path.to_str().is_some())
+                    && previous.is_none_or(|prior| prior < path.as_path())
+                    && *nanos < 1_000_000_000
+                    && *secs == version.modified_secs
+                    && i64::from(*nanos) == version.modified_nanos
+                    && *mode & libc::S_IFMT
+                        == if directory {
+                            libc::S_IFDIR
+                        } else {
+                            libc::S_IFREG
+                        },
+                "unsafe preserved capture entry"
+            );
+            version.validate_preserved()?;
+            ensure!(
+                version.recorded_identity().filesystem_id == root.filesystem_id
+                    && inodes.insert(version.inode),
+                "invalid preserved capture entry identity"
+            );
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                ensure!(
+                    directories.contains(parent),
+                    "preserved capture entry lacks its parent"
+                );
+            }
+            if directory {
+                directories.insert(path.as_path());
+            }
+            previous = Some(path);
+        }
+        Ok(super::PreservedRootCapture {
+            record_format: self.format_version,
+            anchor_id: self.anchor_id,
+            source_root: &self.source_root,
+            area: &self.area,
+            recorded_root_identity: root,
+            // Guarded root plans were introduced after stable filesystem IDs.
+            stable_root_identity: Some(root),
+        })
+    }
+
+    pub fn for_each_preserved_file_capture(
+        &self,
+        mut visit: impl FnMut(super::PreservedFileCapture<'_>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.preserved_ownership()?;
+        for entry in &self.entries {
+            if let GuardedRootEntry::File {
+                path,
+                capture_id,
+                version,
+                ..
+            } = entry
+            {
+                visit(super::PreservedFileCapture {
+                    relative_path: path,
+                    capture_id: *capture_id,
+                    native_id: version.recorded_identity(),
+                    logical_len: version.logical_len,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn source_root(&self) -> &Path {
         &self.source_root
     }
@@ -302,4 +423,135 @@ pub(super) fn guarded_root_marker_name(anchor_id: Uuid) -> String {
 }
 pub(super) fn guarded_file_marker_name(anchor_id: Uuid) -> String {
     format!(".mutualbackup-guarded-file-v1-{anchor_id}")
+}
+
+#[cfg(test)]
+mod preserved_tests {
+    use super::*;
+
+    fn fixture() -> GuardedRootCapturePlan {
+        let version = CaptureVersion {
+            filesystem_id: 2,
+            inode: 3,
+            logical_len: 0,
+            modified_secs: 4,
+            modified_nanos: 5,
+            changed_secs: 6,
+            changed_nanos: 7,
+        };
+        GuardedRootCapturePlan {
+            format_version: 2,
+            anchor_id: Uuid::from_bytes([1; 16]),
+            source_root: PathBuf::from("/absent-preserved-source"),
+            area: StableAnchorAreaLocator {
+                area_id: Uuid::from_bytes([2; 16]),
+                path_hint: PathBuf::from("/absent-preserved-area"),
+                filesystem_id: 2,
+                volume_root_hint: PathBuf::from("/"),
+            },
+            root_version: version.clone(),
+            root_mode: libc::S_IFDIR | 0o700,
+            root_modified_secs: 4,
+            root_modified_nanos: 5,
+            entries: vec![GuardedRootEntry::File {
+                path: PathBuf::from(OsString::from_vec(b"file-\xff".to_vec())),
+                capture_id: Uuid::from_bytes([3; 16]),
+                version: CaptureVersion {
+                    inode: 8,
+                    logical_len: 9,
+                    ..version
+                },
+                mode: libc::S_IFREG | 0o600,
+                modified_secs: 4,
+                modified_nanos: 5,
+            }],
+        }
+    }
+
+    #[test]
+    fn preserved_guarded_plan_validates_all_entries_before_visiting_pins() {
+        let valid = fixture();
+        let wire = mb_core::canonical_bytes(&valid).unwrap();
+        let root = valid.preserved_ownership().unwrap();
+        assert_eq!(
+            root.stable_root_identity,
+            Some(NativeFileId {
+                filesystem_id: 2,
+                inode: 3
+            })
+        );
+        let mut pins = 0;
+        valid
+            .for_each_preserved_file_capture(|pin| {
+                assert_eq!(pin.relative_path.as_os_str().as_bytes(), b"file-\xff");
+                assert_eq!(pin.logical_len, 9);
+                pins += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(pins, 1);
+        assert_eq!(mb_core::canonical_bytes(&valid).unwrap(), wire);
+
+        let mut utf8 = valid.clone();
+        utf8.format_version = 1;
+        if let GuardedRootEntry::File { path, .. } = &mut utf8.entries[0] {
+            *path = PathBuf::from("file");
+        }
+        assert!(utf8.preserved_ownership().is_ok());
+
+        let mut invalid = Vec::new();
+        let mut value = valid.clone();
+        value.format_version = 3;
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.format_version = 1;
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.area.filesystem_id = 42;
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.root_modified_nanos = 6;
+        invalid.push(value);
+        let mut value = valid.clone();
+        value.entries.push(value.entries[0].clone());
+        invalid.push(value);
+        for mutation in 0..7 {
+            let mut value = valid.clone();
+            if let GuardedRootEntry::File {
+                path,
+                capture_id,
+                version,
+                mode,
+                modified_nanos,
+                ..
+            } = &mut value.entries[0]
+            {
+                match mutation {
+                    0 => *capture_id = value.anchor_id,
+                    1 => version.filesystem_id = 42,
+                    2 => *path = PathBuf::from("../escape"),
+                    3 => *path = PathBuf::from("missing-parent/file"),
+                    4 => *mode = libc::S_IFDIR | 0o700,
+                    5 => version.inode = 0,
+                    6 => *modified_nanos = 1_000_000_000,
+                    _ => unreachable!(),
+                }
+            }
+            invalid.push(value);
+        }
+        for value in invalid {
+            let original = mb_core::canonical_bytes(&value).unwrap();
+            let mut visits = 0;
+            assert!(
+                value
+                    .for_each_preserved_file_capture(|_| {
+                        visits += 1;
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert_eq!(visits, 0);
+            assert_eq!(mb_core::canonical_bytes(&value).unwrap(), original);
+        }
+    }
 }

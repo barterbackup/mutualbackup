@@ -249,6 +249,30 @@ pub enum SourceCapturePlan {
 }
 
 impl SourceCapturePlan {
+    /// Inspect a retained plan without executing capture, discovery or replay.
+    pub fn preserved_ownership(&self) -> anyhow::Result<crate::PreservedRootCapture<'_>> {
+        match self {
+            Self::ReflinkV1(plan) => plan.preserved_ownership(),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.preserved_ownership(),
+        }
+    }
+
+    pub fn for_each_preserved_file_capture(
+        &self,
+        visit: impl FnMut(crate::PreservedFileCapture<'_>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::ReflinkV1(plan) => {
+                plan.preserved_ownership()?;
+                let _ = visit;
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.for_each_preserved_file_capture(visit),
+        }
+    }
+
     pub fn plan_reflink(source_root: impl AsRef<Path>) -> Result<Self, AnchorError> {
         ReflinkAnchor::plan(source_root).map(Self::ReflinkV1)
     }

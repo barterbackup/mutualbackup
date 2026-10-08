@@ -2422,7 +2422,90 @@ impl FileAnchorManifest {
     }
 }
 
+/// Pure inspection of a retained root plan; no source or anchor is opened.
+#[derive(Clone, Copy, Debug)]
+pub struct PreservedRootCapture<'a> {
+    pub record_format: u16,
+    pub anchor_id: Uuid,
+    pub source_root: &'a Path,
+    pub area: &'a StableAnchorAreaLocator,
+    /// Native format 1 used this word for both st_dev and stable filesystem IDs.
+    pub recorded_root_identity: NativeFileId,
+    pub stable_root_identity: Option<NativeFileId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PreservedFileCapture<'a> {
+    pub relative_path: &'a Path,
+    pub capture_id: Uuid,
+    pub native_id: NativeFileId,
+    pub logical_len: u64,
+}
+
+pub(crate) fn validate_preserved_capture_root(
+    format_version: u16,
+    anchor_id: Uuid,
+    source: &Path,
+    area: &StableAnchorAreaLocator,
+    version: &CaptureVersion,
+    modified_nanos: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(format_version, 1 | 2)
+            && !anchor_id.is_nil()
+            && !area.area_id.is_nil()
+            && area.filesystem_id == version.filesystem_id
+            && modified_nanos < 1_000_000_000,
+        "invalid preserved root capture ownership"
+    );
+    version.validate_preserved()?;
+    for path in [source, &area.path_hint, &area.volume_root_hint] {
+        anyhow::ensure!(
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+                && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str(),
+            "unsafe preserved capture path hint"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            anyhow::ensure!(
+                !path.as_os_str().as_bytes().contains(&0),
+                "unsafe preserved capture path hint"
+            );
+        }
+    }
+    Ok(())
+}
+
 impl ReflinkCapturePlan {
+    pub fn preserved_ownership(&self) -> anyhow::Result<PreservedRootCapture<'_>> {
+        anyhow::ensure!(
+            self.format_version == 1,
+            "unsupported preserved native capture plan"
+        );
+        validate_preserved_capture_root(
+            self.format_version,
+            self.anchor_id,
+            &self.source_root,
+            &self.area,
+            &self.root_version,
+            self.root_modified_nanos,
+        )?;
+        Ok(PreservedRootCapture {
+            record_format: self.format_version,
+            anchor_id: self.anchor_id,
+            source_root: &self.source_root,
+            area: &self.area,
+            recorded_root_identity: self.root_version.recorded_identity(),
+            // Neither the plan version nor a migrated envelope disambiguates
+            // the unchanged historical device/stable-filesystem wire layout.
+            stable_root_identity: None,
+        })
+    }
+
     pub fn anchor_id(&self) -> Uuid {
         self.anchor_id
     }
@@ -2445,6 +2528,26 @@ pub(crate) struct CaptureVersion {
     modified_nanos: i64,
     changed_secs: i64,
     changed_nanos: i64,
+}
+
+impl CaptureVersion {
+    pub(crate) fn recorded_identity(&self) -> NativeFileId {
+        NativeFileId {
+            filesystem_id: self.filesystem_id,
+            inode: self.inode,
+        }
+    }
+
+    pub(crate) fn validate_preserved(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.filesystem_id != 0
+                && self.inode != 0
+                && (0..1_000_000_000).contains(&self.modified_nanos)
+                && (0..1_000_000_000).contains(&self.changed_nanos),
+            "invalid preserved capture version"
+        );
+        Ok(())
+    }
 }
 
 impl StableAnchorFileLocator {

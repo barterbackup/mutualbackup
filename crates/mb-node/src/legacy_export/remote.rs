@@ -156,6 +156,18 @@ impl ScratchParentCheck {
         Ok(())
     }
 
+    fn check_recorded_native(&mut self, recorded: mb_store::NativeFileId) -> Result<()> {
+        ensure!(
+            !self
+                .ancestors
+                .iter()
+                .any(|ancestor| ancestor.inode == recorded.inode
+                    && ancestor.device == recorded.filesystem_id),
+            "temporary client directory must be outside preserved inputs; select another TMPDIR"
+        );
+        self.check_native(recorded)
+    }
+
     fn check_native(&mut self, root: mb_store::NativeFileId) -> Result<()> {
         self.check_native_with(root, |path| mb_store::directory_identity(path))
     }
@@ -221,6 +233,7 @@ pub(super) fn peer_client_preflight(
             record.for_each_input(|input| match input {
                 PreservedInput::PathHint(path) => checked.check_hint(path),
                 PreservedInput::NativeRoot(root) => checked.check_native(root),
+                PreservedInput::RecordedNativeRoot(root) => checked.check_recorded_native(root),
             })
         })?;
         let guild = if discover {
@@ -936,6 +949,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_peer_scratch_conservatively_excludes_recorded_device_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("catalog");
+        std::fs::create_dir(&data).unwrap();
+        let metadata = temp.path().metadata().unwrap();
+        let mut checked = ScratchParentCheck::new(temp.path(), &data, &[]).unwrap();
+        // This is the pre-stable-ID wire meaning, still legal in native plan 1.
+        let error = checked
+            .check_recorded_native(mb_store::NativeFileId {
+                filesystem_id: metadata.dev(),
+                inode: metadata.ino(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("outside preserved inputs"));
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+    }
+
+    #[test]
     fn legacy_peer_scratch_rejects_parent_replacement_during_inspection() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("catalog");
@@ -1052,6 +1083,7 @@ mod tests {
     #[ignore = "requires a provisioned reflink filesystem"]
     fn legacy_peer_preflight_rejects_renamed_roots_by_stable_identity() {
         use crate::control::ProtectedRoot;
+        use std::os::unix::ffi::OsStrExt;
         let parent = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
         let temp = tempfile::tempdir_in(parent).unwrap();
         let data = temp.path().join("catalog");
@@ -1059,7 +1091,12 @@ mod tests {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
         let store = ControlStore::open(data.join("control.db"), &keys).unwrap();
         let mut moved = Vec::new();
-        for owner in ["registration", "binding", "stopped-capture"] {
+        for owner in [
+            "registration",
+            "binding",
+            "stopped-capture",
+            "capture-intent",
+        ] {
             let old = temp.path().join(format!("source-{owner}"));
             std::fs::create_dir_all(old.join("nested")).unwrap();
             let native = mb_store::directory_identity(&old).unwrap();
@@ -1091,6 +1128,51 @@ mod tests {
                         "protected-root",
                         id.as_bytes(),
                         &mb_core::canonical_bytes(&registration).unwrap(),
+                    )
+                    .unwrap();
+            } else if owner == "capture-intent" {
+                let area = mb_store::StableAnchorAreaLocator {
+                    area_id: uuid::Uuid::new_v4(),
+                    path_hint: temp.path().join("absent-area"),
+                    filesystem_id: native.filesystem_id,
+                    volume_root_hint: temp.path().to_path_buf(),
+                };
+                let plan: mb_store::ReflinkCapturePlan = mb_core::decode_canonical(
+                    &mb_core::canonical_bytes(&(
+                        1_u16,
+                        uuid::Uuid::new_v4(),
+                        old.as_os_str().as_bytes().to_vec(),
+                        area,
+                        (
+                            native.filesystem_id,
+                            native.inode,
+                            0_u64,
+                            0_i64,
+                            0_i64,
+                            0_i64,
+                            0_i64,
+                        ),
+                        libc::S_IFDIR | 0o700,
+                        0_i64,
+                        0_u32,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                store
+                    .put_record(
+                        "capture-intent",
+                        id.as_bytes(),
+                        &mb_core::canonical_bytes(&(
+                            1_u16,
+                            [74_u8; 32],
+                            id,
+                            1_u64,
+                            None::<[u8; 32]>,
+                            &old,
+                            plan,
+                        ))
+                        .unwrap(),
                     )
                     .unwrap();
             } else {

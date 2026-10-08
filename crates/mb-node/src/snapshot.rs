@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+pub(crate) mod preserved;
+
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;

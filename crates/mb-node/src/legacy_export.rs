@@ -11,8 +11,9 @@ pub use inventory::{
     inventory_withdrawn_revisions_from_catalog_over_network,
 };
 pub use local_inventory::{
-    LegacyGitRegistration, LegacyGuardedAnchorPin, LegacyGuardedCapture, LegacyLocalStateInventory,
-    LegacyPreservedRecord, LegacyRootRegistration, LegacySourceBinding,
+    LegacyCaptureOwnership, LegacyGitRegistration, LegacyGuardedAnchorPin, LegacyGuardedCapture,
+    LegacyLocalStateInventory, LegacyPendingCapture, LegacyPendingFilePin, LegacyPreservedRecord,
+    LegacyRootRegistration, LegacySourceBinding,
 };
 pub use remote::{
     LegacyExportPeer, LegacyPeerInventoryCoverage, LegacyPeerSources,
