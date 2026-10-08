@@ -2145,8 +2145,8 @@ remain active.
     Clippy, Bash syntax and workflow lint pass. A real failing frozen driver
     left a root-owned process in its disposable namespace; the exit trap
     retired it and restored namespace, firewall and forwarding baselines.
-    Actual installed-candidate provisioned execution is pending; these checks
-    do not qualify the release artifact or close R7's remaining native, upgrade,
+    Installed-candidate provisioned execution is qualified below. These
+    implementation checks alone do not close R7's remaining native, upgrade,
     multi-volume and platform matrix.
 
   - [x] Normalize scratch filesystem IDs across glibc and musl. The actual Nix
@@ -2157,7 +2157,31 @@ remain active.
     Seven ordinary scratch/allocation tests and the separately provisioned Btrfs
     rewrite/rollback/reclamation fixture pass, with mount, loop and image cleanup
     verified. Formatting and strict workspace/all-targets Clippy pass. The
-    corrected musl release build and installed-process qualification are pending.
+    corrected musl release build passes on `83590ac`; its runtime and optional
+    Git alias are qualified below.
+
+  - [x] Qualify the installed Linux runtime and alias on `83590ac`. The actual
+    Nix musl runtime passes all three isolated-PATH Git packaging scenarios,
+    including both bridge directions, alias discovery and the standalone
+    missing-Git rejection. Frozen process drivers then pass 19 ordinary process
+    cases, raw Unix CLI/daemon/Git paths, the stock-Git bridge and the complete
+    five-daemon topology/seed-only recovery scenario. The provisioned case
+    passes in 793.81 seconds, exercising source/storage loss, direct and punched
+    routes, relay-only replacement and final verified backups. All five
+    independently observed daemon executables match the installed static payload.
+    Source (276 tracked files), wrappers/payloads (eight files) and both drivers
+    match their recorded hashes after the run and a separate final audit. All
+    eight named daemon logs survive fixture and image removal with 0700
+    directories and 0600 files. Independent audits verify no fixture daemon,
+    namespace, firewall rule, mount, loop association or image remains; forwarding
+    returns to its baseline. The qualification manifest and provisioning audit
+    both report success. Transient incomplete signatures and stale endpoint
+    retries still occur; this single passing run does not diagnose R5's original
+    5,400-second stall or qualify its repeated fault/retry matrix. Debug-only
+    interruption hooks remain separately covered by source debug fixtures.
+    Private-Tor, the full native-filesystem/upgrade/multi-volume matrix, retained
+    1 TiB geometry and other platforms remain separate open release gates; the
+    hosted packaged CI job has not been run here.
 
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
@@ -2212,6 +2236,13 @@ remain active.
     This fixes a demonstrated response-path defect; there is no evidence that
     invalid signatures caused the historical relay-only stall. Its diagnosis,
     repeated exact-source topology and release gates remain open.
+
+    The installed musl candidate subsequently passes one complete five-daemon
+    topology/seed-recovery run on `83590ac` (793.81 seconds), with unchanged
+    source/payload/driver hashes and independently verified resource cleanup.
+    Its archived logs retain transient incomplete signatures during recovery and
+    transport replacement. This is additional release-artifact evidence, not a
+    causal explanation or closure of the historical missing-signer stall.
 
   Existing investigation and validation record:
 
