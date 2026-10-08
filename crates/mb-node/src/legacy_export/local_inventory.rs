@@ -1003,7 +1003,10 @@ mod tests {
         let before = hashes();
         let preflight =
             || super::super::remote::peer_client_preflight(&keys, &data, temp.path(), &[], false);
+        let export_parent =
+            || super::super::remote::export_parent_preflight(&keys, &data, temp.path(), &[]);
         assert_eq!(preflight().unwrap().0, temp.path().canonicalize().unwrap());
+        export_parent().unwrap();
         let error =
             super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                 .unwrap_err();
@@ -1025,6 +1028,12 @@ mod tests {
             error.to_string().contains("outside preserved inputs"),
             "{error:#}"
         );
+        let error = export_parent().err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("export destination must be outside preserved inputs")
+        );
         assert_eq!(hashes(), before);
 
         // Placement consumes the shared validation, even for a late field
@@ -1041,6 +1050,12 @@ mod tests {
                 .to_string()
                 .contains("unsafe preserved anchor relative path"),
             "{error:#}"
+        );
+        let error = export_parent().err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe preserved anchor relative path")
         );
         assert_eq!(hashes(), before);
     }

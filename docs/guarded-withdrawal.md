@@ -245,9 +245,9 @@ inventory. Existing WAL/SHM pairs use SQLite read snapshots without checkpointin
 the original database or WAL. Incomplete WAL/SHM pairs and rollback journals are
 rejected before SQLite opens them. Preserve all files from that installation and
 inspect a separate complete snapshot; never delete or checkpoint its original
-journals to make an inventory succeed. These stricter opens currently apply to
-`legacy-list`; the other legacy catalog readers still require separate no-creation
-qualification under R1.
+journals to make an inventory succeed. These stricter opens apply to `legacy-list`
+and placement preflight. The catalog reader used for export payload recovery and
+other legacy readers still require separate no-creation qualification under R1.
 
 The report's `signed_format` describes the public revision format, not private
 namespace format 6/7. `retained_history_complete` is false: available metadata
@@ -320,6 +320,35 @@ mutualbackup legacy-export \
   --destination /exports/revision-001 \
   --seed-file /preserved/recovery.txt
 ```
+
+Catalog export destinations must also resolve outside every known local source,
+Git repository, retained anchor area and absolute remembered area location.
+The same streamed record validation and directory-identity checks used for peer
+placement reject unsafe or malformed ownership before the export catalog reader
+opens. File mode applies these placement checks to its explicitly supplied
+revision/ciphertext input directories. Both modes pin the checked output parent
+before recovery reads, then create, clean up and publish through that directory
+capability. Replacing its path during recovery cannot redirect output to the
+replacement. The requested parent identity is checked again before staging and
+publication; a changed parent rejects the export, and cleanup uses the original
+directory capability. Complete external-owner inventory, aliases through mounted
+subdirectories and concurrent directory reparenting or ownership changes remain
+R1 gaps.
+
+Destination validation and parent pinning were qualified on Linux on 2026-10-08
+with 61 unique passing cases: 37 inventory/export/peer cases, two discovery cases,
+19 ordinary CLI process cases, two compatibility cases and one provisioned Btrfs
+regression. Actual CLI destinations inside registered source/history directories
+and symlink aliases reject with unchanged catalogs and source file sets. Wrapped
+and legacy keys, old schemas, raw graph/anchor/cache owners, late malformed
+records, placement beyond the report budget and renamed native roots are covered.
+Parent replacement before staging and during construction rejects without
+publication or writes to the replacement; cleanup removes the owned staging
+through its original directory capability. All four debug programs build; format
+and strict workspace/all-targets Clippy pass. Source and six program/test-driver
+hashes remain unchanged through qualification, and mount/loop/image cleanup is
+verified. Three CLI process fixtures remain ignored. Installed artifacts and
+the full R1/M6 release gates remain open.
 
 Unavailable inputs can also come from explicitly selected surviving peers.
 Repeat `--peer NODE-ID=MULTIADDR` in catalog mode; the multiaddress must end in

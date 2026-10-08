@@ -3567,6 +3567,61 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     assert!(!catalog.join("control.key").exists());
+    let history_alias = temp.path().join("history-alias");
+    std::os::unix::fs::symlink(&history_only, &history_alias).unwrap();
+    let catalog_files = || -> std::collections::BTreeMap<_, _> {
+        fs::read_dir(&catalog)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    };
+    let before_destination_checks = catalog_files();
+    for parent in [
+        registered_source.clone(),
+        registered_source.join("nested"),
+        history_only.clone(),
+        history_alias.join("nested"),
+    ] {
+        let destination = parent.join("rejected-export");
+        let rejected = run_output(
+            program("mutualbackup"),
+            &[
+                os("legacy-export"),
+                os("--data-dir"),
+                catalog.clone().into_os_string(),
+                os("--revision-id"),
+                os(revision_id.to_string()),
+                os("--destination"),
+                destination.clone().into_os_string(),
+                os("--seed-file"),
+                seed_file.clone().into_os_string(),
+            ],
+            CLI_TIMEOUT,
+        )
+        .unwrap();
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("export destination must be outside preserved inputs")
+        );
+        assert!(!destination.exists());
+        assert!(
+            catalog_files() == before_destination_checks,
+            "preserved catalog changed during destination rejection"
+        );
+    }
+    for path in [&registered_source, &history_only] {
+        assert_eq!(
+            fs::read(path.join("original")).unwrap(),
+            b"preserve source/history"
+        );
+        assert_eq!(fs::read_dir(path).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(path.join("nested")).unwrap().count(), 0);
+    }
     let catalog_target = temp.path().join("catalog-export");
     let extra_peer = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
     let extra_endpoint = format!(
@@ -3633,8 +3688,6 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let confined_target = temp.path().join("rejected-tmpdir-export");
     confined_args[destination_index] = confined_target.clone().into_os_string();
     let entries_before = fs::read_dir(&catalog).unwrap().count();
-    let history_alias = temp.path().join("history-alias");
-    std::os::unix::fs::symlink(&history_only, &history_alias).unwrap();
     for confined in [
         &catalog,
         &registered_source.join("nested"),

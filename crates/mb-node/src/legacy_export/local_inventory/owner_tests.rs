@@ -535,11 +535,16 @@ fn graph_and_anchor_only_inputs_exclude_peer_scratch_without_catalog_or_payload_
             )
             .is_err()
         );
+        assert!(
+            super::super::remote::export_parent_preflight(&keys, &data, &path.join("scratch"), &[])
+                .is_err()
+        );
         assert!(fs::read_dir(path.join("scratch")).unwrap().next().is_none());
         assert_eq!(fs::read(path.join("witness")).unwrap(), b"preserved source");
         assert_eq!(fs::read_dir(path).unwrap().count(), 2);
     }
     super::super::remote::peer_client_preflight(&keys, &data, temp.path(), &[], false).unwrap();
+    super::super::remote::export_parent_preflight(&keys, &data, temp.path(), &[]).unwrap();
     crate::volume::with_inspected_control_snapshot(&data, &keys, |store| {
         for_each_record(store, |record| {
             record.for_each_input(|input| {
@@ -571,6 +576,7 @@ fn reject_row(
         super::super::inventory::inventory_withdrawn_revisions_from_catalog(keys, data).is_err()
     );
     assert!(super::super::remote::peer_client_preflight(keys, data, scratch, &[], false).is_err());
+    assert!(super::super::remote::export_parent_preflight(keys, data, scratch, &[]).is_err());
     tests::assert_preserved_files(data, &before);
     let store = ControlStore::open(data.join("control.db"), keys).unwrap();
     store.delete_record(kind, key).unwrap();
@@ -811,7 +817,12 @@ fn cached_anchor_locations_preserve_raw_relative_hints_and_exclude_absolute_scra
         .is_err()
     );
     assert!(fs::read_dir(area.join("scratch")).unwrap().next().is_none());
+    assert!(
+        super::super::remote::export_parent_preflight(&keys, &data, &area.join("scratch"), &[])
+            .is_err()
+    );
     super::super::remote::peer_client_preflight(&keys, &data, temp.path(), &[], false).unwrap();
+    super::super::remote::export_parent_preflight(&keys, &data, temp.path(), &[]).unwrap();
     tests::assert_preserved_files(&data, &before);
     let store = ControlStore::open(data.join("control.db"), &keys).unwrap();
     store

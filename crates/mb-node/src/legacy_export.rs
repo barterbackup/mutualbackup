@@ -24,7 +24,7 @@ pub use remote::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -56,6 +56,18 @@ pub struct LegacyExportReport {
     pub git_objects: Option<u32>,
 }
 
+fn require_export_parent_path(parent: &PinnedDirectory, path: &Path) -> Result<()> {
+    const CHANGED: &str =
+        "export destination parent changed during recovery; select another destination";
+    let pinned = parent.as_file().metadata()?;
+    let current = std::fs::metadata(path).context(CHANGED)?;
+    ensure!(
+        current.is_dir() && current.dev() == pinned.dev() && current.ino() == pinned.ino(),
+        CHANGED
+    );
+    Ok(())
+}
+
 /// Export one owner/writer-signed legacy revision into a new package. Required
 /// ciphertexts must be available and match every signed reference/commitment.
 /// The package contains `namespace`, optional `history.git`, signed provenance
@@ -65,6 +77,19 @@ pub fn export_withdrawn_revision_from_source<F>(
     keys: &KeyMaterial,
     revision: &SignedRecord<UserRevision>,
     target: &Path,
+    load: F,
+) -> Result<LegacyExportReport>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    export_withdrawn_revision_in_parent(keys, revision, target, None, load)
+}
+
+fn export_withdrawn_revision_in_parent<F>(
+    keys: &KeyMaterial,
+    revision: &SignedRecord<UserRevision>,
+    target: &Path,
+    pinned_parent: Option<PinnedDirectory>,
     mut load: F,
 ) -> Result<LegacyExportReport>
 where
@@ -181,7 +206,11 @@ where
     let name = target
         .file_name()
         .context("export target needs a file name")?;
-    let parent = PinnedDirectory::open(parent_path)?;
+    let parent = match pinned_parent {
+        Some(parent) => parent,
+        None => PinnedDirectory::open(parent_path)?,
+    };
+    require_export_parent_path(&parent, parent_path)?;
     ensure!(
         parent.entry_identity(name, true)?.is_none(),
         "export target already exists"
@@ -235,6 +264,7 @@ where
         manifest.write_all(b"\n")?;
         manifest.sync_all()?;
         staging.sync_all()?;
+        require_export_parent_path(&parent, parent_path)?;
         parent.rename_child_no_replace(&staging_name, name)?;
         ensure!(
             parent.entry_identity(name, true)? == Some(identity),
@@ -277,6 +307,11 @@ pub fn export_withdrawn_revision_from_files(
             && !parent.starts_with(input.parent().context("revision input has no parent")?),
         "export destination must be outside revision and ciphertext input directories"
     );
+    let pinned_parent = remote::export_file_parent_preflight(
+        &parent,
+        input.parent().context("revision input has no parent")?,
+        &sector_path,
+    )?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -298,7 +333,7 @@ pub fn export_withdrawn_revision_from_files(
         "revision input is not canonical Postcard"
     );
     let sectors = PinnedDirectory::open(&sector_path)?;
-    export_withdrawn_revision_from_source(keys, &revision, target, |id| {
+    export_withdrawn_revision_in_parent(keys, &revision, target, Some(pinned_parent), |id| {
         let file = sectors
             .open_child_file(format!("{}.bin", hex::encode(id)))?
             .context("required legacy ciphertext is unavailable")?;
@@ -390,6 +425,9 @@ fn export_catalog(
         !parent.starts_with(&data_dir),
         "export destination must be outside the original installation"
     );
+    let protected_inputs: Vec<_> = anchor_areas.iter().chain(parity_volumes).cloned().collect();
+    let pinned_parent =
+        remote::export_parent_preflight(keys, &data_dir, &parent, &protected_inputs)?;
     let control = crate::volume::inspect_control_store(&data_dir, keys)?
         .context("original control catalog is unavailable")?;
     let mut selected = control
@@ -554,7 +592,7 @@ fn export_catalog(
         volumes: &volumes,
         remote,
     };
-    export_withdrawn_revision_from_source(keys, &revision, target, |id| {
+    export_withdrawn_revision_in_parent(keys, &revision, target, Some(pinned_parent), |id| {
         let reference = references
             .get(id)
             .context("unsigned legacy sector requested")?;
@@ -1823,6 +1861,94 @@ pub(crate) mod tests {
                 .is_err()
             );
             assert!(!data.join("unsafe-export").exists());
+        }
+    }
+
+    #[test]
+    fn legacy_export_rejects_parent_replacement_before_staging_and_publication() {
+        for during_construction in [false, true] {
+            let (keys, revision, sectors) = fixture(7);
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("original");
+            let parent = temp.path().join("export-parent");
+            let preserved = temp.path().join("preserved-source");
+            for path in [&data, &parent, &preserved] {
+                fs::create_dir(path).unwrap();
+            }
+            fs::write(preserved.join("witness"), b"preserved bytes").unwrap();
+            let store = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+            let root = crate::control::ProtectedRoot {
+                format_version: 4,
+                root_id: Uuid::new_v4(),
+                path: preserved.clone(),
+                filesystem_id: 7,
+                root_inode: preserved.metadata().unwrap().ino(),
+            };
+            store
+                .put_record(
+                    "protected-root",
+                    root.root_id.as_bytes(),
+                    &canonical_bytes(&root).unwrap(),
+                )
+                .unwrap();
+            drop(store);
+            let files = || -> BTreeMap<_, _> {
+                fs::read_dir(&data)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect()
+            };
+            let before = files();
+            let pinned = remote::export_parent_preflight(&keys, &data, &parent, &[]).unwrap();
+            let moved = temp.path().join("original-export-parent");
+            let target = parent.join("export");
+            let mut replaced = false;
+            let error = export_withdrawn_revision_in_parent(
+                &keys,
+                &revision,
+                &target,
+                Some(pinned),
+                |id| {
+                    if !replaced
+                        && (!during_construction
+                            || fs::read_dir(&parent).unwrap().any(|entry| {
+                                entry
+                                    .unwrap()
+                                    .file_name()
+                                    .as_encoded_bytes()
+                                    .starts_with(b".mutualbackup-legacy-export-")
+                            }))
+                    {
+                        fs::rename(&parent, &moved).unwrap();
+                        std::os::unix::fs::symlink(&preserved, &parent).unwrap();
+                        replaced = true;
+                    }
+                    Ok(sectors[id].clone())
+                },
+            )
+            .unwrap_err();
+            assert!(replaced);
+            assert!(
+                error
+                    .to_string()
+                    .contains("export destination parent changed during recovery"),
+                "{error:#}"
+            );
+            assert_eq!(
+                fs::read_dir(&moved).unwrap().count(),
+                0,
+                "staging remained in the original checked directory"
+            );
+            assert!(!preserved.join("export").exists());
+            assert_eq!(
+                fs::read(preserved.join("witness")).unwrap(),
+                b"preserved bytes"
+            );
+            assert_eq!(fs::read_dir(&preserved).unwrap().count(), 1);
+            assert!(files() == before, "preserved catalog files changed");
         }
     }
 

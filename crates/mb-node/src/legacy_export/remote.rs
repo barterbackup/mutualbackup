@@ -73,42 +73,101 @@ pub struct LegacyPeerInventoryCoverage {
     pub unauthorized_owner_checkpoints: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PlacementPurpose {
+    PeerClient,
+    Export,
+}
+
+impl PlacementPurpose {
+    fn parent(self) -> &'static str {
+        match self {
+            Self::PeerClient => "temporary client parent must be a directory",
+            Self::Export => "export destination parent must be a directory",
+        }
+    }
+
+    fn outside(self) -> &'static str {
+        match self {
+            Self::PeerClient => {
+                "temporary client directory must be outside preserved inputs; select another TMPDIR"
+            }
+            Self::Export => {
+                "export destination must be outside preserved inputs; select another destination"
+            }
+        }
+    }
+
+    fn unverified(self) -> &'static str {
+        match self {
+            Self::PeerClient => {
+                "cannot verify temporary client directory ancestry; select another TMPDIR"
+            }
+            Self::Export => "cannot verify export destination ancestry; select another destination",
+        }
+    }
+
+    fn changed(self) -> &'static str {
+        match self {
+            Self::PeerClient => {
+                "temporary client directory ancestry changed during preflight; select another TMPDIR"
+            }
+            Self::Export => {
+                "export destination ancestry changed during preflight; select another destination"
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
-struct ScratchAncestor {
+struct PreservedAncestor {
     device: u64,
     inode: u64,
     native_id: Option<mb_store::NativeFileId>,
 }
 
-/// Placement state depends on the temporary parent's ancestry, not the number
+/// Placement state depends on the proposed parent's ancestry, not the number
 /// of preserved owners. Only one repeated path hint is cached between rows.
 #[derive(Debug)]
-struct ScratchParentCheck {
+struct PreservedParentCheck {
+    purpose: PlacementPurpose,
     parent: PathBuf,
-    ancestors: Vec<ScratchAncestor>,
+    ancestors: Vec<PreservedAncestor>,
     ancestor_inodes: BTreeSet<u64>,
     last_hint: Option<PathBuf>,
 }
 
-impl ScratchParentCheck {
+impl PreservedParentCheck {
     fn new(candidate: &Path, data_dir: &Path, selected_inputs: &[PathBuf]) -> Result<Self> {
+        Self::for_purpose(
+            candidate,
+            data_dir,
+            selected_inputs,
+            PlacementPurpose::PeerClient,
+        )
+    }
+
+    fn for_purpose(
+        candidate: &Path,
+        data_dir: &Path,
+        selected_inputs: &[PathBuf],
+        purpose: PlacementPurpose,
+    ) -> Result<Self> {
         let parent = candidate.canonicalize()?;
-        ensure!(
-            parent.is_dir(),
-            "temporary client parent must be a directory"
-        );
+        ensure!(parent.is_dir(), purpose.parent());
         let mut ancestors = Vec::new();
         let mut ancestor_inodes = BTreeSet::new();
         for path in parent.ancestors() {
             let metadata = path.metadata()?;
             ancestor_inodes.insert(metadata.ino());
-            ancestors.push(ScratchAncestor {
+            ancestors.push(PreservedAncestor {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 native_id: None,
             });
         }
         let checked = Self {
+            purpose,
             parent,
             ancestors,
             ancestor_inodes,
@@ -121,10 +180,7 @@ impl ScratchParentCheck {
     }
 
     fn reject_canonical_path(&self, input: &Path) -> Result<()> {
-        ensure!(
-            !self.parent.starts_with(input),
-            "temporary client directory must be outside preserved inputs; select another TMPDIR"
-        );
+        ensure!(!self.parent.starts_with(input), self.purpose.outside());
         let metadata = input.metadata()?;
         ensure!(
             !metadata.is_dir()
@@ -133,7 +189,7 @@ impl ScratchParentCheck {
                     .iter()
                     .any(|ancestor| ancestor.device == metadata.dev()
                         && ancestor.inode == metadata.ino()),
-            "temporary client directory must be outside preserved inputs; select another TMPDIR"
+            self.purpose.outside()
         );
         Ok(())
     }
@@ -163,7 +219,7 @@ impl ScratchParentCheck {
                 .iter()
                 .any(|ancestor| ancestor.inode == recorded.inode
                     && ancestor.device == recorded.filesystem_id),
-            "temporary client directory must be outside preserved inputs; select another TMPDIR"
+            self.purpose.outside()
         );
         self.check_native(recorded)
     }
@@ -193,19 +249,36 @@ impl ScratchParentCheck {
             let identity = match ancestor.native_id {
                 Some(identity) => identity,
                 None => {
-                    let identity = native_identity(path).context(
-                        "cannot verify temporary client directory ancestry; select another TMPDIR",
-                    )?;
+                    let identity = native_identity(path).context(self.purpose.unverified())?;
                     ancestor.native_id = Some(identity);
                     identity
                 }
             };
-            ensure!(
-                root != identity,
-                "temporary client directory must be outside preserved inputs; select another TMPDIR"
-            );
+            ensure!(root != identity, self.purpose.outside());
         }
         Ok(())
+    }
+
+    fn check_records(&mut self, control: &ControlStore) -> Result<()> {
+        super::local_inventory::for_each_record(control, |record| {
+            record.for_each_input(|input| match input {
+                PreservedInput::PathHint(path) => self.check_hint(path),
+                PreservedInput::NativeRoot(root) => self.check_native(root),
+                PreservedInput::RecordedNativeRoot(root) => self.check_recorded_native(root),
+            })
+        })
+    }
+
+    fn pin(self) -> Result<mb_store::PinnedDirectory> {
+        let parent = mb_store::PinnedDirectory::open(&self.parent)?;
+        let metadata = parent.as_file().metadata()?;
+        let original = &self.ancestors[0];
+        ensure!(
+            metadata.dev() == original.device && metadata.ino() == original.inode,
+            self.purpose.changed()
+        );
+        self.finish()?;
+        Ok(parent)
     }
 
     fn finish(self) -> Result<PathBuf> {
@@ -213,11 +286,45 @@ impl ScratchParentCheck {
             let metadata = path.metadata()?;
             ensure!(
                 metadata.dev() == ancestor.device && metadata.ino() == ancestor.inode,
-                "temporary client directory ancestry changed during preflight; select another TMPDIR"
+                self.purpose.changed()
             );
         }
         Ok(self.parent)
     }
+}
+
+/// Check every known local owner before export reads can create journals or
+/// output. Keep the checked directory capability through recovery/publication.
+pub(super) fn export_parent_preflight(
+    keys: &KeyMaterial,
+    data_dir: &Path,
+    candidate: &Path,
+    protected_inputs: &[PathBuf],
+) -> Result<mb_store::PinnedDirectory> {
+    crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
+        let mut checked = PreservedParentCheck::for_purpose(
+            candidate,
+            data_dir,
+            protected_inputs,
+            PlacementPurpose::Export,
+        )?;
+        checked.check_records(control)?;
+        checked.pin()
+    })
+}
+
+pub(super) fn export_file_parent_preflight(
+    candidate: &Path,
+    revision_directory: &Path,
+    sector_directory: &Path,
+) -> Result<mb_store::PinnedDirectory> {
+    PreservedParentCheck::for_purpose(
+        candidate,
+        revision_directory,
+        &[sector_directory.to_path_buf()],
+        PlacementPurpose::Export,
+    )?
+    .pin()
 }
 
 pub(super) fn peer_client_preflight(
@@ -228,14 +335,8 @@ pub(super) fn peer_client_preflight(
     discover: bool,
 ) -> Result<(PathBuf, Option<[u8; 32]>)> {
     crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
-        let mut checked = ScratchParentCheck::new(candidate, data_dir, protected_inputs)?;
-        super::local_inventory::for_each_record(control, |record| {
-            record.for_each_input(|input| match input {
-                PreservedInput::PathHint(path) => checked.check_hint(path),
-                PreservedInput::NativeRoot(root) => checked.check_native(root),
-                PreservedInput::RecordedNativeRoot(root) => checked.check_recorded_native(root),
-            })
-        })?;
+        let mut checked = PreservedParentCheck::new(candidate, data_dir, protected_inputs)?;
+        checked.check_records(control)?;
         let guild = if discover {
             Some(
                 crate::node::preserved_guild_certificate(control)?
@@ -877,14 +978,14 @@ mod tests {
         for path in &paths {
             std::fs::create_dir(path).unwrap();
         }
-        assert!(ScratchParentCheck::new(temp.path(), &paths[0], &paths[1..]).is_ok());
+        assert!(PreservedParentCheck::new(temp.path(), &paths[0], &paths[1..]).is_ok());
         for path in &paths {
-            assert!(ScratchParentCheck::new(path, &paths[0], &paths[1..]).is_err());
+            assert!(PreservedParentCheck::new(path, &paths[0], &paths[1..]).is_err());
             assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
         }
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&paths[0], &alias).unwrap();
-        assert!(ScratchParentCheck::new(&alias, &paths[0], &paths[1..]).is_err());
+        assert!(PreservedParentCheck::new(&alias, &paths[0], &paths[1..]).is_err());
         let first = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
         let second = KeyMaterial::from_seed(&Seed::from_bytes([72; 32])).node_id();
         assert!(
@@ -902,7 +1003,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("catalog");
         std::fs::create_dir(&data).unwrap();
-        let mut checked = ScratchParentCheck::new(temp.path(), &data, &[]).unwrap();
+        let mut checked = PreservedParentCheck::new(temp.path(), &data, &[]).unwrap();
         // Ordinary temporary filesystems need no enrollment capability when
         // their ancestry cannot match a preserved native root.
         assert!(
@@ -954,7 +1055,7 @@ mod tests {
         let data = temp.path().join("catalog");
         std::fs::create_dir(&data).unwrap();
         let metadata = temp.path().metadata().unwrap();
-        let mut checked = ScratchParentCheck::new(temp.path(), &data, &[]).unwrap();
+        let mut checked = PreservedParentCheck::new(temp.path(), &data, &[]).unwrap();
         // This is the pre-stable-ID wire meaning, still legal in native plan 1.
         let error = checked
             .check_recorded_native(mb_store::NativeFileId {
@@ -973,7 +1074,10 @@ mod tests {
         let parent = temp.path().join("scratch-parent");
         std::fs::create_dir(&data).unwrap();
         std::fs::create_dir(&parent).unwrap();
-        let checked = ScratchParentCheck::new(&parent, &data, &[]).unwrap();
+        let checked = PreservedParentCheck::new(&parent, &data, &[]).unwrap();
+        let export_checked =
+            PreservedParentCheck::for_purpose(&parent, &data, &[], PlacementPurpose::Export)
+                .unwrap();
         let original = temp.path().join("original-parent");
         std::fs::rename(&parent, &original).unwrap();
         std::fs::create_dir(&parent).unwrap();
@@ -982,6 +1086,12 @@ mod tests {
             error
                 .to_string()
                 .contains("ancestry changed during preflight")
+        );
+        let error = export_checked.pin().err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("export destination ancestry changed during preflight")
         );
         assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
@@ -1053,11 +1163,20 @@ mod tests {
             };
             let before = files();
             assert!(peer_client_preflight(&keys, &data, temp.path(), &[], false).is_ok());
+            assert!(export_parent_preflight(&keys, &data, temp.path(), &[]).is_ok());
             for path in [&root, &root.join("nested"), &history, &alias.join("nested")] {
                 let error = peer_client_preflight(&keys, &data, path, &[], false).unwrap_err();
                 assert!(
                     error.to_string().contains("outside preserved inputs"),
                     "{error:#}"
+                );
+                let error = export_parent_preflight(&keys, &data, path, &[])
+                    .err()
+                    .unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("export destination must be outside preserved inputs")
                 );
             }
             let after = files();
@@ -1207,11 +1326,12 @@ mod tests {
         }
         drop(store);
         assert!(peer_client_preflight(&keys, &data, temp.path(), &[], false).is_ok());
+        assert!(export_parent_preflight(&keys, &data, temp.path(), &[]).is_ok());
         for root in moved {
             // Inode equality across distinct stable filesystem identities is
             // not ownership; Btrfs subvolumes can reuse inode numbers.
             let native = mb_store::directory_identity(&root).unwrap();
-            let mut unrelated = ScratchParentCheck::new(&root, &data, &[]).unwrap();
+            let mut unrelated = PreservedParentCheck::new(&root, &data, &[]).unwrap();
             assert!(
                 unrelated
                     .check_native(mb_store::NativeFileId {
@@ -1225,6 +1345,14 @@ mod tests {
                 assert!(
                     error.to_string().contains("outside preserved inputs"),
                     "{error:#}"
+                );
+                let error = export_parent_preflight(&keys, &data, path, &[])
+                    .err()
+                    .unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("export destination must be outside preserved inputs")
                 );
             }
             assert_eq!(std::fs::read_dir(root.join("nested")).unwrap().count(), 0);

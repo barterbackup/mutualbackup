@@ -585,6 +585,39 @@ remain active.
     worktrees, other intents, recipes/pins/volume owners, missing/relative
     relocation evidence, path races, complete conversion and original
     upgrade/source-loss/platform/capacity/release gates remain open.
+  - [x] Apply preserved-owner placement validation to export destinations.
+    Catalog exports stream the same original record validation and known
+    source/Git/anchor/cache exclusions as peer-client placement, including
+    aliases, renamed stable root identities and ambiguous historical native
+    identities. Reject unsafe or malformed input before opening the ordinary
+    export catalog reader or creating output. Explicit file mode checks its
+    revision/ciphertext directories with the same ancestry checks. Pin each
+    checked output parent before recovery reads and use that capability for
+    staging, cleanup and publication, so later path replacement cannot redirect
+    writes through a fresh parent lookup. Recheck the requested parent identity
+    before staging and publication; reject replacement and clean up through the
+    original capability. Public APIs and serialized identities remain unchanged.
+    Validation: 61 unique cases pass: 37 inventory/export/range/peer cases,
+    two discovery cases, 19 ordinary CLI process cases, withdrawal and historical
+    graph-intent compatibility, and one separately provisioned Btrfs regression.
+    Actual offline CLI destinations inside registered sources, raw history
+    directories and symlink aliases reject with unchanged catalog bytes and
+    source file sets. Wrapped/legacy keys, old schemas, retained graph/anchor/
+    cache owners and malformed records are covered. Export placement succeeds
+    beyond the report budget and rejects late unsafe/corrupt records. Btrfs
+    covers renamed registration, binding, stopped-capture and pending-capture
+    roots. Deterministic replacements before staging and during construction
+    both fail without publication; the protected replacement stays untouched
+    and owned staging is removed through the original capability. All four
+    debug programs build; format and strict locked workspace/all-targets Clippy
+    pass. All 283 source-file and six program/test-driver hashes remain unchanged
+    during qualification. Mount, loop and image cleanup is verified; three CLI
+    process fixtures remain ignored. This qualifies the exercised source, not
+    an installed artifact or the full R1 gate. Complete external-owner
+    inventory, aliases through mounted subdirectories, concurrent reparenting/
+    ownership changes, no-creation qualification for other catalog readers,
+    incomplete-journal recovery, retained conversion,
+    upgrade/source-loss and the remaining M6 release gates remain open.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent
