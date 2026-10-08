@@ -29,7 +29,7 @@ pub use attempt::{
     coding_sample_guarantee, coding_transfer_estimate, encode_coding_attempt,
     replay_coding_transcript,
 };
-pub use canonical::{canonical_bytes_bounded, canonical_size_bounded};
+pub use canonical::{canonical_bytes_bounded, canonical_hash_bounded, canonical_size_bounded};
 pub use catalog::{
     CATALOG_CHECKPOINT_RECORD_BYTES, CATALOG_CHECKPOINT_ROOT_BYTES,
     CATALOG_CODING_DIRECTORY_ROOT_BYTES, CATALOG_CODING_FRAGMENT_BYTES, CATALOG_CODING_GROUP_BYTES,

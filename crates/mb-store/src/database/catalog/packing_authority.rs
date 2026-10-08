@@ -994,7 +994,7 @@ pub(super) mod tests {
             fixture
         }
 
-        fn resign(&mut self) {
+        pub(crate) fn resign(&mut self) {
             self.certificate.signatures.clear();
             for keys in &self.keys {
                 if self

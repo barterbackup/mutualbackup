@@ -1756,7 +1756,7 @@ before exposing an understated reference. Bounded mixed-revision and source
 cursors preserve original identities without a flat legacy checkpoint or a
 second scratch store. The event snapshot and fence authorization still require
 independent certified history and live rechecks; full production certification,
-previous-checkpoint transition, coding lifecycle, private/payload
+the full authority/coding transition, private/payload
 joins and complete publication/retirement ownership remain open. This does not
 activate normal producers or change the required retained 1 TiB policy or gates.
 
@@ -1774,6 +1774,20 @@ publication/retirement capability; all remaining transition, private/payload,
 ownership, quota and release qualification gates above still apply. Protocol
 formats 3–7 and original signed identities stay unchanged. Validation is recorded
 in ADR 0002 and TODO.md.
+
+Paged header signing and binding now additionally require a private completed
+public authority transition proof. It compares the exact independently trusted
+legacy or paged predecessor through bounded encrypted-index cursors, preserving
+original signed envelopes, fences and tombstone prefixes. Fresh revisions need
+active membership and the certified-current nonrevoked writer; historical keys
+and removed owners authorize only unchanged retained history. Both complete
+public inputs and a conservative bound for indexed comparison work share one
+trusted job budget. The transition is atomic in the disposable scratch store,
+with no production writer held. This removes the raw public-body signing route;
+coding lifecycle/fixed legacy migration, the full retention/quota policy,
+private/payload custody and durable certified-current publication/retirement
+remain gates before normal consumers or retained 1 TiB qualification. See
+ADR 0002 for fixtures, including spill/exhaustion/rebuild across 4,096 fences.
 
 ### Historical implementation and validation record (before scope correction)
 

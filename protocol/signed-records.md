@@ -189,13 +189,38 @@ the enclosing policy. `paged-checkpoint-v1.postcard.hex` freezes the new header
 and ordered quorum signature layout; it is a header codec fixture, not evidence
 of a complete body/coverage or state-transition validation.
 
-The store bridge signs and binds only a completed current-coverage public proof,
-compares exact member records and roots/ledger, and rereads independent event and
-previous-checkpoint snapshots before and after the operation. The private
-wrapper preserves the original certificate and indexed body; a raw header or
-manifest cannot create it. These draft APIs do not authorize production
-activation: legal previous-state retention/mutations, original coding lifecycle
+The store bridge signs and binds only a completed current-coverage public proof
+with a completed authority successor comparison. It compares exact member
+records and roots/ledger, and rereads independent event and previous-checkpoint
+snapshots before and after the operation. The private wrapper preserves the
+original certificate, transition and indexed body; a raw header, manifest or
+body proof cannot create it. These draft APIs do not authorize production
+activation: the full retention/quota policy, original coding lifecycle
 and fixed legacy-group migration, private/bootstrap/native joins, payload
 custody, durable transitive ownership and an atomic current-state publication
 or retirement guard remain mandatory. No normal producer, peer version or
 seed-only consumer is enabled by this header.
+
+The authority successor comparison preserves every previous historical fence
+and every retained original signed revision unless an exact monotone tombstone
+retires its prefix. A new/advanced floor must identify a revision present in the
+trusted predecessor, with its original ID/body hash and this successor's
+generation. Unchanged floors are immutable. New revisions cannot reuse IDs
+reserved by the predecessor's retained revisions or last-retired tombstones;
+they require active membership and the independently certified latest nonrevoked
+writer key. Successor fence advances must be one step and have a new revision;
+initial checkpoints may admit their certified contiguous fence history. Removed
+owners and revoked historical keys can retain unchanged authorized history.
+
+`CatalogCheckpointTransitionIndex` is constructed only after that complete join
+in the existing encrypted scratch store. A required separate job budget admits
+both complete public inputs and a conservative bound on indexed comparison
+rows; neither input resets the debt. Legacy input keeps its original 32 MiB
+certificate bound and signed bytes, with a separately supplied certified epoch/
+event witness for formats without authority. Paged input requires a completed
+quorum-bound predecessor, whose hash must match independently trusted state.
+Original envelope hashes are computed with bounded streaming Postcard hashing,
+avoiding another encoded copy. Physical legacy-body references are excluded from
+signed identity equality so repagination cannot rewrite signed authority.
+Checkpoint rosters allow certified shared failure domains; each coding group's
+placement still requires its original distinct-domain checks.

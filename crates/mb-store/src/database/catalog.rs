@@ -14,6 +14,7 @@ use super::{ControlStore, DatabaseError};
 
 mod bundle;
 mod checkpoint_retention;
+mod checkpoint_transition;
 mod checkpoint_validation;
 mod coding_coverage;
 mod coding_directory_coverage;
@@ -34,6 +35,7 @@ pub use bundle::{
     CatalogBundleState,
 };
 pub use checkpoint_retention::{CatalogCheckpointRetention, CatalogCheckpointRetentionState};
+pub use checkpoint_transition::{CatalogCheckpointPrevious, CatalogCheckpointTransitionIndex};
 pub use checkpoint_validation::{
     CatalogCheckpointAuthorityContext, CatalogCheckpointAuthorityIndex,
     CatalogCheckpointAuthorityValidation, CatalogCheckpointCodingDirectoryIndex,

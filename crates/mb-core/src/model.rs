@@ -1541,7 +1541,7 @@ impl UserRevision {
             _ => return Err(ModelError::InvalidCheckpoint),
         };
         let mut hasher = blake3::Hasher::new_derive_key(domain);
-        hasher.update(&canonical_bytes(self)?);
+        crate::canonical::update_canonical_hash(&mut hasher, self)?;
         Ok(*hasher.finalize().as_bytes())
     }
 }
@@ -1623,7 +1623,7 @@ pub enum ModelError {
     Merkle(#[from] crate::MerkleError),
 }
 
-pub(crate) fn validate_members(members: &[Member]) -> Result<(), ModelError> {
+fn validate_members(members: &[Member]) -> Result<(), ModelError> {
     let mut previous = None;
     let mut node_ids = std::collections::BTreeSet::new();
     let mut failure_domains = std::collections::BTreeSet::new();

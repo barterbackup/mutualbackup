@@ -90,6 +90,50 @@ pub fn canonical_bytes_bounded<T: Serialize>(
     Ok(bytes)
 }
 
+/// Plain BLAKE3 of exactly the canonical bytes, without allocating an encoded
+/// copy. The limit applies during this single serialization, including for a
+/// stateful serializer. This hashes representation, not authorization.
+pub fn canonical_hash_bounded<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<[u8; 32], ModelError> {
+    struct BoundedHash {
+        hash: blake3::Hasher,
+        remaining: usize,
+    }
+    impl Flavor for BoundedHash {
+        type Output = [u8; 32];
+        fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+            self.try_extend(&[byte])
+        }
+        fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+            self.remaining = self
+                .remaining
+                .checked_sub(bytes.len())
+                .ok_or(postcard::Error::SerializeBufferFull)?;
+            self.hash.update(bytes);
+            Ok(())
+        }
+        fn finalize(self) -> postcard::Result<Self::Output> {
+            Ok(*self.hash.finalize().as_bytes())
+        }
+    }
+    postcard::serialize_with_flavor(
+        value,
+        BoundedHash {
+            hash: blake3::Hasher::new(),
+            remaining: limit,
+        },
+    )
+    .map_err(|error| {
+        if error == postcard::Error::SerializeBufferFull {
+            ModelError::EncodingTooLarge { limit }
+        } else {
+            ModelError::Encode(error)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -108,16 +152,25 @@ mod tests {
             let limit = expected.len();
             assert_eq!(canonical_size_bounded(&value, limit).unwrap(), limit);
             assert_eq!(canonical_bytes_bounded(&value, limit).unwrap(), expected);
+            assert_eq!(
+                canonical_hash_bounded(&value, limit).unwrap(),
+                *blake3::hash(&expected).as_bytes()
+            );
             assert_eq!(canonical_size_bounded(&value, limit + 1).unwrap(), limit);
             for result in [
                 canonical_size_bounded(&value, limit - 1).map(|_| ()),
                 canonical_bytes_bounded(&value, limit - 1).map(|_| ()),
+                canonical_hash_bounded(&value, limit - 1).map(|_| ()),
             ] {
                 assert!(matches!(result, Err(ModelError::EncodingTooLarge { .. })));
             }
         }
         assert_eq!(canonical_bytes_bounded(&(), 0).unwrap(), Vec::<u8>::new());
         assert_eq!(canonical_size_bounded(&(), 0).unwrap(), 0);
+        assert_eq!(
+            canonical_hash_bounded(&(), 0).unwrap(),
+            *blake3::hash(&[]).as_bytes()
+        );
         assert!(canonical_bytes_bounded(&1_u8, 0).is_err());
     }
 
@@ -146,6 +199,13 @@ mod tests {
         };
         assert!(matches!(
             canonical_bytes_bounded(&generated, 100),
+            Err(ModelError::EncodingTooLarge { limit: 100 })
+        ));
+        assert!(visits.get() <= 101);
+        assert!(visits.get() > 0);
+        visits.set(0);
+        assert!(matches!(
+            canonical_hash_bounded(&generated, 100),
             Err(ModelError::EncodingTooLarge { limit: 100 })
         ));
         assert!(visits.get() <= 101);

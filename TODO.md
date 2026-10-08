@@ -1601,10 +1601,10 @@ separately below.
     strict locked workspace/all-targets Clippy and formatting/diff checks.
     Existing signed formats/vectors and legacy-base APIs remain unchanged.
     See ADR 0002. This is public metadata validation against supplied event trust;
-    previous-checkpoint transition, production quorum certification, atomic
+    full checkpoint transition/publication, production quorum certification, atomic
     event/publication guards, coding lifecycle, private/payload joins and the
-    enclosing ownership
-    and production/retained-capacity qualification gates remain open.
+    enclosing ownership and production/retained-capacity qualification gates
+    remain open.
   - [x] Bind a fixed version-eight public quorum header to the completed
     authority/packing/coding-directory proof. Require current coverage and
     independently reread certified event/membership and previous-checkpoint
@@ -1625,6 +1625,28 @@ separately below.
     transitions, coding lifecycle/fixed legacy migration, private/payload joins,
     certified-current durable ownership and retained 1 TiB/release gates below
     remain required.
+  - [x] Require a completed bounded public authority successor proof before
+    paged header signing/binding. Compare exact original signed revisions,
+    historical fences and tombstone prefixes against an independently trusted
+    legacy certificate or completed paged predecessor. Reject dropped/changed
+    retained state, invented retirement floors, previous retained/last-retired
+    UUID reuse, new removed-owner mutations and superseded/revoked writer keys.
+    Cache certified-current writer lookups for at most 256 active owners; require
+    one-step successor fence advances backed by a new revision. Admit both full
+    public inputs and bounded comparison-row work under one trusted job budget.
+    Use the same disposable transaction, with exact EOF/counters and no usable
+    prefix after ignored writes or late failure. Eight fixtures include legacy
+    formats 3–7, paged continuation, exact retirement, original identity, stale
+    snapshots, missing/orphan rows and 4,096 historical fences spilling beyond
+    the 1 MiB cache, exhausting a tighter store and rebuilding. Canonical
+    envelope hashing streams without an encoded copy and preserves existing
+    signed bytes/hashes. Correct checkpoint trust validation to allow certified
+    cohosted failure domains; per-group placement constraints remain unchanged.
+    All 170 core and 227 ordinary store tests pass (26 store tests ignored),
+    with strict locked workspace/all-targets Clippy and formatting/diff checks.
+    See ADR 0002. Coding lifecycle/fixed legacy migration, full retention/quota
+    policy, private/payload custody, atomic durable ownership/publication and
+    normal producer/retained 1 TiB/release qualification remain required below.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
@@ -1635,8 +1657,8 @@ separately below.
     authority/coding joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body
     and source/bootstrap EOFs, migration-evidence quorum, integration of exact
-    current packed-input coverage, retained coding lifecycle authority and fixed legacy-group
-    migration without changing identities. Retain and retire
+    current packed-input coverage, retained coding lifecycle authority and
+    fixed legacy-group migration without changing identities. Retain and retire
     remaining logical root references inside coding records and source/native
     payload owners through bounded durable ownership, and guard authority-root
     retirement with the certified current checkpoint.

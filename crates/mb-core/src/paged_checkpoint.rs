@@ -66,7 +66,21 @@ impl PagedCheckpointTrust {
         {
             return Err(CatalogError::InvalidPage);
         }
-        crate::model::validate_members(&self.members)?;
+        let mut previous = None;
+        for member in &self.members {
+            if previous.is_some_and(|node| node >= member.node_id)
+                || member.failure_domain.is_empty()
+                || member.failure_domain.len() > 256
+                || !member.recovery_public_key.is_contributory()
+            {
+                return Err(CatalogError::InvalidPage);
+            }
+            let key = VerifyingKey::from_bytes(&member.node_id.0).map_err(ModelError::from)?;
+            if key.is_weak() {
+                return Err(ModelError::WeakPublicKey.into());
+            }
+            previous = Some(member.node_id);
+        }
         Ok(())
     }
 
@@ -672,6 +686,20 @@ mod tests {
             change(&mut bad);
             assert!(bad.validate().is_err());
         }
+    }
+
+    #[test]
+    fn paged_checkpoint_trust_allows_certified_shared_failure_domains() {
+        let (header, mut trust, keys) = fixture();
+        trust.members[1].failure_domain = trust.members[0].failure_domain.clone();
+        trust.validate().unwrap();
+        certificate(header, &keys)
+            .verify_header(&trust, unlimited())
+            .unwrap();
+        // Placement must still enforce distinct domains within each coding
+        // group; roster validation must not reject a legitimate cohosted peer.
+        trust.members[1].node_id = trust.members[0].node_id;
+        assert!(trust.validate().is_err());
     }
 
     #[test]

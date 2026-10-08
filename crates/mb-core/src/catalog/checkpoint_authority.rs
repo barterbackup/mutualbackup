@@ -359,7 +359,7 @@ impl CatalogCheckpointAuthorityRoot {
 /// Canonical mixed-revision order. The fixed database key uses a big-endian
 /// sequence, so indexed traversal agrees with numeric order across varint
 /// boundaries and does not need to sort a whole retained catalog.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct CatalogCheckpointRevisionKey {
     pub owner: NodeId,
     pub protected_root_id: Uuid,

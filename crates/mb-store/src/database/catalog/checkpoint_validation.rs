@@ -21,14 +21,15 @@ use crate::RecordScratchStore;
 
 const MANIFEST_BYTES: usize = 2048;
 const COMPLETE: &str = "checkpoint-authority-complete";
-const HISTORY: &str = "checkpoint-authority-writer-history";
+pub(super) const HISTORY: &str = "checkpoint-authority-writer-history";
 const USED: &str = "checkpoint-authority-latest-writer-used";
-const TOMBSTONES: &str = "checkpoint-authority-tombstone";
+pub(super) const TOMBSTONES: &str = "checkpoint-authority-tombstone";
 const OBJECTS: &str = "checkpoint-authority-source-object";
-const REVISIONS: &str = "checkpoint-authority-revision";
+pub(super) const REVISIONS: &str = "checkpoint-authority-revision";
+pub(super) const IDENTITIES: &str = "checkpoint-authority-revision-identity";
 pub(super) const MEMBER_RECORDS: &str = "checkpoint-authority-member";
 pub(super) const MEMBER_BYTES: usize = 512;
-const KINDS: [&str; 7] = [
+const KINDS: [&str; 8] = [
     COMPLETE,
     HISTORY,
     USED,
@@ -36,6 +37,7 @@ const KINDS: [&str; 7] = [
     OBJECTS,
     REVISIONS,
     MEMBER_RECORDS,
+    IDENTITIES,
 ];
 
 /// Trusted enclosing event snapshot, not a claim learned from the proposed
@@ -137,7 +139,7 @@ pub enum CatalogCheckpointWriterAuthorization {
     LatestRetained,
 }
 
-fn fence_key(fence: &WriterFence) -> [u8; 40] {
+pub(super) fn fence_key(fence: &WriterFence) -> [u8; 40] {
     let mut key = [0; 40];
     key[..32].copy_from_slice(&fence.owner.0);
     key[32..].copy_from_slice(&fence.epoch.to_be_bytes());
@@ -377,6 +379,15 @@ impl CatalogCheckpointAuthorityIndex {
                         let signed = unwrap_stream(reference.read_signed(&mut |page| {
                             fetch(manifest.scope(), CatalogSection::Checkpoint, page)
                         }))?;
+                        let identity =
+                            super::checkpoint_transition::RevisionIdentity::legacy(&signed)?;
+                        insert(
+                            &store,
+                            IDENTITIES,
+                            &key.index_key(),
+                            &identity.bind_reference(&record)?,
+                            ROW_BYTES,
+                        )?;
                         let body = &signed.value;
                         let source_records = body
                             .metadata_sectors
@@ -413,6 +424,15 @@ impl CatalogCheckpointAuthorityIndex {
                     R::PagedRevision(signed) => {
                         let body = &signed.value;
                         let key = CatalogCheckpointRevisionKey::from(body);
+                        let identity =
+                            super::checkpoint_transition::RevisionIdentity::paged(signed)?;
+                        insert(
+                            &store,
+                            IDENTITIES,
+                            &key.index_key(),
+                            &identity.bind_reference(&record)?,
+                            ROW_BYTES,
+                        )?;
                         first_or_next(&store, key, body.parent, body.writer_epoch)?;
                         let expected = WriterFence {
                             owner: body.owner,
@@ -852,8 +872,8 @@ pub(super) mod tests {
     pub(crate) struct Fixture {
         pub(crate) sources: Sources,
         pub(crate) context: CatalogCheckpointAuthorityContext,
-        records: Vec<R>,
-        pages: Pages,
+        pub(crate) records: Vec<R>,
+        pub(crate) pages: Pages,
     }
 
     fn budget() -> CatalogCodingTraversalBudget {
@@ -954,12 +974,12 @@ pub(super) mod tests {
                 pages,
             }
         }
-        fn scope(&self) -> CatalogScope {
+        pub(crate) fn scope(&self) -> CatalogScope {
             CatalogScope::Guild {
                 guild_id: self.context.guild_id,
             }
         }
-        fn paged(&self) -> SignedRecord<PagedUserRevision> {
+        pub(crate) fn paged(&self) -> SignedRecord<PagedUserRevision> {
             self.records
                 .iter()
                 .find_map(|record| {
@@ -971,7 +991,11 @@ pub(super) mod tests {
                 })
                 .unwrap()
         }
-        fn replace_paged(&mut self, mut value: PagedUserRevision, records: &[CatalogSectorRecord]) {
+        pub(crate) fn replace_paged(
+            &mut self,
+            mut value: PagedUserRevision,
+            records: &[CatalogSectorRecord],
+        ) {
             let mut builder = CatalogSectorBuilder::new(value.scope()).unwrap();
             let mut sink = |page: CatalogPageRef, bytes| {
                 self.pages.insert(page.hash, bytes);
@@ -1058,6 +1082,46 @@ pub(super) mod tests {
                     hash: old.hash().unwrap(),
                 }),
             }
+        }
+        pub(crate) fn previous_trust(&self) -> mb_core::PagedCheckpointTrust {
+            let mut trust = self.trust();
+            let checkpoint = &self.sources.certificate.checkpoint;
+            trust.previous = checkpoint
+                .parent
+                .map(|hash| mb_core::PagedCheckpointParent {
+                    generation: checkpoint.generation - 1,
+                    hash,
+                });
+            trust.authority = checkpoint.authority.unwrap_or(self.context.authority);
+            trust
+        }
+        pub(crate) fn transitioned(
+            &mut self,
+            limit: CatalogCodingTraversalBudget,
+            policy: CatalogCodingCoveragePolicy,
+        ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError> {
+            let current = self.joined(limit, policy);
+            let trust = self.trust();
+            let previous_trust = self.previous_trust();
+            current.validate_authority_transition(
+                Some(CatalogCheckpointPrevious::Legacy {
+                    certificate: &self.sources.certificate,
+                    trust: &previous_trust,
+                }),
+                budget(),
+                || Ok(trust.clone()),
+                |owner, _| {
+                    Ok(self
+                        .sources
+                        .certificate
+                        .checkpoint
+                        .writer_fences
+                        .iter()
+                        .filter(|fence| fence.owner == owner)
+                        .max_by_key(|fence| fence.epoch)
+                        .cloned())
+                },
+            )
         }
         pub(crate) fn joined(
             &mut self,
@@ -1568,7 +1632,7 @@ pub(super) mod tests {
             .is_err()
         );
         assert_eq!(source_fetches.get(), 0);
-        for kind in [COMPLETE, SOURCES, MEMBER_RECORDS] {
+        for kind in [COMPLETE, SOURCES, MEMBER_RECORDS, IDENTITIES] {
             let store = RecordScratchStore::new(4 << 20).unwrap();
             store.put_record_if_absent(kind, b"orphan", b"").unwrap();
             assert!(
@@ -1586,6 +1650,7 @@ pub(super) mod tests {
         }
         for (operation, kind) in [
             ("INSERT", MEMBER_RECORDS),
+            ("INSERT", IDENTITIES),
             ("INSERT", HISTORY),
             ("INSERT", SOURCES),
             ("UPDATE", HEADS),

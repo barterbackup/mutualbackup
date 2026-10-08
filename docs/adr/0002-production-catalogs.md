@@ -3049,7 +3049,7 @@ oversized list/signature declarations before allocating their bodies. Header
 verification requires a separate `PagedCheckpointTrust` snapshot containing the
 independently certified event roster/quorum and exact trusted previous state.
 That local trust type deliberately has no wire decoder. Trust bounds validate
-member keys, recovery keys, unique domains and ordering before quorum replay;
+member keys, recovery keys, bounded domains and ordering before quorum replay;
 no trust is learned from the proposed root. Parent identity/generation, genesis,
 event head/sequence and policy must match exactly. The unchanged previous hash
 can refer to a legacy checkpoint. Header/quorum verification alone establishes
@@ -3066,7 +3066,8 @@ exact equality to the completed proof. Existing tree/authority/packing caps
 remain intact, and all coding forests share this original budget. This is not
 a complete retained-history quota or private/payload admission policy.
 
-`CatalogCheckpointCodingDirectoryIndex::sign_paged_checkpoint_header` requires
+The original public-body signing bridge (strengthened by the transition proof
+below) requires
 current coverage and every authority/packing/coding completion marker. Full
 original member records now have bounded disposable rows so it can recompare
 recovery keys and domains, as well as IDs, with the independently read roster.
@@ -3108,3 +3109,98 @@ Validation: the full locked regression passes all 169 core and 219 ordinary
 store tests (26 store tests ignored). Strict locked workspace/all-targets
 Clippy and formatting/diff checks pass. No network/native, release/platform or
 real retained 1 TiB runtime gate was rerun for this header bridge.
+
+## Public authority transitions gate paged header signatures (2026-10-08)
+
+`CatalogCheckpointTransitionIndex` now compares a completed public proposal
+against its exact independently trusted previous checkpoint before paged header
+signing/binding. `CatalogCheckpointPrevious` accepts a bounded original legacy
+certificate with separately certified historical event/epoch trust, or an
+already completed quorum-bound paged predecessor. The expected generation/hash
+comes from the new independent current snapshot, never from the same proposed
+input. First checkpoints require no predecessor. Legacy formats 3–7 retain their
+original signatures and body hashes; formats 3/4 require the supplied historical
+authority witness. Paged input retains its original certificate and completed
+public body/transition proof. No raw manifest/header can acquire either proof.
+
+The complete authority index records fixed revision facts alongside each original
+mixed record. Facts bind the owner/root/sequence/UUID, format, original body and
+signed-envelope hashes, parent and writer key/epoch. A separate reference hash
+checks the original bounded scratch record during comparison. Legacy physical
+body references are excluded from cross-checkpoint signed-identity equality:
+repagination may change physical roots while preserving exactly the same signed
+envelope. `canonical_hash_bounded` computes plain BLAKE3 of the exact Postcard
+encoding in one bounded pass without an encoded copy, including nested envelopes.
+Legacy revision body hashing now also streams its unchanged derive-key encoding.
+Existing signed layouts, domains, protocol vectors and hashes remain unchanged.
+
+The transition streams ordered fixed rows and performs bounded indexed point
+joins. It preserves every historical fence, retained original signed revision
+and tombstone prefix. Dropped revisions require a covering tombstone; existing
+floors cannot move backward or change at the same sequence. A new/advanced floor
+must name a revision in the trusted predecessor, with exact original UUID/body
+hash and this successor's generation. It cannot invent retired history or retire
+a new candidate in the same checkpoint. Both cursors and all declared row counts
+must reach exact EOF; missing or extra rows cannot quietly become an accepted
+prefix. Original reference rows, keys and signatures are checked as they are read.
+
+Only unchanged retained revisions can rely on removed owners or historical
+writer keys. Every new revision requires an active member and an exact latest
+nonrevoked writer returned from the same independently certified event snapshot.
+The callback's result is compared to the signed writer fields and the proposed
+latest fence. Lookups cache at most 256 active owners; no collection scales with
+roots, history, fences or sources. A successor advances a fence by exactly one
+and needs a new revision at that key; initial checkpoints can include certified
+contiguous history before their first revision. New revisions cannot reuse UUIDs
+in the predecessor's retained/last-retired ID index. The complete enclosing
+retention/quota and any archival ID obligations remain separate policy gates.
+
+Both full public inputs and conservative bounded row-comparison work share one
+required trusted job budget. Paged input charges its full byte/page/record ledger
+again for this job, including every logical closure occurrence. Legacy input
+keeps its existing individually bounded 32 MiB certificate admission as one
+legacy object; temporary indexed fields and every comparison/write are debited
+by the separate row reservation. Four KiB per bounded row attempt and a fixed
+local descriptor bound the comparison bytes; checked arithmetic and independent
+record/page caps reject exhaustion before the large join or writer lookup.
+The proposed public proof also retains its own original admission. No input
+boundary resets either ledger and no peer-selected limit is trusted.
+
+All comparison and temporary legacy indexing use the existing private scratch
+transaction. Ignored writes, orphan namespaces, bad snapshots, invalid old
+signatures and late row/tail errors return no transition/signing capability;
+failed jobs discard their private store and rebuild. The completion marker binds
+the current header, both trust snapshots and exact admitted work. Current event
+and previous-state snapshots are reread at the end and again around later signing
+or certificate binding. `CatalogQuorumPagedCheckpointIndex` now owns this
+transition proof. The earlier raw public-body signing/binding methods have moved
+to `CatalogCheckpointTransitionIndex`; no normal producer calls these draft APIs.
+No production database writer spans traversal, comparison or callbacks.
+
+Checkpoint trust validation now follows existing checkpoint/event roster rules,
+which permit multiple certified peers in one failure domain. The earlier genesis
+helper incorrectly required unique domains across the roster. Node IDs stay
+strictly ordered/unique, recovery and Ed25519 keys remain validated, and domains
+remain nonempty and at most 256 bytes. Per-coding-group distinct-domain placement
+checks are unchanged. A core regression covers the legitimate cohosted roster.
+
+Eight focused store fixtures pass, covering first publication, legacy formats
+3–7, unchanged paged continuation, original signed identity, revoked/superseded
+current writers, one-step rotation, exact monotone retirement, invented/new floors,
+removed-owner retention versus new mutation, prior UUID reuse, both-input/scan
+admission in all dimensions, changed snapshots and missing/orphan/ignored rows.
+A 4,096-fence fixture spills beyond the 1 MiB cache, fails after a valid history
+prefix or under a tightened real SQLite limit, then rebuilds and signs. This is
+structural metadata evidence, not real retained 1 TiB payload qualification.
+
+Validation: the full locked regression passes all 170 core and 227 ordinary
+store tests (26 store tests ignored). Strict locked workspace/all-targets
+Clippy and formatting/diff checks pass. The eight focused transition fixtures
+also pass after the final Clippy simplification. No network/native,
+release/platform or real retained 1 TiB runtime gate was rerun for this step.
+
+These are public authority transition proofs. Original coding lifecycle and
+fixed legacy-group migration, full retention/quota policy, private/bootstrap/
+native and information/parity payload custody, complete durable ownership and
+atomic certified-current publication/retirement guards remain required. The
+normal producer/recovery/retained-capacity and platform/release gates stay open.
