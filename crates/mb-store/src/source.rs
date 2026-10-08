@@ -383,6 +383,17 @@ impl SourceFileCaptureError {
 }
 
 impl SourceFileCapturePlan {
+    /// Inspect the original plan shape without source access, capture or replay.
+    pub fn preserved_ownership(&self) -> anyhow::Result<crate::PreservedFileCapturePlan<'_>> {
+        match self {
+            Self::ReflinkV1(plan) => plan.preserved_ownership(),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.preserved_ownership(),
+            #[cfg(target_os = "linux")]
+            Self::ReflinkRawV2(plan) => plan.preserved_ownership(),
+        }
+    }
+
     pub fn backend_kind(&self) -> SourceBackendKind {
         match self {
             Self::ReflinkV1(_) => SourceBackendKind::ReflinkV1,

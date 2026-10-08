@@ -394,6 +394,41 @@ impl GuardedRootCapturePlan {
     }
 }
 impl GuardedFileCapturePlan {
+    pub fn preserved_ownership(&self) -> anyhow::Result<super::PreservedFileCapturePlan<'_>> {
+        ensure!(
+            self.format_version == 1
+                && !self.anchor_id.is_nil()
+                && !self.area.area_id.is_nil()
+                && self.source_root_id.filesystem_id == self.area.filesystem_id
+                && self.source_root_id.inode != 0
+                && self.source_version.filesystem_id == self.area.filesystem_id
+                && self.source_mode & libc::S_IFMT == libc::S_IFREG,
+            "invalid preserved guarded file capture plan"
+        );
+        self.source_version.validate_preserved()?;
+        for path in [
+            &self.source_root,
+            &self.area.path_hint,
+            &self.area.volume_root_hint,
+        ] {
+            super::validate_preserved_path_hint(path)?;
+        }
+        super::validate_preserved_relative(&self.relative_path)?;
+        let identity = self.source_version.recorded_identity();
+        Ok(super::PreservedFileCapturePlan {
+            record_format: self.format_version,
+            capture_id: self.anchor_id,
+            source_root: &self.source_root,
+            relative_path: &self.relative_path,
+            area: &self.area,
+            logical_len: self.source_version.logical_len,
+            recorded_root_identity: self.source_root_id,
+            stable_root_identity: Some(self.source_root_id),
+            recorded_file_identity: identity,
+            stable_file_identity: Some(identity),
+        })
+    }
+
     pub fn source_root(&self) -> &Path {
         &self.source_root
     }
@@ -428,6 +463,82 @@ pub(super) fn guarded_file_marker_name(anchor_id: Uuid) -> String {
 #[cfg(test)]
 mod preserved_tests {
     use super::*;
+    use mb_core::{canonical_bytes, decode_canonical};
+
+    #[test]
+    fn preserved_guarded_file_plan_keeps_original_wire_and_stable_ownership_without_io() {
+        use std::os::unix::ffi::OsStrExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("missing-source");
+        let area_path = temporary.path().join("missing-area");
+        let root_id = NativeFileId {
+            filesystem_id: 7,
+            inode: 8,
+        };
+        let area = StableAnchorAreaLocator {
+            area_id: Uuid::from_u128(193),
+            path_hint: area_path.clone(),
+            filesystem_id: 7,
+            volume_root_hint: temporary.path().to_path_buf(),
+        };
+        let wire = canonical_bytes(&(
+            1_u16,
+            Uuid::from_u128(192),
+            source.as_os_str().as_bytes().to_vec(),
+            root_id,
+            b"file-\xff".to_vec(),
+            (7_u64, 9_u64, 13_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+            0o100644_u32,
+            &area,
+        ))
+        .unwrap();
+        let plan: GuardedFileCapturePlan = decode_canonical(&wire).unwrap();
+        assert_eq!(canonical_bytes(&plan).unwrap(), wire);
+        let ownership = plan.preserved_ownership().unwrap();
+        assert_eq!(ownership.source_root, source);
+        assert_eq!(ownership.relative_path.as_os_str().as_bytes(), b"file-\xff");
+        assert_eq!(ownership.area, &area);
+        assert_eq!(ownership.logical_len, 13);
+        assert_eq!(ownership.recorded_root_identity, root_id);
+        assert_eq!(ownership.stable_root_identity, Some(root_id));
+        assert_eq!(
+            ownership.stable_file_identity,
+            Some(NativeFileId {
+                filesystem_id: 7,
+                inode: 9
+            })
+        );
+        let dispatch = crate::SourceFileCapturePlan::GuardedLinkFreezeV1(plan.clone());
+        assert!(dispatch.backend_kind().require_supported().is_err());
+        assert_eq!(
+            dispatch.preserved_ownership().unwrap().capture_id,
+            plan.anchor_id
+        );
+        for index in 0..14 {
+            let mut bad = plan.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.anchor_id = Uuid::nil(),
+                2 => bad.area.area_id = Uuid::nil(),
+                3 => bad.source_root_id.filesystem_id = 8,
+                4 => bad.source_root_id.inode = 0,
+                5 => bad.source_version.filesystem_id = 8,
+                6 => bad.source_version.inode = 0,
+                7 => bad.source_version.modified_nanos = 1_000_000_000,
+                8 => bad.source_mode = 0o644,
+                9 => bad.source_root = PathBuf::from("relative"),
+                10 => bad.area.path_hint = PathBuf::from("/bad\0area"),
+                11 => bad.area.volume_root_hint = PathBuf::from("relative"),
+                12 => bad.relative_path = PathBuf::from("../escape"),
+                _ => bad.relative_path = PathBuf::from("a\0b"),
+            }
+            assert!(bad.preserved_ownership().is_err(), "case {index}");
+        }
+        assert_eq!(canonical_bytes(&plan).unwrap(), wire);
+        assert!(!source.exists());
+        assert!(!area_path.exists());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+    }
 
     fn fixture() -> GuardedRootCapturePlan {
         let version = CaptureVersion {

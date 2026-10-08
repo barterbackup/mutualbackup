@@ -23,10 +23,10 @@ pub use anchor::{
     FileAnchorManifest, FileExtent, FilesystemIdentity, GIT_CATALOG_DIRECTORY,
     GIT_CATALOG_MARKER_FILE, ImportedBlobCapturePlan, NativeFileId, PinnedDirectory,
     PinnedEntryKind, PinnedReadDirectory, PreservedFileAnchor, PreservedFileCapture,
-    PreservedRootCapture, ReflinkAnchor, ReflinkCapturePlan, ReflinkFileCapturePlan,
-    StableAnchorAreaLocator, StableAnchorFileLocator, StableAnchorManifest, directory_identity,
-    filesystem_identity, git_catalog_marker, git_catalog_marker_bytes, probe_reflink,
-    remove_owned_directory_tree,
+    PreservedFileCapturePlan, PreservedRootCapture, ReflinkAnchor, ReflinkCapturePlan,
+    ReflinkFileCapturePlan, StableAnchorAreaLocator, StableAnchorFileLocator, StableAnchorManifest,
+    directory_identity, filesystem_identity, git_catalog_marker, git_catalog_marker_bytes,
+    probe_reflink, remove_owned_directory_tree,
 };
 #[cfg(target_os = "linux")]
 pub use anchor::{

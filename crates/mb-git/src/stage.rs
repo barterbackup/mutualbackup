@@ -230,7 +230,7 @@ pub(crate) fn require_native_stage_state(control: &ControlStore) -> anyhow::Resu
     Ok(())
 }
 
-/// Preserve original object mappings and primary/linked index ownership.
+/// Preserve original object mappings, indexes and regular-file stage intents.
 /// No anchor payload, source path, marker or normal replay helper is opened.
 #[cfg(target_os = "linux")]
 pub(crate) fn for_each_preserved_record(
@@ -241,6 +241,37 @@ pub(crate) fn for_each_preserved_record(
     use anyhow::{Context, ensure};
     use std::os::unix::ffi::OsStrExt;
 
+    for prefix in [INTENT_PREFIX, WORKTREE_STAGE_INTENT_PREFIX] {
+        control.for_each_record_with_kind_prefix_bounded(
+            prefix,
+            512,
+            MAX_STAGE_PATH_BYTES,
+            mb_core::V1_MAX_CATALOG_BYTES,
+            |kind, key, bytes| {
+                let scope = GitWorktreeScope::preserved_from_kind(
+                    kind,
+                    repository_id,
+                    INTENT_PREFIX,
+                    WORKTREE_STAGE_INTENT_PREFIX,
+                )?;
+                ensure!(!key.contains(&0), "invalid preserved Git stage path");
+                let intent = decode_intent(bytes, repository_id, key)?;
+                ensure!(
+                    mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                    "noncanonical preserved Git stage intent"
+                );
+                intent.plan.preserved_ownership()?;
+                visit(crate::PreservedGitRecord::StageIntent {
+                    scope,
+                    record_format: intent.format_version,
+                    relative_path: key.to_vec(),
+                    git_mode: intent.git_mode,
+                    plan: Box::new(intent.plan),
+                })?;
+                Ok(true)
+            },
+        )?;
+    }
     let expected_objects = object_kind_prefix(repository_id);
     control.for_each_record_with_kind_prefix_bounded(
         OBJECT_PREFIX,
@@ -1304,6 +1335,189 @@ mod tests {
     };
     use crate::GitWorktreeScope;
     use crate::merge::{MergeSession, merge_state_for_scope, store_merge_session_for_scope};
+
+    #[test]
+    fn preserved_git_regular_stage_intents_validate_original_scopes_keys_and_plans_without_replay()
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let area = tempfile::tempdir().unwrap();
+        let path = area.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&path, &[194; 32]).unwrap();
+        let repository_id = Uuid::from_u128(194);
+        let linked_id = Uuid::from_u128(195);
+        let wire = canonical_bytes(&(
+            1_u16,
+            Uuid::from_u128(196),
+            area.path()
+                .join("missing-source")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+            mb_store::NativeFileId {
+                filesystem_id: 7,
+                inode: 8,
+            },
+            b"file-\xff".to_vec(),
+            (7_u64, 9_u64, 13_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+            0o100644_u32,
+            StableAnchorAreaLocator {
+                area_id: Uuid::from_u128(197),
+                path_hint: area.path().join("missing-area"),
+                filesystem_id: 7,
+                volume_root_hint: area.path().to_path_buf(),
+            },
+        ))
+        .unwrap();
+        let plan =
+            SourceFileCapturePlan::GuardedLinkFreezeV1(mb_core::decode_canonical(&wire).unwrap());
+        let intent = super::StageIntent {
+            format_version: 1,
+            repository_id,
+            relative_path: PathBuf::from(std::ffi::OsString::from_vec(b"file-\xff".to_vec())),
+            git_mode: 0o100755,
+            plan,
+        };
+        let original = canonical_bytes(&intent).unwrap();
+        let primary = format!("git-stage-intent-v1/{repository_id}");
+        let linked = format!("git-worktree-stage-intent-v1/{repository_id}/{linked_id}");
+        for kind in [&primary, &linked] {
+            control.put_record(kind, b"file-\xff", &original).unwrap();
+        }
+        let mut rows = Vec::new();
+        let before = (
+            fs::read(&path).unwrap(),
+            fs::read(path.with_extension("db-wal")).unwrap(),
+        );
+        super::for_each_preserved_record(&control, repository_id, |record| {
+            rows.push(record);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let crate::PreservedGitRecord::StageIntent {
+                scope,
+                record_format,
+                relative_path,
+                git_mode,
+                plan,
+            } = row
+            else {
+                panic!("wrong preserved record")
+            };
+            assert_eq!(scope.repository_id(), repository_id);
+            assert!([repository_id, linked_id].contains(&scope.worktree_id()));
+            assert_eq!(record_format, 1);
+            assert_eq!(relative_path, b"file-\xff");
+            assert_eq!(git_mode, 0o100755);
+            assert_eq!(plan.backend_kind(), SourceBackendKind::GuardedLinkFreezeV1);
+            assert_eq!(plan.preserved_ownership().unwrap().logical_len, 13);
+        }
+        assert_eq!(
+            before,
+            (
+                fs::read(&path).unwrap(),
+                fs::read(path.with_extension("db-wal")).unwrap()
+            )
+        );
+        for kind in [&primary, &linked] {
+            control.delete_record(kind, b"file-\xff").unwrap();
+        }
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = (
+                fs::read(&path).unwrap(),
+                fs::read(path.with_extension("db-wal")).unwrap(),
+            );
+            assert!(super::for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(
+                before,
+                (
+                    fs::read(&path).unwrap(),
+                    fs::read(path.with_extension("db-wal")).unwrap()
+                )
+            );
+            control.delete_record(kind, key).unwrap();
+        };
+        for key in [
+            b"".as_slice(),
+            b"other",
+            b"../escape",
+            b"a\0b",
+            &vec![b'x'; super::MAX_STAGE_PATH_BYTES + 1],
+        ] {
+            reject(&primary, key, &original);
+        }
+        for kind in [
+            format!("git-stage-intent-v1/{linked_id}"),
+            format!(
+                "git-worktree-stage-intent-v1/{repository_id}/{}",
+                linked_id.simple()
+            ),
+            format!("git-worktree-stage-intent-v1/{repository_id}/{repository_id}"),
+            format!(
+                "git-worktree-stage-intent-v1/{repository_id}/{}",
+                Uuid::nil()
+            ),
+        ] {
+            reject(&kind, b"file-\xff", &original);
+        }
+        for index in 0..4 {
+            let mut invalid = intent.clone();
+            match index {
+                0 => invalid.format_version = 2,
+                1 => invalid.repository_id = linked_id,
+                2 => invalid.git_mode = 0o120000,
+                _ => invalid.relative_path = PathBuf::from("other"),
+            }
+            reject(&primary, b"file-\xff", &canonical_bytes(&invalid).unwrap());
+        }
+        reject(
+            &primary,
+            b"file-\xff",
+            &[original.clone(), vec![0]].concat(),
+        );
+        reject(
+            &primary,
+            b"file-\xff",
+            &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1],
+        );
+        // A correctly decoded intent still has to validate its original plan.
+        let invalid_plan_wire = canonical_bytes(&(
+            1_u16,
+            repository_id,
+            b"file-\xff".to_vec(),
+            0o100755_u32,
+            SourceFileCapturePlan::GuardedLinkFreezeV1(
+                mb_core::decode_canonical(
+                    &canonical_bytes(&(
+                        1_u16,
+                        Uuid::nil(),
+                        b"/missing-source".to_vec(),
+                        mb_store::NativeFileId {
+                            filesystem_id: 7,
+                            inode: 8,
+                        },
+                        b"file-\xff".to_vec(),
+                        (7_u64, 9_u64, 13_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+                        0o100644_u32,
+                        StableAnchorAreaLocator {
+                            area_id: Uuid::from_u128(197),
+                            path_hint: PathBuf::from("/missing-area"),
+                            filesystem_id: 7,
+                            volume_root_hint: PathBuf::from("/"),
+                        },
+                    ))
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
+        ))
+        .unwrap();
+        reject(&primary, b"file-\xff", &invalid_plan_wire);
+        assert!(!area.path().join("missing-source").exists());
+        assert!(!area.path().join("missing-area").exists());
+    }
 
     #[test]
     fn preserved_git_object_index_and_location_rows_reject_invalid_ownership_without_mutation() {

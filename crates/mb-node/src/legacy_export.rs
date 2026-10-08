@@ -11,14 +11,14 @@ pub use inventory::{
     inventory_withdrawn_revisions_from_catalog_over_network,
 };
 pub use local_inventory::{
-    LegacyAnchorAreaLocation, LegacyCaptureOwnership, LegacyGitAnchorAreaLocation,
-    LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef, LegacyGitIndexRegistration,
-    LegacyGitMetadataObject, LegacyGitObjectAnchor, LegacyGitReference, LegacyGitRegistration,
-    LegacyGitSelectedBranch, LegacyGitWorktreeRegistration, LegacyGuardedAnchorPin,
-    LegacyGuardedCapture, LegacyLocalSectorRecipe, LegacyLocalSectorSource,
+    LegacyAnchorAreaLocation, LegacyCaptureOwnership, LegacyFileCapturePlan,
+    LegacyGitAnchorAreaLocation, LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef,
+    LegacyGitIndexRegistration, LegacyGitMetadataObject, LegacyGitObjectAnchor, LegacyGitReference,
+    LegacyGitRegistration, LegacyGitSelectedBranch, LegacyGitWorktreeRegistration,
+    LegacyGuardedAnchorPin, LegacyGuardedCapture, LegacyLocalSectorRecipe, LegacyLocalSectorSource,
     LegacyLocalStateInventory, LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitGraph,
-    LegacyPreservedRecord, LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
-    LegacyStorageVolumeRegistration, LegacyVolumeOwnership,
+    LegacyPendingGitStage, LegacyPreservedRecord, LegacyRetainedAnchor, LegacyRootRegistration,
+    LegacySourceBinding, LegacyStorageVolumeRegistration, LegacyVolumeOwnership,
 };
 pub use remote::{
     LegacyExportPeer, LegacyPeerInventoryCoverage, LegacyPeerSources,

@@ -750,6 +750,40 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory original unfinished external Git regular-file staging plans.
+    `legacy-list` format 11 adds original unfinished regular-file staging
+    intents from primary and linked external Git scopes. The unchanged
+    ReflinkV1, guarded link-freeze V1 and raw ReflinkV2 plan layouts are
+    inspected without backend admission, source/anchor access, capture or
+    replay. Plans retain capture/area UUIDs, raw source/relative/area/volume
+    hints, logical lengths and recorded/stable root/file identity provenance;
+    unchanged native identity layouts remain unknown, while the original
+    guarded plan establishes stable IDs.
+    Canonical/version/namespace/key/path/mode and plan-shape checks share one
+    reader for inventory and placement; SQL paths are bounded to 4,096 bytes
+    and intent rows to the existing 32 MiB bound. Complete stage projections
+    share the full 32 MiB report budget. Known source/area hints, aliases and
+    recorded/stable renamed source roots exclude export/scratch parents;
+    volume roots remain discovery hints. A separate regular-stage coverage
+    flag leaves full catalog/payload/history verification false. Original-wire
+    plan variants, malformed shapes/scopes/keys/versions/modes/encoding/rows,
+    staging-only ownership, closed/WAL-only/live catalogs, raw paths, renamed
+    roots, aliases, exact/over report budgets, JSON, late corruption and the
+    real CLI preserve original inputs. External Git regular-stage qualification passes 538 unique cases: 48
+    export/peer cases, all 292 ordinary store, 63 ordinary volume and 108
+    ordinary Git cases, 20 CLI process cases,
+    retained-graph/discovery/withdrawal/graph-intent regressions, and two
+    provisioned Btrfs identity/retained-capture cases. All four debug programs
+    build; format and strict locked workspace/all-targets Clippy pass. All 284
+    source-file and eight program/test-driver hashes remain unchanged, and
+    native mount/loop/image cleanup is verified. Evidence and the distinct
+    passing-case inventory are retained under
+    `/tmp/mb-m6-regular-stage-validation-sciir69g`; the post-commit audit
+    binds the code to the commit. This is a focused debug-source
+    qualification; complete ordinary/native suites and installed artifacts
+    were not rerun.
+    Symlink/prune/checkout/merge/removal intents, full owner/history joins,
+    common resource budgets and all remaining milestone gates stay open.
   - [x] Inventory saved external Git refs, metadata objects and HEAD selections.
     Report format 10 adds original branch/tag/remote/other refs, pin-namespace
     status, all stored commit/tree/tag metadata (including unreachable members)

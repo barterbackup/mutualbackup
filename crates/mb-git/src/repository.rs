@@ -237,6 +237,13 @@ pub enum PreservedGitRecord {
         relative_path: Vec<u8>,
         entry: crate::GitIndexEntry,
     },
+    StageIntent {
+        scope: crate::GitWorktreeScope,
+        record_format: u16,
+        relative_path: Vec<u8>,
+        git_mode: u32,
+        plan: Box<mb_store::SourceFileCapturePlan>,
+    },
     AnchorAreaLocation {
         repository_id: Uuid,
         area_id: Uuid,

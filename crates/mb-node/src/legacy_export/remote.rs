@@ -283,6 +283,19 @@ impl PreservedParentCheck {
                     self.check_hint(&anchor.source_root_hint)?;
                     self.check_hint(&anchor.area.path_hint)?;
                 }
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::StageIntent {
+                    plan,
+                    ..
+                }) => {
+                    let ownership = plan.preserved_ownership()?;
+                    self.check_hint(ownership.source_root)?;
+                    self.check_hint(&ownership.area.path_hint)?;
+                    if let Some(identity) = ownership.stable_root_identity {
+                        self.check_native(identity)?;
+                    } else {
+                        self.check_recorded_native(ownership.recorded_root_identity)?;
+                    }
+                }
                 PreservedExternalGitRecord::Record(
                     mb_git::PreservedGitRecord::AnchorAreaLocation { path, .. },
                 ) => {

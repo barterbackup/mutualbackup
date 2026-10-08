@@ -3695,13 +3695,72 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let object_source = temp.path().join("preserved-git-object-source");
     let object_area = temp.path().join("preserved-git-object-area");
     let cached_area = temp.path().join("preserved-git-cached-area");
-    for path in [&object_source, &object_area, &cached_area] {
+    let stage_source = temp.path().join("preserved-git-stage-source");
+    let stage_area = temp.path().join("preserved-git-stage-area");
+    for path in [
+        &object_source,
+        &object_area,
+        &cached_area,
+        &stage_source,
+        &stage_area,
+    ] {
         fs::create_dir(path).unwrap();
         fs::create_dir(path.join("nested")).unwrap();
         fs::write(path.join("original"), b"preserve Git ownership").unwrap();
     }
     let object_alias = temp.path().join("object-area-alias");
     std::os::unix::fs::symlink(&object_area, &object_alias).unwrap();
+    let stage_alias = temp.path().join("stage-source-alias");
+    std::os::unix::fs::symlink(&stage_source, &stage_alias).unwrap();
+    let stage_root_id = mb_store::PinnedDirectory::open(&stage_source)
+        .unwrap()
+        .identity()
+        .unwrap();
+    let stage_capture_id = Uuid::new_v4();
+    let stage_area_id = Uuid::new_v4();
+    let stage_plan = mb_store::SourceFileCapturePlan::GuardedLinkFreezeV1(
+        mb_core::decode_canonical(
+            &canonical_bytes(&(
+                1_u16,
+                stage_capture_id,
+                stage_source.as_os_str().as_bytes().to_vec(),
+                stage_root_id,
+                b"unfinished-\xfa".to_vec(),
+                (
+                    stage_root_id.filesystem_id,
+                    51_u64,
+                    7_u64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                ),
+                0o100644_u32,
+                mb_store::StableAnchorAreaLocator {
+                    area_id: stage_area_id,
+                    path_hint: stage_area.clone(),
+                    filesystem_id: stage_root_id.filesystem_id,
+                    volume_root_hint: temp.path().to_path_buf(),
+                },
+            ))
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    external_store
+        .put_record(
+            &format!("git-worktree-stage-intent-v1/{repository_id}/{worktree_id}"),
+            b"unfinished-\xfa",
+            &canonical_bytes(&(
+                1_u16,
+                repository_id,
+                b"unfinished-\xfa".to_vec(),
+                0o100755_u32,
+                stage_plan,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
     let anchor_id = Uuid::new_v4();
     let area_id = Uuid::new_v4();
     let object_oid = *git2::Oid::hash_object(git2::ObjectType::Blob, b"native!")
@@ -3871,7 +3930,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 10);
+    assert_eq!(inventory.format_version, 11);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -3907,6 +3966,26 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(git_registration.references_inventoried);
     assert!(git_registration.metadata_objects_inventoried);
     assert!(git_registration.selected_branches_inventoried);
+    assert!(git_registration.regular_stage_intents_inventoried);
+    assert_eq!(inventory.local_state.pending_git_stages.len(), 1);
+    let saved_stage = &inventory.local_state.pending_git_stages[0];
+    assert_eq!(saved_stage.repository_id, repository_id);
+    assert_eq!(saved_stage.worktree_id, worktree_id);
+    assert_eq!(saved_stage.record_format, 1);
+    assert_eq!(
+        saved_stage.relative_path_hex,
+        hex::encode(b"unfinished-\xfa")
+    );
+    assert_eq!(saved_stage.git_mode, 0o100755);
+    assert_eq!(
+        saved_stage.plan.backend,
+        mb_store::SourceBackendKind::GuardedLinkFreezeV1
+    );
+    assert_eq!(saved_stage.plan.capture_id, stage_capture_id);
+    assert_eq!(saved_stage.plan.area_id, stage_area_id);
+    assert_eq!(saved_stage.plan.logical_len, 7);
+    assert_eq!(saved_stage.plan.stable_root_identity, Some(stage_root_id));
+    assert!(!saved_stage.payloads_verified);
     assert_eq!(inventory.local_state.git_references.len(), 5);
     assert!(
         inventory
@@ -4010,6 +4089,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         object_area.join("nested"),
         object_alias.join("nested"),
         cached_area.join("nested"),
+        stage_source.join("nested"),
+        stage_area.join("nested"),
+        stage_alias.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -4128,6 +4210,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &object_source.join("nested"),
         &object_alias.join("nested"),
         &cached_area.join("nested"),
+        &stage_source.join("nested"),
+        &stage_area.join("nested"),
+        &stage_alias.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -4165,7 +4250,13 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     assert_eq!(fs::read_dir(&worktree).unwrap().count(), 2);
     assert_eq!(fs::read_dir(worktree.join("nested")).unwrap().count(), 0);
-    for path in [&object_source, &object_area, &cached_area] {
+    for path in [
+        &object_source,
+        &object_area,
+        &cached_area,
+        &stage_source,
+        &stage_area,
+    ] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),
             b"preserve Git ownership"

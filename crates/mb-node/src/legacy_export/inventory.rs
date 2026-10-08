@@ -261,7 +261,7 @@ pub(super) fn inventory_catalog(
         ))
     });
     let report = LegacyRevisionInventory {
-        format_version: 10,
+        format_version: 11,
         owner: keys.node_id().to_string(),
         scope: if remote.is_some() {
             "available-local-and-selected-peer-signed-revisions-and-preserved-local-state"

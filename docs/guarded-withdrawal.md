@@ -191,6 +191,36 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+`legacy-list` format 11 adds original unfinished regular-file staging intents
+from primary and linked external Git scopes. The unchanged ReflinkV1, guarded
+link-freeze V1 and raw ReflinkV2 plan layouts are inspected without backend
+admission, source/anchor access, capture or replay. Plans retain capture/area
+UUIDs, raw source/relative/area/volume hints, logical lengths and
+recorded/stable root/file identity provenance; unchanged native identity
+layouts remain unknown, while the original guarded plan establishes stable
+IDs. Canonical/version/namespace/key/path/mode and plan-shape checks share one
+reader for inventory and placement; SQL paths are bounded to 4,096 bytes and
+intent rows to the existing 32 MiB bound. Complete stage projections share the
+full 32 MiB report budget. Known source/area hints, aliases and
+recorded/stable renamed source roots exclude export/scratch parents; volume
+roots remain discovery hints. A separate regular-stage coverage flag leaves
+full catalog/payload/history verification false. Original-wire plan variants,
+malformed shapes/scopes/keys/versions/modes/encoding/rows, staging-only
+ownership, closed/WAL-only/live catalogs, raw paths, renamed roots, aliases,
+exact/over report budgets, JSON, late corruption and the real CLI preserve
+original inputs. External Git regular-stage qualification passes 538 unique cases: 48
+export/peer cases, all 292 ordinary store, 63 ordinary volume and 108 ordinary
+Git cases, 20 CLI process cases,
+retained-graph/discovery/withdrawal/graph-intent regressions, and two
+provisioned Btrfs identity/retained-capture cases. All four debug programs
+build; format and strict locked workspace/all-targets Clippy pass. All 284
+source-file and eight program/test-driver hashes remain unchanged, and native
+mount/loop/image cleanup is verified. Evidence and the distinct passing-case
+inventory are retained under `/tmp/mb-m6-regular-stage-validation-sciir69g`;
+the post-commit audit binds the code to the commit. This is a focused
+debug-source qualification; complete ordinary/native suites and installed
+artifacts were not rerun.
+
 The `git_references`, `git_metadata_objects` and `git_selected_branches` entries
 add original external refs, all stored commit/tree/tag metadata and explicit
 primary/linked HEAD records to each repository's preserved snapshot. Unreachable

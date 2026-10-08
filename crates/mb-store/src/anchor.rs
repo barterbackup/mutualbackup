@@ -1670,6 +1670,20 @@ pub mod raw_path_bytes_option {
 
 #[cfg(target_os = "linux")]
 impl RawReflinkFileCapturePlanV2 {
+    pub fn preserved_ownership(&self) -> anyhow::Result<PreservedFileCapturePlan<'_>> {
+        anyhow::ensure!(
+            self.format_version == 2,
+            "unsupported preserved raw native file plan"
+        );
+        preserved_file_capture_plan(
+            self.format_version,
+            &self.root,
+            &self.relative_path,
+            &self.file_version,
+            true,
+        )
+    }
+
     pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
         &self.root.area
     }
@@ -1975,6 +1989,20 @@ impl ImportedBlobCapturePlan {
 }
 
 impl ReflinkFileCapturePlan {
+    pub fn preserved_ownership(&self) -> anyhow::Result<PreservedFileCapturePlan<'_>> {
+        anyhow::ensure!(
+            self.format_version == 1,
+            "unsupported preserved native file plan"
+        );
+        preserved_file_capture_plan(
+            self.format_version,
+            &self.root,
+            &self.relative_path,
+            &self.file_version,
+            false,
+        )
+    }
+
     pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
         &self.root.area
     }
@@ -2499,6 +2527,50 @@ pub struct PreservedFileCapture<'a> {
     pub capture_id: Uuid,
     pub native_id: NativeFileId,
     pub logical_len: u64,
+}
+
+/// Original single-file capture ownership, inspected without opening the source.
+#[derive(Clone, Copy, Debug)]
+pub struct PreservedFileCapturePlan<'a> {
+    pub record_format: u16,
+    pub capture_id: Uuid,
+    pub source_root: &'a Path,
+    pub relative_path: &'a Path,
+    pub area: &'a StableAnchorAreaLocator,
+    pub logical_len: u64,
+    pub recorded_root_identity: NativeFileId,
+    pub stable_root_identity: Option<NativeFileId>,
+    pub recorded_file_identity: NativeFileId,
+    pub stable_file_identity: Option<NativeFileId>,
+}
+
+fn preserved_file_capture_plan<'a>(
+    record_format: u16,
+    root: &'a ReflinkCapturePlan,
+    relative_path: &'a Path,
+    file_version: &CaptureVersion,
+    raw: bool,
+) -> anyhow::Result<PreservedFileCapturePlan<'a>> {
+    let ownership = root.preserved_ownership()?;
+    validate_preserved_relative(relative_path)?;
+    file_version.validate_preserved()?;
+    anyhow::ensure!(
+        (raw || relative_path.to_str().is_some())
+            && file_version.filesystem_id == ownership.recorded_root_identity.filesystem_id,
+        "invalid preserved native file capture plan"
+    );
+    Ok(PreservedFileCapturePlan {
+        record_format,
+        capture_id: ownership.anchor_id,
+        source_root: ownership.source_root,
+        relative_path,
+        area: ownership.area,
+        logical_len: file_version.logical_len,
+        recorded_root_identity: ownership.recorded_root_identity,
+        stable_root_identity: None,
+        recorded_file_identity: file_version.recorded_identity(),
+        stable_file_identity: None,
+    })
 }
 
 pub(crate) fn validate_preserved_capture_root(
@@ -5616,6 +5688,93 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_native_file_plans_decode_original_layouts_without_source_access() {
+        use crate::SourceFileCapturePlan;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("missing-source");
+        let area_path = temporary.path().join("missing-area");
+        let version = (7_u64, 9_u64, 13_u64, 0_i64, 0_i64, 0_i64, 0_i64);
+        let area = StableAnchorAreaLocator {
+            area_id: Uuid::from_u128(191),
+            path_hint: area_path.clone(),
+            filesystem_id: 7,
+            volume_root_hint: temporary.path().to_path_buf(),
+        };
+        let root_wire = canonical_bytes(&(
+            1_u16,
+            Uuid::from_u128(190),
+            source.as_os_str().as_bytes().to_vec(),
+            &area,
+            version,
+            0o40700_u32,
+            0_i64,
+            0_u32,
+        ))
+        .unwrap();
+        let root: ReflinkCapturePlan = decode_canonical(&root_wire).unwrap();
+        assert_eq!(canonical_bytes(&root).unwrap(), root_wire);
+        let old_wire = canonical_bytes(&(1_u16, &root, "file", version)).unwrap();
+        let old: ReflinkFileCapturePlan = decode_canonical(&old_wire).unwrap();
+        assert_eq!(canonical_bytes(&old).unwrap(), old_wire);
+        let raw_path = PathBuf::from(std::ffi::OsString::from_vec(b"file-\xff".to_vec()));
+        let raw_wire = canonical_bytes(&(
+            2_u16,
+            &root,
+            raw_path.as_os_str().as_bytes().to_vec(),
+            version,
+        ))
+        .unwrap();
+        let raw: RawReflinkFileCapturePlanV2 = decode_canonical(&raw_wire).unwrap();
+        assert_eq!(canonical_bytes(&raw).unwrap(), raw_wire);
+        for plan in [
+            SourceFileCapturePlan::ReflinkV1(old.clone()),
+            SourceFileCapturePlan::ReflinkRawV2(raw.clone()),
+        ] {
+            let encoded = canonical_bytes(&plan).unwrap();
+            let ownership = plan.preserved_ownership().unwrap();
+            assert_eq!(ownership.source_root, source);
+            assert_eq!(ownership.area, &area);
+            assert_eq!(ownership.logical_len, 13);
+            assert_eq!(ownership.recorded_root_identity.filesystem_id, 7);
+            assert_eq!(ownership.recorded_file_identity.inode, 9);
+            assert_eq!(ownership.stable_root_identity, None);
+            assert_eq!(ownership.stable_file_identity, None);
+            assert_eq!(canonical_bytes(&plan).unwrap(), encoded);
+        }
+        assert_eq!(raw.preserved_ownership().unwrap().relative_path, raw_path);
+        for path in ["", "../escape", "/absolute", "a//b", "a\0b"] {
+            let mut bad = old.clone();
+            bad.relative_path = PathBuf::from(path);
+            assert!(bad.preserved_ownership().is_err());
+        }
+        let mut bad = old.clone();
+        bad.relative_path = raw_path;
+        assert!(bad.preserved_ownership().is_err());
+        for index in 0..8 {
+            let mut bad = old.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.file_version.filesystem_id = 8,
+                2 => bad.file_version.inode = 0,
+                3 => bad.file_version.modified_nanos = 1_000_000_000,
+                4 => bad.root.anchor_id = Uuid::nil(),
+                5 => bad.root.area.area_id = Uuid::nil(),
+                6 => bad.root.source_root = PathBuf::from("relative"),
+                _ => bad.root.area.path_hint = PathBuf::from("/bad\0area"),
+            }
+            assert!(bad.preserved_ownership().is_err(), "case {index}");
+        }
+        let mut bad = raw;
+        bad.format_version = 1;
+        assert!(bad.preserved_ownership().is_err());
+        assert!(!source.exists());
+        assert!(!area_path.exists());
+        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
