@@ -1718,6 +1718,25 @@ separately below.
     Durable compact tip/incremental consumers, archive retention/compaction,
     fixed legacy migration, payload/private ownership, complete capacity/quota
     and retained 1 TiB/platform/release gates remain open.
+  - [x] Persist a bounded event-authority projection for ordinary Node membership
+    consumers. Verified genesis installation, recovery and event ingestion
+    publish the roster/tip with original accepted records and pending-record
+    cleanup in one checked transaction. Active/historical member checks,
+    coordinator lookup, guild summaries and peer-exchange rosters avoid
+    decoding growing writer/recovery/coding vectors. Bound SQL payloads; check
+    canonical roster/checksum, original genesis, exact original tip and final
+    projection reread. Reject malformed/stale projections without fallback;
+    retain legacy behavior for absent projections until a verified install or
+    event fills them. Five fixtures exercise actual signed events, removal,
+    reopen, unreadable unused flat state, ignored/corrupted SQL, rollback and
+    retry. Legacy export peers explicitly model older stores without this
+    projection. All 423 ordinary Node tests are verified across the full run
+    and final seven-target rerun (21 ignored), with strict locked workspace/
+    all-targets Clippy and formatting/diff checks; see ADR 0002. This step does
+    not replace flat event mutations, historical replay, automatic legacy/
+    downgrade projection rebuilding or complete durable history indexes; those
+    and checkpoint ownership/publication, capacity/quota and qualification
+    remain required.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

@@ -1835,6 +1835,21 @@ migrate fixed legacy groups or own payloads. Incremental history maintenance,
 archive retention/compaction, complete aggregate quota/retained 1 TiB and release
 qualification remain required. See ADR 0002 for the validation evidence.
 
+Ordinary Node membership consumers now have a durable compact event-authority
+projection. Verified genesis installation, recovery and event ingestion publish
+the bounded roster/tip with the original accepted records and pending-record
+cleanup in one checked transaction. Active/historical member checks, coordinator
+selection, guild summaries and peer-exchange rosters read the projection without
+loading growing writer/recovery/coding vectors. Fixed SQL payload limits, local
+checksum, original genesis binding, exact original tip and a final reread reject
+malformed/stale projections. Stores without the projection retain the existing
+legacy path until an accepted install/recovery/event publishes it; malformed
+projections do not fall back. This is local authority projection, not a new
+peer certificate or an indexed coding-history proof. Flat event mutations,
+historical replay, automatic legacy/downgrade projection rebuilding, durable
+writer/recovery/coding indexes and atomic checkpoint publication still need
+their bounded integration and the full remaining qualification gates.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

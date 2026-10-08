@@ -249,6 +249,19 @@ future normal publication must require the concrete history checks. Durable
 compact tip publication, incremental consumers, archive retention/compaction,
 fixed legacy migration and enclosing publication/ownership remain required.
 
+Normal Node ingestion now atomically persists a local bounded roster/event-tip
+projection with accepted original genesis, recovered state or events. Ordinary
+member/coordinator/peer-roster consumers use it without decoding accumulated
+writer/recovery/coding history. Fixed bounded reads check its local checksum,
+installed original genesis and exact original event tip, then reread the same
+projection to reject concurrent authority changes. A checksum is local corruption
+detection, not a new quorum signature or peer certificate. Only verified Node
+ingestion constructs the projection. Missing projections use the existing legacy
+path until an accepted install/recovery/event fills them; malformed/stale ones
+fail closed. Full indexed history, automatic legacy/downgrade rebuilding and
+paged checkpoint publication remain separate integration gates. Existing signed
+layouts and wire versions are unchanged.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the

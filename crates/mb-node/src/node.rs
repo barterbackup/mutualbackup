@@ -60,6 +60,8 @@ use crate::volume::{
 
 type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
+mod guild_authority;
+
 type LegacyPackingAttestationEntries =
     BTreeMap<(NodeId, [u8; 32], SectorId), Vec<SignedRecord<mb_core::LegacyPackingAttestation>>>;
 
@@ -873,7 +875,11 @@ impl NodeReader {
         let installed = decode_installed_guild(
             &self
                 .control
-                .get_record("guild-installed", b"primary")?
+                .get_record_bounded(
+                    "guild-installed",
+                    b"primary",
+                    mb_core::GUILD_AUTHORITY_SNAPSHOT_BYTES,
+                )?
                 .context("this node has no installed guild")?,
         )?;
         if installed.certificate.genesis.guild_id != guild_id {
@@ -931,10 +937,8 @@ impl NodeReader {
         guild_id: [u8; 32],
     ) -> Result<Vec<SignedRecord<EndpointRecord>>> {
         let certificate = self.installed_guild_certificate(guild_id)?;
-        let allowed = match self.control.get_record("guild-dynamic-state", b"primary")? {
-            Some(bytes) => {
-                let state: DynamicGuildState = decode_canonical(&bytes)?;
-                state.validate()?;
+        let allowed = match guild_authority::read_or_legacy(&self.control)? {
+            Some(state) => {
                 if state.guild_id != certificate.genesis.guild_id {
                     anyhow::bail!("dynamic membership belongs to another guild");
                 }
@@ -3649,19 +3653,30 @@ impl Node {
                 b"primary".to_vec(),
                 canonical_bytes(&endpoint_cache)?,
             )];
+            let mut authority_state = initial_dynamic.clone();
             match self.dynamic_guild_state()? {
-                Some(state) => validate_dynamic_state_origin(&state, &initial_dynamic)?,
+                Some(state) => {
+                    validate_dynamic_state_origin(&state, &initial_dynamic)?;
+                    authority_state = state;
+                }
                 None => records.push((
                     "guild-dynamic-state".to_owned(),
                     b"primary".to_vec(),
                     canonical_bytes(&initial_dynamic)?,
                 )),
             }
-            self.control.put_records(&records)?;
+            guild_authority::publish(
+                &self.control,
+                &installed,
+                &authority_state,
+                None,
+                &records,
+                &[],
+            )?;
             return Ok(());
         }
         let endpoint_cache = self.merged_guild_endpoint_cache(&installed, peers)?;
-        self.control.put_records(&[
+        let records = [
             (
                 "guild-installed".to_owned(),
                 b"primary".to_vec(),
@@ -3677,7 +3692,15 @@ impl Node {
                 b"primary".to_vec(),
                 canonical_bytes(&initial_dynamic)?,
             ),
-        ])?;
+        ];
+        guild_authority::publish(
+            &self.control,
+            &installed,
+            &initial_dynamic,
+            None,
+            &records,
+            &[],
+        )?;
         Ok(())
     }
 
@@ -3778,7 +3801,14 @@ impl Node {
                 canonical_bytes(&initial_dynamic)?,
             ));
         }
-        self.control.put_records(&records)?;
+        guild_authority::publish(
+            &self.control,
+            &installed,
+            dynamic_state.as_ref().unwrap_or(&initial_dynamic),
+            None,
+            &records,
+            &[],
+        )?;
         Ok(())
     }
 
@@ -4049,16 +4079,16 @@ impl Node {
         records.extend(event_records);
         records.extend(transcript_records);
         records.extend(binding_records);
-        self.control.put_records(&records)?;
+        guild_authority::publish(&self.control, &installed, &state, None, &records, &[])?;
         Ok(())
     }
 
     pub fn guild_summary(&self) -> Result<Option<GuildSummary>> {
         if let Some(installed) = self.installed_guild()? {
-            let dynamic = self.dynamic_guild_state()?;
+            let dynamic = guild_authority::read_or_legacy(&self.control)?;
             let (coordinator, peers, membership_epoch, event_sequence, quorum) = match dynamic {
                 Some(state) => (
-                    dynamic_guild_coordinator(&installed, &state)?,
+                    guild_authority::coordinator(&installed, &state)?,
                     self.dynamic_guild_peers(&installed, &state)?,
                     Some(state.membership_epoch),
                     Some(state.event_sequence),
@@ -4579,6 +4609,10 @@ impl Node {
             None
         };
         let is_forget = forgotten_group.is_some();
+        let authority_before = mb_core::GuildAuthoritySnapshot::from_state(&state)?;
+        let installed = self
+            .installed_guild()?
+            .context("guild event has no installed genesis")?;
         state.apply_event(&certified)?;
         if invalidates_placement_audit {
             // Invalidate before committing the valid event so an interruption
@@ -4705,7 +4739,14 @@ impl Node {
             "guild-event-partial-signatures".to_owned(),
             pending_guild_event_signatures_id(&certified.event).to_vec(),
         ));
-        self.control.put_records_and_delete(&records, &deletions)?;
+        guild_authority::publish(
+            &self.control,
+            &installed,
+            &state,
+            Some(&authority_before),
+            &records,
+            &deletions,
+        )?;
         if let Some(attempt_id) = attempt_id {
             self.volumes.finalize_attempt(&self.control, &attempt_id)?;
         }
@@ -5256,7 +5297,11 @@ impl Node {
 
     fn installed_guild(&self) -> Result<Option<InstalledGuild>> {
         self.control
-            .get_record("guild-installed", b"primary")?
+            .get_record_bounded(
+                "guild-installed",
+                b"primary",
+                mb_core::GUILD_AUTHORITY_SNAPSHOT_BYTES,
+            )?
             .map(|bytes| decode_installed_guild(&bytes))
             .transpose()
     }
@@ -5357,7 +5402,7 @@ impl Node {
     fn dynamic_guild_peers(
         &self,
         installed: &InstalledGuild,
-        state: &DynamicGuildState,
+        state: &mb_core::GuildAuthoritySnapshot,
     ) -> Result<Vec<GuildPeer>> {
         if state.guild_id != installed.certificate.genesis.guild_id {
             anyhow::bail!("dynamic membership belongs to another guild");
@@ -14063,9 +14108,7 @@ fn interrupt_after_recovery_publish() -> Result<()> {
 }
 
 fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
-    if let Some(bytes) = control.get_record("guild-dynamic-state", b"primary")? {
-        let state: DynamicGuildState = decode_canonical(&bytes)?;
-        state.validate()?;
+    if let Some(state) = guild_authority::read_or_legacy(control)? {
         if state.guild_id != *guild_id
             || !state
                 .active_members()
@@ -14075,7 +14118,11 @@ fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId)
         }
         return Ok(());
     }
-    if let Some(bytes) = control.get_record("guild-installed", b"primary")? {
+    if let Some(bytes) = control.get_record_bounded(
+        "guild-installed",
+        b"primary",
+        mb_core::GUILD_AUTHORITY_SNAPSHOT_BYTES,
+    )? {
         let installed = decode_installed_guild(&bytes)?;
         if installed.certificate.genesis.guild_id != *guild_id
             || !installed
@@ -14111,9 +14158,7 @@ fn authorize_historical_member(
     guild_id: &[u8; 32],
     caller: NodeId,
 ) -> Result<()> {
-    if let Some(bytes) = control.get_record("guild-dynamic-state", b"primary")? {
-        let state: DynamicGuildState = decode_canonical(&bytes)?;
-        state.validate()?;
+    if let Some(state) = guild_authority::read_or_legacy(control)? {
         if state.guild_id == *guild_id
             && state
                 .members
@@ -14128,20 +14173,20 @@ fn authorize_historical_member(
 }
 
 fn guild_coordinator(control: &ControlStore, guild_id: &[u8; 32]) -> Result<Option<NodeId>> {
-    let Some(bytes) = control.get_record("guild-installed", b"primary")? else {
+    let Some(bytes) = control.get_record_bounded(
+        "guild-installed",
+        b"primary",
+        mb_core::GUILD_AUTHORITY_SNAPSHOT_BYTES,
+    )?
+    else {
         return Ok(None);
     };
     let installed = decode_installed_guild(&bytes)?;
     if installed.certificate.genesis.guild_id != *guild_id {
         anyhow::bail!("requested guild differs from installed guild");
     }
-    if let Some(bytes) = control.get_record("guild-dynamic-state", b"primary")? {
-        let state: DynamicGuildState = decode_canonical(&bytes)?;
-        state.validate()?;
-        if state.guild_id != *guild_id {
-            anyhow::bail!("dynamic membership belongs to another guild");
-        }
-        return dynamic_guild_coordinator(&installed, &state).map(Some);
+    if let Some(state) = guild_authority::read_or_legacy(control)? {
+        return guild_authority::coordinator(&installed, &state).map(Some);
     }
     Ok(Some(installed.certificate.genesis.coordinator))
 }
@@ -15125,6 +15170,11 @@ pub(crate) mod tests {
                     .collect(),
             )
             .unwrap();
+            // Model an older peer whose accepted legacy history predates the
+            // compact authority projection, including the corrupt variants.
+            node.control
+                .delete_record("guild-authority-tip-v1", b"primary")
+                .unwrap();
             node.control
                 .commit_checkpoint(
                     &state.guild_id,
@@ -16021,6 +16071,11 @@ pub(crate) mod tests {
                 })
                 .collect();
             let install_evidence = |node: &Node| {
+                // Direct legacy fixture ingestion has no compact projection.
+                // Keep all subsequent corrupt-evidence cases on that path.
+                node.control
+                    .delete_record("guild-authority-tip-v1", b"primary")
+                    .unwrap();
                 node.control
                     .put_record(
                         "guild-dynamic-state",

@@ -3465,3 +3465,67 @@ incremental history maintenance, archive retention/compaction under complete
 quota policy, fixed legacy migration, private/bootstrap/native and information/
 parity payload custody, atomic certified-current ownership/publication/retirement
 and all retained-capacity, native/platform/release gates remain open.
+
+## Durable compact event authority for ordinary Node readers (2026-10-08)
+
+Normal Node membership consumers no longer need to decode accumulated writer,
+recovery and coding vectors after a durable compact authority projection exists.
+`guild-authority-tip-v1` stores only the original genesis hash, bounded
+`GuildAuthoritySnapshot` and a local checksum, capped at 128 KiB plus 128 bytes.
+The snapshot includes removed members for historical authorization, event
+sequence/head, membership epoch and quorum. This is private local state derived
+from original accepted authority, not a new signed certificate, protocol format
+or a substitute for the complete indexed coding-history proof.
+
+Verified genesis installation, ordinary recovery, full dynamic recovery and
+new event ingestion publish the projection in the same writer transaction as
+their accepted original records, inherited legacy dynamic state, verifier/binding
+evidence and pending-record cleanup. Original quorum/non-membership validation
+and witness replay run in the existing ingestion paths before publication. A
+private publisher checks the expected compact predecessor and original event
+tail under the writer, checks every accepted write/readback and deletion, then
+publishes the exact new projection with CAS/insert/readback checks. Ignored,
+corrupted or late failing writes roll back both authority and accepted records.
+Original record IDs, signed bodies, hashes and serialized enum identities remain
+unchanged. The transaction still includes the inherited flat state; replacing
+that growing legacy write with indexed mutations remains required.
+
+Active and historical member authorization, coordinator lookup, guild summary
+membership and NodeReader peer-exchange rosters consume fixed projection reads.
+SQL bounds the payload before allocation. Canonical/schema/roster/checksum
+validation, original installed-genesis binding and an exact bounded original
+event-tip lookup reject missing, conflicting, stale and oversized rows. A final
+projection reread rejects concurrent authority changes. Lookup performs no full
+history traversal or witness replay. Genesis reads in these paths also have a
+fixed SQL payload bound. A checksum detects local corruption; it does not make
+arbitrary proposed membership authoritative.
+
+An older store with no projection retains its existing full legacy validation
+path. The next verified genesis/recovery/event installation fills the projection
+atomically. A present malformed or stale projection never silently falls back to
+another authority. Automatic original-history rebuilding for legacy/downgrade
+stores remains required; this step does not certify that migration gate or
+remove the inherited whole-state paths elsewhere.
+
+Validation covers all 423 ordinary locked Node library tests (21 ignored).
+The full run passed 420, with two legacy-export fixtures failing because their
+directly injected history left a genesis projection stale. After those fixtures
+explicitly model older stores without the projection, the final seven-target
+run passes both export cases and all five projection fixtures, including the
+added initial-publication rollback and original-genesis signature assertions.
+Production code is identical across these runs. Strict locked workspace/
+all-targets Clippy and formatting/diff checks pass.
+The focused fixtures exercise actual original genesis and signed membership/
+writer events, coordinator removal, active versus historical members, reopen,
+missing legacy projections, fixed bounds/checksum/genesis/tip failures and stale
+proposals. They replace the unused flat blob with an unreadable 2 MiB record to
+prove ordinary projected readers do not decode it. SQL triggers exercise ignored
+and corrupted writes in the original event/state/projection batch, pending-record
+deletion and initial recovered-guild publication, followed by valid retry.
+The existing legacy-export peer fixtures explicitly model older stores without
+this projection when directly installing legacy history. Their corrupt-signature,
+parent, Add, epoch and unavailable-evidence cases continue to exercise original
+history validation, rather than failing early on a stale fixture projection.
+This does not qualify a retained 1 TiB dataset, indexed coding-history spill,
+full quota policy, private/payload ownership, normal paged checkpoint production
+or the remaining native/platform/release gates.
