@@ -18,7 +18,7 @@ use mb_core::{
 use mb_store::ControlStore;
 
 use super::LegacyExportReport;
-use super::local_inventory::PreservedInputScope;
+use super::local_inventory::PreservedInput;
 use crate::{Node, P2pClient, P2pConfig, TorMode, build_p2p};
 
 /// An explicitly selected identity-bound peer endpoint: `NODE-ID=MULTIADDR`.
@@ -73,57 +73,78 @@ pub struct LegacyPeerInventoryCoverage {
     pub unauthorized_owner_checkpoints: u64,
 }
 
-fn scratch_parent(
-    candidate: &Path,
-    data_dir: &Path,
-    anchor_areas: &[PathBuf],
-    parity_volumes: &[PathBuf],
-    scope: &PreservedInputScope,
-) -> Result<PathBuf> {
-    scratch_parent_with_native_lookup(
-        candidate,
-        data_dir,
-        anchor_areas,
-        parity_volumes,
-        scope,
-        |path| mb_store::directory_identity(path),
-    )
+#[derive(Debug)]
+struct ScratchAncestor {
+    device: u64,
+    inode: u64,
+    native_id: Option<mb_store::NativeFileId>,
 }
 
-fn scratch_parent_with_native_lookup(
-    candidate: &Path,
-    data_dir: &Path,
-    anchor_areas: &[PathBuf],
-    parity_volumes: &[PathBuf],
-    scope: &PreservedInputScope,
-    native_identity: impl Fn(
-        &Path,
-    ) -> std::result::Result<mb_store::NativeFileId, mb_store::AnchorError>,
-) -> Result<PathBuf> {
-    let parent = candidate.canonicalize()?;
-    let mut directory_ids = BTreeSet::new();
-    let native_inodes: BTreeSet<_> = scope.native_roots.iter().map(|id| id.inode).collect();
-    for input in std::iter::once(data_dir)
-        .chain(anchor_areas.iter().map(PathBuf::as_path))
-        .chain(parity_volumes.iter().map(PathBuf::as_path))
-    {
-        let input = input.canonicalize()?;
-        reject_preserved_parent(&parent, &input)?;
-        let metadata = input.metadata()?;
-        if metadata.is_dir() {
-            directory_ids.insert((metadata.dev(), metadata.ino()));
+/// Placement state depends on the temporary parent's ancestry, not the number
+/// of preserved owners. Only one repeated path hint is cached between rows.
+#[derive(Debug)]
+struct ScratchParentCheck {
+    parent: PathBuf,
+    ancestors: Vec<ScratchAncestor>,
+    ancestor_inodes: BTreeSet<u64>,
+    last_hint: Option<PathBuf>,
+}
+
+impl ScratchParentCheck {
+    fn new(candidate: &Path, data_dir: &Path, selected_inputs: &[PathBuf]) -> Result<Self> {
+        let parent = candidate.canonicalize()?;
+        ensure!(
+            parent.is_dir(),
+            "temporary client parent must be a directory"
+        );
+        let mut ancestors = Vec::new();
+        let mut ancestor_inodes = BTreeSet::new();
+        for path in parent.ancestors() {
+            let metadata = path.metadata()?;
+            ancestor_inodes.insert(metadata.ino());
+            ancestors.push(ScratchAncestor {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                native_id: None,
+            });
         }
+        let checked = Self {
+            parent,
+            ancestors,
+            ancestor_inodes,
+            last_hint: None,
+        };
+        for path in std::iter::once(data_dir).chain(selected_inputs.iter().map(PathBuf::as_path)) {
+            checked.reject_canonical_path(&path.canonicalize()?)?;
+        }
+        Ok(checked)
     }
-    for input in &scope.paths {
+
+    fn reject_canonical_path(&self, input: &Path) -> Result<()> {
+        ensure!(
+            !self.parent.starts_with(input),
+            "temporary client directory must be outside preserved inputs; select another TMPDIR"
+        );
+        let metadata = input.metadata()?;
+        ensure!(
+            !metadata.is_dir()
+                || !self
+                    .ancestors
+                    .iter()
+                    .any(|ancestor| ancestor.device == metadata.dev()
+                        && ancestor.inode == metadata.ino()),
+            "temporary client directory must be outside preserved inputs; select another TMPDIR"
+        );
+        Ok(())
+    }
+
+    fn check_hint(&mut self, input: &Path) -> Result<()> {
+        if self.last_hint.as_deref() == Some(input) {
+            return Ok(());
+        }
         match input.canonicalize() {
-            Ok(input) => {
-                reject_preserved_parent(&parent, &input)?;
-                let metadata = input.metadata()?;
-                if metadata.is_dir() {
-                    directory_ids.insert((metadata.dev(), metadata.ino()));
-                }
-            }
-            // Recovery need not have the original sources or anchor locations.
+            Ok(path) => self.reject_canonical_path(&path)?,
+            // Recovery need not have original sources or anchor locations.
             Err(error)
                 if matches!(
                     error.kind(),
@@ -131,38 +152,63 @@ fn scratch_parent_with_native_lookup(
                 ) => {}
             Err(error) => return Err(error).context("cannot inspect preserved input location"),
         }
+        self.last_hint = Some(input.to_path_buf());
+        Ok(())
     }
-    for ancestor in parent.ancestors() {
-        let metadata = ancestor.metadata()?;
-        ensure!(
-            !directory_ids.contains(&(metadata.dev(), metadata.ino())),
-            "temporary client directory must be outside preserved inputs; select another TMPDIR"
-        );
-        if native_inodes.contains(&metadata.ino()) {
-            // Only possible inode matches need a stable filesystem lookup.
-            // If it is unavailable, a renamed preserved root cannot be ruled
-            // out, including after a kernel/filesystem capability change.
-            let identity = native_identity(ancestor).context(
-                "cannot verify temporary client directory ancestry; select another TMPDIR",
-            )?;
+
+    fn check_native(&mut self, root: mb_store::NativeFileId) -> Result<()> {
+        self.check_native_with(root, |path| mb_store::directory_identity(path))
+    }
+
+    fn check_native_with(
+        &mut self,
+        root: mb_store::NativeFileId,
+        native_identity: impl Fn(
+            &Path,
+        )
+            -> std::result::Result<mb_store::NativeFileId, mb_store::AnchorError>,
+    ) -> Result<()> {
+        if !self.ancestor_inodes.contains(&root.inode) {
+            return Ok(());
+        }
+        for (path, ancestor) in self.parent.ancestors().zip(&mut self.ancestors) {
+            if ancestor.inode != root.inode {
+                continue;
+            }
+            // An unverifiable possible match cannot rule out a renamed root,
+            // including after a kernel/filesystem capability change. Successful
+            // lookups are reused for all later owners with this ancestor inode.
+            let identity = match ancestor.native_id {
+                Some(identity) => identity,
+                None => {
+                    let identity = native_identity(path).context(
+                        "cannot verify temporary client directory ancestry; select another TMPDIR",
+                    )?;
+                    ancestor.native_id = Some(identity);
+                    identity
+                }
+            };
             ensure!(
-                !scope.native_roots.contains(&identity),
+                root != identity,
                 "temporary client directory must be outside preserved inputs; select another TMPDIR"
             );
         }
+        Ok(())
     }
-    Ok(parent)
+
+    fn finish(self) -> Result<PathBuf> {
+        for (path, ancestor) in self.parent.ancestors().zip(&self.ancestors) {
+            let metadata = path.metadata()?;
+            ensure!(
+                metadata.dev() == ancestor.device && metadata.ino() == ancestor.inode,
+                "temporary client directory ancestry changed during preflight; select another TMPDIR"
+            );
+        }
+        Ok(self.parent)
+    }
 }
 
-fn reject_preserved_parent(parent: &Path, input: &Path) -> Result<()> {
-    ensure!(
-        !parent.starts_with(input),
-        "temporary client directory must be outside preserved inputs; select another TMPDIR"
-    );
-    Ok(())
-}
-
-fn peer_client_preflight(
+pub(super) fn peer_client_preflight(
     keys: &KeyMaterial,
     data_dir: &Path,
     candidate: &Path,
@@ -170,13 +216,13 @@ fn peer_client_preflight(
     discover: bool,
 ) -> Result<(PathBuf, Option<[u8; 32]>)> {
     crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
-        let (local_state, scope) = super::local_inventory::collect_with_scope(
-            control,
-            &mut 0,
-            mb_core::V1_MAX_CATALOG_BYTES,
-        )?;
-        mb_core::canonical_size_bounded(&local_state, mb_core::V1_MAX_CATALOG_BYTES)?;
-        drop(local_state);
+        let mut checked = ScratchParentCheck::new(candidate, data_dir, protected_inputs)?;
+        super::local_inventory::for_each_record(control, |record| {
+            record.for_each_input(|input| match input {
+                PreservedInput::PathHint(path) => checked.check_hint(path),
+                PreservedInput::NativeRoot(root) => checked.check_native(root),
+            })
+        })?;
         let guild = if discover {
             Some(
                 crate::node::preserved_guild_certificate(control)?
@@ -187,10 +233,7 @@ fn peer_client_preflight(
         } else {
             None
         };
-        Ok((
-            scratch_parent(candidate, data_dir, protected_inputs, &[], &scope)?,
-            guild,
-        ))
+        Ok((checked.finish()?, guild))
     })
 }
 
@@ -821,15 +864,14 @@ mod tests {
         for path in &paths {
             std::fs::create_dir(path).unwrap();
         }
-        let scope = PreservedInputScope::default();
-        assert!(scratch_parent(temp.path(), &paths[0], &paths[1..2], &paths[2..], &scope).is_ok());
+        assert!(ScratchParentCheck::new(temp.path(), &paths[0], &paths[1..]).is_ok());
         for path in &paths {
-            assert!(scratch_parent(path, &paths[0], &paths[1..2], &paths[2..], &scope).is_err());
+            assert!(ScratchParentCheck::new(path, &paths[0], &paths[1..]).is_err());
             assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
         }
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&paths[0], &alias).unwrap();
-        assert!(scratch_parent(&alias, &paths[0], &paths[1..2], &paths[2..], &scope).is_err());
+        assert!(ScratchParentCheck::new(&alias, &paths[0], &paths[1..]).is_err());
         let first = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
         let second = KeyMaterial::from_seed(&Seed::from_bytes([72; 32])).node_id();
         assert!(
@@ -847,28 +889,71 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("catalog");
         std::fs::create_dir(&data).unwrap();
-        let mut scope = PreservedInputScope::default();
+        let mut checked = ScratchParentCheck::new(temp.path(), &data, &[]).unwrap();
         // Ordinary temporary filesystems need no enrollment capability when
         // their ancestry cannot match a preserved native root.
         assert!(
-            scratch_parent_with_native_lookup(temp.path(), &data, &[], &[], &scope, |_| panic!(
-                "unnecessary stable identity lookup"
-            ))
-            .is_ok()
+            checked
+                .check_native_with(
+                    mb_store::NativeFileId {
+                        filesystem_id: 7,
+                        inode: data.metadata().unwrap().ino(),
+                    },
+                    |_| panic!("unnecessary stable identity lookup")
+                )
+                .is_ok()
         );
-        scope.native_roots.insert(mb_store::NativeFileId {
+        let possible_root = mb_store::NativeFileId {
             filesystem_id: 7,
             inode: temp.path().metadata().unwrap().ino(),
-        });
-        let error = scratch_parent_with_native_lookup(temp.path(), &data, &[], &[], &scope, |_| {
-            Err(mb_store::AnchorError::ReflinkUnavailable(
-                std::io::Error::new(std::io::ErrorKind::Unsupported, "stable UUID unavailable"),
-            ))
-        })
-        .unwrap_err();
+        };
+        let error = checked
+            .check_native_with(possible_root, |_| {
+                Err(mb_store::AnchorError::ReflinkUnavailable(
+                    std::io::Error::new(std::io::ErrorKind::Unsupported, "stable UUID unavailable"),
+                ))
+            })
+            .unwrap_err();
         assert!(error.to_string().contains("select another TMPDIR"));
+        let actual = possible_root;
+        checked
+            .check_native_with(
+                mb_store::NativeFileId {
+                    filesystem_id: 8,
+                    inode: actual.inode,
+                },
+                |_| Ok(actual),
+            )
+            .unwrap();
+        // A previously accepted owner on another filesystem must not hide a
+        // later exact owner; cache the observed ancestor, not the input ID.
+        let error = checked
+            .check_native_with(actual, |_| panic!("cached ancestor lookup"))
+            .unwrap_err();
+        assert!(error.to_string().contains("outside preserved inputs"));
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn legacy_peer_scratch_rejects_parent_replacement_during_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("catalog");
+        let parent = temp.path().join("scratch-parent");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let checked = ScratchParentCheck::new(&parent, &data, &[]).unwrap();
+        let original = temp.path().join("original-parent");
+        std::fs::rename(&parent, &original).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let error = checked.finish().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ancestry changed during preflight")
+        );
+        assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
     }
 
     #[test]
@@ -1044,12 +1129,15 @@ mod tests {
             // Inode equality across distinct stable filesystem identities is
             // not ownership; Btrfs subvolumes can reuse inode numbers.
             let native = mb_store::directory_identity(&root).unwrap();
-            let mut unrelated = PreservedInputScope::default();
-            unrelated.native_roots.insert(mb_store::NativeFileId {
-                filesystem_id: native.filesystem_id.wrapping_add(1).max(1),
-                inode: native.inode,
-            });
-            assert!(scratch_parent(&root, &data, &[], &[], &unrelated).is_ok());
+            let mut unrelated = ScratchParentCheck::new(&root, &data, &[]).unwrap();
+            assert!(
+                unrelated
+                    .check_native(mb_store::NativeFileId {
+                        filesystem_id: native.filesystem_id.wrapping_add(1).max(1),
+                        inode: native.inode,
+                    })
+                    .is_ok()
+            );
             for path in [&root, &root.join("nested")] {
                 let error = peer_client_preflight(&keys, &data, path, &[], false).unwrap_err();
                 assert!(

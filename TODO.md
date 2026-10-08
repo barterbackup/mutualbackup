@@ -496,12 +496,36 @@ remain active.
     exercised source slice, not a new installed artifact or the full M6 gate.
     External Git catalogs and worktrees, other intent/native-anchor/volume owners,
     relocated anchor-area discovery and concurrent path replacement still require
-    the complete R1
-    isolation gate. Preflight currently inherits the 32 MiB local-state report
-    ceiling; stream and account the ownership scope independently before claiming
-    large retained-graph support, and qualify unavailable old mount hints. Full
-    conversion, upgrade/source-loss and installed/platform qualification remain
-    open.
+    the complete R1 isolation gate. The following streaming increment removes
+    preflight's inherited 32 MiB report ceiling; unavailable old mount hints still
+    require qualification. Full conversion, upgrade/source-loss and
+    installed/platform qualification remain open.
+  - [x] Qualify streamed preserved-record placement validation independently of
+    the inventory report. One shared decoder validates canonical bytes, record
+    keys/versions, namespace/anchor shapes and extents. Inventory retains its
+    format-2 report and aggregate 32 MiB ceiling; peer preflight streams every
+    relevant row with the existing SQL per-row byte limits, without allocating
+    report entries, root/anchor sets or digest summaries. Placement state contains
+    only temporary-parent ancestry, cached observed native identities and one
+    recent path hint. Recheck ancestor device/inode identities after the last row
+    before creating private client state. Cache observed ancestor identities,
+    rather than the input owner ID, so an unrelated owner cannot hide a later
+    exact match.
+    Validation: all 24 inventory/export/range/peer cases, two discovery cases,
+    19 ordinary CLI process cases and the separately provisioned Btrfs identity
+    case pass (46 unique cases; three process cases remain explicitly ignored).
+    A valid fixture with 219 retained captures and 28,032 raw-path file-pin
+    references has a 33,738,045-byte canonical report body. Inventory rejects its
+    aggregate report budget while placement succeeds without building that
+    report. Late unsafe area hints and malformed locators reject after the large
+    prefix, with catalog hashes and file sets unchanged. Deterministic checks
+    reject replacement of the temporary parent during inspection and preserve
+    native identity failures/cached exact matches. Existing wrapped/legacy key,
+    raw path, alias, discovery and renamed-root coverage remains passing. All
+    four programs build; formatting and strict locked workspace/all-targets
+    Clippy pass. Disposable Btrfs mount, loop and image cleanup is verified.
+    This is local known-owner placement work, not complete ownership inventory,
+    retained conversion, installed artifact or 1 TiB capacity qualification.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

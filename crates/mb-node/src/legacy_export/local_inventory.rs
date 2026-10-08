@@ -1,11 +1,7 @@
 //! Preserved local registrations and historical anchor ownership, without
 //! opening a source path, Git runtime, anchor payload or withdrawn mount.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    os::unix::ffi::OsStrExt,
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, os::unix::ffi::OsStrExt};
 
 use anyhow::{Context, Result, ensure};
 use mb_core::{
@@ -94,13 +90,63 @@ pub struct LegacyPreservedRecord {
     pub payload_hash: String,
 }
 
-/// Known exclusions for a temporary peer client. Paths remain exclusions even
-/// when their registrations disagree; neither a hint nor this partial scope is
-/// proof that all retained owners or external Git catalogs have been found.
-#[derive(Default)]
-pub(super) struct PreservedInputScope {
-    pub paths: BTreeSet<PathBuf>,
-    pub native_roots: BTreeSet<NativeFileId>,
+/// A validated local record. The scanner retains at most one decoded row;
+/// consumers choose whether to build a bounded report or check locations.
+pub(super) enum PreservedLocalRecord<'a> {
+    Root(ProtectedRoot),
+    Binding(SourceBackendBinding),
+    Git(GitRepositoryInfo),
+    Capture {
+        kind: &'a str,
+        revision_id: Uuid,
+        capture: GuardedStoppedCaptureV1,
+    },
+    Unclassified {
+        kind: &'a str,
+        key: &'a [u8],
+        bytes: &'a [u8],
+    },
+}
+
+pub(super) enum PreservedInput<'a> {
+    PathHint(&'a std::path::Path),
+    NativeRoot(NativeFileId),
+}
+
+impl PreservedLocalRecord<'_> {
+    /// Known exclusions only. A path hint is not ownership authority, and
+    /// opaque records do not establish a complete retained ownership graph.
+    pub(super) fn for_each_input(
+        &self,
+        mut visit: impl FnMut(PreservedInput<'_>) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Self::Root(root) => {
+                visit(PreservedInput::PathHint(&root.path))?;
+                if matches!(root.format_version, 3 | 4) {
+                    visit(PreservedInput::NativeRoot(NativeFileId {
+                        filesystem_id: root.filesystem_id,
+                        inode: root.root_inode,
+                    }))?;
+                }
+            }
+            Self::Binding(binding) => visit(PreservedInput::NativeRoot(NativeFileId {
+                filesystem_id: binding.filesystem_id,
+                inode: binding.root_inode,
+            }))?,
+            Self::Git(registration) => visit(PreservedInput::PathHint(&registration.path))?,
+            Self::Capture { capture, .. } => {
+                visit(PreservedInput::NativeRoot(capture.metadata.lower_root_id))?;
+                for file in &capture.files {
+                    // A volume root is a discovery starting point, often `/`,
+                    // not ownership of the whole filesystem.
+                    visit(PreservedInput::PathHint(&file.locator.area.path_hint))?;
+                }
+            }
+            Self::Unclassified { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 fn account<T: Serialize>(item: &T, used: &mut usize, limit: usize) -> Result<()> {
@@ -123,27 +169,59 @@ fn canonical_record<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> R
     Ok(record)
 }
 
-pub(super) fn collect(
-    control: &ControlStore,
-    used: &mut usize,
-    limit: usize,
-) -> Result<LegacyLocalStateInventory> {
-    collect_with_scope(control, used, limit).map(|(report, _)| report)
+fn validate_capture(capture: &GuardedStoppedCaptureV1) -> Result<()> {
+    capture.validate_shape()?;
+    for file in &capture.files {
+        let locator = &file.locator;
+        ensure!(
+            !locator.anchor_id.is_nil() && !locator.area.area_id.is_nil(),
+            "invalid preserved anchor ownership ID"
+        );
+        let relative = locator.relative_path.as_os_str().as_bytes();
+        let mut normalized = std::path::PathBuf::new();
+        for component in locator.relative_path.components() {
+            let std::path::Component::Normal(name) = component else {
+                anyhow::bail!("unsafe preserved anchor relative path")
+            };
+            normalized.push(name);
+        }
+        ensure!(
+            !relative.is_empty()
+                && !relative.contains(&0)
+                && normalized.as_os_str().as_bytes() == relative,
+            "unsafe preserved anchor relative path"
+        );
+        let mut end = 0;
+        for extent in &file.data_extents {
+            ensure!(
+                extent.logical_len != 0 && extent.offset >= end,
+                "invalid preserved anchor extent order"
+            );
+            end = extent
+                .offset
+                .checked_add(extent.logical_len)
+                .context("preserved anchor extent overflow")?;
+            ensure!(
+                end <= file.logical_len,
+                "preserved anchor extent exceeds file"
+            );
+        }
+        ensure!(
+            locator.area.path_hint.is_absolute()
+                && !locator.area.path_hint.as_os_str().as_bytes().contains(&0),
+            "unsafe preserved anchor area path hint"
+        );
+    }
+    Ok(())
 }
 
-pub(super) fn collect_with_scope(
+/// Stream every relevant row with SQL byte limits before materialization.
+/// Validation is shared by report and placement consumers; neither may skip
+/// canonical/shape checks merely because it does not need a field for output.
+pub(super) fn for_each_record(
     control: &ControlStore,
-    used: &mut usize,
-    limit: usize,
-) -> Result<(LegacyLocalStateInventory, PreservedInputScope)> {
-    let mut scope = PreservedInputScope::default();
-    let mut report = LegacyLocalStateInventory {
-        protected_roots: Vec::new(),
-        source_backends: Vec::new(),
-        git_repositories: Vec::new(),
-        guarded_captures: Vec::new(),
-        unclassified_guarded_records: Vec::new(),
-    };
+    mut visit: impl FnMut(PreservedLocalRecord<'_>) -> Result<()>,
+) -> Result<()> {
     control.for_each_record_bounded("protected-root", 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
         let root: ProtectedRoot = canonical_record(bytes)?;
         ensure!(
@@ -156,23 +234,7 @@ pub(super) fn collect_with_scope(
                 && !root.path.as_os_str().as_bytes().contains(&0),
             "invalid preserved protected-root registration"
         );
-        let entry = LegacyRootRegistration {
-            root_id: root.root_id,
-            record_format: root.format_version,
-            path_hex: hex::encode(root.path.as_os_str().as_bytes()),
-            filesystem_id: root.filesystem_id,
-            root_inode: root.root_inode,
-            signed_revision_ids: Vec::new(),
-        };
-        account(&entry, used, limit)?;
-        scope.paths.insert(root.path);
-        if matches!(root.format_version, 3 | 4) {
-            scope.native_roots.insert(NativeFileId {
-                filesystem_id: root.filesystem_id,
-                inode: root.root_inode,
-            });
-        }
-        report.protected_roots.push(entry);
+        visit(PreservedLocalRecord::Root(root))?;
         Ok(true)
     })?;
     control.for_each_record_bounded("source-backend", 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
@@ -187,27 +249,7 @@ pub(super) fn collect_with_scope(
                 && binding.mount_id != 0,
             "invalid preserved source-backend binding"
         );
-        let root = report
-            .protected_roots
-            .binary_search_by_key(&binding.root_id, |root| root.root_id)
-            .ok()
-            .map(|index| &report.protected_roots[index]);
-        let entry = LegacySourceBinding {
-            registered_root: root.is_some(),
-            registration_identity_matches: root
-                .filter(|root| matches!(root.record_format, 3 | 4))
-                .map(|root| {
-                    root.filesystem_id == binding.filesystem_id
-                        && root.root_inode == binding.root_inode
-                }),
-            binding,
-        };
-        account(&entry, used, limit)?;
-        scope.native_roots.insert(NativeFileId {
-            filesystem_id: entry.binding.filesystem_id,
-            inode: entry.binding.root_inode,
-        });
-        report.source_backends.push(entry);
+        visit(PreservedLocalRecord::Binding(binding))?;
         Ok(true)
     })?;
     control.for_each_record_bounded("git-repository", 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
@@ -220,19 +262,7 @@ pub(super) fn collect_with_scope(
                 && !registration.path.as_os_str().as_bytes().contains(&0),
             "invalid preserved Git registration"
         );
-        let entry = LegacyGitRegistration {
-            repository_id: registration.repository_id,
-            path_hex: hex::encode(registration.path.as_os_str().as_bytes()),
-            registered_root: report
-                .protected_roots
-                .binary_search_by_key(&registration.repository_id, |root| root.root_id)
-                .is_ok(),
-            catalog_inventoried: false,
-            signed_revision_ids: Vec::new(),
-        };
-        account(&entry, used, limit)?;
-        scope.paths.insert(registration.path);
-        report.git_repositories.push(entry);
+        visit(PreservedLocalRecord::Git(registration))?;
         Ok(true)
     })?;
     for prefix in ["guarded-", "link-freeze-"] {
@@ -264,97 +294,134 @@ pub(super) fn collect_with_scope(
                     _ => None,
                 };
                 if let Some((revision_id, capture)) = capture {
-                    capture.validate_shape()?;
-                    let mut entry = LegacyGuardedCapture {
-                        record_kind: kind.to_owned(),
+                    validate_capture(&capture)?;
+                    visit(PreservedLocalRecord::Capture {
+                        kind,
                         revision_id,
-                        protected_root_id: None,
-                        signed_revision_metadata_available: false,
-                        namespace_anchor_id: capture.metadata.anchor_id,
-                        anchors: Vec::new(),
-                        payloads_verified: false,
-                    };
-                    account(&entry, used, limit)?;
-                    scope.native_roots.insert(capture.metadata.lower_root_id);
-                    for file in capture.files {
-                        let locator = file.locator;
-                        ensure!(
-                            !locator.anchor_id.is_nil() && !locator.area.area_id.is_nil(),
-                            "invalid preserved anchor ownership ID"
-                        );
-                        let relative = locator.relative_path.as_os_str().as_bytes();
-                        let mut normalized = std::path::PathBuf::new();
-                        for component in locator.relative_path.components() {
-                            let std::path::Component::Normal(name) = component else {
-                                anyhow::bail!("unsafe preserved anchor relative path")
-                            };
-                            normalized.push(name);
-                        }
-                        ensure!(
-                            !relative.is_empty()
-                                && !relative.contains(&0)
-                                && normalized.as_os_str().as_bytes() == relative,
-                            "unsafe preserved anchor relative path"
-                        );
-                        let mut end = 0;
-                        for extent in file.data_extents {
-                            ensure!(
-                                extent.logical_len != 0 && extent.offset >= end,
-                                "invalid preserved anchor extent order"
-                            );
-                            end = extent
-                                .offset
-                                .checked_add(extent.logical_len)
-                                .context("preserved anchor extent overflow")?;
-                            ensure!(
-                                end <= file.logical_len,
-                                "preserved anchor extent exceeds file"
-                            );
-                        }
-                        let pin = LegacyGuardedAnchorPin {
-                            namespace_path_hex: hex::encode(file.path),
-                            area_id: locator.area.area_id,
-                            filesystem_id: locator.area.filesystem_id,
-                            area_path_hint_hex: hex::encode(
-                                locator.area.path_hint.as_os_str().as_bytes(),
-                            ),
-                            volume_root_hint_hex: hex::encode(
-                                locator.area.volume_root_hint.as_os_str().as_bytes(),
-                            ),
-                            anchor_id: locator.anchor_id,
-                            relative_path_hex: hex::encode(
-                                locator.relative_path.as_os_str().as_bytes(),
-                            ),
-                            logical_len: file.logical_len,
-                            content_hash: hex::encode(file.content_hash),
-                        };
-                        account(&pin, used, limit)?;
-                        // A volume-root hint is a discovery starting point,
-                        // often `/`, not an owned source or anchor directory.
-                        ensure!(
-                            locator.area.path_hint.is_absolute()
-                                && !locator.area.path_hint.as_os_str().as_bytes().contains(&0),
-                            "unsafe preserved anchor area path hint"
-                        );
-                        scope.paths.insert(locator.area.path_hint);
-                        entry.anchors.push(pin);
-                    }
-                    report.guarded_captures.push(entry);
+                        capture,
+                    })?;
                 } else {
-                    let entry = LegacyPreservedRecord {
-                        kind: kind.to_owned(),
-                        record_id_hex: hex::encode(key),
-                        payload_bytes: bytes.len() as u64,
-                        payload_hash: hex::encode(blake3::hash(bytes).as_bytes()),
-                    };
-                    account(&entry, used, limit)?;
-                    report.unclassified_guarded_records.push(entry);
+                    visit(PreservedLocalRecord::Unclassified { kind, key, bytes })?;
                 }
                 Ok(true)
             },
         )?;
     }
-    Ok((report, scope))
+    Ok(())
+}
+
+pub(super) fn collect(
+    control: &ControlStore,
+    used: &mut usize,
+    limit: usize,
+) -> Result<LegacyLocalStateInventory> {
+    let mut report = LegacyLocalStateInventory {
+        protected_roots: Vec::new(),
+        source_backends: Vec::new(),
+        git_repositories: Vec::new(),
+        guarded_captures: Vec::new(),
+        unclassified_guarded_records: Vec::new(),
+    };
+    for_each_record(control, |record| {
+        match record {
+            PreservedLocalRecord::Root(root) => {
+                let entry = LegacyRootRegistration {
+                    root_id: root.root_id,
+                    record_format: root.format_version,
+                    path_hex: hex::encode(root.path.as_os_str().as_bytes()),
+                    filesystem_id: root.filesystem_id,
+                    root_inode: root.root_inode,
+                    signed_revision_ids: Vec::new(),
+                };
+                account(&entry, used, limit)?;
+                report.protected_roots.push(entry);
+            }
+            PreservedLocalRecord::Binding(binding) => {
+                let root = report
+                    .protected_roots
+                    .binary_search_by_key(&binding.root_id, |root| root.root_id)
+                    .ok()
+                    .map(|index| &report.protected_roots[index]);
+                let entry = LegacySourceBinding {
+                    registered_root: root.is_some(),
+                    registration_identity_matches: root
+                        .filter(|root| matches!(root.record_format, 3 | 4))
+                        .map(|root| {
+                            root.filesystem_id == binding.filesystem_id
+                                && root.root_inode == binding.root_inode
+                        }),
+                    binding,
+                };
+                account(&entry, used, limit)?;
+                report.source_backends.push(entry);
+            }
+            PreservedLocalRecord::Git(registration) => {
+                let entry = LegacyGitRegistration {
+                    repository_id: registration.repository_id,
+                    path_hex: hex::encode(registration.path.as_os_str().as_bytes()),
+                    registered_root: report
+                        .protected_roots
+                        .binary_search_by_key(&registration.repository_id, |root| root.root_id)
+                        .is_ok(),
+                    catalog_inventoried: false,
+                    signed_revision_ids: Vec::new(),
+                };
+                account(&entry, used, limit)?;
+                report.git_repositories.push(entry);
+            }
+            PreservedLocalRecord::Capture {
+                kind,
+                revision_id,
+                capture,
+            } => {
+                let mut entry = LegacyGuardedCapture {
+                    record_kind: kind.to_owned(),
+                    revision_id,
+                    protected_root_id: None,
+                    signed_revision_metadata_available: false,
+                    namespace_anchor_id: capture.metadata.anchor_id,
+                    anchors: Vec::new(),
+                    payloads_verified: false,
+                };
+                account(&entry, used, limit)?;
+                for file in capture.files {
+                    let locator = file.locator;
+                    let pin = LegacyGuardedAnchorPin {
+                        namespace_path_hex: hex::encode(file.path),
+                        area_id: locator.area.area_id,
+                        filesystem_id: locator.area.filesystem_id,
+                        area_path_hint_hex: hex::encode(
+                            locator.area.path_hint.as_os_str().as_bytes(),
+                        ),
+                        volume_root_hint_hex: hex::encode(
+                            locator.area.volume_root_hint.as_os_str().as_bytes(),
+                        ),
+                        anchor_id: locator.anchor_id,
+                        relative_path_hex: hex::encode(
+                            locator.relative_path.as_os_str().as_bytes(),
+                        ),
+                        logical_len: file.logical_len,
+                        content_hash: hex::encode(file.content_hash),
+                    };
+                    account(&pin, used, limit)?;
+                    entry.anchors.push(pin);
+                }
+                report.guarded_captures.push(entry);
+            }
+            PreservedLocalRecord::Unclassified { kind, key, bytes } => {
+                let entry = LegacyPreservedRecord {
+                    kind: kind.to_owned(),
+                    record_id_hex: hex::encode(key),
+                    payload_bytes: bytes.len() as u64,
+                    payload_hash: hex::encode(blake3::hash(bytes).as_bytes()),
+                };
+                account(&entry, used, limit)?;
+                report.unclassified_guarded_records.push(entry);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(report)
 }
 
 impl LegacyLocalStateInventory {
@@ -404,6 +471,7 @@ mod tests {
         GuardedViewMetadataV1, NativeFileId, StableAnchorAreaLocator, StableAnchorFileLocator,
     };
     use std::{
+        collections::BTreeSet,
         ffi::OsString,
         fs,
         os::unix::ffi::OsStringExt,
@@ -502,6 +570,121 @@ mod tests {
         for (name, bytes) in before {
             assert!(after[name] == *bytes, "preserved file changed: {name:?}");
         }
+    }
+
+    #[test]
+    fn legacy_peer_preflight_streams_retained_captures_beyond_report_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("original");
+        fs::create_dir(&data).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([50; 32]));
+        let mut capture = stopped_capture(temp.path());
+        let template_entry = capture.metadata.entries[0].clone();
+        let template_file = capture.files[0].clone();
+        capture.metadata.entries.clear();
+        capture.files.clear();
+        for index in 0..128 {
+            let mut name = format!("file-{index:04}-").into_bytes();
+            name.resize(239, b'x');
+            name.push(0xff);
+            let native_id = NativeFileId {
+                filesystem_id: 7,
+                inode: 1000 + index,
+            };
+            let mut entry = template_entry.clone();
+            entry.path = name.clone();
+            entry.native_id = native_id;
+            let mut file = template_file.clone();
+            file.path = name.clone();
+            file.native_id = native_id;
+            file.locator.relative_path = raw_path(Path::new("capture"), &name);
+            capture.metadata.entries.push(entry);
+            capture.files.push(file);
+        }
+        validate_capture(&capture).unwrap();
+        let kind = "guarded-view-stopped-capture-v1";
+        let payload = canonical_bytes(&capture).unwrap();
+        let mut store = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        save(&store, kind, Uuid::from_u128(1), &capture);
+        let report = collect(&store, &mut 0, V1_MAX_CATALOG_BYTES).unwrap();
+        let row_cost =
+            canonical_size_bounded(&report.guarded_captures[0], V1_MAX_CATALOG_BYTES).unwrap();
+        let count = V1_MAX_CATALOG_BYTES / row_cost + 2;
+        assert!(count < 1000);
+        store
+            .put_records_iter((2..=count).map(|index| {
+                Ok::<_, anyhow::Error>((
+                    kind,
+                    *Uuid::from_u128(index as u128).as_bytes(),
+                    payload.as_slice(),
+                ))
+            }))
+            .unwrap();
+        drop(store);
+        assert!(count * row_cost > V1_MAX_CATALOG_BYTES);
+        eprintln!(
+            "retained captures={count} pins={} encoded_record_bytes={} report_body_bytes={} catalog_bytes={}",
+            count * 128,
+            payload.len(),
+            count * row_cost,
+            data.join("control.db").metadata().unwrap().len(),
+        );
+        let hashes = || -> BTreeMap<_, _> {
+            fs::read_dir(&data)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let file = fs::File::open(entry.path()).unwrap();
+                    let len = file.metadata().unwrap().len();
+                    let mut hash = blake3::Hasher::new();
+                    hash.update_reader(file).unwrap();
+                    (entry.file_name(), (len, *hash.finalize().as_bytes()))
+                })
+                .collect()
+        };
+        let before = hashes();
+        let preflight =
+            || super::super::remote::peer_client_preflight(&keys, &data, temp.path(), &[], false);
+        assert_eq!(preflight().unwrap().0, temp.path().canonicalize().unwrap());
+        let error =
+            super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("bounded metadata budget"),
+            "{error:#}"
+        );
+        assert_eq!(hashes(), before);
+
+        // A late owner still excludes the candidate after a graph larger than
+        // the entire report budget; there is no successful truncated scan.
+        capture.files[0].locator.area.path_hint = temp.path().to_path_buf();
+        let store = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        save(&store, kind, Uuid::from_u128(u128::MAX), &capture);
+        drop(store);
+        let before = hashes();
+        let error = preflight().unwrap_err();
+        assert!(
+            error.to_string().contains("outside preserved inputs"),
+            "{error:#}"
+        );
+        assert_eq!(hashes(), before);
+
+        // Placement consumes the shared validation, even for a late field
+        // which does not itself contain a directory exclusion.
+        capture.files[0].locator.area.path_hint = temp.path().join("missing-area");
+        capture.files[0].locator.relative_path = "../escape".into();
+        let store = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        save(&store, kind, Uuid::from_u128(u128::MAX), &capture);
+        drop(store);
+        let before = hashes();
+        let error = preflight().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe preserved anchor relative path"),
+            "{error:#}"
+        );
+        assert_eq!(hashes(), before);
     }
 
     #[test]
@@ -627,19 +810,25 @@ mod tests {
             drop(store);
             let before = preserved_files(&data);
             crate::volume::with_inspected_control_snapshot(&data, &keys, |store| {
-                let (_, scope) = collect_with_scope(store, &mut 0, V1_MAX_CATALOG_BYTES)?;
-                ensure!(scope.paths.contains(&root_path) && scope.paths.contains(&history_path));
-                ensure!(scope.native_roots.contains(&capture.metadata.lower_root_id));
-                ensure!(
-                    scope
-                        .paths
-                        .contains(&capture.files[0].locator.area.path_hint)
-                );
-                ensure!(
-                    !scope
-                        .paths
-                        .contains(&capture.files[0].locator.area.volume_root_hint)
-                );
+                let mut paths = BTreeSet::new();
+                let mut roots = BTreeSet::new();
+                for_each_record(store, |record| {
+                    record.for_each_input(|input| {
+                        match input {
+                            PreservedInput::PathHint(path) => {
+                                paths.insert(path.to_path_buf());
+                            }
+                            PreservedInput::NativeRoot(root) => {
+                                roots.insert(root);
+                            }
+                        }
+                        Ok(())
+                    })
+                })?;
+                ensure!(paths.contains(&root_path) && paths.contains(&history_path));
+                ensure!(roots.contains(&capture.metadata.lower_root_id));
+                ensure!(paths.contains(&capture.files[0].locator.area.path_hint));
+                ensure!(!paths.contains(&capture.files[0].locator.area.volume_root_hint));
                 Ok(())
             })
             .unwrap();

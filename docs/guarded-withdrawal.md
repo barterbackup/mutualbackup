@@ -265,14 +265,19 @@ publishes recovery state, repairs shards, enrolls a root or retires source data.
 Original catalog, key and selected local volume state remain read-only.
 `TMPDIR` must resolve outside the preserved installation, selected anchor/parity
 areas, registered source roots, Git repository paths and typed guarded capture
-anchor-area hints. Peer mode reads these exclusions with the same bounded,
-non-creating snapshot reader used by inventory, including its 32 MiB local-state
-budget. Directory identities also reject
-aliases of existing inputs and renamed roots identified by stable root/backend/
+anchor-area hints. Peer mode uses inventory's non-creating snapshot reader and
+shared canonical/shape validation, with a 32 MiB limit per local record. It streams
+all relevant rows without building the inventory report or applying its aggregate
+32 MiB report ceiling to placement checks. Placement state retains the temporary
+parent's ancestry and one recent path hint; it does not grow with retained capture
+count. Directory identities also reject aliases of existing inputs and renamed
+roots identified by stable root/backend/
 stopped-capture records. Missing old paths remain compatible with recovery;
 registration formats 1/2 are not interpreted as stable filesystem/inode IDs.
 If an inode could match a preserved root and its stable filesystem identity
 cannot be verified, select another `TMPDIR`; client creation is refused.
+The parent's ancestor identities are checked again after the scan, so replacement
+during inspection fails before client creation.
 Volume-root hints are discovery locations, not ownership of the entire volume.
 These checks cover known local records. External Git worktrees, other pending
 owners, relocated anchor-area discovery and concurrent path replacement still
