@@ -18,6 +18,7 @@ const ROW_BYTES: usize = 256;
 const KEY_BYTES: usize = 104;
 const HEADERS: &str = "packing-source";
 const CHUNKS: &str = "packing-chunk";
+const SECTORS: &str = "packing-sector";
 const COMPLETE: &str = "packing-complete";
 
 /// Local join configuration, with an aggregate budget including both streams
@@ -77,6 +78,16 @@ pub struct CatalogPackingPlacement {
     pub virtual_zero: bool,
 }
 
+/// A complete descriptor whose identity and source composition passed both
+/// packing EOFs. Available only behind the completed packing index marker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CatalogPackingSector {
+    pub id: [u8; 32],
+    pub index: u32,
+    pub flat_root: [u8; 32],
+    pub commitment: MerkleCommitment,
+}
+
 #[derive(Serialize, Deserialize)]
 struct SourceHeader {
     id: CatalogPackedSourceId,
@@ -93,6 +104,7 @@ struct ActiveSector {
     id: [u8; 32],
     index: u32,
     commitment: MerkleCommitment,
+    flat_root: [u8; 32],
     accumulator: MerkleSubtreeAccumulator,
     consumed: u32,
 }
@@ -252,6 +264,25 @@ impl CatalogPackingIndex {
         }
         Ok(Some(placement))
     }
+
+    pub fn sector(&self, id: [u8; 32]) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
+        self.require_complete()?;
+        let Some((sector, _)) = row::<CatalogPackingSector>(&self.store, SECTORS, &id)? else {
+            return Ok(None);
+        };
+        if sector.id != id
+            || sector.id == [0; 32]
+            || u64::from(sector.index) >= self.manifest.descriptors.sectors
+            || sector.flat_root == [0; 32]
+            || sector.commitment.byte_len != self.manifest.descriptors.profile.sector_size
+            || sector.commitment.validate().is_err()
+            || self.manifest.descriptors.packing_version >= 3
+                && sector.flat_root != sector.commitment.root
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(Some(sector))
+    }
 }
 
 pub(super) fn build_index(
@@ -263,7 +294,7 @@ pub(super) fn build_index(
         &MerkleCommitment,
     ) -> Result<(), CatalogStoreError>,
 ) -> Result<(), CatalogStoreError> {
-    for kind in [HEADERS, CHUNKS, COMPLETE] {
+    for kind in [HEADERS, CHUNKS, SECTORS, COMPLETE] {
         if store
             .next_record_bounded(kind, None, KEY_BYTES, ROOT_BYTES)?
             .is_some()
@@ -354,6 +385,7 @@ pub(super) fn build_index(
                 id,
                 sector_index,
                 commitment,
+                flat_root,
                 ..
             } => {
                 if active.is_some() {
@@ -363,6 +395,7 @@ pub(super) fn build_index(
                     id,
                     index: sector_index,
                     commitment,
+                    flat_root,
                     accumulator: MerkleSubtreeAccumulator::new(
                         profile.sector_size,
                         profile.slot_size,
@@ -427,6 +460,17 @@ pub(super) fn build_index(
                     {
                         return Err(CatalogError::InvalidPage.into());
                     }
+                    put(
+                        store,
+                        SECTORS,
+                        &sector.id,
+                        &encode(&CatalogPackingSector {
+                            id: sector.id,
+                            index: sector.index,
+                            flat_root: sector.flat_root,
+                            commitment: sector.commitment,
+                        })?,
+                    )?;
                 }
             }
             CatalogPackedSectorRecord::CompactSlots { .. } => {
@@ -447,7 +491,7 @@ pub(super) fn build_index(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use mb_core::{
         CatalogPackedSectorBuilder, CatalogPackedSourceBuilder, KeyMaterial,
@@ -456,16 +500,17 @@ mod tests {
     };
     use std::collections::{BTreeMap, HashMap};
 
-    struct Fixture {
-        manifest: CatalogPackingValidation,
-        pages: HashMap<[u8; 32], Vec<u8>>,
-        roles: [Vec<(CatalogPageRef, Vec<u8>)>; 2],
-        authority: BTreeMap<CatalogPackedSourceId, MerkleCommitment>,
-        sectors: Vec<PackedSectorDescriptor>,
+    pub(crate) struct Fixture {
+        pub(crate) manifest: CatalogPackingValidation,
+        pub(crate) pages: HashMap<[u8; 32], Vec<u8>>,
+        pub(crate) roles: [Vec<(CatalogPageRef, Vec<u8>)>; 2],
+        pub(crate) authority: BTreeMap<CatalogPackedSourceId, MerkleCommitment>,
+        pub(crate) sectors: Vec<PackedSectorDescriptor>,
+        pub(crate) bytes: Vec<Vec<u8>>,
     }
 
     impl Fixture {
-        fn authorize(
+        pub(crate) fn authorize(
             &self,
             id: CatalogPackedSourceId,
             commitment: &MerkleCommitment,
@@ -475,13 +520,16 @@ mod tests {
             }
             Ok(())
         }
-        fn fetch(&self, reference: CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError> {
+        pub(crate) fn fetch(
+            &self,
+            reference: CatalogPageRef,
+        ) -> Result<Vec<u8>, CatalogStoreError> {
             self.pages
                 .get(&reference.hash)
                 .cloned()
                 .ok_or_else(|| DatabaseError::NotReady.into())
         }
-        fn build(&self, maximum: u64) -> Result<CatalogPackingIndex, CatalogStoreError> {
+        pub(crate) fn build(&self, maximum: u64) -> Result<CatalogPackingIndex, CatalogStoreError> {
             CatalogPackingIndex::build(
                 self.manifest,
                 RecordScratchStore::new(maximum)?,
@@ -522,7 +570,7 @@ mod tests {
         }
     }
 
-    fn fixture(count: u32, compact: bool) -> Fixture {
+    pub(crate) fn fixture(count: u32, compact: bool) -> Fixture {
         let profile = PackingProfile {
             format_version: 1,
             sector_size: 64,
@@ -657,6 +705,11 @@ mod tests {
             pages,
             roles,
             authority,
+            bytes: packed
+                .sectors
+                .iter()
+                .map(|sector| sector.bytes.clone())
+                .collect(),
             sectors: packed.catalog.sectors,
         }
     }
@@ -668,6 +721,15 @@ mod tests {
             let index = fixture.build(16 * 1024 * 1024).unwrap();
             assert_eq!(index.manifest(), fixture.manifest);
             for sector in &fixture.sectors {
+                assert_eq!(
+                    index.sector(sector.id).unwrap(),
+                    Some(CatalogPackingSector {
+                        id: sector.id,
+                        index: sector.sector_index,
+                        flat_root: sector.flat_root,
+                        commitment: sector.commitment.clone()
+                    })
+                );
                 for (slot_index, slot) in sector.slots.iter().enumerate() {
                     let source = slot.source().unwrap();
                     assert_eq!(
@@ -689,6 +751,7 @@ mod tests {
             }
             .chunk(0);
             assert_eq!(index.placement(missing).unwrap(), None);
+            assert_eq!(index.sector([255; 32]).unwrap(), None);
             let cache = index
                 .store
                 .database_shell_statement("PRAGMA scratch.cache_size", false)
@@ -787,6 +850,7 @@ mod tests {
         for trigger in [
             "CREATE TEMP TRIGGER ignored BEFORE INSERT ON protocol_records WHEN NEW.kind='packing-chunk' BEGIN SELECT RAISE(IGNORE); END",
             "CREATE TEMP TRIGGER ignored BEFORE UPDATE ON protocol_records WHEN OLD.kind='packing-chunk' BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TEMP TRIGGER ignored BEFORE INSERT ON protocol_records WHEN NEW.kind='packing-sector' BEGIN SELECT RAISE(IGNORE); END",
             "CREATE TEMP TRIGGER ignored BEFORE INSERT ON protocol_records WHEN NEW.kind='packing-complete' BEGIN SELECT RAISE(IGNORE); END",
         ] {
             let store = RecordScratchStore::new(4 * 1024 * 1024).unwrap();
@@ -800,7 +864,7 @@ mod tests {
                 )
             });
             assert!(result.is_err());
-            for kind in [HEADERS, CHUNKS, COMPLETE] {
+            for kind in [HEADERS, CHUNKS, SECTORS, COMPLETE] {
                 assert!(
                     store
                         .next_record_bounded(kind, None, KEY_BYTES, ROOT_BYTES)
@@ -832,7 +896,7 @@ mod tests {
                 )
             });
             assert!(result.is_err());
-            for kind in [HEADERS, CHUNKS, COMPLETE] {
+            for kind in [HEADERS, CHUNKS, SECTORS, COMPLETE] {
                 assert!(
                     store
                         .next_record_bounded(kind, None, KEY_BYTES, ROOT_BYTES)

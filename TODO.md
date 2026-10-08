@@ -1489,11 +1489,33 @@ separately below.
     tests pass (26 store tests ignored), with strict locked workspace/all-targets
     Clippy and formatting/diff checks. This does not migrate fixed
     legacy groups or activate normal checkpoint/coding/recovery consumers.
+  - [x] Join verified packed-sector summaries to complete replayed coding
+    evidence in the same admitted encrypted index. Require active non-virtual
+    coverage for every packed input with exact commitments, geometry and signed
+    roots; preserve overlapping replacements, retired/unrelated history and
+    original witness bytes. Distinguish current placement from historical
+    authority and require full-byte witnesses for current flat-root inputs.
+    Retain bounded witness ranges for authenticated recovery lookup, and bind
+    both packing roots and every coding part atomically in one local bundle.
+    Carry the certified source base/candidates and all admitted authority work
+    into the combined 64 GiB/one-million-page budget. Full locked regression:
+    150 core and 182 ordinary store tests pass (26 store tests ignored); the
+    final additional cursor-corruption fixture and two expanded packing/sector
+    fixtures pass separately. Strict locked workspace/all-targets Clippy and
+    formatting/diff checks pass. Fixtures cover real spill/exhaustion/rebuild,
+    ignored writes, late fetch/authority failure, input omissions/substitution,
+    virtual/retired/replacement coverage, historical compatibility, aggregate
+    rejection before fetch and six-root shared ownership/reopen/cancellation/GC.
+    An overlapping rebuild invalidated an older test executable before two
+    subprocess fixtures could launch; both pass in the completed rebuilt suite.
+    Certified guild-event/lifecycle authority, enclosing certificate publication,
+    fixed legacy-group migration, payload ownership, normal consumers, quotas,
+    incremental work and real retained 1 TiB/release/platform gates remain open.
   - [ ] Complete the enclosing paged checkpoint certificate and full
     authority/coding joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body
-    and source/bootstrap EOFs, migration-evidence quorum, exact current packed
-    input coverage, retained coding lifecycle authority and fixed legacy-group
+    and source/bootstrap EOFs, migration-evidence quorum, integration of exact
+    current packed-input coverage, retained coding lifecycle authority and fixed legacy-group
     migration without changing identities. Retain and retire
     remaining logical root references inside coding records and source/native
     payload owners through bounded durable ownership, and guard authority-root

@@ -2598,3 +2598,76 @@ reinterpret fixed group IDs. Their migration, enclosing paged certificates,
 complete authority/source/coding joins, current checkpoint retirement guards,
 normal capture/coding/publication/retention/seed-only consumers, incremental
 work, combined quotas and real retained 1 TiB/release/platform gates remain open.
+
+
+### Bounded packing/coding coverage (2026-10-08)
+
+The disposable packing index now retains a fixed completed-sector summary only
+when its original ID, full source composition and Merkle commitment have passed.
+The global packing completion marker still follows both typed EOFs. Coding joins
+reuse that same physically admitted encrypted index and its 1 MiB cache; they do
+not materialize the packed catalog or hold a production SQL writer while fetching
+and replaying evidence.
+
+`CatalogPackingIndex::validate_coding` requires full coding-forest EOF and an
+external certified-history authorizer for every original witness. It joins each
+information role to the verified packed summary: original ID, exact commitment,
+full logical length, shard size and signed plan root. Every current packed sector
+must have eligible active coverage before the combined completion marker exists.
+Virtual information/filler and retired groups never establish coverage. Multiple
+active replacement groups may cover an input; the index selects the first eligible
+group in canonical ID order and retains all original witnesses. Historical groups
+outside the current packing remain available under the required authorizer.
+Unbound original attempt-one witnesses remain retainable but cannot cover inputs.
+
+Current and historical coverage policies are explicit. A CurrentPlacement result
+from the authorizer certifies current membership/domain placement in addition to
+original delegation and retained lifecycle authority. Retained authority alone
+cannot cover a current checkpoint. Current flat-root inputs require the existing
+full-byte attempt-three witness; historical lookup preserves original compact
+flat-root evidence. The authorizer must bind the certified guild event head,
+original add/retire events and original witness hash, and use read-only state or
+a disposable job. Current authority must be rechecked at protocol publication.
+This API supplies the packing/coverage join rather than delegating that join to
+the callback; certified guild history and lifecycle validation remain mandatory.
+
+The combined fixed descriptor, both packing streams and all coding parts share
+one 64 GiB represented-byte ceiling and one million page occurrences. The
+certified-source wrapper also carries forward all admitted legacy envelope,
+paged-source/candidate and migration-evidence work, plus its trusted base and
+bounded candidate cursor. The earlier authority/packing bridge retains its own
+conservative 16 GiB admission. Neither primitive tree nor peer-frame limits
+change. This aggregate accounting does not derive retained dataset/file/Git
+quotas or qualify the complete enclosing checkpoint capacity.
+
+Full traversal records a fixed local cursor containing part, byte offset, framed
+length, original group ID and original witness hash. Original record bytes and
+protocol vectors remain unchanged. Range reads authenticate only intersecting
+pages, decode/replay one original witness and verify its exact range and identity.
+They do not establish whole-forest EOF, ordering or coverage; their trusted source
+is the completed disposable index. Recovery lookup thus needs no whole-catalog
+scan. Fixed bounded index records also retain lifecycle and coding profile.
+
+Only the completed combined proof can bind both packing roles and all (at most
+four) coding parts in one ordinary atomic local bundle. Cancelled final parts
+cannot publish packing alone. Shared successors preserve all six closures across
+reopen; bounded pin retirement and ordinary page GC reclaim them after the last
+owner. This local bundle does not issue a certificate or own native/bootstrap,
+information or parity payloads.
+
+The full locked regression passes all 150 core and 182 ordinary store tests
+(26 store tests ignored). The final additional local-cursor corruption fixture
+and two expanded packing/sector fixtures pass separately. Formatting/diff checks
+and strict locked workspace/all-targets Clippy pass. The original overlapping
+rebuild removed an older test executable before two subprocess fixtures could
+launch; both pass in the completed rebuilt suite. No new network/native/release
+or real retained 1 TiB runtime qualification is implied. The fixtures cover original witness seek/replay, malformed cursors and scopes,
+full-byte compatibility, omissions/substitutions, virtual/retired coverage,
+replacement overlap, unrelated retained groups, explicit historical/current
+placement, ignored-write and late-fetch/authority rollback, aggregate admission
+before fetch, real spill beyond the cache, index exhaustion/fresh rebuild,
+certified base/candidate/accounting continuity and six-root durable ownership.
+The enclosing paged certificate, current guild-event/lifecycle authority join,
+fixed legacy-group migration, guarded retirement, normal capture/coding/
+checkpoint/retention/seed-only consumers, quotas, incremental work and real
+retained 1 TiB/release/platform qualification remain open.

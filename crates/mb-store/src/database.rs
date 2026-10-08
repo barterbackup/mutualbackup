@@ -26,13 +26,16 @@ pub use anchor_discovery::{
 };
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
-    CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedPackingIndex,
-    CatalogCheckpointRetention, CatalogCheckpointRetentionState, CatalogCodingValidation,
-    CatalogIntent, CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,
-    CatalogPackingAuthority, CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
-    CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingValidation, CatalogPublicationView,
-    CatalogSectorSource, CatalogSourceSweep, CatalogStoreError, CatalogValidatedCoding,
-    CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
+    CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingIndex,
+    CatalogCertifiedPackingIndex, CatalogCheckpointRetention, CatalogCheckpointRetentionState,
+    CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,
+    CatalogCodingValidation, CatalogIndexedCodingGroup, CatalogIntent, CatalogIntentState,
+    CatalogNativeValidation, CatalogNativeValidationState, CatalogPackingAuthority,
+    CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource, CatalogPackingCodingIndex,
+    CatalogPackingCodingValidation, CatalogPackingIndex, CatalogPackingPlacement,
+    CatalogPackingSector, CatalogPackingValidation, CatalogPublicationView, CatalogSectorSource,
+    CatalogSourceSweep, CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink,
+    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
     PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};

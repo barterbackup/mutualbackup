@@ -14,6 +14,7 @@ use super::{ControlStore, DatabaseError};
 
 mod bundle;
 mod checkpoint_retention;
+mod coding_coverage;
 mod coding_validation;
 mod native_validation;
 mod packing_authority;
@@ -27,16 +28,20 @@ pub use bundle::{
     CatalogBundleState,
 };
 pub use checkpoint_retention::{CatalogCheckpointRetention, CatalogCheckpointRetentionState};
+pub use coding_coverage::{
+    CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,
+    CatalogIndexedCodingGroup, CatalogPackingCodingIndex, CatalogPackingCodingValidation,
+};
 pub use coding_validation::{CatalogCodingValidation, CatalogValidatedCoding};
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };
 pub use packing_authority::{
-    CatalogCertifiedPackingIndex, CatalogPackingAuthority, CatalogPackingAuthorityBase,
-    CatalogPackingAuthorizedSource,
+    CatalogCertifiedCodingIndex, CatalogCertifiedPackingIndex, CatalogPackingAuthority,
+    CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
 };
 pub use packing_validation::{
-    CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingValidation,
+    CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingSector, CatalogPackingValidation,
 };
 pub use paged_data::{PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource};
 pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCatalogSnapshot};

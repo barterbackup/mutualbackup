@@ -152,6 +152,8 @@ pub struct CatalogRecordReader {
     records: u64,
     header_checked: bool,
     failed: bool,
+    byte_position: u64,
+    last_range: Option<std::ops::Range<u64>>,
 }
 
 impl CatalogRecordReader {
@@ -169,6 +171,8 @@ impl CatalogRecordReader {
             records: 0,
             header_checked: false,
             failed: false,
+            byte_position: 0,
+            last_range: None,
         })
     }
 
@@ -179,9 +183,18 @@ impl CatalogRecordReader {
         if self.failed {
             return Err(CatalogError::Failed.into());
         }
+        self.last_range = None;
         let result = self.next_inner(fetch);
         self.failed = result.is_err();
         result
+    }
+
+    pub(super) fn last_record_range(&self) -> Option<std::ops::Range<u64>> {
+        if self.failed {
+            None
+        } else {
+            self.last_range.clone()
+        }
     }
 
     fn next_inner<E>(
@@ -202,6 +215,7 @@ impl CatalogRecordReader {
             }
             return Ok(None);
         }
+        let start = self.byte_position;
         let mut length = [0; 4];
         self.read_exact(&mut length, fetch)?;
         let length = u32::from_be_bytes(length) as usize;
@@ -216,6 +230,7 @@ impl CatalogRecordReader {
         if self.records == self.root.records && self.ensure_leaf(fetch)? {
             return Err(CatalogError::InvalidPage.into());
         }
+        self.last_range = Some(start..self.byte_position);
         Ok(Some(bytes))
     }
 
@@ -245,6 +260,11 @@ impl CatalogRecordReader {
             let take = output.len().min(self.leaf.len() - self.position);
             output[..take].copy_from_slice(&self.leaf[self.position..self.position + take]);
             self.position += take;
+            self.byte_position = self
+                .byte_position
+                .checked_add(take as u64)
+                .filter(|position| *position <= self.root.page.byte_len)
+                .ok_or(CatalogError::Bounds)?;
             output = &mut output[take..];
         }
         Ok(())

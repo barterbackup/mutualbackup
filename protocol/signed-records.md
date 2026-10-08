@@ -116,6 +116,14 @@ transcripts. Current delegation, membership, source coverage and retained
 lifecycle joins, fixed legacy-group migration and the enclosing certificate
 remain required before activation. No peer publication version changes here.
 
+Verified local indexes can record one coding group's part/byte range, original
+ID and transcript hash during complete traversal. These cursors are local
+metadata, not new signed fields or a substitute for full EOF. Range reads
+re-authenticate intersecting pages and replay the unchanged original witness.
+The combined packing/coding staging proof charges all its streams and descriptor
+under one budget and checks active input coverage; its required authorizer still
+joins certified guild history and lifecycle authority before activation.
+
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw
 Postcard or CBOR unless their extension says JSON.

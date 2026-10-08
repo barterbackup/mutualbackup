@@ -1699,6 +1699,19 @@ fits the forest. This is separate from real retained-data/runtime qualification.
 Fixed legacy coding groups, current delegation/source/lifecycle joins, the
 enclosing certificate and normal consumers remain required before activation.
 
+The bounded packing index now retains verified sector summaries and joins
+complete replayed coding evidence to every current packed input in the same
+admitted encrypted scratch store. Active non-virtual coverage requires exact
+commitments, logical geometry and signed roots; retained/replacement groups stay
+available through bounded original-witness range lookup. Explicit current versus
+historical authority results preserve full-byte flat-root requirements. A single
+combined descriptor charges packing/coding work under 64 GiB and one million
+page occurrences; the certified wrapper preserves source-authority admission,
+trusted base and candidate cursors. A completed proof binds both packing roots
+and all coding parts in one atomic local bundle. Certified guild-event/lifecycle
+validation, the enclosing certificate and full consumer/retention/quota/runtime
+qualification remain required; this is a staging join. See ADR 0002 for validation.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

@@ -647,6 +647,8 @@ impl CatalogPackingAuthority {
         Ok(CatalogCertifiedPackingIndex {
             base: self.base,
             candidates: self.candidates,
+            authority_bytes: self.bytes,
+            authority_pages: self.pages,
             index: CatalogPackingIndex {
                 manifest,
                 store: self.store,
@@ -660,6 +662,8 @@ impl CatalogPackingAuthority {
 pub struct CatalogCertifiedPackingIndex {
     base: CatalogPackingAuthorityBase,
     candidates: u64,
+    authority_bytes: u64,
+    authority_pages: u64,
     index: CatalogPackingIndex,
 }
 
@@ -686,22 +690,112 @@ impl CatalogCertifiedPackingIndex {
         &self,
         after: Option<CatalogCheckpointRevisionKey>,
     ) -> Result<Option<SignedRecord<PagedUserRevision>>, CatalogStoreError> {
-        self.index.require_complete()?;
-        let after = after.map(CatalogCheckpointRevisionKey::index_key);
-        let Some((key, bytes)) = self.index.store.next_record_bounded(
-            CANDIDATES,
-            after.as_ref().map(|key| key.as_slice()),
-            72,
-            PAGED_USER_REVISION_BYTES,
-        )?
-        else {
-            return Ok(None);
+        next_candidate(&self.index, after)
+    }
+}
+
+fn next_candidate(
+    index: &CatalogPackingIndex,
+    after: Option<CatalogCheckpointRevisionKey>,
+) -> Result<Option<SignedRecord<PagedUserRevision>>, CatalogStoreError> {
+    index.require_complete()?;
+    let after = after.map(CatalogCheckpointRevisionKey::index_key);
+    let Some((key, bytes)) = index.store.next_record_bounded(
+        CANDIDATES,
+        after.as_ref().map(|key| key.as_slice()),
+        72,
+        PAGED_USER_REVISION_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let signed = PagedUserRevision::decode_signed(&bytes)?;
+    if key != CatalogCheckpointRevisionKey::from(&signed.value).index_key() {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(Some(signed))
+}
+
+/// The source-authority base/candidates and aggregate admission survive the
+/// coding join. This proof still requires live event rechecks and complete
+/// enclosing checkpoint/private catalog validation before activation.
+pub struct CatalogCertifiedCodingIndex {
+    base: CatalogPackingAuthorityBase,
+    candidates: u64,
+    authority_bytes: u64,
+    authority_pages: u64,
+    index: CatalogPackingCodingIndex,
+}
+
+impl CatalogCertifiedPackingIndex {
+    pub fn validate_coding(
+        self,
+        coding: CatalogCodingValidation,
+        policy: CatalogCodingCoveragePolicy,
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+        authorize: impl FnMut(
+            &mb_core::CatalogCodingEntry,
+        ) -> Result<CatalogCodingAuthorization, CatalogStoreError>,
+    ) -> Result<CatalogCertifiedCodingIndex, CatalogStoreError> {
+        let manifest = CatalogPackingCodingValidation {
+            format_version: 1,
+            packing: self.index.manifest,
+            coding: coding.clone(),
+            policy,
         };
-        let signed = PagedUserRevision::decode_signed(&bytes)?;
-        if key != CatalogCheckpointRevisionKey::from(&signed.value).index_key() {
-            return Err(DatabaseError::Integrity.into());
-        }
-        Ok(Some(signed))
+        manifest.validate()?;
+        let (bytes, pages) = manifest.represented_work()?;
+        check_coding_work(self.authority_bytes, self.authority_pages, bytes, pages)?;
+        let index = self
+            .index
+            .validate_coding(coding, policy, fetch, authorize)?;
+        Ok(CatalogCertifiedCodingIndex {
+            base: self.base,
+            candidates: self.candidates,
+            authority_bytes: self.authority_bytes,
+            authority_pages: self.authority_pages,
+            index,
+        })
+    }
+}
+
+fn check_coding_work(
+    authority_bytes: u64,
+    authority_pages: u64,
+    bytes: u64,
+    pages: u64,
+) -> Result<(u64, u64), CatalogStoreError> {
+    let bytes = authority_bytes
+        .checked_add(bytes)
+        .ok_or(CatalogError::Bounds)?;
+    let pages = authority_pages
+        .checked_add(pages)
+        .ok_or(CatalogError::Bounds)?;
+    if bytes > mb_core::CATALOG_CODING_MAX_BYTES || pages > CATALOG_MAX_PAGE_OCCURRENCES {
+        return Err(CatalogError::Bounds.into());
+    }
+    Ok((bytes, pages))
+}
+
+impl CatalogCertifiedCodingIndex {
+    pub fn base(&self) -> CatalogPackingAuthorityBase {
+        self.base
+    }
+    pub fn candidate_count(&self) -> u64 {
+        self.candidates
+    }
+    pub fn index(&self) -> &CatalogPackingCodingIndex {
+        &self.index
+    }
+    pub fn represented_work(&self) -> Result<(u64, u64), CatalogStoreError> {
+        let (bytes, pages) = self.index.manifest().represented_work()?;
+        check_coding_work(self.authority_bytes, self.authority_pages, bytes, pages)
+    }
+    pub fn next_paged_revision(
+        &self,
+        after: Option<CatalogCheckpointRevisionKey>,
+    ) -> Result<Option<SignedRecord<PagedUserRevision>>, CatalogStoreError> {
+        next_candidate(self.index.packing(), after)
     }
 }
 
@@ -1658,5 +1752,160 @@ mod tests {
             .authority()
             .with_paged_revision(&candidate, |page| fetch(&pages, page))
             .unwrap();
+    }
+    #[test]
+    fn certified_coding_join_preserves_source_base_candidates_and_combined_admission() {
+        let fixture = Fixture::new(true, false);
+        let extra_bytes = vec![3; V1_SECTOR_SIZE];
+        let extra = CatalogSectorRecord {
+            format_version: 1,
+            sector: mb_core::SectorRef {
+                id: [3; 32],
+                root: sector_root(&extra_bytes),
+                logical_len: 17,
+            },
+            commitment: merkle_commit(&extra_bytes).unwrap(),
+        };
+        let (candidate, candidate_pages) =
+            fixture.candidate(&[fixture.records[0].clone(), extra.clone()]);
+        let mut records = fixture.records.clone();
+        records.push(extra);
+        let mut payloads = fixture.bytes.clone();
+        payloads.push(extra_bytes);
+        let (manifest, pages) = fixture.packing(&records, &payloads);
+        let old = &fixture.certificate.checkpoint.revisions[0].value;
+        let packed = pack_incremental(
+            manifest.descriptors.profile,
+            None,
+            records
+                .iter()
+                .zip(&payloads)
+                .map(|(record, bytes)| PackingInput {
+                    owner: old.owner,
+                    protected_root: packing_protected_root(old.protected_root_id),
+                    object_id: record.sector.id,
+                    source_commitment: Some(record.commitment.clone()),
+                    bytes: bytes.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let packing = super::super::packing_validation::tests::Fixture {
+            manifest,
+            pages: pages
+                .iter()
+                .map(|(id, bytes)| (*id, bytes.clone()))
+                .collect(),
+            roles: [Vec::new(), Vec::new()],
+            authority: BTreeMap::new(),
+            sectors: packed.catalog.sectors,
+            bytes: packed
+                .sectors
+                .into_iter()
+                .map(|sector| sector.bytes)
+                .collect(),
+        };
+        let entry = super::super::coding_coverage::tests::entry(&packing, [0, 1, 2], 400, 2, None);
+        let mut coding_pages = Pages::new();
+        let mut sink = |page: CatalogPageRef, bytes| {
+            coding_pages.insert(page.hash, bytes);
+            Ok::<_, ()>(())
+        };
+        let mut builder = mb_core::CatalogCodingBuilder::new(manifest.scope, 100).unwrap();
+        let other = super::super::coding_coverage::tests::entry(&packing, [3, 0, 1], 401, 2, None);
+        let mut entries = [&entry, &other];
+        entries.sort_by_key(|entry| entry.retained.group.id);
+        for entry in entries {
+            builder.push_group(entry, &mut sink).unwrap();
+        }
+        let coding = CatalogCodingValidation {
+            format_version: 1,
+            scope: manifest.scope,
+            root: builder.finish(&mut sink).unwrap(),
+        };
+        let authority = fixture
+            .authority()
+            .with_paged_revision(&candidate, |page| fetch(&candidate_pages, page))
+            .unwrap();
+        let (authority_bytes, authority_pages) = (authority.bytes, authority.pages);
+        let checked = authority
+            .validate_packing(manifest, |page| fetch(&pages, page))
+            .unwrap();
+        assert_eq!(manifest.descriptors.sectors, packing.sectors.len() as u64);
+        for sector in &packing.sectors {
+            assert!(
+                checked.index.sector(sector.id).unwrap().is_some(),
+                "input ID absent from packing"
+            );
+        }
+        let base = checked.base();
+        let checked = checked
+            .validate_coding(
+                coding.clone(),
+                CatalogCodingCoveragePolicy::Current,
+                |page| fetch(&coding_pages, page),
+                |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
+            )
+            .unwrap();
+        assert_eq!(checked.base(), base);
+        assert_eq!(checked.candidate_count(), 1);
+        assert_eq!(
+            checked.next_paged_revision(None).unwrap(),
+            Some(candidate.clone())
+        );
+        assert!(
+            checked
+                .next_paged_revision(Some((&candidate.value).into()))
+                .unwrap()
+                .is_none()
+        );
+        let (bytes, pages_count) = checked.index().manifest().represented_work().unwrap();
+        assert_eq!(
+            checked.represented_work().unwrap(),
+            (authority_bytes + bytes, authority_pages + pages_count)
+        );
+        for sector in &packing.sectors {
+            assert!(checked.index().coverage(sector.id).unwrap().is_some());
+        }
+        assert_eq!(
+            checked
+                .index()
+                .read_group(entry.retained.group.id, |page| fetch(&coding_pages, page))
+                .unwrap(),
+            Some(entry)
+        );
+        let mut checked = fixture
+            .authority()
+            .with_paged_revision(&candidate, |page| fetch(&candidate_pages, page))
+            .unwrap()
+            .validate_packing(manifest, |page| fetch(&pages, page))
+            .unwrap();
+        checked.authority_pages = CATALOG_MAX_PAGE_OCCURRENCES;
+        assert!(
+            checked
+                .validate_coding(
+                    coding,
+                    CatalogCodingCoveragePolicy::Current,
+                    |_| panic!("over-budget authority fetched pages"),
+                    |_| panic!("over-budget authority authorized groups")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            check_coding_work(
+                1,
+                1,
+                mb_core::CATALOG_CODING_MAX_BYTES - 1,
+                CATALOG_MAX_PAGE_OCCURRENCES - 1
+            )
+            .unwrap(),
+            (
+                mb_core::CATALOG_CODING_MAX_BYTES,
+                CATALOG_MAX_PAGE_OCCURRENCES
+            )
+        );
+        assert!(check_coding_work(1, 0, mb_core::CATALOG_CODING_MAX_BYTES, 0).is_err());
+        assert!(check_coding_work(u64::MAX, 0, 1, 0).is_err());
+        assert!(check_coding_work(0, u64::MAX, 0, 1).is_err());
     }
 }
