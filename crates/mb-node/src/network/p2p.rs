@@ -8648,6 +8648,9 @@ async fn fetch_checkpoint_from_sources(
 
 async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
     let proposal = node_blocking(node.clone(), |node| {
+        if !node.needs_recovery_key_registration()? {
+            return Ok(None);
+        }
         let state = node
             .dynamic_guild_state()?
             .context("recovery-key registration requires dynamic guild state")?;
@@ -9319,6 +9322,16 @@ async fn ensure_writer_key_epochs(
     fences.sort_by_key(|fence| (fence.owner, fence.epoch));
     fences.dedup();
     for fence in fences {
+        let registered = node_blocking(node.clone(), move |node| {
+            node.retained_writer_public_key(fence.owner, fence.epoch)
+        })
+        .await?;
+        if let Some(public_key) = registered {
+            if public_key != fence.public_key {
+                bail!("writer epoch conflicts with the authenticated guild event history");
+            }
+            continue;
+        }
         let (state, guild, local_id) = node_blocking(node.clone(), |node| {
             Ok((
                 node.dynamic_guild_state()?

@@ -21,6 +21,20 @@ pub(super) fn retained_group(
 ) -> Result<mb_core::RetainedCodingGroup> {
     original_history::retained_group(control, guild, group)
 }
+
+/// Freeze one independently checked current scope around a batch of bounded
+/// key/group lookups. A successful result always includes the final fences.
+pub(super) fn with_history<T>(
+    control: &ControlStore,
+    read: impl FnOnce(&original_history::AuthorityReader<'_>) -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(authority) = original_history::AuthorityReader::open(control)? else {
+        return Ok(None);
+    };
+    let result = read(&authority)?;
+    authority.check()?;
+    Ok(Some(result))
+}
 pub(super) fn read_membership_epoch(
     control: &ControlStore,
     epoch: u64,

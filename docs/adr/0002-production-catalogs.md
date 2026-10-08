@@ -3722,3 +3722,77 @@ checkpoint publication/retirement, private/bootstrap/native and information/
 parity payload custody, retained 1 TiB qualification and all remaining native/
 platform/release gates remain required. Signed record layouts, hashes and wire
 versions are unchanged; normal paged checkpoint producers remain disabled.
+
+## Frozen bounded key authority for normal consumers (2026-10-08)
+
+Normal recovery-key and retained-writer consumers now use a frozen authority
+reader over the completed durable original-history index. A successful batch
+checks the original installed genesis, compact current authority and exact
+original tail, uses bounded indexed point reads, then checks the same genesis
+bytes, compact record/tail and history marker before returning. It reuses that
+checked genesis across the member key lookups.
+Group serving uses the same reader and retains its exact original identity,
+lifecycle and holder/payload checks. No signed layout, record identity, wire
+version or durable index schema changes.
+
+A missing/incomplete original index explicitly uses the existing compatibility
+state. That state is decoded/validated once per batch, checked against the
+independent current roster/tip, and fenced by its exact length and content hash.
+The final SQL read is bounded by that observed length. Appearance of a compact
+projection during a legacy-only lookup, changed original genesis/tip/completion,
+changed legacy state or a mismatched current index fails the batch. Current
+indexed readers do not load the legacy blob. This keeps legacy rebuilding debt
+explicit and prevents a changed compatibility source from yielding a successful
+mixed-scope result.
+
+The Store view adds bounded latest/current recovery lookups. The latest pointer
+must name a positive epoch no later than the represented original event tip and
+an existing valid envelope row. A missing pointer beside epoch one is damaged
+completed state. The greatest registered epoch is usable only while unrevoked;
+an older still-unrevoked epoch never replaces a revoked greatest epoch. Removed
+subjects' envelopes remain addressable, matching the original full-state rule;
+callers enforce their active-member or historical-recovery scope. Retained writer
+lookup returns the exact original epoch's public key, including after revocation
+or removal. A missing writer epoch inside the registered contiguous range fails
+closed. No current malformed/missing key row triggers flat-state fallback.
+
+Backup submission uses bounded current membership/coordinator authority; backup
+claim checks current recovery envelopes for the bounded active roster before
+claiming a job. DHT recovery publication gathers active members/envelopes in one
+frozen batch and local bundle validation compares the exact current envelope.
+Supplied recovered remote history retains its original full validation path.
+Idle recovery-key reconciliation now returns before materializing full history
+when registration is unnecessary; existing writer fences similarly use exact
+indexed historical keys before taking the registration path. Actual new/locked
+registration still uses the original event validation, signatures and mutation
+path. Signature-lock reads are bounded by the existing original-event limit
+plus 256 bytes of lock overhead. Endpoint refresh, removed-holder endpoints,
+recovery-sequence probes, readiness publisher selection, local recovery-resume
+binding and legacy packing-attestation membership use the bounded current roster.
+
+Two new Store fixtures exercise latest revocation without older fallback,
+subsequent rotation, removed-subject semantics, unregistered subjects and missing,
+corrupt or oversized latest/envelope rows. Four new Node fixtures cover retained
+revoked/removed writers, recovery revocation/rotation, completed-row failures
+without fallback, batch fences for genesis/current/history/legacy changes,
+coordinator backup admission/claim with unreadable unused 2 MiB flat state,
+caller rejection, idle registration and oversized signature locks. The existing
+DHT rotation/revocation fixture now creates real sealed publications and validates
+all four dynamic checkpoint formats while the unused flat state is unreadable;
+it also exercises bounded endpoint/probe/readiness/recovery-resume consumers.
+
+Validation: the locked full Store library suite passed 257 tests with 26
+ignored, and the locked full Node library suite passed 436 tests with 21
+ignored. The focused Node authority/backup/DHT selection also passed all 20
+tests. Both full suites completed before a syntax-only Clippy let-chain
+cleanup. Final-tree focused runs passed all seven Store durable-history and
+all 20 Node authority/backup/DHT tests. Ignored provisioned/native/topology
+cases remain unqualified. Strict locked workspace/all-targets Clippy and
+formatting/diff checks pass.
+
+Actual event mutation and key-registration actions, unbounded job queue scans,
+remote recovered-history materialization, complete checkpoint body/authority
+joins and ownership/publication, migration throughput, archive retention and
+full metadata/physical quota policy remain required. These authority reads do
+not qualify a retained 1 TiB dataset or the remaining native/platform/topology/
+release gates. Normal paged checkpoint producers remain disabled.

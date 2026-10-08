@@ -197,81 +197,202 @@ pub(super) fn advance(control: &ControlStore) -> Result<bool> {
     Ok(true)
 }
 
+// The legacy allocation is confined to an explicitly absent/incomplete index.
+// Successful indexed batches never materialize the accumulated history vectors.
+pub(crate) struct AuthorityReader<'a> {
+    control: &'a ControlStore,
+    original: Option<Vec<u8>>,
+    compact: Option<Record>,
+    current: GuildAuthoritySnapshot,
+    history: Option<History>,
+    legacy: Option<DynamicGuildState>,
+    legacy_fence: Option<(usize, [u8; 32])>,
+}
+
+impl<'a> AuthorityReader<'a> {
+    pub(super) fn open(control: &'a ControlStore) -> Result<Option<Self>> {
+        let original =
+            control.get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?;
+        let compact = read_record(control)?;
+        let mut legacy = None;
+        let mut legacy_fence = None;
+        let current = match &compact {
+            Some(record) => record.authority.clone(),
+            None => {
+                let Some((state, fence)) = read_legacy(control)? else {
+                    return Ok(None);
+                };
+                let current = GuildAuthoritySnapshot::from_state(&state)?;
+                legacy = Some(state);
+                legacy_fence = Some(fence);
+                current
+            }
+        };
+        let mut history = History::read(control)?;
+        if let Some(index) = &history {
+            let genesis_hash = match &compact {
+                Some(record) => record.genesis_hash,
+                None => decode_installed_guild(
+                    original
+                        .as_deref()
+                        .context("indexed authority has no original genesis")?,
+                )?
+                .certificate
+                .hash()?,
+            };
+            if index.genesis_hash() != genesis_hash
+                || index.authority().guild_id != current.guild_id
+                || index.authority().event_sequence > current.event_sequence
+            {
+                anyhow::bail!("indexed authority belongs to another original history");
+            }
+            if index.authority().event_sequence == current.event_sequence {
+                index.view(control, genesis_hash, &current)?;
+            } else {
+                check_original_tip(control, &make(genesis_hash, index.authority().clone())?)?;
+                history = None;
+            }
+        }
+        if history.is_none() && legacy.is_none() {
+            let (state, fence) =
+                read_legacy(control)?.context("legacy guild state is unavailable")?;
+            if GuildAuthoritySnapshot::from_state(&state)? != current {
+                anyhow::bail!("legacy guild state differs from current authority");
+            }
+            legacy = Some(state);
+            legacy_fence = Some(fence);
+        }
+        Ok(Some(Self {
+            control,
+            original,
+            compact,
+            current,
+            history,
+            legacy,
+            legacy_fence,
+        }))
+    }
+
+    pub(crate) fn snapshot(&self) -> &GuildAuthoritySnapshot {
+        &self.current
+    }
+
+    pub(crate) fn current_recovery_key(
+        &self,
+        owner: NodeId,
+    ) -> Result<Option<mb_core::RecoveryKeyEpoch>> {
+        match &self.history {
+            Some(history) => Ok(history
+                .view(self.control, history.genesis_hash(), &self.current)?
+                .current_recovery_key(owner)?),
+            None => Ok(self
+                .legacy
+                .as_ref()
+                .context("legacy authority is unavailable")?
+                .current_recovery_key(owner)
+                .cloned()),
+        }
+    }
+
+    pub(crate) fn writer_key_for_retained_revision(
+        &self,
+        owner: NodeId,
+        epoch: u64,
+    ) -> Result<Option<[u8; 32]>> {
+        match &self.history {
+            Some(history) => Ok(history
+                .view(self.control, history.genesis_hash(), &self.current)?
+                .writer_key(owner, epoch)?
+                .map(|entry| entry.public_key)),
+            None => Ok(self
+                .legacy
+                .as_ref()
+                .context("legacy authority is unavailable")?
+                .writer_key_for_retained_revision(owner, epoch)),
+        }
+    }
+
+    fn retained_group(&self, id: [u8; 32]) -> Result<Option<mb_core::RetainedCodingGroup>> {
+        match &self.history {
+            Some(history) => Ok(history
+                .view(self.control, history.genesis_hash(), &self.current)?
+                .retained_group(id)?),
+            None => Ok(self
+                .legacy
+                .as_ref()
+                .context("legacy authority is unavailable")?
+                .coding_groups
+                .iter()
+                .find(|group| group.group.id == id)
+                .cloned()),
+        }
+    }
+
+    pub(super) fn check(&self) -> Result<()> {
+        if self.control.get_record_bounded(
+            "guild-installed",
+            KEY,
+            GUILD_AUTHORITY_SNAPSHOT_BYTES,
+        )? != self.original
+        {
+            anyhow::bail!("original guild genesis changed during lookup");
+        }
+        match &self.compact {
+            Some(record) => {
+                if self.control.get_record_bounded(KIND, KEY, BYTES)?
+                    != Some(mb_core::canonical_bytes_bounded(record, BYTES)?)
+                {
+                    anyhow::bail!("guild authority changed during lookup");
+                }
+                check_tail(self.control, record)?;
+            }
+            None if self.control.record_length(KIND, KEY)?.is_some() => {
+                anyhow::bail!("guild authority appeared during legacy lookup")
+            }
+            None => {}
+        }
+        if let Some(history) = &self.history {
+            history.view(self.control, history.genesis_hash(), &self.current)?;
+        }
+        if let Some((length, hash)) = self.legacy_fence {
+            let bytes = self
+                .control
+                .get_record_bounded("guild-dynamic-state", KEY, length)?
+                .context("legacy guild state disappeared during lookup")?;
+            if bytes.len() != length || *blake3::hash(&bytes).as_bytes() != hash {
+                anyhow::bail!("legacy guild state changed during lookup");
+            }
+        }
+        Ok(())
+    }
+}
+
+type LegacyState = (DynamicGuildState, (usize, [u8; 32]));
+fn read_legacy(control: &ControlStore) -> Result<Option<LegacyState>> {
+    control
+        .get_record("guild-dynamic-state", KEY)?
+        .map(|bytes| {
+            let state: DynamicGuildState = decode_canonical(&bytes)?;
+            state.validate()?;
+            Ok((state, (bytes.len(), *blake3::hash(&bytes).as_bytes())))
+        })
+        .transpose()
+}
+
 pub(super) fn retained_group(
     control: &ControlStore,
     guild: [u8; 32],
     id: [u8; 32],
 ) -> Result<mb_core::RetainedCodingGroup> {
-    let original =
-        control.get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?;
-    let compact = read_record(control)?;
-    let current = match &compact {
-        Some(record) => record.authority.clone(),
-        None => read_or_legacy(control)?.context("node has no dynamic guild state")?,
-    };
-    if current.guild_id != guild {
-        anyhow::bail!("variable coding group belongs to another guild");
-    }
-    if let Some(history) = History::read(control)? {
-        let genesis_hash = match &compact {
-            Some(record) => record.genesis_hash,
-            None => decode_installed_guild(
-                original
-                    .as_deref()
-                    .context("indexed group has no original genesis")?,
-            )?
-            .certificate
-            .hash()?,
-        };
-        if history.genesis_hash() != genesis_hash
-            || history.authority().guild_id != guild
-            || history.authority().event_sequence > current.event_sequence
-        {
-            anyhow::bail!("indexed group belongs to another original history");
+    with_history(control, |authority| {
+        if authority.snapshot().guild_id != guild {
+            anyhow::bail!("variable coding group belongs to another guild");
         }
-        if history.authority().event_sequence == current.event_sequence {
-            let retained = history
-                .view(control, history.genesis_hash(), &current)?
-                .retained_group(id)?
-                .context("variable coding group is unavailable")?;
-            if control.get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?
-                != original
-            {
-                anyhow::bail!("original group genesis changed during lookup");
-            }
-            if let Some(record) = &compact {
-                if control.get_record_bounded(KIND, KEY, BYTES)?
-                    != Some(mb_core::canonical_bytes_bounded(record, BYTES)?)
-                {
-                    anyhow::bail!("group authority changed during lookup");
-                }
-                check_tail(control, record)?;
-            } else if read_or_legacy(control)?.as_ref() != Some(&current) {
-                anyhow::bail!("legacy group authority changed during lookup");
-            }
-            return Ok(retained);
-        }
-        check_original_tip(
-            control,
-            &make(history.genesis_hash(), history.authority().clone())?,
-        )?;
-    }
-    // Compatibility only while a verified original-prefix rebuild is absent
-    // or incomplete. A present malformed/current index never falls back.
-    let state: DynamicGuildState = decode_canonical(
-        &control
-            .get_record("guild-dynamic-state", KEY)?
-            .context("legacy group state is unavailable")?,
-    )?;
-    state.validate()?;
-    if GuildAuthoritySnapshot::from_state(&state)? != current {
-        anyhow::bail!("legacy group state differs from current authority");
-    }
-    state
-        .coding_groups
-        .into_iter()
-        .find(|group| group.group.id == id)
-        .context("variable coding group is unavailable")
+        authority
+            .retained_group(id)?
+            .context("variable coding group is unavailable")
+    })?
+    .context("node has no dynamic guild state")
 }
 
 #[cfg(test)]
@@ -279,6 +400,248 @@ mod tests {
     use super::*;
     use crate::node::guild_authority::tests::{event, fixture, relabel};
     use crate::node::tests::test_coding_transcript;
+
+    fn recovery(
+        node: &mut Node,
+        keys: &[KeyMaterial],
+        subject: &KeyMaterial,
+        epoch: u64,
+    ) -> mb_core::RecoveryKeyEnvelope {
+        let guild = node.dynamic_guild_state().unwrap().unwrap().guild_id;
+        let (envelope, _) = mb_core::create_recovery_key_envelope(subject, guild, epoch).unwrap();
+        let certified = event(
+            node,
+            keys,
+            mb_core::GuildEventKind::RotateRecoveryKey {
+                envelope: envelope.clone(),
+            },
+        );
+        node.install_guild_event(certified).unwrap();
+        envelope
+    }
+
+    #[test]
+    fn indexed_key_readers_keep_retained_writers_and_never_revive_revoked_recovery_epochs() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let owner = keys[0].node_id();
+        let writer = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: keys[1].node_id().0,
+            },
+        );
+        node.install_guild_event(writer).unwrap();
+        let revoke = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RevokeWriterKey { owner, epoch: 1 },
+        );
+        node.install_guild_event(revoke).unwrap();
+        recovery(&mut node, &keys, &keys[0], 1);
+        recovery(&mut node, &keys, &keys[0], 2);
+        let revoke = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RevokeRecoveryKey {
+                subject: owner,
+                epoch: 2,
+            },
+        );
+        node.install_guild_event(revoke).unwrap();
+        let flat = node
+            .control
+            .get_record("guild-dynamic-state", KEY)
+            .unwrap()
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+            .unwrap();
+        assert_eq!(
+            node.retained_writer_public_key(owner, 1).unwrap(),
+            Some(keys[1].node_id().0)
+        );
+        assert_eq!(node.retained_writer_public_key(owner, 99).unwrap(), None);
+        assert!(
+            with_history(&node.control, |reader| reader.current_recovery_key(owner))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        node.control
+            .put_record("guild-dynamic-state", KEY, &flat)
+            .unwrap();
+        let envelope = recovery(&mut node, &keys, &keys[0], 3);
+        let remove = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RemoveMember { node_id: owner },
+        );
+        node.install_guild_event(remove).unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert_eq!(
+            node.retained_writer_public_key(owner, 1).unwrap(),
+            Some(keys[1].node_id().0)
+        );
+        let current = with_history(&node.control, |reader| reader.current_recovery_key(owner))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.envelope, envelope,
+            "removed subjects retain the original historical-envelope semantics"
+        );
+    }
+
+    #[test]
+    fn indexed_key_readers_reject_damaged_completed_rows_without_flat_fallback() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let owner = keys[0].node_id();
+        let writer = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: keys[1].node_id().0,
+            },
+        );
+        node.install_guild_event(writer).unwrap();
+        recovery(&mut node, &keys, &keys[0], 1);
+        let key = [owner.0.as_slice(), &1_u64.to_be_bytes()].concat();
+        for (kind, id, cap) in [
+            ("guild-original-recovery", key.clone(), 6144 + 64),
+            ("guild-original-latest-recovery", owner.0.to_vec(), 256 + 64),
+            ("guild-original-writer", key.clone(), 256 + 64),
+        ] {
+            let old = node.control.get_record(kind, &id).unwrap().unwrap();
+            for bad in [Some(vec![0]), Some(vec![0; cap + 1]), None] {
+                match bad {
+                    Some(bytes) => node.control.put_record(kind, &id, &bytes).unwrap(),
+                    None => {
+                        node.control.delete_record(kind, &id).unwrap();
+                    }
+                }
+                let result = if kind == "guild-original-writer" {
+                    node.retained_writer_public_key(owner, 1).map(|_| ())
+                } else {
+                    with_history(&node.control, |reader| reader.current_recovery_key(owner))
+                        .map(|_| ())
+                };
+                assert!(result.is_err(), "damaged completed {kind}");
+            }
+            node.control.put_record(kind, &id, &old).unwrap();
+        }
+        assert!(
+            node.dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .current_recovery_key(owner)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn indexed_key_batches_recheck_genesis_tip_history_and_legacy_source_fences() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let owner = keys[0].node_id();
+        recovery(&mut node, &keys, &keys[0], 1);
+        for kind in ["guild-installed", KIND, "guild-original-tip-v1"] {
+            let before = node.control.get_record(kind, KEY).unwrap().unwrap();
+            assert!(
+                with_history(&node.control, |reader| {
+                    assert!(reader.current_recovery_key(owner)?.is_some());
+                    node.control.put_record(kind, KEY, &[0])?;
+                    Ok(())
+                })
+                .is_err(),
+                "changed batch fence {kind}"
+            );
+            node.control.put_record(kind, KEY, &before).unwrap();
+        }
+        node.control
+            .database_shell_statement(
+                "DELETE FROM protocol_records WHERE kind LIKE 'guild-original-%'",
+                false,
+            )
+            .unwrap();
+        let before = node
+            .control
+            .get_record("guild-dynamic-state", KEY)
+            .unwrap()
+            .unwrap();
+        assert!(
+            with_history(&node.control, |reader| {
+                assert!(reader.current_recovery_key(owner)?.is_some());
+                node.control.put_record("guild-dynamic-state", KEY, &[0])?;
+                Ok(())
+            })
+            .is_err()
+        );
+        node.control
+            .put_record("guild-dynamic-state", KEY, &before)
+            .unwrap();
+        assert!(
+            with_history(&node.control, |reader| reader.current_recovery_key(owner))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn indexed_key_backup_admission_and_idle_registration_avoid_flat_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, certificate, peers) = crate::node::tests::recovery_guild_fixture();
+        let keys = (120..125)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value; 32])))
+            .collect::<Vec<_>>();
+        let coordinator_seed = (120..125)
+            .map(|value| Seed::from_bytes([value; 32]))
+            .find(|seed| KeyMaterial::from_seed(seed).node_id() == certificate.genesis.coordinator)
+            .unwrap();
+        let mut node = Node::open(directory.path(), coordinator_seed).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        for key in &keys {
+            recovery(&mut node, &keys, key, 1);
+        }
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+            .unwrap();
+        assert!(!node.needs_recovery_key_registration().unwrap());
+        let descriptor = BackupDescriptor {
+            format_version: 2,
+            guild_id: state.guild_id,
+            owner: keys[1].node_id(),
+            protected_root_id: Uuid::from_bytes([81; 16]),
+            revision_id: Uuid::from_bytes([82; 16]),
+            total_pages: 1,
+            object_hash: [83; 32],
+        };
+        node.enqueue_backup(descriptor.owner, descriptor.clone())
+            .unwrap();
+        assert!(
+            node.enqueue_backup(keys[2].node_id(), descriptor.clone())
+                .is_err()
+        );
+        assert_eq!(
+            node.claim_backup_job().unwrap().unwrap().descriptor,
+            descriptor
+        );
+        node.control
+            .put_record(
+                "guild-event-signature-lock",
+                &(state.event_sequence + 1).to_be_bytes(),
+                &vec![0; GUILD_EVENT_BYTES + 257],
+            )
+            .unwrap();
+        assert!(node.needs_recovery_key_registration().is_err());
+    }
 
     fn group(
         node: &Node,

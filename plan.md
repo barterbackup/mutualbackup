@@ -1884,6 +1884,23 @@ key-reader integration, old-store compact-tip rebuilding, migration throughput,
 archive retention/compaction, full quota policy, enclosing checkpoint custody
 and all retained-capacity/platform/release gates remain required.
 
+Normal key consumers now share a frozen bounded authority batch. Backup
+admission/claim authority, DHT recovery publication, local bundle validation,
+idle recovery-key registration and already registered retained-writer checks
+read indexed point rows without decoding accumulated guild history. The batch
+checks original genesis, compact current authority and original tail before
+the point reads, then rechecks them and the completed history marker before
+returning. Explicit
+compatibility reads fence the exact legacy state bytes as well. Latest recovery
+lookup never revives an older epoch after revocation; retained writer lookup
+preserves the original public key after revocation/removal. Damaged or missing
+registered point rows fail closed. Endpoint/probe/readiness, installed recovery
+resume and legacy packing-attestation membership checks use bounded rosters;
+signature-lock SQL reads have the existing event bound plus fixed lock overhead.
+Actual key registration and event mutation, job queue scans, remote history
+recovery and enclosing checkpoint production/ownership still need bounded
+integration, quota admission and the complete retained-capacity/platform gates.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

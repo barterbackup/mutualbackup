@@ -296,6 +296,19 @@ These indexes change no signed record, identity or wire layout. Flat mutation
 replacement, complete key-reader/migration/quota integration and enclosing
 checkpoint/payload ownership remain separate requirements.
 
+Normal recovery-key and retained-writer consumers use frozen batches of these
+bounded local authority rows. Original genesis, current compact authority,
+original tail and history completion are checked around successful batches;
+explicit compatibility reads additionally fence the exact legacy state bytes.
+The greatest registered recovery epoch is usable only while unrevoked, with
+no older-epoch fallback. Removed subjects' original historical envelopes remain
+addressable, and callers retain their membership checks. Retained revision
+writer lookup continues to return the exact original epoch's public key after
+revocation or removal. Missing registered writer/recovery epochs, malformed
+latest pointers and corrupt rows fail closed. These local reads neither change
+original signed formats nor replace the original event validation used for
+registration, recovered remote history or enclosing checkpoint proofs.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the

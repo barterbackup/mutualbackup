@@ -21,6 +21,136 @@ fn advance_durable(control: &ControlStore, history: &History) {
 }
 
 #[test]
+fn durable_original_history_latest_recovery_preserves_revocation_and_removed_subject_semantics() {
+    let mut history = History::new(false, 4);
+    let owner = history.keys[0].node_id();
+    let (envelope, _) =
+        create_recovery_key_envelope(&history.keys[0], history.state.guild_id, 2).unwrap();
+    history.push(GuildEventKind::RotateRecoveryKey { envelope });
+    history.push(GuildEventKind::RevokeRecoveryKey {
+        subject: owner,
+        epoch: 2,
+    });
+    let revoked_sequence = history.state.event_sequence;
+    let (envelope, _) =
+        create_recovery_key_envelope(&history.keys[0], history.state.guild_id, 3).unwrap();
+    history.push(GuildEventKind::RotateRecoveryKey { envelope });
+    history.push(GuildEventKind::RemoveMember { node_id: owner });
+    let directory = tempfile::tempdir().unwrap();
+    let control =
+        ControlStore::open(directory.path().join("durable.db"), &history.keys[0]).unwrap();
+    CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    for sequence in 1..=history.state.event_sequence {
+        advance_durable(&control, &history);
+        let current = durable(&control);
+        let view = current
+            .view(&control, current.genesis_hash(), current.authority())
+            .unwrap();
+        if sequence == revoked_sequence {
+            assert_eq!(
+                view.latest_recovery_key(owner)
+                    .unwrap()
+                    .unwrap()
+                    .envelope
+                    .epoch,
+                2
+            );
+            assert!(view.current_recovery_key(owner).unwrap().is_none());
+            assert!(
+                view.recovery_key(owner, 1)
+                    .unwrap()
+                    .unwrap()
+                    .revoked_at_event
+                    .is_none()
+            );
+        }
+    }
+    let current = durable(&control);
+    let view = current
+        .view(&control, current.genesis_hash(), current.authority())
+        .unwrap();
+    assert_eq!(
+        view.current_recovery_key(owner).unwrap().as_ref(),
+        history.state.current_recovery_key(owner)
+    );
+    assert_eq!(
+        view.latest_recovery_key(owner)
+            .unwrap()
+            .unwrap()
+            .envelope
+            .epoch,
+        3
+    );
+    assert!(
+        !current
+            .authority()
+            .active_members()
+            .any(|member| member.node_id == owner)
+    );
+    assert!(
+        view.current_recovery_key(history.keys[1].node_id())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn durable_original_history_recovery_latest_rows_fail_closed_without_old_epoch_fallback() {
+    let history = History::new(false, 4);
+    let directory = tempfile::tempdir().unwrap();
+    let control =
+        ControlStore::open(directory.path().join("durable.db"), &history.keys[0]).unwrap();
+    CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    for _ in 0..6 {
+        advance_durable(&control, &history);
+    }
+    let owner = history.keys[0].node_id();
+    let current = durable(&control);
+    let view = current
+        .view(&control, current.genesis_hash(), current.authority())
+        .unwrap();
+    let pointer = control
+        .get_record("guild-original-latest-recovery", &owner.0)
+        .unwrap()
+        .unwrap();
+    for corrupt in [vec![0], vec![0; ROW_BYTES + 65]] {
+        control
+            .put_record("guild-original-latest-recovery", &owner.0, &corrupt)
+            .unwrap();
+        assert!(view.current_recovery_key(owner).is_err());
+    }
+    control
+        .delete_record("guild-original-latest-recovery", &owner.0)
+        .unwrap();
+    assert!(view.current_recovery_key(owner).is_err());
+    control
+        .put_record("guild-original-latest-recovery", &owner.0, &pointer)
+        .unwrap();
+    let key = epoch_key(owner, 1);
+    let epoch = control
+        .get_record("guild-original-recovery", &key)
+        .unwrap()
+        .unwrap();
+    control
+        .delete_record("guild-original-recovery", &key)
+        .unwrap();
+    assert!(view.current_recovery_key(owner).is_err());
+    control
+        .put_record("guild-original-recovery", &key, &epoch)
+        .unwrap();
+    assert_eq!(
+        view.current_recovery_key(owner).unwrap().as_ref(),
+        history.state.current_recovery_key(owner)
+    );
+}
+
+#[test]
 fn durable_original_history_reopens_and_matches_all_original_event_effects() {
     for legacy in [false, true] {
         let mut history = History::new(legacy, 4);

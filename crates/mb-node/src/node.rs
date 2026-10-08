@@ -4127,6 +4127,40 @@ impl Node {
         guild_authority::advance_original_history(&self.control)
     }
 
+    pub(crate) fn retained_writer_public_key(
+        &self,
+        owner: NodeId,
+        epoch: u64,
+    ) -> Result<Option<[u8; 32]>> {
+        guild_authority::with_history(&self.control, |authority| {
+            authority.writer_key_for_retained_revision(owner, epoch)
+        })?
+        .context("writer-key registration requires dynamic guild state")
+    }
+
+    pub(crate) fn needs_recovery_key_registration(&self) -> Result<bool> {
+        guild_authority::with_history(&self.control, |authority| {
+            let sequence = authority
+                .snapshot()
+                .event_sequence
+                .checked_add(1)
+                .context("guild event sequence exhausted")?;
+            if let Some(locked) = self.locked_guild_event_proposal(sequence)? {
+                return Ok(
+                    matches!(&locked.kind, mb_core::GuildEventKind::RotateRecoveryKey { envelope }
+                    if envelope.subject == self.keys.node_id()),
+                );
+            }
+            for member in authority.snapshot().active_members() {
+                if authority.current_recovery_key(member.node_id)?.is_none() {
+                    return Ok(member.node_id == self.keys.node_id());
+                }
+            }
+            Ok(false)
+        })?
+        .context("recovery-key registration requires dynamic guild state")
+    }
+
     pub fn sign_guild_event_proposal(&self, event: &GuildEvent) -> Result<MemberSignature> {
         if event.kind.coding_group_add().is_some() {
             anyhow::bail!("coding-group events require replayable verifier evidence");
@@ -4136,9 +4170,11 @@ impl Node {
 
     pub(crate) fn locked_guild_event_proposal(&self, sequence: u64) -> Result<Option<GuildEvent>> {
         let record_id = sequence.to_be_bytes();
-        let Some(bytes) = self
-            .control
-            .get_record("guild-event-signature-lock", &record_id)?
+        let Some(bytes) = self.control.get_record_bounded(
+            "guild-event-signature-lock",
+            &record_id,
+            mb_core::GUILD_EVENT_BYTES + 256,
+        )?
         else {
             return Ok(None);
         };
@@ -5079,10 +5115,9 @@ impl Node {
         let installed = self
             .installed_guild()?
             .context("this node has no active guild")?;
-        let state = self
-            .dynamic_guild_state()?
+        let state = guild_authority::read_or_legacy(&self.control)?
             .context("this node has no dynamic guild state")?;
-        if dynamic_guild_coordinator(&installed, &state)? != self.keys.node_id()
+        if guild_authority::coordinator(&installed, &state)? != self.keys.node_id()
             || installed.certificate.genesis.guild_id != descriptor.guild_id
             || descriptor.owner != caller
             || !state
@@ -5125,18 +5160,23 @@ impl Node {
         let Some(installed) = self.installed_guild()? else {
             return Ok(None);
         };
-        let state = self
-            .dynamic_guild_state()?
-            .context("this node has no dynamic guild state")?;
-        if dynamic_guild_coordinator(&installed, &state)? != self.keys.node_id() {
+        let state = guild_authority::with_history(&self.control, |authority| {
+            if guild_authority::coordinator(&installed, authority.snapshot())?
+                != self.keys.node_id()
+            {
+                return Ok(None);
+            }
+            for member in authority.snapshot().active_members() {
+                if authority.current_recovery_key(member.node_id)?.is_none() {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(authority.snapshot().clone()))
+        })?
+        .context("this node has no dynamic guild state")?;
+        let Some(state) = state else {
             return Ok(None);
-        }
-        if state
-            .active_members()
-            .any(|member| state.current_recovery_key(member.node_id).is_none())
-        {
-            return Ok(None);
-        }
+        };
         let next_event_sequence = state
             .event_sequence
             .checked_add(1)
@@ -5730,8 +5770,7 @@ impl Node {
         value: mb_core::LegacyPackingAttestation,
         bytes: &[u8],
     ) -> Result<SignedRecord<mb_core::LegacyPackingAttestation>> {
-        let state = self
-            .dynamic_guild_state()?
+        let state = guild_authority::read_or_legacy(&self.control)?
             .context("legacy packing attestation requires dynamic guild state")?;
         if value.format_version != 1
             || value.guild_id != state.guild_id
@@ -5759,8 +5798,7 @@ impl Node {
         attestation: &SignedRecord<mb_core::LegacyPackingAttestation>,
     ) -> Result<()> {
         attestation.verify(mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN)?;
-        let state = self
-            .dynamic_guild_state()?
+        let state = guild_authority::read_or_legacy(&self.control)?
             .context("legacy packing attestation requires dynamic guild state")?;
         if attestation.value.guild_id != state.guild_id
             || attestation.value.membership_epoch != state.membership_epoch
@@ -12040,24 +12078,32 @@ impl Node {
         let local_id = self.keys.node_id();
         let (publication_members, recovery_envelopes) =
             if matches!(checkpoint.checkpoint.format_version, 4..=7) {
-                let state = self
-                    .dynamic_guild_state()?
-                    .context("dynamic DHT publication requires dynamic guild state")?;
-                let active = state.active_members().cloned().collect::<Vec<_>>();
-                if active != checkpoint.checkpoint.members {
-                    return Ok(None);
-                }
-                let mut envelopes = BTreeMap::new();
-                for member in &active {
-                    if member.node_id == local_id {
-                        continue;
-                    }
-                    let Some(epoch) = state.current_recovery_key(member.node_id) else {
+                let publication = guild_authority::with_history(&self.control, |authority| {
+                    let active = authority
+                        .snapshot()
+                        .active_members()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if active != checkpoint.checkpoint.members {
                         return Ok(None);
-                    };
-                    envelopes.insert(member.node_id, epoch.envelope.clone());
-                }
-                (active, envelopes)
+                    }
+                    let mut envelopes = BTreeMap::new();
+                    for member in &active {
+                        if member.node_id != local_id {
+                            let Some(epoch) = authority.current_recovery_key(member.node_id)?
+                            else {
+                                return Ok(None);
+                            };
+                            envelopes.insert(member.node_id, epoch.envelope);
+                        }
+                    }
+                    Ok(Some((active, envelopes)))
+                })?
+                .context("dynamic DHT publication requires dynamic guild state")?;
+                let Some(publication) = publication else {
+                    return Ok(None);
+                };
+                publication
             } else {
                 (checkpoint.checkpoint.members.clone(), BTreeMap::new())
             };
@@ -12207,7 +12253,7 @@ impl Node {
             return Ok(None);
         };
         installed.certificate.verify()?;
-        if self.dynamic_guild_state()?.is_some_and(|state| {
+        if guild_authority::read_or_legacy(&self.control)?.is_some_and(|state| {
             !state
                 .active_members()
                 .any(|member| member.node_id == self.keys.node_id())
@@ -12232,7 +12278,7 @@ impl Node {
             return Ok(None);
         };
         installed.certificate.verify()?;
-        let Some(state) = self.dynamic_guild_state()? else {
+        let Some(state) = guild_authority::read_or_legacy(&self.control)? else {
             return Ok(None);
         };
         if state
@@ -12306,7 +12352,7 @@ impl Node {
         if !required {
             return Ok(Vec::new());
         }
-        if let Some(state) = self.dynamic_guild_state()? {
+        if let Some(state) = guild_authority::read_or_legacy(&self.control)? {
             return Ok(state
                 .active_members()
                 .filter(|member| member.node_id != self.keys.node_id())
@@ -12632,14 +12678,23 @@ impl Node {
         match checkpoint.checkpoint.format_version {
             3 if bundle.format_version == 1 && bundle.key_envelope.is_none() => Ok(()),
             4..=7 => {
-                let local_dynamic_state = if recovered_dynamic_state.is_none() {
-                    self.dynamic_guild_state()?
-                } else {
-                    None
+                let Some(state) = recovered_dynamic_state else {
+                    return guild_authority::with_history(&self.control, |authority| {
+                        if authority.snapshot().guild_id != checkpoint.checkpoint.guild_id {
+                            anyhow::bail!("dynamic recovery state belongs to another guild");
+                        }
+                        let current = authority
+                            .current_recovery_key(bundle.subject)?
+                            .context("recovery key epoch is unavailable or revoked")?;
+                        if bundle.format_version != 2
+                            || bundle.key_envelope.as_ref() != Some(&current.envelope)
+                        {
+                            anyhow::bail!("recovery bundle does not use the current key epoch");
+                        }
+                        Ok(())
+                    })?
+                    .context("dynamic recovery requires dynamic guild state");
                 };
-                let state = recovered_dynamic_state
-                    .or(local_dynamic_state.as_ref())
-                    .context("dynamic recovery requires dynamic guild state")?;
                 state.validate()?;
                 if state.guild_id != checkpoint.checkpoint.guild_id {
                     anyhow::bail!("dynamic recovery state belongs to another guild");
@@ -12764,8 +12819,7 @@ impl Node {
     ) -> Result<(BTreeSet<NodeId>, usize)> {
         let local_id = self.keys.node_id();
         let members = if matches!(checkpoint.checkpoint.format_version, 4..=7) {
-            let state = self
-                .dynamic_guild_state()?
+            let state = guild_authority::read_or_legacy(&self.control)?
                 .context("dynamic recovery readiness requires dynamic guild state")?;
             let active = state.active_members().cloned().collect::<Vec<_>>();
             if active != checkpoint.checkpoint.members {
@@ -13229,7 +13283,7 @@ impl Node {
         {
             anyhow::bail!("installed recovery checkpoint is not bound to the local seed");
         }
-        if let Some(state) = self.dynamic_guild_state()? {
+        if let Some(state) = guild_authority::read_or_legacy(&self.control)? {
             let local_state_member = state
                 .active_members()
                 .find(|member| member.node_id == local_id)
@@ -14169,22 +14223,6 @@ fn guild_coordinator(control: &ControlStore, guild_id: &[u8; 32]) -> Result<Opti
         return guild_authority::coordinator(&installed, &state).map(Some);
     }
     Ok(Some(installed.certificate.genesis.coordinator))
-}
-
-fn dynamic_guild_coordinator(
-    installed: &InstalledGuild,
-    state: &DynamicGuildState,
-) -> Result<NodeId> {
-    if state.guild_id != installed.certificate.genesis.guild_id {
-        anyhow::bail!("dynamic membership belongs to another guild");
-    }
-    let genesis_coordinator = installed.certificate.genesis.coordinator;
-    state
-        .active_members()
-        .map(|member| member.node_id)
-        .find(|node_id| *node_id == genesis_coordinator)
-        .or_else(|| state.active_members().next().map(|member| member.node_id))
-        .context("dynamic guild has no active coordinator")
 }
 
 fn initial_dynamic_guild_state(installed: &InstalledGuild) -> Result<DynamicGuildState> {
@@ -26117,6 +26155,14 @@ pub(crate) mod tests {
             local_id.libp2p_peer_id().unwrap()
         );
         let expires = unix_seconds() + 15 * 60;
+        let flat = node
+            .control
+            .get_record("guild-dynamic-state", b"primary")
+            .unwrap()
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", b"primary", &vec![0; 2 << 20])
+            .unwrap();
         let first = node
             .build_dht_publications(
                 vec![endpoint.clone()],
@@ -26148,6 +26194,38 @@ pub(crate) mod tests {
                     .unwrap();
             }
         }
+
+        assert!(!node.needs_recovery_key_registration().unwrap());
+        assert_eq!(
+            node.recovery_readiness_publishers(&checkpoint).unwrap().1,
+            3
+        );
+        node.validate_local_recovery_resume(&node.installed_guild().unwrap().unwrap(), &checkpoint)
+            .unwrap();
+        node.refresh_peer_exchange_endpoint(vec![endpoint.clone()], expires)
+            .unwrap()
+            .unwrap();
+        node.control
+            .put_record(
+                "dht-recovery-sequence-probe",
+                b"primary",
+                &canonical_bytes(&true).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            node.dht_recovery_sequence_probe_subjects().unwrap().len(),
+            4
+        );
+        node.control
+            .put_record(
+                "dht-recovery-sequence-probe",
+                b"primary",
+                &canonical_bytes(&false).unwrap(),
+            )
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", b"primary", &flat)
+            .unwrap();
 
         let target = first.recovery[0].value.subject;
         let target_keys = signer_keys

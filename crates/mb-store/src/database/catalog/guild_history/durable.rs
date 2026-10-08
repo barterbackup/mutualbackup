@@ -728,6 +728,12 @@ impl CatalogDurableGuildHistoryView<'_> {
         let value = self.point::<WriterKeyEpoch>(WRITERS, &epoch_key(owner, epoch))?;
         if let Some(value) = &value {
             validate_writer(value, owner, epoch, self.history.authority().event_sequence)?;
+        } else if let Some(latest) = self.point::<u64>(LATEST_WRITER, &owner.0)?
+            && (latest == 0
+                || latest > self.history.authority().event_sequence
+                || epoch > 0 && epoch <= latest)
+        {
+            return Err(DatabaseError::Integrity.into());
         }
         Ok(value)
     }
@@ -747,5 +753,37 @@ impl CatalogDurableGuildHistoryView<'_> {
             )?;
         }
         Ok(value)
+    }
+
+    /// Latest registered epoch, including a revoked one. Registration callers
+    /// must advance this epoch instead of falling back to an older envelope.
+    pub fn latest_recovery_key(
+        &self,
+        owner: NodeId,
+    ) -> Result<Option<RecoveryKeyEpoch>, CatalogStoreError> {
+        let Some(epoch) = self.point::<u64>(LATEST_RECOVERY, &owner.0)? else {
+            if self.recovery_key(owner, 1)?.is_some() {
+                return Err(DatabaseError::Integrity.into());
+            }
+            return Ok(None);
+        };
+        if epoch == 0 || epoch > self.history.authority().event_sequence {
+            return Err(DatabaseError::Integrity.into());
+        }
+        self.recovery_key(owner, epoch)?
+            .map(Some)
+            .ok_or_else(|| DatabaseError::Integrity.into())
+    }
+
+    /// Match the original DynamicGuildState rule: the greatest registered
+    /// epoch is current only while unrevoked. Removed subjects' historical
+    /// envelopes remain addressable; callers enforce their membership scope.
+    pub fn current_recovery_key(
+        &self,
+        owner: NodeId,
+    ) -> Result<Option<RecoveryKeyEpoch>, CatalogStoreError> {
+        Ok(self
+            .latest_recovery_key(owner)?
+            .filter(|key| key.revoked_at_event.is_none()))
     }
 }

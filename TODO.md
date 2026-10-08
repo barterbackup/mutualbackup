@@ -1775,6 +1775,22 @@ separately below.
     throughput/qualification, archive retention/compaction, metadata/quota policy,
     paged checkpoint ownership/publication or retained 1 TiB/platform/release
     gates; all remain required.
+  - [x] Use frozen bounded authority batches for normal recovery-key and
+    retained-writer reads. Backup admission/claim authority, DHT recovery
+    publication, local bundle validation, idle recovery-key registration and
+    already registered writer-fence checks no longer decode accumulated guild
+    history when the original index is current. Preserve exact historical
+    writer keys after revocation/removal and the original latest-recovery rule:
+    a revoked greatest epoch never falls back to an older envelope. Bound
+    signature-lock reads, reject damaged/missing completed key rows, and check
+    original genesis, compact authority, original tail and index completion at
+    the end of each successful batch. Explicit compatibility reads additionally
+    fence the exact legacy state bytes. Endpoint/probe/readiness, installed
+    recovery-resume and legacy packing-attestation membership checks use the
+    bounded roster. See ADR 0002 for validation. Actual key registration/event
+    mutations, job queue scans, remote recovery-history materialization,
+    checkpoint bodies/joins/ownership, full metadata/quota and all retained
+    1 TiB/platform/release qualification remain required.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
