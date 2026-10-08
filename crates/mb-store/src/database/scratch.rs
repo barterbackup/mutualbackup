@@ -191,6 +191,20 @@ impl RecordScratchStore {
         self.records.get_record_bounded(kind, key, limit)
     }
 
+    pub fn record_length(&self, kind: &str, key: &[u8]) -> Result<Option<usize>, DatabaseError> {
+        self.records.record_length(kind, key)
+    }
+
+    pub fn next_record_metadata_bounded(
+        &self,
+        kind: &str,
+        after: Option<&[u8]>,
+        key_limit: usize,
+    ) -> Result<Option<(Vec<u8>, usize)>, DatabaseError> {
+        self.records
+            .next_record_metadata_bounded(kind, after, key_limit)
+    }
+
     pub fn next_record_bounded(
         &self,
         kind: &str,

@@ -3287,3 +3287,95 @@ production certified-history indexing, private/bootstrap/native and information/
 parity payload custody, complete durable ownership and atomic certified-current
 publication/retirement guards remain required. Normal consumers, full retained
 capacity/quota and release/platform gates stay open.
+
+## Bounded disposable original guild-history reader (2026-10-08)
+
+`CatalogGuildHistoryIndex` supplies a concrete bounded source for the draft
+checkpoint's certified coding facts and writer history. It starts from an
+independently trusted original `QuorumGuildGenesis`, verifies its original five
+signatures and genesis identity, and streams every original event from sequence
+one through exact EOF. A separately supplied compact `PagedCheckpointTrust`
+binds the final guild/genesis, sequence/head, membership epoch, quorum, exact
+active roster and expected previous checkpoint. This snapshot never comes from
+the proposed body. It is reread around completion, including after marker
+write/readback. Missing/gapped/extra events, changed tips or unavailable original
+evidence reject the job; no valid prefix can manufacture the completion token.
+
+`GuildAuthoritySnapshot` retains only the bounded roster and event tip. It reuses
+existing membership/quorum/signature/placement rules on bounded temporary state,
+without copying accumulated writer, recovery or coding vectors. Non-membership
+events require a separate indexed transition validator. The store implementation
+checks active subjects, strong keys, exact successive epochs, revocation,
+original group identities and placement, retirement deadlines and certified
+forgetting. Checked sequence/epoch arithmetic rejects overflow. Scoped original
+event and legacy-binding decoders bound member/domain/signature/ciphertext
+allocations before decoding nested payloads. Every original event variant
+roundtrips unchanged, and streamed event hashing preserves the original domain
+and positional bytes. The existing bounded original coding-witness decoder is
+shared with the history reader; decoding alone grants no authority.
+
+Memory stays bounded by a fixed number of roster snapshots and original
+event/witness buffers. An encrypted disposable record store with its existing
+1 MiB cache holds
+membership epochs, full writer/recovery histories and retained variable groups.
+Each original Add verifies the exact event-bound signed transcript, its original
+plain BLAKE3 hash, full signature/RS replay, original descriptor equality and
+historical attempt delegation/member/domain authority. Legacy Adds additionally
+require the exact original-signers quorum binding. No witness, group identity or
+binding is recreated from the proposed checkpoint. The ControlStore source uses
+`guild-event`, `coding-event-transcript` and `coding-legacy-add-binding` through
+bounded metadata and payload queries. A pre-binding store missing event-bound
+evidence fails closed; automatic whole-state fallback is not introduced.
+
+The completed final scan precomputes fixed coding facts of at most 256 bytes,
+including original lifecycle/profile/witness hash and placement under the final
+roster. Retired and unrelated groups remain until certified Forget; re-adding a
+forgotten original group retains its original ID and exact new Add event/witness.
+Point reads do not fetch a full descriptor or replay a witness. Historical writer
+and recovery epochs remain addressable after revocation/removal. Current writer
+lookup requires an active owner and the latest exact incarnation; revoking that
+incarnation cannot fall back to an older unrevoked key. A private borrowed view
+checks completion around enclosing scans, rather than rereading a marker at
+every fixed point. No raw decoder/store accessor constructs a completed index.
+
+One disposable transaction covers all replay rows and the completion marker.
+Empty namespaces, exact canonical key/row checks, conditional writes and exact
+readback catch orphan/ignored/missing writes; storage or late history errors
+return no completed projection. Production SQL writers are not held during
+traversal. Each input metadata reference is admitted before payload fetch;
+original object and nested limits remain fixed. Checked byte/record/page work
+preserves prior admitted work, charges original payloads and indexed replay
+reads/writes/readbacks, and reserves fixed snapshot/marker work before deriving
+the marker. `validate_certified_history_coding_state` carries the completed
+history ledger into the public coding proof and its authority successor, without
+resetting history admission. This work ledger does not replace aggregate physical
+allocation or complete dataset/guild quota policy.
+
+Four new core fixtures cover bounded projection replay, all original event
+layouts/hashes, nested bounds, failed transitions, stale certificates, required
+subject signatures, overflow and original legacy binding signers. Nine store
+history fixtures cover actual original genesis/events/witnesses and ControlStore
+metadata reads, valid signed but invalid transitions, invalid historical
+membership despite valid witness replay, latest revocation/removal, complete
+retire/forget/re-add identity, missing/changed witnesses and legacy binding gaps,
+exact EOF/tip, all prior admission dimensions, ignored writes/orphans, a real
+SQLite capacity failure across 512 certified writer rotations and fresh rebuild.
+A tenth store fixture checks that history debt survives coding completion and
+rejects each under-admitted dimension before group lookups. These are bounded
+structural fixtures; they do not qualify a real retained 1 TiB dataset or a
+history projection spilling beyond its 1 MiB cache.
+
+Validation: the final locked core/store run passes all 174 core and 243 ordinary
+store tests (26 ignored), with four test threads. The final added assertion for a
+changed tip after marker write/readback also passes its focused run. Strict locked
+workspace/all-targets Clippy and formatting/diff checks pass. No normal native,
+network/topology, installed release/platform or real retained 1 TiB runtime gate
+was rerun.
+
+Normal producers/consumers still use the existing flat paths. Publishing and
+maintaining a durable compact certified-current tip and incremental indexed
+history, complete original coding successor comparisons, fixed legacy-group
+migration, private/bootstrap/native and information/parity payload ownership,
+atomic certified-current publication/retirement, complete aggregate quotas and
+real retained 1 TiB/release/platform qualification remain required. This reader
+does not activate a peer format or change any original signed identity.

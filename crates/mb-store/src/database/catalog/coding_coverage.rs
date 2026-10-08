@@ -504,6 +504,17 @@ pub(super) mod tests {
         version: u16,
         virtual_index: Option<usize>,
     ) -> CatalogCodingEntry {
+        entry_at_epoch(fixture, indices, id, version, virtual_index, 1)
+    }
+
+    pub(crate) fn entry_at_epoch(
+        fixture: &PackingFixture,
+        indices: [usize; 3],
+        id: u64,
+        version: u16,
+        virtual_index: Option<usize>,
+        membership_epoch: u64,
+    ) -> CatalogCodingEntry {
         let CatalogScope::Guild { guild_id } = fixture.manifest.scope else {
             panic!("test scope must be guild");
         };
@@ -544,7 +555,7 @@ pub(super) mod tests {
                 format_version: version,
                 attempt_id,
                 checkpoint_hash: [46; 32],
-                membership_epoch: 1,
+                membership_epoch,
                 geometry: CodingPlanGeometry {
                     format_version: 1,
                     guild_id,

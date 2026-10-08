@@ -1804,6 +1804,23 @@ bounded certified-history reader, fixed legacy migration, complete coding
 transitions, quota/private/payload and atomic durable publication/retirement
 remain required. No signed layouts or original group/witness identities change.
 
+The draft joins now have a concrete bounded disposable original-history reader.
+It starts at independently trusted original genesis, traverses bounded event
+metadata/payloads to exact EOF, verifies original certificates and indexed state
+effects, and compares the final roster/tip with an independently supplied compact
+certified snapshot. Only the bounded roster stays in memory; encrypted indexed
+rows retain membership epochs, writer/recovery history and variable groups.
+Original coding witnesses and historical delegation are checked once during
+replay, including original-signers legacy Add bindings. Final fixed coding facts
+include exact lifecycle and current placement; revoked latest writer keys never
+fall back to older incarnations. The draft coding join can consume this token
+and carry its whole replay/prior-work ledger into authority validation. Failure,
+stale trust or missing original evidence yields no completed projection.
+This does not integrate normal consumers, publish a durable compact current tip,
+migrate fixed legacy groups, compare full coding successors or own payloads.
+Those gates and complete aggregate quota/retained 1 TiB/release qualification
+remain required. See ADR 0002 for the bounded-reader validation evidence.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

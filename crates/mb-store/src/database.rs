@@ -35,8 +35,9 @@ pub use catalog::{
     CatalogCheckpointTransitionIndex, CatalogCheckpointWriterAuthorization,
     CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,
     CatalogCodingRetention, CatalogCodingRetentionState, CatalogCodingValidation,
-    CatalogIndexedCodingGroup, CatalogIndexedDirectoryCodingGroup, CatalogIntent,
-    CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,
+    CatalogGuildHistoryIndex, CatalogGuildHistoryObject, CatalogGuildHistorySource,
+    CatalogGuildHistoryView, CatalogIndexedCodingGroup, CatalogIndexedDirectoryCodingGroup,
+    CatalogIntent, CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,
     CatalogPackingAuthority, CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
     CatalogPackingCodingDirectoryIndex, CatalogPackingCodingDirectoryValidation,
     CatalogPackingCodingIndex, CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
@@ -593,6 +594,58 @@ impl ControlStore {
             )
             .optional()
             .map_err(DatabaseError::from)
+    }
+
+    /// Read the payload length without materializing the original record.
+    pub fn record_length(
+        &self,
+        kind: &str,
+        record_id: &[u8],
+    ) -> Result<Option<usize>, DatabaseError> {
+        let length: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT length(bytes) FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                params![kind, record_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        length
+            .map(|length| usize::try_from(length).map_err(|_| DatabaseError::Integrity))
+            .transpose()
+    }
+
+    /// Read just a bounded key and payload length before admitting a payload.
+    /// This is an exclusive index cursor, not a concurrent-write snapshot.
+    pub fn next_record_metadata_bounded(
+        &self,
+        kind: &str,
+        after: Option<&[u8]>,
+        key_limit: usize,
+    ) -> Result<Option<(Vec<u8>, usize)>, DatabaseError> {
+        let limit = i64::try_from(key_limit).map_err(|_| DatabaseError::Integrity)?;
+        let sql = if after.is_some() {
+            "SELECT CASE WHEN length(record_id) <= ?3 THEN record_id END, length(bytes)
+             FROM protocol_records WHERE kind = ?1 AND record_id > ?2
+             ORDER BY record_id LIMIT 1"
+        } else {
+            "SELECT CASE WHEN length(record_id) <= ?3 THEN record_id END, length(bytes)
+             FROM protocol_records WHERE kind = ?1
+             ORDER BY record_id LIMIT 1"
+        };
+        let row: Option<(Option<Vec<u8>>, i64)> = self
+            .connection
+            .query_row(sql, params![kind, after, limit], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        row.map(|(key, length)| {
+            Ok((
+                key.ok_or(DatabaseError::Integrity)?,
+                usize::try_from(length).map_err(|_| DatabaseError::Integrity)?,
+            ))
+        })
+        .transpose()
     }
 
     /// Bound payload allocation inside SQLite, including damaged records.

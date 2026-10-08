@@ -218,9 +218,20 @@ Point reads use already verified indexed facts; history ingestion/replay needs
 its own enclosing admission before this phase, without resetting that debt.
 Internal joins check completion around the full scan without rereading large
 descriptors per point. A raw directory proof cannot proceed directly to signing.
-This proves the supplied certified variable state; the production bounded
-history reader, fixed legacy-group migration, complete coding transitions and
-the remaining enclosing publication/ownership gates are still required.
+The bounded disposable `CatalogGuildHistoryIndex` can supply these facts by
+replaying original event certificates from independently trusted five-member
+genesis to exact EOF and an independently supplied compact current tip. Bounded
+roster snapshots and indexed writer/recovery/group rows replace whole-history
+copies. Every Add verifies the original event-bound signed witness, historical
+delegation and placement; legacy Adds require an original-signers quorum
+binding. Fixed final coding facts preserve original IDs/profiles/witness hashes
+and lifecycle; current writers use the latest incarnation with no revoked-key
+fallback. The scoped decoders preserve all original signed layouts and hashes.
+The concrete coding-join entry point carries the history reader's complete
+replay/prior work into successor validation. Missing original evidence or stale
+trust fails closed, with atomic disposable completion. Durable compact tip
+publication and normal bounded history consumers, fixed legacy-group migration,
+complete coding successors and enclosing publication/ownership remain required.
 
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone

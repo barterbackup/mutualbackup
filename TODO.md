@@ -1671,6 +1671,31 @@ separately below.
     migration, full coding transitions, durable private/payload ownership,
     full retained capacity/quota policy and normal producer/recovery/release
     qualification remain required below.
+  - [x] Add a bounded disposable original guild-history reader for the draft
+    checkpoint joins. Start from independently trusted original five-member
+    genesis and stream exact ordered event EOF to an independently supplied
+    compact certified tip. Keep only the bounded roster in memory; indexed
+    encrypted rows hold membership epochs, writer/recovery histories and
+    retained variable groups. Verify every original quorum and subject signer,
+    exact writer/recovery epoch transitions, add/retire/forget semantics,
+    original signed coding witness and historical delegation/placement. Legacy
+    Adds require the original-signers binding; missing event-bound evidence
+    fails closed. Precompute fixed 256-byte coding facts and current placement;
+    point reads do not load the full history or replay original witnesses.
+    Current-writer lookup never falls back from a revoked latest incarnation.
+    Admit metadata before payload fetch, bound nested original decoders without
+    changing signed layouts, and carry replay/prior work into the coding and
+    authority proofs. Exact EOF/tip checks, empty namespaces, insert/readback
+    checks and one disposable transaction prevent usable prefixes after late
+    failure. Fixtures cover real original genesis/events/witnesses and legacy
+    binding, signed invalid transitions, stale/missing history, retained/reused
+    identities, all admission dimensions, ignored writes and a 512-event real
+    SQLite capacity failure followed by fresh rebuilding. See ADR 0002 for
+    validation: all 174 core and 243 ordinary store tests pass (26 ignored),
+    together with strict locked workspace/all-targets Clippy and formatting/diff
+    checks. Durable compact certified-tip indexing and normal consumers,
+    complete previous-checkpoint coding/fixed legacy migration, aggregate
+    physical/dataset/guild quota and retained 1 TiB/release gates remain open.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
@@ -1681,8 +1706,8 @@ separately below.
     authority/coding joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body
     and source/bootstrap EOFs, migration-evidence quorum, integration of exact
-    current packed-input coverage, production bounded certified-history
-    snapshot/group lookups, complete retained coding lifecycle transitions and
+    current packed-input coverage, durable compact certified-history tip and
+    normal bounded snapshot/group lookup integration, complete retained coding lifecycle transitions and
     fixed legacy-group migration without changing identities. Retain and retire
     remaining logical root references inside coding records and source/native
     payload owners through bounded durable ownership, and guard authority-root

@@ -21,6 +21,7 @@ mod coding_coverage;
 mod coding_directory_coverage;
 mod coding_retention;
 mod coding_validation;
+mod guild_history;
 mod native_validation;
 mod packing_authority;
 mod packing_coding_retention;
@@ -55,6 +56,10 @@ pub use coding_directory_coverage::{
 };
 pub use coding_retention::{CatalogCodingRetention, CatalogCodingRetentionState};
 pub use coding_validation::{CatalogCodingValidation, CatalogValidatedCoding};
+pub use guild_history::{
+    CatalogGuildHistoryIndex, CatalogGuildHistoryObject, CatalogGuildHistorySource,
+    CatalogGuildHistoryView,
+};
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };
@@ -91,6 +96,8 @@ pub enum CatalogStoreError {
     Page(#[from] CatalogError),
     #[error(transparent)]
     Model(#[from] ModelError),
+    #[error(transparent)]
+    Guild(#[from] mb_core::GuildStateError),
 }
 
 impl From<rusqlite::Error> for CatalogStoreError {

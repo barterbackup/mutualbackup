@@ -256,6 +256,43 @@ impl CatalogCheckpointCodingDirectoryIndex {
     pub fn validate_certified_coding_state(
         self,
         budget: Work,
+        read_trust: impl FnMut() -> Result<CatalogCheckpointCodingTrust, CatalogStoreError>,
+        read_group: impl FnMut(
+            [u8; 32],
+            &CatalogCheckpointCodingTrust,
+        )
+            -> Result<Option<CatalogCertifiedCodingGroup>, CatalogStoreError>,
+    ) -> Result<CatalogCheckpointCodingStateIndex, CatalogStoreError> {
+        self.validate_certified_coding_state_with_work(
+            budget,
+            Work::default(),
+            read_trust,
+            read_group,
+        )
+    }
+
+    /// Use the completed bounded original-history reader and carry its whole
+    /// replay debt into this proof and subsequent authority transitions. The
+    /// independent current tip is rechecked around the enclosing group scan.
+    pub fn validate_certified_history_coding_state(
+        self,
+        history: &CatalogGuildHistoryIndex,
+        budget: Work,
+        mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+    ) -> Result<CatalogCheckpointCodingStateIndex, CatalogStoreError> {
+        let view = history.view(&mut read_trust)?;
+        self.validate_certified_coding_state_with_work(
+            budget,
+            history.represented_work(),
+            || Ok(history.view(&mut read_trust)?.coding_trust()),
+            |id, trust| view.coding_group(id, trust),
+        )
+    }
+
+    fn validate_certified_coding_state_with_work(
+        self,
+        budget: Work,
+        prior_work: Work,
         mut read_trust: impl FnMut() -> Result<CatalogCheckpointCodingTrust, CatalogStoreError>,
         mut read_group: impl FnMut(
             [u8; 32],
@@ -271,11 +308,13 @@ impl CatalogCheckpointCodingDirectoryIndex {
         {
             return Err(DatabaseError::Conflict.into());
         }
-        let work = header.represented_work()?.checked_add(scan_reservation(
-            summary.groups,
-            header.packed_sectors.sectors,
-            trust.checkpoint.members.len(),
-        )?)?;
+        let work = prior_work
+            .checked_add(header.represented_work()?)?
+            .checked_add(scan_reservation(
+                summary.groups,
+                header.packed_sectors.sectors,
+                trust.checkpoint.members.len(),
+            )?)?;
         budget.remaining_after(work)?;
         let manifest = Manifest {
             format_version: 1,
@@ -747,6 +786,50 @@ mod tests {
         }
         for (groups, sectors) in [(u64::MAX, 0), (0, u64::MAX)] {
             assert!(scan_reservation(groups, sectors, 256).is_err());
+        }
+    }
+
+    #[test]
+    fn certified_history_replay_debt_survives_the_coding_join() {
+        let (index, trust, facts) = one();
+        let base = join(index, &trust, &facts, budget())
+            .unwrap()
+            .represented_work();
+        let prior = Work {
+            bytes: 123_456,
+            page_occurrences: 17,
+            records: 701,
+        };
+        let exact = base.checked_add(prior).unwrap();
+        let (index, trust, facts) = one();
+        let proof = index
+            .validate_certified_coding_state_with_work(
+                exact,
+                prior,
+                || Ok(trust.clone()),
+                |id, _| Ok(facts.get(&id).copied()),
+            )
+            .unwrap();
+        assert_eq!(proof.represented_work(), exact);
+        proof.header(&trust.checkpoint).unwrap();
+        for dimension in 0..3 {
+            let (index, trust, _) = one();
+            let mut short = exact;
+            match dimension {
+                0 => short.bytes -= 1,
+                1 => short.page_occurrences -= 1,
+                _ => short.records -= 1,
+            }
+            assert!(
+                index
+                    .validate_certified_coding_state_with_work(
+                        short,
+                        prior,
+                        || Ok(trust.clone()),
+                        |_, _| panic!("under-admitted history debt reached a group lookup")
+                    )
+                    .is_err()
+            );
         }
     }
 
