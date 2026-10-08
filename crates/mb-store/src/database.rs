@@ -17,6 +17,8 @@ use crate::SCHEMA_VERSION;
 #[cfg(target_os = "linux")]
 mod anchor_discovery;
 mod catalog;
+#[cfg(target_os = "linux")]
+mod preserved_read;
 mod scratch;
 #[cfg(target_os = "linux")]
 mod scratch_space;
@@ -247,6 +249,34 @@ impl ControlStore {
         let result = operation()?;
         transaction.commit().map_err(DatabaseError::from)?;
         Ok(result)
+    }
+
+    /// Inspect multiple namespaces from one SQLite read snapshot. Only an
+    /// already read-only connection is accepted; the callback must not begin
+    /// another transaction. Keep remote I/O outside this local snapshot.
+    pub fn with_read_only_snapshot<T>(
+        &self,
+        operation: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if !self.is_read_only()? {
+            return Err(DatabaseError::Integrity.into());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let result = operation()?;
+        transaction.rollback()?;
+        Ok(result)
+    }
+
+    /// Read preserved control metadata without creating or deleting database
+    /// journals. Journal-free catalogs are version-checked immutable reads;
+    /// existing WAL/SHM pairs retain SQLite's live read-snapshot behavior.
+    #[cfg(target_os = "linux")]
+    pub fn with_preserved_read_only_snapshot<T>(
+        path: impl AsRef<Path>,
+        database_keys: &[[u8; 32]],
+        operation: impl FnOnce(&ControlStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        preserved_read::inspect(path.as_ref(), database_keys, operation)
     }
 
     pub fn put_record_if_absent(
@@ -783,6 +813,49 @@ impl ControlStore {
             let key = key.ok_or(DatabaseError::Integrity)?;
             let bytes = bytes.ok_or(DatabaseError::Integrity)?;
             if !visit(&key, &bytes)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit an exact record-kind prefix with SQL bounds on each returned
+    /// kind, identifier and payload. Unlike the collecting prefix reader this
+    /// keeps one row in memory and permits an early stop.
+    pub fn for_each_record_with_kind_prefix_bounded(
+        &self,
+        prefix: &str,
+        kind_limit: usize,
+        key_limit: usize,
+        payload_limit: usize,
+        mut visit: impl FnMut(&str, &[u8], &[u8]) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        let kind_limit = i64::try_from(kind_limit).map_err(|_| DatabaseError::Integrity)?;
+        let key_limit = i64::try_from(key_limit).map_err(|_| DatabaseError::Integrity)?;
+        let payload_limit = i64::try_from(payload_limit).map_err(|_| DatabaseError::Integrity)?;
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN length(CAST(kind AS BLOB)) <= ?3 THEN kind END,
+                    CASE WHEN length(CAST(record_id AS BLOB)) <= ?4 THEN record_id END,
+                    CASE WHEN length(CAST(bytes AS BLOB)) <= ?5 THEN bytes END
+             FROM protocol_records WHERE substr(kind, 1, ?1) = ?2
+             ORDER BY kind, record_id",
+        )?;
+        let mut rows = statement.query(params![
+            prefix.chars().count(),
+            prefix,
+            kind_limit,
+            key_limit,
+            payload_limit
+        ])?;
+        while let Some(row) = rows.next()? {
+            let kind: Option<String> = row.get(0)?;
+            let key: Option<Vec<u8>> = row.get(1)?;
+            let bytes: Option<Vec<u8>> = row.get(2)?;
+            if !visit(
+                kind.as_deref().ok_or(DatabaseError::Integrity)?,
+                key.as_deref().ok_or(DatabaseError::Integrity)?,
+                bytes.as_deref().ok_or(DatabaseError::Integrity)?,
+            )? {
                 break;
             }
         }
@@ -4501,6 +4574,113 @@ fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_only_snapshot_keeps_namespaces_consistent_and_releases_on_error() {
+        use super::ControlStore;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.db");
+        let writer = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        writer.put_record("first", b"a", b"old").unwrap();
+        let reader = ControlStore::open_existing_read_only_with_key(&path, &[7; 32]).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(
+            writer
+                .with_read_only_snapshot(|| {
+                    called.set(true);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!called.get());
+        reader
+            .with_read_only_snapshot(|| {
+                assert_eq!(reader.get_record("first", b"a")?.unwrap(), b"old");
+                writer.put_record("first", b"a", b"new")?;
+                writer.put_record("second", b"b", b"new")?;
+                assert_eq!(reader.get_record("first", b"a")?.unwrap(), b"old");
+                assert!(reader.get_record("second", b"b")?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reader.get_record("first", b"a").unwrap().unwrap(), b"new");
+        assert_eq!(reader.get_record("second", b"b").unwrap().unwrap(), b"new");
+        assert!(
+            reader
+                .with_read_only_snapshot(|| -> anyhow::Result<()> {
+                    reader.get_record("first", b"a")?;
+                    anyhow::bail!("abort inventory")
+                })
+                .is_err()
+        );
+        reader
+            .with_read_only_snapshot(|| {
+                assert_eq!(reader.get_record("first", b"a")?.unwrap(), b"new");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn bounded_prefix_reader_uses_literal_prefix_and_checks_bytes_before_callback() {
+        use super::ControlStore;
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("prefix.db"), &[7; 32]).unwrap();
+        store.put_record("guarded_%é/a", b"a", b"one").unwrap();
+        store.put_record("guarded_%é/b", b"b", b"two").unwrap();
+        store
+            .put_record("guarded_XXé/a", b"a", b"excluded")
+            .unwrap();
+        let mut seen = Vec::new();
+        store
+            .for_each_record_with_kind_prefix_bounded(
+                "guarded_%é/",
+                13,
+                1,
+                3,
+                |kind, key, bytes| {
+                    seen.push((kind.to_owned(), key.to_vec(), bytes.to_vec()));
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ("guarded_%é/a".to_owned(), b"a".to_vec(), b"one".to_vec()),
+                ("guarded_%é/b".to_owned(), b"b".to_vec(), b"two".to_vec()),
+            ]
+        );
+        for (kind_limit, key_limit, payload_limit) in [(11, 1, 3), (13, 0, 3), (13, 1, 2)] {
+            let mut visited = false;
+            assert!(
+                store
+                    .for_each_record_with_kind_prefix_bounded(
+                        "guarded_%é/",
+                        kind_limit,
+                        key_limit,
+                        payload_limit,
+                        |_, _, _| {
+                            visited = true;
+                            Ok(true)
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(!visited);
+        }
+        store
+            .put_record("guarded_%é/z", b"oversize", b"oversize")
+            .unwrap();
+        let mut count = 0;
+        store
+            .for_each_record_with_kind_prefix_bounded("guarded_%é/", 13, 1, 3, |_, _, _| {
+                count += 1;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
     #[test]
     fn record_transaction_commits_reopen_and_rolls_back_errors_ignored_writes_and_nesting() {
         use super::{ControlStore, DatabaseError};
