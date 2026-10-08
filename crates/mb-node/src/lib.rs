@@ -39,7 +39,8 @@ pub use guarded_metadata::{GuardedPrivateEntryV6, GuardedPrivateMetadataV6, Guar
 #[cfg(target_os = "linux")]
 pub use legacy_export::{
     LegacyAnchorAreaLocation, LegacyCaptureOwnership, LegacyExportPeer, LegacyExportReport,
-    LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef, LegacyGitRegistration,
+    LegacyGitAnchorAreaLocation, LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef,
+    LegacyGitIndexRegistration, LegacyGitObjectAnchor, LegacyGitRegistration,
     LegacyGitWorktreeRegistration, LegacyGuardedAnchorPin, LegacyGuardedCapture,
     LegacyLocalSectorRecipe, LegacyLocalSectorSource, LegacyLocalStateInventory,
     LegacyPeerInventoryCoverage, LegacyPeerSources, LegacyPendingCapture, LegacyPendingFilePin,

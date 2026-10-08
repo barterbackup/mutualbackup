@@ -202,7 +202,7 @@ pub(super) fn inventory_catalog(
             )?;
             let mut local =
                 super::local_inventory::collect(control, &mut builder.used, summary_budget)?;
-            super::local_inventory::collect_external_git_worktrees(
+            super::local_inventory::collect_external_git_records(
                 control,
                 keys,
                 &mut local,
@@ -261,7 +261,7 @@ pub(super) fn inventory_catalog(
         ))
     });
     let report = LegacyRevisionInventory {
-        format_version: 8,
+        format_version: 9,
         owner: keys.node_id().to_string(),
         scope: if remote.is_some() {
             "available-local-and-selected-peer-signed-revisions-and-preserved-local-state"

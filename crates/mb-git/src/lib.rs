@@ -91,7 +91,9 @@ pub use ref_catalog::{
     GitRefCatalogRoot, GitRefRecord, git_ref_name_order,
 };
 #[cfg(target_os = "linux")]
-pub use repository::{GitRepository, RepositoryError, require_native_catalog_state};
+pub use repository::{
+    GitRepository, PreservedGitRecord, RepositoryError, require_native_catalog_state,
+};
 #[cfg(target_os = "linux")]
 pub use rm::GitRmError;
 pub use stage::{

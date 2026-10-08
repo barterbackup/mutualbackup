@@ -223,8 +223,28 @@ fn require_native_pinned_catalog_state(
     )
 }
 
+/// Original saved Git ownership records, without source or marker access.
+#[derive(Clone, Debug)]
+pub enum PreservedGitRecord {
+    LinkedWorktree(crate::GitWorktreeInfo),
+    ObjectAnchor {
+        repository_id: Uuid,
+        oid: [u8; 20],
+        anchor: Box<FileAnchorManifest>,
+    },
+    IndexEntry {
+        scope: crate::GitWorktreeScope,
+        relative_path: Vec<u8>,
+        entry: crate::GitIndexEntry,
+    },
+    AnchorAreaLocation {
+        repository_id: Uuid,
+        area_id: Uuid,
+        path: PathBuf,
+    },
+}
+
 impl GitRepository {
-    /// Inspect local discovery assistance without replaying Git operations.
     /// Inspect an available saved catalog without native admission, migration,
     /// capture, mount discovery or replay. False means its root/catalog is absent.
     #[cfg(target_os = "linux")]
@@ -233,6 +253,35 @@ impl GitRepository {
         repository_id: Uuid,
         key: &[u8; 32],
         visit: impl FnMut(crate::GitWorktreeInfo) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        Self::with_preserved_catalog(source_root, repository_id, key, |catalog| {
+            crate::worktree::for_each_preserved_worktree(catalog, repository_id, visit)
+        })
+    }
+
+    /// Stream original worktree, object-anchor and index ownership in one
+    /// non-creating external snapshot. This does not certify complete history.
+    #[cfg(target_os = "linux")]
+    pub fn for_each_preserved_record(
+        source_root: &Path,
+        repository_id: Uuid,
+        key: &[u8; 32],
+        mut visit: impl FnMut(PreservedGitRecord) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        Self::with_preserved_catalog(source_root, repository_id, key, |catalog| {
+            crate::worktree::for_each_preserved_worktree(catalog, repository_id, |info| {
+                visit(PreservedGitRecord::LinkedWorktree(info))
+            })?;
+            crate::stage::for_each_preserved_record(catalog, repository_id, &mut visit)?;
+            crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, visit)
+        })
+    }
+
+    fn with_preserved_catalog(
+        source_root: &Path,
+        repository_id: Uuid,
+        key: &[u8; 32],
+        inspect: impl FnOnce(&ControlStore) -> anyhow::Result<()>,
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             !repository_id.is_nil(),
@@ -270,7 +319,7 @@ impl GitRepository {
             directory.descriptor_path().join(CATALOG_DATABASE),
             &[*key],
             |catalog| {
-                crate::worktree::for_each_preserved_worktree(catalog, repository_id, visit)?;
+                inspect(catalog)?;
                 let current = directory
                     .open_child_file(CATALOG_DATABASE)?
                     .ok_or(RepositoryError::Conflict)?
@@ -285,6 +334,7 @@ impl GitRepository {
         Ok(true)
     }
 
+    /// Inspect local discovery assistance without replaying Git operations.
     pub fn anchor_discovery_jobs(
         source_root: &PinnedDirectory,
         repository_id: Uuid,

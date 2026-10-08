@@ -108,3 +108,31 @@ pub(crate) fn remember(
     control.finish_anchor_area_discovery(manifest.area.area_id, &encoded)?;
     Ok(())
 }
+
+/// Keep original cached locations, including unresolved historical relative hints.
+pub(crate) fn for_each_preserved_location(
+    control: &ControlStore,
+    repository_id: uuid::Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    control.for_each_record_bounded(HINT_KIND, 16, MAX_HINT, |key, bytes| {
+        let area_id = uuid::Uuid::from_slice(key)?;
+        let path: RawPath = mb_core::decode_canonical(bytes)?;
+        anyhow::ensure!(
+            !area_id.is_nil()
+                && !path.0.as_os_str().is_empty()
+                && path.0.as_os_str().as_bytes().len() <= MAX_PATH
+                && !path.0.as_os_str().as_bytes().contains(&0)
+                && mb_core::canonical_bytes_bounded(&path, bytes.len())? == bytes,
+            "invalid preserved Git anchor area location"
+        );
+        visit(crate::PreservedGitRecord::AnchorAreaLocation {
+            repository_id,
+            area_id,
+            path: path.0,
+        })?;
+        Ok(true)
+    })?;
+    Ok(())
+}

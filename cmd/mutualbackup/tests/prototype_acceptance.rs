@@ -3692,6 +3692,72 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             &canonical_bytes(&worktree_info).unwrap(),
         )
         .unwrap();
+    let object_source = temp.path().join("preserved-git-object-source");
+    let object_area = temp.path().join("preserved-git-object-area");
+    let cached_area = temp.path().join("preserved-git-cached-area");
+    for path in [&object_source, &object_area, &cached_area] {
+        fs::create_dir(path).unwrap();
+        fs::create_dir(path.join("nested")).unwrap();
+        fs::write(path.join("original"), b"preserve Git ownership").unwrap();
+    }
+    let object_alias = temp.path().join("object-area-alias");
+    std::os::unix::fs::symlink(&object_area, &object_alias).unwrap();
+    let anchor_id = Uuid::new_v4();
+    let area_id = Uuid::new_v4();
+    let object_oid = *git2::Oid::hash_object(git2::ObjectType::Blob, b"native!")
+        .unwrap()
+        .as_bytes()
+        .first_chunk::<20>()
+        .unwrap();
+    let manifest: mb_store::FileAnchorManifest = mb_core::decode_canonical(
+        &canonical_bytes(&(
+            1_u16,
+            anchor_id,
+            mb_store::StableAnchorAreaLocator {
+                area_id,
+                path_hint: object_area.clone(),
+                filesystem_id: 7,
+                volume_root_hint: "/".into(),
+            },
+            object_source.as_os_str().as_bytes().to_vec(),
+            b"file-\xfb".to_vec(),
+            7_u64,
+            *blake3::hash(b"native!").as_bytes(),
+            (7_u64, 31_u64, 7_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    external_store
+        .put_record(
+            &format!(
+                "git-object-anchor-v1/{repository_id}/{}",
+                hex::encode(object_oid)
+            ),
+            anchor_id.as_bytes(),
+            &canonical_bytes(&manifest).unwrap(),
+        )
+        .unwrap();
+    external_store
+        .put_record(
+            &format!("git-worktree-index-entry-v1/{repository_id}/{worktree_id}"),
+            b"file-\xfb",
+            &canonical_bytes(&mb_git::GitIndexEntry {
+                format_version: 1,
+                oid: object_oid,
+                mode: 0o100644,
+                anchor_id,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    external_store
+        .put_record(
+            "anchor-area-location",
+            area_id.as_bytes(),
+            &canonical_bytes(&cached_area.as_os_str().as_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
     drop(external_store);
     let external_files = || -> std::collections::BTreeMap<_, _> {
         fs::read_dir(&external_catalog)
@@ -3755,7 +3821,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 8);
+    assert_eq!(inventory.format_version, 9);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -3785,6 +3851,26 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let git_registration = &inventory.local_state.git_repositories[0];
     assert!(git_registration.external_catalog_available);
     assert!(git_registration.linked_worktrees_inventoried);
+    assert!(git_registration.object_anchors_inventoried);
+    assert!(git_registration.worktree_indexes_inventoried);
+    assert!(git_registration.anchor_area_locations_inventoried);
+    assert_eq!(inventory.local_state.git_object_anchors.len(), 1);
+    let object = &inventory.local_state.git_object_anchors[0];
+    assert_eq!(object.repository_id, repository_id);
+    assert_eq!(object.pin.anchor_id, anchor_id);
+    assert_eq!(object.pin.oid, hex::encode(object_oid));
+    assert!(!object.payloads_verified);
+    assert_eq!(inventory.local_state.git_indexes.len(), 1);
+    let index = &inventory.local_state.git_indexes[0];
+    assert_eq!(index.worktree_id, worktree_id);
+    assert_eq!(index.anchor_id, anchor_id);
+    assert_eq!(index.relative_path_hex, hex::encode(b"file-\xfb"));
+    assert!(!index.payloads_verified);
+    assert_eq!(inventory.local_state.git_anchor_area_locations.len(), 1);
+    assert_eq!(
+        inventory.local_state.git_anchor_area_locations[0].path_hex,
+        hex::encode(cached_area.as_os_str().as_bytes())
+    );
     assert!(!git_registration.catalog_inventoried);
     assert_eq!(inventory.local_state.git_worktrees.len(), 1);
     let saved_worktree = &inventory.local_state.git_worktrees[0];
@@ -3829,6 +3915,10 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         worktree.clone(),
         worktree.join("nested"),
         worktree_alias.join("nested"),
+        object_source.join("nested"),
+        object_area.join("nested"),
+        object_alias.join("nested"),
+        cached_area.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -3944,6 +4034,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &history_alias.join("nested"),
         &worktree,
         &worktree_alias.join("nested"),
+        &object_source.join("nested"),
+        &object_alias.join("nested"),
+        &cached_area.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -3981,6 +4074,14 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     assert_eq!(fs::read_dir(&worktree).unwrap().count(), 2);
     assert_eq!(fs::read_dir(worktree.join("nested")).unwrap().count(), 0);
+    for path in [&object_source, &object_area, &cached_area] {
+        assert_eq!(
+            fs::read(path.join("original")).unwrap(),
+            b"preserve Git ownership"
+        );
+        assert_eq!(fs::read_dir(path).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(path.join("nested")).unwrap().count(), 0);
+    }
     assert_eq!(fs::read_dir(&catalog).unwrap().count(), entries_before);
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     let area_id = Uuid::new_v4();

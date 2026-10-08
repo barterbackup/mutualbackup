@@ -230,6 +230,100 @@ pub(crate) fn require_native_stage_state(control: &ControlStore) -> anyhow::Resu
     Ok(())
 }
 
+/// Preserve original object mappings and primary/linked index ownership.
+/// No anchor payload, source path, marker or normal replay helper is opened.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_record(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use std::os::unix::ffi::OsStrExt;
+
+    let expected_objects = object_kind_prefix(repository_id);
+    control.for_each_record_with_kind_prefix_bounded(
+        OBJECT_PREFIX,
+        512,
+        16,
+        mb_core::V1_MAX_CATALOG_BYTES,
+        |kind, key, bytes| {
+            let suffix = kind
+                .strip_prefix(&expected_objects)
+                .context("preserved object namespace conflicts with its repository marker")?;
+            let oid = Oid::from_str(suffix)?;
+            ensure!(
+                oid.to_string() == suffix,
+                "noncanonical preserved Git object ID"
+            );
+            let anchor: FileAnchorManifest = decode_canonical(bytes)?;
+            ensure!(
+                key == anchor.anchor_id.as_bytes()
+                    && mb_core::canonical_bytes_bounded(&anchor, bytes.len())? == bytes,
+                "invalid preserved Git object anchor key or encoding"
+            );
+            anchor.preserved_ownership()?;
+            visit(crate::PreservedGitRecord::ObjectAnchor {
+                repository_id,
+                oid: oid.as_bytes().try_into().expect("SHA-1 object ID"),
+                anchor: Box::new(anchor),
+            })?;
+            Ok(true)
+        },
+    )?;
+    for prefix in [INDEX_PREFIX, WORKTREE_INDEX_PREFIX] {
+        let expected_primary = index_kind(repository_id);
+        let expected_linked = format!("{WORKTREE_INDEX_PREFIX}{repository_id}/");
+        control.for_each_record_with_kind_prefix_bounded(
+            prefix,
+            512,
+            MAX_STAGE_PATH_BYTES,
+            512,
+            |kind, key, bytes| {
+                let scope = if prefix == INDEX_PREFIX {
+                    ensure!(
+                        kind == expected_primary,
+                        "preserved index namespace conflicts with its repository marker"
+                    );
+                    GitWorktreeScope::primary(repository_id)
+                } else {
+                    let suffix = kind.strip_prefix(&expected_linked).context(
+                        "preserved linked index namespace conflicts with its repository marker",
+                    )?;
+                    let worktree_id = Uuid::parse_str(suffix)?;
+                    let scope = GitWorktreeScope::linked(repository_id, worktree_id)
+                        .context("invalid preserved linked index scope")?;
+                    ensure!(
+                        index_kind_for_scope(scope) == kind,
+                        "noncanonical preserved linked index scope"
+                    );
+                    scope
+                };
+                let path = Path::new(OsStr::from_bytes(key));
+                ensure!(
+                    !key.contains(&0) && stage_path_key(path)? == key,
+                    "invalid preserved Git index path"
+                );
+                let entry: GitIndexEntry = decode_canonical(bytes)?;
+                ensure!(
+                    entry.format_version == 1
+                        && !entry.anchor_id.is_nil()
+                        && matches!(entry.mode, 0o100644 | 0o100755 | 0o120000)
+                        && mb_core::canonical_bytes_bounded(&entry, bytes.len())? == bytes,
+                    "invalid preserved Git index entry"
+                );
+                visit(crate::PreservedGitRecord::IndexEntry {
+                    scope,
+                    relative_path: key.to_vec(),
+                    entry,
+                })?;
+                Ok(true)
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn intent_kind_for_scope(scope: GitWorktreeScope) -> String {
     scope.local_kind(INTENT_PREFIX, WORKTREE_STAGE_INTENT_PREFIX)
 }
@@ -1225,6 +1319,226 @@ mod tests {
     };
     use crate::GitWorktreeScope;
     use crate::merge::{MergeSession, merge_state_for_scope, store_merge_session_for_scope};
+
+    #[test]
+    fn preserved_git_object_index_and_location_rows_reject_invalid_ownership_without_mutation() {
+        use mb_store::FileAnchorManifest;
+        let area = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(area.path().join("catalog.db"), &[155; 32]).unwrap();
+        let repository_id = Uuid::from_u128(155);
+        let anchor_id = Uuid::from_u128(156);
+        let oid = [0xab; 20];
+        let oid_hex = Oid::from_bytes(&oid).unwrap().to_string();
+        let wire = canonical_bytes(&(
+            1_u16,
+            anchor_id,
+            StableAnchorAreaLocator {
+                area_id: Uuid::from_u128(157),
+                path_hint: area.path().join("missing-area"),
+                filesystem_id: 7,
+                volume_root_hint: PathBuf::from("/"),
+            },
+            area.path()
+                .join("missing-source")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+            b"file-\xff".to_vec(),
+            7_u64,
+            [7_u8; 32],
+            (7_u64, 31_u64, 7_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+        ))
+        .unwrap();
+        let anchor: FileAnchorManifest = mb_core::decode_canonical(&wire).unwrap();
+        anchor.preserved_ownership().unwrap();
+        let object_kind = format!("git-object-anchor-v1/{repository_id}/{}", oid_hex);
+        let index_kind = format!("git-index-entry-v1/{repository_id}");
+        let linked_kind = format!(
+            "git-worktree-index-entry-v1/{repository_id}/{}",
+            Uuid::from_u128(158)
+        );
+        let index = super::GitIndexEntry {
+            format_version: 1,
+            oid,
+            mode: 0o100644,
+            anchor_id,
+        };
+        let index_bytes = canonical_bytes(&index).unwrap();
+        let location_id = Uuid::from_u128(159);
+        let location = canonical_bytes(&b"relative-\xfe".to_vec()).unwrap();
+        let scan = || -> anyhow::Result<usize> {
+            let mut count = 0;
+            super::for_each_preserved_record(&control, repository_id, |_| {
+                count += 1;
+                Ok(())
+            })?;
+            crate::catalog_anchor::for_each_preserved_location(&control, repository_id, |_| {
+                count += 1;
+                Ok(())
+            })?;
+            Ok(count)
+        };
+        control
+            .put_record(&object_kind, anchor_id.as_bytes(), &wire)
+            .unwrap();
+        control
+            .put_record(&index_kind, b"file-\xff", &index_bytes)
+            .unwrap();
+        control
+            .put_record(&linked_kind, b"file-\xfd", &index_bytes)
+            .unwrap();
+        control
+            .put_record("anchor-area-location", location_id.as_bytes(), &location)
+            .unwrap();
+        assert_eq!(scan().unwrap(), 4);
+        for (kind, key) in [
+            (&object_kind, anchor_id.as_bytes().as_slice()),
+            (&index_kind, b"file-\xff"),
+            (&linked_kind, b"file-\xfd"),
+            (
+                &"anchor-area-location".to_owned(),
+                location_id.as_bytes().as_slice(),
+            ),
+        ] {
+            control.delete_record(kind, key).unwrap();
+        }
+        let snapshot = || {
+            fs::read_dir(area.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name();
+                    let bytes = if name.as_encoded_bytes().ends_with(b"-shm") {
+                        fs::metadata(entry.path())
+                            .unwrap()
+                            .len()
+                            .to_le_bytes()
+                            .to_vec()
+                    } else {
+                        fs::read(entry.path()).unwrap()
+                    };
+                    (name, (bytes.len(), *blake3::hash(&bytes).as_bytes()))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(scan().is_err(), "accepted invalid {kind}");
+            assert_eq!(snapshot(), before, "reader changed {kind}");
+            control.delete_record(kind, key).unwrap();
+        };
+        reject(&object_kind, &[1; 17], &wire);
+        reject(&object_kind, Uuid::from_u128(999).as_bytes(), &wire);
+        reject(
+            &object_kind,
+            anchor_id.as_bytes(),
+            &[wire.clone(), vec![0]].concat(),
+        );
+        reject(
+            &format!("git-object-anchor-v1/{}/{}", Uuid::from_u128(999), oid_hex),
+            anchor_id.as_bytes(),
+            &wire,
+        );
+        reject(
+            &format!(
+                "git-object-anchor-v1/{repository_id}/{}",
+                oid_hex.to_uppercase()
+            ),
+            anchor_id.as_bytes(),
+            &wire,
+        );
+        let mut invalid = anchor.clone();
+        invalid.logical_len += 1;
+        reject(
+            &object_kind,
+            anchor_id.as_bytes(),
+            &canonical_bytes(&invalid).unwrap(),
+        );
+        let mut invalid = anchor.clone();
+        invalid.area.area_id = Uuid::nil();
+        reject(
+            &object_kind,
+            anchor_id.as_bytes(),
+            &canonical_bytes(&invalid).unwrap(),
+        );
+        let mut invalid = anchor.clone();
+        invalid.source_relative_path = PathBuf::from("../escape");
+        reject(
+            &object_kind,
+            anchor_id.as_bytes(),
+            &canonical_bytes(&invalid).unwrap(),
+        );
+        reject(
+            &object_kind,
+            anchor_id.as_bytes(),
+            &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1],
+        );
+        for key in [
+            b"".as_slice(),
+            b"../escape",
+            b"/absolute",
+            b"a//b",
+            b"a\0b",
+            &vec![b'x'; super::MAX_STAGE_PATH_BYTES + 1],
+        ] {
+            reject(&index_kind, key, &index_bytes);
+        }
+        reject(
+            &index_kind,
+            b"file",
+            &[index_bytes.clone(), vec![0]].concat(),
+        );
+        reject(&index_kind, b"file", &[0; 513]);
+        for invalid in [
+            super::GitIndexEntry {
+                format_version: 2,
+                ..index.clone()
+            },
+            super::GitIndexEntry {
+                mode: 0,
+                ..index.clone()
+            },
+            super::GitIndexEntry {
+                anchor_id: Uuid::nil(),
+                ..index.clone()
+            },
+        ] {
+            reject(&index_kind, b"file", &canonical_bytes(&invalid).unwrap());
+        }
+        for kind in [
+            format!("git-index-entry-v1/{}", Uuid::from_u128(999)),
+            format!(
+                "git-worktree-index-entry-v1/{repository_id}/{}",
+                Uuid::from_u128(158).simple()
+            ),
+            format!("git-worktree-index-entry-v1/{repository_id}/{repository_id}"),
+            format!(
+                "git-worktree-index-entry-v1/{repository_id}/{}",
+                Uuid::nil()
+            ),
+        ] {
+            reject(&kind, b"file", &index_bytes);
+        }
+        reject("anchor-area-location", &[0; 17], &location);
+        reject("anchor-area-location", Uuid::nil().as_bytes(), &location);
+        for path in [Vec::new(), b"a\0b".to_vec(), vec![b'x'; 4097]] {
+            reject(
+                "anchor-area-location",
+                location_id.as_bytes(),
+                &canonical_bytes(&path).unwrap(),
+            );
+        }
+        reject(
+            "anchor-area-location",
+            location_id.as_bytes(),
+            &[location, vec![0]].concat(),
+        );
+        assert_eq!(scan().unwrap(), 0);
+        assert!(!area.path().join("missing-area").exists());
+        assert!(!area.path().join("missing-source").exists());
+    }
 
     #[test]
     fn unbound_guarded_stage_journals_reject_before_catalog_migration() {

@@ -159,7 +159,7 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
-Report format 8 includes preserved local protected-root registrations, backend
+Report format 9 includes preserved local protected-root registrations, backend
 bindings, Git registrations, guarded stopped/revision-capture anchor ownership,
 pending source-capture and recovery-anchor intents, pending Git graph intents,
 retained revision/retirement anchors and remembered anchor-area locations.
@@ -190,6 +190,40 @@ locations. Envelope 1 omitted the selected branch: its decoder default `main`
 is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
+
+The `git_object_anchors`, `git_indexes` and `git_anchor_area_locations` entries
+preserve original external object mappings, primary/linked staged ownership and
+cached area locations. These and linked worktrees come from one non-creating
+external snapshot per repository. Original native, withdrawn root-backed and
+imported file manifests keep physical locator and recorded/stable identity
+provenance through the existing decoder and `preserved_ownership` checks.
+Index scope, raw path, OID, mode and anchor ID remain visible even if a linked
+registration is absent. Relative cached locations are reported without resolving
+against the current cwd. Canonical/key/namespace/shape validation shares the
+existing object-row limit (32 MiB), bounded index rows (512 bytes) and paths
+(4,096 bytes), and the original cached-location row/path limits (4,112/4,096
+bytes). The complete report still has one 32 MiB encoded limit. Known source,
+area and absolute cached-location hints and aliases exclude output/scratch
+parents. No source/anchor payload or working marker is opened, and no Git work
+is replayed. `object_anchors_inventoried`, `worktree_indexes_inventoried` and
+`anchor_area_locations_inventoried` describe these families, while full
+`catalog_inventoried`, payload verification and history completeness remain
+false. Original-wire closed/WAL-only/live, raw-path/relative-hint/JSON,
+malformed-record, report-budget, late-corruption and actual CLI ownership/
+placement fixtures cover unchanged original catalogs and working files.
+External Git anchor/index qualification passes 242 unique cases: 47
+export/peer cases, all 63 ordinary volume and 105 ordinary Git cases, 20 CLI
+process cases, retained-graph/discovery/withdrawal/graph-intent regressions,
+and two provisioned Btrfs identity/retained-capture cases. All four debug
+programs build; format and strict locked workspace/all-targets Clippy pass.
+All 284 source-file and seven program/test-driver hashes remain unchanged, and
+native mount/loop/image cleanup is verified. Evidence and the distinct
+passing-case inventory are retained under
+`/tmp/mb-m6-external-git-owners-validation-is_jr74i`; the post-commit audit
+binds the code to the commit. This is a focused debug-source qualification;
+complete ordinary/native suites and installed artifacts were not rerun. Full refs/non-blob
+objects/pins, stage/prune/checkout/merge/removal-intent joins, relocated owner
+discovery and atomic admission/writer handoff remain open.
 
 The `git_worktrees` entries inspect original linked-worktree registrations through
 the per-repository key, pinned private catalog and repository marker. Preparing,

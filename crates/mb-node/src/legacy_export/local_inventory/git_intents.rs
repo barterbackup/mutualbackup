@@ -100,31 +100,35 @@ pub(super) fn report(
         report.objects.push(entry);
     }
     for blob in &graph.blobs {
-        let anchor = &blob.anchor;
-        let ownership = anchor.preserved_ownership()?;
-        let pin = LegacyGitBlobPin {
-            oid: hex::encode(blob.oid),
-            manifest_format: anchor.format_version,
-            anchor_id: anchor.anchor_id,
-            area_id: anchor.area.area_id,
-            recorded_area_filesystem_id: anchor.area.filesystem_id,
-            area_path_hint_hex: hex::encode(anchor.area.path_hint.as_os_str().as_bytes()),
-            volume_root_hint_hex: hex::encode(anchor.area.volume_root_hint.as_os_str().as_bytes()),
-            source_path_hint_hex: hex::encode(anchor.source_root_hint.as_os_str().as_bytes()),
-            source_relative_path_hex: hex::encode(
-                anchor.source_relative_path.as_os_str().as_bytes(),
-            ),
-            logical_len: anchor.logical_len,
-            content_hash: hex::encode(anchor.content_hash),
-            recorded_file_identity: ownership.recorded_file_identity,
-            stable_file_identity: ownership.stable_file_identity,
-            locator_anchor_id: ownership.locator_anchor_id,
-            locator_relative_path_hex: hex::encode(
-                ownership.locator_relative_path.as_os_str().as_bytes(),
-            ),
-        };
+        let pin = file_anchor(blob.oid, &blob.anchor)?;
         account(&pin, used, limit)?;
         report.blobs.push(pin);
     }
     Ok(report)
+}
+
+pub(super) fn file_anchor(
+    oid: [u8; 20],
+    anchor: &mb_store::FileAnchorManifest,
+) -> Result<LegacyGitBlobPin> {
+    let ownership = anchor.preserved_ownership()?;
+    Ok(LegacyGitBlobPin {
+        oid: hex::encode(oid),
+        manifest_format: anchor.format_version,
+        anchor_id: anchor.anchor_id,
+        area_id: anchor.area.area_id,
+        recorded_area_filesystem_id: anchor.area.filesystem_id,
+        area_path_hint_hex: hex::encode(anchor.area.path_hint.as_os_str().as_bytes()),
+        volume_root_hint_hex: hex::encode(anchor.area.volume_root_hint.as_os_str().as_bytes()),
+        source_path_hint_hex: hex::encode(anchor.source_root_hint.as_os_str().as_bytes()),
+        source_relative_path_hex: hex::encode(anchor.source_relative_path.as_os_str().as_bytes()),
+        logical_len: anchor.logical_len,
+        content_hash: hex::encode(anchor.content_hash),
+        recorded_file_identity: ownership.recorded_file_identity,
+        stable_file_identity: ownership.stable_file_identity,
+        locator_anchor_id: ownership.locator_anchor_id,
+        locator_relative_path_hex: hex::encode(
+            ownership.locator_relative_path.as_os_str().as_bytes(),
+        ),
+    })
 }

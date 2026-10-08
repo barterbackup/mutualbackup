@@ -750,6 +750,43 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory original external Git object anchors, indexes and cached areas.
+    Report format 9 streams linked worktrees, object-to-anchor mappings,
+    primary/linked index entries and saved area locations in one preserved
+    external snapshot per repository. Keep native, withdrawn root-backed and
+    imported file manifests through the original versioned decoder and
+    `preserved_ownership` validation. Preserve original scope/path/OID/mode/
+    anchor IDs and physical locator/identity provenance; no source, anchor
+    payload, working marker or operation replay is opened. Indexes remain
+    visible without a linked registration. Cached relative hints retain
+    their status without cwd resolution. Object/source/area hints and absolute
+    cached locations exclude client/export parents and aliases. SQL namespace,
+    key, canonical and shape checks precede callbacks: existing 32 MiB object
+    rows, 512-byte index rows/4,096-byte paths, and 4,112-byte location rows/
+    4,096-byte paths. All entries share the complete 32 MiB report budget.
+    Separate coverage flags describe these families; full catalog, payload
+    and retained-history verification remain false. Original-wire fixtures
+    cover closed/WAL-only/live catalogs, all three manifest forms, primary/
+    linked scopes, raw paths, missing payloads, relative cached hints, aliases,
+    JSON, exact/over report budgets, malformed namespaces/keys/paths/geometry/
+    encoding/row sizes and late corruption with unchanged original inputs.
+    The actual CLI lists these owners and rejects source/area/cache/alias
+    export and scratch parents without changing catalogs or working data.
+    External Git anchor/index qualification passes 242 unique cases: 47
+    export/peer cases, all 63 ordinary volume and 105 ordinary Git cases, 20
+    CLI process cases, retained-graph/discovery/withdrawal/graph-intent
+    regressions, and two provisioned Btrfs identity/retained-capture cases.
+    All four debug programs build; format and strict locked
+    workspace/all-targets Clippy pass. All 284 source-file and seven
+    program/test-driver hashes remain unchanged, and native mount/loop/image
+    cleanup is verified. Evidence and the distinct passing-case inventory are
+    retained under `/tmp/mb-m6-external-git-owners-validation-is_jr74i`; the
+    post-commit audit binds the code to the commit. This is a focused
+    debug-source qualification; complete ordinary/native suites and installed
+    artifacts were not rerun.
+    Full refs/non-blob objects/pins and stage/prune/checkout/merge/removal-intent
+    joins, relocated ownership/atomic handoff, installed artifacts and full
+    R1/R2/R3/release gates remain open.
   - [x] Inventory linked worktrees from preserved external Git catalogs.
     Report format 8 uses the per-repository key and pinned private catalog/
     repository-marker validation with non-creating read snapshots. Decode

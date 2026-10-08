@@ -267,10 +267,33 @@ impl PreservedParentCheck {
                 PreservedInput::RecordedNativeRoot(root) => self.check_recorded_native(root),
             })
         })?;
-        super::local_inventory::for_each_external_git_worktree(control, keys, |record| {
-            if let super::local_inventory::PreservedExternalGitRecord::Worktree(info) = record {
-                self.check_hint(&info.path)?;
-                self.check_recorded_native(info.root_id)?;
+        super::local_inventory::for_each_external_git_record(control, keys, |record| {
+            use super::local_inventory::PreservedExternalGitRecord;
+            match record {
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::LinkedWorktree(
+                    info,
+                )) => {
+                    self.check_hint(&info.path)?;
+                    self.check_recorded_native(info.root_id)?;
+                }
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::ObjectAnchor {
+                    anchor,
+                    ..
+                }) => {
+                    self.check_hint(&anchor.source_root_hint)?;
+                    self.check_hint(&anchor.area.path_hint)?;
+                }
+                PreservedExternalGitRecord::Record(
+                    mb_git::PreservedGitRecord::AnchorAreaLocation { path, .. },
+                ) => {
+                    if path.is_absolute() {
+                        self.check_hint(&path)?;
+                    }
+                }
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::IndexEntry {
+                    ..
+                })
+                | PreservedExternalGitRecord::CatalogStatus { .. } => {}
             }
             Ok(())
         })
