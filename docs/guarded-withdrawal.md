@@ -283,8 +283,22 @@ metadata/resource budgets remain open.
 Linux catalog export payload recovery and explicitly selected preserved parity
 volumes now use reusable non-creating readers. Local signed-revision selection
 runs in a short snapshot that ends before peer discovery. Export holds no
-explicit transaction across the full recovery. Existing checkpoint/transcript
-scans can retain SQL cursors during peer callbacks; releasing those remains open.
+explicit transaction across the full recovery. Checkpoint/transcript scans now
+fetch one owned bounded row per indexed key lookup, releasing the SQL cursor
+before peer callbacks. Input guards run before each lookup and after callbacks,
+rejecting changed inputs before another lookup or publication. A real SQLite
+regression reproduces a busy WAL checkpoint with the previous streaming cursor;
+the new callback permits checkpointing and then rejects the changed input.
+Cursor qualification passes 63 unique cases (38 legacy-export, 1 large-
+retained-graph, 2 legacy-discovery, 19 ordinary-process, 1 capture-withdrawal,
+1 graph-intent-compatibility, and one provisioned Btrfs renamed-root case).
+All four debug programs build; format and strict locked workspace/all-targets
+Clippy pass. All 284 source files and six program/test-driver hashes remain
+unchanged, and native mount/loop/image cleanup is verified. Evidence and the
+distinct passing-case inventory are retained under `/tmp/mb-m6-recovery-
+cursor-validation-h6i65pwl`; the post-commit audit binds the code to the
+commit. This is a focused debug-source qualification; complete ordinary/native
+suites and installed artifacts were not rerun.
 Input guards require unchanged main/WAL versions and sidecar identity/absence
 before staging and immediately before publication. Existing live SHM read marks
 remain transient. Fixed and variable parity loads also check versions before and

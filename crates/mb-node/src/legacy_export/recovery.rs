@@ -10,8 +10,34 @@ use mb_core::{
 };
 use mb_store::ControlStore;
 
-#[derive(Default)]
+// Each lookup finishes its SQLite statement before recovery can contact peers.
+// Export's input-version guard rejects concurrent changes before publication.
+fn for_each_recovery_record(
+    control: &ControlStore,
+    kind: &str,
+    guard: &mb_store::PreservedReadGuard,
+    mut visit: impl FnMut(&[u8], &[u8]) -> Result<bool>,
+) -> Result<()> {
+    let mut after = None;
+    loop {
+        guard.verify_unchanged()?;
+        let Some((key, bytes)) =
+            control.next_record_bounded(kind, after.as_deref(), 32, V1_MAX_CATALOG_BYTES)?
+        else {
+            break;
+        };
+        let more = visit(&key, &bytes)?;
+        guard.verify_unchanged()?;
+        if !more {
+            break;
+        }
+        after = Some(key);
+    }
+    Ok(())
+}
+
 pub(super) struct RecoveryInputs<'a> {
+    pub(super) control_guard: &'a mb_store::PreservedReadGuard,
     pub(super) volumes: &'a [PreservedParityVolume],
     pub(super) remote: Option<&'a super::remote::PeerRecovery>,
 }
@@ -62,10 +88,10 @@ impl CheckpointRecovery {
         }
         let previous = self.checkpoint.as_ref().map(|(hash, _)| *hash);
         let mut found = None;
-        control.for_each_record_bounded(
+        for_each_recovery_record(
+            control,
             "guild-checkpoint",
-            32,
-            V1_MAX_CATALOG_BYTES,
+            inputs.control_guard,
             |key, bytes| {
                 if previous.is_some_and(|hash| key == hash) {
                     return Ok(true);
@@ -410,10 +436,10 @@ fn recover_variable(
     }
     let mut found = None;
     let mut last_error = None;
-    control.for_each_record_bounded(
+    for_each_recovery_record(
+        control,
         "coding-group-transcript",
-        32,
-        V1_MAX_CATALOG_BYTES,
+        inputs.control_guard,
         |key, encoded| {
             let transcript: SignedRecord<mb_core::CodingVerificationTranscript> =
                 decode_canonical(encoded)?;
@@ -421,10 +447,14 @@ fn recover_variable(
             if group.guild_id != guild {
                 return Ok(true);
             }
-            let Some(wanted) = group.roles.iter().position(|role| matches!(role,
-            mb_core::ShardRoleV2::Information(info) if info.sector.id == descriptor.id
-                && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero
-        )) else { return Ok(true); };
+            let Some(wanted) = group.roles.iter().position(|role| {
+            matches!(role,
+                mb_core::ShardRoleV2::Information(info) if info.sector.id == descriptor.id
+                    && info.sector.commitment == descriptor.commitment && !info.sector.virtual_zero
+            )
+        }) else {
+            return Ok(true);
+        };
             let attempt = (|| -> Result<_> {
                 ensure!(
                     key == group.id
@@ -565,4 +595,48 @@ fn recover_variable_transcript(
         shards,
     });
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_record_callbacks_release_sqlite_snapshots_before_peer_work() {
+        for kind in ["guild-checkpoint", "coding-group-transcript"] {
+            let area = tempfile::tempdir().unwrap();
+            let path = area.path().join("control.db");
+            let writer = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            writer
+                .database_shell_statement("PRAGMA busy_timeout=0", false)
+                .unwrap();
+            for key in [b"a", b"b"] {
+                writer.put_record(kind, key, b"preserved").unwrap();
+            }
+            let (reader, guard) =
+                ControlStore::open_preserved_read_only_with_keys(&path, &[[7; 32]]).unwrap();
+            let mut visited = Vec::new();
+            let error = for_each_recovery_record(&reader, kind, &guard, |key, bytes| {
+                assert_eq!(bytes, b"preserved");
+                visited.push(key.to_vec());
+                // This callback stands in for a slow peer request. A retained
+                // SELECT cursor would leave checkpointing busy throughout it.
+                writer.put_record("progress", b"id", key)?;
+                let checkpoint =
+                    writer.database_shell_statement("PRAGMA wal_checkpoint(TRUNCATE)", false)?;
+                assert_eq!(
+                    checkpoint.rows[0][0], "0",
+                    "recovery retained a SQL read lock"
+                );
+                Ok(true)
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("changed"), "{error:#}");
+            assert_eq!(visited, [b"a".to_vec()]);
+            assert!(
+                guard.verify_unchanged().is_err(),
+                "changed recovery inputs must not publish"
+            );
+        }
+    }
 }

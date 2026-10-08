@@ -656,8 +656,7 @@ remain active.
   - [x] Qualify non-creating Linux catalog export payload and preserved parity
     readers. Reuse an opened preserved database without an export-wide explicit
     read transaction. Select local signed revisions in one short snapshot.
-    Existing recovery callbacks can retain SQL cursors across peer I/O;
-    releasing those cursor snapshots remains open.
+    Recovery cursor release is qualified separately below.
     A separate input guard requires unchanged main/WAL versions and sidecar
     identities/absence before staging and immediately before publication; live
     shared-memory read marks remain transient. Both fixed and variable parity
@@ -680,6 +679,26 @@ remain active.
     key-manifest/external-owner reconciliation,
     other-platform no-creation qualification and common WAL-index/resource
     budgets remain open with the full R1/R2/R3/release gates.
+  - [x] Release preserved checkpoint/transcript SQL cursors before peer work.
+    Recovery visits one owned bounded row at a time through an indexed exclusive
+    key cursor. The input guard runs before each lookup and after each callback,
+    rejecting changed inputs before another lookup or publication. This also
+    prevents a live writer extending the recovery scan indefinitely. A real
+    SQLite regression reproduces the old cursor's busy WAL checkpoint and
+    verifies that checkpointing completes during the new callback, followed by
+    changed-input rejection before a second row. Cursor qualification passes 63 unique cases (38 legacy-export, 1 large-
+    retained-graph, 2 legacy-discovery, 19 ordinary-process, 1 capture-
+    withdrawal, 1 graph-intent-compatibility, and one provisioned Btrfs
+    renamed-root case). All four debug programs build; format and strict
+    locked workspace/all-targets Clippy pass. All 284 source files and six
+    program/test-driver hashes remain unchanged, and native mount/loop/image
+    cleanup is verified. Evidence and the distinct passing-case inventory are
+    retained under `/tmp/mb-m6-recovery-cursor-validation-h6i65pwl`; the post-
+    commit audit binds the code to the commit. This is a focused debug-source
+    qualification; complete ordinary/native suites and installed artifacts
+    were not rerun.
+    Atomic writer/path/ownership handoff, common resource budgets, installed
+    artifacts and the full R1/R2/R3/release gates remain open.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

@@ -601,6 +601,7 @@ fn export_catalog(
     let mut checkpoint_recovery =
         recovery::CheckpointRecovery::with_checkpoint(downloaded_checkpoint)?;
     let inputs = recovery::RecoveryInputs {
+        control_guard: &guard,
         volumes: &volumes,
         remote,
     };
@@ -1352,9 +1353,8 @@ pub(crate) mod tests {
             }
             drop(store);
             let original = fs::read(data.join("control.db")).unwrap();
-            let inspected = crate::volume::inspect_control_store(&data, &keys)
-                .unwrap()
-                .unwrap();
+            let (inspected, input_guard) =
+                crate::volume::open_preserved_control_store(&data, &keys).unwrap();
             let mut decoder = recovery::CheckpointRecovery::default();
             for reference in revision
                 .value
@@ -1368,7 +1368,11 @@ pub(crate) mod tests {
                             &inspected,
                             &revision,
                             reference,
-                            &recovery::RecoveryInputs::default()
+                            &recovery::RecoveryInputs {
+                                control_guard: &input_guard,
+                                volumes: &[],
+                                remote: None,
+                            }
                         )
                         .unwrap()
                         .unwrap(),
