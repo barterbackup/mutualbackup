@@ -331,7 +331,7 @@ fn pending_git_inventory_preserves_history_raw_pins_imported_streams_and_origina
         let report =
             super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                 .unwrap();
-        assert_eq!(report.format_version, 4);
+        assert_eq!(report.format_version, 5);
         assert_eq!(report.local_state.pending_git_graphs.len(), 2);
         for entry in &report.local_state.pending_git_graphs {
             assert!(entry.graph_metadata_validated && !entry.payloads_verified);

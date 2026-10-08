@@ -266,8 +266,7 @@ impl PreservedParentCheck {
                 PreservedInput::NativeRoot(root) => self.check_native(root),
                 PreservedInput::RecordedNativeRoot(root) => self.check_recorded_native(root),
             })
-        })?;
-        crate::volume::for_each_preserved_volume_path(control, |path| self.check_hint(path))
+        })
     }
 
     fn pin(self) -> Result<mb_store::PinnedDirectory> {

@@ -3232,7 +3232,7 @@ pub(crate) fn paged_scratch_store(
         let device = mb_store::physical_allocation_domain(directory)?;
         let mut limits = mb_store::ScratchStorageLimits::for_database(max_database_bytes)?;
         let mut checkpoints = vec![control.path().to_path_buf()];
-        let records = load_bounded_volume_records(control)?;
+        let (records, _) = load_bounded_volume_records(control)?;
         for record in records {
             validate_volume_record(&record)?;
             match fs::metadata(&record.path) {
@@ -3263,43 +3263,62 @@ pub(crate) fn paged_scratch_store(
     }
 }
 
-fn decode_volume_records(bytes: &[u8]) -> Result<Vec<VolumeRecord>> {
-    decode_canonical(bytes)
+fn decode_volume_records_with_configured_flag(bytes: &[u8]) -> Result<(Vec<VolumeRecord>, bool)> {
+    decode_canonical::<Vec<VolumeRecord>>(bytes)
+        .map(|records| (records, true))
         .or_else(|_| {
             decode_canonical::<Vec<VolumeRecordBeforeConfiguredState>>(bytes)
-                .map(|records| records.into_iter().map(Into::into).collect())
+                .map(|records| (records.into_iter().map(Into::into).collect(), false))
         })
         .map_err(Into::into)
 }
 
+fn decode_volume_records(bytes: &[u8]) -> Result<Vec<VolumeRecord>> {
+    decode_volume_records_with_configured_flag(bytes).map(|(records, _)| records)
+}
+
 #[cfg(target_os = "linux")]
-fn load_bounded_volume_records(control: &ControlStore) -> Result<Vec<VolumeRecord>> {
+fn load_bounded_volume_records(control: &ControlStore) -> Result<(Vec<VolumeRecord>, bool)> {
     let records = control
         .get_record_bounded(
             "node-config",
             b"storage-volumes",
             MAX_BOUNDED_VOLUME_REGISTRY_BYTES,
         )?
-        .map(|bytes| decode_volume_records(&bytes))
+        .map(|bytes| decode_volume_records_with_configured_flag(&bytes))
         .transpose()?
-        .unwrap_or_default();
-    if records.len() > MAX_BOUNDED_VOLUME_RECORDS {
+        .unwrap_or_else(|| (Vec::new(), true));
+    if records.0.len() > MAX_BOUNDED_VOLUME_RECORDS {
         bail!("too many volumes for bounded registry inspection");
     }
     Ok(records)
 }
 
-/// Exclude every saved volume location without opening its manifest or payload.
+/// A decoded registration without wrapped keys or claims about payload custody.
+#[cfg(target_os = "linux")]
+pub(crate) struct PreservedVolumeRegistration<'a> {
+    pub(crate) record_format: u16,
+    pub(crate) volume_id: Uuid,
+    pub(crate) path: &'a Path,
+    pub(crate) database_file: &'a str,
+    pub(crate) state: StorageVolumeState,
+    pub(crate) configured: bool,
+    pub(crate) configured_recorded: bool,
+    pub(crate) budget_bytes: u64,
+    pub(crate) headroom_bytes: u64,
+}
+
+/// Visit every saved volume without opening its manifest or payload.
 /// Retired/unconfigured volumes can still hold retained or interrupted data.
 #[cfg(target_os = "linux")]
-pub(crate) fn for_each_preserved_volume_path(
+pub(crate) fn for_each_preserved_volume_registration(
     control: &ControlStore,
-    mut visit: impl FnMut(&Path) -> Result<()>,
+    mut visit: impl FnMut(PreservedVolumeRegistration<'_>) -> Result<()>,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::path::Component;
 
-    let records = load_bounded_volume_records(control)?;
+    let (records, configured_recorded) = load_bounded_volume_records(control)?;
     let mut ids = BTreeSet::new();
     for record in &records {
         validate_volume_record(record)?;
@@ -3321,7 +3340,17 @@ pub(crate) fn for_each_preserved_volume_path(
         }
     }
     for record in records {
-        visit(&record.path)?;
+        visit(PreservedVolumeRegistration {
+            record_format: record.format_version,
+            volume_id: record.volume_id,
+            path: &record.path,
+            database_file: &record.database_file,
+            state: record.state,
+            configured: record.configured,
+            configured_recorded,
+            budget_bytes: record.budget_bytes,
+            headroom_bytes: record.headroom_bytes,
+        })?;
     }
     Ok(())
 }
@@ -3577,7 +3606,8 @@ mod tests {
 
         let area = TempDir::new().unwrap();
         let database = area.path().join("control.db");
-        let writer = ControlStore::open_with_key(&database, &[83; 32]).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([83; 32]));
+        let writer = ControlStore::open(&database, &keys).unwrap();
         let records = [
             StorageVolumeState::Online,
             StorageVolumeState::Offline,
@@ -3613,9 +3643,9 @@ mod tests {
                 last_error: record.last_error.clone(),
             })
             .collect::<Vec<_>>();
-        for encoded in [
-            canonical_bytes(&records).unwrap(),
-            canonical_bytes(&historical).unwrap(),
+        for (encoded, configured_recorded) in [
+            (canonical_bytes(&records).unwrap(), true),
+            (canonical_bytes(&historical).unwrap(), false),
         ] {
             writer
                 .put_record("node-config", b"storage-volumes", &encoded)
@@ -3630,12 +3660,22 @@ mod tests {
             };
             let before = names();
             let mut paths = Vec::new();
-            ControlStore::with_preserved_read_only_snapshot(&database, &[[83; 32]], |control| {
-                for_each_preserved_volume_path(control, |path| {
-                    paths.push(path.to_path_buf());
-                    Ok(())
-                })
-            })
+            ControlStore::with_preserved_read_only_snapshot(
+                &database,
+                &[keys.database_key(b"control.db")],
+                |control| {
+                    for_each_preserved_volume_registration(control, |volume| {
+                        assert_eq!(volume.configured_recorded, configured_recorded);
+                        let original = &records[paths.len()];
+                        assert_eq!(
+                            volume.configured,
+                            !configured_recorded || original.configured
+                        );
+                        paths.push(volume.path.to_path_buf());
+                        Ok(())
+                    })
+                },
+            )
             .unwrap();
             assert_eq!(
                 paths,
@@ -3645,6 +3685,35 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             assert!(paths.iter().all(|path| !path.exists()));
+            let inventory =
+                crate::inventory_withdrawn_revisions_from_catalog(&keys, area.path()).unwrap();
+            assert_eq!(inventory.format_version, 5);
+            assert!(!inventory.retained_history_complete);
+            let volumes = &inventory.local_state.storage_volumes;
+            assert_eq!(volumes.len(), records.len());
+            for (volume, original) in volumes.iter().zip(&records) {
+                assert_eq!(volume.volume_id, original.volume_id);
+                assert_eq!(volume.record_format, original.format_version);
+                assert_eq!(
+                    volume.path_hex,
+                    hex::encode(original.path.as_os_str().as_encoded_bytes())
+                );
+                assert_eq!(volume.database_file, original.database_file);
+                assert_eq!(volume.state, original.state);
+                assert_eq!(volume.configured_recorded, configured_recorded);
+                assert_eq!(
+                    volume.configured,
+                    !configured_recorded || original.configured
+                );
+                assert_eq!(volume.budget_bytes, original.budget_bytes);
+                assert_eq!(volume.headroom_bytes, original.headroom_bytes);
+                assert!(!volume.payloads_verified);
+            }
+            assert!(
+                !serde_json::to_string(&inventory)
+                    .unwrap()
+                    .contains("wrapped_database_key")
+            );
             assert_eq!(names(), before);
             assert_eq!(fs::read(&database).unwrap(), original);
             assert_eq!(fs::read(database.with_extension("db-wal")).unwrap(), wal);
@@ -3703,7 +3772,7 @@ mod tests {
             store_volume_records(&control, &records).unwrap();
             let mut visits = 0;
             assert!(
-                for_each_preserved_volume_path(&control, |_| {
+                for_each_preserved_volume_registration(&control, |_| {
                     visits += 1;
                     Ok(())
                 })
@@ -3718,8 +3787,10 @@ mod tests {
             .put_record("node-config", b"storage-volumes", b"damaged registry")
             .unwrap();
         assert!(
-            for_each_preserved_volume_path(&control, |_| panic!("damaged registry visited"))
-                .is_err()
+            for_each_preserved_volume_registration(&control, |_| panic!(
+                "damaged registry visited"
+            ))
+            .is_err()
         );
     }
 
@@ -3739,7 +3810,7 @@ mod tests {
             .collect::<Vec<_>>();
         store_volume_records(&control, &records).unwrap();
         let mut visits = 0;
-        for_each_preserved_volume_path(&control, |_| {
+        for_each_preserved_volume_registration(&control, |_| {
             visits += 1;
             Ok(())
         })
@@ -3748,10 +3819,12 @@ mod tests {
         records.push(record.clone());
         store_volume_records(&control, &records).unwrap();
         assert!(
-            for_each_preserved_volume_path(&control, |_| panic!("oversized registry visited"))
-                .unwrap_err()
-                .to_string()
-                .contains("too many volumes")
+            for_each_preserved_volume_registration(&control, |_| panic!(
+                "oversized registry visited"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("too many volumes")
         );
         assert!(
             paged_scratch_store(&control, 64 * 1024 * 1024)
@@ -3772,7 +3845,7 @@ mod tests {
             error.truncate(error.len() - (length - MAX_BOUNDED_VOLUME_REGISTRY_BYTES));
         }
         store_volume_records(&control, &[boundary]).unwrap();
-        for_each_preserved_volume_path(&control, |_| Ok(())).unwrap();
+        for_each_preserved_volume_registration(&control, |_| Ok(())).unwrap();
         control
             .put_record(
                 "node-config",
@@ -3781,7 +3854,7 @@ mod tests {
             )
             .unwrap();
         for error in [
-            for_each_preserved_volume_path(&control, |_| panic!("oversized blob visited"))
+            for_each_preserved_volume_registration(&control, |_| panic!("oversized blob visited"))
                 .unwrap_err(),
             paged_scratch_store(&control, 64 * 1024 * 1024)
                 .err()

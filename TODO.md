@@ -750,6 +750,32 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Include saved storage-volume registrations in `legacy-list` report
+    format 5. Reuse placement's bounded current/historical decoder and one
+    local snapshot. Report raw paths, volume IDs, database names, state,
+    configured status and budget/headroom without exposing wrapped keys or
+    opening volume manifests/payloads. Historical `configured: true` defaults
+    retain `configured_recorded: false`. Unconfigured/retired registrations
+    remain included; payload verification and history completeness stay false.
+    Charge each entry to the existing full 32 MiB report budget. New and
+    expanded fixtures cover exact/over report budgets, original historical
+    field provenance, all storage states, raw paths and a real CLI listing/
+    destination-rejection fixture with an unselected saved volume.
+    Storage-volume inventory qualification passes 128 unique cases: 40 export/peer
+    cases, all 61 ordinary volume cases, 20 CLI process cases,
+    retained-graph/discovery/withdrawal/graph-intent regressions, and two
+    provisioned Btrfs identity/retained-capture cases. All four debug programs
+    build; format and strict locked workspace/all-targets Clippy pass. All 284
+    source-file and six program/test-driver hashes remain unchanged, and
+    native mount/loop/image cleanup is verified. Evidence and the distinct
+    passing-case inventory are retained under
+    `/tmp/mb-m6-volume-inventory-validation-gdx0ells`; the post-commit audit
+    binds the code to the commit. This is a focused debug-source
+    qualification; complete ordinary/native suites and installed artifacts
+    were not rerun. Full receipt,
+    recipe, local-sector, native-pin and intent ownership reconciliation,
+    external Git catalogs, relocated volumes/aliases, atomic admission/writer
+    handoff, installed artifacts and full R1/R2/R3/release gates remain open.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

@@ -3592,7 +3592,26 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(!inputs.join("control.db").exists());
     let catalog = temp.path().join("catalog");
     fs::create_dir(&catalog).unwrap();
+    let volume = temp
+        .path()
+        .join(OsString::from_vec(b"saved-volume-\xfd".to_vec()));
+    fs::create_dir(&volume).unwrap();
+    fs::create_dir(volume.join("nested")).unwrap();
+    let mut registry_node = Node::open(temp.path().join("registry-state"), seed).unwrap();
+    registry_node
+        .configure_storage_volumes(std::slice::from_ref(&volume), 65536, 0)
+        .unwrap();
+    let registry = registry_node.database_shell_statement(
+        None,
+        "SELECT hex(bytes) FROM protocol_records WHERE kind='node-config' AND record_id=X'73746f726167652d766f6c756d6573'",
+        false,
+    ).unwrap();
+    let registry_bytes = hex::decode(&registry.rows[0][0]).unwrap();
+    drop(registry_node);
     let mut store = mb_store::ControlStore::open(catalog.join("control.db"), &keys).unwrap();
+    store
+        .put_record("node-config", b"storage-volumes", &registry_bytes)
+        .unwrap();
     store
         .put_record("user-revision", revision_id.as_bytes(), &signed)
         .unwrap();
@@ -3675,13 +3694,23 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 4);
+    assert_eq!(inventory.format_version, 5);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
     assert_eq!(inventory.local_state.unclassified_guarded_records.len(), 1);
     assert_eq!(inventory.local_state.protected_roots.len(), 1);
     assert_eq!(inventory.local_state.git_repositories.len(), 1);
+    assert_eq!(inventory.local_state.storage_volumes.len(), 2);
+    let saved_volume = inventory
+        .local_state
+        .storage_volumes
+        .iter()
+        .find(|record| record.path_hex == hex::encode(volume.as_os_str().as_bytes()))
+        .unwrap();
+    assert!(saved_volume.configured && saved_volume.configured_recorded);
+    assert_eq!(saved_volume.budget_bytes, 65536);
+    assert!(!saved_volume.payloads_verified);
     assert!(!inventory.local_state.git_repositories[0].registered_root);
     let preserved = &inventory.local_state.unclassified_guarded_records[0];
     assert_eq!(preserved.kind, "guarded-view-mount-v1");
@@ -3710,6 +3739,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         registered_source.join("nested"),
         history_only.clone(),
         history_alias.join("nested"),
+        volume.clone(),
+        volume.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(

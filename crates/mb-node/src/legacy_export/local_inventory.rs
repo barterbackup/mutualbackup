@@ -30,6 +30,7 @@ pub struct LegacyLocalStateInventory {
     pub protected_roots: Vec<LegacyRootRegistration>,
     pub source_backends: Vec<LegacySourceBinding>,
     pub git_repositories: Vec<LegacyGitRegistration>,
+    pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
     pub guarded_captures: Vec<LegacyGuardedCapture>,
     pub pending_captures: Vec<LegacyPendingCapture>,
     pub pending_git_graphs: Vec<LegacyPendingGitGraph>,
@@ -68,6 +69,21 @@ pub struct LegacyGitRegistration {
     /// or that its refs, pins, linked worktrees and pending intents are inventoried.
     pub catalog_inventoried: bool,
     pub signed_revision_ids: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyStorageVolumeRegistration {
+    pub volume_id: Uuid,
+    pub record_format: u16,
+    pub path_hex: String,
+    pub database_file: String,
+    pub state: crate::StorageVolumeState,
+    pub configured: bool,
+    /// Historical records defaulted to configured without storing this field.
+    pub configured_recorded: bool,
+    pub budget_bytes: u64,
+    pub headroom_bytes: u64,
+    pub payloads_verified: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -166,6 +182,7 @@ pub(super) enum PreservedLocalRecord<'a> {
     Root(ProtectedRoot),
     Binding(SourceBackendBinding),
     Git(GitRepositoryInfo),
+    Volume(crate::volume::PreservedVolumeRegistration<'a>),
     Capture {
         kind: &'a str,
         revision_id: Uuid,
@@ -222,6 +239,7 @@ impl PreservedLocalRecord<'_> {
                 inode: binding.root_inode,
             }))?,
             Self::Git(registration) => visit(PreservedInput::PathHint(&registration.path))?,
+            Self::Volume(volume) => visit(PreservedInput::PathHint(volume.path))?,
             Self::Capture { capture, .. } => {
                 visit(PreservedInput::NativeRoot(capture.metadata.lower_root_id))?;
                 for file in &capture.files {
@@ -427,6 +445,9 @@ pub(super) fn for_each_record(
         visit(PreservedLocalRecord::Git(registration))?;
         Ok(true)
     })?;
+    crate::volume::for_each_preserved_volume_registration(control, |volume| {
+        visit(PreservedLocalRecord::Volume(volume))
+    })?;
     for kind in ["capture-intent", "recovery-anchor-intent"] {
         control.for_each_record_bounded(kind, 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
             let intent = crate::snapshot::preserved::decode_capture_intent(kind, key, bytes)?;
@@ -534,6 +555,7 @@ pub(super) fn collect(
         protected_roots: Vec::new(),
         source_backends: Vec::new(),
         git_repositories: Vec::new(),
+        storage_volumes: Vec::new(),
         guarded_captures: Vec::new(),
         pending_captures: Vec::new(),
         pending_git_graphs: Vec::new(),
@@ -587,6 +609,22 @@ pub(super) fn collect(
                 };
                 account(&entry, used, limit)?;
                 report.git_repositories.push(entry);
+            }
+            PreservedLocalRecord::Volume(volume) => {
+                let entry = LegacyStorageVolumeRegistration {
+                    volume_id: volume.volume_id,
+                    record_format: volume.record_format,
+                    path_hex: hex::encode(volume.path.as_os_str().as_bytes()),
+                    database_file: volume.database_file.to_owned(),
+                    state: volume.state,
+                    configured: volume.configured,
+                    configured_recorded: volume.configured_recorded,
+                    budget_bytes: volume.budget_bytes,
+                    headroom_bytes: volume.headroom_bytes,
+                    payloads_verified: false,
+                };
+                account(&entry, used, limit)?;
+                report.storage_volumes.push(entry);
             }
             PreservedLocalRecord::Capture {
                 kind,
@@ -823,6 +861,60 @@ impl LegacyLocalStateInventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_volume_inventory_accounts_registry_entries_without_opening_volumes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let area = tempfile::tempdir().unwrap();
+        let data = area.path().join("state");
+        let volume = area
+            .path()
+            .join(std::ffi::OsString::from_vec(b"volume-\xff".to_vec()));
+        std::fs::create_dir(&volume).unwrap();
+        let seed = mb_core::Seed::from_bytes([86; 32]);
+        let keys = mb_core::KeyMaterial::from_seed(&seed);
+        let mut node = crate::Node::open(&data, seed).unwrap();
+        node.configure_storage_volumes(std::slice::from_ref(&volume), 65536, 0)
+            .unwrap();
+        drop(node);
+        let before_data = preserved_files(&data);
+        let before_volume = preserved_files(&volume);
+        let report =
+            super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+        assert_eq!(report.format_version, 5);
+        assert!(!report.retained_history_complete);
+        assert!(report.revisions.is_empty());
+        let volumes = &report.local_state.storage_volumes;
+        assert_eq!(
+            volumes.len(),
+            2,
+            "retain the unconfigured data-directory volume"
+        );
+        let selected = volumes
+            .iter()
+            .find(|record| record.path_hex == hex::encode(volume.as_os_str().as_bytes()))
+            .unwrap();
+        assert!(selected.configured && selected.configured_recorded);
+        assert_eq!(selected.state, crate::StorageVolumeState::Online);
+        assert_eq!(selected.budget_bytes, 65536);
+        assert_eq!(selected.headroom_bytes, 0);
+        assert!(volumes.iter().any(|volume| !volume.configured));
+        assert!(volumes.iter().all(|volume| !volume.payloads_verified));
+        let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+        assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+        assert!(super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err());
+        let first = canonical_size_bounded(&volumes[0], V1_MAX_CATALOG_BYTES).unwrap();
+        crate::volume::with_inspected_control_snapshot(&data, &keys, |control| {
+            let mut used = 0;
+            assert!(collect(control, &mut used, first - 1).is_err());
+            assert_eq!(used, 0, "reject before adding the first registry entry");
+            Ok(())
+        })
+        .unwrap();
+        assert_preserved_files(&data, &before_data);
+        assert_preserved_files(&volume, &before_volume);
+    }
     use mb_core::{KeyMaterial, SignedRecord, UserRevision, canonical_bytes};
     use mb_store::{
         FileExtent, GuardedStoppedFileV1, GuardedViewEntryKind, GuardedViewMetadataEntry,
@@ -1209,7 +1301,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 4);
+            assert_eq!(report.format_version, 5);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);
