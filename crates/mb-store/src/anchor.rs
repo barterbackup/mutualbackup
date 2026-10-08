@@ -1762,6 +1762,15 @@ pub struct ImportedBlobCapturePlan {
 }
 
 impl ImportedBlobCapturePlan {
+    /// Inspect original import ownership without opening its source or area.
+    pub fn preserved_ownership(&self) -> anyhow::Result<PreservedRootCapture<'_>> {
+        anyhow::ensure!(
+            self.format_version == 1,
+            "unsupported preserved blob import plan"
+        );
+        self.root.preserved_ownership()
+    }
+
     pub(crate) fn area(&self) -> &StableAnchorAreaLocator {
         &self.root.area
     }
@@ -5688,6 +5697,78 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_blob_import_plan_keeps_original_root_without_source_or_area_access() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary
+            .path()
+            .join(std::ffi::OsString::from_vec(b"missing-\xff".to_vec()));
+        let area = StableAnchorAreaLocator {
+            area_id: Uuid::from_u128(231),
+            path_hint: temporary.path().join("missing-area"),
+            filesystem_id: 7,
+            volume_root_hint: temporary.path().to_path_buf(),
+        };
+        let anchor_id = Uuid::from_u128(232);
+        let root_wire = canonical_bytes(&(
+            1_u16,
+            anchor_id,
+            source.as_os_str().as_bytes().to_vec(),
+            area.clone(),
+            (7_u64, 8_u64, 0_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+            libc::S_IFDIR | 0o700,
+            0_i64,
+            0_u32,
+        ))
+        .unwrap();
+        let root: ReflinkCapturePlan = decode_canonical(&root_wire).unwrap();
+        let wire = canonical_bytes(&(1_u16, root, 17_u64)).unwrap();
+        let plan: ImportedBlobCapturePlan = decode_canonical(&wire).unwrap();
+        assert_eq!(canonical_bytes(&plan).unwrap(), wire);
+        #[derive(Serialize)]
+        enum OriginalPlan {
+            DirectV1((u16, ReflinkCapturePlan, u64)),
+        }
+        let original = OriginalPlan::DirectV1((1, plan.root.clone(), 17));
+        let wire = canonical_bytes(&original).unwrap();
+        let source_plan: crate::SourceBlobImportPlan = decode_canonical(&wire).unwrap();
+        assert_eq!(canonical_bytes(&source_plan).unwrap(), wire);
+        let ownership = source_plan.preserved_ownership().unwrap();
+        assert_eq!(ownership.record_format, 1);
+        assert_eq!(ownership.anchor_id, anchor_id);
+        assert_eq!(ownership.source_root, source);
+        assert_eq!(ownership.area, &area);
+        assert_eq!(
+            ownership.recorded_root_identity,
+            NativeFileId {
+                filesystem_id: 7,
+                inode: 8
+            }
+        );
+        assert_eq!(ownership.stable_root_identity, None);
+        assert_eq!(source_plan.logical_len(), 17);
+        for index in 0..5 {
+            let mut bad = plan.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.root.anchor_id = Uuid::nil(),
+                2 => bad.root.source_root = PathBuf::from("relative"),
+                3 => bad.root.area.filesystem_id = 0,
+                _ => bad.root.root_version.inode = 0,
+            }
+            assert!(bad.preserved_ownership().is_err());
+            assert!(
+                crate::SourceBlobImportPlan::DirectV1(bad)
+                    .preserved_ownership()
+                    .is_err()
+            );
+        }
+        assert!(!source.exists());
+        assert!(!area.path_hint.exists());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -700,6 +700,13 @@ pub enum SourceBlobImportPlan {
 }
 
 impl SourceBlobImportPlan {
+    /// Preserve the original import plan; backend admission and replay are separate.
+    pub fn preserved_ownership(&self) -> anyhow::Result<crate::PreservedRootCapture<'_>> {
+        match self {
+            Self::DirectV1(plan) => plan.preserved_ownership(),
+        }
+    }
+
     pub fn plan_direct(
         source_root: impl AsRef<Path>,
         logical_len: u64,

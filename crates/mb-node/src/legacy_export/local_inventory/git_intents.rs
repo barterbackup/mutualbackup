@@ -2,6 +2,148 @@
 use super::*;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitFetch {
+    pub repository_id: Uuid,
+    pub fetch_id: Uuid,
+    pub record_format: u16,
+    pub source_path_hint_hex: String,
+    pub source_root_hint_hex: String,
+    pub push: Option<LegacyPendingGitPush>,
+    pub refs: Vec<LegacyGitGraphRef>,
+    pub objects: Vec<LegacyGitGraphObject>,
+    pub blobs: Vec<LegacyFetchedBlob>,
+    pub graph_metadata_validated: bool,
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitPush {
+    pub record_format: u16,
+    pub target_name: String,
+    pub expected_old: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyFetchedBlob {
+    pub oid: String,
+    pub logical_len: u64,
+    pub symlink: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitBlobImport {
+    pub repository_id: Uuid,
+    pub record_format: u16,
+    pub oid: String,
+    pub logical_len: u64,
+    /// The original blob row does not identify a fetch UUID.
+    pub plan: LegacyBlobImportPlan,
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyBlobImportPlan {
+    pub record_format: u16,
+    pub anchor_id: Uuid,
+    pub source_root_hint_hex: String,
+    pub area_id: Uuid,
+    pub recorded_area_filesystem_id: u64,
+    pub area_path_hint_hex: String,
+    pub volume_root_hint_hex: String,
+    pub logical_len: u64,
+    pub recorded_root_identity: NativeFileId,
+    pub stable_root_identity: Option<NativeFileId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyVerifiedFetchBlob {
+    pub repository_id: Uuid,
+    pub fetch_id: Uuid,
+    pub record_format: u16,
+    pub oid: String,
+    pub anchors: Vec<LegacyVerifiedFetchAnchor>,
+    /// Original verification evidence is retained; payloads are not reread.
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyVerifiedFetchAnchor {
+    pub anchor_id: Uuid,
+    pub content_hash: String,
+}
+
+pub(super) fn blob_import_plan(
+    plan: &mb_store::SourceBlobImportPlan,
+) -> Result<LegacyBlobImportPlan> {
+    let ownership = plan.preserved_ownership()?;
+    Ok(LegacyBlobImportPlan {
+        record_format: ownership.record_format,
+        anchor_id: ownership.anchor_id,
+        source_root_hint_hex: hex::encode(ownership.source_root.as_os_str().as_bytes()),
+        area_id: ownership.area.area_id,
+        recorded_area_filesystem_id: ownership.area.filesystem_id,
+        area_path_hint_hex: hex::encode(ownership.area.path_hint.as_os_str().as_bytes()),
+        volume_root_hint_hex: hex::encode(ownership.area.volume_root_hint.as_os_str().as_bytes()),
+        logical_len: plan.logical_len(),
+        recorded_root_identity: ownership.recorded_root_identity,
+        stable_root_identity: ownership.stable_root_identity,
+    })
+}
+
+pub(super) fn report_fetch(
+    intent: mb_git::PreservedFetchIntent,
+    used: &mut usize,
+    limit: usize,
+) -> Result<LegacyPendingGitFetch> {
+    let mut report = LegacyPendingGitFetch {
+        repository_id: intent.repository_id,
+        fetch_id: intent.fetch_id,
+        record_format: intent.record_format,
+        source_path_hint_hex: hex::encode(intent.source_path.as_os_str().as_bytes()),
+        source_root_hint_hex: hex::encode(intent.source_root.as_os_str().as_bytes()),
+        push: intent.push.map(|push| LegacyPendingGitPush {
+            record_format: push.record_format,
+            target_name: push.target_name,
+            expected_old: push.expected_old.map(hex::encode),
+        }),
+        refs: Vec::new(),
+        objects: Vec::new(),
+        blobs: Vec::new(),
+        graph_metadata_validated: false,
+        payloads_verified: false,
+    };
+    account(&report, used, limit)?;
+    for reference in intent.refs {
+        let entry = LegacyGitGraphRef {
+            name_hex: hex::encode(reference.name),
+            oid: hex::encode(reference.oid),
+        };
+        account(&entry, used, limit)?;
+        report.refs.push(entry);
+    }
+    for object in intent.objects {
+        let entry = LegacyGitGraphObject {
+            kind: object.kind,
+            oid: hex::encode(object.oid),
+            payload_bytes: object.bytes.len() as u64,
+            payload_hash: hex::encode(blake3::hash(&object.bytes).as_bytes()),
+        };
+        account(&entry, used, limit)?;
+        report.objects.push(entry);
+    }
+    for blob in intent.blobs {
+        let entry = LegacyFetchedBlob {
+            oid: hex::encode(blob.oid),
+            logical_len: blob.logical_len,
+            symlink: blob.symlink,
+        };
+        account(&entry, used, limit)?;
+        report.blobs.push(entry);
+    }
+    Ok(report)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyPendingGitGraph {
     pub record_format: u16,
     pub guild_id: String,

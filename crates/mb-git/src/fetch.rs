@@ -121,6 +121,281 @@ struct VerifiedBlob {
     anchors: Vec<(Uuid, [u8; 32])>,
 }
 
+/// Original unfinished import metadata; payload and graph joins remain unchecked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedFetchIntent {
+    pub record_format: u16,
+    pub fetch_id: Uuid,
+    pub repository_id: Uuid,
+    pub source_path: PathBuf,
+    pub source_root: PathBuf,
+    pub refs: Vec<GitGraphRef>,
+    pub objects: Vec<GitGraphObject>,
+    pub blobs: Vec<PreservedFetchedBlob>,
+    pub push: Option<PreservedPushImport>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedFetchedBlob {
+    pub oid: [u8; 20],
+    pub logical_len: u64,
+    pub symlink: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedPushImport {
+    pub record_format: u16,
+    pub target_name: String,
+    pub expected_old: Option<[u8; 20]>,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_preserved_fetch(intent: &FetchIntent, repository_id: Uuid) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    use std::os::unix::ffi::OsStrExt;
+    ensure!(
+        !repository_id.is_nil()
+            && intent.repository_id == repository_id
+            && !intent.fetch_id.is_nil()
+            && matches!(intent.format_version, 1..=6)
+            && intent
+                .refs
+                .len()
+                .saturating_add(intent.objects.len())
+                .saturating_add(intent.blobs.len())
+                <= MAX_GRAPH_OBJECTS
+            && (!matches!(intent.format_version, 2 | 4) || intent.refs.len() == 1),
+        "invalid preserved Git fetch identity, version or graph size"
+    );
+    for path in [&intent.source_path, &intent.source_root] {
+        ensure!(
+            path.is_absolute()
+                && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+                && path
+                    .components()
+                    .all(|component| !matches!(component, std::path::Component::ParentDir))
+                && !path.as_os_str().as_bytes().contains(&0),
+            "invalid preserved Git fetch path hint"
+        );
+    }
+    ensure!(
+        !intent.source_path.starts_with(&intent.source_root),
+        "preserved Git fetch source is inside its target"
+    );
+    let mut bytes = 0_usize;
+    let mut names = HashSet::new();
+    for reference in &intent.refs {
+        let name = std::str::from_utf8(&reference.name)?;
+        let namespace = match intent.format_version {
+            2 => name.starts_with("refs/heads/"),
+            4 => name.starts_with("refs/tags/"),
+            5 | 6 => name.starts_with("refs/remotes/origin/") || name.starts_with("refs/tags/"),
+            _ => name.starts_with("refs/remotes/origin/"),
+        };
+        ensure!(
+            namespace
+                && name.len() <= 2048
+                && git2::Reference::is_valid_name(name)
+                && names.insert(reference.name.as_slice()),
+            "invalid preserved Git fetch reference"
+        );
+        bytes = bytes.saturating_add(reference.name.len() + 20);
+    }
+    ensure!(
+        !names.iter().any(|name| name
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'/' && names.contains(&name[..index]))),
+        "conflicting preserved Git fetch reference namespace"
+    );
+    let mut oids = HashSet::new();
+    for object in &intent.objects {
+        let kind = match object.kind {
+            1 => ObjectType::Commit,
+            2 => ObjectType::Tree,
+            3 if matches!(intent.format_version, 4..=6) => ObjectType::Tag,
+            _ => anyhow::bail!("invalid preserved Git fetch metadata kind"),
+        };
+        ensure!(
+            oids.insert(object.oid)
+                && Oid::hash_object(kind, &object.bytes)?.as_bytes() == object.oid,
+            "invalid preserved Git fetch metadata hash or duplicate object"
+        );
+        bytes = bytes.saturating_add(object.bytes.len() + 24);
+    }
+    ensure!(
+        bytes <= MAX_GRAPH_METADATA_BYTES,
+        "preserved Git fetch metadata exceeds its original limit"
+    );
+    for blob in &intent.blobs {
+        ensure!(
+            oids.insert(blob.oid) && (!blob.symlink || (1..=4095).contains(&blob.logical_len)),
+            "invalid preserved Git fetch blob shape or duplicate object"
+        );
+    }
+    // Original v4+ admission also parsed tag chains in a temporary Git repo.
+    // Inventory retains these bytes without claiming syntax/DAG/reachability.
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn preserved_fetch(intent: FetchIntent, push: Option<PreservedPushImport>) -> PreservedFetchIntent {
+    PreservedFetchIntent {
+        record_format: intent.format_version,
+        fetch_id: intent.fetch_id,
+        repository_id: intent.repository_id,
+        source_path: intent.source_path,
+        source_root: intent.source_root,
+        refs: intent.refs,
+        objects: intent.objects,
+        blobs: intent
+            .blobs
+            .into_iter()
+            .map(|blob| PreservedFetchedBlob {
+                oid: blob.oid,
+                logical_len: blob.logical_len,
+                symlink: blob.symlink,
+            })
+            .collect(),
+        push,
+    }
+}
+
+/// Read import journals without opening stock Git, verifying payloads or replay.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_record(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    for prefix in [FETCH_PREFIX, PUSH_PREFIX] {
+        let expected = format!("{prefix}{repository_id}");
+        control.for_each_record_with_kind_prefix_bounded(
+            prefix,
+            512,
+            ACTIVE.len(),
+            mb_core::V1_MAX_CATALOG_BYTES,
+            |kind, key, bytes| {
+                ensure!(
+                    kind == expected && key == ACTIVE,
+                    "invalid preserved Git fetch/push namespace or key"
+                );
+                let record = if prefix == FETCH_PREFIX {
+                    let intent: FetchIntent = decode_canonical(bytes)?;
+                    validate_preserved_fetch(&intent, repository_id)?;
+                    ensure!(
+                        matches!(intent.format_version, 1 | 3 | 5 | 6)
+                            && mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                        "invalid preserved Git fetch record"
+                    );
+                    preserved_fetch(intent, None)
+                } else {
+                    let intent: PushImportIntent = decode_canonical(bytes)?;
+                    validate_preserved_fetch(&intent.fetch, repository_id)?;
+                    let namespace = match intent.format_version {
+                        1 if intent.fetch.format_version == 2 => "refs/heads/",
+                        2 if intent.fetch.format_version == 4 => "refs/tags/",
+                        _ => anyhow::bail!("invalid preserved Git push version"),
+                    };
+                    let target = format!("{namespace}{}", intent.target_branch);
+                    ensure!(
+                        !intent.target_branch.is_empty()
+                            && intent.target_branch.len() <= 1024
+                            && git2::Reference::is_valid_name(&target)
+                            && (intent.format_version == 2
+                                || git2::Branch::name_is_valid(&intent.target_branch)?)
+                            && intent.fetch.refs[0].name == target.as_bytes()
+                            && mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                        "invalid preserved Git push target or encoding"
+                    );
+                    preserved_fetch(
+                        intent.fetch,
+                        Some(PreservedPushImport {
+                            record_format: intent.format_version,
+                            target_name: intent.target_branch,
+                            expected_old: intent.expected_old,
+                        }),
+                    )
+                };
+                visit(crate::PreservedGitRecord::FetchIntent(Box::new(record)))?;
+                Ok(true)
+            },
+        )?;
+    }
+    control.for_each_record_with_kind_prefix_bounded(
+        BLOB_PREFIX,
+        512,
+        20,
+        mb_core::V1_MAX_CATALOG_BYTES,
+        |kind, key, bytes| {
+            let intent: BlobIntent = decode_canonical(bytes)?;
+            ensure!(
+                kind == blob_kind(repository_id)
+                    && key == intent.oid
+                    && intent.format_version == 1
+                    && intent.repository_id == repository_id
+                    && intent.logical_len == intent.plan.logical_len()
+                    && mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                "invalid preserved Git blob import"
+            );
+            intent.plan.preserved_ownership()?;
+            visit(crate::PreservedGitRecord::BlobImportIntent {
+                repository_id,
+                record_format: intent.format_version,
+                oid: intent.oid,
+                logical_len: intent.logical_len,
+                plan: Box::new(intent.plan),
+            })?;
+            Ok(true)
+        },
+    )?;
+    control.for_each_record_with_kind_prefix_bounded(
+        VERIFIED_PREFIX,
+        512,
+        20,
+        mb_core::V1_MAX_CATALOG_BYTES,
+        |kind, key, bytes| {
+            let expected = format!("{VERIFIED_PREFIX}{repository_id}/");
+            let suffix = kind
+                .strip_prefix(&expected)
+                .ok_or_else(|| anyhow::anyhow!("foreign preserved Git verification namespace"))?;
+            let fetch_id = Uuid::parse_str(suffix)?;
+            ensure!(
+                !fetch_id.is_nil() && format!("{expected}{fetch_id}") == kind,
+                "invalid preserved Git verification scope"
+            );
+            let record: VerifiedBlob = decode_canonical(bytes)?;
+            ensure!(
+                record.format_version == 1
+                    && key == record.oid
+                    && !record.anchors.is_empty()
+                    && mb_core::canonical_bytes_bounded(&record, bytes.len())? == bytes,
+                "invalid preserved Git verification record"
+            );
+            ensure!(
+                record.anchors.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "invalid preserved Git verification anchor order"
+            );
+            for (anchor, _) in &record.anchors {
+                ensure!(
+                    !anchor.is_nil(),
+                    "invalid preserved Git verification anchor"
+                );
+            }
+            visit(crate::PreservedGitRecord::VerifiedFetchBlob {
+                repository_id,
+                fetch_id,
+                record_format: record.format_version,
+                oid: record.oid,
+                anchors: record.anchors,
+            })?;
+            Ok(true)
+        },
+    )?;
+    Ok(())
+}
+
 fn fetch_kind(repository_id: Uuid) -> String {
     format!("{FETCH_PREFIX}{repository_id}")
 }
@@ -1256,6 +1531,344 @@ mod tests {
 
     use super::*;
     use crate::GitRepository;
+
+    #[test]
+    fn preserved_fetch_push_blob_and_verification_journals_keep_original_layouts_without_replay() {
+        use mb_store::{ReflinkCapturePlan, StableAnchorAreaLocator};
+        use std::os::unix::ffi::OsStrExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&path, &[233; 32]).unwrap();
+        let repository_id = Uuid::from_u128(233);
+        let fetch_id = Uuid::from_u128(234);
+        let source_root = temporary.path().join("missing-target");
+        let source_path = temporary.path().join("missing-stock-git");
+        let make = |format: u16, count: usize| {
+            let mut tree = Vec::new();
+            let mut blobs = Vec::new();
+            for index in 0..count {
+                let oid = sha1(
+                    Oid::hash_object(ObjectType::Blob, &(index as u64).to_be_bytes()).unwrap(),
+                );
+                tree.extend_from_slice(format!("100644 file-{index:05}\0").as_bytes());
+                tree.extend_from_slice(&oid);
+                blobs.push(FetchedBlob {
+                    oid,
+                    logical_len: 8,
+                    symlink: false,
+                });
+            }
+            let tree_id = sha1(Oid::hash_object(ObjectType::Tree, &tree).unwrap());
+            let commit = format!("tree {}\nauthor Original <original@example.test> 0 +0000\ncommitter Original <original@example.test> 0 +0000\n\nprivate fetch message\n", Oid::from_bytes(&tree_id).unwrap()).into_bytes();
+            let commit_id = sha1(Oid::hash_object(ObjectType::Commit, &commit).unwrap());
+            let mut objects = vec![
+                GitGraphObject {
+                    kind: 2,
+                    oid: tree_id,
+                    bytes: tree,
+                },
+                GitGraphObject {
+                    kind: 1,
+                    oid: commit_id,
+                    bytes: commit,
+                },
+            ];
+            let mut refs = vec![GitGraphRef {
+                name: if format == 2 {
+                    b"refs/heads/main".to_vec()
+                } else {
+                    b"refs/remotes/origin/main".to_vec()
+                },
+                oid: commit_id,
+            }];
+            if matches!(format, 4..=6) {
+                let tag = format!("object {}\ntype commit\ntag release\ntagger Original <original@example.test> 0 +0000\n\nrelease\n",Oid::from_bytes(&commit_id).unwrap()).into_bytes();
+                let tag_id = sha1(Oid::hash_object(ObjectType::Tag, &tag).unwrap());
+                objects.push(GitGraphObject {
+                    kind: 3,
+                    oid: tag_id,
+                    bytes: tag,
+                });
+                if format == 4 {
+                    refs.clear();
+                }
+                refs.push(GitGraphRef {
+                    name: b"refs/tags/release".to_vec(),
+                    oid: tag_id,
+                });
+            }
+            FetchIntent {
+                format_version: format,
+                fetch_id,
+                repository_id,
+                source_path: source_path.clone(),
+                source_root: source_root.clone(),
+                refs,
+                objects,
+                blobs,
+            }
+        };
+        let original = |intent: &FetchIntent| {
+            canonical_bytes(&(
+                intent.format_version,
+                intent.fetch_id,
+                intent.repository_id,
+                intent.source_path.as_os_str().as_bytes().to_vec(),
+                intent.source_root.as_os_str().as_bytes().to_vec(),
+                &intent.refs,
+                &intent.objects,
+                &intent.blobs,
+            ))
+            .unwrap()
+        };
+        let snapshot = || {
+            (
+                fs::read(&path).unwrap(),
+                fs::read(path.with_extension("db-wal")).unwrap(),
+            )
+        };
+        for format in 1..=6 {
+            let intent = make(format, 1);
+            let bytes = original(&intent);
+            assert_eq!(canonical_bytes(&intent).unwrap(), bytes);
+            let (kind, bytes) = if matches!(format, 2 | 4) {
+                let push_format = if format == 2 { 1_u16 } else { 2 };
+                let target = if format == 2 { "main" } else { "release" };
+                let push_wire = canonical_bytes(&(
+                    push_format,
+                    target,
+                    Some(intent.refs[0].oid),
+                    intent.clone(),
+                ))
+                .unwrap();
+                let decoded: PushImportIntent = decode_canonical(&push_wire).unwrap();
+                assert_eq!(canonical_bytes(&decoded).unwrap(), push_wire);
+                (push_kind(repository_id), push_wire)
+            } else {
+                (fetch_kind(repository_id), bytes)
+            };
+            control.put_record(&kind, ACTIVE, &bytes).unwrap();
+            let before = snapshot();
+            let mut seen = false;
+            for_each_preserved_record(&control, repository_id, |record| {
+                let crate::PreservedGitRecord::FetchIntent(actual) = record else {
+                    panic!("wrong record")
+                };
+                assert_eq!(actual.record_format, format);
+                assert_eq!(actual.fetch_id, fetch_id);
+                assert_eq!(actual.repository_id, repository_id);
+                assert_eq!(actual.source_path, source_path);
+                assert_eq!(actual.source_root, source_root);
+                assert_eq!(actual.refs, intent.refs);
+                assert_eq!(actual.objects, intent.objects);
+                assert_eq!(actual.blobs[0].oid, intent.blobs[0].oid);
+                assert_eq!(actual.blobs[0].logical_len, 8);
+                assert_eq!(actual.push.is_some(), matches!(format, 2 | 4));
+                seen = true;
+                Ok(())
+            })
+            .unwrap();
+            assert!(seen);
+            assert_eq!(snapshot(), before);
+            control.delete_record(&kind, ACTIVE).unwrap();
+        }
+        for count in [MAX_GRAPH_OBJECTS - 3, MAX_GRAPH_OBJECTS - 2] {
+            let intent = make(1, count);
+            control
+                .put_record(&fetch_kind(repository_id), ACTIVE, &original(&intent))
+                .unwrap();
+            assert_eq!(
+                for_each_preserved_record(&control, repository_id, |_| Ok(())).is_ok(),
+                count == MAX_GRAPH_OBJECTS - 3
+            );
+            control
+                .delete_record(&fetch_kind(repository_id), ACTIVE)
+                .unwrap();
+        }
+        // Import/verification rows have no enclosing fetch record requirement.
+        let area = StableAnchorAreaLocator {
+            area_id: Uuid::from_u128(235),
+            path_hint: temporary.path().join("missing-area"),
+            filesystem_id: 7,
+            volume_root_hint: temporary.path().to_path_buf(),
+        };
+        let root: ReflinkCapturePlan = decode_canonical(
+            &canonical_bytes(&(
+                1_u16,
+                Uuid::from_u128(236),
+                source_root.as_os_str().as_bytes().to_vec(),
+                area.clone(),
+                (7_u64, 8_u64, 0_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+                libc::S_IFDIR | 0o700,
+                0_i64,
+                0_u32,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        #[derive(Serialize)]
+        enum OriginalPlan {
+            DirectV1((u16, ReflinkCapturePlan, u64)),
+        }
+        let oid = [42_u8; 20];
+        let blob_wire = canonical_bytes(&(
+            1_u16,
+            repository_id,
+            oid,
+            8_u64,
+            OriginalPlan::DirectV1((1, root, 8)),
+        ))
+        .unwrap();
+        let decoded: BlobIntent = decode_canonical(&blob_wire).unwrap();
+        assert_eq!(canonical_bytes(&decoded).unwrap(), blob_wire);
+        let anchors = vec![
+            (Uuid::from_u128(236), [43_u8; 32]),
+            (Uuid::from_u128(237), [44; 32]),
+        ];
+        let verified_wire = canonical_bytes(&(1_u16, oid, &anchors)).unwrap();
+        let verified_kind = format!("{VERIFIED_PREFIX}{repository_id}/{fetch_id}");
+        control
+            .put_record(&blob_kind(repository_id), &oid, &blob_wire)
+            .unwrap();
+        control
+            .put_record(&verified_kind, &oid, &verified_wire)
+            .unwrap();
+        let before = snapshot();
+        let mut visited = 0;
+        for_each_preserved_record(&control, repository_id, |record| {
+            match record {
+                crate::PreservedGitRecord::BlobImportIntent {
+                    oid: actual,
+                    logical_len,
+                    plan,
+                    ..
+                } => {
+                    assert_eq!(actual, oid);
+                    assert_eq!(logical_len, 8);
+                    assert_eq!(plan.preserved_ownership()?.area, &area);
+                }
+                crate::PreservedGitRecord::VerifiedFetchBlob {
+                    fetch_id: actual,
+                    anchors: actual_anchors,
+                    ..
+                } => {
+                    assert_eq!(actual, fetch_id);
+                    assert_eq!(actual_anchors, anchors);
+                }
+                _ => panic!("wrong record"),
+            }
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, 2);
+        assert_eq!(snapshot(), before);
+        control
+            .delete_record(&blob_kind(repository_id), &oid)
+            .unwrap();
+        control.delete_record(&verified_kind, &oid).unwrap();
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        let valid = make(6, 1);
+        for index in 0..14 {
+            let mut bad = valid.clone();
+            match index {
+                0 => bad.format_version = 7,
+                1 => bad.fetch_id = Uuid::nil(),
+                2 => bad.repository_id = Uuid::nil(),
+                3 => bad.source_root = PathBuf::from("relative"),
+                4 => bad.source_path = source_root.join("inside"),
+                5 => bad.source_path = PathBuf::from("/bad\0source"),
+                6 => bad.refs[0].name = b"refs/heads/unsupported".to_vec(),
+                7 => bad.refs.push(bad.refs[0].clone()),
+                8 => bad.objects[0].kind = 0,
+                9 => bad.objects[0].bytes.push(0),
+                10 => bad.objects.push(bad.objects[0].clone()),
+                11 => bad.blobs.push(bad.blobs[0].clone()),
+                12 => {
+                    bad.blobs[0].symlink = true;
+                    bad.blobs[0].logical_len = 0;
+                }
+                _ => bad.source_root = temporary.path().join("dir/../target"),
+            }
+            reject(&fetch_kind(repository_id), ACTIVE, &original(&bad));
+        }
+        let bytes = original(&valid);
+        for key in [b"wrong".as_slice(), b"active-long", b""] {
+            reject(&fetch_kind(repository_id), key, &bytes);
+        }
+        reject(&fetch_kind(Uuid::from_u128(999)), ACTIVE, &bytes);
+        reject(
+            &fetch_kind(repository_id),
+            ACTIVE,
+            &[bytes, vec![0]].concat(),
+        );
+        for index in 0..7 {
+            let mut bad = PushImportIntent {
+                format_version: 1,
+                target_branch: "main".into(),
+                expected_old: Some(valid.refs[0].oid),
+                fetch: make(2, 1),
+            };
+            match index {
+                0 => bad.format_version = 3,
+                1 => bad.fetch.format_version = 4,
+                2 => bad.target_branch.clear(),
+                3 => bad.target_branch = "other".into(),
+                4 => bad.target_branch = "a".repeat(1025),
+                5 => bad.target_branch = "bad..name".into(),
+                _ => bad.fetch.refs.clear(),
+            }
+            reject(
+                &push_kind(repository_id),
+                ACTIVE,
+                &canonical_bytes(&bad).unwrap(),
+            );
+        }
+        for index in 0..4 {
+            let mut bad = decoded.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.repository_id = Uuid::nil(),
+                2 => bad.oid = [0; 20],
+                _ => bad.logical_len += 1,
+            }
+            reject(
+                &blob_kind(repository_id),
+                &oid,
+                &canonical_bytes(&bad).unwrap(),
+            );
+        }
+        for entries in [
+            Vec::new(),
+            vec![(Uuid::nil(), [43; 32])],
+            vec![anchors[0]; 2],
+            vec![anchors[1], anchors[0]],
+        ] {
+            reject(
+                &verified_kind,
+                &oid,
+                &canonical_bytes(&(1_u16, oid, entries)).unwrap(),
+            );
+        }
+        reject(&verified_kind, &[0; 20], &verified_wire);
+        reject(
+            &format!("{VERIFIED_PREFIX}{repository_id}/{}", fetch_id.simple()),
+            &oid,
+            &verified_wire,
+        );
+        reject(
+            &fetch_kind(repository_id),
+            ACTIVE,
+            &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1],
+        );
+        assert!(!source_path.exists() && !source_root.exists() && !area.path_hint.exists());
+    }
 
     fn make_remote(path: &Path, bytes: &[u8], mode: i32) -> (Repository, Oid) {
         let remote = Repository::init_bare(path).unwrap();

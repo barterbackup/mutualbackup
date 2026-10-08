@@ -3843,6 +3843,10 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let worktree_removal_root = temp.path().join("preserved-worktree-removal-root");
     let worktree_removal_marker = temp.path().join("preserved-worktree-removal-marker");
     let worktree_removal_child = temp.path().join("preserved-worktree-removal-child");
+    let fetch_source = temp.path().join("preserved-fetch-stock-source");
+    let fetch_target = temp.path().join("preserved-fetch-target");
+    let import_source = temp.path().join("preserved-blob-import-source");
+    let import_area = temp.path().join("preserved-blob-import-area");
     for path in [
         &object_source,
         &object_area,
@@ -3858,6 +3862,10 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &worktree_removal_root,
         &worktree_removal_marker,
         &worktree_removal_child,
+        &fetch_source,
+        &fetch_target,
+        &import_source,
+        &import_area,
     ] {
         fs::create_dir(path).unwrap();
         fs::create_dir(path.join("nested")).unwrap();
@@ -3867,6 +3875,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     std::os::unix::fs::symlink(&object_area, &object_alias).unwrap();
     let stage_alias = temp.path().join("stage-source-alias");
     std::os::unix::fs::symlink(&stage_source, &stage_alias).unwrap();
+    let import_alias = temp.path().join("blob-import-source-alias");
+    std::os::unix::fs::symlink(&import_source, &import_alias).unwrap();
     let stage_root_id = mb_store::PinnedDirectory::open(&stage_source)
         .unwrap()
         .identity()
@@ -4146,6 +4156,124 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let commit_oid = git2::Oid::hash_object(git2::ObjectType::Commit, &commit_bytes).unwrap();
     let tag_bytes = format!("object {commit_oid}\ntype commit\ntag release\ntagger A <a@example.test> 1 +0000\n\nretained tag\n").into_bytes();
     let tag_oid = git2::Oid::hash_object(git2::ObjectType::Tag, &tag_bytes).unwrap();
+    let fetch_id = Uuid::new_v4();
+    let push_import_id = Uuid::new_v4();
+    let metadata = vec![
+        (
+            2_u8,
+            <[u8; 20]>::try_from(tree_oid.as_bytes()).unwrap(),
+            tree_bytes.clone(),
+        ),
+        (
+            1_u8,
+            <[u8; 20]>::try_from(commit_oid.as_bytes()).unwrap(),
+            commit_bytes.clone(),
+        ),
+        (
+            3_u8,
+            <[u8; 20]>::try_from(tag_oid.as_bytes()).unwrap(),
+            tag_bytes.clone(),
+        ),
+    ];
+    let commit_sha1: [u8; 20] = commit_oid.as_bytes().try_into().unwrap();
+    let tag_sha1: [u8; 20] = tag_oid.as_bytes().try_into().unwrap();
+    external_store
+        .put_record(
+            &format!("git-bare-fetch-intent-v1/{repository_id}"),
+            b"active",
+            &canonical_bytes(&(
+                6_u16,
+                fetch_id,
+                repository_id,
+                fetch_source.as_os_str().as_bytes().to_vec(),
+                fetch_target.as_os_str().as_bytes().to_vec(),
+                vec![
+                    (b"refs/remotes/origin/main".to_vec(), commit_sha1),
+                    (b"refs/tags/release".to_vec(), tag_sha1),
+                ],
+                metadata.clone(),
+                vec![(object_oid, manifest.logical_len, false)],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    external_store
+        .put_record(
+            &format!("git-stock-push-intent-v1/{repository_id}"),
+            b"active",
+            &canonical_bytes(&(
+                2_u16,
+                "release",
+                Some(tag_sha1),
+                (
+                    4_u16,
+                    push_import_id,
+                    repository_id,
+                    fetch_source.as_os_str().as_bytes().to_vec(),
+                    fetch_target.as_os_str().as_bytes().to_vec(),
+                    vec![(b"refs/tags/release".to_vec(), tag_sha1)],
+                    metadata,
+                    vec![(object_oid, manifest.logical_len, false)],
+                ),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let import_root_id = directory_id(&import_source);
+    let fetch_anchor_id = Uuid::new_v4();
+    let import_area_id = Uuid::new_v4();
+    let import_root_plan: mb_store::ReflinkCapturePlan = mb_core::decode_canonical(
+        &canonical_bytes(&(
+            1_u16,
+            fetch_anchor_id,
+            import_source.as_os_str().as_bytes().to_vec(),
+            mb_store::StableAnchorAreaLocator {
+                area_id: import_area_id,
+                filesystem_id: import_root_id.filesystem_id,
+                path_hint: import_area.clone(),
+                volume_root_hint: import_area.clone(),
+            },
+            (
+                import_root_id.filesystem_id,
+                import_root_id.inode,
+                0_u64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+            ),
+            libc::S_IFDIR | 0o700,
+            0_i64,
+            0_u32,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    #[derive(serde::Serialize)]
+    enum OriginalFetchBlobPlan {
+        DirectV1((u16, mb_store::ReflinkCapturePlan, u64)),
+    }
+    external_store
+        .put_record(
+            &format!("git-bare-fetch-blob-intent-v1/{repository_id}"),
+            &object_oid,
+            &canonical_bytes(&(
+                1_u16,
+                repository_id,
+                object_oid,
+                manifest.logical_len,
+                OriginalFetchBlobPlan::DirectV1((1, import_root_plan, manifest.logical_len)),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    external_store
+        .put_record(
+            &format!("git-bare-fetch-verified-v1/{repository_id}/{fetch_id}"),
+            &object_oid,
+            &canonical_bytes(&(1_u16, object_oid, vec![(fetch_anchor_id, [38_u8; 32])])).unwrap(),
+        )
+        .unwrap();
     for (oid, kind, bytes) in [
         (tree_oid, 2_u8, tree_bytes),
         (commit_oid, 1, commit_bytes),
@@ -4253,7 +4381,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 14);
+    assert_eq!(inventory.format_version, 15);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -4333,6 +4461,52 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         removing_child_id
     );
     assert!(!saved_worktree_removal.payloads_verified);
+    assert!(
+        git_registration.fetch_intents_inventoried
+            && git_registration.push_intents_inventoried
+            && git_registration.blob_import_intents_inventoried
+            && git_registration.fetch_verification_records_inventoried
+    );
+    assert_eq!(inventory.local_state.pending_git_fetches.len(), 2);
+    for entry in &inventory.local_state.pending_git_fetches {
+        assert_eq!(
+            entry.source_path_hint_hex,
+            hex::encode(fetch_source.as_os_str().as_bytes())
+        );
+        assert_eq!(
+            entry.source_root_hint_hex,
+            hex::encode(fetch_target.as_os_str().as_bytes())
+        );
+        assert!(!entry.graph_metadata_validated && !entry.payloads_verified);
+        assert_eq!(entry.objects.len(), 3);
+        assert_eq!(entry.blobs[0].oid, hex::encode(object_oid));
+        if entry.fetch_id == push_import_id {
+            let push = entry.push.as_ref().unwrap();
+            assert_eq!(entry.record_format, 4);
+            assert_eq!(push.record_format, 2);
+            assert_eq!(push.target_name, "release");
+            assert_eq!(push.expected_old, Some(hex::encode(tag_sha1)));
+        } else {
+            assert_eq!(entry.fetch_id, fetch_id);
+            assert_eq!(entry.record_format, 6);
+            assert!(entry.push.is_none());
+        }
+    }
+    assert_eq!(inventory.local_state.pending_git_blob_imports.len(), 1);
+    let import = &inventory.local_state.pending_git_blob_imports[0];
+    assert_eq!(import.oid, hex::encode(object_oid));
+    assert_eq!(import.plan.anchor_id, fetch_anchor_id);
+    assert_eq!(import.plan.area_id, import_area_id);
+    assert_eq!(import.plan.recorded_root_identity, import_root_id);
+    assert_eq!(import.plan.stable_root_identity, None);
+    assert_eq!(import.plan.logical_len, manifest.logical_len);
+    assert!(!import.payloads_verified);
+    assert_eq!(inventory.local_state.verified_git_fetch_blobs.len(), 1);
+    let verified = &inventory.local_state.verified_git_fetch_blobs[0];
+    assert_eq!(verified.fetch_id, fetch_id);
+    assert_eq!(verified.anchors[0].anchor_id, fetch_anchor_id);
+    assert_eq!(verified.anchors[0].content_hash, hex::encode([38; 32]));
+    assert!(!verified.payloads_verified);
     assert_eq!(inventory.local_state.pending_git_symlinks.len(), 1);
     let saved_symlink = &inventory.local_state.pending_git_symlinks[0];
     assert_eq!(saved_symlink.repository_id, repository_id);
@@ -4492,6 +4666,11 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         worktree_removal_root.join("nested"),
         worktree_removal_marker.join("nested"),
         worktree_removal_child.join("nested"),
+        fetch_source.join("nested"),
+        fetch_target.join("nested"),
+        import_source.join("nested"),
+        import_area.join("nested"),
+        import_alias.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -4622,6 +4801,11 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &worktree_removal_root.join("nested"),
         &worktree_removal_marker.join("nested"),
         &worktree_removal_child.join("nested"),
+        &fetch_source.join("nested"),
+        &fetch_target.join("nested"),
+        &import_source.join("nested"),
+        &import_area.join("nested"),
+        &import_alias.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -4674,6 +4858,10 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &worktree_removal_root,
         &worktree_removal_marker,
         &worktree_removal_child,
+        &fetch_source,
+        &fetch_target,
+        &import_source,
+        &import_area,
     ] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),

@@ -64,7 +64,7 @@ pub use checkout::CheckoutError;
 #[cfg(target_os = "linux")]
 pub use diff::{DiffError, GitDiff};
 #[cfg(target_os = "linux")]
-pub use fetch::FetchError;
+pub use fetch::{FetchError, PreservedFetchIntent, PreservedFetchedBlob, PreservedPushImport};
 #[cfg(target_os = "linux")]
 pub use head::HeadError;
 #[cfg(target_os = "linux")]

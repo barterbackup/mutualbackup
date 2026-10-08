@@ -11,16 +11,18 @@ pub use inventory::{
     inventory_withdrawn_revisions_from_catalog_over_network,
 };
 pub use local_inventory::{
-    LegacyAnchorAreaLocation, LegacyCaptureOwnership, LegacyFileCapturePlan,
-    LegacyGitAnchorAreaLocation, LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef,
-    LegacyGitIndexRegistration, LegacyGitMetadataObject, LegacyGitObjectAnchor, LegacyGitReference,
-    LegacyGitRegistration, LegacyGitSelectedBranch, LegacyGitWorktreeRegistration,
-    LegacyGuardedAnchorPin, LegacyGuardedCapture, LegacyLocalSectorRecipe, LegacyLocalSectorSource,
-    LegacyLocalStateInventory, LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitGraph,
-    LegacyPendingGitPrune, LegacyPendingGitRemoval, LegacyPendingGitStage, LegacyPendingGitSymlink,
-    LegacyPendingGitWorktreeRemoval, LegacyPreservedRecord, LegacyPruneFileAnchor,
-    LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
-    LegacyStorageVolumeRegistration, LegacyVolumeOwnership, LegacyWorktreeRemovalDirectory,
+    LegacyAnchorAreaLocation, LegacyBlobImportPlan, LegacyCaptureOwnership, LegacyFetchedBlob,
+    LegacyFileCapturePlan, LegacyGitAnchorAreaLocation, LegacyGitBlobPin, LegacyGitGraphObject,
+    LegacyGitGraphRef, LegacyGitIndexRegistration, LegacyGitMetadataObject, LegacyGitObjectAnchor,
+    LegacyGitReference, LegacyGitRegistration, LegacyGitSelectedBranch,
+    LegacyGitWorktreeRegistration, LegacyGuardedAnchorPin, LegacyGuardedCapture,
+    LegacyLocalSectorRecipe, LegacyLocalSectorSource, LegacyLocalStateInventory,
+    LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitBlobImport, LegacyPendingGitFetch,
+    LegacyPendingGitGraph, LegacyPendingGitPrune, LegacyPendingGitPush, LegacyPendingGitRemoval,
+    LegacyPendingGitStage, LegacyPendingGitSymlink, LegacyPendingGitWorktreeRemoval,
+    LegacyPreservedRecord, LegacyPruneFileAnchor, LegacyRetainedAnchor, LegacyRootRegistration,
+    LegacySourceBinding, LegacyStorageVolumeRegistration, LegacyVerifiedFetchAnchor,
+    LegacyVerifiedFetchBlob, LegacyVolumeOwnership, LegacyWorktreeRemovalDirectory,
     LegacyWorktreeRemovalFile,
 };
 pub use remote::{

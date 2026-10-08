@@ -781,6 +781,41 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory original Git fetch/push/import verification ownership.
+    `legacy-list` format 15 includes original external Git fetch versions
+    1/3/5/6, branch/tag push wrappers, standalone blob-import plans and
+    fetch-verification rows. Pure bounded readers validate canonical original
+    namespaces/keys/layouts, source/target path hints, original
+    graph/reference limits, metadata content hashes, blob shapes, push
+    binding, root capture ownership and sorted nonnil verification anchors.
+    They do not open stock Git, replay imports, read payloads or infer a fetch
+    UUID for blob-import rows that never recorded one. Projected metadata
+    exposes byte lengths and hashes; the complete report and every nested item
+    share the 32 MiB limit. Separate family coverage leaves full catalog,
+    graph/payload verification and retained-history completeness false;
+    historical verification evidence is retained without treating it as
+    current payload proof. Placement excludes recorded source/target/root/area
+    hints and renamed import-root identities in both device and
+    stable-filesystem eras, including aliases. Physical verification-anchor
+    joins and relocated areas without recorded directory identities remain
+    unresolved. Original-wire fixtures cover all versions, missing enclosing
+    fetch records, malformed scope/key/version/path/object/plan/anchor data,
+    cardinality/row limits, closed/WAL-only/live catalogs, JSON/privacy/report
+    bounds, unchanged inputs, late corruption and actual CLI placement.
+    External Git fetch/push qualification passes 549 unique cases: 52 export/peer
+    cases, all 293 ordinary store, 63 volume and 113 Git cases, 21 CLI process
+    cases, retained-graph/discovery/withdrawal/graph-intent regressions and
+    two provisioned Btrfs identity/retained-capture cases. All four debug
+    programs build; format and strict locked workspace/all-targets Clippy
+    pass. All 284 source-file and eight program/test-driver hashes remain
+    unchanged, and native mount/loop/image cleanup is verified. Evidence and
+    the distinct passing-case inventory are retained under
+    `/tmp/mb-m6-fetch-inventory-validation-yig_0e3e`; the post-commit audit
+    binds the code to the commit. This is focused debug-source qualification;
+    complete ordinary/native Node suites, installed artifacts and other
+    platforms were not rerun.
+    Merge/checkout intents, complete ownership/history joins, atomic admission,
+    shared budgets, capacity and all remaining milestone gates stay open.
   - [x] Inventory original linked-worktree removal ownership journals.
     `legacy-list` format 14 adds original linked-worktree removal journals
     independently of their saved registration, selected HEAD and index. The
