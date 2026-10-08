@@ -277,6 +277,39 @@ impl<'a> AuthorityReader<'a> {
         &self.current
     }
 
+    pub(crate) fn paged_checkpoint_trust(&self) -> Result<mb_core::PagedCheckpointTrust> {
+        self.check()?;
+        let genesis_hash = match &self.compact {
+            Some(record) => record.genesis_hash,
+            None => decode_installed_guild(
+                self.original
+                    .as_deref()
+                    .context("paged checkpoint requires original genesis")?,
+            )?
+            .certificate
+            .hash()?,
+        };
+        let trust = mb_core::PagedCheckpointTrust {
+            guild_id: self.current.guild_id,
+            genesis_hash,
+            event_sequence: self.current.event_sequence,
+            event_head: self.current.event_head,
+            authority: mb_core::CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: self.current.membership_epoch,
+                quorum: self.current.quorum,
+            },
+            members: self.current.active_members().cloned().collect(),
+            previous: self
+                .control
+                .checkpoint_head_identity(&self.current.guild_id)?
+                .map(|(generation, hash)| mb_core::PagedCheckpointParent { generation, hash }),
+        };
+        trust.validate()?;
+        self.check()?;
+        Ok(trust)
+    }
+
     pub(crate) fn current_recovery_key(
         &self,
         owner: NodeId,
@@ -394,6 +427,9 @@ pub(super) fn retained_group(
     })?
     .context("node has no dynamic guild state")
 }
+
+#[cfg(test)]
+mod paged_checkpoint_tests;
 
 #[cfg(test)]
 mod tests {

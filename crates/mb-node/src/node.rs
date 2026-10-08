@@ -4138,6 +4138,26 @@ impl Node {
         .context("writer-key registration requires dynamic guild state")
     }
 
+    /// Stage the complete public metadata owner against independently checked
+    /// original events and the actual current predecessor. This does not
+    /// publish/activate a protected checkpoint or replace private/payload owners.
+    pub fn retain_paged_checkpoint_metadata(
+        &self,
+        id: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
+    ) -> Result<mb_store::CatalogPagedCheckpointRetention> {
+        guild_authority::with_history(&self.control, |authority| {
+            Ok(self
+                .control
+                .retain_catalog_paged_checkpoint(id, proof, || {
+                    authority.paged_checkpoint_trust().map_err(|_| {
+                        mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                    })
+                })?)
+        })?
+        .context("paged checkpoint requires original guild authority")
+    }
+
     pub(crate) fn needs_recovery_key_registration(&self) -> Result<bool> {
         guild_authority::with_history(&self.control, |authority| {
             let sequence = authority

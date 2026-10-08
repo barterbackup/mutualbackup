@@ -1,3 +1,5 @@
+mod paged_checkpoint_retention;
+
 use super::*;
 use mb_core::{
     CatalogCodingEntry, CheckpointAuthority, DynamicGuildState, GuildEvent, GuildGenesis,

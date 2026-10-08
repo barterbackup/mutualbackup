@@ -44,7 +44,8 @@ pub use catalog::{
     CatalogPackingCodingDirectoryValidation, CatalogPackingCodingIndex,
     CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
     CatalogPackingCodingValidation, CatalogPackingIndex, CatalogPackingPlacement,
-    CatalogPackingSector, CatalogPackingValidation, CatalogPublicationView,
+    CatalogPackingSector, CatalogPackingValidation, CatalogPagedCheckpointRetention,
+    CatalogPagedCheckpointRetentionState, CatalogPublicationView,
     CatalogQuorumPagedCheckpointIndex, CatalogSectorSource, CatalogSourceSweep, CatalogStoreError,
     CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource,
     PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
@@ -1133,6 +1134,35 @@ impl ControlStore {
         guild_id: &[u8; 32],
     ) -> Result<Option<CheckpointRow>, DatabaseError> {
         checkpoint_row(&self.connection, "checkpoint_heads", guild_id)
+    }
+
+    /// Fixed current identity for publication/retirement guards. This never
+    /// loads the accumulated checkpoint certificate/body.
+    pub fn checkpoint_head_identity(
+        &self,
+        guild_id: &[u8; 32],
+    ) -> Result<Option<(u64, [u8; 32])>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT generation, CASE WHEN length(checkpoint_hash) = 32 THEN checkpoint_hash END
+                 FROM checkpoint_heads WHERE guild_id = ?1",
+                [guild_id.as_slice()],
+                |row| {
+                    let generation: i64 = row.get(0)?;
+                    let hash: Option<[u8; 32]> = row.get(1)?;
+                    Ok((generation, hash))
+                },
+            )
+            .optional()?
+            .map(|(generation, hash)| {
+                let hash = hash.ok_or(DatabaseError::Integrity)?;
+                let generation = u64::try_from(generation).map_err(|_| DatabaseError::Integrity)?;
+                if generation == 0 || hash == [0; 32] {
+                    return Err(DatabaseError::Integrity);
+                }
+                Ok((generation, hash))
+            })
+            .transpose()
     }
 
     pub fn checkpoint_at_generation(

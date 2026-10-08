@@ -1909,6 +1909,21 @@ certified historical recovery and revisions retained by a committed head or
 its successor survive rotation/revocation. This corrects the legacy gate;
 bounded enclosing checkpoint production and qualification remain required.
 
+Concrete original-history-proven paged candidates now have one durable public
+metadata owner. It retains the authority root, both packing roots, the coding
+directory and every nested legacy/source/forest root, plus the exact original
+quorum certificate. Completed proof debt and local typed EOF replay share the
+admitted budget. Bounded independent event trust and the actual SQL predecessor
+are checked inside every acquisition/publication transaction. Node uses its
+frozen original-history index for these guards; current-head identity reads
+exclude the certificate body and bound hash payloads in SQL. Cancellation and
+each incremental root release check the actual current checkpoint before and
+after mutation, including after reopen. Final release also retires the original
+certificate atomically. This stages public metadata; complete private/native/
+bootstrap and information/parity custody, certified-current activation and
+successor retirement, full quota/admission policy and normal retained-capacity/
+platform/release qualification remain required before enabling producers.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

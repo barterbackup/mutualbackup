@@ -1319,6 +1319,10 @@ pub(super) mod tests {
                     |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
                 )
                 .unwrap();
+            // Keep the original encoded public pages available to enclosing
+            // ownership fixtures, not just the disposable joined facts.
+            self.pages.extend(packing_pages);
+            self.pages.extend(pages);
             (index, entries)
         }
     }

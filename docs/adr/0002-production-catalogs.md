@@ -3834,3 +3834,79 @@ replace its full-state history materialization or complete paged checkpoint
 ownership/publication, full quota admission, retained 1 TiB or native/platform/
 topology/release qualification. Normal paged checkpoint producers remain
 disabled.
+
+## Guarded enclosing public checkpoint ownership (2026-10-08)
+
+`CatalogPagedCheckpointRetention` gives a concrete original-history-proven,
+quorum-bound paged candidate one public metadata owner. It binds the exact
+header, original certificate hash, independent trust hash, completed proof debt
+and enclosing budget. External-authorizer-only draft transitions cannot enter.
+The budget admits completed original/previous-proof work plus local public EOF
+replay before ownership starts. The authority root, both packing roots and coding
+directory acquire atomically. Bounded traversal pins every logical legacy
+envelope, paged revision source tree and coding forest part before reading it;
+complete original signed envelopes, source/bootstrap EOF, authenticated compact
+packing source resolution and original coding witnesses must all replay locally.
+
+The exact bounded original quorum certificate is stored in the same initial
+transaction, with exact readback. Retry/reopen require the original descriptor
+and certificate; missing, corrupt, substituted or oversized live evidence fails.
+Published retries repeat typed EOF and check every exact dependency/pin instead
+of accepting the journal state alone. Final publication rereads the exact local
+certificate around its guarded state change.
+The final cancelled root release removes the owner's certificate copy in the
+same transaction as the pin and counter changes. The cancelled descriptor remains to prevent ID
+reuse. Interrupted Building jobs replay their typed EOF with idempotent pins;
+failed workers cancel only an unpublished job. Independent successor owners
+preserve shared root closures across old-owner retirement.
+
+Every initial/nested acquisition and final publication checks independently
+certified event trust and the actual SQL checkpoint predecessor inside its short
+writer, with a second check after mutation. Node's metadata entry point supplies
+a frozen original-history reader over the compact accepted scope and exact
+original genesis/tail/index marker. A complete index needs no accumulated flat
+history. The fixed current-head query excludes certificate/body bytes and uses
+SQL length selection before exposing the 32-byte hash. Independent original
+authority and actual predecessor changes cannot publish a mixed-scope result.
+
+Cancellation and every bounded root release check the actual current checkpoint
+before and after mutation. A current owner cannot retire, including after reopen
+or if the current head appears after cancellation. SQL-trigger mutations of the
+head during cancellation/release roll back pins, counters, journal state and the
+head change together. Future full activation must itself require a complete live
+owner atomically; the metadata owner supplies no activation capability and does
+not write the normal current checkpoint. Historical checkpoint/ancestor archive
+ownership and its retirement policy remain required separately; removing this
+owner's certificate copy does not retire the accepted protocol archive.
+
+Store fixtures use original genesis, real signed event/writer/coding history,
+concrete transition proofs and original quorum certificates. They exercise all
+transitive public roots after capture retirement and reopen, a real certified
+shared successor, interrupted Building replay, permanently cancelled IDs,
+external-only proofs, stale trust, missing local EOF, ignored initial writes,
+final event/base changes and atomic cancellation/root/certificate retirement.
+Current-head fixtures include a 2 MiB body and invalid, zero, undersized and
+oversized identity columns. Node fixtures construct a real signed legacy revision
+at its original 64 KiB geometry, authenticated packed sources, original bound
+coding Adds/witnesses and a complete original-history-proven quorum candidate.
+The real Node entry retains it with unreadable unused 2 MiB flat state, retires
+capture pins, reopens and preserves the metadata owner; changed original genesis
+and a later accepted event reject the stale candidate.
+
+Final focused validation passed all eight Store ownership/head-identity tests
+and all 26 selected Node cases: the two new metadata-entry fixtures plus the
+existing authority, backup/DHT, writer-revocation and legacy checkpoint/catch-up
+regressions. The locked full Store library suite subsequently passed all 265
+ordinary tests with 26 ignored against the same final functional tree. Strict
+locked workspace/all-targets Clippy and formatting/diff checks pass. Node
+validation here is the 26-case focused run, not a repeated full Node suite.
+These are local public metadata and current-state guard tests;
+ignored provisioned/native/topology cases remain unqualified.
+
+This completes guarded public candidate metadata ownership, not the complete
+enclosing protected checkpoint. Private metadata, native anchors, bootstrap
+ciphertext and information/parity payload custody, all logical/history owners,
+certified-current activation/retirement and cooperative worker integration, full physical/dataset/guild
+quota and admission policy, archive retention, actual retained 1 TiB and native/
+platform/topology/release qualification remain required. Normal paged checkpoint
+producers remain disabled; original signed layouts and wire versions are unchanged.

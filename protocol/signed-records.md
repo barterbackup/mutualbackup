@@ -312,6 +312,20 @@ latest pointers and corrupt rows fail closed. These local reads neither change
 original signed formats nor replace the original event validation used for
 registration, recovered remote history or enclosing checkpoint proofs.
 
+A private local candidate owner now requires that concrete original-history
+transition and the exact quorum-bound public proof. One journal owns authority,
+both packing roots, coding directory and all nested legacy/source/forest roots;
+the owner's original bounded certificate copy is acquired atomically with the
+initial roots and removed atomically with the final cancelled root. Independent event trust
+and the actual SQL predecessor are checked inside each pin/publication writer.
+Node derives trust from frozen original indexed authority. Current-head reads
+allocate no checkpoint body and reject oversized hash columns in SQL. Local
+cancellation and each root release guard the actual current checkpoint in the
+same transaction. This is public metadata retention, not checkpoint activation;
+the enclosing private/native/bootstrap/information/parity custody, full quota
+policy and certified-current activation/retirement joins remain mandatory.
+Signed layouts, identities and wire versions are unchanged.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the

@@ -1800,6 +1800,20 @@ separately below.
     retained heads/successors across reopen and later valid rotation. See
     ADR 0002 for red/green validation. This does not complete bounded checkpoint
     production, ownership, quota or retained-capacity/platform qualification.
+  - [x] Retain a concrete original-history-proven paged candidate's public
+    authority, both packing roots, coding directory and every logical source/
+    legacy/forest root under one durable owner. Preserve its exact bounded
+    quorum certificate atomically with acquisition and final root release.
+    Debit completed proof work plus local EOF replay; check independent event
+    trust and the actual SQL predecessor inside every pin/publication writer.
+    Node supplies frozen original-index trust without materializing unused flat
+    history. Bound current-head SQL columns before payload allocation. Recheck
+    the actual current checkpoint around cancellation and each root release;
+    preserve shared successors, interrupted acquisition and cancelled-ID fences.
+    See ADR 0002 for fault/reopen/EOF validation. This retains candidate public
+    metadata only; normal producers remain disabled pending complete private,
+    native/bootstrap/information/parity custody, activation/retirement guards,
+    quota/admission and retained 1 TiB/platform/release qualification.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
