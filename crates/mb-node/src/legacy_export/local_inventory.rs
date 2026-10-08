@@ -37,6 +37,9 @@ pub struct LegacyLocalStateInventory {
     pub git_object_anchors: Vec<LegacyGitObjectAnchor>,
     pub git_indexes: Vec<LegacyGitIndexRegistration>,
     pub git_anchor_area_locations: Vec<LegacyGitAnchorAreaLocation>,
+    pub git_references: Vec<LegacyGitReference>,
+    pub git_metadata_objects: Vec<LegacyGitMetadataObject>,
+    pub git_selected_branches: Vec<LegacyGitSelectedBranch>,
     pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
     pub volume_ownership: Vec<LegacyVolumeOwnership>,
     pub local_sectors: Vec<LegacyLocalSectorRecipe>,
@@ -82,6 +85,9 @@ pub struct LegacyGitRegistration {
     pub object_anchors_inventoried: bool,
     pub worktree_indexes_inventoried: bool,
     pub anchor_area_locations_inventoried: bool,
+    pub references_inventoried: bool,
+    pub metadata_objects_inventoried: bool,
+    pub selected_branches_inventoried: bool,
     pub signed_revision_ids: Vec<Uuid>,
 }
 
@@ -124,6 +130,33 @@ pub struct LegacyGitAnchorAreaLocation {
     pub area_id: Uuid,
     pub path_hex: String,
     pub absolute: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitReference {
+    pub repository_id: Uuid,
+    pub record_format: u16,
+    pub reference: LegacyGitGraphRef,
+    pub pin_namespace: bool,
+    pub pin_name_matches_target: Option<bool>,
+    pub target_graph_reconciled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitMetadataObject {
+    pub repository_id: Uuid,
+    pub record_format: u16,
+    pub object: LegacyGitGraphObject,
+    pub content_address_verified: bool,
+    pub graph_metadata_validated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitSelectedBranch {
+    pub repository_id: Uuid,
+    pub worktree_id: Uuid,
+    pub record_format: u16,
+    pub branch: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -583,20 +616,81 @@ pub(super) fn collect_external_git_records(
                 account(&entry, used, limit)?;
                 report.git_anchor_area_locations.push(entry);
             }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::Reference {
+                repository_id,
+                record_format,
+                name,
+                oid,
+                pin_namespace,
+                pin_name_matches_target,
+            }) => {
+                let entry = LegacyGitReference {
+                    repository_id,
+                    record_format,
+                    reference: LegacyGitGraphRef {
+                        name_hex: hex::encode(name),
+                        oid: hex::encode(oid),
+                    },
+                    pin_namespace,
+                    pin_name_matches_target,
+                    target_graph_reconciled: false,
+                };
+                account(&entry, used, limit)?;
+                report.git_references.push(entry);
+            }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::MetadataObject {
+                repository_id,
+                record_format,
+                object,
+            }) => {
+                let entry = LegacyGitMetadataObject {
+                    repository_id,
+                    record_format,
+                    object: LegacyGitGraphObject {
+                        kind: object.kind,
+                        oid: hex::encode(object.oid),
+                        payload_bytes: object.bytes.len() as u64,
+                        payload_hash: hex::encode(blake3::hash(&object.bytes).as_bytes()),
+                    },
+                    content_address_verified: true,
+                    graph_metadata_validated: false,
+                };
+                account(&entry, used, limit)?;
+                report.git_metadata_objects.push(entry);
+            }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::SelectedBranch {
+                scope,
+                record_format,
+                branch,
+            }) => {
+                let entry = LegacyGitSelectedBranch {
+                    repository_id: scope.repository_id(),
+                    worktree_id: scope.worktree_id(),
+                    record_format,
+                    branch,
+                };
+                account(&entry, used, limit)?;
+                report.git_selected_branches.push(entry);
+            }
             PreservedExternalGitRecord::CatalogStatus {
                 repository_id,
                 available,
             } => {
-                let registration = report
+                let index = report
                     .git_repositories
-                    .iter_mut()
-                    .find(|registration| registration.repository_id == repository_id)
-                    .context("external Git catalog lost its preserved registration")?;
+                    .binary_search_by_key(&repository_id, |registration| registration.repository_id)
+                    .map_err(|_| {
+                        anyhow::anyhow!("external Git catalog lost its preserved registration")
+                    })?;
+                let registration = &mut report.git_repositories[index];
                 registration.external_catalog_available = available;
                 registration.linked_worktrees_inventoried = available;
                 registration.object_anchors_inventoried = available;
                 registration.worktree_indexes_inventoried = available;
                 registration.anchor_area_locations_inventoried = available;
+                registration.references_inventoried = available;
+                registration.metadata_objects_inventoried = available;
+                registration.selected_branches_inventoried = available;
             }
         }
         Ok(())
@@ -785,6 +879,9 @@ pub(super) fn collect(
         git_object_anchors: Vec::new(),
         git_indexes: Vec::new(),
         git_anchor_area_locations: Vec::new(),
+        git_references: Vec::new(),
+        git_metadata_objects: Vec::new(),
+        git_selected_branches: Vec::new(),
         storage_volumes: Vec::new(),
         volume_ownership: Vec::new(),
         local_sectors: Vec::new(),
@@ -842,6 +939,9 @@ pub(super) fn collect(
                     object_anchors_inventoried: false,
                     worktree_indexes_inventoried: false,
                     anchor_area_locations_inventoried: false,
+                    references_inventoried: false,
+                    metadata_objects_inventoried: false,
+                    selected_branches_inventoried: false,
                     signed_revision_ids: Vec::new(),
                 };
                 account(&entry, used, limit)?;
@@ -1216,6 +1316,67 @@ mod tests {
                     .unwrap();
                 blobs.push(blob);
             }
+            let mut graph = super::owner_tests::graph(area.path(), repository_id, true);
+            let pinned_oid = graph
+                .refs
+                .iter()
+                .find(|reference| reference.name.starts_with(b"refs/mutualbackup/pins/"))
+                .unwrap()
+                .oid;
+            graph.refs.push(mb_git::GitGraphRef {
+                name: format!("refs/mutualbackup/pins/{}", hex::encode(pinned_oid)).into_bytes(),
+                oid: pinned_oid,
+            });
+            graph.refs.push(mb_git::GitGraphRef {
+                name: b"refs/remotes/origin/main".to_vec(),
+                oid: graph.refs[0].oid,
+            });
+            graph.refs.push(mb_git::GitGraphRef {
+                name: b"refs/custom/unresolved".to_vec(),
+                oid: [233; 20],
+            });
+            graph.objects.push(mb_git::GitGraphObject {
+                kind: 2,
+                oid: git2::Oid::hash_object(git2::ObjectType::Tree, &[])
+                    .unwrap()
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+                bytes: Vec::new(),
+            });
+            for reference in &graph.refs {
+                external
+                    .put_record(
+                        &format!("git-ref-v1/{repository_id}"),
+                        &reference.name,
+                        &canonical_bytes(&(1_u16, reference.oid)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            for object in &graph.objects {
+                external
+                    .put_record(
+                        &format!("git-metadata-object-v1/{repository_id}"),
+                        &object.oid,
+                        &canonical_bytes(&(1_u16, object.kind, &object.bytes)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            for (kind, branch) in [
+                (format!("git-head-v1/{repository_id}"), "main"),
+                (
+                    format!("git-worktree-head-v1/{repository_id}/{linked_id}"),
+                    "topic",
+                ),
+            ] {
+                external
+                    .put_record(
+                        &kind,
+                        b"branch",
+                        &canonical_bytes(&(1_u16, branch)).unwrap(),
+                    )
+                    .unwrap();
+            }
             let cached = raw_path(area.path(), b"cached-\xfc");
             std::fs::create_dir(&cached).unwrap();
             std::fs::create_dir(cached.join("nested")).unwrap();
@@ -1270,11 +1431,56 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 9);
+            assert_eq!(report.format_version, 10);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_object_anchors.len(), 3);
             assert_eq!(report.local_state.git_indexes.len(), 3);
             assert_eq!(report.local_state.git_anchor_area_locations.len(), 2);
+            assert_eq!(report.local_state.git_references.len(), graph.refs.len());
+            assert_eq!(
+                report.local_state.git_metadata_objects.len(),
+                graph.objects.len()
+            );
+            assert_eq!(report.local_state.git_selected_branches.len(), 2);
+            for reference in &graph.refs {
+                let saved = report
+                    .local_state
+                    .git_references
+                    .iter()
+                    .find(|saved| saved.reference.name_hex == hex::encode(&reference.name))
+                    .unwrap();
+                assert_eq!(saved.repository_id, repository_id);
+                assert_eq!(saved.reference.oid, hex::encode(reference.oid));
+                assert!(!saved.target_graph_reconciled);
+            }
+            assert!(report.local_state.git_references.iter().any(|saved| saved.pin_namespace && saved.pin_name_matches_target == Some(true)));
+            assert!(
+                report.local_state.git_references.iter().any(
+                    |saved| saved.pin_namespace && saved.pin_name_matches_target == Some(false)
+                )
+            );
+            for object in &graph.objects {
+                let saved = report
+                    .local_state
+                    .git_metadata_objects
+                    .iter()
+                    .find(|saved| saved.object.oid == hex::encode(object.oid))
+                    .unwrap();
+                assert_eq!(saved.object.payload_bytes, object.bytes.len() as u64);
+                assert_eq!(
+                    saved.object.payload_hash,
+                    hex::encode(blake3::hash(&object.bytes).as_bytes())
+                );
+                assert!(saved.content_address_verified);
+                assert!(!saved.graph_metadata_validated);
+            }
+            assert!(
+                report
+                    .local_state
+                    .git_selected_branches
+                    .iter()
+                    .any(|saved| saved.worktree_id == linked_id && saved.branch == "topic")
+            );
             assert!(report.local_state.git_worktrees.is_empty());
             let registration = &report.local_state.git_repositories[0];
             assert!(
@@ -1283,6 +1489,9 @@ mod tests {
                     && registration.object_anchors_inventoried
                     && registration.worktree_indexes_inventoried
                     && registration.anchor_area_locations_inventoried
+                    && registration.references_inventoried
+                    && registration.metadata_objects_inventoried
+                    && registration.selected_branches_inventoried
             );
             assert!(!registration.catalog_inventoried);
             for blob in &blobs {
@@ -1374,6 +1583,63 @@ mod tests {
                 super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err()
             );
             assert_eq!((snapshot(&data), snapshot(&directory)), before, "{mode}");
+            if mode == "closed" {
+                for (kind, key, bytes) in [
+                    (
+                        format!("git-ref-v1/{repository_id}"),
+                        b"refs/heads/corrupt".to_vec(),
+                        b"bad ref".to_vec(),
+                    ),
+                    (
+                        format!("git-metadata-object-v1/{repository_id}"),
+                        vec![234; 20],
+                        b"bad object".to_vec(),
+                    ),
+                    (
+                        format!(
+                            "git-worktree-head-v1/{repository_id}/{}",
+                            Uuid::from_u128(999)
+                        ),
+                        b"wrong".to_vec(),
+                        canonical_bytes(&(1_u16, "main")).unwrap(),
+                    ),
+                ] {
+                    let external = ControlStore::open_with_key(
+                        &external_path,
+                        &mb_git::catalog_key(&keys, repository_id),
+                    )
+                    .unwrap();
+                    external.put_record(&kind, &key, &bytes).unwrap();
+                    drop(external);
+                    let corrupted = (snapshot(&data), snapshot(&directory));
+                    assert!(
+                        super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data)
+                            .is_err()
+                    );
+                    assert!(
+                        super::super::remote::peer_client_preflight(
+                            &keys,
+                            &data,
+                            &safe,
+                            &[],
+                            false
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                            .is_err()
+                    );
+                    assert_eq!((snapshot(&data), snapshot(&directory)), corrupted);
+                    let external = ControlStore::open_with_key(
+                        &external_path,
+                        &mb_git::catalog_key(&keys, repository_id),
+                    )
+                    .unwrap();
+                    external.delete_record(&kind, &key).unwrap();
+                    drop(external);
+                }
+            }
             if mode == "closed" {
                 let external = ControlStore::open_with_key(
                     &external_path,
@@ -1528,7 +1794,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 9);
+            assert_eq!(report.format_version, 10);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_worktrees.len(), 3);
             let json = serde_json::to_vec(&report).unwrap();
@@ -1655,7 +1921,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 9);
+        assert_eq!(report.format_version, 10);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.local_sectors.len(), 1);
         let entry = &report.local_state.local_sectors[0];
@@ -1777,7 +2043,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 9);
+        assert_eq!(report.format_version, 10);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.volume_ownership.len(), 1);
         let entry = &report.local_state.volume_ownership[0];
@@ -1830,7 +2096,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 9);
+        assert_eq!(report.format_version, 10);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -2249,7 +2515,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 9);
+            assert_eq!(report.format_version, 10);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

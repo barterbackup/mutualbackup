@@ -33,6 +33,44 @@ struct HeadRecord {
     branch: String,
 }
 
+/// Report saved selections without synthesizing the historical `main` default.
+pub(crate) fn for_each_preserved_branch(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for prefix in [HEAD_PREFIX, WORKTREE_HEAD_PREFIX] {
+        control.for_each_record_with_kind_prefix_bounded(
+            prefix,
+            512,
+            HEAD_KEY.len(),
+            2048,
+            |kind, key, bytes| {
+                let scope = GitWorktreeScope::preserved_from_kind(
+                    kind,
+                    repository_id,
+                    HEAD_PREFIX,
+                    WORKTREE_HEAD_PREFIX,
+                )?;
+                anyhow::ensure!(key == HEAD_KEY, "invalid preserved Git HEAD key");
+                let record: HeadRecord = decode_canonical(bytes)?;
+                let branch = decode_selected_branch(bytes)?;
+                anyhow::ensure!(
+                    mb_core::canonical_bytes_bounded(&record, bytes.len())? == bytes,
+                    "noncanonical preserved Git HEAD"
+                );
+                visit(crate::PreservedGitRecord::SelectedBranch {
+                    scope,
+                    record_format: record.format_version,
+                    branch,
+                })?;
+                Ok(true)
+            },
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn head_kind(repository_id: Uuid) -> String {
     head_kind_for_scope(GitWorktreeScope::primary(repository_id))
 }
@@ -210,6 +248,101 @@ pub(crate) fn selected_branch_record_for_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserved_git_heads_keep_explicit_scopes_without_default_repair_or_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(directory.path().join("catalog.db"), &[166; 32]).unwrap();
+        let repository_id = Uuid::from_u128(166);
+        let primary = GitWorktreeScope::primary(repository_id);
+        let linked = GitWorktreeScope::linked(repository_id, Uuid::from_u128(167)).unwrap();
+        let snapshot = || {
+            ["catalog.db", "catalog.db-wal"]
+                .map(|name| std::fs::read(directory.path().join(name)).unwrap())
+        };
+        let before = snapshot();
+        assert_eq!(selected_branch(&control, repository_id).unwrap(), "main");
+        for_each_preserved_branch(&control, repository_id, |_| {
+            panic!("invented a default HEAD")
+        })
+        .unwrap();
+        assert_eq!(snapshot(), before);
+        let longest = "a".repeat(1024);
+        store_selected_branch_for_scope(&control, primary, "main").unwrap();
+        store_selected_branch_for_scope(&control, linked, &longest).unwrap();
+        let before = snapshot();
+        let mut records = Vec::new();
+        for_each_preserved_branch(&control, repository_id, |record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(records.len(), 2);
+        for (expected_scope, expected_branch) in [(primary, "main"), (linked, &longest)] {
+            assert!(records.iter().any(|record| matches!(record,
+                crate::PreservedGitRecord::SelectedBranch { scope, record_format: 1, branch }
+                if *scope == expected_scope && branch == expected_branch)));
+        }
+        assert_eq!(snapshot(), before);
+        for scope in [primary, linked] {
+            control
+                .delete_record(&head_kind_for_scope(scope), HEAD_KEY)
+                .unwrap();
+        }
+        let valid = canonical_bytes(&HeadRecord {
+            format_version: 1,
+            branch: "main".to_owned(),
+        })
+        .unwrap();
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(for_each_preserved_branch(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        for kind in [
+            head_kind(Uuid::from_u128(999)),
+            format!(
+                "{WORKTREE_HEAD_PREFIX}{repository_id}/{}",
+                Uuid::from_u128(167).simple()
+            ),
+            format!("{WORKTREE_HEAD_PREFIX}{repository_id}/{repository_id}"),
+            format!("{WORKTREE_HEAD_PREFIX}{repository_id}/{}", Uuid::nil()),
+        ] {
+            reject(&kind, HEAD_KEY, &valid);
+        }
+        for key in [b"wrong!".as_slice(), b"branchx"] {
+            reject(&head_kind(repository_id), key, &valid);
+        }
+        for (format_version, branch) in [
+            (2, "main".to_owned()),
+            (1, "bad..name".to_owned()),
+            (1, "a".repeat(1025)),
+            (1, "bad\0name".to_owned()),
+        ] {
+            reject(
+                &head_kind(repository_id),
+                HEAD_KEY,
+                &canonical_bytes(&HeadRecord {
+                    format_version,
+                    branch,
+                })
+                .unwrap(),
+            );
+        }
+        reject(
+            &head_kind(repository_id),
+            HEAD_KEY,
+            &[valid, vec![0]].concat(),
+        );
+        reject(&head_kind(repository_id), HEAD_KEY, &[0; 2049]);
+        for_each_preserved_branch(&control, repository_id, |_| {
+            panic!("empty HEAD catalog visited")
+        })
+        .unwrap();
+    }
 
     #[test]
     fn proposed_head_uses_last_primary_change_and_validates_it() {

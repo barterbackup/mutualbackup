@@ -3758,6 +3758,56 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             &canonical_bytes(&cached_area.as_os_str().as_bytes().to_vec()).unwrap(),
         )
         .unwrap();
+    let tree_bytes = [b"100644 file-\xfb\0".as_slice(), object_oid.as_slice()].concat();
+    let tree_oid = git2::Oid::hash_object(git2::ObjectType::Tree, &tree_bytes).unwrap();
+    let commit_bytes = format!("tree {tree_oid}\nauthor A <a@example.test> 1 +0000\ncommitter A <a@example.test> 1 +0000\n\nretained commit\n").into_bytes();
+    let commit_oid = git2::Oid::hash_object(git2::ObjectType::Commit, &commit_bytes).unwrap();
+    let tag_bytes = format!("object {commit_oid}\ntype commit\ntag release\ntagger A <a@example.test> 1 +0000\n\nretained tag\n").into_bytes();
+    let tag_oid = git2::Oid::hash_object(git2::ObjectType::Tag, &tag_bytes).unwrap();
+    for (oid, kind, bytes) in [
+        (tree_oid, 2_u8, tree_bytes),
+        (commit_oid, 1, commit_bytes),
+        (tag_oid, 3, tag_bytes),
+    ] {
+        external_store
+            .put_record(
+                &format!("git-metadata-object-v1/{repository_id}"),
+                oid.as_bytes(),
+                &canonical_bytes(&(1_u16, kind, bytes)).unwrap(),
+            )
+            .unwrap();
+    }
+    for (name, oid) in [
+        ("refs/heads/main".to_owned(), commit_oid),
+        ("refs/tags/release".to_owned(), tag_oid),
+        ("refs/remotes/origin/main".to_owned(), commit_oid),
+        (format!("refs/mutualbackup/pins/{commit_oid}"), commit_oid),
+        ("refs/mutualbackup/pins/retained".to_owned(), commit_oid),
+    ] {
+        let oid: [u8; 20] = oid.as_bytes().try_into().unwrap();
+        external_store
+            .put_record(
+                &format!("git-ref-v1/{repository_id}"),
+                name.as_bytes(),
+                &canonical_bytes(&(1_u16, oid)).unwrap(),
+            )
+            .unwrap();
+    }
+    for (kind, branch) in [
+        (format!("git-head-v1/{repository_id}"), "main"),
+        (
+            format!("git-worktree-head-v1/{repository_id}/{worktree_id}"),
+            "topic",
+        ),
+    ] {
+        external_store
+            .put_record(
+                &kind,
+                b"branch",
+                &canonical_bytes(&(1_u16, branch)).unwrap(),
+            )
+            .unwrap();
+    }
     drop(external_store);
     let external_files = || -> std::collections::BTreeMap<_, _> {
         fs::read_dir(&external_catalog)
@@ -3821,7 +3871,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 9);
+    assert_eq!(inventory.format_version, 10);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -3854,6 +3904,47 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(git_registration.object_anchors_inventoried);
     assert!(git_registration.worktree_indexes_inventoried);
     assert!(git_registration.anchor_area_locations_inventoried);
+    assert!(git_registration.references_inventoried);
+    assert!(git_registration.metadata_objects_inventoried);
+    assert!(git_registration.selected_branches_inventoried);
+    assert_eq!(inventory.local_state.git_references.len(), 5);
+    assert!(
+        inventory
+            .local_state
+            .git_references
+            .iter()
+            .any(|saved| saved.pin_namespace && saved.pin_name_matches_target == Some(true))
+    );
+    assert!(
+        inventory
+            .local_state
+            .git_references
+            .iter()
+            .any(|saved| saved.pin_namespace && saved.pin_name_matches_target == Some(false))
+    );
+    assert!(
+        inventory
+            .local_state
+            .git_references
+            .iter()
+            .all(|saved| !saved.target_graph_reconciled)
+    );
+    assert_eq!(inventory.local_state.git_metadata_objects.len(), 3);
+    assert!(
+        inventory
+            .local_state
+            .git_metadata_objects
+            .iter()
+            .all(|saved| saved.content_address_verified && !saved.graph_metadata_validated)
+    );
+    assert_eq!(inventory.local_state.git_selected_branches.len(), 2);
+    assert!(
+        inventory
+            .local_state
+            .git_selected_branches
+            .iter()
+            .any(|saved| saved.worktree_id == worktree_id && saved.branch == "topic")
+    );
     assert_eq!(inventory.local_state.git_object_anchors.len(), 1);
     let object = &inventory.local_state.git_object_anchors[0];
     assert_eq!(object.repository_id, repository_id);

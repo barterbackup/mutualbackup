@@ -159,7 +159,7 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
-Report format 9 includes preserved local protected-root registrations, backend
+Report format 10 includes preserved local protected-root registrations, backend
 bindings, Git registrations, guarded stopped/revision-capture anchor ownership,
 pending source-capture and recovery-anchor intents, pending Git graph intents,
 retained revision/retirement anchors and remembered anchor-area locations.
@@ -190,6 +190,39 @@ locations. Envelope 1 omitted the selected branch: its decoder default `main`
 is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
+
+The `git_references`, `git_metadata_objects` and `git_selected_branches` entries
+add original external refs, all stored commit/tree/tag metadata and explicit
+primary/linked HEAD records to each repository's preserved snapshot. Unreachable
+metadata and unknown ref targets remain visible. Ref names are reported as bytes;
+`pin_namespace` and `pin_name_matches_target` distinguish the generated OID/name
+convention from named refs that the original graph importer also accepts. A
+nonconforming imported pin name is preserved with false match status. Explicit
+HEAD selections retain their recorded branch; no absent selection is synthesized
+or repaired to `main`. Namespace decoding is shared with index inventory.
+Canonical/version/kind/key validation and SHA-1 object verification create no
+Git scratch repository and open no source or working payload. Metadata-object
+summaries expose size/hash and `content_address_verified: true`, while
+`graph_metadata_validated` and ref `target_graph_reconciled` remain false.
+Separate family coverage flags retain false full-catalog/payload/history claims.
+SQL bounds are 512-byte ref rows/8 KiB names, 64 MiB metadata payloads plus 1 KiB
+encoded overhead with 20-byte keys, and 2 KiB HEAD rows with the original 1,024-
+byte branch bound. All summaries share the complete 32 MiB report limit. Original
+wire, exact/over bounds, malformed-record, closed/WAL-only/live, raw-tree-path,
+named/generated-pin, absent/explicit/scoped-HEAD, unreachable-member/unknown-
+target, JSON/report-budget, late-corruption and real CLI fixtures preserve
+original catalogs and working data. External Git ref/metadata qualification passes 244 unique cases: 47
+export/peer cases, all 63 ordinary volume and 107 ordinary Git cases, 20 CLI
+process cases, retained-graph/discovery/withdrawal/graph-intent regressions,
+and two provisioned Btrfs identity/retained-capture cases. All four debug
+programs build; format and strict locked workspace/all-targets Clippy pass.
+All 284 source-file and seven program/test-driver hashes remain unchanged, and
+native mount/loop/image cleanup is verified. Evidence and the distinct
+passing-case inventory are retained under
+`/tmp/mb-m6-git-history-validation-12rl_xwe`; the post-commit audit binds the
+code to the commit. This is a focused debug-source qualification; complete
+ordinary/native suites and installed artifacts were not rerun. Full ref/object/pin/index/worktree and pending-operation
+joins, common resource budgets and atomic writer/ownership handoff remain open.
 
 The `git_object_anchors`, `git_indexes` and `git_anchor_area_locations` entries
 preserve original external object mappings, primary/linked staged ownership and

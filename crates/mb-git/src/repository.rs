@@ -242,6 +242,24 @@ pub enum PreservedGitRecord {
         area_id: Uuid,
         path: PathBuf,
     },
+    Reference {
+        repository_id: Uuid,
+        record_format: u16,
+        name: Vec<u8>,
+        oid: [u8; 20],
+        pin_namespace: bool,
+        pin_name_matches_target: Option<bool>,
+    },
+    MetadataObject {
+        repository_id: Uuid,
+        record_format: u16,
+        object: crate::GitGraphObject,
+    },
+    SelectedBranch {
+        scope: crate::GitWorktreeScope,
+        record_format: u16,
+        branch: String,
+    },
 }
 
 impl GitRepository {
@@ -259,7 +277,7 @@ impl GitRepository {
         })
     }
 
-    /// Stream original worktree, object-anchor and index ownership in one
+    /// Stream original worktree, anchor, index, ref, metadata and HEAD records in one
     /// non-creating external snapshot. This does not certify complete history.
     #[cfg(target_os = "linux")]
     pub fn for_each_preserved_record(
@@ -273,7 +291,9 @@ impl GitRepository {
                 visit(PreservedGitRecord::LinkedWorktree(info))
             })?;
             crate::stage::for_each_preserved_record(catalog, repository_id, &mut visit)?;
-            crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, visit)
+            crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, &mut visit)?;
+            crate::history::for_each_preserved_record(catalog, repository_id, &mut visit)?;
+            crate::head::for_each_preserved_branch(catalog, repository_id, visit)
         })
     }
 

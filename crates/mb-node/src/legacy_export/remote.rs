@@ -293,6 +293,15 @@ impl PreservedParentCheck {
                 PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::IndexEntry {
                     ..
                 })
+                | PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::Reference {
+                    ..
+                })
+                | PreservedExternalGitRecord::Record(
+                    mb_git::PreservedGitRecord::MetadataObject { .. },
+                )
+                | PreservedExternalGitRecord::Record(
+                    mb_git::PreservedGitRecord::SelectedBranch { .. },
+                )
                 | PreservedExternalGitRecord::CatalogStatus { .. } => {}
             }
             Ok(())

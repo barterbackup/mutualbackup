@@ -13,8 +13,9 @@ pub use inventory::{
 pub use local_inventory::{
     LegacyAnchorAreaLocation, LegacyCaptureOwnership, LegacyGitAnchorAreaLocation,
     LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef, LegacyGitIndexRegistration,
-    LegacyGitObjectAnchor, LegacyGitRegistration, LegacyGitWorktreeRegistration,
-    LegacyGuardedAnchorPin, LegacyGuardedCapture, LegacyLocalSectorRecipe, LegacyLocalSectorSource,
+    LegacyGitMetadataObject, LegacyGitObjectAnchor, LegacyGitReference, LegacyGitRegistration,
+    LegacyGitSelectedBranch, LegacyGitWorktreeRegistration, LegacyGuardedAnchorPin,
+    LegacyGuardedCapture, LegacyLocalSectorRecipe, LegacyLocalSectorSource,
     LegacyLocalStateInventory, LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitGraph,
     LegacyPreservedRecord, LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
     LegacyStorageVolumeRegistration, LegacyVolumeOwnership,

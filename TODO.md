@@ -750,6 +750,46 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory saved external Git refs, metadata objects and HEAD selections.
+    Report format 10 adds original branch/tag/remote/other refs, pin-namespace
+    status, all stored commit/tree/tag metadata (including unreachable members)
+    and explicit primary/linked HEAD records to each preserved Git snapshot.
+    Share exact primary/linked namespace decoding with index inventory. Keep
+    imported named pin refs: report whether their name matches the generated
+    OID/target convention without rejecting the original ref. Explicit HEADs
+    retain their saved branch; absent records do not synthesize or write the
+    historical `main` default. Canonical/version/kind/key/namespace checks and
+    SHA-1 object verification run without a Git scratch repository, payload
+    reads, selected-branch repair or replay. Metadata projections contain sizes/
+    hashes, not object bytes; content addressing does not establish graph joins.
+    Ref targets and complete graph metadata remain unreconciled, and full
+    catalog/payload/history flags remain false. SQL rows use 512-byte refs with
+    8 KiB names, the original 64 MiB metadata-object payload bound plus 1 KiB
+    encoded overhead and exact 20-byte object keys, and 2 KiB HEAD rows with
+    the original 1,024-byte branch limit. Entries share the complete 32 MiB
+    report budget. Repository status uses sorted UUID lookup rather than
+    repeated linear searches. Fixtures cover original records, named/generated
+    pins, explicit/absent HEADs, primary/linked scopes, exact name/object/branch
+    bounds, malformed keys/namespaces/encoding/versions/kinds/content hashes,
+    closed/WAL-only/live catalogs, raw tree paths, unreachable metadata, unknown
+    ref targets, JSON/report limits, late corruption and unchanged originals.
+    The actual CLI includes refs, commit/tree/tag objects and both HEAD scopes.
+    External Git ref/metadata qualification passes 244 unique cases: 47
+    export/peer cases, all 63 ordinary volume and 107 ordinary Git cases, 20
+    CLI process cases, retained-graph/discovery/withdrawal/graph-intent
+    regressions, and two provisioned Btrfs identity/retained-capture cases.
+    All four debug programs build; format and strict locked
+    workspace/all-targets Clippy pass. All 284 source-file and seven
+    program/test-driver hashes remain unchanged, and native mount/loop/image
+    cleanup is verified. Evidence and the distinct passing-case inventory are
+    retained under `/tmp/mb-m6-git-history-validation-12rl_xwe`; the
+    post-commit audit binds the code to the commit. This is a focused
+    debug-source qualification; complete ordinary/native suites and installed
+    artifacts were not rerun.
+    Complete ref/object/pin/index/worktree and stage/prune/checkout/merge/removal
+    joins, other owner/custody reconciliation, common resource budgets, retained
+    1 TiB production support, original R5 diagnosis and full release gates remain
+    open.
   - [x] Inventory original external Git object anchors, indexes and cached areas.
     Report format 9 streams linked worktrees, object-to-anchor mappings,
     primary/linked index entries and saved area locations in one preserved

@@ -36,6 +36,38 @@ impl GitWorktreeScope {
         self.worktree_id
     }
 
+    /// Decode the exact original primary/linked namespace without inventing a
+    /// registration or accepting another repository's local state.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn preserved_from_kind(
+        kind: &str,
+        repository_id: Uuid,
+        primary_prefix: &str,
+        linked_prefix: &str,
+    ) -> anyhow::Result<Self> {
+        use anyhow::{Context, ensure};
+        ensure!(
+            !repository_id.is_nil(),
+            "invalid preserved Git repository scope"
+        );
+        let primary = Self::primary(repository_id);
+        if kind == primary.local_kind(primary_prefix, linked_prefix) {
+            return Ok(primary);
+        }
+        let expected = format!("{linked_prefix}{repository_id}/");
+        let suffix = kind
+            .strip_prefix(&expected)
+            .context("preserved Git namespace conflicts with its repository marker")?;
+        let worktree_id = Uuid::parse_str(suffix)?;
+        let scope = Self::linked(repository_id, worktree_id)
+            .context("invalid preserved linked Git scope")?;
+        ensure!(
+            scope.local_kind(primary_prefix, linked_prefix) == kind,
+            "noncanonical preserved linked Git scope"
+        );
+        Ok(scope)
+    }
+
     pub(crate) fn local_kind(self, primary_prefix: &str, linked_prefix: &str) -> String {
         if self.repository_id == self.worktree_id {
             format!("{primary_prefix}{}", self.repository_id)

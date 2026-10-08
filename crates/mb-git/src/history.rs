@@ -201,6 +201,101 @@ struct RefRecord {
     oid: [u8; 20],
 }
 
+/// Inspect every original stored ref/pin and metadata object, including
+/// unreachable members. Graph reachability and payload custody are separate.
+pub(crate) fn for_each_preserved_record(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    let expected_refs = ref_kind(repository_id);
+    control.for_each_record_with_kind_prefix_bounded(
+        REF_PREFIX,
+        512,
+        crate::GIT_REF_NAME_BYTES,
+        512,
+        |kind, key, bytes| {
+            ensure!(
+                kind == expected_refs,
+                "preserved ref namespace conflicts with its repository marker"
+            );
+            let record: RefRecord = decode_canonical(bytes)?;
+            let name = std::str::from_utf8(key)?;
+            ensure!(
+                record.format_version == 1
+                    && name.starts_with("refs/")
+                    && git2::Reference::is_valid_name(name),
+                "invalid preserved Git ref"
+            );
+            ensure!(
+                mb_core::canonical_bytes_bounded(&record, bytes.len())? == bytes,
+                "noncanonical preserved Git ref"
+            );
+            // Import accepts arbitrary valid Git refs in this namespace.
+            // Preserve them and expose whether the generated pin convention
+            // matches, rather than rejecting an original imported reference.
+            let pin_name_matches_target =
+                key.strip_prefix(PIN_REF_PREFIX.as_bytes()).map(|suffix| {
+                    std::str::from_utf8(suffix)
+                        .ok()
+                        .and_then(|text| {
+                            Oid::from_str(text)
+                                .ok()
+                                .map(|oid| text == oid.to_string() && oid.as_bytes() == record.oid)
+                        })
+                        .unwrap_or(false)
+                });
+            visit(crate::PreservedGitRecord::Reference {
+                repository_id,
+                record_format: record.format_version,
+                name: key.to_vec(),
+                oid: record.oid,
+                pin_namespace: pin_name_matches_target.is_some(),
+                pin_name_matches_target,
+            })?;
+            Ok(true)
+        },
+    )?;
+    let expected_metadata = metadata_kind(repository_id);
+    control.for_each_record_with_kind_prefix_bounded(
+        METADATA_PREFIX,
+        512,
+        20,
+        MAX_GRAPH_METADATA_BYTES + 1024,
+        |kind, key, bytes| {
+            ensure!(
+                kind == expected_metadata,
+                "preserved metadata namespace conflicts with its repository marker"
+            );
+            let record: MetadataObject = decode_canonical(bytes)?;
+            let object_kind = object_type(record.kind).ok_or(HistoryError::IncompatibleRecord)?;
+            ensure!(
+                record.format_version == 1
+                    && record.bytes.len() <= MAX_GRAPH_METADATA_BYTES
+                    && mb_core::canonical_bytes_bounded(&record, bytes.len())? == bytes,
+                "invalid preserved Git metadata object"
+            );
+            let oid = Oid::from_bytes(key)?;
+            ensure!(
+                Oid::hash_object(object_kind, &record.bytes)? == oid,
+                "preserved Git metadata differs from its object ID"
+            );
+            visit(crate::PreservedGitRecord::MetadataObject {
+                repository_id,
+                record_format: record.format_version,
+                object: crate::GitGraphObject {
+                    kind: record.kind,
+                    oid: oid.as_bytes().try_into().expect("SHA-1 object ID"),
+                    bytes: record.bytes,
+                },
+            })?;
+            Ok(true)
+        },
+    )?;
+    Ok(())
+}
+
 pub(crate) fn metadata_kind(repository_id: Uuid) -> String {
     format!("{METADATA_PREFIX}{repository_id}")
 }
@@ -2191,6 +2286,243 @@ mod tests {
 
     use super::*;
     use crate::{GitBackupBlob, GitGraphObject, GitGraphRef};
+
+    #[test]
+    fn preserved_git_refs_pins_and_metadata_keep_original_bytes_and_reject_invalid_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(directory.path().join("catalog.db"), &[165; 32]).unwrap();
+        let repository_id = Uuid::from_u128(165);
+        let tree = Vec::new();
+        let tree_oid = Oid::hash_object(ObjectType::Tree, &tree).unwrap();
+        let commit = format!("tree {tree_oid}\nauthor A <a@example.test> 1 +0000\ncommitter A <a@example.test> 1 +0000\n\noriginal history\n").into_bytes();
+        let commit_oid = Oid::hash_object(ObjectType::Commit, &commit).unwrap();
+        let tag = format!("object {commit_oid}\ntype commit\ntag release\ntagger A <a@example.test> 1 +0000\n\nretained tag\n").into_bytes();
+        let tag_oid = Oid::hash_object(ObjectType::Tag, &tag).unwrap();
+        let objects = [
+            (tree_oid, ObjectType::Tree, tree),
+            (commit_oid, ObjectType::Commit, commit),
+            (tag_oid, ObjectType::Tag, tag),
+        ];
+        let refs = [
+            ("refs/heads/main".to_owned(), commit_oid),
+            ("refs/tags/release".to_owned(), tag_oid),
+            ("refs/remotes/origin/main".to_owned(), commit_oid),
+            (format!("{PIN_REF_PREFIX}{commit_oid}"), commit_oid),
+        ];
+        for (oid, kind, bytes) in &objects {
+            control
+                .put_record(
+                    &metadata_kind(repository_id),
+                    oid.as_bytes(),
+                    &object_record(*kind, bytes.clone()).unwrap(),
+                )
+                .unwrap();
+        }
+        for (name, oid) in &refs {
+            control
+                .put_record(
+                    &ref_kind(repository_id),
+                    name.as_bytes(),
+                    &fetched_ref_record(oid.as_bytes().try_into().unwrap()).unwrap(),
+                )
+                .unwrap();
+        }
+        let snapshot = || {
+            ["catalog.db", "catalog.db-wal"]
+                .map(|name| std::fs::read(directory.path().join(name)).unwrap())
+        };
+        let before = snapshot();
+        let mut records = Vec::new();
+        for_each_preserved_record(&control, repository_id, |record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(records.len(), 7);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    crate::PreservedGitRecord::Reference {
+                        pin_name_matches_target: Some(true),
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        for (oid, kind, bytes) in &objects {
+            assert!(records.iter().any(|record| matches!(record,
+                crate::PreservedGitRecord::MetadataObject { repository_id: owner, record_format: 1, object }
+                if *owner == repository_id && object.oid == oid.as_bytes() && object.kind == object_code(*kind).unwrap() && object.bytes == *bytes)));
+        }
+        assert_eq!(snapshot(), before);
+        for (oid, _, _) in &objects {
+            control
+                .delete_record(&metadata_kind(repository_id), oid.as_bytes())
+                .unwrap();
+        }
+        for (name, _) in &refs {
+            control
+                .delete_record(&ref_kind(repository_id), name.as_bytes())
+                .unwrap();
+        }
+        let longest_ref = format!(
+            "refs/custom/{}",
+            "x".repeat(crate::GIT_REF_NAME_BYTES - "refs/custom/".len())
+        );
+        control
+            .put_record(
+                &ref_kind(repository_id),
+                longest_ref.as_bytes(),
+                &fetched_ref_record(commit_oid.as_bytes().try_into().unwrap()).unwrap(),
+            )
+            .unwrap();
+        let mut visited = 0;
+        for_each_preserved_record(&control, repository_id, |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, 1);
+        control
+            .delete_record(&ref_kind(repository_id), longest_ref.as_bytes())
+            .unwrap();
+        {
+            let mut large = objects[1].2.clone();
+            large.resize(MAX_GRAPH_METADATA_BYTES, b'x');
+            let oid = Oid::hash_object(ObjectType::Commit, &large).unwrap();
+            let encoded = object_record(ObjectType::Commit, large).unwrap();
+            control
+                .put_record(&metadata_kind(repository_id), oid.as_bytes(), &encoded)
+                .unwrap();
+            let before = snapshot();
+            let mut visited = 0;
+            for_each_preserved_record(&control, repository_id, |record| {
+                let crate::PreservedGitRecord::MetadataObject { object, .. } = record else {
+                    panic!("unexpected boundary record")
+                };
+                assert_eq!(object.bytes.len(), MAX_GRAPH_METADATA_BYTES);
+                visited += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(visited, 1);
+            assert_eq!(snapshot(), before);
+            control
+                .delete_record(&metadata_kind(repository_id), oid.as_bytes())
+                .unwrap();
+        }
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(
+                for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err(),
+                "accepted invalid {kind}"
+            );
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        let ref_bytes = fetched_ref_record(commit_oid.as_bytes().try_into().unwrap()).unwrap();
+        for key in [
+            b"refs/heads/bad..name".as_slice(),
+            b"HEAD",
+            b"refs/heads/a\0b",
+            &vec![b'x'; crate::GIT_REF_NAME_BYTES + 1],
+        ] {
+            reject(&ref_kind(repository_id), key, &ref_bytes);
+        }
+        reject(
+            &ref_kind(Uuid::from_u128(999)),
+            b"refs/heads/main",
+            &ref_bytes,
+        );
+        reject(
+            &ref_kind(repository_id),
+            b"refs/heads/main",
+            &canonical_bytes(&RefRecord {
+                format_version: 2,
+                oid: commit_oid.as_bytes().try_into().unwrap(),
+            })
+            .unwrap(),
+        );
+        reject(
+            &ref_kind(repository_id),
+            b"refs/heads/main",
+            &[ref_bytes.clone(), vec![0]].concat(),
+        );
+        reject(&ref_kind(repository_id), b"refs/heads/main", &[0; 513]);
+        for name in [
+            format!("{PIN_REF_PREFIX}{tag_oid}"),
+            format!("{PIN_REF_PREFIX}{}", commit_oid.to_string().to_uppercase()),
+            format!("{PIN_REF_PREFIX}retained"),
+        ] {
+            control
+                .put_record(&ref_kind(repository_id), name.as_bytes(), &ref_bytes)
+                .unwrap();
+            let before = snapshot();
+            let mut seen = false;
+            for_each_preserved_record(&control, repository_id, |record| {
+                assert!(matches!(
+                    record,
+                    crate::PreservedGitRecord::Reference {
+                        pin_namespace: true,
+                        pin_name_matches_target: Some(false),
+                        ..
+                    }
+                ));
+                seen = true;
+                Ok(())
+            })
+            .unwrap();
+            assert!(seen);
+            assert_eq!(snapshot(), before);
+            control
+                .delete_record(&ref_kind(repository_id), name.as_bytes())
+                .unwrap();
+        }
+        let object_bytes = object_record(ObjectType::Commit, objects[1].2.clone()).unwrap();
+        reject(&metadata_kind(repository_id), &[1; 21], &object_bytes);
+        reject(
+            &metadata_kind(Uuid::from_u128(999)),
+            commit_oid.as_bytes(),
+            &object_bytes,
+        );
+        reject(
+            &metadata_kind(repository_id),
+            tree_oid.as_bytes(),
+            &object_bytes,
+        );
+        reject(
+            &metadata_kind(repository_id),
+            commit_oid.as_bytes(),
+            &[object_bytes.clone(), vec![0]].concat(),
+        );
+        for (format_version, kind) in [(2, 1), (1, 4)] {
+            reject(
+                &metadata_kind(repository_id),
+                commit_oid.as_bytes(),
+                &canonical_bytes(&MetadataObject {
+                    format_version,
+                    kind,
+                    bytes: objects[1].2.clone(),
+                })
+                .unwrap(),
+            );
+        }
+        reject(
+            &metadata_kind(repository_id),
+            commit_oid.as_bytes(),
+            &vec![0; MAX_GRAPH_METADATA_BYTES + 1025],
+        );
+        assert!(
+            for_each_preserved_record(&control, repository_id, |_| panic!("empty catalog visited"))
+                .is_ok()
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
 
     #[test]
     fn backup_import_rechecks_empty_destination_and_anchor_collisions_before_publication() {

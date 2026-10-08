@@ -272,33 +272,18 @@ pub(crate) fn for_each_preserved_record(
         },
     )?;
     for prefix in [INDEX_PREFIX, WORKTREE_INDEX_PREFIX] {
-        let expected_primary = index_kind(repository_id);
-        let expected_linked = format!("{WORKTREE_INDEX_PREFIX}{repository_id}/");
         control.for_each_record_with_kind_prefix_bounded(
             prefix,
             512,
             MAX_STAGE_PATH_BYTES,
             512,
             |kind, key, bytes| {
-                let scope = if prefix == INDEX_PREFIX {
-                    ensure!(
-                        kind == expected_primary,
-                        "preserved index namespace conflicts with its repository marker"
-                    );
-                    GitWorktreeScope::primary(repository_id)
-                } else {
-                    let suffix = kind.strip_prefix(&expected_linked).context(
-                        "preserved linked index namespace conflicts with its repository marker",
-                    )?;
-                    let worktree_id = Uuid::parse_str(suffix)?;
-                    let scope = GitWorktreeScope::linked(repository_id, worktree_id)
-                        .context("invalid preserved linked index scope")?;
-                    ensure!(
-                        index_kind_for_scope(scope) == kind,
-                        "noncanonical preserved linked index scope"
-                    );
-                    scope
-                };
+                let scope = GitWorktreeScope::preserved_from_kind(
+                    kind,
+                    repository_id,
+                    INDEX_PREFIX,
+                    WORKTREE_INDEX_PREFIX,
+                )?;
                 let path = Path::new(OsStr::from_bytes(key));
                 ensure!(
                     !key.contains(&0) && stage_path_key(path)? == key,
