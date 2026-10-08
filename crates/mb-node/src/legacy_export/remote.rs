@@ -556,12 +556,12 @@ pub(super) async fn with_peer_recovery<T: Send + 'static>(
         Some(
             tokio::task::spawn_blocking(move || {
                 let keys = KeyMaterial::from_seed(&original_seed);
-                let control = crate::volume::inspect_control_store(&preserved, &keys)?
-                    .context("original control catalog is unavailable")?;
-                let certificate = crate::node::preserved_guild_certificate(&control)?.context(
-                    "directory discovery requires the preserved signed guild certificate",
-                )?;
-                Ok::<_, anyhow::Error>(certificate.genesis.guild_id)
+                crate::volume::with_inspected_control_snapshot(&preserved, &keys, |control| {
+                    let certificate = crate::node::preserved_guild_certificate(control)?.context(
+                        "directory discovery requires the preserved signed guild certificate",
+                    )?;
+                    Ok(certificate.genesis.guild_id)
+                })
             })
             .await??,
         )

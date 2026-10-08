@@ -38,7 +38,7 @@ unsafe extern "C" fn read_only_open(
         return ffi::SQLITE_IOERR;
     };
     let parent = *parent as *mut ffi::sqlite3_vfs;
-    // SAFETY: the default VFS is SQLite-owned and remains registered for the
+    // SAFETY: the native Unix VFS is SQLite-owned and remains registered for the
     // process lifetime. Its callback receives SQLite's original file arguments.
     let Some(open) = (unsafe { (*parent).xOpen }) else {
         return ffi::SQLITE_IOERR;
@@ -70,14 +70,23 @@ fn register_vfs() -> Result<()> {
             if code != ffi::SQLITE_OK {
                 return code;
             }
-            let parent = ffi::sqlite3_vfs_find(std::ptr::null());
+            // Only the built-in Unix VFS has the base-table-only context this
+            // copied adapter uses. An arbitrary default VFS can embed private
+            // state beyond sqlite3_vfs and must not be copied this way.
+            let parent = ffi::sqlite3_vfs_find(c"unix".as_ptr());
             if parent.is_null() {
+                return ffi::SQLITE_NOTFOUND;
+            }
+            // A version-3 VFS guarantees the complete callback-table layout
+            // copied below. Never read later fields from an older VFS object.
+            if (*parent).iVersion < 3 {
                 return ffi::SQLITE_NOTFOUND;
             }
             if PARENT_VFS.set(parent as usize).is_err() {
                 return ffi::SQLITE_MISUSE;
             }
             let mut vfs = *parent;
+            vfs.iVersion = 3;
             vfs.pNext = std::ptr::null_mut();
             vfs.zName = VFS_NAME.as_ptr();
             vfs.xOpen = Some(read_only_open);

@@ -25260,7 +25260,10 @@ mod tests {
             }
             drop(store);
             let original_bytes = std::fs::read(original.join("control.db")).unwrap();
-            assert!(Node::open(&original, Seed::from_bytes([49; 32])).is_err());
+            let original_files: std::collections::BTreeSet<_> = std::fs::read_dir(&original)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
             let hub_seed = Seed::from_bytes([75; 32]);
             let hub_id = KeyMaterial::from_seed(&hub_seed).node_id();
             let hub = Arc::new(Mutex::new(
@@ -25407,6 +25410,13 @@ mod tests {
             );
             assert!(inventory.revisions[0].peer_checkpoint);
             assert_eq!(inventory.peer_coverage.unwrap().selected_peers, 1);
+            let files_after_inventory: std::collections::BTreeSet<_> = std::fs::read_dir(&original)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(files_after_inventory, original_files);
+            assert!(std::fs::read(original.join("control.db")).unwrap() == original_bytes);
+            assert!(Node::open(&original, Seed::from_bytes([49; 32])).is_err());
             let output = temp.path().join("export");
             let report = crate::export_withdrawn_revision_from_catalog_over_network(
                 Seed::from_bytes([49; 32]),

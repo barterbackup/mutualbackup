@@ -431,6 +431,46 @@ remain active.
     all five CLI unit tests and the real CLI fixture pass (eight targeted functions).
     Locked workspace/all-targets build, formatting and strict Clippy pass.
     Complete ordinary Node/Git/core/store suites and full M6 gates were not rerun.
+  - [x] Extend `legacy-list` to preserved local registrations and guarded anchor
+    ownership. Report format 2 includes protected roots, versioned source-backend
+    bindings, history-only Git registrations and typed stopped/revision captures.
+    Preserve raw Unix path bytes as hex and reconcile available authenticated
+    revision IDs without opening sources, mounts, Git runtimes or anchor payloads.
+    Distinguish matching/mismatched stable identities, missing roots and unknown
+    older identity layouts. External Git catalogs and anchor payloads remain
+    explicitly unverified; unknown guarded/link-freeze rows retain bounded kind,
+    ID, byte count and digest evidence rather than being treated as decoded pins.
+    Local revisions, registrations and the preserved guild certificate come from
+    one SQLite snapshot, released before peer requests. Bound the complete
+    canonical report, including local state and peer coverage, to 32 MiB.
+    Bounded literal-prefix reads reject oversized kinds/keys/payloads before
+    visiting a row and support early stop.
+    New preservation tests exposed SQLite's ordinary read-only open creating
+    WAL/SHM files beside closed catalogs. Inventory and bootstrap certificate
+    discovery now use a non-creating read-only VFS. Journal-free immutable reads
+    require unchanged identity/size/mtime/ctime and continued journal absence;
+    existing WAL/SHM pairs retain read snapshots. Incomplete/rollback journal
+    states fail before opening or repairing them. No payload/database copy or
+    original-state migration is performed. The VFS validates and advertises the
+    callback-table version it copies.
+    Validation: 281 ordinary store cases, 20 inventory/export/range/peer cases,
+    two discovery cases and all 19 ordinary CLI process cases pass (322 unique
+    cases; 26 store and three process cases remain explicitly ignored). Five new
+    store regressions cover snapshot consistency/error unwind, literal/Unicode
+    prefix bounds, raw URI filenames, source changes, incomplete journals and
+    live WAL reads. Three new Node fixtures cover closed wrapped/legacy catalogs,
+    raw paths, ownership/registration corruption, exact report budgets and
+    unchanged database/key/WAL bytes and directory contents. The real Kademlia
+    fixture also preserves a closed installation's file set before any startup
+    admission attempt. Format and strict locked workspace/all-targets Clippy pass.
+    Retained-history completeness remains false. External Git catalogs, refs,
+    pins, worktrees, pending-intent/other-owner reconciliation, incomplete-journal
+    recovery, conversion and full upgrade/source-loss/release gates remain open.
+    Other legacy startup/admission/export readers still need the corresponding
+    no-creation qualification; this increment does not close R1 or qualify a new
+    installed release artifact. Temporary peer-client isolation against the
+    registered root/Git/anchor path graph, including missing or relocated hints,
+    also remains to be qualified.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

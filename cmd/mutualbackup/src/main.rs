@@ -134,7 +134,7 @@ enum Command {
     },
     /// Restore this identity's latest revision through the recovery-mode daemon.
     Restore { target: PathBuf },
-    /// List authenticated available local revision metadata without starting a daemon.
+    /// List signed revisions and preserved local registrations and anchors without a daemon.
     #[cfg(target_os = "linux")]
     LegacyList {
         /// Preserved installation inspected read-only.

@@ -2,12 +2,17 @@
 //! Original catalogs and explicitly selected preserved anchors are read-only.
 
 mod inventory;
+mod local_inventory;
 mod recovery;
 mod remote;
 pub use inventory::{
     LegacyRevisionInventory, LegacyRevisionInventoryEntry,
     inventory_withdrawn_revisions_from_catalog,
     inventory_withdrawn_revisions_from_catalog_over_network,
+};
+pub use local_inventory::{
+    LegacyGitRegistration, LegacyGuardedAnchorPin, LegacyGuardedCapture, LegacyLocalStateInventory,
+    LegacyPreservedRecord, LegacyRootRegistration, LegacySourceBinding,
 };
 pub use remote::{
     LegacyExportPeer, LegacyPeerInventoryCoverage, LegacyPeerSources,

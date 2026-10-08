@@ -3513,9 +3513,19 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(inventory.format_version, 2);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
+    assert_eq!(inventory.local_state.unclassified_guarded_records.len(), 1);
+    let preserved = &inventory.local_state.unclassified_guarded_records[0];
+    assert_eq!(preserved.kind, "guarded-view-mount-v1");
+    assert_eq!(preserved.record_id_hex, hex::encode(b"legacy"));
+    assert_eq!(preserved.payload_bytes, 8);
+    assert_eq!(
+        preserved.payload_hash,
+        hex::encode(blake3::hash(b"preserve").as_bytes())
+    );
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     assert!(!catalog.join("control.key").exists());
     let catalog_target = temp.path().join("catalog-export");

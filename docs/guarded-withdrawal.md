@@ -159,12 +159,36 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
+Report format 2 includes preserved local protected-root registrations, backend
+bindings, Git registrations and guarded stopped/revision-capture anchor ownership.
+Raw Unix paths are reported as hex bytes. These records and the local signed
+revisions come from one read-only SQLite snapshot, released before peer requests.
+The complete canonical encoded report has a 32 MiB metadata limit; exceeding it fails the
+inventory instead of returning a truncated success. Binding identity comparisons
+are unknown for missing roots and older registration formats 1/2. Git registrations
+can be history-only: `catalog_inventoried` remains false because the external Git
+catalog is not opened. Unknown guarded/link-freeze records are listed with their
+kind, ID, payload size and digest for preservation; they are not decoded ownership.
+Source paths, mount paths and anchor payloads are not opened during inventory,
+so `payloads_verified` remains false even when signed revision metadata is available.
+
+Inventory opens forbid database/journal creation and deletion. A catalog with no
+journal files uses an immutable read only while its file identity, size, mtime,
+ctime and journal absence remain unchanged; a concurrent change fails the whole
+inventory. Existing WAL/SHM pairs use SQLite read snapshots without checkpointing
+the original database or WAL. Incomplete WAL/SHM pairs and rollback journals are
+rejected before SQLite opens them. Preserve all files from that installation and
+inspect a separate complete snapshot; never delete or checkpoint its original
+journals to make an inventory succeed. These stricter opens currently apply to
+`legacy-list`; the other legacy catalog readers still require separate no-creation
+qualification under R1.
+
 The report's `signed_format` describes the public revision format, not private
-namespace format 6/7. `retained_history_complete` is false: local metadata cannot
-prove that peer-held history, root/Git catalogs, pins or pending intents have all
-been inventoried. Listing a revision does not prove recoverable ciphertext or
-replacement protection. Preserve those inputs and use its `revision_id` with
-`legacy-export` to verify an individual export.
+namespace format 6/7. `retained_history_complete` is false: available metadata
+cannot prove that all peer history, external Git catalogs, refs, pins, worktrees,
+pending intents and other anchor owners have been inventoried. Listing a revision
+does not prove recoverable ciphertext or replacement protection. Preserve those
+inputs and use its `revision_id` with `legacy-export` to verify an individual export.
 
 Alternatively, select a revision from a preserved installation:
 

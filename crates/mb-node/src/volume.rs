@@ -2876,6 +2876,29 @@ pub(crate) fn inspect_control_store(
     .map_err(Into::into)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn with_inspected_control_snapshot<T>(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+    operation: impl FnOnce(&ControlStore) -> Result<T>,
+) -> Result<T> {
+    let mut database_keys = Vec::new();
+    let envelope_path = data_dir.join(CONTROL_KEY_FILE);
+    if envelope_path.exists() {
+        let envelope: WrappedDatabaseKey = read_private_record(&envelope_path)?;
+        database_keys.push(
+            keys.unwrap_database_key(b"control.db/v2", &envelope)
+                .context("cannot unwrap preserved control database key")?,
+        );
+    }
+    database_keys.push(keys.database_key(b"control.db"));
+    ControlStore::with_preserved_read_only_snapshot(
+        data_dir.join("control.db"),
+        &database_keys,
+        operation,
+    )
+}
+
 pub(crate) fn open_control_store(
     data_dir: &Path,
     keys: &KeyMaterial,

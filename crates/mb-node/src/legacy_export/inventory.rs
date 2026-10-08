@@ -29,9 +29,9 @@ pub struct LegacyRevisionInventoryEntry {
     pub peer_checkpoint: bool,
 }
 
-/// Available metadata only; peer gaps are reported when peers are selected.
-/// Missing records, remote history, root/Git
-/// catalogs, pins and pending intents require separate preservation/recovery.
+/// Available signed revision metadata and preserved local registrations and
+/// guarded ownership. External Git catalogs, unclassified records, other pin
+/// owners and missing history still require separate preservation/recovery.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyRevisionInventory {
     pub format_version: u16,
@@ -39,10 +39,11 @@ pub struct LegacyRevisionInventory {
     pub scope: String,
     pub retained_history_complete: bool,
     pub revisions: Vec<LegacyRevisionInventoryEntry>,
+    pub local_state: super::local_inventory::LegacyLocalStateInventory,
     pub peer_coverage: Option<super::remote::LegacyPeerInventoryCoverage>,
 }
 
-const SCOPE: &str = "available-local-signed-revision-metadata";
+const SCOPE: &str = "available-signed-revisions-and-preserved-local-state";
 
 /// Inspect existing encrypted control data without startup, migration, key
 /// wrapping, journal replay, source reads or mutation. Invalid evidence and
@@ -74,27 +75,25 @@ pub async fn inventory_withdrawn_revisions_from_catalog_over_network(
     .await
 }
 
-fn inventory_catalog(
-    keys: &KeyMaterial,
-    data_dir: &Path,
-    summary_budget: usize,
-    remote: Option<&super::remote::PeerRecovery>,
-) -> Result<LegacyRevisionInventory> {
-    let control = crate::volume::inspect_control_store(data_dir, keys)?
-        .context("original control catalog is unavailable")?;
-    let mut entries = BTreeMap::<Uuid, LegacyRevisionInventoryEntry>::new();
-    let mut summary_size = 0usize;
-    let mut add = |revision: &SignedRecord<UserRevision>, source: usize| -> Result<()> {
+struct RevisionInventoryBuilder<'a> {
+    keys: &'a KeyMaterial,
+    limit: usize,
+    used: usize,
+    entries: BTreeMap<Uuid, LegacyRevisionInventoryEntry>,
+}
+
+impl RevisionInventoryBuilder<'_> {
+    fn add(&mut self, revision: &SignedRecord<UserRevision>, source: usize) -> Result<()> {
         let signed = canonical_bytes_bounded(revision, V1_MAX_CATALOG_BYTES)?;
         revision.verify(USER_REVISION_DOMAIN)?;
         revision.value.verify_writer()?;
-        if revision.value.owner != keys.node_id() {
+        if revision.value.owner != self.keys.node_id() {
             return Ok(());
         }
         crate::snapshot::checked_metadata_length(revision)?;
-        crate::snapshot::validate_restore_revision(keys, revision.value.guild_id, revision)?;
+        crate::snapshot::validate_restore_revision(self.keys, revision.value.guild_id, revision)?;
         let hash = hex::encode(blake3::hash(&signed).as_bytes());
-        if let Some(entry) = entries.get_mut(&revision.value.revision_id) {
+        if let Some(entry) = self.entries.get_mut(&revision.value.revision_id) {
             ensure!(
                 entry.signed_record_hash == hash,
                 "conflicting signed records for one revision ID"
@@ -122,68 +121,99 @@ fn inventory_catalog(
             certified_checkpoint: source == 2,
             peer_checkpoint: source == 3,
         };
-        summary_size = summary_size
-            .checked_add(canonical_size_bounded(&entry, summary_budget)?)
+        self.used = self
+            .used
+            .checked_add(canonical_size_bounded(&entry, self.limit)?)
             .context("revision inventory size overflow")?;
         ensure!(
-            summary_size <= summary_budget,
+            self.used <= self.limit,
             "revision inventory exceeds its bounded metadata budget"
         );
-        entries.insert(entry.revision_id, entry);
+        self.entries.insert(entry.revision_id, entry);
         Ok(())
-    };
-    for (namespace, max_key, source) in [("user-revision", 16, 0), ("user-revision-head", 48, 1)] {
-        control.for_each_record_bounded(
-            namespace,
-            max_key,
-            V1_MAX_CATALOG_BYTES,
-            |key, bytes| {
-                let revision: SignedRecord<UserRevision> = decode_canonical(bytes)?;
-                ensure!(
-                    canonical_bytes_bounded(&revision, V1_MAX_CATALOG_BYTES)? == bytes,
-                    "revision inventory record is not canonical"
-                );
-                if source == 0 {
-                    ensure!(
-                        key == revision.value.revision_id.as_bytes(),
-                        "revision inventory record has a conflicting ID"
-                    );
-                } else {
-                    let mut scope = revision.value.guild_id.to_vec();
-                    scope.extend(revision.value.protected_root_id.as_bytes());
-                    ensure!(
-                        key == scope || key == revision.value.guild_id,
-                        "revision inventory head has a conflicting scope"
-                    );
-                }
-                add(&revision, source)?;
-                Ok(true)
-            },
-        )?;
     }
-    control.for_each_record_bounded(
-        "guild-checkpoint",
-        32,
-        V1_MAX_CATALOG_BYTES,
-        |key, bytes| {
-            let checkpoint: QuorumCheckpoint = decode_canonical(bytes)?;
-            ensure!(
-                canonical_bytes_bounded(&checkpoint, V1_MAX_CATALOG_BYTES)? == bytes,
-                "revision inventory checkpoint is not canonical"
-            );
-            checkpoint.verify()?;
-            ensure!(
-                key == checkpoint.hash()?,
-                "revision inventory checkpoint has a conflicting hash"
-            );
-            for revision in &checkpoint.checkpoint.revisions {
-                add(revision, 2)?;
+}
+
+pub(super) fn inventory_catalog(
+    keys: &KeyMaterial,
+    data_dir: &Path,
+    summary_budget: usize,
+    remote: Option<&super::remote::PeerRecovery>,
+) -> Result<LegacyRevisionInventory> {
+    let mut builder = RevisionInventoryBuilder {
+        keys,
+        limit: summary_budget,
+        used: 0,
+        entries: BTreeMap::new(),
+    };
+    let (mut local_state, certificate) =
+        crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
+            for (namespace, max_key, source) in
+                [("user-revision", 16, 0), ("user-revision-head", 48, 1)]
+            {
+                control.for_each_record_bounded(
+                    namespace,
+                    max_key,
+                    V1_MAX_CATALOG_BYTES,
+                    |key, bytes| {
+                        let revision: SignedRecord<UserRevision> = decode_canonical(bytes)?;
+                        ensure!(
+                            canonical_bytes_bounded(&revision, V1_MAX_CATALOG_BYTES)? == bytes,
+                            "revision inventory record is not canonical"
+                        );
+                        if source == 0 {
+                            ensure!(
+                                key == revision.value.revision_id.as_bytes(),
+                                "revision inventory record has a conflicting ID"
+                            );
+                        } else {
+                            let mut scope = revision.value.guild_id.to_vec();
+                            scope.extend(revision.value.protected_root_id.as_bytes());
+                            ensure!(
+                                key == scope || key == revision.value.guild_id,
+                                "revision inventory head has a conflicting scope"
+                            );
+                        }
+                        builder.add(&revision, source)?;
+                        Ok(true)
+                    },
+                )?;
             }
-            Ok(true)
-        },
-    )?;
+            control.for_each_record_bounded(
+                "guild-checkpoint",
+                32,
+                V1_MAX_CATALOG_BYTES,
+                |key, bytes| {
+                    let checkpoint: QuorumCheckpoint = decode_canonical(bytes)?;
+                    ensure!(
+                        canonical_bytes_bounded(&checkpoint, V1_MAX_CATALOG_BYTES)? == bytes,
+                        "revision inventory checkpoint is not canonical"
+                    );
+                    checkpoint.verify()?;
+                    ensure!(
+                        key == checkpoint.hash()?,
+                        "revision inventory checkpoint has a conflicting hash"
+                    );
+                    for revision in &checkpoint.checkpoint.revisions {
+                        builder.add(revision, 2)?;
+                    }
+                    Ok(true)
+                },
+            )?;
+            let local =
+                super::local_inventory::collect(control, &mut builder.used, summary_budget)?;
+            let certificate =
+                if remote.is_some() {
+                    Some(crate::node::preserved_guild_certificate(control)?.context(
+                        "peer inventory requires the preserved signed guild certificate",
+                    )?)
+                } else {
+                    None
+                };
+            Ok((local, certificate))
+        })?;
     let peer_coverage = if let Some(remote) = remote {
-        let certificate = crate::node::preserved_guild_certificate(&control)?
+        let certificate = certificate
             .context("peer inventory requires the preserved signed guild certificate")?;
         let mut unauthorized_owner_checkpoints = 0;
         let mut coverage = remote.checkpoints(
@@ -198,7 +228,7 @@ fn inventory_catalog(
                 {
                     if remote.authorizes_checkpoint(&certificate, keys.node_id(), &checkpoint)? {
                         for revision in &checkpoint.checkpoint.revisions {
-                            add(revision, 3)?;
+                            builder.add(revision, 3)?;
                         }
                     } else {
                         unauthorized_owner_checkpoints += 1;
@@ -213,7 +243,8 @@ fn inventory_catalog(
         None
     };
 
-    let mut revisions: Vec<_> = entries.into_values().collect();
+    local_state.reconcile(&builder.entries, &mut builder.used, summary_budget)?;
+    let mut revisions: Vec<_> = builder.entries.into_values().collect();
     revisions.sort_by(|a, b| {
         (&a.guild_id, a.protected_root_id, a.sequence, a.revision_id).cmp(&(
             &b.guild_id,
@@ -223,19 +254,20 @@ fn inventory_catalog(
         ))
     });
     let report = LegacyRevisionInventory {
-        format_version: 1,
+        format_version: 2,
         owner: keys.node_id().to_string(),
         scope: if remote.is_some() {
-            "available-local-and-selected-peer-signed-revision-metadata"
+            "available-local-and-selected-peer-signed-revisions-and-preserved-local-state"
         } else {
             SCOPE
         }
         .to_owned(),
         retained_history_complete: false,
         revisions,
+        local_state,
         peer_coverage,
     };
-    canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES)?;
+    canonical_size_bounded(&report, summary_budget)?;
     Ok(report)
 }
 
@@ -339,11 +371,7 @@ mod tests {
             assert!(
                 !report.revisions[1].recovery_head && !report.revisions[1].certified_checkpoint
             );
-            let cost = report
-                .revisions
-                .iter()
-                .map(|entry| canonical_size_bounded(entry, V1_MAX_CATALOG_BYTES).unwrap())
-                .sum();
+            let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
             assert!(inventory_catalog(&keys, &data, cost, None).is_ok());
             assert!(inventory_catalog(&keys, &data, cost - 1, None).is_err());
             assert_eq!(fs::read(data.join("control.db")).unwrap(), before);

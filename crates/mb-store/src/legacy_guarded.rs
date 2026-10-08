@@ -201,7 +201,9 @@ impl GuardedViewMetadataV1 {
 }
 
 impl GuardedStoppedCaptureV1 {
-    fn validate_shape(&self) -> anyhow::Result<()> {
+    /// Validate the historical namespace and ownership record without opening
+    /// an anchor, source tree or mount. This does not verify captured payloads.
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
         self.metadata.validate_shape()?;
         ensure!(
             self.format_version == 1
