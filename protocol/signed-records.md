@@ -110,7 +110,7 @@ BLAKE3 hash of original signed canonical transcript bytes. Exact contiguous
 Group roles come from its original signed manifest. All nested signatures are
 bounded to 64 bytes before allocation; existing role/evidence geometry bounds,
 complete typed/raw EOF, exact counters and Verified transcript replay apply.
-`coding-evidence-v1.postcard.hex` freezes a 179-byte four-part directory;
+`coding-evidence-v1.postcard.hex` freezes a 179-byte four-part forest descriptor;
 `coding-transcripts-v1.postcard.hex` preserves its four original signed compact
 transcripts. Current delegation, membership, source coverage and retained
 lifecycle joins, fixed legacy-group migration and the enclosing certificate
@@ -123,6 +123,27 @@ re-authenticate intersecting pages and replay the unchanged original witness.
 The combined packing/coding staging proof charges all its streams and descriptor
 under one budget and checks active input coverage; its required authorizer still
 joins certified guild history and lifecycle authority before activation.
+
+`CatalogCodingDirectoryRoot` format one orders `format_version`,
+`guild_event_sequence`, `records`, `summary`, within 512 bytes. The public guild
+Coding record stream carries unchanged bounded `CatalogCodingRoot` descriptors.
+Its summary orders `forests`, `coding`, `evidence_bytes`, `evidence_pages`, with
+the original coding summary nested unchanged. Empty directories contain an
+authenticated empty record stream and no forest descriptors. Every referenced
+forest retains all existing limits; global group order and complete nested EOF
+apply across forests. `coding-directory-v1.postcard.hex` freezes the directory
+root for four original compact witnesses stored in four forests.
+
+The directory requires a trusted enclosing byte/page/record budget at decode,
+construction and traversal. The root's own claimed work does not authorize that
+budget. Accounting includes a fixed 512-byte envelope, directory stream and all
+referenced part occurrences; the forest descriptors already inside the stream
+are not charged twice. Local completed cursors may include the original part
+reference as well as the existing range, without adding signed fields. A local
+retention journal pins logical forest roots before witness traversal and
+publishes only after replayed globally ordered EOF. This owns public metadata;
+enclosing certified authority/coverage, payload ownership, quotas and checkpoint
+activation remain separate required joins. No peer publication version changes.
 
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw

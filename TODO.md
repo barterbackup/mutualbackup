@@ -1529,6 +1529,27 @@ separately below.
     Certified guild-event/lifecycle authority, enclosing certificate publication,
     fixed legacy-group migration, payload ownership, normal consumers, quotas,
     incremental work and real retained 1 TiB/release/platform gates remain open.
+  - [x] Add a paged directory of unchanged bounded coding forests, with a
+    required trusted byte/page/record budget shared across every forest.
+    Preserve original witnesses, global group order, complete authenticated
+    EOF and fixed-size authenticated group locations. Reject exhausted budgets
+    before fetching evidence, fence failed producers/readers, and retain the
+    original per-tree/per-forest decoder limits. Structural fixtures describe
+    aggregate closures above 64 GiB and one million pages; they do not
+    materialize or qualify that data. See ADR 0002 for validation.
+  - [x] Retain coding-directory logical forest roots through a bounded durable
+    local journal. Pin each forest before evidence traversal, replay all
+    original witnesses through global ordered EOF before publication, resume
+    interrupted builds, separate pin namespaces and retire one root per step.
+    Shared owners survive original capture retirement, reopen and predecessor
+    cleanup. Late order/page failures and ignored writes cannot publish a
+    prefix. This owns public coding metadata only; certified current authority,
+    packing coverage, payload ownership and guarded retirement remain required.
+    All 161 core and 189 ordinary store tests pass (26 store tests ignored),
+    with strict locked workspace/all-targets Clippy and formatting/diff checks.
+    See ADR 0002. The earlier packing/coding index still consumes
+    one bounded forest; directory integration, complete enclosing admission,
+    quotas, normal consumers and real retained 1 TiB qualification remain open.
   - [ ] Complete the enclosing paged checkpoint certificate and full
     authority/coding joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body

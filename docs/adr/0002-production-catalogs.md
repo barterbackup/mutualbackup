@@ -2713,3 +2713,79 @@ Raising parser constants alone, assuming unrelated owners fill the reserved
 slots, or relying on the isolated fully occupied sizing fixture does not resolve
 that requirement. Normal producers remain gated on that complete design and
 runtime qualification.
+
+### Coding directories and durable logical forest ownership (2026-10-08)
+
+A new fixed-size `CatalogCodingDirectoryRoot` authenticates an ordered record
+stream of existing `CatalogCodingRoot` descriptors. Each original forest keeps
+its four-part, 64 GiB and one-million-page limits; primitive byte trees keep
+their existing limits. Original group identities, signed witness bytes, record
+variants and forest protocol vectors remain unchanged. The directory producer
+rolls forests conservatively before one dense 16 GiB tree fills, keeping bounded
+producer state. The directory itself remains one bounded record tree rather
+than allocating a catalog-sized vector.
+
+Every public directory decode, builder, reader and group lookup requires a
+trusted enclosing byte/page/record budget. The caller must charge other
+checkpoint sections before supplying the remaining budget; copying limits from
+an untrusted peer is not admission. Work includes a fixed 512-byte root charge,
+the directory's framed descriptors and every referenced part occurrence.
+Repeated references are charged again. Descriptors are already in the directory
+stream and are not charged a second time as separate envelopes. Budgets never
+reset at forest boundaries, checked arithmetic rejects overflow, and declared
+work is admitted before any fetch. Conservative producer reservations can reject
+a group before its exact final encoding would fill the limit.
+
+The complete reader decodes bounded original descriptors, checks cumulative
+summaries before fetching their evidence, replays every original witness,
+checks global group ordering across forests and requires all nested and
+directory EOFs. A fixed group location carries the original part reference and
+range. Point reads authenticate intersecting pages and replay one witness;
+they require a location from a trusted completed traversal and do not prove
+global membership, EOF, authority or packing coverage independently.
+
+Logical part references inside directory records are not byte-tree child
+edges. Ordinary ownership of the directory root alone would lose those parts.
+`CatalogCodingRetention` therefore uses fixed journal/dependency records and
+short per-root writer transactions. Its reader hook pins each structurally
+admitted forest before evidence fetch, then publishes metadata ownership only
+after complete replayed ordered EOF. Crash-interrupted Building jobs replay
+idempotently; failures fence jobs; cancelled cleanup releases one root per call.
+Independent journals share immutable roots, and their pin prefix differs from
+both 16-byte capture IDs and authority-retention jobs. Traversal charges logical
+occurrences while ownership counters charge distinct physical roots. Existing
+byte-tree parent links preserve descendants until the last owner retires.
+Staging may use multiple existing bounded intents; this does not increase any
+single intent's page limit.
+
+The focused fixtures cover twelve forests, four-part compatibility, multi-page
+full-byte witness lookup, a directory with 1,024 descriptors, malformed nested
+roots, before-fetch admission, budget exhaustion after several forest boundaries,
+ownership callback cancellation, exact summaries/order/EOF and a new fixed
+protocol vector. A structural large-closure fixture exceeds the old single
+forest's byte/page ceilings while retaining each original forest's limits; its
+missing evidence deliberately fails full replay. This is not a materialized
+large-data or retained 1 TiB qualification. Store fixtures cover 21 distinct
+roots beyond fixed bundle capacity, shared successors, build/cleanup reopen,
+original capture-pin retirement, late duplicate/corrupt evidence, ignored
+acquisition/publication/release writes, scopes, orphan rows, exact job/budget
+binding, empty directories and disjoint pin namespaces. Deliberately corrupted
+page bytes are repaired in the fault fixture before GC, whose existing
+integrity checks correctly reject unsafe reclamation of damaged pages.
+
+The existing completed packing/coding index still consumes one original forest
+and retains its conservative combined admission. Joining directories into that
+index and the full authenticated checkpoint remains required. This codec and
+local journal do not derive the complete dataset/file/extent/Git/history/guild
+policy, own information/parity/native/bootstrap payloads, certify current
+membership/delegation/lifecycle, guard active checkpoint retirement or enable
+normal consumers. R3-SINGLE-OWNER-METADATA and the enclosing production,
+retained 1 TiB, release and platform gates remain open.
+
+Validation: the full locked combined regression passes 160 core and 189 ordinary
+store tests (26 store tests ignored). The final core run passes all 161 tests,
+including the fixed-vector assertion and the added understated-summary fixture,
+which verifies rejection before the affected forest's ownership hook or evidence
+fetch. Strict locked workspace/all-targets Clippy, formatting and diff checks
+pass. No network/native/release or real retained 1 TiB runtime gate was rerun
+for this codec and local ownership slice.

@@ -133,6 +133,10 @@ pub struct CatalogCodingSummary {
 
 impl CatalogCodingSummary {
     fn validate(self) -> Result<(), CatalogError> {
+        self.validate_with_record_limit(CATALOG_MAX_RECORDS)
+    }
+
+    pub(super) fn validate_with_record_limit(self, records: u64) -> Result<(), CatalogError> {
         if self.groups == 0 {
             if self != Self::default() {
                 return Err(CatalogError::Bounds);
@@ -168,7 +172,7 @@ impl CatalogCodingSummary {
                     .fragments
                     .checked_mul(CATALOG_CODING_FRAGMENT_BYTES as u64)
                     .ok_or(CatalogError::Bounds)?
-            || self.records()? > CATALOG_MAX_RECORDS
+            || self.records()? > records
         {
             return Err(CatalogError::Bounds);
         }
@@ -226,6 +230,27 @@ pub struct CatalogCodingGroupRange {
     pub len: u32,
     pub group_id: [u8; 32],
     pub transcript_hash: [u8; 32],
+}
+
+/// A trusted completed traversal records the authenticated part reference as
+/// well as the original group range. Its storage is fixed even for directories.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CatalogCodingGroupLocation {
+    pub page: CatalogPageRef,
+    pub range: CatalogCodingGroupRange,
+}
+
+impl CatalogCodingGroupLocation {
+    pub(super) fn read_group<E>(
+        self,
+        scope: CatalogScope,
+        sequence: u64,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+    ) -> Result<CatalogCodingEntry, CatalogStreamError<E>> {
+        // Exact whole-directory membership and counters belong to the trusted
+        // completed traversal; the part/range decoder authenticates this group.
+        read_group_at(scope, sequence, self.page, self.range, fetch)
+    }
 }
 
 impl CatalogCodingRoot {
@@ -304,63 +329,78 @@ impl CatalogCodingRoot {
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
     ) -> Result<CatalogCodingEntry, CatalogStreamError<E>> {
         self.validate()?;
-        let guild_id = guild(scope)?;
         let part = self
             .parts
             .get(usize::from(range.part))
             .ok_or(CatalogError::Bounds)?;
-        let end = range
-            .offset
-            .checked_add(u64::from(range.len))
-            .ok_or(CatalogError::Bounds)?;
-        if range.offset < 8
-            || range.len == 0
-            || range.len as usize > CATALOG_CODING_GROUP_BYTES
-            || end > part.page.byte_len
-            || range.group_id == [0; 32]
-            || range.transcript_hash == [0; 32]
-        {
+        read_group_at(scope, self.guild_event_sequence, part.page, range, fetch)
+    }
+}
+
+fn read_group_at<E>(
+    scope: CatalogScope,
+    sequence: u64,
+    page: CatalogPageRef,
+    range: CatalogCodingGroupRange,
+    fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+) -> Result<CatalogCodingEntry, CatalogStreamError<E>> {
+    let guild_id = guild(scope)?;
+    page.validate()?;
+    if sequence == 0 || sequence > i64::MAX as u64 {
+        return Err(CatalogError::Bounds.into());
+    }
+    let end = range
+        .offset
+        .checked_add(u64::from(range.len))
+        .ok_or(CatalogError::Bounds)?;
+    if usize::from(range.part) >= CATALOG_CODING_PARTS
+        || range.offset < 8
+        || range.len == 0
+        || range.len as usize > CATALOG_CODING_GROUP_BYTES
+        || end > page.byte_len
+        || range.group_id == [0; 32]
+        || range.transcript_hash == [0; 32]
+    {
+        return Err(CatalogError::Bounds.into());
+    }
+    let mut reader =
+        CatalogRangeReader::new(scope, CatalogSection::Coding, page, range.offset..end)?;
+    let mut bytes = Vec::with_capacity(range.len as usize);
+    while let Some(chunk) = reader.next_chunk(fetch)? {
+        bytes.extend(chunk);
+    }
+    let mut position = 0;
+    let mut next = || -> Result<Option<Vec<u8>>, CatalogStreamError<E>> {
+        if position == bytes.len() {
+            return Ok(None);
+        }
+        let length_end = position.checked_add(4).ok_or(CatalogError::Bounds)?;
+        let length = bytes
+            .get(position..length_end)
+            .ok_or(CatalogError::InvalidPage)?;
+        let length = u32::from_be_bytes(length.try_into().expect("four bytes")) as usize;
+        if length == 0 || length > CATALOG_CODING_RECORD_BYTES {
             return Err(CatalogError::Bounds.into());
         }
-        let mut reader =
-            CatalogRangeReader::new(scope, CatalogSection::Coding, part.page, range.offset..end)?;
-        let mut bytes = Vec::with_capacity(range.len as usize);
-        while let Some(chunk) = reader.next_chunk(fetch)? {
-            bytes.extend(chunk);
-        }
-        let mut position = 0;
-        let mut next = || -> Result<Option<Vec<u8>>, CatalogStreamError<E>> {
-            if position == bytes.len() {
-                return Ok(None);
-            }
-            let length_end = position.checked_add(4).ok_or(CatalogError::Bounds)?;
-            let length = bytes
-                .get(position..length_end)
-                .ok_or(CatalogError::InvalidPage)?;
-            let length = u32::from_be_bytes(length.try_into().expect("four bytes")) as usize;
-            if length == 0 || length > CATALOG_CODING_RECORD_BYTES {
-                return Err(CatalogError::Bounds.into());
-            }
-            let end = length_end.checked_add(length).ok_or(CatalogError::Bounds)?;
-            let record = bytes
-                .get(length_end..end)
-                .ok_or(CatalogError::InvalidPage)?
-                .to_vec();
-            position = end;
-            Ok(Some(record))
-        };
-        let header = CatalogCodingRecord::decode(&next()?.ok_or(CatalogError::InvalidPage)?)?;
-        if !matches!(&header, CatalogCodingRecord::Header { lifecycle, transcript_hash, .. }
+        let end = length_end.checked_add(length).ok_or(CatalogError::Bounds)?;
+        let record = bytes
+            .get(length_end..end)
+            .ok_or(CatalogError::InvalidPage)?
+            .to_vec();
+        position = end;
+        Ok(Some(record))
+    };
+    let header = CatalogCodingRecord::decode(&next()?.ok_or(CatalogError::InvalidPage)?)?;
+    if !matches!(&header, CatalogCodingRecord::Header { lifecycle, transcript_hash, .. }
             if lifecycle.group_id == range.group_id && *transcript_hash == range.transcript_hash)
-        {
-            return Err(CatalogError::InvalidPage.into());
-        }
-        let (entry, _) = read_entry(header, guild_id, self.guild_event_sequence, &mut next)?;
-        if next()?.is_some() {
-            return Err(CatalogError::InvalidPage.into());
-        }
-        Ok(entry)
+    {
+        return Err(CatalogError::InvalidPage.into());
     }
+    let (entry, _) = read_entry(header, guild_id, sequence, &mut next)?;
+    if next()?.is_some() {
+        return Err(CatalogError::InvalidPage.into());
+    }
+    Ok(entry)
 }
 
 /// Exactly one decoded, replayed group and its original bounded signed witness.
@@ -385,7 +425,7 @@ fn validate_entry(
     Ok(())
 }
 
-fn guild(scope: CatalogScope) -> Result<[u8; 32], CatalogError> {
+pub(super) fn guild(scope: CatalogScope) -> Result<[u8; 32], CatalogError> {
     scope.validate(CatalogSection::Coding)?;
     match scope {
         CatalogScope::Guild { guild_id } if guild_id != [0; 32] => Ok(guild_id),
@@ -425,6 +465,18 @@ impl CatalogCodingBuilder {
             part_limit: CATALOG_MAX_STREAM_BYTES,
             failed: false,
         })
+    }
+
+    pub(super) fn stream_bytes(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(|part| part.page.byte_len)
+            .sum::<u64>()
+            + self.active.as_ref().map_or(0, |part| part.bytes)
+    }
+
+    pub(super) fn summary(&self) -> CatalogCodingSummary {
+        self.summary
     }
 
     pub fn push_group<E>(
@@ -693,6 +745,14 @@ impl CatalogCodingReader {
         if self.failed { None } else { self.last_group }
     }
 
+    pub fn last_group_location(&self) -> Option<CatalogCodingGroupLocation> {
+        let range = self.last_group_range()?;
+        Some(CatalogCodingGroupLocation {
+            page: self.root.parts[usize::from(range.part)].page,
+            range,
+        })
+    }
+
     fn next_inner<E>(
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
@@ -769,7 +829,7 @@ impl CatalogCodingReader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         CODING_ATTEMPT_PLAN_DOMAIN, CODING_CHALLENGE_COMMITMENT_DOMAIN,
@@ -790,7 +850,12 @@ mod tests {
             .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 38; 32])))
             .collect()
     }
-    fn entry(version: u16, id: u64, shard_size: u32, domain_bytes: usize) -> CatalogCodingEntry {
+    pub(in crate::catalog) fn entry(
+        version: u16,
+        id: u64,
+        shard_size: u32,
+        domain_bytes: usize,
+    ) -> CatalogCodingEntry {
         entry_with_legacy_group(version, id, shard_size, domain_bytes, false)
     }
 

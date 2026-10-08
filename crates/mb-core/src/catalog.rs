@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
 mod checkpoint_authority;
+mod coding_directory;
 mod coding_evidence;
 mod file_recipes;
 mod files;
@@ -27,12 +28,17 @@ pub use checkpoint_authority::{
     CatalogCheckpointAuthorityRecord, CatalogCheckpointAuthorityRoot,
     CatalogCheckpointAuthoritySummary, CatalogCheckpointRevisionKey, CatalogLegacyRevisionRef,
 };
+pub use coding_directory::{
+    CATALOG_CODING_DIRECTORY_ROOT_BYTES, CatalogCodingDirectoryBuilder,
+    CatalogCodingDirectoryReader, CatalogCodingDirectoryRoot, CatalogCodingDirectorySummary,
+    CatalogCodingTraversalBudget,
+};
 pub use coding_evidence::{
     CATALOG_CODING_FRAGMENT_BYTES, CATALOG_CODING_GROUP_BYTES, CATALOG_CODING_MAX_BYTES,
     CATALOG_CODING_PARTS, CATALOG_CODING_RECORD_BYTES, CATALOG_CODING_ROOT_BYTES,
     CATALOG_CODING_TRANSCRIPT_BYTES, CatalogCodingBuilder, CatalogCodingEntry,
-    CatalogCodingGroupRange, CatalogCodingLifecycle, CatalogCodingReader, CatalogCodingRecord,
-    CatalogCodingRoot, CatalogCodingSummary,
+    CatalogCodingGroupLocation, CatalogCodingGroupRange, CatalogCodingLifecycle,
+    CatalogCodingReader, CatalogCodingRecord, CatalogCodingRoot, CatalogCodingSummary,
 };
 pub use file_recipes::{
     CATALOG_FILE_SECTOR_REFS, CatalogFileExtent, CatalogFileRecipeBuilder, CatalogFileRecipeReader,

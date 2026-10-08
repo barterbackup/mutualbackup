@@ -29,14 +29,14 @@ pub use catalog::{
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingIndex,
     CatalogCertifiedPackingIndex, CatalogCheckpointRetention, CatalogCheckpointRetentionState,
     CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,
-    CatalogCodingValidation, CatalogIndexedCodingGroup, CatalogIntent, CatalogIntentState,
-    CatalogNativeValidation, CatalogNativeValidationState, CatalogPackingAuthority,
-    CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource, CatalogPackingCodingIndex,
-    CatalogPackingCodingValidation, CatalogPackingIndex, CatalogPackingPlacement,
-    CatalogPackingSector, CatalogPackingValidation, CatalogPublicationView, CatalogSectorSource,
-    CatalogSourceSweep, CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink,
-    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
-    PagedCatalogSectorSource, PagedCatalogSnapshot,
+    CatalogCodingRetention, CatalogCodingRetentionState, CatalogCodingValidation,
+    CatalogIndexedCodingGroup, CatalogIntent, CatalogIntentState, CatalogNativeValidation,
+    CatalogNativeValidationState, CatalogPackingAuthority, CatalogPackingAuthorityBase,
+    CatalogPackingAuthorizedSource, CatalogPackingCodingIndex, CatalogPackingCodingValidation,
+    CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingSector, CatalogPackingValidation,
+    CatalogPublicationView, CatalogSectorSource, CatalogSourceSweep, CatalogStoreError,
+    CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource,
+    PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
 #[cfg(target_os = "linux")]
