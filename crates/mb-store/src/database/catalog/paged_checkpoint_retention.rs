@@ -219,6 +219,7 @@ impl ControlStore {
                 journal::read::<CatalogPagedCheckpointRetention>(&transaction, id)?.is_some();
             if !existed {
                 paged_checkpoint_revision::require_unowned(&transaction, id)?;
+                paged_checkpoint_payload::require_unowned(&transaction, id)?;
             }
             let state = journal::begin(&transaction, retention)?;
             paged_checkpoint_revision::admitted_work(&transaction, retention)?;
@@ -398,6 +399,11 @@ impl ControlStore {
         };
         paged_checkpoint_revision::admitted_work(&self.connection, record.retention)?;
         if record.state == CatalogPagedCheckpointRetentionState::Cancelled && record.roots == 0 {
+            if paged_checkpoint_payload::admitted_work(&self.connection, record.retention)?
+                .is_some_and(|work| work.records != 0)
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
             if paged_checkpoint_revision::has_dependencies(&self.connection, id)? {
                 return Err(DatabaseError::Integrity.into());
             }
@@ -422,6 +428,11 @@ impl ControlStore {
         };
         paged_checkpoint_revision::admitted_work(&self.connection, record.retention)?;
         if record.state == CatalogPagedCheckpointRetentionState::Cancelled && record.roots == 0 {
+            if paged_checkpoint_payload::admitted_work(&self.connection, record.retention)?
+                .is_some_and(|work| work.records != 0)
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
             if paged_checkpoint_revision::has_dependencies(&self.connection, id)? {
                 return Err(DatabaseError::Integrity.into());
             }
@@ -464,7 +475,7 @@ impl ControlStore {
         Ok(())
     }
 
-    /// Release at most one cancelled private revision dependency or public
+    /// Release at most one cancelled payload, private revision dependency or public
     /// root. Recheck the actual current head inside every writer transaction.
     pub fn release_catalog_paged_checkpoint_root(
         &self,
@@ -475,6 +486,11 @@ impl ControlStore {
         let record = journal::read::<CatalogPagedCheckpointRetention>(&transaction, id)?
             .ok_or(DatabaseError::NotReady)?;
         self.guard_paged_retirement(record.retention)?;
+        if paged_checkpoint_payload::release(&transaction, record.retention)? {
+            self.guard_paged_retirement(record.retention)?;
+            transaction.commit()?;
+            return Ok(true);
+        }
         if paged_checkpoint_revision::release(&transaction, record.retention)? {
             self.guard_paged_retirement(record.retention)?;
             transaction.commit()?;
@@ -487,6 +503,13 @@ impl ControlStore {
                 .roots
                 == 0
         {
+            if paged_checkpoint_revision::admitted_work(&transaction, record.retention)?
+                .is_some_and(|work| work.records != 0)
+                || paged_checkpoint_payload::admitted_work(&transaction, record.retention)?
+                    .is_some_and(|work| work.records != 0)
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
             let certificate = owned_certificate(&transaction, record.retention)?;
             let bytes = mb_core::canonical_bytes_bounded(
                 &certificate,

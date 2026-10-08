@@ -1,6 +1,6 @@
 use super::*;
 
-fn paged_owner_proof(
+pub(super) fn paged_owner_proof(
     fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
     history: &History,
     previous: Option<&CatalogQuorumPagedCheckpointIndex>,

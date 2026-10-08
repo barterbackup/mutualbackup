@@ -27,6 +27,13 @@ including the existing R1/R2/R3/R5/R7 and native platform gates. The review itse
 used source inspection only; the corrections' runtime evidence is recorded
 separately below.
 
+Checkpoint custody work on 2026-10-08 preserves candidate public/private
+metadata and individual local READY payload roles; it does not close M6 or
+enable normal paged producers. Real-upload evacuation exposed missing evidence
+in prior information activation, so R4 is reopened for authenticated historical
+upgrade/qualification. All R1/R2/R3/R4/R5/R7 requirements and remaining native
+platform, full activation/quota and retained 1 TiB gates remain active.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -1826,6 +1833,19 @@ separately below.
     See ADR 0002 for original-proof, corruption, fault and Node validation.
     This preserves existing custody; complete information/parity availability,
     full history ownership, activation, quota and qualification remain open.
+  - [x] Bind actual local READY variable-profile information/parity bytes to
+    the original certified witness under the same paged candidate owner. Node
+    checks the assigned holder, bounded active volume locator and full Merkle
+    commitment. Serialize acquisition and destructive volume operations through
+    the control writer; preserve bytes and locators during GC, Forget/attempt
+    rollback and verified evacuation. Keep shared owners independent through
+    reopen and release one payload dependency before private/public roots under
+    actual current-head guards. Accumulate payload bytes, exact point replay and
+    paired-record work with public/proof/private debt in one admitted budget.
+    See ADR 0002 for fault, budget and real Node lifecycle validation. This is
+    local custody of an individual role; complete distributed availability,
+    history ownership, activation, quota and retained-capacity/release gates
+    remain open, and normal paged checkpoint producers remain disabled.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
@@ -1921,7 +1941,13 @@ separately below.
     retention and seed-only recovery together; qualify the declared capacity
     and geometry policy on real data before enabling production admission.
 
-- [x] **R4 / P1 — Complete variable-profile disk evacuation.**
+- [ ] **R4 / P1 — Complete variable-profile disk evacuation.**
+  Reopened on 2026-10-08: a real normal information upload exposed an older
+  activation path that made bytes READY without the evidence required by the
+  migration reader. Fresh activations now retain the verified original
+  transcript hash, matching recovery; missing evidence still fails closed.
+  Existing stores with already-READY empty-evidence uploads need authenticated
+  upgrade/backfill and qualification before this item can close again.
   Implemented bounded READY enumeration and durable local transfers for variable
   information/parity shards alongside legacy objects. Destination writes count
   reservations and headroom, preserve attempt/receipt/verification evidence,
@@ -1935,6 +1961,18 @@ separately below.
   final retirement. Each source's retirement is persisted before the next
   source can fail. Qualification is recorded below; broader release-artifact
   and platform validation remains R7.
+
+  - [x] Preserve verified original transcript evidence when normal uploaded
+    information becomes READY. Exercise actual information and parity uploads
+    through candidate custody, Forget/rollback, interrupted evacuation and
+    reopen, including independent shared owners and final collection. See the
+    checkpoint payload custody entry and ADR 0002 for current validation.
+  - [ ] Define and qualify an authenticated upgrade for prior uploaded
+    information that is already READY with an empty activation-receipt field.
+    Preserve original bytes, identity, attempt and verified transcript binding;
+    do not fabricate a parity receipt or accept damaged activation evidence.
+    Include original-history recovery, missing original witnesses, interruption,
+    reopen, shared custody and actual source removal.
 
   - [x] Repair interrupted coding-upload reservation retirement. A retry after
     receipt publication now verifies the physical STAGED/READY shard and the

@@ -31,21 +31,21 @@ pub use catalog::{
     CatalogCheckpointAuthorityContext, CatalogCheckpointAuthorityIndex,
     CatalogCheckpointAuthorityValidation, CatalogCheckpointCodingDirectoryIndex,
     CatalogCheckpointCodingStateIndex, CatalogCheckpointCodingTrust, CatalogCheckpointPackingIndex,
-    CatalogCheckpointPrevious, CatalogCheckpointRetention, CatalogCheckpointRetentionState,
-    CatalogCheckpointTransitionIndex, CatalogCheckpointWriterAuthorization,
-    CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,
-    CatalogCodingRetention, CatalogCodingRetentionState, CatalogCodingValidation,
-    CatalogDurableGuildHistory, CatalogDurableGuildHistoryView, CatalogGuildHistoryIndex,
-    CatalogGuildHistoryMutation, CatalogGuildHistoryObject, CatalogGuildHistorySnapshot,
-    CatalogGuildHistorySource, CatalogGuildHistoryView, CatalogIndexedCodingGroup,
-    CatalogIndexedDirectoryCodingGroup, CatalogIntent, CatalogIntentState, CatalogNativeValidation,
-    CatalogNativeValidationState, CatalogPackingAuthority, CatalogPackingAuthorityBase,
-    CatalogPackingAuthorizedSource, CatalogPackingCodingDirectoryIndex,
-    CatalogPackingCodingDirectoryValidation, CatalogPackingCodingIndex,
-    CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
+    CatalogCheckpointPayload, CatalogCheckpointPrevious, CatalogCheckpointRetention,
+    CatalogCheckpointRetentionState, CatalogCheckpointTransitionIndex,
+    CatalogCheckpointWriterAuthorization, CatalogCodingAuthorization, CatalogCodingCoverage,
+    CatalogCodingCoveragePolicy, CatalogCodingRetention, CatalogCodingRetentionState,
+    CatalogCodingValidation, CatalogDurableGuildHistory, CatalogDurableGuildHistoryView,
+    CatalogGuildHistoryIndex, CatalogGuildHistoryMutation, CatalogGuildHistoryObject,
+    CatalogGuildHistorySnapshot, CatalogGuildHistorySource, CatalogGuildHistoryView,
+    CatalogIndexedCodingGroup, CatalogIndexedDirectoryCodingGroup, CatalogIntent,
+    CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,
+    CatalogPackingAuthority, CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
+    CatalogPackingCodingDirectoryIndex, CatalogPackingCodingDirectoryValidation,
+    CatalogPackingCodingIndex, CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
     CatalogPackingCodingValidation, CatalogPackingIndex, CatalogPackingPlacement,
     CatalogPackingSector, CatalogPackingValidation, CatalogPagedCheckpointRetention,
-    CatalogPagedCheckpointRetentionState, CatalogPublicationView,
+    CatalogPagedCheckpointRetentionState, CatalogPayloadRetirementView, CatalogPublicationView,
     CatalogQuorumPagedCheckpointIndex, CatalogSectorSource, CatalogSourceSweep, CatalogStoreError,
     CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource,
     PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
@@ -3212,29 +3212,61 @@ impl ParityStore {
         attempt_id: &[u8; 16],
         preserve_ready: &BTreeSet<([u8; 32], u16)>,
     ) -> Result<u64, DatabaseError> {
+        self.discard_uncommitted_attempt_checked(attempt_id, preserve_ready, |_, _, _| Ok(false))
+    }
+
+    /// Check each READY object inside the same bounded attempt writer before
+    /// deleting it. External custody checks must hold their own control writer.
+    pub fn discard_uncommitted_attempt_checked(
+        &mut self,
+        attempt_id: &[u8; 16],
+        preserve_ready: &BTreeSet<([u8; 32], u16)>,
+        mut pinned: impl FnMut([u8; 32], u16, [u8; 32]) -> Result<bool, DatabaseError>,
+    ) -> Result<u64, DatabaseError> {
         if *attempt_id == [0; 16] {
             return Err(DatabaseError::Integrity);
         }
         let transaction = self.connection.transaction()?;
         let rows = {
             let mut statement = transaction.prepare(
-                "SELECT group_id, shard_index, state FROM parity_objects WHERE attempt_id = ?1",
+                "SELECT CASE WHEN length(group_id) = 32 THEN group_id END, shard_index,
+                 CASE WHEN length(state) <= 6 THEN state END,
+                 CASE WHEN length(root) = 32 THEN root END
+                 FROM parity_objects WHERE attempt_id = ?1 LIMIT 257",
             )?;
             statement
                 .query_map([attempt_id.as_slice()], |row| {
                     Ok((
-                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        if rows.len() > 256 {
+            return Err(DatabaseError::Integrity);
+        }
         let mut objects = 0;
-        for (group_id, shard_index, state) in rows {
-            let group_id: [u8; 32] = group_id.try_into().map_err(|_| DatabaseError::Integrity)?;
+        for (group_id, shard_index, state, root) in rows {
+            let group_id: [u8; 32] = group_id
+                .ok_or(DatabaseError::Integrity)?
+                .try_into()
+                .map_err(|_| DatabaseError::Integrity)?;
             let shard_index = u16::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?;
-            if state == "READY" && preserve_ready.contains(&(group_id, shard_index)) {
+            let state = state.ok_or(DatabaseError::Integrity)?;
+            if !matches!(state.as_str(), "STAGED" | "READY") {
+                return Err(DatabaseError::Integrity);
+            }
+            let root: [u8; 32] = root
+                .ok_or(DatabaseError::Integrity)?
+                .try_into()
+                .map_err(|_| DatabaseError::Integrity)?;
+            if state == "READY"
+                && (preserve_ready.contains(&(group_id, shard_index))
+                    || pinned(group_id, shard_index, root)?)
+            {
                 continue;
             }
             objects += transaction.execute(

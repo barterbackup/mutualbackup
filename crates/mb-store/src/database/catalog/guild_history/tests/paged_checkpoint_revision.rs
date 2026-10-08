@@ -4,7 +4,7 @@ use mb_core::{
     SignedRecord,
 };
 
-fn private_checkpoint(
+pub(super) fn private_checkpoint(
     control: &ControlStore,
 ) -> (
     super::super::super::checkpoint_validation::tests::Fixture,
@@ -71,14 +71,14 @@ fn private_checkpoint(
     (fixture, history, bundle, bootstrap)
 }
 
-fn private_proof(
+pub(super) fn private_proof(
     fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
     history: &History,
 ) -> CatalogQuorumPagedCheckpointIndex {
     private_proof_with_budget(fixture, history, budget())
 }
 
-fn private_proof_with_budget(
+pub(super) fn private_proof_with_budget(
     fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
     history: &History,
     limit: Work,
@@ -134,7 +134,7 @@ fn private_proof_with_budget(
     real_certificate(transition, history)
 }
 
-fn publish_private(
+pub(super) fn publish_private(
     control: &ControlStore,
     fixture: &super::super::super::checkpoint_validation::tests::Fixture,
     bundle: &CatalogBundle,

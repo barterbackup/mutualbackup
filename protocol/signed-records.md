@@ -341,6 +341,21 @@ preserve existing local custody; they do not prove complete information/parity
 availability, transitive archive ownership or safe activation, and their logical
 work budget does not replace full physical/dataset/guild quota admission.
 
+The candidate can also retain a physical local variable-profile role from the
+exact original certified coding witness. Information uses its sector ID and
+parity its group ID. Node requires the original assigned holder and verifies
+full READY bytes against the original guild and Merkle commitment through a
+SQL-bounded active locator. Control writers serialize custody acquisition with
+volume deletion across the separate databases. Paired role records preserve
+payloads and active locators through GC, attempt rollback, sharing and reopen;
+existing verified migration can transfer the physical copy. Cumulative payload
+bytes, measured point-replay pages/records and local dependency work consume the
+same budget as original proof/public/private debt. Each cancelled cleanup call
+releases at most one payload, private dependency or public root, in that order,
+with actual current-head guards. These local pins do not constitute complete
+distributed availability or certified-current activation. Signed layouts and
+wire versions remain unchanged.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the

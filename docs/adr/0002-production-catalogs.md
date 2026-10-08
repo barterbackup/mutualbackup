@@ -3986,3 +3986,106 @@ retirement policy, cooperative workers/normal producers, physical/dataset/guild
 quota or actual retained 1 TiB/native/platform/topology/release qualification.
 Normal paged checkpoint producers remain disabled. Original signed layouts,
 identities and wire versions are unchanged.
+
+## Checkpoint custody of actual local information/parity roles (2026-10-08)
+
+`retain_catalog_paged_checkpoint_payload_checked` binds an individual physical
+variable-profile role to the same original-history-proven paged candidate owner.
+An authenticated group point replay comes from the completed directory index,
+including its original signed witness. It resolves information to its sector ID
+and parity to its group ID, with the exact role index, assigned holder, guild,
+Merkle commitment and original transcript hash. Virtual-zero roles have no
+physical custody dependency. The concrete quorum/history proof, independently
+read event trust, actual SQL predecessor, published owner and exact stored
+certificate are checked around the dependency writer.
+
+Node's `retain_paged_checkpoint_local_payload` checks the assigned local holder
+and loads actual READY bytes through the active online volume locator. The
+locator allocation is bounded to 512 bytes inside SQL. It checks the guild and
+original commitment and recomputes the full Merkle commitment. Missing, STAGED,
+unavailable or damaged bytes and malformed/oversized locators cannot publish a
+pin. A signed witness or upload record alone does not establish possession.
+
+Acquisition holds the control database's immediate writer across the physical
+READY check and paired pin publication. Actual garbage deletion and bulk attempt
+rollback hold that same writer across pin checks and their volume transaction.
+This serializes acquisition and deletion across separate control/volume
+databases. The callback view exposes pin reads and a narrowly scoped exact
+volume-receipt retirement; it cannot change other custody state. Callbacks must
+not start another control transaction. Pins preserve both READY bytes and their
+active locators after Forget and attempt rollback. Repair keeps a custodied
+source locator until verified replacement activation publishes its destination;
+empty-volume retirement cannot erase a still-required locator. Existing verified
+evacuation transfers the bytes and original activation evidence before source
+withdrawal, without needing to release checkpoint custody.
+
+Forward dependencies use the candidate owner plus coding group/role; reverse
+dependencies use the physical storage ID/role plus owner/group. Thus independent
+owners and different coding groups can share information without collapsing
+their ownership. Canonical bounded paired records and a cumulative count/work
+counter are published atomically, survive reopen and remain pinned after
+cancellation until their individual cleanup step commits. The count is bounded
+by the certified role summary. Exact retry adds no debt. Cleanup releases at most
+one payload dependency before private revision dependencies and public roots,
+checks the actual current checkpoint before and after mutation, and keeps the
+original certificate until the final public root retires. Cancelled IDs remain
+fenced. Orphaned, mismatched or oversized pin/counter records prevent deletion.
+
+Admission adds actual payload bytes, bounded local dependency records and the
+measured additional coding-point replay to original proof debt, public EOF replay
+and private root/bootstrap work. The point reader reports actual encoded page
+bytes, page occurrences and framed witness records; it does not substitute a
+guessed per-group byte limit. Public, private and payload acquisition share one
+remaining budget in either order. This logical work bound does not replace
+physical, per-dataset or guild-wide storage accounting.
+
+Four Store custody fixtures use real original coding/history/quorum proofs and
+actual READY codewords. They cover sharing and reopen, exact retry, attempt
+rollback, writer exclusion against a second connection, acquisition after
+deletion, bounded retirement, stale independent trust, current-head changes
+inside acquisition/release writers, ignored paired insert/delete/counter writes,
+damaged records that must preserve physical bytes, and combined private/payload
+budget exhaustion in both acquisition orders. Their Store-only receipt strings
+are explicitly opaque; the Node fixtures use normal uploads and original signed
+plans/witnesses for actual assigned information and parity holders.
+
+Both Node fixtures reject missing/STAGED bytes and an oversized active locator,
+use the frozen original index with unreadable unused flat state, retire capture
+pins, install real signed Retire/Forget events, roll back the coding attempt and
+reopen. They interrupt evacuation exactly after destination READY, retry rollback
+with both copies present, then reopen and finish the verified move. They also
+exercise local volume repair while the custodied source disk is unavailable:
+the old locator survives staging, activation publishes a verified replacement,
+and restoring the old disk leaves both copies protected until final owner
+retirement. Shared owners retire independently before actual collection. These
+tests exercise storage custody mechanics, not normal paged checkpoint production
+or end-to-end historical repair/recovery policy.
+
+The real information evacuation fixture exposed a previously untested normal
+activation defect: uploaded information became READY with an empty receipt
+field, whereas recovery stores its original verified transcript hash as local
+activation evidence. Normal activation now stores that same verified hash
+before READY. Migration retains its strict missing-evidence rejection and copies
+the original evidence exactly. This corrects fresh uploads, without silently
+rewriting old READY objects. R4 is reopened for an authenticated upgrade/backfill
+and qualification of those historical uploaded objects; missing original
+witnesses must remain an explicit failure, not fabricated evidence.
+
+The locked full Core library suite passes all 175 tests. The locked full Store
+suite passes 274 ordinary tests with 26 ignored; after the additional destructive
+fault assertions and lint-only conditional cleanup, all nine private/payload
+custody fixtures pass on the final Store tree. The locked full Node library
+suite passes all 442 ordinary tests with 21 ignored, including both complete
+information/parity custody lifecycles and the existing GC, rollback, migration,
+activation, backup and network regressions. Strict locked workspace/all-targets
+Clippy and formatting/diff checks pass. After lint-only wrapper cleanup, both
+Node custody fixtures pass again on the final tree. Ignored provisioned/native/topology
+cases are not counted as qualification.
+
+This establishes custody of individual existing local roles. Complete
+distributed availability and all private/source EOFs, transitive history and
+ancestor certificate ownership, atomic certified-current activation/retirement,
+cooperative normal producers, full physical/dataset/guild quota and actual
+retained 1 TiB/native/platform/topology/release qualification remain open. Normal
+paged checkpoint producers remain disabled. Original signed identities and wire
+layouts are unchanged.

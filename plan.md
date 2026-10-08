@@ -1337,7 +1337,7 @@ checks while adding the specific missing behavior.
 | R1 — remove FUSE | Execute the removal and existing-state contract in section 4. Cancel guarded recapture repair, guarded Git completion, and FUSE platform probes. | No FUSE runtime/dependency/enrollment path; native regressions pass; legacy data is verified and preserved or rejected before mutation. |
 | R2 — Git and backup capacity consistency | Replace the separate 64 MiB Git graph and 32 MiB serialized-backup assumptions with one end-to-end budget, or versioned bounded metadata chunking. Count refs, tree/commit/tag bytes, blob recipes, surrounding private metadata, and checkpoint/transport constraints. Preflight graph-changing operations before publishing refs, index state, or a protection claim. | Just-below/above boundary tests for commit, fetch, merge, tags and pins; rejected operations leave visible state intact; accepted graphs serialize, back up, and recover with exact bytes and IDs. Reopen and retry preserve the same decision. |
 | R3 — snapshot scale | Treat 39,488 data-sector references at 64 KiB (about 2.41 GiB of full sectors) as the current v1 bound. Define supported production dataset/history sizes beyond this prototype ceiling, then implement versioned authenticated paged/chunked catalogs or another explicit scalable design with bounded traversal. Keep early diagnostics for the current bound until migration is available; do not merely raise constants. | Dense, sparse, hard-linked, many-small-file, and multi-revision/Git-history cases above the old ceiling and at the declared limit; just-over-limit rejection before publication; bounded memory, encoding and recovery; old-format migration and seed-only restore after any format change. |
-| R4 — complete volume evacuation (completed) | Durable variable READY transfers now preserve attempt/receipt/verification evidence, verify destination bytes before publishing its location, and conditionally withdraw the source. GC/abort cancellation, offline cleanup ownership, pending upload completion, and per-source durable retirement are implemented alongside legacy migration. | All 55 volume tests pass, including provisioned Btrfs headroom. Crash/reopen, mixed formats, full/offline destinations, pending ownership, repairs, successor protection, and GC/abort fixtures pass. Node live reads and missing-shard reconstruction pass after source removal and reopen; coding replay and network upload retry pass. Exact release-artifact/platform qualification remains R7. |
+| R4 — complete volume evacuation (reopened for historical uploaded information) | Durable variable READY transfers now preserve attempt/receipt/verification evidence, verify destination bytes before publishing its location, and conditionally withdraw the source. GC/abort cancellation, offline cleanup ownership, pending upload completion, and per-source durable retirement are implemented alongside legacy migration. Fresh information activation now retains original verified transcript evidence; prior READY uploads with missing evidence need an authenticated upgrade. | Historical qualification: all 55 volume tests pass, including provisioned Btrfs headroom. Crash/reopen, mixed formats, full/offline destinations, pending ownership, repairs, successor protection, and GC/abort fixtures pass. Node live reads and missing-shard reconstruction pass after source removal and reopen; coding replay and network upload retry pass. Exact release-artifact/platform qualification remains R7. |
 | R5 — backup/signature progress | Keep the existing relay-only recovered-peer/missing-signer issue open. Correlate each job, event, signer, proposal lock, and selected connection; diagnose remaining response and catch-up paths. Preserve verified partial signatures through retry/reopen and provide bounded waits with actionable blocked status. | Deterministic regressions for identified failure paths plus repeated exact-source provisioned topology runs with stale direct endpoints, relay-only recovery, lagging signers, partition/heal, and restarts. One passing rerun does not establish the old stall's cause. |
 | R6 — ordinary Git runtime dependency (completed) | Default Nix programs now include pinned stock Git through runtime wrappers; the optional alias uses that runtime. Standalone binaries declare their Git PATH requirement and discovery reports a missing dependency clearly. | Installed runtime/alias passed packed import and both bridge directions with exact bytes/IDs in isolated environments, with and without the alias. Raw standalone missing-Git failure left visible refs/history and working bytes unchanged. A dedicated CI job repeats the gate. Broader artifact qualification remains R7. |
 | R7 — release validation | Preserve existing CI jobs for formatting, Clippy, locked tests, reflink/topology, port mapping, and private Tor. Add the complete provisioned `git-linux-acceptance.sh` gate and qualification of the actual packaged binaries and runtime dependencies. | Required checks identify exact source/artifacts and include raw-byte Git, recovery, extent sharing, prune, migration and cleanup evidence. Nix build-only checks cannot stand in for these tests; unsupported privileged environments cannot silently count as passes. |
@@ -1938,6 +1938,27 @@ existing local custody. Complete information/parity availability, transitive
 history/ancestor ownership, certified-current activation, cooperative producers,
 full physical/dataset/guild quota and retained 1 TiB/platform/release gates remain
 open; normal paged checkpoint producers remain disabled.
+
+The same candidate now retains actual local READY variable-profile information
+or parity roles from its original certified coding witness. Node checks the
+assigned holder, bounded active volume locator and full original Merkle
+commitment. Acquisition and destructive volume operations hold the control
+writer across physical READY checks or deletion, closing races between separate
+databases. GC and attempt rollback preserve both payloads and active locators;
+verified evacuation can move custody through its existing recoverable migration.
+Normal uploaded information now records its verified original transcript hash
+before READY activation, matching recovery. The new real-upload evacuation test
+exposed that this evidence was previously absent. R4 is reopened for an
+authenticated upgrade/backfill of those already-READY historical uploads;
+migration continues to reject missing or damaged activation evidence.
+Paired role dependencies survive sharing and reopen, and bounded cancellation
+releases one payload before private dependencies and public roots with actual
+current-head guards. Payload bytes, measured coding-point replay and local
+dependency work share admission with the original proof/public/private debt.
+This establishes individual local roles; complete distributed readiness,
+transitive history ownership, atomic certified-current activation, cooperative
+normal production/recovery, full physical/dataset/guild quota and retained
+1 TiB/native/platform/topology/release qualification remain required.
 
 ### Historical implementation and validation record (before scope correction)
 

@@ -22,6 +22,7 @@ const VOLUME_MANIFEST_DOMAIN: &[u8] = b"mutualbackup/local-volume-manifest/v1";
 const VOLUME_MANIFEST_FILE: &str = ".mutualbackup-volume";
 const CONTROL_KEY_FILE: &str = "control.key";
 const MAX_LOCAL_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_VOLUME_RECEIPT_BYTES: usize = 512;
 const DATABASE_PAGE_BYTES: u64 = 4096;
 const PHYSICAL_WRITE_FIXED_RESERVE: u64 = 64 * 1024;
 
@@ -843,6 +844,9 @@ impl StorageVolumes {
         root: &[u8; 32],
         attempt: Option<(&[u8; 16], &[u8; 32])>,
     ) -> Result<bool> {
+        if control.catalog_checkpoint_payload_is_pinned(*group_id, u16::from(shard_index), *root)? {
+            return Ok(false);
+        }
         let record_id = volume_object_id(group_id, shard_index);
         self.cancel_variable_migration_for_gc(control, &record_id, root, attempt)?;
         let receipt_volume = self
@@ -950,12 +954,24 @@ impl StorageVolumes {
                     control.put_record("volume-attempt-retirement", &key, &bytes)?;
                 }
             }
-            match store.remove_ready(group_id, shard_index, root) {
-                Ok(true) => {
+            let removed = control.with_catalog_checkpoint_payload_retirement(
+                |view| -> Result<Option<bool>> {
+                    if view.is_pinned(*group_id, u16::from(shard_index), *root)? {
+                        Ok(None)
+                    } else {
+                        Ok(Some(store.remove_ready(group_id, shard_index, root)?))
+                    }
+                },
+            );
+            match removed {
+                Ok(None) => {
+                    return Ok(false);
+                }
+                Ok(Some(true)) => {
                     volume_interruption(VolumeInterruption::GarbageObjectRemoved)?;
                     cleanup_volumes.remove(volume_id);
                 }
-                Ok(false) => {
+                Ok(Some(false)) => {
                     cleanup_volumes.remove(volume_id);
                 }
                 Err(error) => {
@@ -970,7 +986,24 @@ impl StorageVolumes {
         self.store_cleanup_volumes(control, &record_id, &cleanup_volumes)?;
         complete &= self.settle_attempt_retirements(control, group_id, shard_index, attempt)?;
         if complete && cleanup_volumes.is_empty() && newer_ready_volumes.is_empty() {
-            control.delete_record("volume-receipt", &record_id)?;
+            if let Some(bytes) = control.get_record_bounded(
+                "volume-receipt",
+                &record_id,
+                MAX_VOLUME_RECEIPT_BYTES,
+            )? {
+                let retired =
+                    control.with_catalog_checkpoint_payload_retirement(|view| -> Result<bool> {
+                        Ok(view.retire_volume_receipt(
+                            *group_id,
+                            u16::from(shard_index),
+                            *root,
+                            &bytes,
+                        )?)
+                    })?;
+                if !retired {
+                    return Ok(false);
+                }
+            }
             control.delete_record("volume-write-intent", &record_id)?;
             volume_interruption(VolumeInterruption::GarbageReceiptRetired)?;
         }
@@ -1397,7 +1430,7 @@ impl StorageVolumes {
         }
         let active_id = volume_object_id(group_id, shard);
         let active = control
-            .get_record("volume-receipt", &active_id)?
+            .get_record_bounded("volume-receipt", &active_id, MAX_VOLUME_RECEIPT_BYTES)?
             .map(|bytes| decode_canonical::<VolumeReceipt>(&bytes))
             .transpose()?;
         if let Some(existing) = &active
@@ -1594,6 +1627,13 @@ impl StorageVolumes {
             {
                 continue;
             }
+            if control.catalog_checkpoint_payload_is_pinned(
+                intent.destination.group_id,
+                u16::from(intent.destination.shard_index),
+                intent.destination.root,
+            )? {
+                continue;
+            }
             intent.cancelled = true;
             control.put_record(VARIABLE_MIGRATION_KIND, &id, &canonical_bytes(&intent)?)?;
             required_volumes.insert(intent.source_volume_id);
@@ -1628,7 +1668,17 @@ impl StorageVolumes {
                 }
                 continue;
             };
-            store.discard_uncommitted_attempt_preserving_ready(attempt_id, preserve_ready)?;
+            control.with_catalog_checkpoint_payload_retirement(|view| -> Result<()> {
+                store.discard_uncommitted_attempt_checked(
+                    attempt_id,
+                    preserve_ready,
+                    |storage, shard, root| {
+                        view.is_pinned(storage, shard, root)
+                            .map_err(|_| DatabaseError::Integrity)
+                    },
+                )?;
+                Ok(())
+            })?;
         }
         for (kind, record_id, record) in attempt_records {
             if self
@@ -1653,13 +1703,25 @@ impl StorageVolumes {
                             .is_ok()
                     });
             if !retained_information
-                && let Some(bytes) = control.get_record("volume-receipt", &active_id)?
+                && let Some(bytes) = control.get_record_bounded(
+                    "volume-receipt",
+                    &active_id,
+                    MAX_VOLUME_RECEIPT_BYTES,
+                )?
             {
                 let active: VolumeReceipt = decode_canonical(&bytes)?;
                 if active != receipt {
                     bail!("active volume receipt conflicts with aborted coding attempt");
                 }
-                control.delete_record("volume-receipt", &active_id)?;
+                control.with_catalog_checkpoint_payload_retirement(|view| -> Result<()> {
+                    view.retire_volume_receipt(
+                        receipt.group_id,
+                        u16::from(receipt.shard_index),
+                        receipt.root,
+                        &bytes,
+                    )?;
+                    Ok(())
+                })?;
             }
             control.delete_record(kind, &record_id)?;
         }
@@ -1777,10 +1839,19 @@ impl StorageVolumes {
         if cleanup {
             self.add_cleanup_volume(control, &object.group_id, shard_index, receipt.volume_id)?;
         }
-        control.delete_record(
-            "volume-receipt",
-            &volume_object_id(&object.group_id, shard_index),
-        )?;
+        // Keep a custodied source locator until repair activation publishes a
+        // verified destination. Staging on another volume does not need to
+        // erase that original location evidence first.
+        let bytes = canonical_bytes(&receipt)?;
+        control.with_catalog_checkpoint_payload_retirement(|view| -> Result<()> {
+            view.retire_volume_receipt(
+                object.group_id,
+                u16::from(shard_index),
+                receipt.root,
+                &bytes,
+            )?;
+            Ok(())
+        })?;
         if failed {
             self.persist(control)?;
         }
@@ -2541,7 +2612,11 @@ impl StorageVolumes {
         shard_index: u8,
     ) -> Result<Option<VolumeReceipt>> {
         control
-            .get_record("volume-receipt", &volume_object_id(group_id, shard_index))?
+            .get_record_bounded(
+                "volume-receipt",
+                &volume_object_id(group_id, shard_index),
+                MAX_VOLUME_RECEIPT_BYTES,
+            )?
             .map(|bytes| {
                 let receipt: VolumeReceipt = decode_canonical(&bytes)?;
                 validate_receipt(&receipt)?;
@@ -2672,7 +2747,18 @@ impl StorageVolumes {
             validate_receipt(&receipt)?;
             validate_volume_object_record_id(&record_id, &receipt)?;
             if receipt.volume_id == volume_id {
-                control.delete_record("volume-receipt", &record_id)?;
+                let retired =
+                    control.with_catalog_checkpoint_payload_retirement(|view| -> Result<bool> {
+                        Ok(view.retire_volume_receipt(
+                            receipt.group_id,
+                            u16::from(receipt.shard_index),
+                            receipt.root,
+                            &bytes,
+                        )?)
+                    })?;
+                if !retired {
+                    bail!("checkpoint custody still requires this volume locator");
+                }
             }
         }
         for (record_id, bytes) in control.records("volume-copy-cleanup")? {

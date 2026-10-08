@@ -347,11 +347,20 @@ impl CatalogPackingCodingDirectoryIndex {
         id: [u8; 32],
         mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
     ) -> Result<Option<CatalogCodingEntry>, CatalogStoreError> {
+        self.read_group_with_work(id, &mut fetch)
+            .map(|entry| entry.map(|(entry, _)| entry))
+    }
+
+    pub fn read_group_with_work(
+        &self,
+        id: [u8; 32],
+        mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<(CatalogCodingEntry, CatalogCodingTraversalBudget)>, CatalogStoreError> {
         self.require_complete()?;
         let Some(group) = self.group(id)? else {
             return Ok(None);
         };
-        let entry = unwrap_stream(self.manifest.coding.read_group(
+        let (entry, work) = unwrap_stream(self.manifest.coding.read_group_with_work(
             self.manifest.packing.scope,
             self.manifest.coding_budget(self.budget)?,
             group.location(),
@@ -364,7 +373,7 @@ impl CatalogPackingCodingDirectoryIndex {
         {
             return Err(DatabaseError::Integrity.into());
         }
-        Ok(Some(entry))
+        Ok(Some((entry, work)))
     }
 }
 

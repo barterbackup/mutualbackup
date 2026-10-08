@@ -27,6 +27,7 @@ mod packing_authority;
 mod packing_coding_retention;
 mod packing_validation;
 mod paged_checkpoint;
+mod paged_checkpoint_payload;
 mod paged_checkpoint_retention;
 mod paged_checkpoint_revision;
 mod paged_data;
@@ -78,6 +79,7 @@ pub use packing_validation::{
     CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingSector, CatalogPackingValidation,
 };
 pub use paged_checkpoint::CatalogQuorumPagedCheckpointIndex;
+pub use paged_checkpoint_payload::{CatalogCheckpointPayload, CatalogPayloadRetirementView};
 pub use paged_checkpoint_retention::{
     CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,
 };

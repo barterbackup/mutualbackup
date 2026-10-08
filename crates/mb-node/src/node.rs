@@ -4200,6 +4200,50 @@ impl Node {
         .context("paged checkpoint requires original guild authority")
     }
 
+    /// Retain one actual local READY role from the original quorum-bound
+    /// checkpoint. Full bytes are checked while the control writer excludes GC.
+    pub fn retain_paged_checkpoint_local_payload(
+        &self,
+        id: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
+        group: [u8; 32],
+        shard: u16,
+    ) -> Result<mb_store::CatalogCheckpointPayload> {
+        guild_authority::with_history(&self.control, |authority| {
+            self.control
+                .retain_catalog_paged_checkpoint_payload_checked(
+                    id,
+                    proof,
+                    group,
+                    shard,
+                    || {
+                        authority.paged_checkpoint_trust().map_err(|_| {
+                            mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                        })
+                    },
+                    |payload| -> Result<()> {
+                        anyhow::ensure!(
+                            payload.holder == self.keys.node_id(),
+                            "checkpoint payload belongs to another holder"
+                        );
+                        let ready = self.volumes.load_ready_variable(
+                            &self.control,
+                            &payload.storage_id,
+                            payload.shard_index,
+                        )?;
+                        anyhow::ensure!(
+                            ready.guild_id == payload.guild_id
+                                && ready.commitment == payload.commitment
+                                && merkle_commit(&ready.bytes)? == payload.commitment,
+                            "checkpoint READY payload differs from its original coding witness"
+                        );
+                        Ok(())
+                    },
+                )
+        })?
+        .context("paged checkpoint requires original guild authority")
+    }
+
     pub(crate) fn needs_recovery_key_registration(&self) -> Result<bool> {
         guild_authority::with_history(&self.control, |authority| {
             let sequence = authority
@@ -9198,6 +9242,17 @@ impl Node {
                         &information.sector.id,
                         index as u16,
                     )? {
+                        // Information uploads have no signed parity receipt.
+                        // Keep the verified original transcript hash as their
+                        // activation evidence, as recovery already does, so a
+                        // later volume move can preserve that evidence exactly.
+                        self.volumes.attach_attempt_receipt(
+                            &self.control,
+                            &plan.attempt_id,
+                            &information.sector.id,
+                            index as u16,
+                            &transcript_hash,
+                        )?;
                         self.volumes.activate_attempt_object(
                             &self.control,
                             &plan.attempt_id,

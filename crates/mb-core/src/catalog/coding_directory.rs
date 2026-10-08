@@ -200,6 +200,19 @@ impl CatalogCodingDirectoryRoot {
         self.validate(budget)?;
         location.read_group(scope, self.guild_event_sequence, fetch)
     }
+
+    /// Return the additional physical page reads and framed records consumed
+    /// by an authenticated point replay, for enclosing custody admission.
+    pub fn read_group_with_work<E>(
+        self,
+        scope: CatalogScope,
+        budget: CatalogCodingTraversalBudget,
+        location: CatalogCodingGroupLocation,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+    ) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
+        self.validate(budget)?;
+        location.read_group_with_work(scope, self.guild_event_sequence, fetch)
+    }
 }
 
 fn dense_pages(bytes: u64) -> Result<u64, CatalogError> {
@@ -654,6 +667,26 @@ mod tests {
                 *expected
             );
             assert_eq!(fetches, 1);
+            let mut bytes = 0;
+            let mut pages_read = 0;
+            let (decoded, work) = root
+                .read_group_with_work(scope(), budget(), location, &mut |page| {
+                    let encoded = pages[&page.hash].clone();
+                    bytes += encoded.len() as u64;
+                    pages_read += 1;
+                    Ok::<_, ()>(encoded)
+                })
+                .unwrap();
+            assert_eq!(decoded, *expected);
+            assert_eq!(work.bytes, bytes);
+            assert_eq!(work.page_occurrences, pages_read);
+            assert_eq!(
+                work.records,
+                1 + crate::canonical_bytes(&expected.transcript)
+                    .unwrap()
+                    .len()
+                    .div_ceil(CATALOG_CODING_FRAGMENT_BYTES) as u64
+            );
         }
         assert!(
             reader

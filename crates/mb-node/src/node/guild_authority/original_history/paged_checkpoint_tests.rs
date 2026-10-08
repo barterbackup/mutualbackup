@@ -646,6 +646,414 @@ fn paged_checkpoint_node_private_dependency_authenticates_roots_and_preserves_cu
     );
 }
 
+fn exercise_checkpoint_payload_custody(information: bool) {
+    let (temp, seed, mut node, mut keys) = fixture();
+    let local = keys
+        .iter()
+        .position(|key| key.node_id() == node.keys.node_id())
+        .unwrap();
+    keys.swap(if information { 0 } else { 1 }, local);
+    let (proof, intents) = checkpoint_owner_proof(&mut node, &keys);
+    let group = proof
+        .index()
+        .index()
+        .next_group(None)
+        .unwrap()
+        .unwrap()
+        .group
+        .range
+        .group_id;
+    let entry = proof
+        .index()
+        .index()
+        .read_group(group, |page| {
+            node.control.catalog_page(
+                mb_core::CatalogScope::Guild {
+                    guild_id: proof.trust().guild_id,
+                },
+                mb_core::CatalogSection::Coding,
+                page,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let plan = &entry.transcript.value.plan;
+    let guild = proof.trust().guild_id;
+    let original = vec![91; mb_core::V1_SECTOR_SIZE];
+    let profile = mb_core::PackingProfile {
+        format_version: 1,
+        sector_size: mb_core::V1_SECTOR_SIZE as u32,
+        slot_size: mb_core::V1_SECTOR_SIZE as u32 / 4,
+    };
+    let packed = mb_core::pack_incremental(
+        profile,
+        None,
+        vec![mb_core::PackingInput {
+            owner: keys[0].node_id(),
+            protected_root: mb_core::packing_protected_root(Uuid::from_u128(194)),
+            object_id: [193; 32],
+            source_commitment: Some(merkle_commit(&original).unwrap()),
+            bytes: original,
+        }],
+    )
+    .unwrap();
+    let information_id = plan.value.geometry.information[0].sector.id;
+    let bytes = packed
+        .catalog
+        .sectors
+        .iter()
+        .zip(&packed.sectors)
+        .find_map(|(descriptor, sector)| {
+            let mut descriptor = descriptor.clone();
+            descriptor.flat_root = sector_root(&sector.bytes);
+            descriptor.id = descriptor.calculate_id(profile).unwrap();
+            (descriptor.id == information_id).then(|| sector.bytes.clone())
+        })
+        .unwrap();
+    let shards = mb_core::encode(entry.retained.group.profile, vec![bytes]).unwrap();
+    let shard = if information { 0 } else { 1 };
+    let storage = if information { information_id } else { group };
+    let ids = [Uuid::from_u128(1), Uuid::from_u128(2)];
+    for id in ids {
+        node.retain_paged_checkpoint_metadata(id, &proof).unwrap();
+    }
+    assert!(
+        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
+            .is_err()
+    );
+    if information {
+        node.reserve_coding_information(plan, 0).unwrap();
+        node.write_coding_information_range(plan, 0, 0, &shards[0])
+            .unwrap();
+        node.finish_coding_information_upload(plan, 0).unwrap();
+    } else {
+        let commitment = merkle_commit(&shards[1]).unwrap();
+        node.stage_coding_parity(
+            plan,
+            &entry.transcript.value.manifest,
+            &mb_store::VariableParityObject {
+                format_version: 2,
+                guild_id: guild,
+                group_id: group,
+                shard_index: 1,
+                commitment,
+                bytes: shards[1].clone(),
+            },
+        )
+        .unwrap();
+    }
+    // STAGED bytes are insufficient even when they already match the witness.
+    assert!(
+        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
+            .is_err()
+    );
+    node.activate_coding_attempt(&entry.transcript).unwrap();
+    // A damaged locator must fail before a custody pin can be published. Its
+    // SQL read is bounded independently of the original authenticated proof.
+    let mut locator_key = storage.to_vec();
+    locator_key.push(shard as u8);
+    let locator = node
+        .control
+        .get_record("volume-receipt", &locator_key)
+        .unwrap()
+        .unwrap();
+    node.control
+        .put_record("volume-receipt", &locator_key, &vec![0; 513])
+        .unwrap();
+    assert!(
+        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
+            .is_err()
+    );
+    assert_eq!(
+        node.control
+            .catalog_paged_checkpoint_payload(ids[0], group, shard)
+            .unwrap(),
+        None
+    );
+    node.control
+        .put_record("volume-receipt", &locator_key, &locator)
+        .unwrap();
+    let flat = node
+        .control
+        .get_record("guild-dynamic-state", KEY)
+        .unwrap()
+        .unwrap();
+    node.control
+        .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+        .unwrap();
+    let payload = node
+        .retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
+        .unwrap();
+    node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
+        .unwrap();
+    node.retain_paged_checkpoint_local_payload(ids[1], &proof, group, shard)
+        .unwrap();
+    assert!(
+        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, 1 - shard)
+            .is_err()
+    );
+    for intent in intents {
+        node.control.cancel_catalog(intent).unwrap();
+        while node.control.release_catalog_pin(intent).unwrap() {}
+    }
+    while node.control.collect_catalog_page().unwrap() {}
+    node.control
+        .put_record("guild-dynamic-state", KEY, &flat)
+        .unwrap();
+    let state = node.dynamic_guild_state().unwrap().unwrap();
+    let retire = event(
+        &node,
+        &keys,
+        mb_core::GuildEventKind::RetireCodingGroup {
+            group_id: group,
+            retain_through_event: state.event_sequence + 1,
+        },
+    );
+    node.install_guild_event(retire).unwrap();
+    let forget = event(
+        &node,
+        &keys,
+        mb_core::GuildEventKind::ForgetCodingGroup { group_id: group },
+    );
+    node.install_guild_event(forget).unwrap();
+    node.discard_coding_attempt(&plan.value.attempt_id).unwrap();
+    assert_eq!(
+        node.volumes
+            .load_ready_variable(&node.control, &storage, shard)
+            .unwrap()
+            .bytes,
+        shards[usize::from(shard)]
+    );
+    assert!(
+        !node
+            .volumes
+            .remove_unreachable(
+                &node.control,
+                &storage,
+                shard as u8,
+                &payload.commitment.root
+            )
+            .unwrap()
+    );
+    drop(node);
+    let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+    assert_eq!(
+        node.volumes
+            .load_ready_variable(&node.control, &storage, shard)
+            .unwrap()
+            .bytes,
+        shards[usize::from(shard)]
+    );
+    assert_eq!(
+        node.control
+            .catalog_paged_checkpoint_payload(ids[0], group, shard)
+            .unwrap(),
+        Some(payload.clone())
+    );
+    // Custody follows a verified physical move. Interrupt after the destination
+    // is READY, then retry rollback while both copies and the migration exist.
+    let source: crate::volume::VolumeReceipt = decode_canonical(&locator).unwrap();
+    let source_path = node
+        .volumes
+        .statuses()
+        .unwrap()
+        .into_iter()
+        .find(|status| status.volume_id == source.volume_id)
+        .unwrap()
+        .path;
+    let destination = tempfile::tempdir().unwrap();
+    node.configure_storage_volumes(
+        &[source_path, destination.path().to_path_buf()],
+        64 << 20,
+        0,
+    )
+    .unwrap();
+    node.drain_storage_volume(source.volume_id).unwrap();
+    crate::volume::interrupt_next_volume_transition(
+        crate::volume::VolumeInterruption::VariableMigrationDestinationReady,
+    );
+    let interruption = node.migrate_draining_volumes().unwrap_err();
+    assert!(
+        interruption
+            .to_string()
+            .contains("VariableMigrationDestinationReady")
+    );
+    node.discard_coding_attempt(&plan.value.attempt_id).unwrap();
+    drop(node);
+    let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+    node.migrate_draining_volumes().unwrap();
+    let moved: crate::volume::VolumeReceipt = decode_canonical(
+        &node
+            .control
+            .get_record("volume-receipt", &locator_key)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(moved.volume_id, source.volume_id);
+    assert_eq!(
+        node.volumes
+            .load_ready_variable(&node.control, &storage, shard)
+            .unwrap()
+            .bytes,
+        shards[usize::from(shard)]
+    );
+    assert_eq!(
+        node.control
+            .catalog_paged_checkpoint_payload(ids[0], group, shard)
+            .unwrap(),
+        Some(payload.clone())
+    );
+    // Repair an unavailable copy without dropping its custodied locator before
+    // the replacement becomes READY. Restore the old disk and collect both
+    // copies only after the last owner retires.
+    let object = node
+        .volumes
+        .load_ready_variable(&node.control, &storage, shard)
+        .unwrap();
+    drop(node);
+    let offline = temp.path().join("offline-custody-volume");
+    std::fs::rename(destination.path(), &offline).unwrap();
+    let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+    let replacement = tempfile::tempdir().unwrap();
+    node.configure_storage_volumes(&[replacement.path().to_path_buf()], 64 << 20, 0)
+        .unwrap();
+    let before = node
+        .control
+        .get_record("volume-receipt", &locator_key)
+        .unwrap();
+    assert!(
+        !node
+            .volumes
+            .prepare_variable_repair(&node.control, &object)
+            .unwrap()
+    );
+    assert_eq!(
+        node.control
+            .get_record("volume-receipt", &locator_key)
+            .unwrap(),
+        before
+    );
+    let repair = [225; 16];
+    node.volumes
+        .reserve_attempt(
+            &node.control,
+            &repair,
+            guild,
+            shard,
+            object.commitment.byte_len,
+        )
+        .unwrap();
+    node.volumes
+        .write_attempt_range(&node.control, &repair, shard, 0, &object.bytes)
+        .unwrap();
+    node.volumes
+        .finish_attempt_upload(&node.control, &repair, storage, shard, &object.commitment)
+        .unwrap();
+    node.volumes
+        .attach_attempt_receipt(
+            &node.control,
+            &repair,
+            &storage,
+            shard,
+            &payload.transcript_hash,
+        )
+        .unwrap();
+    node.volumes
+        .activate_attempt_object(
+            &node.control,
+            &repair,
+            &storage,
+            shard,
+            &object.commitment,
+            &payload.transcript_hash,
+        )
+        .unwrap();
+    node.volumes
+        .finalize_attempt(&node.control, &repair)
+        .unwrap();
+    drop(node);
+    std::fs::rename(&offline, destination.path()).unwrap();
+    let mut node = Node::open(temp.path(), seed).unwrap();
+    node.configure_storage_volumes(
+        &[
+            destination.path().to_path_buf(),
+            replacement.path().to_path_buf(),
+        ],
+        64 << 20,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        node.volumes
+            .load_ready_variable(&node.control, &storage, shard)
+            .unwrap(),
+        object
+    );
+    node.control
+        .cancel_catalog_paged_checkpoint_retention(ids[0])
+        .unwrap();
+    assert!(
+        node.control
+            .release_catalog_paged_checkpoint_root(ids[0])
+            .unwrap()
+    );
+    assert!(
+        !node
+            .volumes
+            .remove_unreachable(
+                &node.control,
+                &storage,
+                shard as u8,
+                &payload.commitment.root
+            )
+            .unwrap()
+    );
+    while node
+        .control
+        .release_catalog_paged_checkpoint_root(ids[0])
+        .unwrap()
+    {}
+    node.control
+        .cancel_catalog_paged_checkpoint_retention(ids[1])
+        .unwrap();
+    assert!(
+        node.control
+            .release_catalog_paged_checkpoint_root(ids[1])
+            .unwrap()
+    );
+    assert!(
+        node.volumes
+            .remove_unreachable(
+                &node.control,
+                &storage,
+                shard as u8,
+                &payload.commitment.root
+            )
+            .unwrap()
+    );
+    assert!(
+        node.volumes
+            .load_ready_variable(&node.control, &storage, shard)
+            .is_err()
+    );
+    while node
+        .control
+        .release_catalog_paged_checkpoint_root(ids[1])
+        .unwrap()
+    {}
+}
+
+#[test]
+fn paged_checkpoint_information_custody_survives_real_forget_rollback_and_reopen() {
+    exercise_checkpoint_payload_custody(true);
+}
+
+#[test]
+fn paged_checkpoint_parity_custody_survives_real_forget_rollback_and_reopen() {
+    exercise_checkpoint_payload_custody(false);
+}
+
 #[test]
 fn paged_checkpoint_metadata_node_owner_uses_original_index_and_survives_capture_retirement() {
     let (temp, seed, mut node, keys) = fixture();

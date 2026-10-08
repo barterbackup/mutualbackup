@@ -247,6 +247,16 @@ impl CatalogCodingGroupLocation {
         sequence: u64,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
     ) -> Result<CatalogCodingEntry, CatalogStreamError<E>> {
+        self.read_group_with_work(scope, sequence, fetch)
+            .map(|(entry, _)| entry)
+    }
+
+    pub(super) fn read_group_with_work<E>(
+        self,
+        scope: CatalogScope,
+        sequence: u64,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+    ) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
         // Exact whole-directory membership and counters belong to the trusted
         // completed traversal; the part/range decoder authenticates this group.
         read_group_at(scope, sequence, self.page, self.range, fetch)
@@ -334,6 +344,7 @@ impl CatalogCodingRoot {
             .get(usize::from(range.part))
             .ok_or(CatalogError::Bounds)?;
         read_group_at(scope, self.guild_event_sequence, part.page, range, fetch)
+            .map(|(entry, _)| entry)
     }
 }
 
@@ -343,7 +354,7 @@ fn read_group_at<E>(
     page: CatalogPageRef,
     range: CatalogCodingGroupRange,
     fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
-) -> Result<CatalogCodingEntry, CatalogStreamError<E>> {
+) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
     let guild_id = guild(scope)?;
     page.validate()?;
     if sequence == 0 || sequence > i64::MAX as u64 {
@@ -366,7 +377,23 @@ fn read_group_at<E>(
     let mut reader =
         CatalogRangeReader::new(scope, CatalogSection::Coding, page, range.offset..end)?;
     let mut bytes = Vec::with_capacity(range.len as usize);
-    while let Some(chunk) = reader.next_chunk(fetch)? {
+    let mut work = CatalogCodingTraversalBudget::default();
+    let mut measured_fetch = |page| -> Result<Vec<u8>, CatalogStreamError<E>> {
+        let bytes = fetch(page).map_err(CatalogStreamError::Storage)?;
+        work = work.checked_add(CatalogCodingTraversalBudget {
+            bytes: bytes.len() as u64,
+            page_occurrences: 1,
+            records: 0,
+        })?;
+        Ok(bytes)
+    };
+    while let Some(chunk) = reader
+        .next_chunk(&mut measured_fetch)
+        .map_err(|error| match error {
+            CatalogStreamError::Catalog(error) => CatalogStreamError::Catalog(error),
+            CatalogStreamError::Storage(error) => error,
+        })?
+    {
         bytes.extend(chunk);
     }
     let mut position = 0;
@@ -388,6 +415,7 @@ fn read_group_at<E>(
             .ok_or(CatalogError::InvalidPage)?
             .to_vec();
         position = end;
+        work.records = work.records.checked_add(1).ok_or(CatalogError::Bounds)?;
         Ok(Some(record))
     };
     let header = CatalogCodingRecord::decode(&next()?.ok_or(CatalogError::InvalidPage)?)?;
@@ -400,7 +428,7 @@ fn read_group_at<E>(
     if next()?.is_some() {
         return Err(CatalogError::InvalidPage.into());
     }
-    Ok(entry)
+    Ok((entry, work))
 }
 
 /// Exactly one decoded, replayed group and its original bounded signed witness.

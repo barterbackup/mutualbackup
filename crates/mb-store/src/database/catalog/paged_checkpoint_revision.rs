@@ -63,7 +63,7 @@ fn dependency(catalog: &PagedCatalogSnapshot) -> Result<Dependency, CatalogStore
     })
 }
 
-pub(super) fn admitted_work(
+pub(super) fn owned_work(
     connection: &Connection,
     retention: CatalogPagedCheckpointRetention,
 ) -> Result<Option<Work>, CatalogStoreError> {
@@ -72,16 +72,14 @@ pub(super) fn admitted_work(
         .as_ref()
         .map(|bytes| decode_canonical(bytes))
         .transpose()?;
-    if let Some(work) = work {
-        if canonical_bytes(&work)? != *stored.as_ref().ok_or(DatabaseError::Integrity)?
+    if let Some(work) = work
+        && (canonical_bytes(&work)? != *stored.as_ref().ok_or(DatabaseError::Integrity)?
             || work.records % 3 != 0
             || work.records / 3 > retention.checkpoint.authority_root.summary.revisions
             || (work.records == 0) != (work.bytes == 0)
-            || (work.records == 0) != (work.page_occurrences == 0)
-        {
-            return Err(DatabaseError::Integrity.into());
-        }
-        check_work(retention, work)?;
+            || (work.records == 0) != (work.page_occurrences == 0))
+    {
+        return Err(DatabaseError::Integrity.into());
     }
     if has_dependencies(connection, retention.id)? != work.is_some_and(|work| work.records != 0) {
         return Err(DatabaseError::Integrity.into());
@@ -89,7 +87,17 @@ pub(super) fn admitted_work(
     Ok(work)
 }
 
+pub(super) fn admitted_work(
+    connection: &Connection,
+    retention: CatalogPagedCheckpointRetention,
+) -> Result<Option<Work>, CatalogStoreError> {
+    let work = owned_work(connection, retention)?;
+    check_work(connection, retention, work.unwrap_or_default())?;
+    Ok(work)
+}
+
 fn check_work(
+    connection: &Connection,
     retention: CatalogPagedCheckpointRetention,
     work: Work,
 ) -> Result<(), CatalogStoreError> {
@@ -97,7 +105,10 @@ fn check_work(
         retention
             .proof_work
             .checked_add(retention.checkpoint.represented_work()?)?
-            .checked_add(work)?,
+            .checked_add(work)?
+            .checked_add(
+                paged_checkpoint_payload::owned_work(connection, retention)?.unwrap_or_default(),
+            )?,
     )?;
     Ok(())
 }
@@ -312,7 +323,7 @@ impl ControlStore {
                 .unwrap_or_default()
                 .checked_add(expected.work)
                 .map_err(CatalogStoreError::from)?;
-            check_work(retention, next)?;
+            check_work(&tx, retention, next)?;
             insert_exact(&tx, &revisions(id), catalog.bundle.id.as_bytes(), &bytes)?;
             insert_exact(&tx, &owners(catalog.bundle.id), id.as_bytes(), &bytes)?;
             change_work(&tx, retention, previous_work, next)?;
