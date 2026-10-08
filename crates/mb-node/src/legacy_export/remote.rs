@@ -266,7 +266,8 @@ impl PreservedParentCheck {
                 PreservedInput::NativeRoot(root) => self.check_native(root),
                 PreservedInput::RecordedNativeRoot(root) => self.check_recorded_native(root),
             })
-        })
+        })?;
+        crate::volume::for_each_preserved_volume_path(control, |path| self.check_hint(path))
     }
 
     fn pin(self) -> Result<mb_store::PinnedDirectory> {
@@ -967,6 +968,101 @@ async fn discover_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_volume_placement_excludes_unselected_registry_paths_without_mutation() {
+        use std::collections::BTreeMap;
+        use std::os::unix::ffi::OsStringExt;
+
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, (u64, Option<blake3::Hash>)> {
+            let mut pending = vec![root.to_path_buf()];
+            let mut files = BTreeMap::new();
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(entry.path());
+                    } else {
+                        let bytes = std::fs::read(entry.path()).unwrap();
+                        // Only an existing live control SHM read mark can change.
+                        let hash =
+                            (entry.file_name() != "control.db-shm").then(|| blake3::hash(&bytes));
+                        files.insert(entry.path(), (bytes.len() as u64, hash));
+                    }
+                }
+            }
+            files
+        }
+
+        for journal_state in 0..3 {
+            let area = tempfile::tempdir().unwrap();
+            let state = area.path().join("state");
+            let volume = area
+                .path()
+                .join(std::ffi::OsString::from_vec(b"volume-\xff".to_vec()));
+            std::fs::create_dir(&volume).unwrap();
+            let seed = Seed::from_bytes([75; 32]);
+            let keys = KeyMaterial::from_seed(&seed);
+            let mut node = Node::open(&state, seed).unwrap();
+            node.database_shell_statement(None, "PRAGMA wal_autocheckpoint=0", true)
+                .unwrap();
+            node.database_shell_statement(None, "PRAGMA wal_checkpoint(TRUNCATE)", true)
+                .unwrap();
+            // The registry is deliberately committed only to WAL in live/copy cases.
+            node.configure_storage_volumes(std::slice::from_ref(&volume), 65536, 0)
+                .unwrap();
+            assert!(state.join("control.db-wal").metadata().unwrap().len() > 32);
+            let state = if journal_state == 1 {
+                let copy = area.path().join("preserved");
+                std::fs::create_dir(&copy).unwrap();
+                for entry in std::fs::read_dir(&state).unwrap() {
+                    let entry = entry.unwrap();
+                    assert!(entry.file_type().unwrap().is_file());
+                    if entry.file_name() != "control.db-shm" {
+                        std::fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+                    }
+                }
+                copy
+            } else {
+                state
+            };
+            let _writer = if journal_state == 2 {
+                Some(node)
+            } else {
+                drop(node);
+                None
+            };
+            let nested = volume.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(volume.join("original"), b"retained volume payload").unwrap();
+            let alias = area.path().join("alias");
+            std::os::unix::fs::symlink(&volume, &alias).unwrap();
+            let safe = area.path().join("safe");
+            std::fs::create_dir(&safe).unwrap();
+            let before = (snapshot(&state), snapshot(&volume));
+            for parent in [&volume, &nested, &alias, &alias.join("nested")] {
+                let error = peer_client_preflight(&keys, &state, parent, &[], false).unwrap_err();
+                assert!(
+                    error.to_string().contains("outside preserved inputs"),
+                    "{error:#}"
+                );
+                let error = export_parent_preflight(&keys, &state, parent, &[])
+                    .err()
+                    .unwrap();
+                assert!(
+                    error.to_string().contains("outside preserved inputs"),
+                    "{error:#}"
+                );
+            }
+            assert_eq!(
+                peer_client_preflight(&keys, &state, &safe, &[], false).unwrap(),
+                (safe.clone(), None)
+            );
+            assert!(export_parent_preflight(&keys, &state, &safe, &[]).is_ok());
+            assert_eq!((snapshot(&state), snapshot(&volume)), before);
+            assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+        }
+    }
 
     #[test]
     fn legacy_export_peer_scratch_rejects_preserved_inputs_before_creation() {

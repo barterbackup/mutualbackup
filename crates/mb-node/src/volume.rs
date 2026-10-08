@@ -23,6 +23,10 @@ const VOLUME_MANIFEST_FILE: &str = ".mutualbackup-volume";
 const CONTROL_KEY_FILE: &str = "control.key";
 const MAX_LOCAL_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_VOLUME_RECEIPT_BYTES: usize = 512;
+#[cfg(target_os = "linux")]
+const MAX_BOUNDED_VOLUME_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_BOUNDED_VOLUME_RECORDS: usize = 1023;
 const DATABASE_PAGE_BYTES: u64 = 4096;
 const PHYSICAL_WRITE_FIXED_RESERVE: u64 = 64 * 1024;
 
@@ -254,6 +258,7 @@ struct VolumeRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 struct VolumeRecordBeforeConfiguredState {
     format_version: u16,
     volume_id: Uuid,
@@ -3227,14 +3232,7 @@ pub(crate) fn paged_scratch_store(
         let device = mb_store::physical_allocation_domain(directory)?;
         let mut limits = mb_store::ScratchStorageLimits::for_database(max_database_bytes)?;
         let mut checkpoints = vec![control.path().to_path_buf()];
-        let records = control
-            .get_record_bounded("node-config", b"storage-volumes", 4 * 1024 * 1024)?
-            .map(|bytes| decode_volume_records(&bytes))
-            .transpose()?
-            .unwrap_or_default();
-        if records.len() > 1023 {
-            bail!("too many volumes for bounded scratch admission");
-        }
+        let records = load_bounded_volume_records(control)?;
         for record in records {
             validate_volume_record(&record)?;
             match fs::metadata(&record.path) {
@@ -3272,6 +3270,60 @@ fn decode_volume_records(bytes: &[u8]) -> Result<Vec<VolumeRecord>> {
                 .map(|records| records.into_iter().map(Into::into).collect())
         })
         .map_err(Into::into)
+}
+
+#[cfg(target_os = "linux")]
+fn load_bounded_volume_records(control: &ControlStore) -> Result<Vec<VolumeRecord>> {
+    let records = control
+        .get_record_bounded(
+            "node-config",
+            b"storage-volumes",
+            MAX_BOUNDED_VOLUME_REGISTRY_BYTES,
+        )?
+        .map(|bytes| decode_volume_records(&bytes))
+        .transpose()?
+        .unwrap_or_default();
+    if records.len() > MAX_BOUNDED_VOLUME_RECORDS {
+        bail!("too many volumes for bounded registry inspection");
+    }
+    Ok(records)
+}
+
+/// Exclude every saved volume location without opening its manifest or payload.
+/// Retired/unconfigured volumes can still hold retained or interrupted data.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_volume_path(
+    control: &ControlStore,
+    mut visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let records = load_bounded_volume_records(control)?;
+    let mut ids = BTreeSet::new();
+    for record in &records {
+        validate_volume_record(record)?;
+        if !ids.insert(record.volume_id) {
+            bail!("duplicate preserved parity volume UUID");
+        }
+        let mut database_path = Path::new(&record.database_file).components();
+        if !record.path.is_absolute()
+            || record.path.as_os_str().as_bytes().contains(&0)
+            || record.database_file.len() > 128
+            || record.database_file.as_bytes().contains(&0)
+            || record.database_file == VOLUME_MANIFEST_FILE
+            || !matches!(database_path.next(), Some(Component::Normal(_)))
+            || database_path.next().is_some()
+        {
+            bail!(
+                "preserved parity volume registry has an unresolved path; preserve the registry and use a separate complete snapshot with verified volume locations"
+            );
+        }
+    }
+    for record in records {
+        visit(&record.path)?;
+    }
+    Ok(())
 }
 
 fn load_volume_records(control: &ControlStore) -> Result<Vec<VolumeRecord>> {
@@ -3497,6 +3549,250 @@ mod tests {
     use super::*;
     use mb_core::{Seed, V1_SECTOR_SIZE, sector_root};
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    fn preserved_registry_record(path: PathBuf, number: u128) -> VolumeRecord {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([81; 32]));
+        let volume_id = Uuid::from_u128(number);
+        VolumeRecord {
+            format_version: 1,
+            volume_id,
+            path,
+            database_file: "parity.db".to_owned(),
+            wrapped_database_key: keys
+                .wrap_database_key(&volume_database_id(volume_id), &[82; 32])
+                .unwrap(),
+            state: StorageVolumeState::Online,
+            budget_bytes: 65536,
+            headroom_bytes: 0,
+            last_error: None,
+            configured: true,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_volume_paths_cover_all_states_and_historical_raw_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let area = TempDir::new().unwrap();
+        let database = area.path().join("control.db");
+        let writer = ControlStore::open_with_key(&database, &[83; 32]).unwrap();
+        let records = [
+            StorageVolumeState::Online,
+            StorageVolumeState::Offline,
+            StorageVolumeState::Draining,
+            StorageVolumeState::Retired,
+            StorageVolumeState::Failed,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, state)| {
+            let path = area.path().join(std::ffi::OsString::from_vec(vec![
+                b'v',
+                index as u8 + b'0',
+                0xff,
+            ]));
+            let mut record = preserved_registry_record(path, index as u128 + 1);
+            record.state = state;
+            record.configured = index % 2 == 0;
+            record
+        })
+        .collect::<Vec<_>>();
+        let historical = records
+            .iter()
+            .map(|record| VolumeRecordBeforeConfiguredState {
+                format_version: record.format_version,
+                volume_id: record.volume_id,
+                path: record.path.clone(),
+                database_file: record.database_file.clone(),
+                wrapped_database_key: record.wrapped_database_key.clone(),
+                state: record.state,
+                budget_bytes: record.budget_bytes,
+                headroom_bytes: record.headroom_bytes,
+                last_error: record.last_error.clone(),
+            })
+            .collect::<Vec<_>>();
+        for encoded in [
+            canonical_bytes(&records).unwrap(),
+            canonical_bytes(&historical).unwrap(),
+        ] {
+            writer
+                .put_record("node-config", b"storage-volumes", &encoded)
+                .unwrap();
+            let original = fs::read(&database).unwrap();
+            let wal = fs::read(database.with_extension("db-wal")).unwrap();
+            let names = || {
+                fs::read_dir(area.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<BTreeSet<_>>()
+            };
+            let before = names();
+            let mut paths = Vec::new();
+            ControlStore::with_preserved_read_only_snapshot(&database, &[[83; 32]], |control| {
+                for_each_preserved_volume_path(control, |path| {
+                    paths.push(path.to_path_buf());
+                    Ok(())
+                })
+            })
+            .unwrap();
+            assert_eq!(
+                paths,
+                records
+                    .iter()
+                    .map(|record| record.path.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert!(paths.iter().all(|path| !path.exists()));
+            assert_eq!(names(), before);
+            assert_eq!(fs::read(&database).unwrap(), original);
+            assert_eq!(fs::read(database.with_extension("db-wal")).unwrap(), wal);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_volume_paths_reject_invalid_or_ambiguous_registry_without_visiting() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let area = TempDir::new().unwrap();
+        let control =
+            ControlStore::open_with_key(area.path().join("control.db"), &[84; 32]).unwrap();
+        let record = preserved_registry_record(area.path().join("absent-volume"), 1);
+        let mut invalid = Vec::new();
+        for path in [
+            PathBuf::new(),
+            PathBuf::from("relative"),
+            area.path()
+                .join(std::ffi::OsString::from_vec(b"volume\0".to_vec())),
+        ] {
+            let mut changed = record.clone();
+            changed.volume_id = Uuid::from_u128(2);
+            changed.path = path;
+            invalid.push(vec![record.clone(), changed]);
+        }
+        for name in [
+            ".",
+            "..",
+            "/",
+            "../parity.db",
+            ".mutualbackup-volume",
+            "parity\0.db",
+        ] {
+            let mut changed = record.clone();
+            changed.volume_id = Uuid::from_u128(2);
+            changed.database_file = name.to_owned();
+            invalid.push(vec![record.clone(), changed]);
+        }
+        for (format, id, budget, headroom) in [
+            (2, Uuid::from_u128(2), 65536, 0),
+            (1, Uuid::nil(), 65536, 0),
+            (1, Uuid::from_u128(2), 0, 0),
+            (1, Uuid::from_u128(2), 65536, 65536),
+        ] {
+            let mut changed = record.clone();
+            changed.format_version = format;
+            changed.volume_id = id;
+            changed.budget_bytes = budget;
+            changed.headroom_bytes = headroom;
+            invalid.push(vec![record.clone(), changed]);
+        }
+        invalid.push(vec![record.clone(), record]);
+        for records in invalid {
+            store_volume_records(&control, &records).unwrap();
+            let mut visits = 0;
+            assert!(
+                for_each_preserved_volume_path(&control, |_| {
+                    visits += 1;
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert_eq!(
+                visits, 0,
+                "validate the full bounded registry before using its locations"
+            );
+        }
+        control
+            .put_record("node-config", b"storage-volumes", b"damaged registry")
+            .unwrap();
+        assert!(
+            for_each_preserved_volume_path(&control, |_| panic!("damaged registry visited"))
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_volume_paths_share_scratch_registry_size_and_count_bounds() {
+        let area = TempDir::new().unwrap();
+        let control =
+            ControlStore::open_with_key(area.path().join("control.db"), &[85; 32]).unwrap();
+        let record = preserved_registry_record(area.path().join("absent-volume"), 1);
+        let mut records = (1..=MAX_BOUNDED_VOLUME_RECORDS)
+            .map(|number| {
+                let mut next = record.clone();
+                next.volume_id = Uuid::from_u128(number as u128);
+                next
+            })
+            .collect::<Vec<_>>();
+        store_volume_records(&control, &records).unwrap();
+        let mut visits = 0;
+        for_each_preserved_volume_path(&control, |_| {
+            visits += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visits, MAX_BOUNDED_VOLUME_RECORDS);
+        records.push(record.clone());
+        store_volume_records(&control, &records).unwrap();
+        assert!(
+            for_each_preserved_volume_path(&control, |_| panic!("oversized registry visited"))
+                .unwrap_err()
+                .to_string()
+                .contains("too many volumes")
+        );
+        assert!(
+            paged_scratch_store(&control, 64 * 1024 * 1024)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("too many volumes")
+        );
+
+        let mut boundary = record;
+        boundary.last_error = Some("x".repeat(MAX_BOUNDED_VOLUME_REGISTRY_BYTES));
+        loop {
+            let length = canonical_bytes(&vec![boundary.clone()]).unwrap().len();
+            if length == MAX_BOUNDED_VOLUME_REGISTRY_BYTES {
+                break;
+            }
+            let error = boundary.last_error.as_mut().unwrap();
+            error.truncate(error.len() - (length - MAX_BOUNDED_VOLUME_REGISTRY_BYTES));
+        }
+        store_volume_records(&control, &[boundary]).unwrap();
+        for_each_preserved_volume_path(&control, |_| Ok(())).unwrap();
+        control
+            .put_record(
+                "node-config",
+                b"storage-volumes",
+                &vec![0; MAX_BOUNDED_VOLUME_REGISTRY_BYTES + 1],
+            )
+            .unwrap();
+        for error in [
+            for_each_preserved_volume_path(&control, |_| panic!("oversized blob visited"))
+                .unwrap_err(),
+            paged_scratch_store(&control, 64 * 1024 * 1024)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                error.downcast_ref::<DatabaseError>(),
+                Some(DatabaseError::Integrity)
+            ));
+        }
+    }
 
     #[test]
     fn preserved_parity_volume_reads_wrapped_legacy_and_interrupted_keys_without_mutation() {

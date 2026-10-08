@@ -201,6 +201,29 @@ placement; relative historical hints do not inherit the current process cwd.
 These hints are not verified area ownership or evidence of complete relocation
 discovery.
 
+Peer-client and export placement also inspect the saved storage-volume registry,
+including volumes not selected for recovery and retired or unconfigured entries.
+Current and historical pre-configured-state records preserve raw path bytes. The
+reader shares paged scratch admission's existing 4 MiB/1,023-record bounds and
+validates the complete bounded registry before using locations. Invalid or
+relative paths, escaping database names and duplicate volume IDs reject before
+client/output creation. It opens no volume manifests or payloads and publishes
+no key, registry, receipt or recovery state. Registered volume descendants and
+symlink aliases are excluded; missing absolute hints remain unavailable locations,
+not evidence of relocated ownership. Saved-volume placement qualification passes 159 unique cases: 39 export/peer
+cases, all 61 ordinary volume cases, all 32 ordinary paged cases, 20 CLI
+process cases, retained-graph/discovery/withdrawal/graph-intent regressions,
+and two provisioned Btrfs identity/retained-capture cases. All four debug
+programs build; format and strict locked workspace/all-targets Clippy pass.
+All 284 source-file and six program/test-driver hashes remain unchanged, and
+native mount/loop/image cleanup is verified. Evidence and the distinct
+passing-case inventory are retained under
+`/tmp/mb-m6-volume-placement-validation-kowi9nmv`; the post-commit audit binds
+the code to the commit. This is a focused debug-source qualification; complete
+ordinary/native suites and installed artifacts were not rerun. Full receipt/recipe/pin/intent reconciliation, renamed volume discovery,
+mount-descendant aliases and atomic path/ownership handoff remain open. The
+inventory report does not yet enumerate volume owners or assert completeness.
+
 Native root plan format 1 predates stable filesystem IDs, and its wire layout did
 not change when the filesystem word changed from `st_dev` to a stable identity.
 A newer intent envelope may contain a migrated old plan. Its recorded root/area

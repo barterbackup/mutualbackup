@@ -724,6 +724,32 @@ remain active.
     Raw `lock_data_dir` and manual daemon locking/socket setup still precede
     keyed admission. Atomic writer/path/ownership handoff, installed
     artifacts, other platforms and the full R1/R2/R3/release gates remain open.
+  - [x] Exclude saved, unselected parity volumes from peer-client and export
+    placement. Read the existing volume registry without opening manifests or
+    payloads; current and pre-configured-state layouts retain every online,
+    offline, draining, retired, failed and unconfigured location. Share paged
+    scratch admission's existing 4 MiB/1,023-record bounds. Validate the complete
+    bounded registry before visiting locations; invalid/relative/NUL paths,
+    escaping database names and duplicate IDs fail before client/output creation.
+    A real Node volume fixture covers closed, WAL-only and live control catalogs,
+    raw paths, unselected volume descendants and symlink aliases, safe siblings
+    and unchanged original control/key/volume bytes and file sets. Boundary
+    fixtures cover original historical layouts and exact/over size/count limits.
+    Saved-volume placement qualification passes 159 unique cases: 39 export/peer
+    cases, all 61 ordinary volume cases, all 32 ordinary paged cases, 20 CLI
+    process cases, retained-graph/discovery/withdrawal/graph-intent
+    regressions, and two provisioned Btrfs identity/retained-capture cases.
+    All four debug programs build; format and strict locked
+    workspace/all-targets Clippy pass. All 284 source-file and six
+    program/test-driver hashes remain unchanged, and native mount/loop/image
+    cleanup is verified. Evidence and the distinct passing-case inventory are
+    retained under `/tmp/mb-m6-volume-placement-validation-kowi9nmv`; the
+    post-commit audit binds the code to the commit. This is a focused
+    debug-source qualification; complete ordinary/native suites and installed
+    artifacts were not rerun. This does not
+    complete volume receipt/recipe/pin/intent ownership inventory, relocated
+    volume discovery, mount-descendant aliases, atomic path/ownership handoff,
+    installed-artifact qualification or the full R1/R2/R3/release gates.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent
