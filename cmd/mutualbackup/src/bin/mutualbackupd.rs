@@ -38,18 +38,26 @@ async fn main() -> Result<()> {
             "ignoring configured failure domain while recovering authenticated guild state"
         );
     }
-    let locked_data_dir = Node::lock_data_dir(&config.data_dir)?;
+    let automatic_seed = config
+        .seed_file
+        .as_ref()
+        .map(|path| read_seed(path).context("automatic recovery-string unlock failed"))
+        .transpose()?;
+    let locked_data_dir = match automatic_seed.as_ref() {
+        Some(seed) => {
+            require_seed_identity(&identity, seed)?;
+            Node::lock_data_dir_with_seed(&config.data_dir, seed)?
+        }
+        None => Node::lock_data_dir(&config.data_dir)?,
+    };
     let listener = bind_local_control(&config.control_socket)?;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let (node, p2p_client, mut p2p_task, startup, tor_shutdown) = match &config.seed_file {
-        Some(seed_file) => {
-            let seed_file = seed_file.clone();
+    let (node, p2p_client, mut p2p_task, startup, tor_shutdown) = match automatic_seed {
+        Some(seed) => {
             let open_config = config.clone();
             let open_identity = identity.clone();
             let mut open_task = tokio::task::spawn_blocking(move || {
-                let seed =
-                    read_seed(&seed_file).context("automatic recovery-string unlock failed")?;
                 open_configured_node(&open_config, &open_identity, locked_data_dir, seed)
             });
             let node = tokio::select! {
@@ -545,19 +553,24 @@ async fn start_node_runtime(
     Ok((node, p2p_client, p2p_event_loop, tor_shutdown))
 }
 
-fn open_configured_node(
-    config: &DaemonOptions,
-    identity: &IdentityManifest,
-    locked_data_dir: LockedDataDir,
-    seed: mb_core::Seed,
-) -> Result<Node> {
-    let actual = mb_core::KeyMaterial::from_seed(&seed).node_id();
+fn require_seed_identity(identity: &IdentityManifest, seed: &mb_core::Seed) -> Result<()> {
+    let actual = mb_core::KeyMaterial::from_seed(seed).node_id();
     if actual != identity.expected_node_id {
         anyhow::bail!(
             "recovery string derives node {actual}, expected {}",
             identity.expected_node_id
         );
     }
+    Ok(())
+}
+
+fn open_configured_node(
+    config: &DaemonOptions,
+    identity: &IdentityManifest,
+    locked_data_dir: LockedDataDir,
+    seed: mb_core::Seed,
+) -> Result<Node> {
+    require_seed_identity(identity, &seed)?;
     let mut node = Node::open_locked(locked_data_dir, seed)?;
     if identity.intent == InitializationIntent::New {
         node.configure_failure_domain(&config.effective_failure_domain(identity))?;

@@ -117,6 +117,77 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn startup_rejection_precedes_directory_permissions_and_lock_file_creation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for format in 0..3 {
+            for journal_state in 0..3 {
+                let area = tempfile::tempdir().unwrap();
+                let data = area.path().join("original");
+                fs::create_dir(&data).unwrap();
+                let seed = Seed::from_bytes([90; 32]);
+                let keys = KeyMaterial::from_seed(&seed);
+                let control = control_with_key_format(&data, &keys, format);
+                control
+                    .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                    .unwrap();
+                control
+                    .put_record("guarded-view-mount-v1", b"id", b"preserved")
+                    .unwrap();
+                let data = if journal_state == 1 {
+                    let copy = area.path().join("preserved");
+                    fs::create_dir(&copy).unwrap();
+                    for name in ["control.db", "control.db-wal", "control.key"] {
+                        if data.join(name).exists() {
+                            fs::copy(data.join(name), copy.join(name)).unwrap();
+                        }
+                    }
+                    copy
+                } else {
+                    data
+                };
+                let _writer = if journal_state == 2 {
+                    Some(control)
+                } else {
+                    drop(control);
+                    None
+                };
+                fs::set_permissions(&data, fs::Permissions::from_mode(0o750)).unwrap();
+                let directory_version = || {
+                    let metadata = fs::metadata(&data).unwrap();
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.mode(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    )
+                };
+                let before = directory_bytes(&data);
+                let before_directory = directory_version();
+                let error = Node::open(&data, seed).err().unwrap();
+                assert!(format!("{error:#}").contains(WITHDRAWN_GUARDED_BACKEND));
+                assert_eq!(directory_version(), before_directory);
+                let after = directory_bytes(&data);
+                assert_eq!(
+                    before.keys().collect::<Vec<_>>(),
+                    after.keys().collect::<Vec<_>>()
+                );
+                for (name, bytes) in before {
+                    if name == "control.db-shm" {
+                        assert_eq!(bytes.0, after[&name].0);
+                    } else {
+                        assert_eq!(bytes, after[&name], "{name:?}");
+                    }
+                }
+                assert!(!data.join(".node.lock").exists());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn startup_admission_does_not_create_a_missing_installation() {
         let area = tempfile::tempdir().unwrap();
         let data = area.path().join("absent/node");

@@ -275,8 +275,26 @@ audit binds the qualified code to its commit. Eleven Node, 26 store and two CLI
 process fixtures remain unexecuted. This qualifies the exercised debug source;
 installed artifacts and the full M6 gates remain open.
 
-The Node data-directory lock and permission adjustment still precede catalog
-admission; this does not yet establish rejection before every filesystem mutation.
+Linux library `Node::open` now inspects the preserved catalog before creating
+or changing the data directory or lock file. `open_locked` repeats admission
+after acquiring the lock. Nine key/journal combinations verify unchanged
+directory identity, mode and timestamps, original catalog/key/journal file sets
+and bytes, and no new `.node.lock` file. Automatic daemon unlock reads and
+verifies its configured seed before this preflight and lock/socket setup. A
+real-process regression covers closed/WAL-only/live-WAL catalogs and wrong
+identities, with no new lock or socket. Early Node admission qualification passes 38 unique cases (12 source-policy, 1
+single-data-owner, 1 discovery-maintenance, 20 ordinary-process, plus four
+provisioned native Git/backend/capture reopen cases). All four debug programs
+build; format and strict locked workspace/all-targets Clippy pass. All 284
+source files and six program/test-driver hashes remain unchanged, and native
+mount/loop/image cleanup is verified. Evidence and the distinct passing-case
+inventory are retained under `/tmp/mb-m6-early-admission-validation-u30_afvh`;
+the post-commit audit binds the code to the commit. This is a focused
+debug-source qualification; complete ordinary/native suites and installed
+artifacts were not rerun.
+Raw `lock_data_dir` and manual daemon lock/socket setup still precede
+keyed admission; atomic writer/path/ownership handoff and rejection before every
+filesystem mutation remain open.
 The private WAL index uses memory proportional to its frame count; common R2/R3
 metadata/resource budgets remain open.
 

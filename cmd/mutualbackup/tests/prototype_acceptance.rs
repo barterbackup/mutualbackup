@@ -421,6 +421,132 @@ fn init_rejection_does_not_mutate_an_existing_directory() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_unlock_rejects_withdrawn_catalog_before_lock_or_socket_mutation() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::MetadataExt;
+
+    for journal_state in 0..3 {
+        let temp = tempfile::tempdir().unwrap();
+        set_private(temp.path());
+        let data = temp.path().join("state");
+        let seed_file = temp.path().join("node.seed");
+        let recovery = "correct-horse-battery-staple-2026!";
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--data-dir"),
+                os(&data),
+                os("--seed-file"),
+                os(&seed_file),
+            ],
+            recovery.as_bytes(),
+            CLI_TIMEOUT,
+        )
+        .unwrap();
+        let seed = Seed::from_recovery_string(recovery).unwrap();
+        let keys = KeyMaterial::from_seed(&seed);
+        let control = mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap();
+        control
+            .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+            .unwrap();
+        control
+            .put_record("guarded-view-mount-v1", b"legacy", b"preserve")
+            .unwrap();
+        let data = if journal_state == 1 {
+            let copy = temp.path().join("preserved");
+            fs::create_dir(&copy).unwrap();
+            for entry in fs::read_dir(&data).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name() != "control.db-shm" {
+                    fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+                }
+            }
+            copy
+        } else {
+            data
+        };
+        let _writer = if journal_state == 2 {
+            Some(control)
+        } else {
+            drop(control);
+            None
+        };
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o750)).unwrap();
+        let wrong_seed_file = temp.path().join("wrong.seed");
+        mutualbackup::write_seed(
+            &wrong_seed_file,
+            "another-long-recovery-string-for-testing-2027!",
+        )
+        .unwrap();
+        let snapshot = || {
+            let metadata = fs::metadata(&data).unwrap();
+            let version = (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            );
+            let files = fs::read_dir(&data)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<BTreeMap<_, _>>();
+            (version, files)
+        };
+        for (selected_seed, expected_error) in [
+            (&seed_file, mb_store::WITHDRAWN_GUARDED_BACKEND),
+            (&wrong_seed_file, "expected"),
+        ] {
+            let before = snapshot();
+            let output = run_output(
+                program("mutualbackupd"),
+                &[
+                    os("--data-dir"),
+                    os(&data),
+                    os("--seed-file"),
+                    os(selected_seed),
+                    os("--control-socket"),
+                    os(data.join("control.sock")),
+                    os("--failure-domain"),
+                    os("withdrawn-admission-test"),
+                    os("--listen"),
+                    os("/ip4/127.0.0.1/udp/0/quic-v1"),
+                    os("--tor-mode"),
+                    os("disable-tor"),
+                ],
+                CLI_TIMEOUT,
+            )
+            .unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(expected_error), "{stderr}");
+            let after = snapshot();
+            assert_eq!(before.0, after.0);
+            assert_eq!(
+                before.1.keys().collect::<Vec<_>>(),
+                after.1.keys().collect::<Vec<_>>()
+            );
+            for (name, bytes) in before.1 {
+                if name == "control.db-shm" {
+                    assert_eq!(bytes.len(), after.1[&name].len());
+                } else {
+                    assert_eq!(bytes, after.1[&name], "{name:?}");
+                }
+            }
+            assert!(!data.join(".node.lock").exists());
+            assert!(!data.join("control.sock").exists());
+        }
+    }
+}
+
 #[test]
 fn init_resumes_after_seed_install_without_replacing_outputs() {
     let temp = tempfile::tempdir().unwrap();

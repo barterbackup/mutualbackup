@@ -1234,8 +1234,27 @@ impl Node {
         })
     }
 
+    /// Lock with an available seed, checking preserved Linux state first.
+    /// `open_locked` repeats admission after the lock has been acquired.
+    pub fn lock_data_dir_with_seed(
+        data_dir: impl AsRef<Path>,
+        seed: &Seed,
+    ) -> Result<LockedDataDir> {
+        let data_dir = data_dir.as_ref();
+        // Inspect existing Linux state before directory/lock-file creation or
+        // permission changes. open_locked checks again after acquiring the lock.
+        #[cfg(target_os = "linux")]
+        crate::source_policy::require_native_source_state_from_catalog(
+            data_dir,
+            &KeyMaterial::from_seed(seed),
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = seed;
+        Self::lock_data_dir(data_dir)
+    }
+
     pub fn open(data_dir: impl AsRef<Path>, seed: Seed) -> Result<Self> {
-        let locked = Self::lock_data_dir(data_dir)?;
+        let locked = Self::lock_data_dir_with_seed(data_dir, &seed)?;
         Self::open_locked(locked, seed)
     }
 

@@ -649,8 +649,9 @@ remain active.
     `/tmp/mb-m6-admission-validation-m6aad954`; the post-commit audit binds the
     qualified code to the commit. Eleven Node, 26 store and two CLI process
     fixtures remain unexecuted. This qualifies debug source, not an installed
-    artifact or the full R1 gate. Data-directory lock creation and permission
-    adjustment still precede admission; other legacy/payload readers,
+    artifact or the full R1 gate. At this increment, data-directory lock creation
+    and permission adjustment preceded admission; library ordering is addressed
+    separately below. Other legacy/payload readers,
     full journal recovery, atomic admission-to-writer handoff, common WAL-index
     resource budgets and full R1/R2/R3/release gates remain open.
   - [x] Qualify non-creating Linux catalog export payload and preserved parity
@@ -699,6 +700,30 @@ remain active.
     were not rerun.
     Atomic writer/path/ownership handoff, common resource budgets, installed
     artifacts and the full R1/R2/R3/release gates remain open.
+  - [x] Reject withdrawn Linux library/automatic-daemon startup before mutation.
+    `Node::open` inspects existing catalogs before directory creation, chmod or
+    lock-file creation, then `open_locked` rechecks after acquiring the lock.
+    Nine legacy/wrapped/interrupted-rekey and closed/WAL-only/live-WAL
+    combinations verify unchanged directory identity, mode and timestamps,
+    catalog/key/journal file sets and bytes, and no new `.node.lock` file.
+    Automatic daemon unlock reads the configured seed and checks its identity
+    before the same preflight, lock and socket setup. A real-process regression
+    verifies closed/WAL-only/live-WAL catalogs and wrong identities leave the
+    directory and original files unchanged, with no new lock or socket.
+    Early Node admission qualification passes 38 unique cases (12 source-policy, 1
+    single-data-owner, 1 discovery-maintenance, 20 ordinary-process, plus four
+    provisioned native Git/backend/capture reopen cases). All four debug
+    programs build; format and strict locked workspace/all-targets Clippy
+    pass. All 284 source files and six program/test-driver hashes remain
+    unchanged, and native mount/loop/image cleanup is verified. Evidence and
+    the distinct passing-case inventory are retained under
+    `/tmp/mb-m6-early-admission-validation-u30_afvh`; the post-commit audit
+    binds the code to the commit. This is a focused debug-source
+    qualification; complete ordinary/native suites and installed artifacts
+    were not rerun.
+    Raw `lock_data_dir` and manual daemon locking/socket setup still precede
+    keyed admission. Atomic writer/path/ownership handoff, installed
+    artifacts, other platforms and the full R1/R2/R3/release gates remain open.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent
