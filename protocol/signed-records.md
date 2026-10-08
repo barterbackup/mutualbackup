@@ -92,6 +92,30 @@ one-root cleanup preserve independent capture/checkpoint pins. This journal is
 local storage ownership; source payload/native-anchor ownership, current
 certificate guards and the protocol authorization joins above remain required.
 
+`CatalogCodingRoot` format one orders `format_version`, `guild_event_sequence`,
+`parts`, `summary`. At most four existing public guild Coding record trees share
+64 GiB represented bytes (including the fixed descriptor), one million page
+occurrences and 64 million records. The root is bounded to 512 bytes; its
+summary orders `groups`, `retired_groups`, `information_roles`, `parity_roles`,
+`transcript_bytes`, `fragments`. Global group-ID order continues across parts,
+and each group remains entirely within one part. Empty forests have no parts.
+The enclosing checkpoint must charge all sections under its combined policy.
+
+Coding record variants are append-only: Header (zero) orders `format_version`,
+`lifecycle`, `transcript_hash`, `transcript_bytes`; Transcript (one) orders
+`offset`, `bytes`. Lifecycle orders the original `group_id`, `added_at_event`,
+`retired_at_event`, `retain_through_event`. The header binds the existing plain
+BLAKE3 hash of original signed canonical transcript bytes. Exact contiguous
+16 KiB fragments carry that unchanged witness, bounded to 600 KiB in total.
+Group roles come from its original signed manifest. All nested signatures are
+bounded to 64 bytes before allocation; existing role/evidence geometry bounds,
+complete typed/raw EOF, exact counters and Verified transcript replay apply.
+`coding-evidence-v1.postcard.hex` freezes a 179-byte four-part directory;
+`coding-transcripts-v1.postcard.hex` preserves its four original signed compact
+transcripts. Current delegation, membership, source coverage and retained
+lifecycle joins, fixed legacy-group migration and the enclosing certificate
+remain required before activation. No peer publication version changes here.
+
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw
 Postcard or CBOR unless their extension says JSON.

@@ -2521,3 +2521,80 @@ guild-event authority, tombstones, globally unique revisions and evidence quorum
 and protect current checkpoint retention from retirement. Enclosing certificates,
 coding roots, normal capture/publication/retention/seed-only consumers, shared
 quotas and real retained 1 TiB/release/platform qualification remain open.
+
+### Fragmented original coding evidence (2026-10-08)
+
+`CatalogCodingBuilder`/`CatalogCodingReader` stream original signed variable
+coding transcripts through the public guild Coding section. A group header
+contains version one, its original group ID, added/retired/retain-through event
+positions, the unchanged BLAKE3 hash of its signed canonical transcript, and
+the transcript byte length. Exact contiguous fragments follow, bounded to
+16 KiB each. The complete original group descriptor already appears in its
+signed manifest, so the header does not duplicate its roles/domains. One decoded
+group and original witness are retained at a time, followed by existing full
+signature, commitment, challenge, receipt, opening and sampled-RS replay.
+Every replay result must be Verified. Signature validity or authenticated
+pages alone cannot authorize the group or its lifecycle.
+
+Each signed transcript is bounded to 600 KiB, covering the original peer-bounded
+evidence, including full-byte compatibility witnesses. New bounded decoders
+limit every outer/nested signature to 64 bytes, receipts/openings and role
+collections to 64, domains to 256 bytes and sampled openings to their existing
+one-leaf geometry before allocation. Existing legacy decoders and original
+signed layouts/identities remain unchanged. Transcript replay retains its
+existing fixed per-object allocations; 600 KiB is the encoded-object ceiling,
+not a claim about peak replay memory.
+
+The root directory has at most four existing 16 GiB record trees, a 512-byte
+descriptor, exact group/retired/information/parity/witness/fragment counters,
+and a guild event sequence. Groups are globally unique and ordered by original
+ID across parts. A group cannot cross a part boundary. The directory shares a
+64 GiB represented-byte ceiling, including itself, and the existing aggregate
+one-million-page occurrence limit; records across parts share the 64-million
+record cap. Primitive byte-tree and peer-frame limits are unchanged. Empty
+forests carry no pages. Final summaries, every fragment offset/length, both
+typed/raw EOFs, canonical encodings and original witness hashes are mandatory.
+Builder/reader errors fence subsequent operations.
+
+The existing single-tree 16 GiB ceiling cannot contain the default dense coding
+evidence. A coding-only structural sizing fixture uses a real compact 3+2,
+64 KiB transcript with maximum 256-byte domains and integer-width charges,
+including worst-case sampled-leaf varints. For a dense 1 TiB information input,
+5,592,406 groups fit at 47,390,048,988 represented bytes and at most 777,414
+page occurrences. It counts frame, directory, stream and
+conservative leaf/index occurrence overhead. This does not admit an additional
+64 GiB independently of other checkpoint sections. Combined authority/packing/
+public/private-source admission, logical retained-data quotas and real 1 TiB
+memory/work/runtime qualification remain required before activation.
+
+`CatalogValidatedCoding::verify` requires complete replayed EOF and an external
+authorization callback for every group. The callback must join certified
+delegation/membership/domains, source/packing coverage and retained lifecycle
+authority using read-only state or a disposable job. Only the completed token
+can produce a local bundle binding precisely all parts in directory order.
+The existing atomic journal rechecks all intents and retains every byte-tree
+closure across reopen and shared owners. Cancelled parts cannot publish a
+prefix. Empty forests need no separate pin bundle and travel in the enclosing
+descriptor. Current authority must still be rechecked for protocol activation;
+this local token does not certify protection or own native/parity payloads.
+
+Nine core fixtures and two store fixtures cover all three original attempt
+versions, original signed bytes/group IDs, full-byte witnesses crossing pages,
+64 compact groups sharing one tree, four-part global order, malformed fragment
+offsets/lengths, incomplete/cross-part groups, corrupt tails, false coding
+evidence, rejected caller authorization, scope/lifecycle/counter limits, failure
+fencing, four-root atomic publication, sharing, reopen and cancelled-part
+rollback. A 179-byte directory vector and original four-transcript vector bind
+the new layout and old witness bytes. All 149 core and 174 ordinary store tests
+pass (26 store tests ignored), with strict locked workspace/all-targets Clippy
+and formatting/diff checks. These are codec and local ownership checks; the
+earlier full workspace/native qualification belongs to `b509ac4`, and no new
+network, provisioned native, release-artifact or retained 1 TiB runtime result
+is implied here.
+
+Fixed legacy `CodingGroup` records remain on their unchanged legacy certificate
+path; this codec preserves variable `CodingGroupV2` evidence and does not
+reinterpret fixed group IDs. Their migration, enclosing paged certificates,
+complete authority/source/coding joins, current checkpoint retirement guards,
+normal capture/coding/publication/retention/seed-only consumers, incremental
+work, combined quotas and real retained 1 TiB/release/platform gates remain open.

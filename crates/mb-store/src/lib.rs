@@ -44,16 +44,16 @@ pub use database::{
 pub use database::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedPackingIndex,
-    CatalogCheckpointRetention, CatalogCheckpointRetentionState, CatalogIntent, CatalogIntentState,
-    CatalogNativeValidation, CatalogNativeValidationState, CatalogPackingAuthority,
-    CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource, CatalogPackingIndex,
-    CatalogPackingPlacement, CatalogPackingValidation, CatalogPublicationView, CatalogSectorSource,
-    CatalogSourceSweep, CatalogStoreError, CatalogValidatedLink, CheckpointRow, ControlStore,
-    DatabaseError, DatabaseShellResult, KindedProtocolRecordRow, ObjectAttemptState,
-    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
-    PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore,
-    ProtocolRecordRow, ReadyVariableObject, RecordScratchStore, RecoveryShardLocator,
-    ScratchStorageLimits, VariableParityObject,
+    CatalogCheckpointRetention, CatalogCheckpointRetentionState, CatalogCodingValidation,
+    CatalogIntent, CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,
+    CatalogPackingAuthority, CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
+    CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingValidation, CatalogPublicationView,
+    CatalogSectorSource, CatalogSourceSweep, CatalogStoreError, CatalogValidatedCoding,
+    CatalogValidatedLink, CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult,
+    KindedProtocolRecordRow, ObjectAttemptState, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource,
+    PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject,
+    ParityScrubReport, ParityStore, ProtocolRecordRow, ReadyVariableObject, RecordScratchStore,
+    RecoveryShardLocator, ScratchStorageLimits, VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";

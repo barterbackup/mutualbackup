@@ -116,6 +116,26 @@ where
     })
 }
 
+pub(crate) fn signed_coding<'de, D, T>(decoder: D) -> Result<Vec<crate::SignedRecord<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(bound(deserialize = "T: Deserialize<'de>"))]
+    struct Bounded<T> {
+        #[serde(deserialize_with = "signed_record")]
+        signed: crate::SignedRecord<T>,
+    }
+    Ok(
+        VecSeed::<Bounded<T>>::new(crate::MAX_CODING_SHARDS as usize)
+            .deserialize(decoder)?
+            .into_iter()
+            .map(|value| value.signed)
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

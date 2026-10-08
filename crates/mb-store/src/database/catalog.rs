@@ -14,6 +14,7 @@ use super::{ControlStore, DatabaseError};
 
 mod bundle;
 mod checkpoint_retention;
+mod coding_validation;
 mod native_validation;
 mod packing_authority;
 mod packing_validation;
@@ -26,6 +27,7 @@ pub use bundle::{
     CatalogBundleState,
 };
 pub use checkpoint_retention::{CatalogCheckpointRetention, CatalogCheckpointRetentionState};
+pub use coding_validation::{CatalogCodingValidation, CatalogValidatedCoding};
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };

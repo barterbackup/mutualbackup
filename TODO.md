@@ -1471,10 +1471,30 @@ separately below.
     public metadata trees only; native anchors/bootstrap ciphertext, coding
     roots, current certified checkpoint ownership and normal consumers remain
     separate required joins and lifecycles. See ADR 0002.
-  - [ ] Complete the enclosing paged checkpoint certificate, coding codecs and
-    full authority joins, including current guild-event membership/writer
+  - [x] Stream original variable-coding transcripts in a bounded public forest.
+    Preserve original plan/manifest/group identities and signed witness bytes;
+    take group descriptors from their manifests instead of duplicating them.
+    Frame witnesses in 16 KiB fragments, keep each group within one part, order
+    groups globally and require complete replayed EOF. Four existing 16 GiB
+    trees share a 64 GiB forest ceiling and one-million-page budget; primitive
+    tree and peer-frame limits remain unchanged. Root/member/source/packing
+    admission must still be combined by the enclosing checkpoint. Nine focused
+    core tests and two store fixtures cover all three attempt versions, 64
+    groups sharing pages, full-byte witnesses, four-part order/EOF, malformed
+    fragments and nested signatures, false evidence, aggregate bounds, fixed
+    vectors, external authorization rejection and atomic local bundle ownership
+    across reopen/sharing/cancellation. A conservative dense default 1 TiB
+    coding-only shape fits at 5,592,406 groups, 47,390,048,988 represented bytes
+    and at most 777,414 page occurrences. All 149 core and 174 ordinary store
+    tests pass (26 store tests ignored), with strict locked workspace/all-targets
+    Clippy and formatting/diff checks. This does not migrate fixed
+    legacy groups or activate normal checkpoint/coding/recovery consumers.
+  - [ ] Complete the enclosing paged checkpoint certificate and full
+    authority/coding joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body
-    and source/bootstrap EOFs and migration-evidence quorum. Retain and retire
+    and source/bootstrap EOFs, migration-evidence quorum, exact current packed
+    input coverage, retained coding lifecycle authority and fixed legacy-group
+    migration without changing identities. Retain and retire
     remaining logical root references inside coding records and source/native
     payload owners through bounded durable ownership, and guard authority-root
     retirement with the certified current checkpoint.

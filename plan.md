@@ -1683,6 +1683,22 @@ strict locked workspace/all-targets Clippy and formatting/diff checks. Native
 anchors/bootstrap ciphertext, coding roots, current certified checkpoint guards,
 complete authority joins and normal consumers remain required before activation.
 
+Variable-coding evidence now streams original signed transcripts through bounded
+fragments in a public Coding forest. Group descriptors come from the original
+manifests, and globally ordered groups remain intact within each part. Four
+existing 16 GiB trees share a 64 GiB forest ceiling and one-million-page budget;
+the enclosing checkpoint must also admit authority/packing/private-source work
+under its combined policy. Complete replayed EOF and an external authorization
+callback precede exact local bundle binding; ordinary atomic publication,
+reopen, shared ownership and cancellation retain all forest parts. Nine focused
+core tests and two store fixtures pass. All 149 core and 174 ordinary store
+tests pass (26 store tests ignored), with strict locked workspace/all-targets
+Clippy and formatting/diff checks. Fixed layout/original witness vectors preserve the
+draft encoding. The conservative dense default 1 TiB coding-only metadata shape
+fits the forest. This is separate from real retained-data/runtime qualification.
+Fixed legacy coding groups, current delegation/source/lifecycle joins, the
+enclosing certificate and normal consumers remain required before activation.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to
