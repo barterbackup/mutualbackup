@@ -6,6 +6,12 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+mod authority;
+mod bounded_event;
+
+pub use authority::{GUILD_AUTHORITY_SNAPSHOT_BYTES, GuildAuthoritySnapshot};
+pub use bounded_event::{GUILD_EVENT_BYTES, LEGACY_CODING_ADD_BINDING_BYTES};
+
 use crate::keys::signing_payload;
 use crate::recovery::open_recovery_record_with_secret;
 use crate::{
@@ -85,6 +91,14 @@ pub struct RecoveryKeyEnvelope {
     pub epoch: u64,
     pub public_key: RecoveryPublicKey,
     pub sealed_private_key: SealedRecoveryRecord,
+}
+
+impl RecoveryKeyEnvelope {
+    /// Original envelope shape rules for indexed event replay. Opening the
+    /// private recovery key remains the recovering subject's responsibility.
+    pub fn validate_for_guild(&self, guild_id: [u8; 32]) -> Result<(), GuildStateError> {
+        validate_recovery_envelope(self, guild_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,7 +189,7 @@ pub struct GuildEvent {
 impl GuildEvent {
     pub fn hash(&self) -> Result<[u8; 32], GuildStateError> {
         let mut hasher = blake3::Hasher::new_derive_key("mutualbackup guild event v1");
-        hasher.update(&canonical_bytes(self)?);
+        crate::canonical::update_canonical_hash(&mut hasher, self)?;
         Ok(*hasher.finalize().as_bytes())
     }
 }
@@ -431,7 +445,7 @@ impl DynamicGuildState {
         let event = &certified.event;
         if !valid_event_format(event)
             || event.guild_id != self.guild_id
-            || event.sequence != self.event_sequence + 1
+            || Some(event.sequence) != self.event_sequence.checked_add(1)
             || event.parent != self.event_head
         {
             return Err(GuildStateError::InvalidEvent);
@@ -1031,6 +1045,314 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn bounded_authority_projection_replays_original_membership_and_indexed_effects() {
+        let keys = keys(6);
+        let mut full = state(&keys);
+        let mut projection = GuildAuthoritySnapshot::from_state(&full).unwrap();
+        for kind in [
+            GuildEventKind::AddMember {
+                member: member(&keys[5], "domain-5"),
+            },
+            GuildEventKind::RelabelMember {
+                node_id: keys[5].node_id(),
+                failure_domain: "domain-0".into(),
+            },
+            GuildEventKind::RemoveMember {
+                node_id: keys[5].node_id(),
+            },
+            GuildEventKind::SetQuorum {
+                policy: full.quorum,
+            },
+        ] {
+            let certified = certify(&full, kind, &keys[..5]);
+            projection
+                .advance(&certified, |_, _| panic!("membership callback"))
+                .unwrap();
+            full.apply_event(&certified).unwrap();
+            assert_eq!(
+                projection,
+                GuildAuthoritySnapshot::from_state(&full).unwrap()
+            );
+        }
+        let roster_bytes = canonical_bytes(&projection).unwrap().len();
+        for epoch in 1..=64 {
+            let certified = certify(
+                &full,
+                GuildEventKind::RotateWriterKey {
+                    owner: keys[0].node_id(),
+                    epoch,
+                    public_key: keys[0].node_id().0,
+                },
+                &keys[..5],
+            );
+            let bytes = canonical_bytes(&certified).unwrap();
+            assert_eq!(QuorumGuildEvent::decode_bounded(&bytes).unwrap(), certified);
+            projection
+                .advance(&certified, |before, event| {
+                    assert_eq!(before, &GuildAuthoritySnapshot::from_state(&full)?);
+                    assert_eq!(event, &certified.event);
+                    // The indexed implementation must perform these semantics;
+                    // this small fixture uses the legacy state as its oracle.
+                    full.apply_event(&certified)
+                })
+                .unwrap();
+            assert_eq!(
+                projection,
+                GuildAuthoritySnapshot::from_state(&full).unwrap()
+            );
+        }
+        assert_eq!(full.writer_keys.len(), 64);
+        assert_eq!(canonical_bytes(&projection).unwrap().len(), roster_bytes);
+        assert_eq!(
+            GuildAuthoritySnapshot::decode(&canonical_bytes(&projection).unwrap()).unwrap(),
+            projection
+        );
+        assert!(canonical_bytes(&full).unwrap().len() > roster_bytes * 3);
+    }
+
+    #[test]
+    fn bounded_authority_failures_do_not_advance_and_overflow_rejects() {
+        let keys = keys(6);
+        let full = state(&keys);
+        let mut snapshot = GuildAuthoritySnapshot::from_state(&full).unwrap();
+        let original = snapshot.clone();
+        let certified = certify(
+            &full,
+            GuildEventKind::RotateWriterKey {
+                owner: keys[0].node_id(),
+                epoch: 7,
+                public_key: keys[0].node_id().0,
+            },
+            &keys[..3],
+        );
+        snapshot.verify_event(&certified).unwrap();
+        assert!(
+            snapshot
+                .advance(&certified, |_, _| Err(GuildStateError::InvalidEvent))
+                .is_err()
+        );
+        assert_eq!(snapshot, original);
+        for mutate in [0, 1, 2, 3, 4] {
+            let mut damaged = certified.clone();
+            match mutate {
+                0 => damaged.event.parent = [9; 32],
+                1 => damaged.event.sequence += 1,
+                2 => damaged.event.format_version = 2,
+                3 => damaged.signatures[0].signature[0] ^= 1,
+                _ => damaged.signatures.reverse(),
+            }
+            assert!(
+                snapshot
+                    .advance(&damaged, |_, _| panic!("invalid certificate callback"))
+                    .is_err()
+            );
+            assert_eq!(snapshot, original);
+        }
+        // A quorum without the rotating subject cannot establish authority.
+        let no_subject = certify(&full, certified.event.kind.clone(), &keys[1..4]);
+        assert!(snapshot.verify_event(&no_subject).is_err());
+        snapshot.event_sequence = u64::MAX;
+        let mut wrapped = certified.clone();
+        wrapped.event.sequence = 0;
+        assert!(snapshot.verify_event(&wrapped).is_err());
+        snapshot = original;
+        snapshot.membership_epoch = u64::MAX;
+        let membership = certify(
+            &full,
+            GuildEventKind::SetQuorum {
+                policy: full.quorum,
+            },
+            &keys[..3],
+        );
+        let before = snapshot.clone();
+        assert!(
+            snapshot
+                .advance(&membership, |_, _| panic!("membership callback"))
+                .is_err()
+        );
+        assert_eq!(snapshot, before);
+    }
+
+    #[test]
+    fn bounded_event_decoders_preserve_every_original_variant_and_reject_nested_excess() {
+        let keys = keys(6);
+        let full = state(&keys);
+        let group = group(&full, &keys);
+        let (envelope, _) = create_recovery_key_envelope(&keys[0], full.guild_id, 1).unwrap();
+        let kinds = vec![
+            GuildEventKind::AddMember {
+                member: member(&keys[5], "domain-5"),
+            },
+            GuildEventKind::RemoveMember {
+                node_id: keys[0].node_id(),
+            },
+            GuildEventKind::RelabelMember {
+                node_id: keys[0].node_id(),
+                failure_domain: "domain".into(),
+            },
+            GuildEventKind::SetQuorum {
+                policy: full.quorum,
+            },
+            GuildEventKind::RotateWriterKey {
+                owner: keys[0].node_id(),
+                epoch: 1,
+                public_key: keys[0].node_id().0,
+            },
+            GuildEventKind::RevokeWriterKey {
+                owner: keys[0].node_id(),
+                epoch: 1,
+            },
+            GuildEventKind::RotateRecoveryKey {
+                envelope: envelope.clone(),
+            },
+            GuildEventKind::RevokeRecoveryKey {
+                subject: keys[0].node_id(),
+                epoch: 1,
+            },
+            GuildEventKind::AddCodingGroup {
+                group: group.clone(),
+            },
+            GuildEventKind::RetireCodingGroup {
+                group_id: group.id,
+                retain_through_event: 20,
+            },
+            GuildEventKind::ForgetCodingGroup { group_id: group.id },
+            GuildEventKind::AddCodingGroupBound {
+                group,
+                transcript_hash: [8; 32],
+            },
+        ];
+        for kind in kinds {
+            let mut certified = certify(&full, kind, &keys[..5]);
+            if matches!(
+                certified.event.kind,
+                GuildEventKind::AddCodingGroupBound { .. }
+            ) {
+                certified.event.format_version = 2;
+            }
+            let bytes = canonical_bytes(&certified).unwrap();
+            assert_eq!(QuorumGuildEvent::decode_bounded(&bytes).unwrap(), certified);
+            let expected = blake3::derive_key(
+                "mutualbackup guild event v1",
+                &canonical_bytes(&certified.event).unwrap(),
+            );
+            assert_eq!(certified.event.hash().unwrap(), expected);
+            let mut trailing = bytes;
+            trailing.push(0);
+            assert!(QuorumGuildEvent::decode_bounded(&trailing).is_err());
+        }
+        let valid = certify(
+            &full,
+            GuildEventKind::SetQuorum {
+                policy: full.quorum,
+            },
+            &keys[..3],
+        );
+        let mut excessive = valid.clone();
+        excessive.signatures[0].signature.resize(65, 0);
+        assert!(QuorumGuildEvent::decode_bounded(&canonical_bytes(&excessive).unwrap()).is_err());
+        excessive = valid.clone();
+        excessive
+            .signatures
+            .resize(257, valid.signatures[0].clone());
+        assert!(QuorumGuildEvent::decode_bounded(&canonical_bytes(&excessive).unwrap()).is_err());
+        let mut excessive_envelope = envelope;
+        excessive_envelope
+            .sealed_private_key
+            .ciphertext
+            .resize(4097, 0);
+        for kind in [
+            GuildEventKind::AddMember {
+                member: member(&keys[5], &"x".repeat(257)),
+            },
+            GuildEventKind::RelabelMember {
+                node_id: keys[0].node_id(),
+                failure_domain: "x".repeat(257),
+            },
+            GuildEventKind::RotateRecoveryKey {
+                envelope: excessive_envelope,
+            },
+        ] {
+            let event = certify(&full, kind, &keys[..5]);
+            assert!(QuorumGuildEvent::decode_bounded(&canonical_bytes(&event).unwrap()).is_err());
+        }
+        assert!(QuorumGuildEvent::decode_bounded(&vec![0; GUILD_EVENT_BYTES + 1]).is_err());
+        let mut projection = GuildAuthoritySnapshot::from_state(&full).unwrap();
+        projection
+            .members
+            .resize(257, projection.members[0].clone());
+        assert!(GuildAuthoritySnapshot::decode(&canonical_bytes(&projection).unwrap()).is_err());
+        assert!(projection.validate().is_err());
+        projection.members.truncate(5);
+        projection.members[0].member.failure_domain = "x".repeat(257);
+        assert!(GuildAuthoritySnapshot::decode(&canonical_bytes(&projection).unwrap()).is_err());
+    }
+
+    #[test]
+    fn bounded_legacy_add_binding_requires_exact_original_event_and_quorum() {
+        let keys = keys(6);
+        let full = state(&keys);
+        let snapshot = GuildAuthoritySnapshot::from_state(&full).unwrap();
+        let certified = certify(
+            &full,
+            GuildEventKind::AddCodingGroup {
+                group: group(&full, &keys),
+            },
+            &keys[..3],
+        );
+        let statement = LegacyCodingAddStatement::for_event(&certified, [7; 32]).unwrap();
+        let binding_for = |signers: &[KeyMaterial]| {
+            let mut signatures = signers
+                .iter()
+                .map(|key| sign_legacy_coding_add_binding(&statement, key).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            QuorumLegacyCodingAddBinding {
+                statement: statement.clone(),
+                signatures,
+            }
+        };
+        let binding = binding_for(&keys[..3]);
+        let bytes = canonical_bytes(&binding).unwrap();
+        assert_eq!(
+            QuorumLegacyCodingAddBinding::decode_bounded(&bytes).unwrap(),
+            binding
+        );
+        snapshot
+            .verify_legacy_coding_add_binding(&binding, &certified)
+            .unwrap();
+        assert!(
+            snapshot
+                .verify_legacy_coding_add_binding(&binding_for(&keys[1..4]), &certified)
+                .is_err()
+        );
+        let mut changed = binding.clone();
+        changed.statement.transcript_hash = [9; 32];
+        assert!(
+            snapshot
+                .verify_legacy_coding_add_binding(&changed, &certified)
+                .is_err()
+        );
+        changed = binding.clone();
+        changed.signatures[0].signature.resize(65, 0);
+        assert!(
+            QuorumLegacyCodingAddBinding::decode_bounded(&canonical_bytes(&changed).unwrap())
+                .is_err()
+        );
+        changed = binding;
+        changed
+            .signatures
+            .resize(257, changed.signatures[0].clone());
+        assert!(
+            QuorumLegacyCodingAddBinding::decode_bounded(&canonical_bytes(&changed).unwrap())
+                .is_err()
+        );
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(QuorumLegacyCodingAddBinding::decode_bounded(&trailing).is_err());
+    }
 
     fn keys(count: u8) -> Vec<KeyMaterial> {
         (0..count)

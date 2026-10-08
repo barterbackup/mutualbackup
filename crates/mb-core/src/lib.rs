@@ -61,7 +61,7 @@ pub use catalog::{
     CatalogSectorReader, CatalogSectorRecord, CatalogSectorRoot, CatalogStreamError,
     PAGED_PRIVATE_METADATA_BYTES, PAGED_USER_REVISION_BYTES, PAGED_USER_REVISION_DOMAIN,
     PAGED_USER_REVISION_VERSION, PagedRevisionSourceReader, PagedUserRevision,
-    catalog_file_path_order,
+    catalog_file_path_order, decode_coding_transcript_bounded,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
@@ -73,12 +73,13 @@ pub use content::{
     make_sector_id, synthetic_filler_sector,
 };
 pub use guild::{
-    DynamicGuildState, DynamicMember, GUILD_EVENT_DOMAIN, GuildEvent, GuildEventKind,
-    GuildEventTail, GuildStateError, LEGACY_CODING_ADD_BINDING_DOMAIN, LegacyCodingAddStatement,
-    MAX_GUILD_EVENT_TAIL, QuorumGuildEvent, QuorumLegacyCodingAddBinding, QuorumPolicy, QuorumRule,
-    RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch, RetainedCodingGroup,
-    WriterKeyEpoch, create_recovery_key_envelope, open_recovery_key_envelope, sign_guild_event,
-    sign_legacy_coding_add_binding, verify_guild_event_signature,
+    DynamicGuildState, DynamicMember, GUILD_AUTHORITY_SNAPSHOT_BYTES, GUILD_EVENT_BYTES,
+    GUILD_EVENT_DOMAIN, GuildAuthoritySnapshot, GuildEvent, GuildEventKind, GuildEventTail,
+    GuildStateError, LEGACY_CODING_ADD_BINDING_BYTES, LEGACY_CODING_ADD_BINDING_DOMAIN,
+    LegacyCodingAddStatement, MAX_GUILD_EVENT_TAIL, QuorumGuildEvent, QuorumLegacyCodingAddBinding,
+    QuorumPolicy, QuorumRule, RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch,
+    RetainedCodingGroup, WriterKeyEpoch, create_recovery_key_envelope, open_recovery_key_envelope,
+    sign_guild_event, sign_legacy_coding_add_binding, verify_guild_event_signature,
     verify_legacy_coding_add_signature,
 };
 pub use keys::{

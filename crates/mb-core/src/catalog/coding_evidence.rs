@@ -612,7 +612,10 @@ struct BoundedTranscript {
     openings: Vec<SignedRecord<CodingShardOpening>>,
 }
 
-fn decode_transcript(
+/// Decode the exact original signed witness with bounded nested allocations.
+/// Signature/RS replay, event binding and historical delegation checks remain
+/// mandatory; decoding alone grants no authority.
+pub fn decode_coding_transcript_bounded(
     bytes: &[u8],
 ) -> Result<SignedRecord<CodingVerificationTranscript>, CatalogError> {
     #[derive(Deserialize)]
@@ -682,7 +685,7 @@ fn read_entry<E>(
     if *blake3::hash(&bytes).as_bytes() != transcript_hash {
         return Err(CatalogError::InvalidPage.into());
     }
-    let transcript = decode_transcript(&bytes)?;
+    let transcript = decode_coding_transcript_bounded(&bytes)?;
     let entry = CatalogCodingEntry {
         retained: RetainedCodingGroup {
             group: transcript.value.manifest.value.group.clone(),
@@ -1502,7 +1505,10 @@ pub(super) mod tests {
     fn bounded_nested_signatures_and_witness_collections_reject_before_replay() {
         let entry = entry(2, 1, 64, 12);
         let bytes = canonical_bytes(&entry.transcript).unwrap();
-        assert_eq!(decode_transcript(&bytes).unwrap(), entry.transcript);
+        assert_eq!(
+            decode_coding_transcript_bounded(&bytes).unwrap(),
+            entry.transcript
+        );
         for field in 0..7 {
             let mut signed = entry.transcript.clone();
             let signature = match field {
@@ -1515,21 +1521,24 @@ pub(super) mod tests {
                 _ => &mut signed.value.openings[0].signature,
             };
             signature.push(0);
-            assert!(decode_transcript(&canonical_bytes(&signed).unwrap()).is_err());
+            assert!(decode_coding_transcript_bounded(&canonical_bytes(&signed).unwrap()).is_err());
         }
         let mut signed = entry.transcript.clone();
         signed.value.staged_receipts = vec![signed.value.staged_receipts[0].clone(); 65];
-        assert!(decode_transcript(&canonical_bytes(&signed).unwrap()).is_err());
+        assert!(decode_coding_transcript_bounded(&canonical_bytes(&signed).unwrap()).is_err());
         let mut signed = entry.transcript.clone();
         signed.value.openings = vec![signed.value.openings[0].clone(); 65];
-        assert!(decode_transcript(&canonical_bytes(&signed).unwrap()).is_err());
+        assert!(decode_coding_transcript_bounded(&canonical_bytes(&signed).unwrap()).is_err());
         let record = CatalogCodingRecord::Transcript {
             offset: 0,
             bytes: vec![0; CATALOG_CODING_FRAGMENT_BYTES + 1],
         };
         assert!(CatalogCodingRecord::decode(&canonical_bytes(&record).unwrap()).is_err());
         assert!(CatalogCodingRecord::decode(&vec![0; CATALOG_CODING_RECORD_BYTES + 1]).is_err());
-        assert!(decode_transcript(&vec![0; CATALOG_CODING_TRANSCRIPT_BYTES + 1]).is_err());
+        assert!(
+            decode_coding_transcript_bounded(&vec![0; CATALOG_CODING_TRANSCRIPT_BYTES + 1])
+                .is_err()
+        );
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub use coding_evidence::{
     CATALOG_CODING_TRANSCRIPT_BYTES, CatalogCodingBuilder, CatalogCodingEntry,
     CatalogCodingGroupLocation, CatalogCodingGroupRange, CatalogCodingLifecycle,
     CatalogCodingReader, CatalogCodingRecord, CatalogCodingRoot, CatalogCodingSummary,
+    decode_coding_transcript_bounded,
 };
 pub use file_recipes::{
     CATALOG_FILE_SECTOR_REFS, CatalogFileExtent, CatalogFileRecipeBuilder, CatalogFileRecipeReader,
