@@ -2,9 +2,143 @@ use super::*;
 use crate::node::guild_authority::tests::{event, fixture, relabel};
 use crate::node::tests::test_coding_transcript;
 
+fn local_private_checkpoint_revision(
+    node: &Node,
+    writer: &ed25519_dalek::SigningKey,
+    guild: [u8; 32],
+    root: Uuid,
+    parent: [u8; 32],
+) -> (
+    SignedRecord<mb_core::PagedUserRevision>,
+    Vec<(mb_core::CatalogSectorRecord, Vec<u8>)>,
+) {
+    use mb_core::{CatalogScope, CatalogSection, CatalogSectorRecord};
+    let scope = CatalogScope::Dataset {
+        guild_id: guild,
+        owner: node.keys.node_id(),
+        protected_root_id: root,
+    };
+    let intents = [
+        CatalogSection::FileMetadata,
+        CatalogSection::FileMetadata,
+        CatalogSection::SectorReferences,
+    ]
+    .map(|section| {
+        let intent = mb_store::CatalogIntent {
+            id: Uuid::new_v4(),
+            scope,
+            section,
+        };
+        node.control.begin_catalog(intent).unwrap();
+        intent
+    });
+    let mut records = std::collections::BTreeMap::new();
+    let mut stage =
+        |intent: mb_store::CatalogIntent, page: mb_core::CatalogPageRef, bytes: Vec<u8>| {
+            node.control.stage_catalog_page(intent, page, &bytes)?;
+            let (sector, encrypted) = page.seal_private_page(
+                &node.keys.guild_content_id_key(&guild),
+                &node.keys.guild_data_key(&guild),
+                scope,
+                intent.section,
+                &bytes,
+            )?;
+            records.insert(
+                sector.id,
+                (
+                    CatalogSectorRecord {
+                        format_version: 1,
+                        sector,
+                        commitment: mb_core::merkle_commit(&encrypted).unwrap(),
+                    },
+                    encrypted,
+                ),
+            );
+            Ok::<_, mb_store::CatalogStoreError>(())
+        };
+    let namespace = mb_core::CatalogFileBuilder::new(
+        scope,
+        mb_core::CatalogFileStat {
+            mode: 0o700,
+            modified_secs: 123,
+            modified_nanos: 456,
+        },
+    )
+    .unwrap()
+    .finish(&mut |page, bytes| stage(intents[0], page, bytes))
+    .unwrap();
+    let recipes = mb_core::CatalogFileRecipeBuilder::new(scope)
+        .unwrap()
+        .finish(&mut |page, bytes| stage(intents[1], page, bytes))
+        .unwrap();
+    let private = crate::PagedPrivateMetadata {
+        format_version: mb_core::PAGED_USER_REVISION_VERSION,
+        native: mb_core::CatalogNativeFileRoot {
+            format_version: 1,
+            namespace,
+            recipes,
+        },
+        git: None,
+    };
+    let (metadata, bootstrap) = private.seal(&node.keys, scope).unwrap();
+    records.insert(metadata.sector.id, (metadata.clone(), bootstrap));
+    let mut sources = mb_core::CatalogSectorBuilder::new(scope).unwrap();
+    let mut sink = |page, bytes: Vec<u8>| node.control.stage_catalog_page(intents[2], page, &bytes);
+    for (record, _) in records.values() {
+        sources.push(record, &mut sink).unwrap();
+    }
+    let sources = sources.finish(&mut sink).unwrap();
+    let signed = mb_core::PagedUserRevision {
+        format_version: mb_core::PAGED_USER_REVISION_VERSION,
+        guild_id: guild,
+        protected_root_id: root,
+        cipher_profile: mb_core::V1_CIPHER_PROFILE,
+        revision_id: Uuid::from_u128(240),
+        owner: node.keys.node_id(),
+        writer_epoch: 1,
+        writer_public_key: writer.verifying_key().to_bytes(),
+        writer_signature: Vec::new(),
+        sequence: 2,
+        parent: Some(parent),
+        metadata,
+        sources,
+    }
+    .sign(writer, &node.keys)
+    .unwrap();
+    private
+        .publish_local_catalog(
+            &node.control,
+            &node.keys,
+            &signed,
+            &mb_core::WriterFence {
+                owner: node.keys.node_id(),
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+            crate::PagedCatalogIntents {
+                native: [intents[0], intents[1]],
+                sources: intents[2],
+                git: None,
+            },
+        )
+        .unwrap();
+    (signed, records.into_values().collect())
+}
+
 fn checkpoint_owner_proof(
     node: &mut Node,
     keys: &[KeyMaterial],
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    checkpoint_owner_proof_with_private(node, keys, false)
+}
+
+fn checkpoint_owner_proof_with_private(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
 ) -> (
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
@@ -74,16 +208,43 @@ fn checkpoint_owner_proof(
     };
     revision.sign_writer(&writer).unwrap();
     let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys[0]).unwrap();
+    let mut inputs = std::collections::BTreeMap::from([(
+        target.id,
+        (
+            mb_core::CatalogSectorRecord {
+                format_version: 1,
+                sector: target.clone(),
+                commitment: commitment.clone(),
+            },
+            bytes.clone(),
+        ),
+    )]);
+    let paged = private.then(|| {
+        let (signed, sources) = local_private_checkpoint_revision(
+            node,
+            &writer,
+            guild,
+            root_id,
+            revision.value.hash().unwrap(),
+        );
+        for (record, bytes) in sources {
+            inputs.insert(record.sector.id, (record, bytes));
+        }
+        signed
+    });
     let packed = mb_core::pack_incremental(
         profile,
         None,
-        vec![mb_core::PackingInput {
-            owner,
-            protected_root: mb_core::packing_protected_root(root_id),
-            object_id: target.id,
-            source_commitment: Some(commitment.clone()),
-            bytes: bytes.clone(),
-        }],
+        inputs
+            .values()
+            .map(|(record, bytes)| mb_core::PackingInput {
+                owner,
+                protected_root: mb_core::packing_protected_root(root_id),
+                object_id: record.sector.id,
+                source_commitment: Some(record.commitment.clone()),
+                bytes: bytes.clone(),
+            })
+            .collect(),
     )
     .unwrap();
     let mut descriptors = packed.catalog.sectors.clone();
@@ -203,6 +364,11 @@ fn checkpoint_owner_proof(
     authority
         .push(&R::LegacyRevision(reference), &mut sink)
         .unwrap();
+    if let Some(signed) = &paged {
+        authority
+            .push(&R::PagedRevision(signed.clone()), &mut sink)
+            .unwrap();
+    }
     let authority = authority.finish(&mut sink).unwrap();
     let mut sink = |page: mb_core::CatalogPageRef, bytes| {
         pages.insert(page.hash, (CatalogSection::Packing, page, bytes));
@@ -214,36 +380,38 @@ fn checkpoint_owner_proof(
     }
     let descriptors = builder.finish(&mut sink).unwrap();
     let mut builder = CatalogPackedSourceBuilder::new_compact(scope, profile).unwrap();
-    builder
-        .push(
-            &CatalogPackedSourceRecord::Source {
-                format_version: 1,
-                id: mb_core::CatalogPackedSourceId {
-                    owner,
-                    protected_root: mb_core::packing_protected_root(root_id),
-                    object_id: target.id,
+    for (record, bytes) in inputs.values() {
+        builder
+            .push(
+                &CatalogPackedSourceRecord::Source {
+                    format_version: 1,
+                    id: mb_core::CatalogPackedSourceId {
+                        owner,
+                        protected_root: mb_core::packing_protected_root(root_id),
+                        object_id: record.sector.id,
+                    },
+                    commitment: record.commitment.clone(),
                 },
-                commitment,
-            },
-            &mut sink,
-        )
-        .unwrap();
-    builder
-        .push(
-            &CatalogPackedSourceRecord::Subtrees {
-                first_chunk: 0,
-                roots: (0..4)
-                    .map(|index| {
-                        let leaves = profile.slot_size / mb_core::MERKLE_LEAF_SIZE as u32;
-                        mb_core::merkle_open_subtree(&bytes, index * leaves, leaves)
-                            .unwrap()
-                            .subtree_root
-                    })
-                    .collect(),
-            },
-            &mut sink,
-        )
-        .unwrap();
+                &mut sink,
+            )
+            .unwrap();
+        builder
+            .push(
+                &CatalogPackedSourceRecord::Subtrees {
+                    first_chunk: 0,
+                    roots: (0..4)
+                        .map(|index| {
+                            let leaves = profile.slot_size / mb_core::MERKLE_LEAF_SIZE as u32;
+                            mb_core::merkle_open_subtree(bytes, index * leaves, leaves)
+                                .unwrap()
+                                .subtree_root
+                        })
+                        .collect(),
+                },
+                &mut sink,
+            )
+            .unwrap();
+    }
     let sources = builder.finish(&mut sink).unwrap();
     let mut sink = |page: mb_core::CatalogPageRef, bytes| {
         pages.insert(page.hash, (CatalogSection::Coding, page, bytes));
@@ -259,8 +427,15 @@ fn checkpoint_owner_proof(
     let fetch = |page: mb_core::CatalogPageRef| {
         pages
             .get(&page.hash)
-            .map(|(_, _, bytes)| bytes.clone())
-            .ok_or_else(|| mb_store::DatabaseError::NotReady.into())
+            .map(|(_, _, bytes)| Ok(bytes.clone()))
+            .unwrap_or_else(|| {
+                let signed = paged.as_ref().ok_or(mb_store::DatabaseError::NotReady)?;
+                node.control.catalog_page(
+                    signed.value.scope(),
+                    CatalogSection::SectorReferences,
+                    page,
+                )
+            })
     };
     let context = CatalogCheckpointAuthorityContext {
         guild_id: trust.guild_id,
@@ -356,6 +531,119 @@ fn checkpoint_owner_proof(
         })
         .collect();
     (proof, intents)
+}
+
+#[test]
+fn paged_checkpoint_node_private_dependency_authenticates_roots_and_preserves_custody_after_reopen()
+{
+    let (temp, seed, mut node, mut keys) = fixture();
+    let owner = keys
+        .iter()
+        .position(|keys| keys.node_id() == node.keys.node_id())
+        .unwrap();
+    keys.swap(0, owner);
+    let (proof, intents) = checkpoint_owner_proof_with_private(&mut node, &keys, true);
+    let first = proof.index().next_revision(None).unwrap().unwrap();
+    let paged = proof
+        .index()
+        .next_revision(first.revision_key())
+        .unwrap()
+        .unwrap();
+    let mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed) = paged else {
+        panic!("expected private paged successor")
+    };
+    let key = mb_core::CatalogCheckpointRevisionKey::from(&signed.value);
+    let flat = node
+        .control
+        .get_record("guild-dynamic-state", KEY)
+        .unwrap()
+        .unwrap();
+    node.control
+        .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+        .unwrap();
+    let id = Uuid::from_u128(1);
+    node.retain_paged_checkpoint_metadata(id, &proof).unwrap();
+    node.retain_paged_checkpoint_local_revision(id, &proof, key)
+        .unwrap();
+    node.retain_paged_checkpoint_local_revision(id, &proof, key)
+        .unwrap();
+    let mut other = key;
+    other.owner = keys[1].node_id();
+    assert!(
+        node.retain_paged_checkpoint_local_revision(id, &proof, other)
+            .is_err()
+    );
+    assert!(
+        node.retain_paged_checkpoint_local_revision(id, &proof, first.revision_key().unwrap())
+            .is_err()
+    );
+    for intent in intents {
+        node.control.cancel_catalog(intent).unwrap();
+        while node.control.release_catalog_pin(intent).unwrap() {}
+    }
+    while node.control.collect_catalog_page().unwrap() {}
+    assert!(
+        node.control
+            .cancel_paged_revision_catalog(signed.value.revision_id)
+            .is_err()
+    );
+    let local = crate::PagedPrivateMetadata::load_local_catalog(
+        &node.control,
+        &node.keys,
+        signed.value.revision_id,
+        signed.value.scope(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(local.private.is_some());
+    assert_eq!(local.revision, signed);
+    node.control
+        .put_record("guild-dynamic-state", KEY, &flat)
+        .unwrap();
+    drop(node);
+    let node = Node::open(temp.path(), seed).unwrap();
+    node.control
+        .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+        .unwrap();
+    node.retain_paged_checkpoint_local_revision(id, &proof, key)
+        .unwrap();
+    let retained = node
+        .control
+        .catalog_paged_checkpoint_revision(id, signed.value.revision_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retained.bundle.descriptor,
+        canonical_bytes(&signed).unwrap()
+    );
+    node.control
+        .cancel_catalog_paged_checkpoint_retention(id)
+        .unwrap();
+    assert!(
+        node.control
+            .release_catalog_paged_checkpoint_root(id)
+            .unwrap()
+    );
+    node.control
+        .cancel_paged_revision_catalog(signed.value.revision_id)
+        .unwrap();
+    assert!(
+        node.control
+            .catalog_paged_checkpoint_certificate(id)
+            .unwrap()
+            .is_some()
+    );
+    while node
+        .control
+        .release_catalog_paged_checkpoint_root(id)
+        .unwrap()
+    {}
+    assert!(
+        node.control
+            .catalog_paged_checkpoint_certificate(id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

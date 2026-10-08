@@ -28,6 +28,7 @@ mod packing_coding_retention;
 mod packing_validation;
 mod paged_checkpoint;
 mod paged_checkpoint_retention;
+mod paged_checkpoint_revision;
 mod paged_data;
 mod paged_revision;
 mod paged_sector;

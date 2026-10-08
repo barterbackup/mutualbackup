@@ -1814,6 +1814,18 @@ separately below.
     metadata only; normal producers remain disabled pending complete private,
     native/bootstrap/information/parity custody, activation/retirement guards,
     quota/admission and retained 1 TiB/platform/release qualification.
+  - [x] Bind an exact retained paged checkpoint revision to its existing
+    authenticated local private bundle. Keep private roots, bootstrap ciphertext
+    and existing native/data-source pins live until each checkpoint dependency
+    retires; preserve sharing, reopen and atomic source replacement. Check the
+    original-history proof, independently frozen event trust, actual predecessor
+    and exact certificate around acquisition. Debit cumulative private root/
+    bootstrap and dependency work against the enclosing proof budget. Release
+    one dependency under current-head guards before public root retirement;
+    block bundle cancellation while any checkpoint still depends on it.
+    See ADR 0002 for original-proof, corruption, fault and Node validation.
+    This preserves existing custody; complete information/parity availability,
+    full history ownership, activation, quota and qualification remain open.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

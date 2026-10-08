@@ -1924,6 +1924,21 @@ bootstrap and information/parity custody, certified-current activation and
 successor retirement, full quota/admission policy and normal retained-capacity/
 platform/release qualification remain required before enabling producers.
 
+The owner can now retain one exact revision's existing authenticated local
+private bundle, keeping its private roots, bootstrap and native/data-source pins
+live through checkpoint sharing and reopen. Acquisition uses an indexed original
+revision identity plus the concrete quorum/history proof and independent event/
+SQL predecessor guards; Node also opens the owner-encrypted private descriptor.
+Cumulative private root, bootstrap and dependency work consumes the enclosing
+proof budget. Existing atomic data-source replacement can transfer physical pins.
+Cancellation of the bundle is blocked until all checkpoint dependencies retire;
+each bounded cleanup step releases one private dependency before public roots,
+checking the actual current checkpoint before and after mutation. This preserves
+existing local custody. Complete information/parity availability, transitive
+history/ancestor ownership, certified-current activation, cooperative producers,
+full physical/dataset/guild quota and retained 1 TiB/platform/release gates remain
+open; normal paged checkpoint producers remain disabled.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

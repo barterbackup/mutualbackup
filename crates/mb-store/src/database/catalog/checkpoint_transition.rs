@@ -112,6 +112,11 @@ impl RevisionIdentity {
         self.reference_hash = canonical_hash_bounded(record, CATALOG_CHECKPOINT_RECORD_BYTES)?;
         Ok(self)
     }
+    pub(super) fn matches_reference(self, record: &R) -> Result<bool, CatalogStoreError> {
+        Ok(record.revision_key() == Some(self.key)
+            && canonical_hash_bounded(record, CATALOG_CHECKPOINT_RECORD_BYTES)?
+                == self.reference_hash)
+    }
     fn same_revision(self, other: Self) -> bool {
         Self {
             reference_hash: [0; 32],

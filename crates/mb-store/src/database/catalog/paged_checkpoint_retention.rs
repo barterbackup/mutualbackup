@@ -15,7 +15,7 @@ use super::*;
 
 const CERTIFICATE: &str = "catalog-paged-checkpoint-certificate-v1";
 
-fn owned_certificate(
+pub(super) fn owned_certificate(
     connection: &Connection,
     retention: CatalogPagedCheckpointRetention,
 ) -> Result<mb_core::QuorumPagedCheckpoint, CatalogStoreError> {
@@ -158,7 +158,7 @@ impl Retention for CatalogPagedCheckpointRetention {
 impl ControlStore {
     // Call only inside the short writer transaction. The independent reader
     // fences original event authority; the actual SQL head fences the base.
-    fn guard_paged_candidate(
+    pub(super) fn guard_paged_candidate(
         &self,
         retention: CatalogPagedCheckpointRetention,
         read_trust: &mut impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
@@ -217,7 +217,11 @@ impl ControlStore {
             self.guard_paged_candidate(retention, &mut read_trust)?;
             let existed =
                 journal::read::<CatalogPagedCheckpointRetention>(&transaction, id)?.is_some();
+            if !existed {
+                paged_checkpoint_revision::require_unowned(&transaction, id)?;
+            }
             let state = journal::begin(&transaction, retention)?;
+            paged_checkpoint_revision::admitted_work(&transaction, retention)?;
             let stored = bounded_record(
                 &transaction,
                 CERTIFICATE,
@@ -354,6 +358,7 @@ impl ControlStore {
                 Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
             self.guard_paged_candidate(retention, &mut read_trust)?;
             owned_certificate(&transaction, retention)?;
+            paged_checkpoint_revision::admitted_work(&transaction, retention)?;
             if published {
                 if journal::require(&transaction, retention)?.state
                     != CatalogPagedCheckpointRetentionState::Published
@@ -391,7 +396,11 @@ impl ControlStore {
         else {
             return Ok(None);
         };
+        paged_checkpoint_revision::admitted_work(&self.connection, record.retention)?;
         if record.state == CatalogPagedCheckpointRetentionState::Cancelled && record.roots == 0 {
+            if paged_checkpoint_revision::has_dependencies(&self.connection, id)? {
+                return Err(DatabaseError::Integrity.into());
+            }
             if self.record_length(CERTIFICATE, id.as_bytes())?.is_some() {
                 return Err(DatabaseError::Integrity.into());
             }
@@ -411,7 +420,11 @@ impl ControlStore {
         else {
             return Ok(None);
         };
+        paged_checkpoint_revision::admitted_work(&self.connection, record.retention)?;
         if record.state == CatalogPagedCheckpointRetentionState::Cancelled && record.roots == 0 {
+            if paged_checkpoint_revision::has_dependencies(&self.connection, id)? {
+                return Err(DatabaseError::Integrity.into());
+            }
             if self.record_length(CERTIFICATE, id.as_bytes())?.is_some() {
                 return Err(DatabaseError::Integrity.into());
             }
@@ -420,7 +433,7 @@ impl ControlStore {
         owned_certificate(&self.connection, record.retention).map(Some)
     }
 
-    fn guard_paged_retirement(
+    pub(super) fn guard_paged_retirement(
         &self,
         retention: CatalogPagedCheckpointRetention,
     ) -> Result<(), CatalogStoreError> {
@@ -451,8 +464,8 @@ impl ControlStore {
         Ok(())
     }
 
-    /// Release at most one cancelled root. Recheck the actual current head in
-    /// the same transaction as each pin/counter change, including after reopen.
+    /// Release at most one cancelled private revision dependency or public
+    /// root. Recheck the actual current head inside every writer transaction.
     pub fn release_catalog_paged_checkpoint_root(
         &self,
         id: Uuid,
@@ -462,6 +475,11 @@ impl ControlStore {
         let record = journal::read::<CatalogPagedCheckpointRetention>(&transaction, id)?
             .ok_or(DatabaseError::NotReady)?;
         self.guard_paged_retirement(record.retention)?;
+        if paged_checkpoint_revision::release(&transaction, record.retention)? {
+            self.guard_paged_retirement(record.retention)?;
+            transaction.commit()?;
+            return Ok(true);
+        }
         let released = journal::release::<CatalogPagedCheckpointRetention>(&transaction, id)?;
         if released
             && journal::read::<CatalogPagedCheckpointRetention>(&transaction, id)?

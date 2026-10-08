@@ -1,4 +1,5 @@
 mod paged_checkpoint_retention;
+mod paged_checkpoint_revision;
 
 use super::*;
 use mb_core::{
@@ -1779,11 +1780,31 @@ fn historical_archive_updates_and_range_reads_fail_closed() {
 }
 
 fn real_checkpoint() -> (super::super::checkpoint_validation::tests::Fixture, History) {
+    real_checkpoint_with_fixture(super::super::checkpoint_validation::tests::Fixture::new(
+        true, false,
+    ))
+}
+
+fn real_checkpoint_with_fixture(
+    mut fixture: super::super::checkpoint_validation::tests::Fixture,
+) -> (super::super::checkpoint_validation::tests::Fixture, History) {
+    use super::super::coding_coverage::tests::entry_at_epoch_with_nonce;
     use mb_core::CatalogCheckpointAuthorityRecord as R;
-    let mut fixture = super::super::checkpoint_validation::tests::Fixture::new(true, false);
     let (_, _, packing) = fixture.packing_inputs_with_byte_roots();
-    let entry =
-        super::super::coding_coverage::tests::entry_at_epoch(&packing, [0, 1, 2], 701, 3, None, 7);
+    let entries = (0..packing.sectors.len())
+        .collect::<Vec<_>>()
+        .chunks(3)
+        .enumerate()
+        .map(|(nonce, indices)| match *indices {
+            [a, b, c] => {
+                entry_at_epoch_with_nonce(&packing, [a, b, c], 701, 3, None, 7, nonce as u64)
+            }
+            [a, b] => entry_at_epoch_with_nonce(&packing, [a, b], 701, 3, None, 7, nonce as u64),
+            [a] => entry_at_epoch_with_nonce(&packing, [a], 701, 3, None, 7, nonce as u64),
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let entry = entries[0].clone();
     let mut keys = (11..14)
         .map(|seed| KeyMaterial::from_seed(&Seed::from_bytes([seed; 32])))
         .collect::<Vec<_>>();
@@ -1850,6 +1871,12 @@ fn real_checkpoint() -> (super::super::checkpoint_validation::tests::Fixture, Hi
         });
     }
     history.add(false);
+    let first = history.entry.clone();
+    for entry in entries.into_iter().skip(1) {
+        history.entry = entry;
+        history.add(false);
+    }
+    history.entry = first;
     fixture.context.generation = 1;
     fixture.context.event_sequence = history.state.event_sequence;
     fixture.context.event_head = history.state.event_head;

@@ -738,7 +738,15 @@ fn next_revision(
     else {
         return Ok(None);
     };
-    let value: CatalogCheckpointAuthorityRecord = decode_canonical(&bytes)?;
+    decode_revision(&bytes, &key, guild_id).map(Some)
+}
+
+fn decode_revision(
+    bytes: &[u8],
+    key: &[u8],
+    guild_id: [u8; 32],
+) -> Result<CatalogCheckpointAuthorityRecord, CatalogStoreError> {
+    let value: CatalogCheckpointAuthorityRecord = decode_canonical(bytes)?;
     if encoded(&value, CATALOG_CHECKPOINT_RECORD_BYTES)? != bytes {
         return Err(DatabaseError::Integrity.into());
     }
@@ -763,7 +771,7 @@ fn next_revision(
     {
         return Err(DatabaseError::Integrity.into());
     }
-    Ok(Some(value))
+    Ok(value)
 }
 
 pub struct CatalogCheckpointPackingIndex {
@@ -825,6 +833,33 @@ pub struct CatalogCheckpointCodingDirectoryIndex {
     index: CatalogPackingCodingDirectoryIndex,
 }
 impl CatalogCheckpointCodingDirectoryIndex {
+    /// Read one exact revision from the completed, authenticated authority join.
+    /// No retained-history scan or caller-supplied membership assertion is used.
+    pub fn revision(
+        &self,
+        key: CatalogCheckpointRevisionKey,
+    ) -> Result<Option<CatalogCheckpointAuthorityRecord>, CatalogStoreError> {
+        self.require_complete()?;
+        let key = key.index_key();
+        let store = &self.index.packing().store;
+        let identity =
+            read::<super::checkpoint_transition::RevisionIdentity>(store, IDENTITIES, &key)?;
+        let Some(bytes) =
+            store.get_record_bounded(REVISIONS, &key, CATALOG_CHECKPOINT_RECORD_BYTES)?
+        else {
+            if identity.is_some() {
+                return Err(DatabaseError::Integrity.into());
+            }
+            return Ok(None);
+        };
+        let record = decode_revision(&bytes, &key, self.authority.context.guild_id)?;
+        let (identity, _) = identity.ok_or(DatabaseError::Integrity)?;
+        if !identity.matches_reference(&record)? {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(Some(record))
+    }
+
     pub fn authority(&self) -> CatalogCheckpointAuthorityValidation {
         self.authority
     }

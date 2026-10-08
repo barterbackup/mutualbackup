@@ -4158,6 +4158,48 @@ impl Node {
         .context("paged checkpoint requires original guild authority")
     }
 
+    /// Keep this node's authenticated private bundle and its existing payload
+    /// pins live for a revision in the exact public checkpoint proof. Complete
+    /// information/parity custody is still required before activation.
+    pub fn retain_paged_checkpoint_local_revision(
+        &self,
+        id: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
+        key: mb_core::CatalogCheckpointRevisionKey,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            key.owner == self.keys.node_id(),
+            "private checkpoint revision belongs to another owner"
+        );
+        guild_authority::with_history(&self.control, |authority| {
+            self.control
+                .retain_catalog_paged_checkpoint_revision_checked(
+                    id,
+                    proof,
+                    key,
+                    || {
+                        authority.paged_checkpoint_trust().map_err(|_| {
+                            mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                        })
+                    },
+                    |snapshot| -> Result<()> {
+                        let opened = crate::PagedPrivateMetadata::open_local_snapshot(
+                            &self.keys,
+                            snapshot,
+                            snapshot.bundle.scope,
+                        )?;
+                        anyhow::ensure!(
+                            opened.private.is_some(),
+                            "checkpoint private revision is retired"
+                        );
+                        Ok(())
+                    },
+                )?;
+            Ok(())
+        })?
+        .context("paged checkpoint requires original guild authority")
+    }
+
     pub(crate) fn needs_recovery_key_registration(&self) -> Result<bool> {
         guild_authority::with_history(&self.control, |authority| {
             let sequence = authority

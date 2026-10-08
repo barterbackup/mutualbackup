@@ -215,6 +215,7 @@ pub(super) fn bundle_snapshot(
 }
 
 pub(super) fn cancel_bundle(connection: &Connection, id: Uuid) -> Result<(), CatalogStoreError> {
+    super::paged_checkpoint_revision::require_unretained(connection, id)?;
     let mut record = read_bundle(connection, id)?.ok_or(DatabaseError::NotReady)?;
     if record.state == CatalogBundleState::Cancelled {
         return Ok(());
@@ -243,6 +244,7 @@ pub(super) fn cancel_bundle(connection: &Connection, id: Uuid) -> Result<(), Cat
     if written != 1 {
         return Err(DatabaseError::Conflict.into());
     }
+    super::paged_checkpoint_revision::require_unretained(connection, id)?;
     Ok(())
 }
 

@@ -44,7 +44,7 @@ fn paged_owner_descriptor(
     }
 }
 
-fn stage_paged_owner(
+pub(super) fn stage_paged_owner(
     control: &ControlStore,
     fixture: &super::super::super::checkpoint_validation::tests::Fixture,
     proof: &CatalogQuorumPagedCheckpointIndex,

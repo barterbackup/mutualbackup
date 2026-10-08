@@ -3910,3 +3910,79 @@ certified-current activation/retirement and cooperative worker integration, full
 quota and admission policy, archive retention, actual retained 1 TiB and native/
 platform/topology/release qualification remain required. Normal paged checkpoint
 producers remain disabled; original signed layouts and wire versions are unchanged.
+
+## Checkpoint dependencies on published private revision custody (2026-10-08)
+
+A public paged checkpoint owner can now retain an exact revision's existing
+published private catalog. This adds an enclosing dependency to the actual
+bundle, rather than constructing an independent copy of its roots or bootstrap.
+The bundle's existing ownership preserves private native/Git pages, the signed
+source root, bootstrap ciphertext, private page-source bindings and any existing
+native/data-source anchor pins. All checkpoint dependencies must retire before
+bundle cancellation can fence its sources or remove its bootstrap. A cancelled
+checkpoint retains its dependency until that bounded cleanup step commits.
+
+Acquisition requires the same concrete original-history-proven quorum candidate
+and exact public owner descriptor/certificate. A bounded point lookup in the
+completed authority join reads the original revision reference and its indexed
+identity; a validly signed replacement reference under the same key is rejected.
+The private bundle must contain that exact signed envelope. Node additionally
+opens the owner-encrypted descriptor, checks ownership/scope and matches every
+private root to the bundle. Independently frozen original event trust and the
+actual SQL predecessor are checked inside the dependency writer before and after
+mutation. A raw manifest, external-only draft history bridge, stale candidate,
+missing private catalog or cancelled public owner cannot acquire a dependency.
+
+Paired forward/reverse records bind the exact bounded bundle hash and private
+work. Both pins and a cumulative work counter publish atomically with exact
+readback. Private root logical bytes/pages, bootstrap ciphertext and conservative
+bounded dependency/counter rows consume the remaining enclosing proof budget;
+original history/proof and public replay debt are not reset. The count cannot
+exceed the candidate's retained revisions. This is logical ownership admission,
+not complete physical/dataset/guild quota or verified availability of every
+source. Existing authenticated data-source replacement remains available and
+atomically transfers physical anchor counts without changing the immutable
+private bundle or checkpoint dependency.
+
+The existing enclosing cleanup entry point releases at most one private revision
+dependency or public root per call. Private dependencies retire before public
+roots, retaining the original certificate until all have been removed. Each
+paired delete/counter update is atomic and checks the actual current checkpoint
+before and after mutation, including after cancellation and reopen. Shared
+checkpoint owners keep the bundle live independently. One-sided, corrupt or
+oversized dependency/counter rows, ignored SQL mutations and head changes inside
+the writer fail closed and preserve custody. Cancelled owner IDs remain fenced.
+
+Five Store fixtures construct real encrypted private catalogs, complete source/
+packing/directory joins, original bound coding events and concrete quorum
+history transitions. They exercise sharing and reopen after capture retirement,
+bootstrap/private-page survival, existing native-anchor replacement/cleanup,
+stale authority, validly signed reference substitution, oversized rows, rejected
+private authentication, every paired pin/delete/counter fault, current-head
+changes before and during retirement, exhaustion after public/proof work, and
+cumulative admission/one-dependency retirement across two retained revisions.
+The Store-only native recipes are explicitly opaque test records: they exercise
+real durable anchor counts, not physical-file availability qualification.
+The Node fixture builds and publishes a real owner-encrypted private catalog and
+paged successor, then uses both real enclosing entry points with unreadable
+unused flat state, retires public capture pins, reopens, reauthenticates private
+roots, rejects another owner's key and a legacy reference, and retires custody
+before the final public certificate. Existing original-authority/backup/DHT/
+writer/catch-up cases remain part of focused validation.
+
+The locked full Store library suite passed all 269 then-existing ordinary tests
+with 26 ignored. After test-only shorthand cleanup and the fifth cumulative
+budget regression, all five ownership fixtures passed on the final tree. The
+27 selected Node original-authority/backup/DHT/writer/catch-up cases passed,
+including the new encrypted-private-catalog fixture; a repeated full Node suite
+was not run for this additive entry point. Strict locked workspace/all-targets
+Clippy and formatting/diff checks pass. These are local ownership tests; ignored
+provisioned/native/topology cases remain unqualified.
+
+This preserves existing local private/native/bootstrap custody; it does not
+complete all private/source EOF and information/parity availability proofs,
+transitive history/ancestor archive ownership, certified-current activation and
+retirement policy, cooperative workers/normal producers, physical/dataset/guild
+quota or actual retained 1 TiB/native/platform/topology/release qualification.
+Normal paged checkpoint producers remain disabled. Original signed layouts,
+identities and wire versions are unchanged.

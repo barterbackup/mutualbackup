@@ -578,6 +578,7 @@ impl ControlStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let current = snapshot(&transaction, id)?.ok_or(DatabaseError::NotReady)?;
+        paged_checkpoint_revision::require_unretained(&transaction, id)?;
         if current.state == CatalogBundleState::Cancelled {
             return Ok(());
         }
@@ -610,13 +611,14 @@ impl ControlStore {
         {
             return Err(DatabaseError::Conflict.into());
         }
+        paged_checkpoint_revision::require_unretained(&transaction, id)?;
         transaction.commit()?;
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeMap;
 
     use ed25519_dalek::SigningKey;
@@ -645,6 +647,32 @@ mod tests {
         sequence: u64,
         parent: Option<[u8; 32]>,
     ) -> (CatalogBundle, Vec<u8>) {
+        fixture_with_context(
+            store,
+            sequence,
+            parent,
+            &keys(),
+            &SigningKey::from_bytes(&[72; 32]),
+            scope(),
+        )
+    }
+
+    pub(crate) fn fixture_with_context(
+        store: &ControlStore,
+        sequence: u64,
+        parent: Option<[u8; 32]>,
+        keys: &KeyMaterial,
+        writer: &SigningKey,
+        scope: CatalogScope,
+    ) -> (CatalogBundle, Vec<u8>) {
+        let CatalogScope::Dataset {
+            guild_id,
+            protected_root_id,
+            ..
+        } = scope
+        else {
+            panic!("test dataset scope")
+        };
         let intents = [
             CatalogSection::FileMetadata,
             CatalogSection::FileMetadata,
@@ -652,7 +680,7 @@ mod tests {
         ]
         .map(|section| CatalogIntent {
             id: Uuid::new_v4(),
-            scope: scope(),
+            scope,
             section,
         });
         for intent in intents {
@@ -664,7 +692,7 @@ mod tests {
             store.stage_catalog_page(intents[0], page, &bytes)
         };
         let namespace = CatalogFileBuilder::new(
-            scope(),
+            scope,
             CatalogFileStat {
                 mode: 0o700,
                 modified_secs: 123,
@@ -678,7 +706,7 @@ mod tests {
             private_pages.insert(page.hash, (page, bytes.clone()));
             store.stage_catalog_page(intents[1], page, &bytes)
         };
-        let recipes = CatalogFileRecipeBuilder::new(scope())
+        let recipes = CatalogFileRecipeBuilder::new(scope)
             .unwrap()
             .finish(&mut sink)
             .unwrap();
@@ -690,16 +718,16 @@ mod tests {
         // The no-Git wire layout is identical to Node's typed descriptor.
         let plaintext = canonical_bytes(&(PAGED_USER_REVISION_VERSION, files, None::<()>)).unwrap();
         let id = make_content_sector_id(
-            &keys().guild_content_id_key(&[73; 32]),
-            keys().node_id(),
-            [73; 32],
-            Uuid::from_bytes([74; 16]),
+            &keys.guild_content_id_key(&guild_id),
+            keys.node_id(),
+            guild_id,
+            protected_root_id,
             SectorPurpose::Metadata,
             &plaintext,
         )
         .unwrap();
         let (sector, bootstrap) =
-            encrypted_sector(&keys().guild_data_key(&[73; 32]), id, &plaintext).unwrap();
+            encrypted_sector(&keys.guild_data_key(&guild_id), id, &plaintext).unwrap();
         let metadata = CatalogSectorRecord {
             format_version: 1,
             sector,
@@ -710,9 +738,9 @@ mod tests {
         for (_, (page, bytes)) in private_pages {
             let (sector, bytes) = page
                 .seal_private_page(
-                    &keys().guild_content_id_key(&[73; 32]),
-                    &keys().guild_data_key(&[73; 32]),
-                    scope(),
+                    &keys.guild_content_id_key(&guild_id),
+                    &keys.guild_data_key(&guild_id),
+                    scope,
                     CatalogSection::FileMetadata,
                     &bytes,
                 )
@@ -726,21 +754,20 @@ mod tests {
                 },
             );
         }
-        let mut sources = CatalogSectorBuilder::new(scope()).unwrap();
+        let mut sources = CatalogSectorBuilder::new(scope).unwrap();
         let mut sink = |page, bytes: Vec<u8>| store.stage_catalog_page(intents[2], page, &bytes);
         for record in records.values() {
             sources.push(record, &mut sink).unwrap();
         }
         let sources = sources.finish(&mut sink).unwrap();
         let id = Uuid::new_v4();
-        let writer = SigningKey::from_bytes(&[72; 32]);
         let signed = PagedUserRevision {
             format_version: PAGED_USER_REVISION_VERSION,
-            guild_id: [73; 32],
-            protected_root_id: Uuid::from_bytes([74; 16]),
+            guild_id,
+            protected_root_id,
             cipher_profile: V1_CIPHER_PROFILE,
             revision_id: id,
-            owner: keys().node_id(),
+            owner: keys.node_id(),
             writer_epoch: 1,
             writer_public_key: writer.verifying_key().to_bytes(),
             writer_signature: vec![],
@@ -749,12 +776,12 @@ mod tests {
             metadata,
             sources,
         }
-        .sign(&writer, &keys())
+        .sign(writer, keys)
         .unwrap();
         store
             .validate_native_file_catalog(CatalogNativeValidation {
                 id,
-                scope: scope(),
+                scope,
                 files,
                 sources,
             })
@@ -766,7 +793,7 @@ mod tests {
         ];
         let bundle = CatalogBundle {
             id,
-            scope: scope(),
+            scope,
             roots: intents
                 .into_iter()
                 .zip(roots)

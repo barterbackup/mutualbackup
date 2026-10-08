@@ -515,6 +515,27 @@ pub(super) mod tests {
         virtual_index: Option<usize>,
         membership_epoch: u64,
     ) -> CatalogCodingEntry {
+        entry_at_epoch_with_nonce(
+            fixture,
+            indices,
+            id,
+            version,
+            virtual_index,
+            membership_epoch,
+            0,
+        )
+    }
+
+    pub(crate) fn entry_at_epoch_with_nonce<const N: usize>(
+        fixture: &PackingFixture,
+        indices: [usize; N],
+        id: u64,
+        version: u16,
+        virtual_index: Option<usize>,
+        membership_epoch: u64,
+        attempt_nonce: u64,
+    ) -> CatalogCodingEntry {
+        assert!((1..=3).contains(&N));
         let CatalogScope::Guild { guild_id } = fixture.manifest.scope else {
             panic!("test scope must be guild");
         };
@@ -532,6 +553,7 @@ pub(super) mod tests {
             .collect::<Vec<_>>();
         let mut attempt_id = [0; 16];
         attempt_id[..8].copy_from_slice(&id.to_be_bytes());
+        attempt_id[8..].copy_from_slice(&attempt_nonce.to_be_bytes());
         let information_roles = indices
             .iter()
             .enumerate()
@@ -559,7 +581,7 @@ pub(super) mod tests {
                 geometry: CodingPlanGeometry {
                     format_version: 1,
                     guild_id,
-                    profile: CodingProfile::new(3, 2, shard_size),
+                    profile: CodingProfile::new(N as u16, 2, shard_size),
                     information: information_roles,
                     parity: (0..2)
                         .map(|row| ParityPlacementV2 {
@@ -605,7 +627,8 @@ pub(super) mod tests {
         .unwrap();
         let receipts = (3..5)
             .map(|index| {
-                let ShardRoleV2::Parity(parity) = &manifest.value.group.roles[index] else {
+                let shard_index = index - 3 + N;
+                let ShardRoleV2::Parity(parity) = &manifest.value.group.roles[shard_index] else {
                     unreachable!()
                 };
                 SignedRecord::sign(
@@ -616,7 +639,7 @@ pub(super) mod tests {
                         plan_hash,
                         guild_id,
                         group_id: manifest.value.group.id,
-                        shard_index: index as u16,
+                        shard_index: shard_index as u16,
                         holder: parity.holder,
                         commitment: parity.commitment.clone(),
                     },
@@ -670,7 +693,7 @@ pub(super) mod tests {
                         commitment,
                         proof: merkle_open_range(bytes, leaf, 1).unwrap(),
                     },
-                    &keys[index],
+                    &keys[if index < N { index } else { index - N + 3 }],
                 )
                 .unwrap()
             })

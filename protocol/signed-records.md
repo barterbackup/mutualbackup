@@ -326,6 +326,21 @@ the enclosing private/native/bootstrap/information/parity custody, full quota
 policy and certified-current activation/retirement joins remain mandatory.
 Signed layouts, identities and wire versions are unchanged.
 
+The same candidate can retain an exact paged revision's existing published
+private bundle. A bounded indexed read binds the revision to its original
+completed authority reference; Node opens the owner-encrypted descriptor and
+checks its exact private roots. Paired local dependency records and cumulative
+private root/bootstrap work publish atomically under independent event and
+actual predecessor guards. The bundle, bootstrap, private page sources and
+existing native/data-source pins remain live while any checkpoint dependency
+exists, including after cancellation until bounded cleanup commits. Existing
+authenticated source replacement transfers physical pins without changing the
+immutable bundle. Each cleanup call releases one private dependency or public
+root, with actual current-head checks before and after mutation. These pins
+preserve existing local custody; they do not prove complete information/parity
+availability, transitive archive ownership or safe activation, and their logical
+work budget does not replace full physical/dataset/guild quota admission.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the
