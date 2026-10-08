@@ -356,6 +356,20 @@ with actual current-head guards. These local pins do not constitute complete
 distributed availability or certified-current activation. Signed layouts and
 wire versions remain unchanged.
 
+Legacy READY information uploads may have an empty local activation marker.
+Normal disk evacuation can fill only that empty marker with its existing verified
+transcript hash after authenticating the exact original signed witness by attempt
+ID, its original indexed membership roster, assigned local nonvirtual role and
+actual payload commitment. Historical expiry and later membership removal do
+not invalidate original evidence; this never authorizes a new coding attempt.
+Control and volume writers hold the checks, conditional update and exact readback
+through commit. Missing original
+witnesses require recovery and incomplete indexes require original-event replay;
+neither unused flat history nor another group's witness is a fallback. Empty
+parity receipts and damaged activation fields remain errors. Reopen resumes
+ordinary verified transfer with the upgraded original marker. Signed layouts
+and wire versions remain unchanged.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the

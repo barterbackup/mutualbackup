@@ -211,9 +211,20 @@ pub(crate) struct AuthorityReader<'a> {
 
 impl<'a> AuthorityReader<'a> {
     pub(super) fn open(control: &'a ControlStore) -> Result<Option<Self>> {
+        Self::open_inner(control, false)
+    }
+
+    pub(super) fn open_complete(control: &'a ControlStore) -> Result<Self> {
+        Self::open_inner(control, true)?.context("original guild history is unavailable")
+    }
+
+    fn open_inner(control: &'a ControlStore, require_indexed: bool) -> Result<Option<Self>> {
         let original =
             control.get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?;
         let compact = read_record(control)?;
+        if require_indexed && compact.is_none() {
+            anyhow::bail!("information upgrade requires indexed original guild authority");
+        }
         let mut legacy = None;
         let mut legacy_fence = None;
         let current = match &compact {
@@ -254,6 +265,9 @@ impl<'a> AuthorityReader<'a> {
             }
         }
         if history.is_none() && legacy.is_none() {
+            if require_indexed {
+                anyhow::bail!("information upgrade requires complete original-history indexing");
+            }
             let (state, fence) =
                 read_legacy(control)?.context("legacy guild state is unavailable")?;
             if GuildAuthoritySnapshot::from_state(&state)? != current {
@@ -275,6 +289,46 @@ impl<'a> AuthorityReader<'a> {
 
     pub(crate) fn snapshot(&self) -> &GuildAuthoritySnapshot {
         &self.current
+    }
+
+    pub(crate) fn validate_information_activation(
+        &self,
+        ready: &mb_store::ReadyVariableObject,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+        holder: NodeId,
+    ) -> Result<()> {
+        self.check()?;
+        let history = self
+            .history
+            .as_ref()
+            .context("original history is not indexed")?;
+        history
+            .view(self.control, history.genesis_hash(), &self.current)?
+            .validate_historical_coding_plan(&transcript.value.plan)?;
+        let group = &transcript.value.manifest.value.group;
+        let Some(ShardRoleV2::Information(role)) =
+            group.roles.get(usize::from(ready.object.shard_index))
+        else {
+            anyhow::bail!("missing activation receipt is not an information upload");
+        };
+        if !ready.staged_receipt.is_empty()
+            || role.sector.virtual_zero
+            || role.owner != holder
+            || role.sector.id != ready.object.group_id
+            || role.sector.commitment != ready.object.commitment
+            || group.guild_id != ready.object.guild_id
+            || ready.attempt_id != transcript.value.plan.value.attempt_id
+            || ready.verification_hash
+                != mb_core::canonical_hash_bounded(
+                    transcript,
+                    mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                )?
+            || replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
+            || merkle_commit(&ready.object.bytes)? != ready.object.commitment
+        {
+            anyhow::bail!("legacy information activation differs from its original witness");
+        }
+        self.check()
     }
 
     pub(crate) fn paged_checkpoint_trust(&self) -> Result<mb_core::PagedCheckpointTrust> {
@@ -361,7 +415,7 @@ impl<'a> AuthorityReader<'a> {
         }
     }
 
-    pub(super) fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.control.get_record_bounded(
             "guild-installed",
             KEY,

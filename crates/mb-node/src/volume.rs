@@ -47,6 +47,7 @@ pub(crate) enum VolumeInterruption {
     VariableMigrationReceiptStored,
     VariableMigrationSourceRemoved,
     VariableMigrationIntentRetired,
+    VariableInformationEvidenceStored,
 }
 
 #[cfg(test)]
@@ -2095,7 +2096,18 @@ impl StorageVolumes {
         self.persist(control)
     }
 
+    #[cfg(test)]
     pub(crate) fn migrate_draining(&mut self, control: &ControlStore) -> Result<u64> {
+        self.migrate_draining_with_information_upgrade(control, |_| {
+            bail!("legacy information upgrade requires authenticated original authority")
+        })
+    }
+
+    pub(crate) fn migrate_draining_with_information_upgrade(
+        &mut self,
+        control: &ControlStore,
+        mut check: impl FnMut(&ReadyVariableObject) -> Result<()>,
+    ) -> Result<u64> {
         let draining = self
             .volumes
             .iter()
@@ -2181,12 +2193,23 @@ impl StorageVolumes {
                 }
             }
             loop {
-                let object = self
+                let store = self
                     .volumes
-                    .get(&source_id)
-                    .and_then(|volume| volume.store.as_ref())
-                    .context("draining volume became unavailable")?
-                    .first_ready_variable_object()?;
+                    .get_mut(&source_id)
+                    .and_then(|volume| volume.store.as_mut())
+                    .context("draining volume became unavailable")?;
+                let mut upgraded = false;
+                let object =
+                    control.with_catalog_checkpoint_payload_retirement(|_| -> Result<_> {
+                        store.first_ready_variable_object_with_information_upgrade(|ready| {
+                            check(ready)?;
+                            upgraded = true;
+                            Ok(())
+                        })
+                    })?;
+                if upgraded {
+                    volume_interruption(VolumeInterruption::VariableInformationEvidenceStored)?;
+                }
                 let Some(object) = object else {
                     break;
                 };

@@ -143,6 +143,18 @@ fn checkpoint_owner_proof_with_private(
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
+    checkpoint_owner_proof_at(node, keys, private, unix_seconds() + 600)
+}
+
+fn checkpoint_owner_proof_at(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+    expires: u64,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
     use mb_core::{
         CatalogBuilder, CatalogCheckpointAuthorityBuilder, CatalogCheckpointAuthorityRecord as R,
         CatalogCodingDirectoryBuilder, CatalogLegacyRevisionRef, CatalogPackedSectorBuilder,
@@ -292,7 +304,7 @@ fn checkpoint_owner_proof_with_private(
             delegator: keys[2].node_id(),
             coding_coordinator: keys[3].node_id(),
             verification_coordinator: keys[4].node_id(),
-            expires_at_unix_seconds: unix_seconds() + 600,
+            expires_at_unix_seconds: expires,
             information_roots: Some(vec![descriptor.flat_root]),
         };
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[2]).unwrap();
@@ -646,14 +658,24 @@ fn paged_checkpoint_node_private_dependency_authenticates_roots_and_preserves_cu
     );
 }
 
-fn exercise_checkpoint_payload_custody(information: bool) {
+fn exercise_checkpoint_payload_custody(information: bool, legacy: bool) {
     let (temp, seed, mut node, mut keys) = fixture();
     let local = keys
         .iter()
         .position(|key| key.node_id() == node.keys.node_id())
         .unwrap();
     keys.swap(if information { 0 } else { 1 }, local);
-    let (proof, intents) = checkpoint_owner_proof(&mut node, &keys);
+    if legacy {
+        let source = temp.path().join("legacy-source-volume");
+        std::fs::create_dir(&source).unwrap();
+        node.configure_storage_volumes(&[source], 64 << 20, 0)
+            .unwrap();
+    }
+    let (proof, intents) = if legacy {
+        checkpoint_owner_proof_at(&mut node, &keys, false, 1)
+    } else {
+        checkpoint_owner_proof(&mut node, &keys)
+    };
     let group = proof
         .index()
         .index()
@@ -721,7 +743,31 @@ fn exercise_checkpoint_payload_custody(information: bool) {
         node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
             .is_err()
     );
-    if information {
+    if legacy {
+        // Reproduce the prior normal upload/activation state without inventing
+        // a receipt or changing its original expired plan and signed witness.
+        node.volumes
+            .reserve_attempt(
+                &node.control,
+                &plan.value.attempt_id,
+                guild,
+                0,
+                shards[0].len() as u32,
+            )
+            .unwrap();
+        node.volumes
+            .write_attempt_range(&node.control, &plan.value.attempt_id, 0, 0, &shards[0])
+            .unwrap();
+        node.volumes
+            .finish_attempt_upload(
+                &node.control,
+                &plan.value.attempt_id,
+                storage,
+                0,
+                &plan.value.geometry.information[0].sector.commitment,
+            )
+            .unwrap();
+    } else if information {
         node.reserve_coding_information(plan, 0).unwrap();
         node.write_coding_information_range(plan, 0, 0, &shards[0])
             .unwrap();
@@ -747,7 +793,24 @@ fn exercise_checkpoint_payload_custody(information: bool) {
         node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
             .is_err()
     );
-    node.activate_coding_attempt(&entry.transcript).unwrap();
+    if legacy {
+        let commitment = merkle_commit(&shards[0]).unwrap();
+        let hash = *blake3::hash(&canonical_bytes(&entry.transcript).unwrap()).as_bytes();
+        node.volumes
+            .activate_attempt_object(
+                &node.control,
+                &plan.value.attempt_id,
+                &storage,
+                0,
+                &commitment,
+                &hash,
+            )
+            .unwrap();
+        node.persist_coding_group_transcript(&entry.transcript)
+            .unwrap();
+    } else {
+        node.activate_coding_attempt(&entry.transcript).unwrap();
+    }
     // A damaged locator must fail before a custody pin can be published. Its
     // SQL read is bounded independently of the original authenticated proof.
     let mut locator_key = storage.to_vec();
@@ -816,6 +879,23 @@ fn exercise_checkpoint_payload_custody(information: bool) {
         mb_core::GuildEventKind::ForgetCodingGroup { group_id: group },
     );
     node.install_guild_event(forget).unwrap();
+    if legacy {
+        let remove = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RemoveMember {
+                node_id: keys[4].node_id(),
+            },
+        );
+        node.install_guild_event(remove).unwrap();
+        assert_ne!(
+            node.dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .membership_epoch,
+            plan.value.membership_epoch
+        );
+    }
     node.discard_coding_attempt(&plan.value.attempt_id).unwrap();
     assert_eq!(
         node.volumes
@@ -863,12 +943,189 @@ fn exercise_checkpoint_payload_custody(information: bool) {
         .path;
     let destination = tempfile::tempdir().unwrap();
     node.configure_storage_volumes(
-        &[source_path, destination.path().to_path_buf()],
+        &[source_path.clone(), destination.path().to_path_buf()],
         64 << 20,
         0,
     )
     .unwrap();
     node.drain_storage_volume(source.volume_id).unwrap();
+    if legacy {
+        let witness = node
+            .control
+            .get_record("coding-transcript", &plan.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        let flat = node
+            .control
+            .get_record("guild-dynamic-state", KEY)
+            .unwrap()
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+            .unwrap();
+        node.control
+            .delete_record("coding-transcript", &plan.value.attempt_id)
+            .unwrap();
+        assert!(
+            node.migrate_draining_volumes()
+                .unwrap_err()
+                .to_string()
+                .contains("activation witness is unavailable")
+        );
+        node.control
+            .put_record(
+                "coding-transcript",
+                &plan.value.attempt_id,
+                &vec![0; mb_core::CATALOG_CODING_TRANSCRIPT_BYTES + 1],
+            )
+            .unwrap();
+        assert!(node.migrate_draining_volumes().is_err());
+        node.control
+            .put_record("coding-transcript", &plan.value.attempt_id, &witness)
+            .unwrap();
+        let other = proof
+            .index()
+            .index()
+            .next_group(Some(group))
+            .unwrap()
+            .unwrap()
+            .group
+            .range
+            .group_id;
+        let other = proof
+            .index()
+            .index()
+            .read_group(other, |page| {
+                node.control.catalog_page(
+                    mb_core::CatalogScope::Guild { guild_id: guild },
+                    mb_core::CatalogSection::Coding,
+                    page,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        node.control
+            .put_record(
+                "coding-transcript",
+                &plan.value.attempt_id,
+                &canonical_bytes(&other.transcript).unwrap(),
+            )
+            .unwrap();
+        assert!(node.migrate_draining_volumes().is_err());
+        node.control
+            .put_record("coding-transcript", &plan.value.attempt_id, &witness)
+            .unwrap();
+        let indexed = node
+            .control
+            .get_record("guild-original-tip-v1", KEY)
+            .unwrap()
+            .unwrap();
+        node.control
+            .delete_record("guild-original-tip-v1", KEY)
+            .unwrap();
+        assert!(
+            node.migrate_draining_volumes()
+                .unwrap_err()
+                .to_string()
+                .contains("complete original-history indexing")
+        );
+        node.control
+            .put_record("guild-original-tip-v1", KEY, &indexed)
+            .unwrap();
+        let member_key = plan.value.membership_epoch.to_be_bytes();
+        let members = node
+            .control
+            .get_record("guild-original-members", &member_key)
+            .unwrap()
+            .unwrap();
+        let mut damaged = members.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        node.control
+            .put_record("guild-original-members", &member_key, &damaged)
+            .unwrap();
+        assert!(node.migrate_draining_volumes().is_err());
+        node.control
+            .put_record("guild-original-members", &member_key, &members)
+            .unwrap();
+        assert_eq!(
+            node.volumes
+                .database_shell_statement(
+                    source.volume_id,
+                    "SELECT length(acknowledgement) FROM parity_objects",
+                    false
+                )
+                .unwrap()
+                .rows,
+            vec![vec!["0".to_owned()]]
+        );
+        assert_eq!(
+            node.control
+                .get_record("volume-receipt", &locator_key)
+                .unwrap(),
+            Some(locator.clone())
+        );
+        crate::volume::interrupt_next_volume_transition(
+            crate::volume::VolumeInterruption::VariableInformationEvidenceStored,
+        );
+        let injected = node.migrate_draining_volumes().unwrap_err();
+        assert!(
+            injected
+                .to_string()
+                .contains("VariableInformationEvidenceStored"),
+            "{injected:#}"
+        );
+        assert_eq!(
+            node.volumes
+                .database_shell_statement(
+                    source.volume_id,
+                    "SELECT lower(hex(acknowledgement)) FROM parity_objects",
+                    false
+                )
+                .unwrap()
+                .rows,
+            vec![vec![hex::encode(payload.transcript_hash)]]
+        );
+        node.control
+            .put_record("guild-dynamic-state", KEY, &flat)
+            .unwrap();
+        node.control
+            .delete_record("coding-transcript", &plan.value.attempt_id)
+            .unwrap();
+        drop(node);
+        node = Node::open(temp.path(), seed.clone()).unwrap();
+    } else if !information {
+        // Empty parity evidence is damage, even with the exact valid witness.
+        let original = node
+            .volumes
+            .database_shell_statement(
+                source.volume_id,
+                "SELECT hex(acknowledgement) FROM parity_objects",
+                false,
+            )
+            .unwrap()
+            .rows[0][0]
+            .clone();
+        node.volumes
+            .database_shell_statement(
+                source.volume_id,
+                "UPDATE parity_objects SET acknowledgement=X''",
+                false,
+            )
+            .unwrap();
+        assert!(
+            node.migrate_draining_volumes()
+                .unwrap_err()
+                .to_string()
+                .contains("not an information upload")
+        );
+        node.volumes
+            .database_shell_statement(
+                source.volume_id,
+                &format!("UPDATE parity_objects SET acknowledgement=X'{original}'"),
+                false,
+            )
+            .unwrap();
+    }
     crate::volume::interrupt_next_volume_transition(
         crate::volume::VolumeInterruption::VariableMigrationDestinationReady,
     );
@@ -882,6 +1139,11 @@ fn exercise_checkpoint_payload_custody(information: bool) {
     drop(node);
     let mut node = Node::open(temp.path(), seed.clone()).unwrap();
     node.migrate_draining_volumes().unwrap();
+    if legacy {
+        assert!(source_path.starts_with(temp.path()));
+        assert_ne!(source_path, temp.path());
+        std::fs::remove_dir_all(&source_path).unwrap();
+    }
     let moved: crate::volume::VolumeReceipt = decode_canonical(
         &node
             .control
@@ -1046,12 +1308,17 @@ fn exercise_checkpoint_payload_custody(information: bool) {
 
 #[test]
 fn paged_checkpoint_information_custody_survives_real_forget_rollback_and_reopen() {
-    exercise_checkpoint_payload_custody(true);
+    exercise_checkpoint_payload_custody(true, false);
 }
 
 #[test]
 fn paged_checkpoint_parity_custody_survives_real_forget_rollback_and_reopen() {
-    exercise_checkpoint_payload_custody(false);
+    exercise_checkpoint_payload_custody(false, false);
+}
+
+#[test]
+fn legacy_information_activation_upgrade_authenticates_history_and_evacuates_shared_custody() {
+    exercise_checkpoint_payload_custody(true, true);
 }
 
 #[test]

@@ -20,6 +20,8 @@ mod catalog;
 mod scratch;
 #[cfg(target_os = "linux")]
 mod scratch_space;
+#[cfg(test)]
+mod variable_information_upgrade_tests;
 #[cfg(target_os = "linux")]
 pub use anchor_discovery::{
     ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage, AnchorDiscoveryJobStatus,
@@ -2494,6 +2496,79 @@ impl ParityStore {
         Ok(result)
     }
 
+    /// Upgrade only an empty legacy information activation marker, after the
+    /// caller authenticates the original witness, role and historical authority.
+    /// Both checks and exact readback share this volume writer. The caller must
+    /// hold its control writer and must reject parity or unavailable evidence.
+    pub fn first_ready_variable_object_with_information_upgrade<E: From<DatabaseError>>(
+        &mut self,
+        mut check: impl FnMut(&ReadyVariableObject) -> Result<(), E>,
+    ) -> Result<Option<ReadyVariableObject>, E> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(DatabaseError::from)?;
+        let identity = tx
+            .query_row(
+                "SELECT CASE WHEN length(group_id) = 32 THEN group_id END, shard_index
+             FROM parity_objects WHERE state = 'READY' AND format_version = 2
+             ORDER BY group_id, shard_index LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(DatabaseError::from)?;
+        let Some((group, shard)) = identity else {
+            tx.commit().map_err(DatabaseError::from)?;
+            return Ok(None);
+        };
+        let group: [u8; 32] = group
+            .ok_or(DatabaseError::Integrity)?
+            .try_into()
+            .map_err(|_| DatabaseError::Integrity)?;
+        let shard = u16::try_from(shard).map_err(|_| DatabaseError::Integrity)?;
+        let ready = self.read_ready_variable_activation(&group, shard)?;
+        let result = if ready.staged_receipt.is_empty() {
+            check(&ready)?;
+            if tx
+                .execute(
+                    "UPDATE parity_objects SET acknowledgement = ?1
+                 WHERE group_id = ?2 AND shard_index = ?3 AND format_version = 2
+                 AND state = 'READY' AND attempt_id = ?4 AND verification_hash = ?1
+                 AND acknowledgement = X''",
+                    params![
+                        ready.verification_hash.as_slice(),
+                        group.as_slice(),
+                        shard,
+                        ready.attempt_id.as_slice()
+                    ],
+                )
+                .map_err(DatabaseError::from)?
+                != 1
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+            let mut expected = ready.clone();
+            expected.staged_receipt = ready.verification_hash.to_vec();
+            let stored = self.read_ready_variable_object(&group, shard)?;
+            if stored != expected {
+                return Err(DatabaseError::Integrity.into());
+            }
+            check(&ready)?;
+            // The final independent guard may itself observe a fault; read the
+            // exact physical object again before committing the marker.
+            if self.read_ready_variable_object(&group, shard)? != expected {
+                return Err(DatabaseError::Integrity.into());
+            }
+            stored
+        } else {
+            ready
+        };
+        tx.commit().map_err(DatabaseError::from)?;
+        Ok(Some(result))
+    }
+
     /// Install a previously verified READY shard on another local volume in
     /// one transaction. Preserve its receipt and activation evidence exactly;
     /// reservations count against the destination budget. Local control must
@@ -2603,30 +2678,45 @@ impl ParityStore {
         group_id: &[u8; 32],
         shard_index: u16,
     ) -> Result<ReadyVariableObject, DatabaseError> {
+        let ready = self.read_ready_variable_activation(group_id, shard_index)?;
+        if ready.staged_receipt.is_empty() {
+            return Err(DatabaseError::Integrity);
+        }
+        Ok(ready)
+    }
+
+    // Only the authenticated upgrade writer may inspect an empty legacy
+    // information marker. Normal transfer/copy readers remain strict.
+    fn read_ready_variable_activation(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<ReadyVariableObject, DatabaseError> {
         let object = self.load_ready_variable(group_id, shard_index)?;
         let (attempt_id, verification_hash, staged_receipt) = self.connection.query_row(
-            "SELECT attempt_id, verification_hash, acknowledgement FROM parity_objects
+            "SELECT CASE WHEN length(attempt_id) = 16 THEN attempt_id END,
+             CASE WHEN length(verification_hash) = 32 THEN verification_hash END,
+             CASE WHEN length(acknowledgement) <= 65536 THEN acknowledgement END FROM parity_objects
              WHERE group_id = ?1 AND shard_index = ?2 AND format_version = 2 AND state = 'READY'",
             params![group_id.as_slice(), shard_index],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
                 ))
             },
         )?;
         let attempt_id: [u8; 16] = attempt_id
+            .ok_or(DatabaseError::Integrity)?
             .try_into()
             .map_err(|_| DatabaseError::Integrity)?;
         let verification_hash: [u8; 32] = verification_hash
+            .ok_or(DatabaseError::Integrity)?
             .try_into()
             .map_err(|_| DatabaseError::Integrity)?;
-        if attempt_id == [0; 16]
-            || verification_hash == [0; 32]
-            || staged_receipt.is_empty()
-            || staged_receipt.len() > 64 * 1024
-        {
+        let staged_receipt = staged_receipt.ok_or(DatabaseError::Integrity)?;
+        if attempt_id == [0; 16] || verification_hash == [0; 32] {
             return Err(DatabaseError::Integrity);
         }
         Ok(ReadyVariableObject {

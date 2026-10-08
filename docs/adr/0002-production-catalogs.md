@@ -4089,3 +4089,68 @@ cooperative normal producers, full physical/dataset/guild quota and actual
 retained 1 TiB/native/platform/topology/release qualification remain open. Normal
 paged checkpoint producers remain disabled. Original signed identities and wire
 layouts are unchanged.
+
+## Authenticated upgrade of historical information activation (2026-10-08)
+
+Prior normal information uploads can be physically READY with the original
+attempt and verified transcript hash but an empty activation-receipt field.
+Normal evacuation now upgrades that specific legacy state using its original
+signed witness. It does not relax the ordinary READY transfer/copy reader or
+the parity receipt requirement. The upgraded field contains the original
+verified transcript hash, exactly as fresh information activation and recovery
+already store it; no signed identity, payload, attempt or verification hash is
+replaced, and no wire/schema version changes.
+
+Node resolves the canonical bounded `coding-transcript` record by the physical
+object's original attempt ID. It requires its exact original hash, replays the
+full signed coding witness, verifies the assigned local nonvirtual information
+role and checks the actual storage ID, role index, guild and full Merkle
+commitment. An independently frozen original-history view authenticates the
+plan against its original indexed membership roster. Expiry and later removal
+do not invalidate historical evidence; this never authorizes a new attempt or
+new protection claim. A valid different transcript cannot substitute for the
+original. Empty parity evidence remains damage and is rejected even when its
+transcript otherwise verifies.
+
+This path requires complete original-history indexing and independently checks
+original genesis, compact current authority, original tail and index marker
+around successful lookups. It never materializes unused flat history or falls
+back to a group-key witness. Missing original activation witnesses must be
+recovered before evacuation; absent/incomplete indexes must finish their
+existing original-event replay. Missing, oversized or corrupt witnesses,
+rosters and activation metadata preserve the legacy READY bytes and locator.
+Existing witness recovery can restore the exact original attempt record; a new
+receipt or later coding group's evidence is not a substitute.
+
+The control immediate writer excludes concurrent custody acquisition and
+destructive work while one bounded volume writer reads the actual candidate,
+authenticates it, conditionally fills only its empty marker and reads back the
+exact complete object. Independent checks run before and after mutation, with
+another exact physical readback after the final guard. Ignored SQL updates,
+changed bytes or activation identities and late authentication failures roll
+back the marker. Fixed-size activation fields and the 64 KiB receipt limit are
+checked in SQL before allocation; source payloads and original transcripts keep
+their existing bounds. No whole-volume/history collection is introduced.
+
+An interruption immediately after upgrade leaves an independently usable
+original marker. Reopen resumes ordinary verified evacuation even if the local
+attempt witness subsequently becomes unavailable. Destination verification,
+source withdrawal, pending operations, offline copies, shared checkpoint pins
+and repair continue through their existing durable lifecycle. The broader
+cooperative worker, archive accounting, native upgrade, quota and actual
+retained-capacity/platform/topology/release gates remain separate M6 work.
+
+Qualification closes the reopened R4 historical-information item: the full
+ordinary store suite passes 276 tests (26 ignored), and the selected Node
+authority/volume/real-upload evacuation suite passes 82 tests (one ignored).
+The ignored physical headroom case separately passes on disposable Btrfs, as do
+all three information/parity/legacy custody lifecycles; mount, loop-device and
+image cleanup is verified. The legacy lifecycle uses an expired original plan
+after membership removal and real source directory removal, then checks repair,
+shared owners and final collection. Negative cases cover missing/oversized or
+substituted witnesses, absent indexing, corrupt original rosters, parity damage,
+SQL faults, competing volume writers and late authentication failure. Reopen
+after the marker commit succeeds even without the local attempt witness.
+Formatting and strict workspace/all-targets Clippy pass. M6 remains open for
+R1/R2/R3/R5/R7; these local regressions do not replace installed-artifact,
+native/platform/topology or retained 1 TiB qualification.

@@ -29,10 +29,10 @@ separately below.
 
 Checkpoint custody work on 2026-10-08 preserves candidate public/private
 metadata and individual local READY payload roles; it does not close M6 or
-enable normal paged producers. Real-upload evacuation exposed missing evidence
-in prior information activation, so R4 is reopened for authenticated historical
-upgrade/qualification. All R1/R2/R3/R4/R5/R7 requirements and remaining native
-platform, full activation/quota and retained 1 TiB gates remain active.
+enable normal paged producers. Authenticated historical information evidence
+upgrade and real-source evacuation now close the reopened R4 item. R1/R2/R3/R5/R7
+and remaining native platform, full activation/quota and retained 1 TiB gates
+remain active.
 
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
@@ -1941,13 +1941,15 @@ platform, full activation/quota and retained 1 TiB gates remain active.
     retention and seed-only recovery together; qualify the declared capacity
     and geometry policy on real data before enabling production admission.
 
-- [ ] **R4 / P1 — Complete variable-profile disk evacuation.**
-  Reopened on 2026-10-08: a real normal information upload exposed an older
-  activation path that made bytes READY without the evidence required by the
-  migration reader. Fresh activations now retain the verified original
-  transcript hash, matching recovery; missing evidence still fails closed.
-  Existing stores with already-READY empty-evidence uploads need authenticated
-  upgrade/backfill and qualification before this item can close again.
+- [x] **R4 / P1 — Complete variable-profile disk evacuation.**
+  Closed again on 2026-10-08 after qualifying authenticated upgrade of older
+  information uploads that became READY with an empty activation marker.
+  Normal evacuation authenticates the exact original signed transcript and
+  historical indexed roster, then atomically fills only that empty marker with
+  the existing verified transcript hash. Expiry or later membership removal
+  does not invalidate historical evidence. Missing original witnesses or
+  incomplete indexes require recovery/replay before evacuation; damaged fields,
+  substituted witnesses and empty parity receipts preserve the source and fail.
   Implemented bounded READY enumeration and durable local transfers for variable
   information/parity shards alongside legacy objects. Destination writes count
   reservations and headroom, preserve attempt/receipt/verification evidence,
@@ -1967,12 +1969,26 @@ platform, full activation/quota and retained 1 TiB gates remain active.
     through candidate custody, Forget/rollback, interrupted evacuation and
     reopen, including independent shared owners and final collection. See the
     checkpoint payload custody entry and ADR 0002 for current validation.
-  - [ ] Define and qualify an authenticated upgrade for prior uploaded
+  - [x] Define and qualify an authenticated upgrade for prior uploaded
     information that is already READY with an empty activation-receipt field.
     Preserve original bytes, identity, attempt and verified transcript binding;
     do not fabricate a parity receipt or accept damaged activation evidence.
     Include original-history recovery, missing original witnesses, interruption,
     reopen, shared custody and actual source removal.
+    The real Node lifecycle verifies an expired original plan after membership
+    removal, missing/oversized/substituted original witnesses, absent indexing,
+    a damaged historical roster, interruption immediately after upgrade, reopen
+    without the local attempt witness, shared custody, repair and removal of the
+    actual source directory. Unused flat history cannot supply a fallback. Two
+    store fixtures verify rollback at both authentication boundaries, ignored
+    updates, altered bytes/identity, competing writers, damaged field bounds,
+    strict readers, copy and source withdrawal after reopen. Current validation:
+    all 276 ordinary store tests pass (26 ignored); 82 selected Node authority,
+    volume and upload/evacuation regressions pass (one ignored headroom case).
+    That headroom case and all three information/parity/legacy custody lifecycles
+    also pass on disposable Btrfs, with mount/loop/image cleanup verified.
+    Formatting and strict workspace/all-targets Clippy pass. Broader installed
+    artifact/native/platform qualification remains R7.
 
   - [x] Repair interrupted coding-upload reservation retirement. A retry after
     receipt publication now verifies the physical STAGED/READY shard and the

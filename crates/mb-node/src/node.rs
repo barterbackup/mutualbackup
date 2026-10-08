@@ -3322,7 +3322,23 @@ impl Node {
     }
 
     pub fn migrate_draining_volumes(&mut self) -> Result<u64> {
-        let migrated = self.volumes.migrate_draining(&self.control)?;
+        let control = &self.control;
+        let holder = self.keys.node_id();
+        let mut authority = None;
+        let migrated = self.volumes.migrate_draining_with_information_upgrade(control, |ready| {
+            if authority.is_none() {
+                authority = Some(guild_authority::frozen_original_history(control)?);
+            }
+            let bytes = control.get_record_bounded(
+                "coding-transcript", &ready.attempt_id, mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+            )?.context("original information activation witness is unavailable; recover it before evacuation")?;
+            let transcript = mb_core::decode_coding_transcript_bounded(&bytes)?;
+            authority.as_ref().context("original history is unavailable")?
+                .validate_information_activation(ready, &transcript, holder)
+        })?;
+        if let Some(authority) = authority {
+            authority.check()?;
+        }
         self.refresh_volume_readers()?;
         self.clear_automatic_backup_block()?;
         Ok(migrated)

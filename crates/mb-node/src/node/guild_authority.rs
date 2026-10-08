@@ -35,6 +35,12 @@ pub(super) fn with_history<T>(
     authority.check()?;
     Ok(Some(result))
 }
+
+pub(super) fn frozen_original_history(
+    control: &ControlStore,
+) -> Result<original_history::AuthorityReader<'_>> {
+    original_history::AuthorityReader::open_complete(control)
+}
 pub(super) fn read_membership_epoch(
     control: &ControlStore,
     epoch: u64,

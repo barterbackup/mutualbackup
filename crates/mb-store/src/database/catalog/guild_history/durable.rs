@@ -677,6 +677,38 @@ pub struct CatalogDurableGuildHistoryView<'a> {
     control: &'a ControlStore,
 }
 impl CatalogDurableGuildHistoryView<'_> {
+    /// Authenticate an original plan against its independently indexed roster.
+    /// Historical activation evidence remains valid after expiry or removal;
+    /// this does not authorize launching or protecting a new coding attempt.
+    pub fn validate_historical_coding_plan(
+        &self,
+        plan: &mb_core::SignedRecord<mb_core::CodingAttemptPlan>,
+    ) -> Result<(), CatalogStoreError> {
+        plan.verify(mb_core::CODING_ATTEMPT_PLAN_DOMAIN)?;
+        plan.value
+            .validate()
+            .map_err(|_| DatabaseError::Integrity)?;
+        if plan.signer != plan.value.delegator {
+            return Err(DatabaseError::Integrity.into());
+        }
+        let roster = self
+            .point::<GuildAuthoritySnapshot>(MEMBERS, &plan.value.membership_epoch.to_be_bytes())?
+            .ok_or(DatabaseError::NotReady)?;
+        GuildAuthoritySnapshot::decode(&canonical_bytes_bounded(
+            &roster,
+            GUILD_AUTHORITY_SNAPSHOT_BYTES,
+        )?)?;
+        if roster.guild_id != self.history.authority().guild_id
+            || roster.membership_epoch != plan.value.membership_epoch
+            || roster.membership_epoch > self.history.authority().membership_epoch
+            || roster.event_sequence > self.history.authority().event_sequence
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        roster.validate_attempt_authority(&plan.value)?;
+        self.history.check(self.control)
+    }
+
     fn point<T: DeserializeOwned + Serialize>(
         &self,
         name: &str,
