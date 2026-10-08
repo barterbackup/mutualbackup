@@ -2285,7 +2285,66 @@ impl RawFileAnchorManifestV2 {
     }
 }
 
+/// Ownership metadata only. A native source identity can still contain an old
+/// device number; a zero inode denotes an imported stream, not a native file.
+#[derive(Clone, Copy, Debug)]
+pub struct PreservedFileAnchor<'a> {
+    pub recorded_file_identity: Option<NativeFileId>,
+    pub stable_file_identity: Option<NativeFileId>,
+    pub locator_anchor_id: Uuid,
+    pub locator_relative_path: &'a Path,
+}
+
 impl FileAnchorManifest {
+    /// Validate the retained shape without opening payloads, ownership markers
+    /// or discovery locations, including withdrawn root-backed manifests.
+    pub fn preserved_ownership(&self) -> anyhow::Result<PreservedFileAnchor<'_>> {
+        anyhow::ensure!(
+            matches!(self.format_version, 1 | 2)
+                && (self.format_version == 1) == self.guarded_root_file.is_none()
+                && !self.anchor_id.is_nil()
+                && !self.area.area_id.is_nil()
+                && self.source_version.filesystem_id == self.area.filesystem_id
+                && self.source_version.logical_len == self.logical_len,
+            "invalid preserved file anchor ownership"
+        );
+        self.source_version.validate_preserved_metadata()?;
+        for path in [
+            &self.source_root_hint,
+            &self.area.path_hint,
+            &self.area.volume_root_hint,
+        ] {
+            validate_preserved_path_hint(path)?;
+        }
+        validate_preserved_relative(&self.source_relative_path)?;
+        let recorded_file_identity =
+            (self.source_version.inode != 0).then(|| self.source_file_identity());
+        let (stable_file_identity, locator_anchor_id, locator_relative_path) =
+            if let Some(backing) = &self.guarded_root_file {
+                validate_preserved_relative(&backing.captured_relative_path)?;
+                anyhow::ensure!(
+                    !backing.root_anchor_id.is_nil()
+                        && backing.root_anchor_id != self.anchor_id
+                        && backing.native_id.inode != 0
+                        && Some(backing.native_id) == recorded_file_identity,
+                    "invalid preserved guarded file backing"
+                );
+                (
+                    Some(backing.native_id),
+                    backing.root_anchor_id,
+                    backing.captured_relative_path.as_path(),
+                )
+            } else {
+                (None, self.anchor_id, Path::new(FILE_ANCHOR_PAYLOAD))
+            };
+        Ok(PreservedFileAnchor {
+            recorded_file_identity,
+            stable_file_identity,
+            locator_anchor_id,
+            locator_relative_path,
+        })
+    }
+
     pub(crate) fn source_file_identity(&self) -> NativeFileId {
         NativeFileId {
             filesystem_id: self.source_version.filesystem_id,
@@ -2460,22 +2519,44 @@ pub(crate) fn validate_preserved_capture_root(
     );
     version.validate_preserved()?;
     for path in [source, &area.path_hint, &area.volume_root_hint] {
+        validate_preserved_path_hint(path)?;
+    }
+    Ok(())
+}
+
+fn validate_preserved_path_hint(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        path.is_absolute()
+            && !path
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
+            && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str(),
+        "unsafe preserved capture path hint"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
         anyhow::ensure!(
-            path.is_absolute()
-                && !path
-                    .components()
-                    .any(|part| matches!(part, Component::ParentDir))
-                && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str(),
+            !path.as_os_str().as_bytes().contains(&0),
             "unsafe preserved capture path hint"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            anyhow::ensure!(
-                !path.as_os_str().as_bytes().contains(&0),
-                "unsafe preserved capture path hint"
-            );
-        }
+    }
+    Ok(())
+}
+
+fn validate_preserved_relative(path: &Path) -> anyhow::Result<()> {
+    validate_relative(path)?;
+    anyhow::ensure!(
+        path.components().collect::<PathBuf>().as_os_str() == path.as_os_str(),
+        "unsafe preserved anchor relative path"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        anyhow::ensure!(
+            !path.as_os_str().as_bytes().contains(&0),
+            "unsafe preserved anchor relative path"
+        );
     }
     Ok(())
 }
@@ -2539,9 +2620,14 @@ impl CaptureVersion {
     }
 
     pub(crate) fn validate_preserved(&self) -> anyhow::Result<()> {
+        self.validate_preserved_metadata()?;
+        anyhow::ensure!(self.inode != 0, "invalid preserved capture inode");
+        Ok(())
+    }
+
+    fn validate_preserved_metadata(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.filesystem_id != 0
-                && self.inode != 0
                 && (0..1_000_000_000).contains(&self.modified_nanos)
                 && (0..1_000_000_000).contains(&self.changed_nanos),
             "invalid preserved capture version"

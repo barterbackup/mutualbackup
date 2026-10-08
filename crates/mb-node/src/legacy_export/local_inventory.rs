@@ -1,5 +1,8 @@
 //! Preserved local registrations and historical anchor ownership, without
-//! opening a source path, Git runtime, anchor payload or withdrawn mount.
+//! opening a source path, Git catalog, anchor payload or withdrawn mount.
+
+mod anchors;
+mod git_intents;
 
 use std::{collections::BTreeMap, os::unix::ffi::OsStrExt};
 
@@ -16,7 +19,11 @@ use uuid::Uuid;
 
 use super::inventory::LegacyRevisionInventoryEntry;
 use crate::control::{GitRepositoryInfo, ProtectedRoot};
-use crate::snapshot::preserved::PreservedCaptureIntent;
+use crate::snapshot::preserved::{PreservedCaptureIntent, PreservedGitGraphIntent};
+use anchors::PreservedAnchor;
+pub use git_intents::{
+    LegacyGitBlobPin, LegacyGitGraphObject, LegacyGitGraphRef, LegacyPendingGitGraph,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyLocalStateInventory {
@@ -25,6 +32,9 @@ pub struct LegacyLocalStateInventory {
     pub git_repositories: Vec<LegacyGitRegistration>,
     pub guarded_captures: Vec<LegacyGuardedCapture>,
     pub pending_captures: Vec<LegacyPendingCapture>,
+    pub pending_git_graphs: Vec<LegacyPendingGitGraph>,
+    pub retained_anchors: Vec<LegacyRetainedAnchor>,
+    pub anchor_area_locations: Vec<LegacyAnchorAreaLocation>,
     /// These rows are preserved and identified, not decoded or certified as
     /// complete ownership. Their presence remains a retained-history gap.
     pub unclassified_guarded_records: Vec<LegacyPreservedRecord>,
@@ -108,9 +118,9 @@ pub struct LegacyCaptureOwnership {
     pub source_path_hint_hex: String,
     pub area_id: Uuid,
     /// Historical native records do not distinguish st_dev from a stable ID.
-    pub recorded_area_filesystem_id: u64,
+    pub recorded_area_filesystem_id: Option<u64>,
     pub area_path_hint_hex: String,
-    pub volume_root_hint_hex: String,
+    pub volume_root_hint_hex: Option<String>,
     pub recorded_root_identity: Option<NativeFileId>,
     pub stable_root_identity: Option<NativeFileId>,
     pub file_pins: Vec<LegacyPendingFilePin>,
@@ -122,6 +132,24 @@ pub struct LegacyPendingFilePin {
     pub capture_id: Uuid,
     pub recorded_file_identity: Option<NativeFileId>,
     pub logical_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyAnchorAreaLocation {
+    pub area_id: Uuid,
+    pub path_hint_hex: String,
+    pub absolute_path: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyRetainedAnchor {
+    pub record_kind: String,
+    pub record_id: Uuid,
+    pub revision_id: Option<Uuid>,
+    pub protected_root_id: Option<Uuid>,
+    pub signed_revision_metadata_available: bool,
+    pub anchor: LegacyCaptureOwnership,
+    pub payloads_verified: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,6 +174,16 @@ pub(super) enum PreservedLocalRecord<'a> {
     PendingCapture {
         kind: &'a str,
         intent: &'a PreservedCaptureIntent,
+    },
+    PendingGitGraph(&'a PreservedGitGraphIntent),
+    Anchor {
+        kind: &'a str,
+        record_id: Uuid,
+        anchor: &'a PreservedAnchor,
+    },
+    AreaLocation {
+        area_id: Uuid,
+        path: std::path::PathBuf,
     },
     Unclassified {
         kind: &'a str,
@@ -210,6 +248,18 @@ impl PreservedLocalRecord<'_> {
                 if let Some(old) = &intent.replaced_anchor {
                     visit(PreservedInput::PathHint(&old.source_root_hint))?;
                     visit(PreservedInput::PathHint(&old.area.path_hint))?;
+                }
+            }
+            Self::PendingGitGraph(intent) => {
+                for blob in &intent.graph.blobs {
+                    visit(PreservedInput::PathHint(&blob.anchor.source_root_hint))?;
+                    visit(PreservedInput::PathHint(&blob.anchor.area.path_hint))?;
+                }
+            }
+            Self::Anchor { anchor, .. } => anchor.for_each_input(&mut visit)?,
+            Self::AreaLocation { path, .. } => {
+                if path.is_absolute() {
+                    visit(PreservedInput::PathHint(path))?;
                 }
             }
             Self::Unclassified { .. } => {}
@@ -300,85 +350,7 @@ fn validate_pending(intent: &PreservedCaptureIntent) -> Result<()> {
         "invalid preserved requested source path"
     );
     if let Some(anchor) = &intent.replaced_anchor {
-        ensure!(
-            matches!(anchor.format_version, 2 | 3)
-                && !anchor.anchor_id.is_nil()
-                && !anchor.area.area_id.is_nil()
-                && anchor.area.filesystem_id != 0
-                && anchor.root_modified_nanos < 1_000_000_000,
-            "invalid preserved replaced anchor"
-        );
-        for path in [
-            &anchor.source_root_hint,
-            &anchor.area.path_hint,
-            &anchor.area.volume_root_hint,
-        ] {
-            validate_hint(path)?;
-        }
-        let mut paths = std::collections::BTreeSet::new();
-        for entry in &anchor.entries {
-            let (path, nanos) = match entry {
-                mb_store::CapturedEntry::Directory {
-                    path,
-                    modified_nanos,
-                    ..
-                }
-                | mb_store::CapturedEntry::File {
-                    path,
-                    modified_nanos,
-                    ..
-                }
-                | mb_store::CapturedEntry::FileV2 {
-                    path,
-                    modified_nanos,
-                    ..
-                } => (path, modified_nanos),
-            };
-            let mut normalized = std::path::PathBuf::new();
-            for component in path.components() {
-                let std::path::Component::Normal(name) = component else {
-                    anyhow::bail!("unsafe preserved replaced anchor entry")
-                };
-                normalized.push(name);
-            }
-            let bytes = path.as_os_str().as_bytes();
-            ensure!(
-                !bytes.is_empty()
-                    && !bytes.contains(&0)
-                    && normalized.as_os_str().as_bytes() == bytes
-                    && paths.insert(bytes)
-                    && *nanos < 1_000_000_000
-                    && (anchor.format_version == 3 || path.to_str().is_some()),
-                "invalid preserved replaced anchor entry"
-            );
-            if let mb_store::CapturedEntry::FileV2 {
-                native_id,
-                logical_len,
-                data_extents,
-                ..
-            } = entry
-            {
-                ensure!(
-                    native_id.filesystem_id != 0 && native_id.inode != 0,
-                    "invalid preserved replaced file identity"
-                );
-                let mut end = 0;
-                for extent in data_extents {
-                    ensure!(
-                        extent.logical_len != 0 && extent.offset >= end,
-                        "invalid preserved replaced file extents"
-                    );
-                    end = extent
-                        .offset
-                        .checked_add(extent.logical_len)
-                        .context("preserved replaced file extent overflow")?;
-                    ensure!(
-                        end <= *logical_len,
-                        "preserved replaced file extent exceeds file"
-                    );
-                }
-            }
-        }
+        anchors::validate_stable(anchor)?;
     }
     Ok(())
 }
@@ -396,9 +368,9 @@ fn ownership(
         anchor_id,
         source_path_hint_hex: hex::encode(source.as_os_str().as_bytes()),
         area_id: area.area_id,
-        recorded_area_filesystem_id: area.filesystem_id,
+        recorded_area_filesystem_id: Some(area.filesystem_id),
         area_path_hint_hex: hex::encode(area.path_hint.as_os_str().as_bytes()),
-        volume_root_hint_hex: hex::encode(area.volume_root_hint.as_os_str().as_bytes()),
+        volume_root_hint_hex: Some(hex::encode(area.volume_root_hint.as_os_str().as_bytes())),
         recorded_root_identity: recorded,
         stable_root_identity: stable,
         file_pins: Vec::new(),
@@ -466,6 +438,48 @@ pub(super) fn for_each_record(
             Ok(true)
         })?;
     }
+    control.for_each_record_bounded(
+        "git-graph-intent-v1",
+        16,
+        V1_MAX_CATALOG_BYTES,
+        |key, bytes| {
+            let intent = crate::snapshot::preserved::decode_git_graph_intent(key, bytes)?;
+            visit(PreservedLocalRecord::PendingGitGraph(&intent))?;
+            Ok(true)
+        },
+    )?;
+    for kind in ["anchor-manifest", "anchor-retirement"] {
+        control.for_each_record_bounded(kind, 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
+            let record_id = Uuid::from_slice(key)?;
+            ensure!(!record_id.is_nil(), "invalid preserved anchor record key");
+            let anchor = PreservedAnchor::decode(kind, bytes)?;
+            ensure!(
+                kind == "anchor-manifest" || record_id == anchor.anchor_id(),
+                "preserved anchor retirement key differs from anchor ID"
+            );
+            visit(PreservedLocalRecord::Anchor {
+                kind,
+                record_id,
+                anchor: &anchor,
+            })?;
+            Ok(true)
+        })?;
+    }
+    control.for_each_record_bounded(
+        "anchor-area-location",
+        16,
+        crate::snapshot::preserved::PRESERVED_AREA_LOCATION_BYTES,
+        |key, bytes| {
+            let area_id = Uuid::from_slice(key)?;
+            ensure!(
+                !area_id.is_nil(),
+                "invalid preserved anchor area location key"
+            );
+            let path = crate::snapshot::preserved::decode_area_location(bytes)?;
+            visit(PreservedLocalRecord::AreaLocation { area_id, path })?;
+            Ok(true)
+        },
+    )?;
     for prefix in ["guarded-", "link-freeze-"] {
         control.for_each_record_with_kind_prefix_bounded(
             prefix,
@@ -522,6 +536,9 @@ pub(super) fn collect(
         git_repositories: Vec::new(),
         guarded_captures: Vec::new(),
         pending_captures: Vec::new(),
+        pending_git_graphs: Vec::new(),
+        retained_anchors: Vec::new(),
+        anchor_area_locations: Vec::new(),
         unclassified_guarded_records: Vec::new(),
     };
     for_each_record(control, |record| {
@@ -632,42 +649,11 @@ pub(super) fn collect(
                     planned.file_pins.push(pin);
                     Ok(())
                 })?;
-                let replaced = if let Some(old) = &intent.replaced_anchor {
-                    let mut anchor = ownership(
-                        old.format_version,
-                        old.anchor_id,
-                        &old.source_root_hint,
-                        &old.area,
-                        None,
-                        None,
-                    );
-                    account(&anchor, used, limit)?;
-                    for entry in &old.entries {
-                        let (path, len, id) = match entry {
-                            mb_store::CapturedEntry::Directory { .. } => continue,
-                            mb_store::CapturedEntry::File {
-                                path, logical_len, ..
-                            } => (path, *logical_len, None),
-                            mb_store::CapturedEntry::FileV2 {
-                                path,
-                                logical_len,
-                                native_id,
-                                ..
-                            } => (path, *logical_len, Some(*native_id)),
-                        };
-                        let pin = LegacyPendingFilePin {
-                            relative_path_hex: hex::encode(path.as_os_str().as_bytes()),
-                            capture_id: old.anchor_id,
-                            recorded_file_identity: id,
-                            logical_len: len,
-                        };
-                        account(&pin, used, limit)?;
-                        anchor.file_pins.push(pin);
-                    }
-                    Some(anchor)
-                } else {
-                    None
-                };
+                let replaced = intent
+                    .replaced_anchor
+                    .as_ref()
+                    .map(|old| anchors::report_stable(old, used, limit))
+                    .transpose()?;
                 let entry = LegacyPendingCapture {
                     record_kind: kind.to_owned(),
                     record_format: intent.record_format,
@@ -709,6 +695,57 @@ pub(super) fn collect(
                 );
                 account(&envelope, used, limit)?;
                 report.pending_captures.push(entry);
+            }
+            PreservedLocalRecord::PendingGitGraph(intent) => {
+                let mut entry = git_intents::report(intent, used, limit)?;
+                entry.registered_root = report
+                    .protected_roots
+                    .binary_search_by_key(&intent.protected_root_id, |root| root.root_id)
+                    .is_ok();
+                entry.registered_repository = report
+                    .git_repositories
+                    .binary_search_by_key(&intent.graph.repository_id, |repository| {
+                        repository.repository_id
+                    })
+                    .is_ok();
+                report.pending_git_graphs.push(entry);
+            }
+            PreservedLocalRecord::Anchor {
+                kind,
+                record_id,
+                anchor,
+            } => {
+                let entry = LegacyRetainedAnchor {
+                    record_kind: kind.to_owned(),
+                    record_id,
+                    revision_id: (kind == "anchor-manifest").then_some(record_id),
+                    protected_root_id: None,
+                    signed_revision_metadata_available: false,
+                    anchor: anchor.report(used, limit)?,
+                    payloads_verified: false,
+                };
+                account(
+                    &(
+                        &entry.record_kind,
+                        entry.record_id,
+                        entry.revision_id,
+                        entry.protected_root_id,
+                        entry.signed_revision_metadata_available,
+                        entry.payloads_verified,
+                    ),
+                    used,
+                    limit,
+                )?;
+                report.retained_anchors.push(entry);
+            }
+            PreservedLocalRecord::AreaLocation { area_id, path } => {
+                let entry = LegacyAnchorAreaLocation {
+                    area_id,
+                    path_hint_hex: hex::encode(path.as_os_str().as_bytes()),
+                    absolute_path: path.is_absolute(),
+                };
+                account(&entry, used, limit)?;
+                report.anchor_area_locations.push(entry);
             }
             PreservedLocalRecord::Unclassified { kind, key, bytes } => {
                 let entry = LegacyPreservedRecord {
@@ -757,6 +794,20 @@ impl LegacyLocalStateInventory {
             intent.signed_revision_metadata_available = revisions
                 .get(&intent.revision_id)
                 .is_some_and(|revision| revision.guild_id == intent.guild_id);
+        }
+        for intent in &mut self.pending_git_graphs {
+            intent.signed_revision_metadata_available =
+                revisions.get(&intent.revision_id).is_some_and(|revision| {
+                    revision.guild_id == intent.guild_id
+                        && revision.protected_root_id == intent.protected_root_id
+                });
+        }
+        for anchor in &mut self.retained_anchors {
+            if let Some(revision) = anchor.revision_id.and_then(|id| revisions.get(&id)) {
+                anchor.signed_revision_metadata_available = true;
+                anchor.protected_root_id = Some(revision.protected_root_id);
+                account(&revision.protected_root_id, used, limit)?;
+            }
         }
         for capture in &mut self.guarded_captures {
             if let Some(revision) = revisions.get(&capture.revision_id) {
@@ -1143,7 +1194,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 3);
+            assert_eq!(report.format_version, 4);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);
@@ -1359,3 +1410,6 @@ mod tests {
 
 #[cfg(test)]
 mod intent_tests;
+
+#[cfg(test)]
+mod owner_tests;

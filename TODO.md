@@ -554,6 +554,37 @@ remain active.
     device identities after remount with missing hints, relocated anchor areas, full conversion,
     upgrade/source-loss, installed releases and native platform gates remain
     open; this does not close R1 or M6.
+  - [x] Inventory pending Git graphs, retained native anchors and remembered
+    area locations with the shared preserved scanner. Decode original graph
+    envelopes 1/2, anchor manifests 1/2/3 and stable retirement records without
+    migration/replay. Share libgit2 DAG validation with signed Git descriptors,
+    using an in-memory object database without a Git catalog or temporary repo.
+    Format-4 reports identify refs/pins, commit/tree/tag objects, raw blob paths,
+    native/imported and guarded physical/virtual anchor mappings, revision versus
+    retirement keys and absolute/relative cached area hints. Preserve unknown
+    filesystem/volume identities in old version-1 anchors and unknown native
+    file identity meaning; do not treat file inodes as directory roots or
+    reinterpret relative hints against the current cwd. Peer placement excludes
+    known source/anchor/cache paths without opening Git catalogs or payloads.
+    Validation: 444 unique cases pass: 282 ordinary store cases, 100 ordinary
+    Git cases, 36 inventory/export/range/peer cases (including the separately
+    selected large retained-history case), two discovery cases, 19 ordinary CLI
+    process cases, withdrawal and historical graph-intent compatibility, and
+    three separately provisioned Btrfs regressions. Seven new owner cases cover
+    original graph/anchor layouts, commit ancestry and durable pins, annotated
+    tags, raw paths, imported streams, guarded physical/virtual mappings,
+    canonical/identity/DAG corruption, retirement-key semantics and bounded
+    area caches. Catalog bytes and file sets remain unchanged. A child process
+    inventories and checks placement with a nonexistent TMPDIR without creating
+    it. All four debug programs build; format and strict locked workspace/
+    all-targets Clippy pass. All 283 source-file hashes and eight program/test
+    driver hashes remain unchanged during qualification; disposable Btrfs
+    mount, loop and image cleanup is verified. Sixty-four Git, 26 store and three
+    CLI process fixtures remain ignored. This qualifies the exercised source,
+    not a new installed artifact or the full R1 gate. External catalogs and
+    worktrees, other intents, recipes/pins/volume owners, missing/relative
+    relocation evidence, path races, complete conversion and original
+    upgrade/source-loss/platform/capacity/release gates remain open.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

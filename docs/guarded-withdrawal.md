@@ -159,12 +159,14 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
-Report format 3 includes preserved local protected-root registrations, backend
+Report format 4 includes preserved local protected-root registrations, backend
 bindings, Git registrations, guarded stopped/revision-capture anchor ownership,
-and pending source-capture and recovery-anchor intents. Capture envelopes 1/2/3
-and recovery envelopes 1/2 are checked against their original canonical layouts;
-inventory never migrates or replays them. Pending ownership includes the planned
-root anchor and guarded per-file capture IDs, plus any anchor retained during
+pending source-capture and recovery-anchor intents, pending Git graph intents,
+retained revision/retirement anchors and remembered anchor-area locations.
+Capture envelopes 1/2/3 and recovery envelopes 1/2 are checked against their
+original canonical layouts; inventory never migrates or replays them. Pending
+ownership includes the planned root anchor and guarded per-file capture IDs,
+plus any anchor retained during
 recovery replacement. Relative historical requests are reported as bytes without
 resolving them against the inventory process's working directory.
 Raw Unix paths are reported as hex bytes. These records and the local signed
@@ -175,6 +177,30 @@ are unknown for missing roots and older registration formats 1/2. Git registrati
 can be history-only: `catalog_inventoried` remains false because the external Git
 catalog is not opened. Unknown guarded/link-freeze records are listed with their
 kind, ID, payload size and digest for preservation; they are not decoded ownership.
+Git graph intent envelopes 1/2 retain their original bytes. libgit2 validates
+object IDs, reachable commit/tree/tag history, refs and declared blob lengths
+using a repository backed only by an in-memory object database. No Git catalog,
+config file or temporary repository is created; blob payloads are not opened.
+The report identifies refs (including pins), metadata objects, native/imported
+blob manifests and guarded virtual mappings with their physical root-anchor
+locations. Envelope 1 omitted the selected branch: its decoder default `main`
+is reported with `head_branch_recorded: false`, not as a recorded selection.
+Same-revision/guild/root signed metadata availability does not authenticate the
+pending graph or establish that its blob payloads survive.
+
+Retained `anchor-manifest` versions 1/2/3 and stable `anchor-retirement` records
+are validated without replay. Revision-keyed manifests can link available signed
+metadata; retirement keys identify anchors and are never inferred to be revision
+IDs. Version 1 lacks a filesystem/volume locator, so its corresponding report
+fields are null. Imported stream manifests can lack a native file identity;
+ordinary native file identity words remain ambiguous, while guarded root-backed
+file identities postdate stable filesystem IDs. File identities are not treated
+as directory roots during placement checks. Remembered area paths retain raw
+bytes and their absolute/relative status. Absolute cache hints participate in
+placement; relative historical hints do not inherit the current process cwd.
+These hints are not verified area ownership or evidence of complete relocation
+discovery.
+
 Native root plan format 1 predates stable filesystem IDs, and its wire layout did
 not change when the filesystem word changed from `st_dev` to a stable identity.
 A newer intent envelope may contain a migrated old plan. Its recorded root/area
@@ -192,9 +218,25 @@ Btrfs regressions. Closed catalog bytes and file sets, raw Unix pins, malformed
 intents, report budget rejection, pending-only moved sources and old native
 intent migration are covered. Both disposable Btrfs filesystems, loop devices
 and images were removed with cleanup verified. All four debug programs build;
-formatting and strict workspace/all-targets Clippy pass. This qualifies the exercised source slice; other ignored fixtures,
-installed artifacts and the complete
-upgrade/source-loss/platform matrix remain release gates.
+formatting and strict workspace/all-targets Clippy pass. This qualifies the
+exercised source slice; other ignored fixtures, installed artifacts and the
+complete upgrade/source-loss/platform matrix remain release gates.
+
+The graph/native-owner increment was qualified on Linux on 2026-10-08 with
+444 unique passing cases: 282 ordinary store cases, 100 ordinary Git cases,
+36 inventory/export/peer cases, two discovery cases, 19 ordinary CLI process
+cases, withdrawal and historical graph-intent compatibility, and three
+provisioned Btrfs regressions. New fixtures cover graph ancestry, pins and tags,
+original manifest layouts, raw blob/area paths, imported and guarded mappings,
+malformed metadata, retirement keys and bounded absolute/relative area caches.
+Closed catalog bytes and file sets remain unchanged. Inspection and placement
+also pass in a child process with a nonexistent TMPDIR, which remains absent.
+All four debug programs build; format and strict workspace/all-targets Clippy
+pass. The 283 source files and eight program/test drivers retain their hashes
+throughout qualification, and disposable mount/loop/image cleanup is verified.
+Sixty-four Git, 26 store and three CLI process fixtures remain ignored. These
+results qualify the exercised source; installed releases, complete ownership
+inventory, retained conversion and the full M6 release gates remain open.
 
 Inventory opens forbid database/journal creation and deletion. A catalog with no
 journal files uses an immutable read only while its file identity, size, mtime,
@@ -290,7 +332,8 @@ Original catalog, key and selected local volume state remain read-only.
 `TMPDIR` must resolve outside the preserved installation, selected anchor/parity
 areas, registered source roots, Git repository paths, typed guarded capture
 anchor-area hints, pending capture source/area hints and recovery-replacement
-source/area hints. Peer mode uses inventory's non-creating snapshot reader and
+source/area hints, pending Git blob source/area hints, retained anchors and
+absolute remembered area locations. Peer mode uses inventory's non-creating snapshot reader and
 shared canonical/shape validation, with a 32 MiB limit per local record. It streams
 all relevant rows without building the inventory report or applying its aggregate
 32 MiB report ceiling to placement checks. Placement state retains the temporary
@@ -308,7 +351,7 @@ during inspection fails before client creation.
 Volume-root hints are discovery locations, not ownership of the entire volume.
 An old device-based plan with a missing hint cannot identify a relocated root
 after its device number changes. These checks cover known local records. External
-Git catalogs/worktrees and their graph intents, other anchor/volume owners,
+Git catalogs/worktrees and their other intents, recipe/pin/volume owners,
 relocated anchor-area discovery and concurrent path replacement still
 require the remaining R1 isolation qualification. Preserve those inputs too.
 

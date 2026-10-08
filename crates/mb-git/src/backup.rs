@@ -18,7 +18,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::stage::stage_path_key;
-use crate::{GitGraphObject, GitGraphRef};
+use crate::{GitGraphObject, GitGraphRef, GitGraphSource};
 
 const MAX_OBJECTS: usize = 100_000;
 
@@ -92,45 +92,15 @@ impl GitBackupDescriptor {
     /// Validate the descriptor and identify blobs that must be usable as
     /// symlink targets when native anchors are imported on recovery.
     pub fn symlink_blob_oids(&self) -> Result<HashSet<Oid>, GitBackupError> {
-        if !matches!(self.format_version, 1..=4)
-            || self.repository_id.is_nil()
-            || self.refs.len() > MAX_OBJECTS
-            || self.objects.len() > MAX_OBJECTS
-            || self.blobs.len() > MAX_OBJECTS
-            || self.head_branch.len() > 1024
-            || !Branch::name_is_valid(&self.head_branch)?
-            || (self.format_version == 1 && self.head_branch != "main")
-        {
-            return Err(GitBackupError::InvalidGraph);
-        }
-        match canonical_size_bounded(self, V1_MAX_CATALOG_BYTES) {
-            Ok(_) => {}
-            Err(ModelError::EncodingTooLarge { .. }) => {
-                return Err(GitBackupError::TooLarge);
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let temporary = tempfile::tempdir()?;
-        let repository = Repository::init_bare(temporary.path())?;
-        let odb = git2::Odb::new()?;
-        let _pack = odb.add_new_mempack_backend(1000)?;
-        repository.set_odb(&odb)?;
-        let mut kinds = HashMap::new();
-        for object in &self.objects {
-            let kind = match object.kind {
-                1 => ObjectType::Commit,
-                2 => ObjectType::Tree,
-                3 if self.format_version >= 3 => ObjectType::Tag,
-                _ => return Err(GitBackupError::InvalidGraph),
-            };
-            let oid = Oid::hash_object(kind, &object.bytes)?;
-            if oid.as_bytes() != object.oid
-                || kinds.insert(oid, kind).is_some()
-                || odb.write(kind, &object.bytes)? != oid
-            {
-                return Err(GitBackupError::InvalidGraph);
-            }
-        }
+        let graph = GraphView {
+            format_version: self.format_version,
+            repository_id: self.repository_id,
+            refs: &self.refs,
+            objects: &self.objects,
+            head_branch: &self.head_branch,
+        };
+        graph.validate_header(self.blobs.len())?;
+        bounded_metadata(self)?;
         let mut blob_lengths = HashMap::new();
         for blob in &self.blobs {
             let oid = Oid::from_bytes(&blob.oid)?;
@@ -162,10 +132,111 @@ impl GitBackupDescriptor {
                 previous_end = end;
             }
         }
+        graph.validate(blob_lengths)
+    }
+}
+
+fn bounded_metadata(value: &impl Serialize) -> Result<(), GitBackupError> {
+    match canonical_size_bounded(value, V1_MAX_CATALOG_BYTES) {
+        Ok(_) => Ok(()),
+        Err(ModelError::EncodingTooLarge { .. }) => Err(GitBackupError::TooLarge),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A source graph has no sector geometry yet. Validate its reachable metadata
+/// and declared blob lengths without inventing sectors or opening an anchor.
+impl GitGraphSource {
+    pub fn validate_metadata(&self, head_branch: &str) -> Result<(), GitBackupError> {
+        let tags = self.objects.iter().any(|object| object.kind == 3);
+        if !matches!(self.format_version, 1 | 2) || (self.format_version == 2) != tags {
+            return Err(GitBackupError::InvalidGraph);
+        }
+        let selected = format!("refs/heads/{head_branch}");
+        let selected_present = self
+            .refs
+            .iter()
+            .any(|reference| reference.name == selected.as_bytes());
+        let format_version = if !self.refs.is_empty() && !selected_present {
+            4
+        } else if self.format_version == 2 {
+            3
+        } else {
+            2
+        };
+        let graph = GraphView {
+            format_version,
+            repository_id: self.repository_id,
+            refs: &self.refs,
+            objects: &self.objects,
+            head_branch,
+        };
+        graph.validate_header(self.blobs.len())?;
+        bounded_metadata(self)?;
+        let mut lengths = HashMap::new();
+        for blob in &self.blobs {
+            if lengths
+                .insert(Oid::from_bytes(&blob.oid)?, blob.anchor.logical_len)
+                .is_some()
+            {
+                return Err(GitBackupError::InvalidGraph);
+            }
+        }
+        graph.validate(lengths).map(|_| ())
+    }
+}
+
+struct GraphView<'a> {
+    format_version: u16,
+    repository_id: Uuid,
+    refs: &'a [GitGraphRef],
+    objects: &'a [GitGraphObject],
+    head_branch: &'a str,
+}
+
+impl GraphView<'_> {
+    fn validate_header(&self, blob_count: usize) -> Result<(), GitBackupError> {
+        if !matches!(self.format_version, 1..=4)
+            || self.repository_id.is_nil()
+            || self.refs.len() > MAX_OBJECTS
+            || self.objects.len() > MAX_OBJECTS
+            || blob_count > MAX_OBJECTS
+            || self.head_branch.len() > 1024
+            || !Branch::name_is_valid(self.head_branch)?
+            || (self.format_version == 1 && self.head_branch != "main")
+        {
+            return Err(GitBackupError::InvalidGraph);
+        }
+        Ok(())
+    }
+
+    fn validate(self, blob_lengths: HashMap<Oid, u64>) -> Result<HashSet<Oid>, GitBackupError> {
+        let odb = git2::Odb::new()?;
+        // The ODB owns its mempack backend after insertion. No repository path,
+        // config file, temporary directory or payload store is created.
+        odb.add_new_mempack_backend(1000)?;
+        let repository = Repository::from_odb(odb)?;
+        let odb = repository.odb()?;
+        let mut kinds = HashMap::new();
+        for object in self.objects {
+            let kind = match object.kind {
+                1 => ObjectType::Commit,
+                2 => ObjectType::Tree,
+                3 if self.format_version >= 3 => ObjectType::Tag,
+                _ => return Err(GitBackupError::InvalidGraph),
+            };
+            let oid = Oid::hash_object(kind, &object.bytes)?;
+            if oid.as_bytes() != object.oid
+                || kinds.insert(oid, kind).is_some()
+                || odb.write(kind, &object.bytes)? != oid
+            {
+                return Err(GitBackupError::InvalidGraph);
+            }
+        }
         let mut ref_names = HashSet::new();
         let mut pending_commits = Vec::new();
         let mut seen_tags = HashSet::new();
-        for reference in &self.refs {
+        for reference in self.refs {
             let name =
                 std::str::from_utf8(&reference.name).map_err(|_| GitBackupError::InvalidGraph)?;
             let branch_valid = match name.strip_prefix("refs/heads/") {
