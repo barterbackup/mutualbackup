@@ -28,9 +28,17 @@ use mutualbackup::{
 };
 use uuid::Uuid;
 
+#[path = "support/binaries.rs"]
+mod binaries;
+use binaries::program;
+
 #[path = "support/peer_logs.rs"]
 mod peer_logs;
 use peer_logs::PeerLogArchive;
+
+fn uses_cargo_debug_programs() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("MUTUALBACKUP_TEST_BIN_DIR").is_none()
+}
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_BULK_TRANSFER_BYTES: u64 = 64 * 1024;
@@ -108,7 +116,7 @@ impl NetworkNamespace {
             assignment.push(value);
             command.arg(assignment);
         }
-        command.arg(env!("CARGO_BIN_EXE_mutualbackupd"));
+        command.arg(program("mutualbackupd"));
         command
     }
 
@@ -170,7 +178,7 @@ impl Daemon {
         let mut command = if let Some(namespace) = &self.network_namespace {
             namespace.command(&self.environment)
         } else {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_mutualbackupd"));
+            let mut command = Command::new(program("mutualbackupd"));
             command.envs(self.environment.iter().cloned());
             command
         };
@@ -362,7 +370,7 @@ fn source_scan_cli_resets_unreadable_progress_through_daemon_and_restart() {
 fn daemon_requires_an_initialized_identity_without_creating_state() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("missing-state");
-    let output = Command::new(env!("CARGO_BIN_EXE_mutualbackupd"))
+    let output = Command::new(program("mutualbackupd"))
         .args([
             os("--data-dir"),
             data_dir.as_os_str().to_owned(),
@@ -424,21 +432,22 @@ fn init_resumes_after_seed_install_without_replacing_outputs() {
         data_dir.as_os_str().to_owned(),
     ];
 
-    #[cfg(debug_assertions)]
-    {
-        let interrupted = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+    if uses_cargo_debug_programs() {
+        let interrupted = Command::new(program("mutualbackup"))
             .args(&args)
             .env("MUTUALBACKUP_TEST_FAIL_AFTER_SEED_INSTALL", "1")
             .output()
             .unwrap();
         assert!(!interrupted.status.success());
+    } else {
+        // Installed release programs omit debug failpoints. Recreate the
+        // durable interrupted state and exercise their real resume path.
+        mutualbackup::write_seed(
+            &seed_file,
+            "release-resumable-initialization-recovery-string-2027!",
+        )
+        .unwrap();
     }
-    #[cfg(not(debug_assertions))]
-    mutualbackup::write_seed(
-        &seed_file,
-        "release-resumable-initialization-recovery-string-2027!",
-    )
-    .unwrap();
     assert!(seed_file.is_file());
     assert!(!data_dir.exists());
 
@@ -672,7 +681,7 @@ fn init_rejects_overlapping_output_paths_without_mutation() {
 fn init_accepts_bare_relative_seed_and_data_paths() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+    let mut child = Command::new(program("mutualbackup"))
         .current_dir(temp.path())
         .args([
             "init",
@@ -728,7 +737,7 @@ fn daemon_never_reports_ready_when_its_only_listener_cannot_start() {
         occupied.local_addr().unwrap().port()
     );
     let output = run_output(
-        env!("CARGO_BIN_EXE_mutualbackupd"),
+        program("mutualbackupd"),
         &[
             os("--data-dir"),
             data_dir.as_os_str().to_owned(),
@@ -1187,14 +1196,14 @@ fn raw_unix_paths_survive_cli_daemon_and_git_checkout() {
         os("add"),
         relative.as_os_str().to_owned(),
     ];
-    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
+    let output = run_output(program("mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
     assert!(
         output.status.success(),
         "raw Git add failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     git_args[5] = link_relative.as_os_str().to_owned();
-    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
+    let output = run_output(program("mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
     assert!(
         output.status.success(),
         "raw Git symlink add failed: {}",
@@ -1258,7 +1267,7 @@ fn raw_unix_paths_survive_cli_daemon_and_git_checkout() {
         os("export"),
         full_export.as_os_str().to_owned(),
     ];
-    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &export_args, CLI_TIMEOUT).unwrap();
+    let output = run_output(program("mutualgit"), &export_args, CLI_TIMEOUT).unwrap();
     assert!(
         output.status.success(),
         "full export failed: {}",
@@ -1308,7 +1317,7 @@ fn raw_unix_paths_survive_cli_daemon_and_git_checkout() {
     git_args[4] = os("restore");
     git_args[5] = relative.as_os_str().to_owned();
     git_args.push(link_relative.as_os_str().to_owned());
-    let output = run_output(env!("CARGO_BIN_EXE_mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
+    let output = run_output(program("mutualgit"), &git_args, CLI_TIMEOUT).unwrap();
     assert!(
         output.status.success(),
         "raw Git restore failed: {}",
@@ -1436,7 +1445,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         .map(|(index, config)| {
             let mut daemon = Daemon::new(config.clone(), run_root.join(format!("p{index}.log")));
             daemon.set_env("RUST_LOG", "warn");
-            if index == 0 {
+            if index == 0 && uses_cargo_debug_programs() {
                 daemon.set_env("MUTUALBACKUP_TEST_FAIL_BEFORE_LOCAL_GUILD_INSTALL", "1");
             }
             daemon.start();
@@ -1488,23 +1497,27 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         let token = value_after(&invite, "invitation: ");
         join_guild_with_retry(&sockets[index], token.as_str(), Duration::from_secs(90));
     }
-    let interrupted_finalize = run_cli(
-        &[
-            os("--socket"),
-            sockets[0].as_os_str().to_owned(),
-            os("guild"),
-            os("finalize"),
-        ],
-        Duration::from_secs(60),
-    )
-    .unwrap_err();
-    assert!(
-        interrupted_finalize.contains("test interruption"),
-        "unexpected interrupted-finalize result: {interrupted_finalize}"
-    );
-    assert!(cli(&sockets[0], ["guild", "status"], CLI_TIMEOUT).contains("Draft"));
-    for socket in &sockets[1..] {
-        assert!(cli(socket, ["guild", "status"], CLI_TIMEOUT).contains("Active"));
+    if uses_cargo_debug_programs() {
+        // Debug source qualification separately exercises the interruption
+        // after remote installation. Production binaries have no such hook.
+        let interrupted_finalize = run_cli(
+            &[
+                os("--socket"),
+                sockets[0].as_os_str().to_owned(),
+                os("guild"),
+                os("finalize"),
+            ],
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(
+            interrupted_finalize.contains("test interruption"),
+            "unexpected interrupted-finalize result: {interrupted_finalize}"
+        );
+        assert!(cli(&sockets[0], ["guild", "status"], CLI_TIMEOUT).contains("Draft"));
+        for socket in &sockets[1..] {
+            assert!(cli(socket, ["guild", "status"], CLI_TIMEOUT).contains("Active"));
+        }
     }
     let finalized = cli(&sockets[0], ["guild", "finalize"], Duration::from_secs(60));
     assert!(finalized.lines().any(|line| line == "members:     5"));
@@ -3123,12 +3136,7 @@ fn git_cli<const N: usize>(socket: &Path, directory: &Path, args: [&str; N]) -> 
         directory.as_os_str().to_owned(),
     ];
     owned.extend(args.into_iter().map(os));
-    let output = run_output(
-        env!("CARGO_BIN_EXE_mutualgit"),
-        &owned,
-        PROCESS_SMALL_BACKUP_TIMEOUT,
-    )
-    .unwrap();
+    let output = run_output(program("mutualgit"), &owned, PROCESS_SMALL_BACKUP_TIMEOUT).unwrap();
     assert!(
         output.status.success(),
         "mutualgit {:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
@@ -3157,7 +3165,7 @@ fn cli_path_with_timeout<const N: usize>(
 }
 
 fn run_cli(args: &[OsString], timeout: Duration) -> Result<String, String> {
-    let output = run_output(env!("CARGO_BIN_EXE_mutualbackup"), args, timeout)?;
+    let output = run_output(program("mutualbackup"), args, timeout)?;
     if !output.status.success() {
         return Err(format!(
             "mutualbackup {:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
@@ -3175,7 +3183,7 @@ fn run_cli_with_input(
     input: &[u8],
     timeout: Duration,
 ) -> Result<String, String> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+    let mut child = Command::new(program("mutualbackup"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3201,7 +3209,11 @@ fn run_cli_with_input(
     String::from_utf8(output.stdout).map_err(|error| error.to_string())
 }
 
-fn run_output(program: &str, args: &[OsString], timeout: Duration) -> Result<Output, String> {
+fn run_output(
+    program: impl AsRef<OsStr>,
+    args: &[OsString],
+    timeout: Duration,
+) -> Result<Output, String> {
     let child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -3415,7 +3427,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         os("--seed-file"),
         seed_file.clone().into_os_string(),
     ];
-    let output = run_output(env!("CARGO_BIN_EXE_mutualbackup"), &args, CLI_TIMEOUT).unwrap();
+    let output = run_output(program("mutualbackup"), &args, CLI_TIMEOUT).unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -3442,7 +3454,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         fs::read_to_string(&seed_file).unwrap().trim(),
         recovery.as_str()
     );
-    let retry = run_output(env!("CARGO_BIN_EXE_mutualbackup"), &args, CLI_TIMEOUT).unwrap();
+    let retry = run_output(program("mutualbackup"), &args, CLI_TIMEOUT).unwrap();
     assert!(!retry.status.success());
     assert_eq!(
         fs::read(target.join("signed-revision.postcard")).unwrap(),
@@ -3490,7 +3502,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         os("--seed-file"),
         seed_file.clone().into_os_string(),
     ];
-    let listed = run_output(env!("CARGO_BIN_EXE_mutualbackup"), &list_args, CLI_TIMEOUT).unwrap();
+    let listed = run_output(program("mutualbackup"), &list_args, CLI_TIMEOUT).unwrap();
     assert!(
         listed.status.success(),
         "{}",
@@ -3511,12 +3523,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let mut peer_list_args = list_args.clone();
     peer_list_args.extend([os("--peer"), os(&extra_endpoint)]);
-    let refused = run_output(
-        env!("CARGO_BIN_EXE_mutualbackup"),
-        &peer_list_args,
-        CLI_TIMEOUT,
-    )
-    .unwrap();
+    let refused = run_output(program("mutualbackup"), &peer_list_args, CLI_TIMEOUT).unwrap();
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
     assert!(
@@ -3526,12 +3533,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     let mut discovery_args = list_args.clone();
     discovery_args.extend([os("--bootstrap-peer"), os(&extra_endpoint)]);
-    let discovery_refused = run_output(
-        env!("CARGO_BIN_EXE_mutualbackup"),
-        &discovery_args,
-        CLI_TIMEOUT,
-    )
-    .unwrap();
+    let discovery_refused =
+        run_output(program("mutualbackup"), &discovery_args, CLI_TIMEOUT).unwrap();
     assert!(!discovery_refused.status.success());
     assert!(discovery_refused.stdout.is_empty());
     assert!(
@@ -3552,12 +3555,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         os("--seed-file"),
         seed_file.clone().into_os_string(),
     ];
-    let output = run_output(
-        env!("CARGO_BIN_EXE_mutualbackup"),
-        &catalog_args,
-        CLI_TIMEOUT,
-    )
-    .unwrap();
+    let output = run_output(program("mutualbackup"), &catalog_args, CLI_TIMEOUT).unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -3583,7 +3581,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let confined_target = temp.path().join("rejected-tmpdir-export");
     confined_args[destination_index] = confined_target.clone().into_os_string();
     let entries_before = fs::read_dir(&catalog).unwrap().count();
-    let child = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+    let child = Command::new(program("mutualbackup"))
         .args(&confined_args)
         .env("TMPDIR", &catalog)
         .stdin(Stdio::null())
@@ -3640,7 +3638,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let original = fs::read(catalog.join("control.db")).unwrap();
     let anchor_target = temp.path().join("anchor-export");
     let output = run_output(
-        env!("CARGO_BIN_EXE_mutualbackup"),
+        program("mutualbackup"),
         &[
             os("legacy-export"),
             os("--data-dir"),
@@ -3831,7 +3829,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let original = fs::read(catalog.join("control.db")).unwrap();
     let coded_target = temp.path().join("coded-export");
     let output = run_output(
-        env!("CARGO_BIN_EXE_mutualbackup"),
+        program("mutualbackup"),
         &[
             os("legacy-export"),
             os("--data-dir"),
@@ -3870,7 +3868,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(!parity_volume.join(".mutualbackup-volume").exists());
     assert!(!catalog.join("control.key").exists());
     let invalid = run_output(
-        env!("CARGO_BIN_EXE_mutualbackup"),
+        program("mutualbackup"),
         &[
             os("legacy-export"),
             os("--data-dir"),

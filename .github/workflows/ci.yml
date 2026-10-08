@@ -22,13 +22,14 @@ jobs:
           toolchain: 1.91.0
           components: clippy,rustfmt
       - run: bash scripts/docker-lab-safety-test.sh
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/packaged-process-acceptance-test.py
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
 
   packaged-git-acceptance:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
@@ -39,32 +40,81 @@ jobs:
       - name: Provision disposable Btrfs filesystem
         run: |
           sudo apt-get update
-          sudo apt-get install -y btrfs-progs
-          truncate -s 2G /tmp/mutualbackup-package-ci.btrfs
+          sudo apt-get install -y btrfs-progs iproute2 iptables procps util-linux
+          truncate -s 6G /tmp/mutualbackup-package-ci.btrfs
           sudo mkfs.btrfs -q -f /tmp/mutualbackup-package-ci.btrfs
           sudo mkdir -p /mnt/mutualbackup-package-ci
-          sudo mount -o loop,user_subvol_rm_allowed /tmp/mutualbackup-package-ci.btrfs /mnt/mutualbackup-package-ci
+          package_ci_loopdev=$(sudo losetup --find --show /tmp/mutualbackup-package-ci.btrfs)
+          echo "PACKAGE_CI_LOOPDEV=$package_ci_loopdev" >> "$GITHUB_ENV"
+          sudo mount -t btrfs -o user_subvol_rm_allowed "$package_ci_loopdev" /mnt/mutualbackup-package-ci
           sudo chown "$USER":"$USER" /mnt/mutualbackup-package-ci
       - name: Prove packaged Git interoperability without ambient Git
         run: |
+          # Resolve stock Git inside the pinned Nix shell.
+          # shellcheck disable=SC2016
           nix develop -c bash -c 'python3 scripts/packaged-git-smoke.py \
             --bin-dir "$PWD/result-runtime/bin" \
             --alias-dir "$PWD/result-git/bin" \
             --stock-git "$(command -v git)" \
             --reflink-root /mnt/mutualbackup-package-ci'
-      - name: Retain failed daemon diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: packaged-git-diagnostics
-          path: /mnt/mutualbackup-package-ci/mb-package-git-*/daemon.log
-          if-no-files-found: ignore
-      - name: Unmount disposable filesystem
+      - name: Qualify the installed candidate through process and seed recovery
+        run: |
+          nix develop -c python3 scripts/packaged-process-acceptance.py \
+            --bin-dir "$PWD/result-runtime/bin" \
+            --reflink-root /mnt/mutualbackup-package-ci \
+            --output-dir "$RUNNER_TEMP/package-process-qualification"
+      - name: Collect remaining named daemon logs before cleanup
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+          os.umask(0o077)
+          root = Path("/mnt/mutualbackup-package-ci")
+          artifacts = Path(os.environ["RUNNER_TEMP"]) / "package-peer-logs"
+          names = {"p0.log", "p1.log", "p2.log", "p3.log", "p4.log",
+                   "recovered.log", "storage-recovered.log", "outsider.log"}
+          logs = [path for path in root.glob("process-*/*.log") if path.name in names]
+          logs.extend(root.glob("mb-package-git-*/daemon.log"))
+          for source in logs:
+              if source.is_file() and not source.is_symlink() and not source.parent.is_symlink():
+                  destination = artifacts / source.relative_to(root)
+                  destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                  shutil.copyfile(source, destination)
+          PY
+      - name: Verify disposable filesystem and loop cleanup
         if: always()
         run: |
           if mountpoint -q /mnt/mutualbackup-package-ci; then
             sudo umount /mnt/mutualbackup-package-ci
           fi
+          if [[ -n "${PACKAGE_CI_LOOPDEV:-}" ]]; then
+            sudo losetup -d "$PACKAGE_CI_LOOPDEV"
+          fi
+          package_ci_associations=$(sudo losetup -j /tmp/mutualbackup-package-ci.btrfs)
+          test -z "$package_ci_associations"
+          if mountpoint -q /mnt/mutualbackup-package-ci; then
+            echo 'Disposable package filesystem is still mounted' >&2
+            exit 1
+          fi
+          if [[ -f /tmp/mutualbackup-package-ci.btrfs ]]; then
+            unlink /tmp/mutualbackup-package-ci.btrfs
+          fi
+          if [[ -d /mnt/mutualbackup-package-ci ]]; then
+            sudo rmdir /mnt/mutualbackup-package-ci
+          fi
+          echo 'Verified Btrfs mount, loop device and image cleanup' > "$RUNNER_TEMP/package-filesystem-cleanup.log"
+      - name: Retain packaged qualification and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-process-qualification
+          path: |
+            ${{ runner.temp }}/package-process-qualification/
+            ${{ runner.temp }}/package-peer-logs/
+            ${{ runner.temp }}/package-filesystem-cleanup.log
+          if-no-files-found: ignore
 
   native-git-acceptance:
     runs-on: ubuntu-latest
@@ -166,6 +216,8 @@ jobs:
       - name: Provision disposable Btrfs filesystem
         run: |
           truncate -s 6G /tmp/mutualbackup-tor-ci.btrfs
+          # Resolve mkfs inside the private-Tor development shell.
+          # shellcheck disable=SC2016
           nix develop .#private-tor -c bash -c \
             'sudo "$(command -v mkfs.btrfs)" -q -f /tmp/mutualbackup-tor-ci.btrfs'
           sudo mkdir -p /mnt/mutualbackup-tor-ci

@@ -17,6 +17,17 @@ if [[ ! -d "$test_root" ]]; then
   exit 2
 fi
 
+# Artifact qualification uses one previously built and hashed test driver.
+# An explicit invalid driver must fail before creating privileged resources.
+if [[ ${MUTUALBACKUP_TEST_PROCESS_BINARY+x} ]]; then
+  if [[ "$MUTUALBACKUP_TEST_PROCESS_BINARY" != /* ||
+        ! -f "$MUTUALBACKUP_TEST_PROCESS_BINARY" ||
+        ! -x "$MUTUALBACKUP_TEST_PROCESS_BINARY" ]]; then
+    echo "MUTUALBACKUP_TEST_PROCESS_BINARY must name an absolute executable test driver" >&2
+    exit 2
+  fi
+fi
+
 for program in sudo ip iptables setpriv env sysctl; do
   if ! command -v "$program" >/dev/null 2>&1; then
     echo "$program is required for isolated network acceptance" >&2
@@ -34,6 +45,10 @@ iptables_program="$(command -v iptables)"
 setpriv_program="$(command -v setpriv)"
 env_program="$(command -v env)"
 sysctl_program="$(command -v sysctl)"
+kill_program="$(type -P kill)" || {
+  echo "an external kill program is required for namespace process cleanup" >&2
+  exit 2
+}
 
 run_sudo() {
   "$sudo_program" -n "$@"
@@ -75,6 +90,13 @@ cleanup() {
   run_iptables -w -t nat -X "$prerouting_chain" >/dev/null 2>&1
   run_iptables -w -t nat -X "$postrouting_chain" >/dev/null 2>&1
   for namespace in "$coordinator_ns" "$punched_ns" "$fallback_ns" "$relay_ns"; do
+    # Deleting a namespace name alone leaves its running processes alive.
+    # After a driver timeout, retire only processes in our four namespaces.
+    while IFS= read -r namespace_pid; do
+      if [[ "$namespace_pid" =~ ^[0-9]+$ ]]; then
+        run_sudo "$kill_program" -KILL "$namespace_pid" >/dev/null 2>&1
+      fi
+    done < <(run_sudo "$ip_program" netns pids "$namespace" 2>/dev/null)
     run_sudo "$ip_program" netns delete "$namespace" >/dev/null 2>&1
   done
   run_sudo "$sysctl_program" -q -w "net.ipv4.ip_forward=$original_forwarding" >/dev/null 2>&1
@@ -162,6 +184,12 @@ export MUTUALBACKUP_TEST_IP="$ip_program"
 export MUTUALBACKUP_TEST_SETPRIV="$setpriv_program"
 export MUTUALBACKUP_TEST_ENV="$env_program"
 
-cargo test -p mutualbackup --test prototype_acceptance \
-  five_daemons_recover_latest_snapshot_from_seed_and_dht \
-  --locked -- --ignored --exact --nocapture
+if [[ ${MUTUALBACKUP_TEST_PROCESS_BINARY+x} ]]; then
+  "$MUTUALBACKUP_TEST_PROCESS_BINARY" \
+    five_daemons_recover_latest_snapshot_from_seed_and_dht \
+    --ignored --exact --nocapture
+else
+  cargo test -p mutualbackup --test prototype_acceptance \
+    five_daemons_recover_latest_snapshot_from_seed_and_dht \
+    --locked -- --ignored --exact --nocapture
+fi

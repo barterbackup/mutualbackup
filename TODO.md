@@ -2122,6 +2122,33 @@ remain active.
     signatures occurred during recovery and transport replacement; this passing
     run does not resolve R5's original stall.
 
+  - [x] Implement installed-candidate selection and a frozen process qualification
+    runner. Both process drivers select the complete absolute
+    `MUTUALBACKUP_TEST_BIN_DIR` candidate, preserving raw Unix paths and refusing
+    missing or unexecutable programs without Cargo fallback. The new
+    `scripts/packaged-process-acceptance.py` runner requires committed clean
+    source, hashes source/wrappers/underlying Nix payloads/test drivers, compiles
+    drivers once, and runs ordinary process, raw-path, stock-Git bridge and
+    provisioned five-daemon topology/seed recovery cases. Positive exact test
+    counts and unchanged identities are required; timeouts retire whole driver
+    process groups. Installed programs use persisted-state resume and normal
+    finalization fixtures; debug-only seed-install and guild-finalize interruption
+    hooks remain in source debug qualification and are explicitly excluded from
+    the installed manifest. The network script accepts that frozen driver and
+    retires remaining processes inside its four disposable namespaces before deletion.
+    The packaged CI job provisions an explicit loop device, retains private
+    logs and the qualification manifest outside the image, and verifies mount,
+    loop and image cleanup. Its existing packaged Git smoke gate is preserved.
+    Validation: 19 ordinary process tests and two Git-driver support tests pass;
+    three process and one Git provisioned cases remain excluded from that run.
+    Five qualification-boundary negative checks, format, strict workspace
+    Clippy, Bash syntax and workflow lint pass. A real failing frozen driver
+    left a root-owned process in its disposable namespace; the exit trap
+    retired it and restored namespace, firewall and forwarding baselines.
+    Actual installed-candidate provisioned execution is pending; these checks
+    do not qualify the release artifact or close R7's remaining native, upgrade,
+    multi-volume and platform matrix.
+
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
   source-loss matrix on the release source. Record repeated topology evidence
@@ -2169,8 +2196,9 @@ remain active.
     Those four cases, the existing slow-minority majority case, partial-signature
     reopen fixture and active guild administration test pass (seven functions).
     Formatting and strict workspace/all-targets Clippy pass. The complete
-    ordinary Node suite is being run separately; the focused cases alone do
-    not qualify that suite or the provisioned topology.
+    ordinary Node suite passes on `e45b3c1`: 447 passed, zero failed and 21
+    ignored in 1,262.73 seconds. Those ignored provisioned cases remain
+    excluded; this result does not qualify the provisioned topology.
     This fixes a demonstrated response-path defect; there is no evidence that
     invalid signatures caused the historical relay-only stall. Its diagnosis,
     repeated exact-source topology and release gates remain open.

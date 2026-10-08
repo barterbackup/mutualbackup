@@ -15,6 +15,10 @@ use mb_git::{FetchError, GitRepository, RepositoryError};
 use mb_node::{GitRepositoryInfo, LocalRequest, LocalResponse, WireError};
 use uuid::Uuid;
 
+#[path = "support/binaries.rs"]
+mod binaries;
+use binaries::program;
+
 #[test]
 #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
 fn stock_git_fetches_and_pushes_through_native_anchors() {
@@ -220,9 +224,9 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
         }
     });
 
-    let helper = PathBuf::from(env!("CARGO_BIN_EXE_git-remote-mutualbackup"));
+    let helper = PathBuf::from(program("git-remote-mutualbackup"));
     let git_alias = run_root.join("git");
-    symlink(env!("CARGO_BIN_EXE_mutualgit"), &git_alias).unwrap();
+    symlink(program("mutualgit"), &git_alias).unwrap();
     let output = Command::new(&git_alias)
         .arg("-C")
         .arg(&source_root)

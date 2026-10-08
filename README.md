@@ -183,6 +183,29 @@ relay-only paths real rather than inferred. It requires passwordless `sudo` for
 that network plumbing; daemons are dropped back to the invoking UID/GID, and an
 exit trap removes the namespaces and rules and restores the forwarding setting.
 
+To run the Linux process, raw-path, stock-Git bridge and five-daemon seed-recovery
+cases against the installed Nix runtime:
+
+```sh
+nix build .#default -o result-runtime
+nix develop -c python3 scripts/packaged-process-acceptance.py \
+  --bin-dir "$PWD/result-runtime/bin" \
+  --reflink-root /mnt/disposable-btrfs \
+  --output-dir /tmp/mutualbackup-package-qualification
+```
+
+Use a clean committed source tree, a fresh output directory outside the source
+tree, and a disposable Btrfs filesystem provisioned by the caller. The caller
+must also unmount it and remove its loop device and image afterward. The runner
+builds and freezes the test drivers, selects all four installed programs without
+fallback, and records source, wrapper, payload and driver hashes with explicit
+test counts and network cleanup checks. Logs stay in the private output directory.
+Debug-only interruption hooks are exercised separately by source debug fixtures;
+installed programs exercise persisted-state resume and normal finalization.
+This gate covers the listed Linux scenarios; the full native, upgrade and platform
+release matrix remains separate. CI runs it alongside the packaged Git dependency
+smoke test and verifies disposable filesystem cleanup.
+
 The separate gateway-mapping gate runs a real stateful NAT-PMP exchange in an
 isolated namespace and verifies acquisition, replacement, loss, reacquisition,
 and orderly deletion:
