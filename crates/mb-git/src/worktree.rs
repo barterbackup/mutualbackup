@@ -595,6 +595,45 @@ fn validate(
     Ok(())
 }
 
+/// Read saved registrations without checking out files, selected-HEAD repair,
+/// worktree marker access or removal replay. Every state remains visible.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_worktree(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(GitWorktreeInfo) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut count = 0;
+    let expected_kind = record_kind(repository_id);
+    control.for_each_record_with_kind_prefix_bounded(
+        RECORD_PREFIX,
+        512,
+        16,
+        mb_core::V1_MAX_CATALOG_BYTES,
+        |kind, key, bytes| {
+            anyhow::ensure!(
+                kind == expected_kind,
+                "preserved worktree namespace conflicts with its repository marker"
+            );
+            count += 1;
+            if count > MAX_WORKTREES {
+                return Err(GitWorktreeError::TooManyWorktrees.into());
+            }
+            let info: GitWorktreeInfo = decode_canonical(bytes)?;
+            validate(&info, repository_id, key)?;
+            anyhow::ensure!(
+                mb_core::canonical_bytes_bounded(&info, bytes.len())? == bytes
+                    && !info.path.as_os_str().as_bytes().contains(&0),
+                "invalid preserved Git worktree registration"
+            );
+            visit(info)?;
+            Ok(true)
+        },
+    )?;
+    Ok(())
+}
+
 pub(crate) fn list_worktrees(
     control: &ControlStore,
     repository_id: Uuid,

@@ -259,13 +259,20 @@ impl PreservedParentCheck {
         Ok(())
     }
 
-    fn check_records(&mut self, control: &ControlStore) -> Result<()> {
+    fn check_records(&mut self, control: &ControlStore, keys: &KeyMaterial) -> Result<()> {
         super::local_inventory::for_each_record(control, |record| {
             record.for_each_input(|input| match input {
                 PreservedInput::PathHint(path) => self.check_hint(path),
                 PreservedInput::NativeRoot(root) => self.check_native(root),
                 PreservedInput::RecordedNativeRoot(root) => self.check_recorded_native(root),
             })
+        })?;
+        super::local_inventory::for_each_external_git_worktree(control, keys, |record| {
+            if let super::local_inventory::PreservedExternalGitRecord::Worktree(info) = record {
+                self.check_hint(&info.path)?;
+                self.check_recorded_native(info.root_id)?;
+            }
+            Ok(())
         })
     }
 
@@ -308,7 +315,7 @@ pub(super) fn export_parent_preflight(
             protected_inputs,
             PlacementPurpose::Export,
         )?;
-        checked.check_records(control)?;
+        checked.check_records(control, keys)?;
         checked.pin()
     })
 }
@@ -336,7 +343,7 @@ pub(super) fn peer_client_preflight(
 ) -> Result<(PathBuf, Option<[u8; 32]>)> {
     crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
         let mut checked = PreservedParentCheck::new(candidate, data_dir, protected_inputs)?;
-        checked.check_records(control)?;
+        checked.check_records(control, keys)?;
         let guild = if discover {
             Some(
                 crate::node::preserved_guild_certificate(control)?

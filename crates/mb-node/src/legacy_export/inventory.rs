@@ -200,8 +200,15 @@ pub(super) fn inventory_catalog(
                     Ok(true)
                 },
             )?;
-            let local =
+            let mut local =
                 super::local_inventory::collect(control, &mut builder.used, summary_budget)?;
+            super::local_inventory::collect_external_git_worktrees(
+                control,
+                keys,
+                &mut local,
+                &mut builder.used,
+                summary_budget,
+            )?;
             let certificate =
                 if remote.is_some() {
                     Some(crate::node::preserved_guild_certificate(control)?.context(
@@ -254,7 +261,7 @@ pub(super) fn inventory_catalog(
         ))
     });
     let report = LegacyRevisionInventory {
-        format_version: 7,
+        format_version: 8,
         owner: keys.node_id().to_string(),
         scope: if remote.is_some() {
             "available-local-and-selected-peer-signed-revisions-and-preserved-local-state"

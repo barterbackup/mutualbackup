@@ -1,5 +1,5 @@
-//! Preserved local registrations and historical anchor ownership, without
-//! opening a source path, Git catalog, anchor payload or withdrawn mount.
+//! Preserved local and external Git ownership through bounded metadata reads.
+//! Source/worktree/anchor payloads and withdrawn mount views are not opened.
 
 mod anchors;
 mod git_intents;
@@ -33,6 +33,7 @@ pub struct LegacyLocalStateInventory {
     pub protected_roots: Vec<LegacyRootRegistration>,
     pub source_backends: Vec<LegacySourceBinding>,
     pub git_repositories: Vec<LegacyGitRegistration>,
+    pub git_worktrees: Vec<LegacyGitWorktreeRegistration>,
     pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
     pub volume_ownership: Vec<LegacyVolumeOwnership>,
     pub local_sectors: Vec<LegacyLocalSectorRecipe>,
@@ -70,10 +71,25 @@ pub struct LegacyGitRegistration {
     pub repository_id: Uuid,
     pub path_hex: String,
     pub registered_root: bool,
-    /// The registration does not establish that an external catalog is present
-    /// or that its refs, pins, linked worktrees and pending intents are inventoried.
+    /// Complete refs, objects, pins and pending-intent reconciliation remains
+    /// separate from linked-worktree enumeration and catalog availability.
     pub catalog_inventoried: bool,
+    pub external_catalog_available: bool,
+    pub linked_worktrees_inventoried: bool,
     pub signed_revision_ids: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitWorktreeRegistration {
+    pub repository_id: Uuid,
+    pub worktree_id: Uuid,
+    pub record_format: u16,
+    pub path_hex: String,
+    /// Preserve the saved word without asserting its stable-identity era.
+    pub recorded_root_identity: NativeFileId,
+    pub recorded_target_branch: String,
+    pub state: mb_git::GitWorktreeState,
+    pub payloads_verified: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -423,6 +439,84 @@ fn ownership(
     }
 }
 
+pub(super) enum PreservedExternalGitRecord {
+    Worktree(mb_git::GitWorktreeInfo),
+    CatalogStatus {
+        repository_id: Uuid,
+        available: bool,
+    },
+}
+
+pub(super) fn for_each_external_git_worktree(
+    control: &ControlStore,
+    keys: &mb_core::KeyMaterial,
+    mut visit: impl FnMut(PreservedExternalGitRecord) -> Result<()>,
+) -> Result<()> {
+    control.for_each_record_bounded("git-repository", 16, V1_MAX_CATALOG_BYTES, |key, bytes| {
+        let registration: GitRepositoryInfo = canonical_record(bytes)?;
+        ensure!(
+            registration.format_version == 1
+                && !registration.repository_id.is_nil()
+                && key == registration.repository_id.as_bytes()
+                && registration.path.is_absolute()
+                && !registration.path.as_os_str().as_bytes().contains(&0),
+            "invalid preserved Git registration"
+        );
+        let available = mb_git::GitRepository::for_each_preserved_linked_worktree(
+            &registration.path,
+            registration.repository_id,
+            &mb_git::catalog_key(keys, registration.repository_id),
+            |worktree| visit(PreservedExternalGitRecord::Worktree(worktree)),
+        )?;
+        visit(PreservedExternalGitRecord::CatalogStatus {
+            repository_id: registration.repository_id,
+            available,
+        })?;
+        Ok(true)
+    })?;
+    Ok(())
+}
+
+pub(super) fn collect_external_git_worktrees(
+    control: &ControlStore,
+    keys: &mb_core::KeyMaterial,
+    report: &mut LegacyLocalStateInventory,
+    used: &mut usize,
+    limit: usize,
+) -> Result<()> {
+    for_each_external_git_worktree(control, keys, |record| {
+        match record {
+            PreservedExternalGitRecord::Worktree(info) => {
+                let entry = LegacyGitWorktreeRegistration {
+                    repository_id: info.repository_id,
+                    worktree_id: info.worktree_id,
+                    record_format: info.format_version,
+                    path_hex: hex::encode(info.path.as_os_str().as_bytes()),
+                    recorded_root_identity: info.root_id,
+                    recorded_target_branch: info.target_branch,
+                    state: info.state,
+                    payloads_verified: false,
+                };
+                account(&entry, used, limit)?;
+                report.git_worktrees.push(entry);
+            }
+            PreservedExternalGitRecord::CatalogStatus {
+                repository_id,
+                available,
+            } => {
+                let registration = report
+                    .git_repositories
+                    .iter_mut()
+                    .find(|registration| registration.repository_id == repository_id)
+                    .context("external Git catalog lost its preserved registration")?;
+                registration.external_catalog_available = available;
+                registration.linked_worktrees_inventoried = available;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Stream every relevant row with SQL byte limits before materialization.
 /// Validation is shared by report and placement consumers; neither may skip
 /// canonical/shape checks merely because it does not need a field for output.
@@ -601,6 +695,7 @@ pub(super) fn collect(
         protected_roots: Vec::new(),
         source_backends: Vec::new(),
         git_repositories: Vec::new(),
+        git_worktrees: Vec::new(),
         storage_volumes: Vec::new(),
         volume_ownership: Vec::new(),
         local_sectors: Vec::new(),
@@ -653,6 +748,8 @@ pub(super) fn collect(
                         .binary_search_by_key(&registration.repository_id, |root| root.root_id)
                         .is_ok(),
                     catalog_inventoried: false,
+                    external_catalog_available: false,
+                    linked_worktrees_inventoried: false,
                     signed_revision_ids: Vec::new(),
                 };
                 account(&entry, used, limit)?;
@@ -946,6 +1043,230 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_export_external_git_worktrees_inventory_and_placement_preserve_original_inputs() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for mode in ["closed", "wal-only", "live"] {
+            let area = tempfile::tempdir().unwrap();
+            let data = area.path().join("state");
+            let source = area.path().join("source");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([130; 32]));
+            let repository_id = Uuid::from_u128(130);
+            let control_path = data.join("control.db");
+            let control = ControlStore::open(&control_path, &keys).unwrap();
+            control
+                .put_record(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: source.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let directory = source.join(mb_store::GIT_CATALOG_DIRECTORY);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = directory.join(mb_store::GIT_CATALOG_MARKER_FILE);
+            std::fs::write(&marker, mb_store::git_catalog_marker_bytes(repository_id)).unwrap();
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let external_path = directory.join("catalog.db");
+            let external = ControlStore::open_with_key(
+                &external_path,
+                &mb_git::catalog_key(&keys, repository_id),
+            )
+            .unwrap();
+            let mut locations = Vec::new();
+            for (index, state) in [
+                mb_git::GitWorktreeState::Preparing,
+                mb_git::GitWorktreeState::Ready,
+                mb_git::GitWorktreeState::Removing,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let old = area.path().join(std::ffi::OsString::from_vec(vec![
+                    b'w',
+                    b'0' + index as u8,
+                    255,
+                ]));
+                std::fs::create_dir(&old).unwrap();
+                std::fs::create_dir(old.join("nested")).unwrap();
+                std::fs::write(old.join("original"), b"retained working data").unwrap();
+                let identity = std::fs::metadata(&old).unwrap();
+                let info = mb_git::GitWorktreeInfo {
+                    format_version: 1,
+                    repository_id,
+                    worktree_id: Uuid::from_u128(131 + index as u128),
+                    path: old.clone(),
+                    root_id: NativeFileId {
+                        filesystem_id: identity.dev(),
+                        inode: identity.ino(),
+                    },
+                    target_branch: "main".to_owned(),
+                    state,
+                };
+                external
+                    .put_record(
+                        &format!("git-linked-worktree-v1/{repository_id}"),
+                        info.worktree_id.as_bytes(),
+                        &canonical_bytes(&info).unwrap(),
+                    )
+                    .unwrap();
+                let moved = area.path().join(format!("moved-{index}"));
+                std::fs::rename(&old, &moved).unwrap();
+                let alias = area.path().join(format!("alias-{index}"));
+                std::os::unix::fs::symlink(&moved, &alias).unwrap();
+                locations.push((info, moved, alias));
+            }
+            external
+                .put_record(
+                    "git-guarded-stage-receipt-v1/preserved",
+                    b"old",
+                    b"retained opaque evidence",
+                )
+                .unwrap();
+            let mut writers = Some((control, external));
+            if mode == "closed" {
+                drop(writers.take());
+            }
+            if mode == "wal-only" {
+                for path in [&control_path, &external_path] {
+                    std::fs::remove_file(path.with_extension("db-shm")).unwrap();
+                }
+            }
+            let snapshot = |path: &std::path::Path| {
+                let mut files = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        let name = entry.file_name();
+                        let bytes = if name.as_bytes().ends_with(b"-shm") {
+                            std::fs::metadata(entry.path())
+                                .unwrap()
+                                .len()
+                                .to_le_bytes()
+                                .to_vec()
+                        } else {
+                            std::fs::read(entry.path()).unwrap()
+                        };
+                        (name, bytes)
+                    })
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
+            };
+            let before = (snapshot(&data), snapshot(&directory));
+            let report =
+                super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+            assert_eq!(report.format_version, 8);
+            assert!(!report.retained_history_complete);
+            assert_eq!(report.local_state.git_worktrees.len(), 3);
+            let json = serde_json::to_vec(&report).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<crate::LegacyRevisionInventory>(&json).unwrap(),
+                report
+            );
+            let registration = &report.local_state.git_repositories[0];
+            assert!(
+                registration.external_catalog_available
+                    && registration.linked_worktrees_inventoried
+            );
+            assert!(!registration.catalog_inventoried);
+            for (info, moved, alias) in &locations {
+                let entry = report
+                    .local_state
+                    .git_worktrees
+                    .iter()
+                    .find(|entry| entry.worktree_id == info.worktree_id)
+                    .unwrap();
+                assert_eq!(
+                    entry.path_hex,
+                    hex::encode(info.path.as_os_str().as_bytes())
+                );
+                assert_eq!(entry.state, info.state);
+                assert_eq!(entry.recorded_root_identity, info.root_id);
+                assert!(!entry.payloads_verified);
+                for parent in [
+                    moved.clone(),
+                    moved.join("nested"),
+                    alias.clone(),
+                    alias.join("nested"),
+                ] {
+                    assert!(
+                        super::super::remote::peer_client_preflight(
+                            &keys,
+                            &data,
+                            &parent,
+                            &[],
+                            false
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        super::super::remote::export_parent_preflight(&keys, &data, &parent, &[])
+                            .is_err()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(moved.join("original")).unwrap(),
+                    b"retained working data"
+                );
+            }
+            let safe = area.path().join("safe");
+            std::fs::create_dir(&safe).unwrap();
+            assert!(
+                super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                    .is_ok()
+            );
+            assert!(
+                super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_ok()
+            );
+            let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+            assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+            assert!(
+                super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err()
+            );
+            assert_eq!((snapshot(&data), snapshot(&directory)), before, "{mode}");
+            assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+            if mode == "closed" {
+                let external = ControlStore::open_with_key(
+                    &external_path,
+                    &mb_git::catalog_key(&keys, repository_id),
+                )
+                .unwrap();
+                external
+                    .put_record(
+                        &format!("git-linked-worktree-v1/{repository_id}"),
+                        Uuid::from_u128(999).as_bytes(),
+                        b"damaged late worktree",
+                    )
+                    .unwrap();
+                drop(external);
+                let corrupted_before = (snapshot(&data), snapshot(&directory));
+                assert!(
+                    super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).is_err()
+                );
+                assert!(
+                    super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                        .is_err()
+                );
+                assert!(
+                    super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                        .is_err()
+                );
+                assert_eq!((snapshot(&data), snapshot(&directory)), corrupted_before);
+                assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+            }
+            drop(writers);
+        }
+    }
+
+    #[test]
     fn legacy_export_local_sector_inventory_accounts_budget_and_rejects_late_corruption() {
         let area = tempfile::tempdir().unwrap();
         let data = area.path().join("state");
@@ -969,7 +1290,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 7);
+        assert_eq!(report.format_version, 8);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.local_sectors.len(), 1);
         let entry = &report.local_state.local_sectors[0];
@@ -1091,7 +1412,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 7);
+        assert_eq!(report.format_version, 8);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.volume_ownership.len(), 1);
         let entry = &report.local_state.volume_ownership[0];
@@ -1144,7 +1465,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 7);
+        assert_eq!(report.format_version, 8);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -1563,7 +1884,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 7);
+            assert_eq!(report.format_version, 8);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

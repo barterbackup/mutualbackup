@@ -3461,6 +3461,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     use mb_node::{
         GuardedPrivateEntryV6, GuardedPrivateMetadataV6, GuardedPrivateStatV6, PrivateDataExtent,
     };
+    use std::os::unix::fs::MetadataExt;
+
     let temp = tempfile::tempdir().unwrap();
     let inputs = temp.path().join("original");
     fs::create_dir(&inputs).unwrap();
@@ -3651,6 +3653,56 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         )
         .unwrap();
     let repository_id = Uuid::new_v4();
+    let external_catalog = history_only.join(mb_store::GIT_CATALOG_DIRECTORY);
+    fs::create_dir(&external_catalog).unwrap();
+    set_private(&external_catalog);
+    let marker = external_catalog.join(mb_store::GIT_CATALOG_MARKER_FILE);
+    fs::write(&marker, mb_store::git_catalog_marker_bytes(repository_id)).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let worktree = temp
+        .path()
+        .join(OsString::from_vec(b"linked-worktree-\xfc".to_vec()));
+    fs::create_dir_all(worktree.join("nested")).unwrap();
+    fs::write(worktree.join("original"), b"preserve linked worktree").unwrap();
+    let worktree_alias = temp.path().join("worktree-alias");
+    std::os::unix::fs::symlink(&worktree, &worktree_alias).unwrap();
+    let worktree_metadata = fs::metadata(&worktree).unwrap();
+    let worktree_id = Uuid::new_v4();
+    let worktree_info = mb_git::GitWorktreeInfo {
+        format_version: 1,
+        repository_id,
+        worktree_id,
+        path: worktree.clone(),
+        root_id: mb_store::NativeFileId {
+            filesystem_id: worktree_metadata.dev(),
+            inode: worktree_metadata.ino(),
+        },
+        target_branch: "main".into(),
+        state: mb_git::GitWorktreeState::Preparing,
+    };
+    let external_store = mb_store::ControlStore::open_with_key(
+        external_catalog.join("catalog.db"),
+        &mb_git::catalog_key(&keys, repository_id),
+    )
+    .unwrap();
+    external_store
+        .put_record(
+            &format!("git-linked-worktree-v1/{repository_id}"),
+            worktree_id.as_bytes(),
+            &canonical_bytes(&worktree_info).unwrap(),
+        )
+        .unwrap();
+    drop(external_store);
+    let external_files = || -> std::collections::BTreeMap<_, _> {
+        fs::read_dir(&external_catalog)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    };
+    let original_external = external_files();
     store
         .put_record(
             "git-repository",
@@ -3703,7 +3755,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 7);
+    assert_eq!(inventory.format_version, 8);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -3730,6 +3782,21 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     ));
     assert!(!filler_entry.payloads_verified);
     assert!(!inventory.local_state.git_repositories[0].registered_root);
+    let git_registration = &inventory.local_state.git_repositories[0];
+    assert!(git_registration.external_catalog_available);
+    assert!(git_registration.linked_worktrees_inventoried);
+    assert!(!git_registration.catalog_inventoried);
+    assert_eq!(inventory.local_state.git_worktrees.len(), 1);
+    let saved_worktree = &inventory.local_state.git_worktrees[0];
+    assert_eq!(saved_worktree.repository_id, repository_id);
+    assert_eq!(saved_worktree.worktree_id, worktree_id);
+    assert_eq!(
+        saved_worktree.path_hex,
+        hex::encode(worktree.as_os_str().as_bytes())
+    );
+    assert_eq!(saved_worktree.state, mb_git::GitWorktreeState::Preparing);
+    assert!(!saved_worktree.payloads_verified);
+    assert_eq!(external_files(), original_external);
     let preserved = &inventory.local_state.unclassified_guarded_records[0];
     assert_eq!(preserved.kind, "guarded-view-mount-v1");
     assert_eq!(preserved.record_id_hex, hex::encode(b"legacy"));
@@ -3759,6 +3826,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         history_alias.join("nested"),
         volume.clone(),
         volume.join("nested"),
+        worktree.clone(),
+        worktree.join("nested"),
+        worktree_alias.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -3788,13 +3858,17 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             catalog_files() == before_destination_checks,
             "preserved catalog changed during destination rejection"
         );
+        assert_eq!(external_files(), original_external);
     }
     for path in [&registered_source, &history_only] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),
             b"preserve source/history"
         );
-        assert_eq!(fs::read_dir(path).unwrap().count(), 2);
+        assert_eq!(
+            fs::read_dir(path).unwrap().count(),
+            if path == &history_only { 3 } else { 2 }
+        );
         assert_eq!(fs::read_dir(path.join("nested")).unwrap().count(), 0);
     }
     let catalog_target = temp.path().join("catalog-export");
@@ -3868,6 +3942,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &registered_source.join("nested"),
         &history_only,
         &history_alias.join("nested"),
+        &worktree,
+        &worktree_alias.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -3892,9 +3968,19 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
             fs::read(path.join("original")).unwrap(),
             b"preserve source/history"
         );
-        assert_eq!(fs::read_dir(path).unwrap().count(), 2);
+        assert_eq!(
+            fs::read_dir(path).unwrap().count(),
+            if path == &history_only { 3 } else { 2 }
+        );
         assert_eq!(fs::read_dir(path.join("nested")).unwrap().count(), 0);
     }
+    assert_eq!(external_files(), original_external);
+    assert_eq!(
+        fs::read(worktree.join("original")).unwrap(),
+        b"preserve linked worktree"
+    );
+    assert_eq!(fs::read_dir(&worktree).unwrap().count(), 2);
+    assert_eq!(fs::read_dir(worktree.join("nested")).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&catalog).unwrap().count(), entries_before);
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     let area_id = Uuid::new_v4();

@@ -750,6 +750,40 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory linked worktrees from preserved external Git catalogs.
+    Report format 8 uses the per-repository key and pinned private catalog/
+    repository-marker validation with non-creating read snapshots. Decode
+    original linked-worktree records in Preparing/Ready/Removing states without
+    native admission, selected-HEAD repair, source-file access or removal replay.
+    Preserve raw paths, recorded root identities and recorded target branches.
+    Share this scan between inventory and client/export placement; paths,
+    symlink aliases and both historical/stable interpretations of saved root
+    identities exclude destinations, including renamed worktrees. Reject
+    conflicting namespaces/markers, malformed keys/records, orphan journals
+    and the existing 256-worktree cap before creation. SQL rows retain the
+    existing 32 MiB local-row bound and entries share the complete 32 MiB report
+    budget. Report external catalog availability and linked-worktree coverage
+    separately; full `catalog_inventoried`, payload verification and retained
+    history completeness remain false. Original-wire fixtures cover closed/
+    WAL-only/live catalogs, all states, raw/renamed paths, aliases, JSON,
+    missing roots/catalogs, wrong keys, canonical encoding, namespace/count
+    bounds, exact/over report budgets and late corruption without changing
+    original catalog/working data. The actual CLI inventories an original
+    Preparing record and rejects worktree/alias export and scratch parents
+    without changing either catalog or working files. External Git worktree qualification passes 240 unique cases: 46 export/peer
+    cases, all 63 ordinary volume and 104 ordinary Git cases, 20 CLI process
+    cases, retained-graph/discovery/withdrawal/graph-intent regressions, and
+    two provisioned Btrfs identity/retained-capture cases. All four debug
+    programs build; format and strict locked workspace/all-targets Clippy
+    pass. All 284 source-file and seven program/test-driver hashes remain
+    unchanged, and native mount/loop/image cleanup is verified. Evidence and
+    the distinct passing-case inventory are retained under
+    `/tmp/mb-m6-git-worktree-validation-xaclttn_`; the post-commit audit binds
+    the code to the commit. This is a focused debug-source qualification;
+    complete ordinary/native suites and installed artifacts were not rerun. Complete refs/objects/pins/index/stage/prune/checkout/merge and
+    removal-intent reconciliation, recipe/native-pin/paged-source/custody joins,
+    atomic writer handoff, installed artifacts and full R1/R2/R3/release gates
+    remain open.
   - [x] Inventory original local-sector recipes in `legacy-list` report format 7.
     Decode the original unversioned recipe and its four append-only source
     variants: legacy/stable anchor files, Inline and private catalog pages.

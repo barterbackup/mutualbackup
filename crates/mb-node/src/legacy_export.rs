@@ -12,10 +12,10 @@ pub use inventory::{
 };
 pub use local_inventory::{
     LegacyAnchorAreaLocation, LegacyCaptureOwnership, LegacyGitBlobPin, LegacyGitGraphObject,
-    LegacyGitGraphRef, LegacyGitRegistration, LegacyGuardedAnchorPin, LegacyGuardedCapture,
-    LegacyLocalSectorRecipe, LegacyLocalSectorSource, LegacyLocalStateInventory,
-    LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitGraph, LegacyPreservedRecord,
-    LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
+    LegacyGitGraphRef, LegacyGitRegistration, LegacyGitWorktreeRegistration,
+    LegacyGuardedAnchorPin, LegacyGuardedCapture, LegacyLocalSectorRecipe, LegacyLocalSectorSource,
+    LegacyLocalStateInventory, LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitGraph,
+    LegacyPreservedRecord, LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
     LegacyStorageVolumeRegistration, LegacyVolumeOwnership,
 };
 pub use remote::{

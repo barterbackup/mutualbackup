@@ -159,7 +159,7 @@ keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
 
-Report format 7 includes preserved local protected-root registrations, backend
+Report format 8 includes preserved local protected-root registrations, backend
 bindings, Git registrations, guarded stopped/revision-capture anchor ownership,
 pending source-capture and recovery-anchor intents, pending Git graph intents,
 retained revision/retirement anchors and remembered anchor-area locations.
@@ -169,13 +169,16 @@ ownership includes the planned root anchor and guarded per-file capture IDs,
 plus any anchor retained during
 recovery replacement. Relative historical requests are reported as bytes without
 resolving them against the inventory process's working directory.
-Raw Unix paths are reported as hex bytes. These records and the local signed
+Raw Unix paths are reported as hex bytes. Local control records and signed
 revisions come from one read-only SQLite snapshot, released before peer requests.
+Available external Git catalogs use their own non-creating metadata snapshots;
+these do not establish an atomic snapshot of every owner across filesystems.
 The complete canonical encoded report has a 32 MiB metadata limit; exceeding it fails the
 inventory instead of returning a truncated success. Binding identity comparisons
 are unknown for missing roots and older registration formats 1/2. Git registrations
-can be history-only: `catalog_inventoried` remains false because the external Git
-catalog is not opened. Unknown guarded/link-freeze records are listed with their
+can be history-only: `catalog_inventoried` remains false because complete external
+refs, objects, pins, index and pending-intent reconciliation is unfinished.
+Unknown guarded/link-freeze control records are listed with their
 kind, ID, payload size and digest for preservation; they are not decoded ownership.
 Git graph intent envelopes 1/2 retain their original bytes. libgit2 validates
 object IDs, reachable commit/tree/tag history, refs and declared blob lengths
@@ -187,6 +190,35 @@ locations. Envelope 1 omitted the selected branch: its decoder default `main`
 is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
+
+The `git_worktrees` entries inspect original linked-worktree registrations through
+the per-repository key, pinned private catalog and repository marker. Preparing,
+Ready and Removing records retain saved paths, root identities and target
+branches without selected-HEAD repair or source/removal replay. Missing roots
+or catalogs leave availability/coverage false. An available validated catalog
+sets `external_catalog_available` and `linked_worktrees_inventoried`; this does
+not make `catalog_inventoried` true. Inventory and placement share canonical,
+key, namespace and shape validation, the existing 256-worktree limit and bounded
+SQL rows. Absolute paths/aliases and both interpretations of recorded native
+identities exclude destinations, including renamed worktrees. Recorded identity
+words are not evidence of their stable-identity era. Every report entry shares
+the complete 32 MiB encoded-report budget. No working files or worktree markers
+are opened, and payload verification/history completeness remain false.
+The actual CLI fixture inventories an original Preparing record and rejects
+worktree/alias export and scratch parents while preserving both catalogs and
+working files. External Git worktree qualification passes 240 unique cases: 46 export/peer
+cases, all 63 ordinary volume and 104 ordinary Git cases, 20 CLI process
+cases, retained-graph/discovery/withdrawal/graph-intent regressions, and two
+provisioned Btrfs identity/retained-capture cases. All four debug programs
+build; format and strict locked workspace/all-targets Clippy pass. All 284
+source-file and seven program/test-driver hashes remain unchanged, and native
+mount/loop/image cleanup is verified. Evidence and the distinct passing-case
+inventory are retained under `/tmp/mb-m6-git-worktree-validation-xaclttn_`;
+the post-commit audit binds the code to the commit. This is a focused
+debug-source qualification; complete ordinary/native suites and installed
+artifacts were not rerun. Complete refs/objects/
+pins/index/stage/prune/checkout/merge/removal-intent reconciliation, other owner
+joins, relocated catalog discovery and atomic admission/writer handoff remain open.
 
 Retained `anchor-manifest` versions 1/2/3 and stable `anchor-retirement` records
 are validated without replay. Revision-keyed manifests can link available signed
@@ -309,7 +341,7 @@ identity is therefore reported without asserting a stable root identity. Guarded
 root plans were introduced after that change and retain stable identities.
 Available signed metadata is linked to pending records only for the same revision
 and guild; it does not authenticate a pending plan or verify its payloads.
-Source paths, mount paths and anchor payloads are not opened during inventory,
+Source/worktree/anchor payloads and withdrawn mount views are not opened during inventory,
 so `payloads_verified` remains false even when signed revision metadata is available.
 
 The pending-intent increment was qualified on Linux on 2026-10-08 with 336

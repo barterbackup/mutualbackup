@@ -225,6 +225,66 @@ fn require_native_pinned_catalog_state(
 
 impl GitRepository {
     /// Inspect local discovery assistance without replaying Git operations.
+    /// Inspect an available saved catalog without native admission, migration,
+    /// capture, mount discovery or replay. False means its root/catalog is absent.
+    #[cfg(target_os = "linux")]
+    pub fn for_each_preserved_linked_worktree(
+        source_root: &Path,
+        repository_id: Uuid,
+        key: &[u8; 32],
+        visit: impl FnMut(crate::GitWorktreeInfo) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !repository_id.is_nil(),
+            "invalid preserved Git repository identity"
+        );
+        let root = match PinnedDirectory::open(source_root) {
+            Ok(root) => root,
+            Err(AnchorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(directory) = root.open_child_directory(GIT_CATALOG_DIRECTORY)? else {
+            return Ok(false);
+        };
+        require_private_catalog(&directory)?;
+        if read_marker(&directory, GIT_CATALOG_MARKER_FILE)?.as_deref()
+            != Some(git_catalog_marker_bytes(repository_id).as_slice())
+        {
+            return Err(RepositoryError::Conflict.into());
+        }
+        let Some(database) = directory.open_child_file(CATALOG_DATABASE)? else {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                anyhow::ensure!(
+                    directory
+                        .open_child_file(format!("{CATALOG_DATABASE}{suffix}"))?
+                        .is_none(),
+                    "preserved Git catalog has a journal without its database"
+                );
+            }
+            return Ok(false);
+        };
+        let identity = database.metadata()?;
+        ControlStore::with_preserved_read_only_snapshot(
+            directory.descriptor_path().join(CATALOG_DATABASE),
+            &[*key],
+            |catalog| {
+                crate::worktree::for_each_preserved_worktree(catalog, repository_id, visit)?;
+                let current = directory
+                    .open_child_file(CATALOG_DATABASE)?
+                    .ok_or(RepositoryError::Conflict)?
+                    .metadata()?;
+                anyhow::ensure!(
+                    identity.dev() == current.dev() && identity.ino() == current.ino(),
+                    "preserved Git catalog was replaced"
+                );
+                Ok(())
+            },
+        )?;
+        Ok(true)
+    }
+
     pub fn anchor_discovery_jobs(
         source_root: &PinnedDirectory,
         repository_id: Uuid,
@@ -1921,6 +1981,294 @@ mod tests {
     use mb_store::{GIT_CATALOG_DIRECTORY, git_catalog_marker};
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_linked_worktrees_reject_ambiguous_catalogs_keys_and_existing_count_bound() {
+        let area = tempfile::tempdir().unwrap();
+        let root = area.path().join("missing");
+        let repository_id = Uuid::from_u128(140);
+        let key = [140; 32];
+        assert!(
+            !GitRepository::for_each_preserved_linked_worktree(
+                &root,
+                repository_id,
+                &key,
+                |_| panic!("absent root visited")
+            )
+            .unwrap()
+        );
+        assert!(!root.exists());
+        std::fs::create_dir(&root).unwrap();
+        assert!(
+            !GitRepository::for_each_preserved_linked_worktree(
+                &root,
+                repository_id,
+                &key,
+                |_| panic!("absent catalog visited")
+            )
+            .unwrap()
+        );
+        let directory = root.join(GIT_CATALOG_DIRECTORY);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = directory.join(GIT_CATALOG_MARKER_FILE);
+        std::fs::write(&marker, git_catalog_marker_bytes(Uuid::from_u128(141))).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            GitRepository::for_each_preserved_linked_worktree(
+                &root,
+                repository_id,
+                &key,
+                |_| panic!("foreign marker visited")
+            )
+            .is_err()
+        );
+        std::fs::write(&marker, git_catalog_marker_bytes(repository_id)).unwrap();
+        assert!(
+            !GitRepository::for_each_preserved_linked_worktree(
+                &root,
+                repository_id,
+                &key,
+                |_| panic!("absent database visited")
+            )
+            .unwrap()
+        );
+        let database = directory.join(CATALOG_DATABASE);
+        let wal = database.with_extension("db-wal");
+        std::fs::write(&wal, b"orphan journal").unwrap();
+        assert!(
+            GitRepository::for_each_preserved_linked_worktree(
+                &root,
+                repository_id,
+                &key,
+                |_| panic!("orphan WAL visited")
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"orphan journal");
+        assert!(!database.exists());
+        std::fs::remove_file(&wal).unwrap();
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let info = crate::GitWorktreeInfo {
+            format_version: 1,
+            repository_id,
+            worktree_id: Uuid::from_u128(142),
+            path: area.path().join("unavailable-worktree"),
+            root_id: mb_store::NativeFileId {
+                filesystem_id: 14,
+                inode: 140,
+            },
+            target_branch: "main".to_owned(),
+            state: crate::GitWorktreeState::Preparing,
+        };
+        let kind = format!("git-linked-worktree-v1/{repository_id}");
+        let bytes = canonical_bytes(&info).unwrap();
+        let foreign_kind = format!("git-linked-worktree-v1/{}", Uuid::from_u128(141));
+        control
+            .put_record(&foreign_kind, info.worktree_id.as_bytes(), &bytes)
+            .unwrap();
+        assert!(
+            GitRepository::for_each_preserved_linked_worktree(
+                &root,
+                repository_id,
+                &key,
+                |_| panic!("foreign worktree namespace visited")
+            )
+            .is_err()
+        );
+        control
+            .delete_record(&foreign_kind, info.worktree_id.as_bytes())
+            .unwrap();
+        for (record_key, record) in [
+            (vec![1; 17], bytes.clone()),
+            (Uuid::from_u128(143).as_bytes().to_vec(), bytes.clone()),
+            (
+                info.worktree_id.as_bytes().to_vec(),
+                [bytes.clone(), vec![0]].concat(),
+            ),
+        ] {
+            control.put_record(&kind, &record_key, &record).unwrap();
+            assert!(
+                GitRepository::for_each_preserved_linked_worktree(
+                    &root,
+                    repository_id,
+                    &key,
+                    |_| panic!("invalid worktree visited")
+                )
+                .is_err()
+            );
+            control.delete_record(&kind, &record_key).unwrap();
+        }
+        control
+            .put_record(&kind, info.worktree_id.as_bytes(), &bytes)
+            .unwrap();
+        assert!(
+            GitRepository::for_each_preserved_linked_worktree(
+                &root,
+                repository_id,
+                &[141; 32],
+                |_| panic!("wrong key visited")
+            )
+            .is_err()
+        );
+        control
+            .delete_record(&kind, info.worktree_id.as_bytes())
+            .unwrap();
+        for index in 0..256 {
+            let record = crate::GitWorktreeInfo {
+                worktree_id: Uuid::from_u128(200 + index),
+                ..info.clone()
+            };
+            control
+                .put_record(
+                    &kind,
+                    record.worktree_id.as_bytes(),
+                    &canonical_bytes(&record).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut visited = 0;
+        assert!(
+            GitRepository::for_each_preserved_linked_worktree(&root, repository_id, &key, |_| {
+                visited += 1;
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(visited, 256);
+        let extra = crate::GitWorktreeInfo {
+            worktree_id: Uuid::from_u128(456),
+            ..info
+        };
+        control
+            .put_record(
+                &kind,
+                extra.worktree_id.as_bytes(),
+                &canonical_bytes(&extra).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            GitRepository::for_each_preserved_linked_worktree(&root, repository_id, &key, |_| Ok(
+                ()
+            ))
+            .is_err()
+        );
+        assert!(!area.path().join("unavailable-worktree").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_linked_worktrees_keep_original_states_paths_and_catalog_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        for mode in ["closed", "wal-only", "live"] {
+            let area = tempfile::tempdir().unwrap();
+            let root = area.path().join("source");
+            fs::create_dir(&root).unwrap();
+            let directory = root.join(GIT_CATALOG_DIRECTORY);
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let repository_id = Uuid::from_u128(120);
+            fs::write(
+                directory.join(GIT_CATALOG_MARKER_FILE),
+                git_catalog_marker_bytes(repository_id),
+            )
+            .unwrap();
+            fs::set_permissions(
+                directory.join(GIT_CATALOG_MARKER_FILE),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let key = [120; 32];
+            let database = directory.join(CATALOG_DATABASE);
+            let control = ControlStore::open_with_key(&database, &key).unwrap();
+            let records = [
+                crate::GitWorktreeState::Preparing,
+                crate::GitWorktreeState::Ready,
+                crate::GitWorktreeState::Removing,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| crate::GitWorktreeInfo {
+                format_version: 1,
+                repository_id,
+                worktree_id: Uuid::from_u128(index as u128 + 121),
+                path: area.path().join(std::ffi::OsString::from_vec(vec![
+                    b'w',
+                    index as u8 + b'0',
+                    255,
+                ])),
+                root_id: mb_store::NativeFileId {
+                    filesystem_id: 12,
+                    inode: index as u64 + 120,
+                },
+                target_branch: "main".to_owned(),
+                state,
+            })
+            .collect::<Vec<_>>();
+            for info in &records {
+                control
+                    .put_record(
+                        &format!("git-linked-worktree-v1/{repository_id}"),
+                        info.worktree_id.as_bytes(),
+                        &canonical_bytes(info).unwrap(),
+                    )
+                    .unwrap();
+            }
+            control
+                .put_record(
+                    "git-guarded-stage-receipt-v1/preserved",
+                    b"old",
+                    b"opaque retained evidence",
+                )
+                .unwrap();
+            let mut writer = Some(control);
+            if mode == "closed" {
+                drop(writer.take());
+            }
+            if mode == "wal-only" {
+                fs::remove_file(database.with_extension("db-shm")).unwrap();
+            }
+            let names = || {
+                let mut names = fs::read_dir(&directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            };
+            let before_names = names();
+            let before_main = fs::read(&database).unwrap();
+            let before_wal = fs::read(database.with_extension("db-wal")).ok();
+            let mut visited = Vec::new();
+            assert!(
+                GitRepository::for_each_preserved_linked_worktree(
+                    &root,
+                    repository_id,
+                    &key,
+                    |info| {
+                        visited.push(info);
+                        Ok(())
+                    }
+                )
+                .unwrap()
+            );
+            assert_eq!(visited, records);
+            assert!(visited.iter().all(|info| !info.path.exists()));
+            assert!(
+                require_native_catalog_state(&root, repository_id, &key).is_err(),
+                "ordinary admission must still reject guarded state"
+            );
+            assert_eq!(names(), before_names, "{mode}");
+            assert_eq!(fs::read(&database).unwrap(), before_main, "{mode}");
+            assert_eq!(
+                fs::read(database.with_extension("db-wal")).ok(),
+                before_wal,
+                "{mode}"
+            );
+            drop(writer);
+        }
+    }
 
     #[test]
     fn oversized_history_status_and_full_export_preserve_all_refs_and_exact_bytes() {
