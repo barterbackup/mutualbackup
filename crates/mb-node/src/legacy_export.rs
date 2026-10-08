@@ -18,8 +18,10 @@ pub use local_inventory::{
     LegacyGuardedAnchorPin, LegacyGuardedCapture, LegacyLocalSectorRecipe, LegacyLocalSectorSource,
     LegacyLocalStateInventory, LegacyPendingCapture, LegacyPendingFilePin, LegacyPendingGitGraph,
     LegacyPendingGitPrune, LegacyPendingGitRemoval, LegacyPendingGitStage, LegacyPendingGitSymlink,
-    LegacyPreservedRecord, LegacyPruneFileAnchor, LegacyRetainedAnchor, LegacyRootRegistration,
-    LegacySourceBinding, LegacyStorageVolumeRegistration, LegacyVolumeOwnership,
+    LegacyPendingGitWorktreeRemoval, LegacyPreservedRecord, LegacyPruneFileAnchor,
+    LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
+    LegacyStorageVolumeRegistration, LegacyVolumeOwnership, LegacyWorktreeRemovalDirectory,
+    LegacyWorktreeRemovalFile,
 };
 pub use remote::{
     LegacyExportPeer, LegacyPeerInventoryCoverage, LegacyPeerSources,

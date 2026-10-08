@@ -78,12 +78,19 @@ mod tests {
             .path()
             .join(std::ffi::OsString::from_vec(b"candidate-\xff".to_vec()));
         std::fs::create_dir(&directory).unwrap();
-        candidate(&directory);
+        // A pre-existing executable avoids ETXTBSY when parallel process tests
+        // overlap execution with freshly written executable fixtures.
+        for (name, _) in PROGRAMS {
+            symlink("/bin/sh", directory.join(name)).unwrap();
+        }
         let link = temp.path().join("installed");
         symlink(&directory, &link).unwrap();
         for program in select(Some(link.as_os_str())).unwrap() {
             assert!(program.starts_with(&link));
-            let output = std::process::Command::new(program).output().unwrap();
+            let output = std::process::Command::new(program)
+                .args(["-c", "printf 'installed-candidate\\n'"])
+                .output()
+                .unwrap();
             assert!(output.status.success());
             assert_eq!(output.stdout, b"installed-candidate\n");
         }

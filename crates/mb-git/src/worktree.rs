@@ -135,6 +135,341 @@ struct RemovalIntent {
     directories: Vec<RemovalDirectory>,
 }
 
+/// Ownership retained by an unfinished removal; no filesystem access is needed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedWorktreeRemoval {
+    pub format_version: u16,
+    pub scope: GitWorktreeScope,
+    pub root_id: NativeFileId,
+    pub parent_id: NativeFileId,
+    pub marker_directory_id: NativeFileId,
+    pub marker_id: NativeFileId,
+    pub files: Vec<PreservedWorktreeRemovalFile>,
+    pub directories: Vec<PreservedWorktreeRemovalDirectory>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedWorktreeRemovalFile {
+    pub path: Vec<u8>,
+    pub oid: [u8; 20],
+    pub mode: u32,
+    pub recorded_identity: NativeFileId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedWorktreeRemovalDirectory {
+    pub path: Vec<u8>,
+    pub recorded_identity: NativeFileId,
+}
+
+/// Inspect removal journals independently of registration, index and HEAD joins.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_removal(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    let mut count = 0;
+    control.for_each_record_with_kind_prefix_bounded(
+        REMOVE_PREFIX,
+        512,
+        16,
+        mb_core::V1_MAX_CATALOG_BYTES,
+        |kind, key, bytes| {
+            count += 1;
+            ensure!(
+                count <= MAX_WORKTREES,
+                "too many preserved worktree removals"
+            );
+            ensure!(
+                kind == remove_kind(repository_id),
+                "invalid preserved worktree removal namespace"
+            );
+            let intent: RemovalIntent = decode_canonical(bytes)?;
+            let scope = GitWorktreeScope::linked(repository_id, intent.worktree_id)
+                .ok_or_else(|| anyhow::anyhow!("invalid preserved worktree removal scope"))?;
+            ensure!(
+                intent.format_version == 1
+                    && intent.repository_id == repository_id
+                    && key == intent.worktree_id.as_bytes()
+                    && intent.files.len() <= MAX_REMOVAL_FILES
+                    && intent.directories.len() <= MAX_REMOVAL_FILES
+                    && mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                "invalid preserved worktree removal record"
+            );
+            for identity in [
+                intent.root_id,
+                intent.parent_id,
+                intent.marker_directory_id,
+                intent.marker_id,
+            ] {
+                ensure!(
+                    identity.filesystem_id != 0 && identity.inode != 0,
+                    "invalid preserved worktree removal identity"
+                );
+            }
+            ensure!(
+                intent.marker_directory_id.filesystem_id == intent.root_id.filesystem_id
+                    && intent.marker_id.filesystem_id == intent.root_id.filesystem_id,
+                "invalid preserved worktree removal marker filesystem"
+            );
+            let mut seen = BTreeSet::new();
+            let mut validate_path = |path: &[u8], identity: NativeFileId| -> anyhow::Result<()> {
+                ensure!(
+                    !path.contains(&0)
+                        && path.len() <= crate::stage::MAX_STAGE_PATH_BYTES
+                        && stage_path_key(&PathBuf::from(OsString::from_vec(path.to_vec())))?
+                            == path
+                        && identity.filesystem_id == intent.root_id.filesystem_id
+                        && identity.inode != 0
+                        && seen.insert(path.to_vec()),
+                    "invalid preserved worktree removal path or ownership"
+                );
+                Ok(())
+            };
+            for file in &intent.files {
+                validate_path(&file.path, file.identity)?;
+                ensure!(
+                    matches!(file.mode, 0o100644 | 0o100755 | 0o120000),
+                    "invalid preserved worktree removal mode"
+                );
+            }
+            for directory in &intent.directories {
+                validate_path(&directory.path, directory.identity)?;
+            }
+            visit(crate::PreservedGitRecord::WorktreeRemovalIntent(Box::new(
+                PreservedWorktreeRemoval {
+                    format_version: intent.format_version,
+                    scope,
+                    root_id: intent.root_id,
+                    parent_id: intent.parent_id,
+                    marker_directory_id: intent.marker_directory_id,
+                    marker_id: intent.marker_id,
+                    files: intent
+                        .files
+                        .into_iter()
+                        .map(|file| PreservedWorktreeRemovalFile {
+                            path: file.path,
+                            oid: file.oid,
+                            mode: file.mode,
+                            recorded_identity: file.identity,
+                        })
+                        .collect(),
+                    directories: intent
+                        .directories
+                        .into_iter()
+                        .map(|directory| PreservedWorktreeRemovalDirectory {
+                            path: directory.path,
+                            recorded_identity: directory.identity,
+                        })
+                        .collect(),
+                },
+            )))?;
+            Ok(true)
+        },
+    )?;
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod preserved_removal_tests {
+    use super::*;
+
+    #[test]
+    fn preserved_worktree_removal_keeps_original_ownership_without_registration_or_replay() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&path, &[225; 32]).unwrap();
+        let repository_id = Uuid::from_u128(225);
+        let worktree_id = Uuid::from_u128(226);
+        let identity = |inode| NativeFileId {
+            filesystem_id: 7,
+            inode,
+        };
+        let file = (
+            b"nested/file-\xff".to_vec(),
+            [31_u8; 20],
+            0o120000_u32,
+            identity(8),
+        );
+        let directory = (b"nested".to_vec(), identity(9));
+        // The original v1 positional layout; no registration, HEAD or index.
+        let bytes = canonical_bytes(&(
+            1_u16,
+            repository_id,
+            worktree_id,
+            identity(10),
+            identity(11),
+            identity(12),
+            identity(13),
+            vec![file.clone()],
+            vec![directory.clone()],
+        ))
+        .unwrap();
+        let original: RemovalIntent = decode_canonical(&bytes).unwrap();
+        assert_eq!(canonical_bytes(&original).unwrap(), bytes);
+        let kind = remove_kind(repository_id);
+        control
+            .put_record(&kind, worktree_id.as_bytes(), &bytes)
+            .unwrap();
+        let snapshot = || {
+            (
+                fs::read(&path).unwrap(),
+                fs::read(path.with_extension("db-wal")).unwrap(),
+            )
+        };
+        let before = snapshot();
+        let mut count = 0;
+        for_each_preserved_removal(&control, repository_id, |record| {
+            let crate::PreservedGitRecord::WorktreeRemovalIntent(intent) = record else {
+                panic!("wrong record")
+            };
+            assert_eq!(intent.format_version, 1);
+            assert_eq!(
+                intent.scope,
+                GitWorktreeScope::linked(repository_id, worktree_id).unwrap()
+            );
+            assert_eq!(intent.root_id, identity(10));
+            assert_eq!(intent.parent_id, identity(11));
+            assert_eq!(intent.marker_directory_id, identity(12));
+            assert_eq!(intent.marker_id, identity(13));
+            assert_eq!(
+                intent.files,
+                vec![PreservedWorktreeRemovalFile {
+                    path: file.0.clone(),
+                    oid: file.1,
+                    mode: file.2,
+                    recorded_identity: file.3,
+                }]
+            );
+            assert_eq!(
+                intent.directories,
+                vec![PreservedWorktreeRemovalDirectory {
+                    path: directory.0.clone(),
+                    recorded_identity: directory.1,
+                }]
+            );
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(snapshot(), before);
+        control
+            .delete_record(&kind, worktree_id.as_bytes())
+            .unwrap();
+        for count in [0, MAX_REMOVAL_FILES] {
+            let mut intent = original.clone();
+            intent.files = (0..count)
+                .map(|index| RemovalFile {
+                    path: format!("f{index}").into_bytes(),
+                    oid: [31; 20],
+                    mode: 0o100644,
+                    identity: identity(20 + index as u64),
+                })
+                .collect();
+            intent.directories = (0..count)
+                .map(|index| RemovalDirectory {
+                    path: format!("d{index}").into_bytes(),
+                    identity: identity(20_000 + index as u64),
+                })
+                .collect();
+            control
+                .put_record(
+                    &kind,
+                    worktree_id.as_bytes(),
+                    &canonical_bytes(&intent).unwrap(),
+                )
+                .unwrap();
+            assert!(for_each_preserved_removal(&control, repository_id, |_| Ok(())).is_ok());
+            control
+                .delete_record(&kind, worktree_id.as_bytes())
+                .unwrap();
+        }
+        let mut boundary = original.clone();
+        boundary.files[0].path = vec![b'x'; crate::stage::MAX_STAGE_PATH_BYTES];
+        control
+            .put_record(
+                &kind,
+                worktree_id.as_bytes(),
+                &canonical_bytes(&boundary).unwrap(),
+            )
+            .unwrap();
+        assert!(for_each_preserved_removal(&control, repository_id, |_| Ok(())).is_ok());
+        control
+            .delete_record(&kind, worktree_id.as_bytes())
+            .unwrap();
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(for_each_preserved_removal(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        for index in 0..18 {
+            let mut bad = original.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.repository_id = Uuid::nil(),
+                2 => bad.worktree_id = repository_id,
+                3 => bad.root_id.inode = 0,
+                4 => bad.parent_id.filesystem_id = 0,
+                5 => bad.marker_directory_id.filesystem_id = 8,
+                6 => bad.marker_id.inode = 0,
+                7 => bad.files[0].mode = 0,
+                8 => bad.files[0].identity.filesystem_id = 8,
+                9 => bad.files[0].identity.inode = 0,
+                10 => bad.files.push(bad.files[0].clone()),
+                11 => bad.directories.push(bad.directories[0].clone()),
+                12 => bad.files[0].path = b"../escape".to_vec(),
+                13 => bad.directories[0].path = b"a\0b".to_vec(),
+                14 => bad.directories[0].path = bad.files[0].path.clone(),
+                15 => bad.files[0].path = vec![b'x'; crate::stage::MAX_STAGE_PATH_BYTES + 1],
+                16 => bad.files = vec![bad.files[0].clone(); MAX_REMOVAL_FILES + 1],
+                _ => bad.directories = vec![bad.directories[0].clone(); MAX_REMOVAL_FILES + 1],
+            }
+            reject(
+                &kind,
+                worktree_id.as_bytes(),
+                &canonical_bytes(&bad).unwrap(),
+            );
+        }
+        for key in [b"".as_slice(), repository_id.as_bytes(), &[0; 17]] {
+            reject(&kind, key, &bytes);
+        }
+        reject(
+            &remove_kind(Uuid::from_u128(999)),
+            worktree_id.as_bytes(),
+            &bytes,
+        );
+        reject(
+            &kind,
+            worktree_id.as_bytes(),
+            &[bytes.clone(), vec![0]].concat(),
+        );
+        reject(
+            &kind,
+            worktree_id.as_bytes(),
+            &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1],
+        );
+        for index in 0..=MAX_WORKTREES {
+            let mut intent = original.clone();
+            intent.worktree_id = Uuid::from_u128(1_000 + index as u128);
+            control
+                .put_record(
+                    &kind,
+                    intent.worktree_id.as_bytes(),
+                    &canonical_bytes(&intent).unwrap(),
+                )
+                .unwrap();
+            let outcome = for_each_preserved_removal(&control, repository_id, |_| Ok(()));
+            assert_eq!(outcome.is_ok(), index < MAX_WORKTREES);
+        }
+        assert!(!temporary.path().join("nested").exists());
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitWorktreeInfo {
     pub format_version: u16,

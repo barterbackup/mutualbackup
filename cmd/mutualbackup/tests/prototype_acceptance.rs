@@ -3703,6 +3703,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let prune_source = temp.path().join("preserved-git-prune-source");
     let prune_area = temp.path().join("preserved-git-prune-area");
     let removal_root = temp.path().join("preserved-git-removal-root");
+    let worktree_removal_root = temp.path().join("preserved-worktree-removal-root");
+    let worktree_removal_marker = temp.path().join("preserved-worktree-removal-marker");
+    let worktree_removal_child = temp.path().join("preserved-worktree-removal-child");
     for path in [
         &object_source,
         &object_area,
@@ -3715,6 +3718,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &prune_source,
         &prune_area,
         &removal_root,
+        &worktree_removal_root,
+        &worktree_removal_marker,
+        &worktree_removal_child,
     ] {
         fs::create_dir(path).unwrap();
         fs::create_dir(path.join("nested")).unwrap();
@@ -3909,6 +3915,45 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         mode: 0o100644,
         anchor_id: Uuid::new_v4(),
     };
+    let removing_worktree_id = Uuid::new_v4();
+    let directory_id = |path: &Path| {
+        mb_store::PinnedDirectory::open(path)
+            .unwrap()
+            .identity()
+            .unwrap()
+    };
+    let removing_root_id = directory_id(&worktree_removal_root);
+    let removing_marker_id = directory_id(&worktree_removal_marker);
+    let removing_child_id = directory_id(&worktree_removal_child);
+    external_store
+        .put_record(
+            &format!("git-worktree-remove-intent-v1/{repository_id}"),
+            removing_worktree_id.as_bytes(),
+            &canonical_bytes(&(
+                1_u16,
+                repository_id,
+                removing_worktree_id,
+                removing_root_id,
+                directory_id(temp.path()),
+                removing_marker_id,
+                mb_store::NativeFileId {
+                    filesystem_id: removing_root_id.filesystem_id,
+                    inode: 63,
+                },
+                vec![(
+                    b"nested/file-\xf5".to_vec(),
+                    [36_u8; 20],
+                    0o100755_u32,
+                    mb_store::NativeFileId {
+                        filesystem_id: removing_root_id.filesystem_id,
+                        inode: 64,
+                    },
+                )],
+                vec![(b"nested".to_vec(), removing_child_id)],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
     external_store
         .put_record(
             &format!("git-worktree-rm-intent-v1/{repository_id}/{removal_worktree_id}"),
@@ -4071,7 +4116,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 13);
+    assert_eq!(inventory.format_version, 14);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -4127,6 +4172,30 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert_eq!(saved_removal.relative_path_hex, hex::encode(b"remove-\xf6"));
     assert_eq!(saved_removal.entry, removal_entry);
     assert!(!saved_removal.payloads_verified);
+    assert!(git_registration.worktree_removal_intents_inventoried);
+    assert_eq!(inventory.local_state.pending_git_worktree_removals.len(), 1);
+    let saved_worktree_removal = &inventory.local_state.pending_git_worktree_removals[0];
+    assert_eq!(saved_worktree_removal.repository_id, repository_id);
+    assert_eq!(saved_worktree_removal.worktree_id, removing_worktree_id);
+    assert_eq!(saved_worktree_removal.record_format, 1);
+    assert_eq!(
+        saved_worktree_removal.recorded_root_identity,
+        removing_root_id
+    );
+    assert_eq!(
+        saved_worktree_removal.recorded_marker_directory_identity,
+        removing_marker_id
+    );
+    assert_eq!(
+        saved_worktree_removal.files[0].relative_path_hex,
+        hex::encode(b"nested/file-\xf5")
+    );
+    assert_eq!(saved_worktree_removal.files[0].oid, hex::encode([36; 20]));
+    assert_eq!(
+        saved_worktree_removal.directories[0].recorded_identity,
+        removing_child_id
+    );
+    assert!(!saved_worktree_removal.payloads_verified);
     assert_eq!(inventory.local_state.pending_git_symlinks.len(), 1);
     let saved_symlink = &inventory.local_state.pending_git_symlinks[0];
     assert_eq!(saved_symlink.repository_id, repository_id);
@@ -4283,6 +4352,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         prune_source.join("nested"),
         prune_area.join("nested"),
         removal_root.join("nested"),
+        worktree_removal_root.join("nested"),
+        worktree_removal_marker.join("nested"),
+        worktree_removal_child.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -4410,6 +4482,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &prune_source.join("nested"),
         &prune_area.join("nested"),
         &removal_root.join("nested"),
+        &worktree_removal_root.join("nested"),
+        &worktree_removal_marker.join("nested"),
+        &worktree_removal_child.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -4459,6 +4534,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &prune_source,
         &prune_area,
         &removal_root,
+        &worktree_removal_root,
+        &worktree_removal_marker,
+        &worktree_removal_child,
     ] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),

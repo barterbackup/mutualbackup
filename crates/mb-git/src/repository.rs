@@ -261,6 +261,7 @@ pub enum PreservedGitRecord {
         record_format: u16,
         anchors: Vec<FileAnchorManifest>,
     },
+    WorktreeRemovalIntent(Box<crate::worktree::PreservedWorktreeRemoval>),
     AnchorAreaLocation {
         repository_id: Uuid,
         area_id: Uuid,
@@ -317,6 +318,7 @@ impl GitRepository {
             crate::stage::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::rm::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::prune::for_each_preserved_record(catalog, repository_id, &mut visit)?;
+            crate::worktree::for_each_preserved_removal(catalog, repository_id, &mut visit)?;
             crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, &mut visit)?;
             crate::history::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::head::for_each_preserved_branch(catalog, repository_id, visit)

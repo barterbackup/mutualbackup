@@ -283,6 +283,15 @@ impl PreservedParentCheck {
                     self.check_hint(&anchor.source_root_hint)?;
                     self.check_hint(&anchor.area.path_hint)?;
                 }
+                PreservedExternalGitRecord::Record(
+                    mb_git::PreservedGitRecord::WorktreeRemovalIntent(intent),
+                ) => {
+                    self.check_recorded_native(intent.root_id)?;
+                    self.check_recorded_native(intent.marker_directory_id)?;
+                    for directory in intent.directories {
+                        self.check_recorded_native(directory.recorded_identity)?;
+                    }
+                }
                 PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::RemovalIntent {
                     recorded_root_identity,
                     ..

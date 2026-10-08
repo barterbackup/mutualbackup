@@ -191,6 +191,50 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+`legacy-list` format 14 adds original linked-worktree removal journals
+independently of their saved registration, selected HEAD and index. The
+original v1 positional codec retains repository/worktree scope,
+root/parent/marker-directory/marker identities, every raw file
+path/OID/mode/identity and every child-directory path/identity. Pure bounded
+decoding enforces the original 256-worktree and 8,192-file/directory limits,
+4,096-byte paths, canonical namespace/key/version/encoding, nonzero
+identities, same-root-filesystem owned entries, valid modes and unique
+normalized non-NUL paths. It does not open a worktree, read its marker, repair
+its HEAD, unlink files or replay removal. The complete projected report shares
+the 32 MiB limit. Recorded root, marker-directory and child-directory
+identities exclude output/scratch placement after rename or relocation,
+including historical device and stable-filesystem identity eras and aliases.
+The containing parent is location metadata rather than an owned root. Separate
+family coverage keeps full catalog/payload/history verification false and
+leaves absent registration/index joins unresolved. Original-wire,
+empty/exact/over cardinality and path/row bounds, malformed ownership,
+closed/WAL-only/live catalogs, relocated directories, JSON/report limits, late
+corruption and actual CLI checks preserve original inputs. The initial worktree-removal qualification passed all 233 non-process cases
+and 19 CLI process cases, but candidate selection returned Linux ETXTBSY while
+executing a freshly written test script. The fixture now executes the existing
+`/bin/sh` through installed-candidate symlinks and explicit marker commands,
+preserving raw-path and candidate-only assertions without writing an
+executable. The exact competing writable descriptor was not captured. The
+failed attempt, unchanged 284-source/seven-binary hashes and verified native
+cleanup are retained under `/tmp/mb-m6-worktree-removal-validation-rvn03s52`.
+Continuation qualification reuses only passing cases on identical production
+code and identical Node/Git/program binaries, and reruns the complete CLI
+process suite on the rebuilt driver. External Git worktree-removal qualification passes 253 unique cases: 51
+export/peer cases, all 63 ordinary volume and 112 ordinary Git cases, 20 CLI
+process cases, retained-graph/discovery/withdrawal/graph-intent regressions,
+and two provisioned Btrfs identity/retained-capture cases. The continuation
+reruns all 20 CLI cases after correcting the executable fixture and reuses 233
+passing cases on identical production code and six unchanged binaries from the
+retained first attempt. All four debug programs build; format and strict
+locked workspace/all-targets Clippy pass. All 284 source-file and seven
+program/test-driver hashes remain unchanged during the continuation, and
+native mount/loop/image cleanup is verified. Evidence and the distinct
+passing-case inventory are retained under
+`/tmp/mb-m6-worktree-removal-validation-continuation-phcwl26e`; the
+post-commit audit binds the code to the commit. This is a focused debug-source
+qualification; complete ordinary/native suites and installed artifacts were
+not rerun.
+
 `legacy-list` format 13 adds original external Git prune batches and
 primary/linked tracked-removal intents to each preserved repository snapshot.
 The original positional codecs retain every retired native, imported and
