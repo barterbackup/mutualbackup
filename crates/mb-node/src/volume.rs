@@ -121,6 +121,8 @@ struct VolumeManifest {
 pub struct PreservedParityVolume {
     volume_id: Uuid,
     store: ParityStore,
+    #[cfg(target_os = "linux")]
+    guard: mb_store::PreservedReadGuard,
 }
 
 impl PreservedParityVolume {
@@ -158,6 +160,16 @@ impl PreservedParityVolume {
             }
             Err(error) => return Err(error.into()),
         };
+        #[cfg(target_os = "linux")]
+        let (store, guard) = ParityStore::open_preserved_read_only_with_keys(
+            &path,
+            volume_id.as_bytes(),
+            &[
+                database_key,
+                keys.database_key(&legacy_volume_database_id(volume_id)),
+            ],
+        )?;
+        #[cfg(not(target_os = "linux"))]
         let store = ParityStore::open_existing_read_only_with_key(
             &path,
             volume_id.as_bytes(),
@@ -171,7 +183,18 @@ impl PreservedParityVolume {
             )
             .map_err(|_| wrapped_error)
         })?;
-        Ok(Self { volume_id, store })
+        Ok(Self {
+            volume_id,
+            store,
+            #[cfg(target_os = "linux")]
+            guard,
+        })
+    }
+
+    /// Verify preserved input versions immediately before publishing recovery.
+    #[cfg(target_os = "linux")]
+    pub fn verify_unchanged(&self) -> Result<()> {
+        self.guard.verify_unchanged()
     }
 
     pub fn volume_id(&self) -> Uuid {
@@ -185,10 +208,14 @@ impl PreservedParityVolume {
         index: u8,
         root: &[u8; 32],
     ) -> Result<Vec<u8>> {
+        #[cfg(target_os = "linux")]
+        self.verify_unchanged()?;
         let object = self.store.load_ready(group_id, index)?;
         if object.guild_id != *guild_id || object.root != *root {
             bail!("preserved fixed shard differs from its authenticated reference");
         }
+        #[cfg(target_os = "linux")]
+        self.verify_unchanged()?;
         Ok(object.bytes)
     }
 
@@ -199,10 +226,14 @@ impl PreservedParityVolume {
         index: u16,
         commitment: &MerkleCommitment,
     ) -> Result<Vec<u8>> {
+        #[cfg(target_os = "linux")]
+        self.verify_unchanged()?;
         let object = self.store.load_ready_variable(group_id, index)?;
         if object.guild_id != *guild_id || object.commitment != *commitment {
             bail!("preserved variable shard differs from its authenticated reference");
         }
+        #[cfg(target_os = "linux")]
+        self.verify_unchanged()?;
         Ok(object.bytes)
     }
 }
@@ -2840,6 +2871,7 @@ pub(crate) fn reader_coding_capacity(
 
 /// Read-only inspection uses the existing key without publishing an envelope
 /// or migrating a legacy key. Callers can reject retired backends first.
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn inspect_control_store(
     data_dir: &Path,
     keys: &KeyMaterial,
@@ -2882,6 +2914,25 @@ pub(crate) fn with_inspected_control_snapshot<T>(
     keys: &KeyMaterial,
     operation: impl FnOnce(&ControlStore) -> Result<T>,
 ) -> Result<T> {
+    let database_keys = preserved_control_keys(data_dir, keys)?;
+    ControlStore::with_preserved_read_only_snapshot(
+        data_dir.join("control.db"),
+        &database_keys,
+        operation,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn open_preserved_control_store(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+) -> Result<(ControlStore, mb_store::PreservedReadGuard)> {
+    let database_keys = preserved_control_keys(data_dir, keys)?;
+    ControlStore::open_preserved_read_only_with_keys(data_dir.join("control.db"), &database_keys)
+}
+
+#[cfg(target_os = "linux")]
+fn preserved_control_keys(data_dir: &Path, keys: &KeyMaterial) -> Result<Vec<[u8; 32]>> {
     let mut database_keys = Vec::new();
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
     if envelope_path.exists() {
@@ -2892,11 +2943,7 @@ pub(crate) fn with_inspected_control_snapshot<T>(
         );
     }
     database_keys.push(keys.database_key(b"control.db"));
-    ControlStore::with_preserved_read_only_snapshot(
-        data_dir.join("control.db"),
-        &database_keys,
-        operation,
-    )
+    Ok(database_keys)
 }
 
 pub(crate) fn open_control_store(
@@ -3454,124 +3501,251 @@ mod tests {
     #[test]
     fn preserved_parity_volume_reads_wrapped_legacy_and_interrupted_keys_without_mutation() {
         for mode in 0..3 {
+            let journal_states = if cfg!(target_os = "linux") { 3 } else { 1 };
+            for journal_state in 0..journal_states {
+                let temp = TempDir::new().unwrap();
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([119; 32]));
+                let volume_id = if mode == 1 {
+                    Uuid::new_v4()
+                } else {
+                    legacy_default_volume_id(&keys)
+                };
+                let wrapped_key = [120; 32];
+                let database_key = if mode == 1 {
+                    wrapped_key
+                } else {
+                    keys.database_key(&legacy_volume_database_id(volume_id))
+                };
+                let path = temp.path().join("parity.db");
+                let mut writer =
+                    ParityStore::open_with_key(&path, volume_id.as_bytes(), &database_key).unwrap();
+                writer
+                    .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                    .unwrap();
+                let fixed = parity_object(121, 3);
+                writer.stage_and_publish(&fixed).unwrap();
+                let bytes = vec![122; 4096];
+                let variable = VariableParityObject {
+                    format_version: 2,
+                    guild_id: [123; 32],
+                    group_id: [124; 32],
+                    shard_index: 7,
+                    commitment: mb_core::merkle_commit(&bytes).unwrap(),
+                    bytes,
+                };
+                writer
+                    .stage_attempt(&[125; 16], &variable, b"receipt", 2 * 65536)
+                    .unwrap();
+                writer
+                    .activate_attempt_object(
+                        &[125; 16],
+                        &variable.group_id,
+                        variable.shard_index,
+                        &variable.commitment,
+                        &[126; 32],
+                    )
+                    .unwrap();
+                if mode != 0 {
+                    let manifest = VolumeManifest {
+                        format_version: 1,
+                        owner: keys.node_id(),
+                        volume_id,
+                        database_file: "parity.db".into(),
+                        wrapped_database_key: keys
+                            .wrap_database_key(&volume_database_id(volume_id), &wrapped_key)
+                            .unwrap(),
+                    };
+                    write_new_private_record(
+                        &temp.path().join(VOLUME_MANIFEST_FILE),
+                        &SignedRecord::sign(VOLUME_MANIFEST_DOMAIN, manifest, &keys).unwrap(),
+                    )
+                    .unwrap();
+                }
+                let root = if journal_state == 1 {
+                    let copy = temp.path().join("copy");
+                    fs::create_dir(&copy).unwrap();
+                    for name in ["parity.db", "parity.db-wal", VOLUME_MANIFEST_FILE] {
+                        if temp.path().join(name).exists() {
+                            fs::copy(temp.path().join(name), copy.join(name)).unwrap();
+                        }
+                    }
+                    copy
+                } else {
+                    temp.path().to_path_buf()
+                };
+                let _writer = if journal_state == 2 {
+                    Some(writer)
+                } else {
+                    drop(writer);
+                    None
+                };
+                let path = root.join("parity.db");
+                #[cfg(target_os = "linux")]
+                let files = || -> BTreeMap<_, _> {
+                    fs::read_dir(&root)
+                        .unwrap()
+                        .filter_map(|entry| {
+                            let entry = entry.unwrap();
+                            if !entry.file_type().unwrap().is_file() {
+                                return None;
+                            }
+                            let bytes = fs::read(entry.path()).unwrap();
+                            let digest = (entry.file_name() != "parity.db-shm")
+                                .then(|| blake3::hash(&bytes));
+                            Some((entry.file_name(), (bytes.len(), digest)))
+                        })
+                        .collect()
+                };
+                #[cfg(target_os = "linux")]
+                let original_files = files();
+                let original = fs::read(&path).unwrap();
+                let manifest_before = fs::read(root.join(VOLUME_MANIFEST_FILE)).ok();
+                let reader = PreservedParityVolume::open(&root, &keys).unwrap();
+                assert_eq!(reader.volume_id(), volume_id);
+                assert_eq!(
+                    reader
+                        .load_fixed(
+                            &fixed.guild_id,
+                            &fixed.group_id,
+                            fixed.shard_index,
+                            &fixed.root
+                        )
+                        .unwrap(),
+                    fixed.bytes
+                );
+                assert_eq!(
+                    reader
+                        .load_variable(
+                            &variable.guild_id,
+                            &variable.group_id,
+                            variable.shard_index,
+                            &variable.commitment
+                        )
+                        .unwrap(),
+                    variable.bytes
+                );
+                assert!(
+                    reader
+                        .load_fixed(&[127; 32], &fixed.group_id, fixed.shard_index, &fixed.root)
+                        .is_err()
+                );
+                assert!(
+                    reader
+                        .load_fixed(
+                            &fixed.guild_id,
+                            &fixed.group_id,
+                            fixed.shard_index,
+                            &[128; 32]
+                        )
+                        .is_err()
+                );
+                let mut changed = variable.commitment.clone();
+                changed.root = [129; 32];
+                assert!(
+                    reader
+                        .load_variable(
+                            &variable.guild_id,
+                            &variable.group_id,
+                            variable.shard_index,
+                            &changed
+                        )
+                        .is_err()
+                );
+                #[cfg(target_os = "linux")]
+                reader.verify_unchanged().unwrap();
+                drop(reader);
+                #[cfg(target_os = "linux")]
+                assert_eq!(
+                    files(),
+                    original_files,
+                    "mode {mode}, journal state {journal_state}"
+                );
+                assert_eq!(fs::read(path).unwrap(), original);
+                assert_eq!(
+                    fs::read(root.join(VOLUME_MANIFEST_FILE)).ok(),
+                    manifest_before
+                );
+                assert!(!root.join("control.db").exists());
+                assert!(!root.join("control.key").exists());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn preserved_parity_volume_rejects_incomplete_journals_without_repair() {
+        for (suffix, bytes) in [
+            ("-wal", b"partial".as_slice()),
+            ("-shm", b"shared memory without WAL".as_slice()),
+            ("-journal", b"unfinished rollback".as_slice()),
+            ("-wal", &[0; 32]),
+        ] {
             let temp = TempDir::new().unwrap();
             let keys = KeyMaterial::from_seed(&Seed::from_bytes([119; 32]));
-            let volume_id = if mode == 1 {
-                Uuid::new_v4()
-            } else {
-                legacy_default_volume_id(&keys)
-            };
-            let wrapped_key = [120; 32];
-            let database_key = if mode == 1 {
-                wrapped_key
-            } else {
-                keys.database_key(&legacy_volume_database_id(volume_id))
-            };
-            let path = temp.path().join("parity.db");
+            let volume_id = legacy_default_volume_id(&keys);
             let mut writer =
-                ParityStore::open_with_key(&path, volume_id.as_bytes(), &database_key).unwrap();
-            let fixed = parity_object(121, 3);
-            writer.stage_and_publish(&fixed).unwrap();
-            let bytes = vec![122; 4096];
-            let variable = VariableParityObject {
-                format_version: 2,
-                guild_id: [123; 32],
-                group_id: [124; 32],
-                shard_index: 7,
-                commitment: mb_core::merkle_commit(&bytes).unwrap(),
-                bytes,
-            };
-            writer
-                .stage_attempt(&[125; 16], &variable, b"receipt", 2 * 65536)
-                .unwrap();
-            writer
-                .activate_attempt_object(
-                    &[125; 16],
-                    &variable.group_id,
-                    variable.shard_index,
-                    &variable.commitment,
-                    &[126; 32],
-                )
-                .unwrap();
+                ParityStore::open(temp.path().join("parity.db"), volume_id.as_bytes(), &keys)
+                    .unwrap();
+            writer.stage_and_publish(&parity_object(121, 3)).unwrap();
             drop(writer);
-            if mode != 0 {
-                let manifest = VolumeManifest {
-                    format_version: 1,
-                    owner: keys.node_id(),
-                    volume_id,
-                    database_file: "parity.db".into(),
-                    wrapped_database_key: keys
-                        .wrap_database_key(&volume_database_id(volume_id), &wrapped_key)
-                        .unwrap(),
-                };
-                write_new_private_record(
-                    &temp.path().join(VOLUME_MANIFEST_FILE),
-                    &SignedRecord::sign(VOLUME_MANIFEST_DOMAIN, manifest, &keys).unwrap(),
-                )
-                .unwrap();
-            }
-            let original = fs::read(&path).unwrap();
-            let manifest_before = fs::read(temp.path().join(VOLUME_MANIFEST_FILE)).ok();
-            let reader = PreservedParityVolume::open(temp.path(), &keys).unwrap();
-            assert_eq!(reader.volume_id(), volume_id);
-            assert_eq!(
-                reader
-                    .load_fixed(
-                        &fixed.guild_id,
-                        &fixed.group_id,
-                        fixed.shard_index,
-                        &fixed.root
-                    )
-                    .unwrap(),
-                fixed.bytes
-            );
-            assert_eq!(
-                reader
-                    .load_variable(
-                        &variable.guild_id,
-                        &variable.group_id,
-                        variable.shard_index,
-                        &variable.commitment
-                    )
-                    .unwrap(),
-                variable.bytes
-            );
-            assert!(
-                reader
-                    .load_fixed(&[127; 32], &fixed.group_id, fixed.shard_index, &fixed.root)
-                    .is_err()
-            );
-            assert!(
-                reader
-                    .load_fixed(
-                        &fixed.guild_id,
-                        &fixed.group_id,
-                        fixed.shard_index,
-                        &[128; 32]
-                    )
-                    .is_err()
-            );
-            let mut changed = variable.commitment.clone();
-            changed.root = [129; 32];
-            assert!(
-                reader
-                    .load_variable(
-                        &variable.guild_id,
-                        &variable.group_id,
-                        variable.shard_index,
-                        &changed
-                    )
-                    .is_err()
-            );
-            drop(reader);
-            assert_eq!(fs::read(path).unwrap(), original);
-            assert_eq!(
-                fs::read(temp.path().join(VOLUME_MANIFEST_FILE)).ok(),
-                manifest_before
-            );
-            assert!(!temp.path().join("control.db").exists());
-            assert!(!temp.path().join("control.key").exists());
+            fs::write(temp.path().join(format!("parity.db{suffix}")), bytes).unwrap();
+            let files = || -> BTreeMap<_, _> {
+                fs::read_dir(temp.path())
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect()
+            };
+            let before = files();
+            assert!(PreservedParityVolume::open(temp.path(), &keys).is_err());
+            assert_eq!(files(), before);
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn preserved_parity_volume_rejects_input_changes_after_open() {
+        use std::io::Write;
+        let temp = TempDir::new().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([119; 32]));
+        let volume_id = legacy_default_volume_id(&keys);
+        let path = temp.path().join("parity.db");
+        let mut writer = ParityStore::open(&path, volume_id.as_bytes(), &keys).unwrap();
+        let object = parity_object(121, 3);
+        writer.stage_and_publish(&object).unwrap();
+        drop(writer);
+        let reader = PreservedParityVolume::open(temp.path(), &keys).unwrap();
+        assert_eq!(
+            reader
+                .load_fixed(
+                    &object.guild_id,
+                    &object.group_id,
+                    object.shard_index,
+                    &object.root
+                )
+                .unwrap(),
+            object.bytes
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed input")
+            .unwrap();
+        assert!(reader.verify_unchanged().is_err());
+        assert!(
+            reader
+                .load_fixed(
+                    &object.guild_id,
+                    &object.group_id,
+                    object.shard_index,
+                    &object.root
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]

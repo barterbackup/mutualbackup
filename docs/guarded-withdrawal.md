@@ -278,8 +278,34 @@ installed artifacts and the full M6 gates remain open.
 The Node data-directory lock and permission adjustment still precede catalog
 admission; this does not yet establish rejection before every filesystem mutation.
 The private WAL index uses memory proportional to its frame count; common R2/R3
-metadata/resource budgets remain open. The catalog reader used for export payload recovery and
-other legacy readers still require separate no-creation qualification under R1.
+metadata/resource budgets remain open.
+
+Linux catalog export payload recovery and explicitly selected preserved parity
+volumes now use reusable non-creating readers. Local signed-revision selection
+runs in a short snapshot that ends before peer discovery. Export holds no
+explicit transaction across the full recovery. Existing checkpoint/transcript
+scans can retain SQL cursors during peer callbacks; releasing those remains open.
+Input guards require unchanged main/WAL versions and sidecar identity/absence
+before staging and immediately before publication. Existing live SHM read marks
+remain transient. Fixed and variable parity loads also check versions before and
+after reading. A changed input rejects publication and removes owned staging
+through the pinned output parent. No repair, schema migration or key publication
+occurs. The export/parity reader increment was qualified on Linux on 2026-10-08 with
+966 unique passing cases: 477 ordinary Node, 290 store, 102 Git and 19 CLI
+process tests, all 64 provisioned Git cases, 11 native Node cases, extent
+sharing/prune, stock-Git bridge and raw Unix CLI/daemon/Git paths. Closed, live
+WAL/SHM and WAL-only control and parity fixtures preserve original bytes/file
+sets across legacy/wrapped/interrupted-rekey keys. Missing, partial and corrupt
+journals reject without repair. Input changes before staging or during
+construction reject publication and remove owned staging. All four debug
+programs build; formatting and strict locked workspace/all-targets Clippy pass.
+All 284 source files and ten program/test drivers retain their hashes through
+qualification, and native mount/loop/image cleanup is verified. Evidence and the
+distinct passing-case inventory are retained under `/tmp/mb-m6-payload-validation-756jxsvu`;
+the post-commit audit binds the code to the commit. Eleven Node, 26 store and two
+CLI process fixtures and installed-artifact qualification remain open. Atomic writer/
+path/ownership handoff, complete key-manifest and external-owner reconciliation,
+other-platform reader qualification and common resource budgets remain open.
 
 The report's `signed_format` describes the public revision format, not private
 namespace format 6/7. `retained_history_complete` is false: available metadata

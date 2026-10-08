@@ -237,103 +237,173 @@ fn uri(path: &Path, immutable: bool) -> Result<String> {
     Ok(uri)
 }
 
-pub(super) fn inspect<T>(
+/// Versions of preserved database inputs. Long-running recovery must verify
+/// these immediately before publishing output; this guard holds no SQLite lock.
+pub struct PreservedReadGuard {
+    path: PathBuf,
+    before: FileVersion,
+    journals: [PathBuf; 3],
+    journal_versions: Vec<Option<FileVersion>>,
+    immutable: bool,
+    private_wal: bool,
+}
+
+impl PreservedReadGuard {
+    fn capture(path: &Path) -> Result<Self> {
+        let before = version(path)?.context("preserved database is unavailable")?;
+        ensure!(before.len != 0, "preserved database is empty");
+        let journals = journal_paths(path);
+        let journal_versions: Vec<_> = journals
+            .iter()
+            .map(|path| version(path))
+            .collect::<Result<_>>()?;
+        let immutable = journal_versions.iter().all(Option::is_none);
+        let private_wal = journal_versions[0]
+            .as_ref()
+            .is_some_and(|wal| wal.len == 0 || wal.len >= 32)
+            && journal_versions[1].is_none()
+            && journal_versions[2].is_none();
+        ensure!(
+            immutable
+                || private_wal
+                || (journal_versions[0].is_some()
+                    && journal_versions[1].is_some()
+                    && journal_versions[2].is_none()),
+            "preserved database has incomplete or rollback journal state; preserve every database/journal file and inspect a separate complete snapshot; see docs/guarded-withdrawal.md"
+        );
+        if private_wal {
+            validate_private_wal_header(&journals[0], journal_versions[0].as_ref().unwrap().len)?;
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            before,
+            journals,
+            journal_versions,
+            immutable,
+            private_wal,
+        })
+    }
+
+    /// Reject changed or replaced inputs before publishing a recovered result.
+    /// SQLite may update transient read marks in an existing writer's SHM
+    /// mapping; its identity and length must remain unchanged instead.
+    pub fn verify_unchanged(&self) -> Result<()> {
+        ensure!(
+            version(&self.path)?.as_ref() == Some(&self.before),
+            "preserved database changed during recovery; stop its writer and retry"
+        );
+        for (index, (path, before)) in self.journals.iter().zip(&self.journal_versions).enumerate()
+        {
+            let after = version(path)?;
+            let unchanged = if index == 1 && !self.immutable && !self.private_wal {
+                matches!((before, &after), (Some(before), Some(after)) if before.device == after.device && before.inode == after.inode && before.len == after.len)
+            } else {
+                before == &after
+            };
+            ensure!(
+                unchanged,
+                "preserved database journal changed during recovery; stop its writer and retry"
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_snapshot(&self) -> Result<()> {
+        if self.immutable || self.private_wal {
+            return self.verify_unchanged().with_context(|| {
+                format!(
+                    "preserved catalog changed during {} inspection; stop its writer and retry",
+                    if self.immutable {
+                        "immutable"
+                    } else {
+                        "private WAL"
+                    },
+                )
+            });
+        }
+        // The enclosing live read snapshot supplies the original inspection
+        // contract. Recovery callers require the stronger verify_unchanged()
+        // check before publishing their output.
+        Ok(())
+    }
+}
+
+pub(super) fn open<T>(
     path: &Path,
     database_keys: &[[u8; 32]],
-    operation: impl FnOnce(&ControlStore) -> Result<T>,
-) -> Result<T> {
+    validate: impl Fn(Connection) -> Result<T>,
+) -> Result<(T, PreservedReadGuard)> {
     register_vfs()?;
-    let before = version(path)?.context("preserved control catalog is unavailable")?;
-    ensure!(before.len != 0, "preserved control catalog is empty");
-    let journals = journal_paths(path);
-    let journal_versions: Vec<_> = journals
-        .iter()
-        .map(|path| version(path))
-        .collect::<Result<_>>()?;
-    let immutable = journal_versions.iter().all(Option::is_none);
-    let private_wal = journal_versions[0]
-        .as_ref()
-        .is_some_and(|wal| wal.len == 0 || wal.len >= 32)
-        && journal_versions[1].is_none()
-        && journal_versions[2].is_none();
-    ensure!(
-        immutable
-            || private_wal
-            || (journal_versions[0].is_some()
-                && journal_versions[1].is_some()
-                && journal_versions[2].is_none()),
-        "preserved catalog has incomplete or rollback journal state; preserve every database/journal file and inspect a separate complete snapshot; see docs/guarded-withdrawal.md"
-    );
-    if private_wal {
-        validate_private_wal_header(&journals[0], journal_versions[0].as_ref().unwrap().len)?;
-    }
-    let uri = uri(path, immutable)?;
+    let guard = PreservedReadGuard::capture(path)?;
+    let uri = uri(path, guard.immutable)?;
     let mut opened = None;
     let mut last_error = None;
     for key in database_keys {
-        let attempt = (|| -> Result<ControlStore> {
+        let attempt = (|| -> Result<T> {
             let connection = Connection::open_with_flags_and_vfs(
                 &uri,
                 OpenFlags::SQLITE_OPEN_READ_ONLY
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX
                     | OpenFlags::SQLITE_OPEN_URI,
-                if private_wal {
+                if guard.private_wal {
                     PRIVATE_WAL_VFS_NAME
                 } else {
                     VFS_NAME
                 }
                 .to_str()?,
             )?;
-            if private_wal {
+            if guard.private_wal {
                 // Unlike URI nolock=1 (which disables WAL), this keeps SQLite's
                 // WAL pager enabled and selects its private heap wal-index.
                 // A native exclusive lock requires a writable fd. unix-none
                 // avoids that lock; version guards must protect both files.
                 connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
             }
-            let connection = configure_encrypted_connection(connection, key, true)?;
-            if meta_value(&connection, "database_kind")?.as_deref() != Some(b"control") {
-                return Err(DatabaseError::IncompatibleSchema.into());
-            }
-            let schema = meta_value(&connection, "schema_version")?
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                .map(u32::from_be_bytes)
-                .context("preserved catalog schema is unavailable")?;
-            validate_control_schema(&connection, schema)?;
-            Ok(ControlStore {
-                connection,
-                path: path.to_path_buf(),
-            })
+            validate(configure_encrypted_connection(connection, key, true)?)
         })();
         match attempt {
-            Ok(control) => {
-                opened = Some(control);
+            Ok(store) => {
+                opened = Some(store);
                 break;
             }
             Err(error) => last_error = Some(error),
         }
     }
-    let result = match opened {
-        Some(control) => control.with_read_only_snapshot(|| operation(&control)),
-        None => Err(last_error
-            .unwrap_or_else(|| anyhow::anyhow!("no database key supplied"))
-            .context("preserved control catalog rejected available database keys")),
-    };
-    if immutable || private_wal {
-        ensure!(
-            version(path)?.as_ref() == Some(&before)
-                && journals
-                    .iter()
-                    .zip(&journal_versions)
-                    .all(|(path, before)| matches!(version(path), Ok(after) if &after == before)),
-            "preserved catalog changed during {} inspection; stop its writer and retry",
-            if immutable {
-                "immutable"
-            } else {
-                "private WAL"
-            },
-        );
-    }
+    guard.verify_snapshot()?;
+    let store = opened
+        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow::anyhow!("no database key supplied")))
+        .context("preserved database rejected available database keys")?;
+    Ok((store, guard))
+}
+
+pub(super) fn open_control(
+    path: &Path,
+    database_keys: &[[u8; 32]],
+) -> Result<(ControlStore, PreservedReadGuard)> {
+    open(path, database_keys, |connection| {
+        if meta_value(&connection, "database_kind")?.as_deref() != Some(b"control") {
+            return Err(DatabaseError::IncompatibleSchema.into());
+        }
+        let schema = meta_value(&connection, "schema_version")?
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_be_bytes)
+            .context("preserved catalog schema is unavailable")?;
+        validate_control_schema(&connection, schema)?;
+        Ok(ControlStore {
+            connection,
+            path: path.to_path_buf(),
+        })
+    })
+}
+
+pub(super) fn inspect<T>(
+    path: &Path,
+    database_keys: &[[u8; 32]],
+    operation: impl FnOnce(&ControlStore) -> Result<T>,
+) -> Result<T> {
+    let (control, guard) = open_control(path, database_keys)?;
+    let result = control.with_read_only_snapshot(|| operation(&control));
+    guard.verify_snapshot()?;
     result
 }
 
@@ -341,6 +411,68 @@ pub(super) fn inspect<T>(
 mod tests {
     use super::*;
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    #[test]
+    fn reusable_preserved_reader_releases_snapshots_and_rejects_later_writer_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let writer = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        writer.put_record("root", b"id", b"old").unwrap();
+        let (reader, guard) =
+            ControlStore::open_preserved_read_only_with_keys(&path, &[[7; 32]]).unwrap();
+        reader
+            .with_read_only_snapshot(|| {
+                assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"old");
+                writer.put_record("root", b"id", b"new")?;
+                assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"old");
+                Ok(())
+            })
+            .unwrap();
+        assert!(reader.connection.is_autocommit());
+        reader
+            .with_read_only_snapshot(|| {
+                assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"new");
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            guard
+                .verify_unchanged()
+                .unwrap_err()
+                .to_string()
+                .contains("journal changed")
+        );
+    }
+
+    #[test]
+    fn reusable_private_wal_reader_creates_no_sidecars_across_snapshots_and_key_failures() {
+        let (_temp, path) = offline_wal_fixture();
+        let journals = journal_paths(&path);
+        let before = [fs::read(&path).unwrap(), fs::read(&journals[0]).unwrap()];
+        assert!(ControlStore::open_preserved_read_only_with_keys(&path, &[[8; 32]]).is_err());
+        let (reader, guard) =
+            ControlStore::open_preserved_read_only_with_keys(&path, &[[8; 32], [7; 32]]).unwrap();
+        for _ in 0..3 {
+            reader
+                .with_read_only_snapshot(|| {
+                    assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"only in WAL");
+                    Ok(())
+                })
+                .unwrap();
+            assert!(reader.connection.is_autocommit());
+            guard.verify_unchanged().unwrap();
+        }
+        drop(reader);
+        guard.verify_unchanged().unwrap();
+        assert_eq!(
+            [fs::read(&path).unwrap(), fs::read(&journals[0]).unwrap()],
+            before
+        );
+        assert!(!journals[1].exists());
+        assert!(!journals[2].exists());
+        fs::write(&journals[1], b"").unwrap();
+        assert!(guard.verify_unchanged().is_err());
+    }
 
     fn offline_wal_fixture() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();

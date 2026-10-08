@@ -55,6 +55,8 @@ pub use catalog::{
     CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource,
     PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
+#[cfg(target_os = "linux")]
+pub use preserved_read::PreservedReadGuard;
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
 #[cfg(target_os = "linux")]
 pub use scratch_space::physical_allocation_domain;
@@ -280,6 +282,16 @@ impl ControlStore {
         operation: impl FnOnce(&ControlStore) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         preserved_read::inspect(path.as_ref(), database_keys, operation)
+    }
+
+    /// Open a reusable non-creating reader. Keep remote I/O outside local read
+    /// snapshots and verify the returned input guard before publishing output.
+    #[cfg(target_os = "linux")]
+    pub fn open_preserved_read_only_with_keys(
+        path: impl AsRef<Path>,
+        database_keys: &[[u8; 32]],
+    ) -> anyhow::Result<(Self, PreservedReadGuard)> {
+        preserved_read::open_control(path.as_ref(), database_keys)
     }
 
     pub fn put_record_if_absent(
@@ -2111,6 +2123,29 @@ pub struct ParityStore {
 }
 
 impl ParityStore {
+    /// Open preserved parity without creating journals, migrating, or rekeying.
+    /// Verify the input guard before publishing recovered output.
+    #[cfg(target_os = "linux")]
+    pub fn open_preserved_read_only_with_keys(
+        path: impl AsRef<Path>,
+        volume_id: &[u8; 16],
+        database_keys: &[[u8; 32]],
+    ) -> anyhow::Result<(Self, PreservedReadGuard)> {
+        let path = path.as_ref();
+        preserved_read::open(path, database_keys, |connection| {
+            if meta_value(&connection, "database_kind")?.as_deref() != Some(b"parity")
+                || meta_value(&connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
+            {
+                return Err(DatabaseError::IncompatibleSchema.into());
+            }
+            validate_parity_schema_version(&connection, stored_schema_version(&connection)?)?;
+            Ok(Self {
+                connection,
+                path: path.to_path_buf(),
+            })
+        })
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         volume_id: &[u8; 16],

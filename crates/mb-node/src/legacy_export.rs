@@ -82,7 +82,7 @@ pub fn export_withdrawn_revision_from_source<F>(
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
-    export_withdrawn_revision_in_parent(keys, revision, target, None, load)
+    export_withdrawn_revision_in_parent(keys, revision, target, None, load, || Ok(()))
 }
 
 fn export_withdrawn_revision_in_parent<F>(
@@ -91,6 +91,7 @@ fn export_withdrawn_revision_in_parent<F>(
     target: &Path,
     pinned_parent: Option<PinnedDirectory>,
     mut load: F,
+    mut verify_inputs: impl FnMut() -> Result<()>,
 ) -> Result<LegacyExportReport>
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
@@ -215,6 +216,7 @@ where
         parent.entry_identity(name, true)?.is_none(),
         "export target already exists"
     );
+    verify_inputs()?;
     let staging_name = format!(".mutualbackup-legacy-export-{}", Uuid::new_v4());
     let staging = parent.create_child_directory(&staging_name)?;
     let identity = staging.identity()?;
@@ -264,6 +266,7 @@ where
         manifest.write_all(b"\n")?;
         manifest.sync_all()?;
         staging.sync_all()?;
+        verify_inputs()?;
         require_export_parent_path(&parent, parent_path)?;
         parent.rename_child_no_replace(&staging_name, name)?;
         ensure!(
@@ -333,19 +336,26 @@ pub fn export_withdrawn_revision_from_files(
         "revision input is not canonical Postcard"
     );
     let sectors = PinnedDirectory::open(&sector_path)?;
-    export_withdrawn_revision_in_parent(keys, &revision, target, Some(pinned_parent), |id| {
-        let file = sectors
-            .open_child_file(format!("{}.bin", hex::encode(id)))?
-            .context("required legacy ciphertext is unavailable")?;
-        ensure!(
-            file.metadata()?.len() == V1_SECTOR_SIZE as u64,
-            "legacy ciphertext file must contain exactly one sector"
-        );
-        let mut bytes = Vec::with_capacity(V1_SECTOR_SIZE);
-        file.take(V1_SECTOR_SIZE as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })
+    export_withdrawn_revision_in_parent(
+        keys,
+        &revision,
+        target,
+        Some(pinned_parent),
+        |id| {
+            let file = sectors
+                .open_child_file(format!("{}.bin", hex::encode(id)))?
+                .context("required legacy ciphertext is unavailable")?;
+            ensure!(
+                file.metadata()?.len() == V1_SECTOR_SIZE as u64,
+                "legacy ciphertext file must contain exactly one sector"
+            );
+            let mut bytes = Vec::with_capacity(V1_SECTOR_SIZE);
+            file.take(V1_SECTOR_SIZE as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        },
+        || Ok(()),
+    )
 }
 
 /// Export available recovered ciphertext directly from an existing installation
@@ -428,66 +438,68 @@ fn export_catalog(
     let protected_inputs: Vec<_> = anchor_areas.iter().chain(parity_volumes).cloned().collect();
     let pinned_parent =
         remote::export_parent_preflight(keys, &data_dir, &parent, &protected_inputs)?;
-    let control = crate::volume::inspect_control_store(&data_dir, keys)?
-        .context("original control catalog is unavailable")?;
-    let mut selected = control
-        .get_record_bounded(
-            "user-revision",
-            revision_id.as_bytes(),
-            V1_MAX_CATALOG_BYTES,
-        )?
-        .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
-        .transpose()?;
-    if selected.is_none() {
-        control.for_each_record_bounded(
-            "user-revision-head",
-            48,
-            V1_MAX_CATALOG_BYTES,
-            |key, bytes| {
-                let revision: SignedRecord<UserRevision> = decode_canonical(bytes)?;
-                if revision.value.revision_id != revision_id
-                    || revision.value.owner != keys.node_id()
-                {
-                    return Ok(true);
-                }
-                let mut scoped = revision.value.guild_id.to_vec();
-                scoped.extend(revision.value.protected_root_id.as_bytes());
-                ensure!(
-                    key == scoped || key == revision.value.guild_id,
-                    "legacy revision head has a conflicting scope"
-                );
-                selected = Some(revision);
-                Ok(false)
-            },
-        )?;
-    }
-    if selected.is_none() {
-        control.for_each_record_bounded(
-            "guild-checkpoint",
-            32,
-            V1_MAX_CATALOG_BYTES,
-            |key, bytes| {
-                let checkpoint: mb_core::QuorumCheckpoint = decode_canonical(bytes)?;
-                let Some(revision) = checkpoint.checkpoint.revisions.iter().find(|revision| {
-                    revision.value.revision_id == revision_id
-                        && revision.value.owner == keys.node_id()
-                }) else {
-                    return Ok(true);
-                };
-                ensure!(
-                    canonical_bytes_bounded(&checkpoint, V1_MAX_CATALOG_BYTES)? == bytes,
-                    "legacy checkpoint is not canonical"
-                );
-                checkpoint.verify()?;
-                ensure!(
-                    key == checkpoint.hash()?,
-                    "legacy checkpoint record has a conflicting hash"
-                );
-                selected = Some(revision.clone());
-                Ok(false)
-            },
-        )?;
-    }
+    let (control, guard) = crate::volume::open_preserved_control_store(&data_dir, keys)?;
+    let mut selected = control.with_read_only_snapshot(|| {
+        let mut selected = control
+            .get_record_bounded(
+                "user-revision",
+                revision_id.as_bytes(),
+                V1_MAX_CATALOG_BYTES,
+            )?
+            .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
+            .transpose()?;
+        if selected.is_none() {
+            control.for_each_record_bounded(
+                "user-revision-head",
+                48,
+                V1_MAX_CATALOG_BYTES,
+                |key, bytes| {
+                    let revision: SignedRecord<UserRevision> = decode_canonical(bytes)?;
+                    if revision.value.revision_id != revision_id
+                        || revision.value.owner != keys.node_id()
+                    {
+                        return Ok(true);
+                    }
+                    let mut scoped = revision.value.guild_id.to_vec();
+                    scoped.extend(revision.value.protected_root_id.as_bytes());
+                    ensure!(
+                        key == scoped || key == revision.value.guild_id,
+                        "legacy revision head has a conflicting scope"
+                    );
+                    selected = Some(revision);
+                    Ok(false)
+                },
+            )?;
+        }
+        if selected.is_none() {
+            control.for_each_record_bounded(
+                "guild-checkpoint",
+                32,
+                V1_MAX_CATALOG_BYTES,
+                |key, bytes| {
+                    let checkpoint: mb_core::QuorumCheckpoint = decode_canonical(bytes)?;
+                    let Some(revision) = checkpoint.checkpoint.revisions.iter().find(|revision| {
+                        revision.value.revision_id == revision_id
+                            && revision.value.owner == keys.node_id()
+                    }) else {
+                        return Ok(true);
+                    };
+                    ensure!(
+                        canonical_bytes_bounded(&checkpoint, V1_MAX_CATALOG_BYTES)? == bytes,
+                        "legacy checkpoint is not canonical"
+                    );
+                    checkpoint.verify()?;
+                    ensure!(
+                        key == checkpoint.hash()?,
+                        "legacy checkpoint record has a conflicting hash"
+                    );
+                    selected = Some(revision.clone());
+                    Ok(false)
+                },
+            )?;
+        }
+        Ok(selected)
+    })?;
     let mut downloaded_checkpoint = None;
     if selected.is_none()
         && let Some(remote) = remote
@@ -592,43 +604,56 @@ fn export_catalog(
         volumes: &volumes,
         remote,
     };
-    export_withdrawn_revision_in_parent(keys, &revision, target, Some(pinned_parent), |id| {
-        let reference = references
-            .get(id)
-            .context("unsigned legacy sector requested")?;
-        let local_error = match load_local(reference) {
-            Ok(Some(bytes)) => return Ok(bytes),
-            Ok(None) => None,
-            Err(error) => Some(error),
-        };
-        let Some(locator) = recovered.get(&reference.root) else {
-            let checkpoint_error =
-                match checkpoint_recovery.load(&control, &revision, reference, &inputs) {
-                    Ok(Some(bytes)) => return Ok(bytes),
-                    Ok(None) => None,
-                    Err(error) => Some(error),
-                };
-            if let Some(bytes) = remote.and_then(|peer| peer.sector(guild, reference)) {
-                return Ok(bytes);
+    export_withdrawn_revision_in_parent(
+        keys,
+        &revision,
+        target,
+        Some(pinned_parent),
+        |id| {
+            let reference = references
+                .get(id)
+                .context("unsigned legacy sector requested")?;
+            let local_error = match load_local(reference) {
+                Ok(Some(bytes)) => return Ok(bytes),
+                Ok(None) => None,
+                Err(error) => Some(error),
+            };
+            let Some(locator) = recovered.get(&reference.root) else {
+                let checkpoint_error =
+                    match checkpoint_recovery.load(&control, &revision, reference, &inputs) {
+                        Ok(Some(bytes)) => return Ok(bytes),
+                        Ok(None) => None,
+                        Err(error) => Some(error),
+                    };
+                if let Some(bytes) = remote.and_then(|peer| peer.sector(guild, reference)) {
+                    return Ok(bytes);
+                }
+                if let Some(error) = checkpoint_error {
+                    return Err(error);
+                }
+                if let Some(error) = local_error {
+                    return Err(error).context("legacy source could not be authenticated; original anchors and journals remain preserved");
+                }
+                bail!(
+                    "legacy sector has no available recovered Inline/cache ciphertext or authenticated preserved anchor range; original anchors and journals remain preserved"
+                );
+            };
+            Ok(control.recovery_shard(
+                &locator.checkpoint_hash,
+                &guild,
+                &locator.group_id,
+                locator.shard_index,
+                &locator.root,
+            )?)
+        },
+        || {
+            guard.verify_unchanged()?;
+            for volume in &volumes {
+                volume.verify_unchanged()?;
             }
-            if let Some(error) = checkpoint_error {
-                return Err(error);
-            }
-            if let Some(error) = local_error {
-                return Err(error).context("legacy source could not be authenticated; original anchors and journals remain preserved");
-            }
-            bail!(
-                "legacy sector has no available recovered Inline/cache ciphertext or authenticated preserved anchor range; original anchors and journals remain preserved"
-            );
-        };
-        Ok(control.recovery_shard(
-            &locator.checkpoint_hash,
-            &guild,
-            &locator.group_id,
-            locator.shard_index,
-            &locator.root,
-        )?)
-    })
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1686,181 +1711,279 @@ pub(crate) mod tests {
     #[test]
     fn legacy_export_catalog_sources_preserve_database_keys_and_journals() {
         for mode in 0..4 {
-            let (keys, revision, sectors) = fixture(if mode == 3 { 7 } else { 6 });
-            let temp = tempfile::tempdir().unwrap();
-            let data = temp.path().join("original");
-            fs::create_dir(&data).unwrap();
-            let mut store = if mode == 0 {
-                mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap()
-            } else {
-                crate::volume::open_control_store(&data, &keys).unwrap().0
-            };
-            let signed = canonical_bytes(&revision).unwrap();
-            match mode {
-                0 => store
-                    .put_record(
-                        "user-revision",
-                        revision.value.revision_id.as_bytes(),
-                        &signed,
-                    )
-                    .unwrap(),
-                1 | 2 => {
-                    let mut key = revision.value.guild_id.to_vec();
-                    if mode == 2 {
-                        key.extend(revision.value.protected_root_id.as_bytes());
-                    }
-                    store
-                        .put_record("user-revision-head", &key, &signed)
-                        .unwrap();
-                }
-                _ => {
-                    let mut checkpoint = mb_core::QuorumCheckpoint {
-                        checkpoint: mb_core::GuildCheckpoint {
-                            format_version: 4,
-                            guild_id: revision.value.guild_id,
-                            genesis_hash: [99; 32],
-                            generation: 1,
-                            parent: None,
-                            members: vec![mb_core::Member {
-                                node_id: keys.node_id(),
-                                recovery_public_key: keys.recovery_public_key(),
-                                failure_domain: "fixture".into(),
-                            }],
-                            writer_fences: vec![mb_core::WriterFence {
-                                owner: keys.node_id(),
-                                epoch: 1,
-                                public_key: revision.value.writer_public_key,
-                            }],
-                            revision_tombstones: vec![],
-                            revisions: vec![revision.clone()],
-                            coding_groups: vec![],
-                            authority: None,
-                            packing_catalog: None,
-                        },
-                        signatures: vec![],
-                    };
-                    checkpoint.add_signature(&keys).unwrap();
-                    checkpoint.verify().unwrap();
-                    store
-                        .put_record(
-                            "guild-checkpoint",
-                            &checkpoint.hash().unwrap(),
-                            &canonical_bytes(&checkpoint).unwrap(),
-                        )
-                        .unwrap();
-                }
-            }
-            store
-                .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
-                .unwrap();
-            for (index, reference) in revision
-                .value
-                .metadata_sectors
-                .iter()
-                .chain(&revision.value.data_sectors)
-                .enumerate()
-            {
-                if mode < 2 || index == 0 {
-                    let plaintext = decrypt_reference(
-                        &keys.guild_data_key(&revision.value.guild_id),
-                        reference,
-                        &mut |id| Ok(sectors[id].clone()),
-                    )
-                    .unwrap();
-                    crate::snapshot::install_inline_recipe(
-                        &mut store,
-                        revision.value.guild_id,
-                        reference.clone(),
-                        plaintext,
-                    )
-                    .unwrap();
+            for journal_state in 0..3 {
+                let (keys, revision, sectors) = fixture(if mode == 3 { 7 } else { 6 });
+                let temp = tempfile::tempdir().unwrap();
+                let data = temp.path().join("original");
+                fs::create_dir(&data).unwrap();
+                let mut store = if mode == 0 {
+                    mb_store::ControlStore::open(data.join("control.db"), &keys).unwrap()
                 } else {
-                    store
-                        .stage_recovery_shard(
-                            &[61; 32],
-                            &revision.value.guild_id,
-                            &[index as u8; 32],
-                            0,
-                            &reference.root,
-                            &sectors[&reference.id],
+                    crate::volume::open_control_store(&data, &keys).unwrap().0
+                };
+                store
+                    .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                    .unwrap();
+                let signed = canonical_bytes(&revision).unwrap();
+                match mode {
+                    0 => store
+                        .put_record(
+                            "user-revision",
+                            revision.value.revision_id.as_bytes(),
+                            &signed,
+                        )
+                        .unwrap(),
+                    1 | 2 => {
+                        let mut key = revision.value.guild_id.to_vec();
+                        if mode == 2 {
+                            key.extend(revision.value.protected_root_id.as_bytes());
+                        }
+                        store
+                            .put_record("user-revision-head", &key, &signed)
+                            .unwrap();
+                    }
+                    _ => {
+                        let mut checkpoint = mb_core::QuorumCheckpoint {
+                            checkpoint: mb_core::GuildCheckpoint {
+                                format_version: 4,
+                                guild_id: revision.value.guild_id,
+                                genesis_hash: [99; 32],
+                                generation: 1,
+                                parent: None,
+                                members: vec![mb_core::Member {
+                                    node_id: keys.node_id(),
+                                    recovery_public_key: keys.recovery_public_key(),
+                                    failure_domain: "fixture".into(),
+                                }],
+                                writer_fences: vec![mb_core::WriterFence {
+                                    owner: keys.node_id(),
+                                    epoch: 1,
+                                    public_key: revision.value.writer_public_key,
+                                }],
+                                revision_tombstones: vec![],
+                                revisions: vec![revision.clone()],
+                                coding_groups: vec![],
+                                authority: None,
+                                packing_catalog: None,
+                            },
+                            signatures: vec![],
+                        };
+                        checkpoint.add_signature(&keys).unwrap();
+                        checkpoint.verify().unwrap();
+                        store
+                            .put_record(
+                                "guild-checkpoint",
+                                &checkpoint.hash().unwrap(),
+                                &canonical_bytes(&checkpoint).unwrap(),
+                            )
+                            .unwrap();
+                    }
+                }
+                store
+                    .put_record("guarded-view-mount-v1", b"legacy", b"must-not-replay")
+                    .unwrap();
+                for (index, reference) in revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .enumerate()
+                {
+                    if mode < 2 || index == 0 {
+                        let plaintext = decrypt_reference(
+                            &keys.guild_data_key(&revision.value.guild_id),
+                            reference,
+                            &mut |id| Ok(sectors[id].clone()),
                         )
                         .unwrap();
+                        crate::snapshot::install_inline_recipe(
+                            &mut store,
+                            revision.value.guild_id,
+                            reference.clone(),
+                            plaintext,
+                        )
+                        .unwrap();
+                    } else {
+                        store
+                            .stage_recovery_shard(
+                                &[61; 32],
+                                &revision.value.guild_id,
+                                &[index as u8; 32],
+                                0,
+                                &reference.root,
+                                &sectors[&reference.id],
+                            )
+                            .unwrap();
+                    }
                 }
-            }
-            // Extraction must not perform even an otherwise valid schema migration.
-            store
-                .database_shell_statement("DROP INDEX protocol_records_paged_sector_sources", false)
-                .unwrap();
-            store
-                .database_shell_statement(
-                    "UPDATE meta SET value = X'00000008' WHERE key = 'schema_version'",
-                    false,
-                )
-                .unwrap();
-            drop(store);
-            let db = fs::read(data.join("control.db")).unwrap();
-            let envelope = fs::read(data.join("control.key")).ok();
-            let target = temp.path().join("export");
-            let report = export_withdrawn_revision_from_catalog(
-                &keys,
-                &data,
-                revision.value.revision_id,
-                &target,
-            )
-            .unwrap();
-            assert_eq!(report.private_format, if mode == 3 { 7 } else { 6 });
-            let content = fs::read(
-                target
-                    .join("namespace")
-                    .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec())),
-            )
-            .unwrap();
-            assert_eq!(content.len(), 1024 * 1024);
-            assert_eq!(&content[1000..1003], b"raw");
-            assert_eq!(
-                fs::read(target.join("signed-revision.postcard")).unwrap(),
-                signed
-            );
-            assert_eq!(fs::read(data.join("control.db")).unwrap(), db);
-            assert_eq!(fs::read(data.join("control.key")).ok(), envelope);
-            let inspected = crate::volume::inspect_control_store(&data, &keys)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                inspected
-                    .get_record("guarded-view-mount-v1", b"legacy")
-                    .unwrap()
-                    .unwrap(),
-                b"must-not-replay"
-            );
-            for reference in revision
-                .value
-                .metadata_sectors
-                .iter()
-                .chain(&revision.value.data_sectors)
-            {
-                assert!(
-                    recovered_inline_sector_for_export(
-                        &inspected,
-                        &keys,
-                        revision.value.guild_id,
-                        reference
+                // Extraction must not perform even an otherwise valid schema migration.
+                store
+                    .database_shell_statement(
+                        "DROP INDEX protocol_records_paged_sector_sources",
+                        false,
                     )
-                    .unwrap()
-                    .is_some()
-                        || mode >= 2
-                );
-            }
-            assert!(
-                export_withdrawn_revision_from_catalog(
+                    .unwrap();
+                store
+                    .database_shell_statement(
+                        "UPDATE meta SET value = X'00000008' WHERE key = 'schema_version'",
+                        false,
+                    )
+                    .unwrap();
+                let data = if journal_state == 1 {
+                    let copy = temp.path().join("preserved");
+                    fs::create_dir(&copy).unwrap();
+                    for name in ["control.db", "control.db-wal", "control.key"] {
+                        if data.join(name).exists() {
+                            fs::copy(data.join(name), copy.join(name)).unwrap();
+                        }
+                    }
+                    copy
+                } else {
+                    data
+                };
+                let _writer = if journal_state == 2 {
+                    Some(store)
+                } else {
+                    drop(store);
+                    None
+                };
+                let files = || -> BTreeMap<_, _> {
+                    fs::read_dir(&data)
+                        .unwrap()
+                        .map(|entry| {
+                            let entry = entry.unwrap();
+                            let bytes = fs::read(entry.path()).unwrap();
+                            let digest = (entry.file_name() != "control.db-shm")
+                                .then(|| blake3::hash(&bytes));
+                            (entry.file_name(), (bytes.len(), digest))
+                        })
+                        .collect()
+                };
+                let original_files = files();
+                let db = fs::read(data.join("control.db")).unwrap();
+                let envelope = fs::read(data.join("control.key")).ok();
+                let target = temp.path().join("export");
+                let report = export_withdrawn_revision_from_catalog(
                     &keys,
                     &data,
                     revision.value.revision_id,
-                    &data.join("unsafe-export")
+                    &target,
                 )
-                .is_err()
+                .unwrap();
+                assert_eq!(report.private_format, if mode == 3 { 7 } else { 6 });
+                let content = fs::read(
+                    target
+                        .join("namespace")
+                        .join(std::ffi::OsString::from_vec(b"nested/\xfe".to_vec())),
+                )
+                .unwrap();
+                assert_eq!(content.len(), 1024 * 1024);
+                assert_eq!(&content[1000..1003], b"raw");
+                assert_eq!(
+                    fs::read(target.join("signed-revision.postcard")).unwrap(),
+                    signed
+                );
+                assert_eq!(fs::read(data.join("control.db")).unwrap(), db);
+                assert_eq!(fs::read(data.join("control.key")).ok(), envelope);
+                crate::volume::with_inspected_control_snapshot(&data, &keys, |inspected| {
+                    assert_eq!(
+                        inspected
+                            .get_record("guarded-view-mount-v1", b"legacy")
+                            .unwrap()
+                            .unwrap(),
+                        b"must-not-replay"
+                    );
+                    for reference in revision
+                        .value
+                        .metadata_sectors
+                        .iter()
+                        .chain(&revision.value.data_sectors)
+                    {
+                        assert!(
+                            recovered_inline_sector_for_export(
+                                inspected,
+                                &keys,
+                                revision.value.guild_id,
+                                reference
+                            )
+                            .unwrap()
+                            .is_some()
+                                || mode >= 2
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(
+                    files(),
+                    original_files,
+                    "mode {mode}, journal state {journal_state}"
+                );
+                assert!(
+                    export_withdrawn_revision_from_catalog(
+                        &keys,
+                        &data,
+                        revision.value.revision_id,
+                        &data.join("unsafe-export")
+                    )
+                    .is_err()
+                );
+                assert!(!data.join("unsafe-export").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_export_input_changes_before_staging_or_publication_never_publish() {
+        for during_construction in [false, true] {
+            let (keys, revision, sectors) = fixture(7);
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("original");
+            fs::create_dir(&data).unwrap();
+            let path = data.join("control.db");
+            let writer = mb_store::ControlStore::open(&path, &keys).unwrap();
+            writer.put_record("test", b"id", b"original").unwrap();
+            drop(writer);
+            let (_reader, guard) =
+                crate::volume::open_preserved_control_store(&data, &keys).unwrap();
+            let target = temp.path().join("export");
+            let mut changed = false;
+            let error = export_withdrawn_revision_in_parent(
+                &keys,
+                &revision,
+                &target,
+                None,
+                |id| {
+                    let constructing = fs::read_dir(temp.path()).unwrap().any(|entry| {
+                        entry
+                            .unwrap()
+                            .file_name()
+                            .as_encoded_bytes()
+                            .starts_with(b".mutualbackup-legacy-export-")
+                    });
+                    if !changed && (!during_construction || constructing) {
+                        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+                        file.write_all(b"changed original input").unwrap();
+                        file.sync_all().unwrap();
+                        changed = true;
+                    }
+                    Ok(sectors[id].clone())
+                },
+                || guard.verify_unchanged(),
+            )
+            .unwrap_err();
+            assert!(changed);
+            assert!(
+                error.to_string().contains("preserved database changed"),
+                "{error:#}"
             );
-            assert!(!data.join("unsafe-export").exists());
+            assert!(!target.exists());
+            assert_eq!(
+                fs::read_dir(temp.path()).unwrap().count(),
+                1,
+                "owned staging remains"
+            );
+            assert_eq!(fs::read_dir(&data).unwrap().count(), 1);
         }
     }
 
@@ -1928,6 +2051,7 @@ pub(crate) mod tests {
                     }
                     Ok(sectors[id].clone())
                 },
+                || Ok(()),
             )
             .unwrap_err();
             assert!(replaced);

@@ -653,6 +653,33 @@ remain active.
     adjustment still precede admission; other legacy/payload readers,
     full journal recovery, atomic admission-to-writer handoff, common WAL-index
     resource budgets and full R1/R2/R3/release gates remain open.
+  - [x] Qualify non-creating Linux catalog export payload and preserved parity
+    readers. Reuse an opened preserved database without an export-wide explicit
+    read transaction. Select local signed revisions in one short snapshot.
+    Existing recovery callbacks can retain SQL cursors across peer I/O;
+    releasing those cursor snapshots remains open.
+    A separate input guard requires unchanged main/WAL versions and sidecar
+    identities/absence before staging and immediately before publication; live
+    shared-memory read marks remain transient. Both fixed and variable parity
+    loads check preserved input versions before and after reading. Changed
+    inputs reject output publication and clean owned staging through its pinned
+    parent; no source repair, schema migration or key publication occurs.
+    Expanded fixtures cover closed, live WAL/SHM and WAL-only inputs across
+    legacy/wrapped/interrupted-rekey keys, missing/corrupt journals and changes
+    during construction. Qualification passes 966 unique cases: 477 ordinary
+    Node, 290 store, 102 Git and 19 CLI process tests, all 64 provisioned Git
+    cases, 11 native Node cases, extent sharing/prune, stock-Git bridge and raw
+    Unix CLI/daemon/Git paths. All four debug programs build; format and strict
+    locked workspace/all-targets Clippy pass. All 284 source-file and ten
+    program/test-driver hashes remain unchanged, and native mount/loop/image
+    cleanup is verified. Evidence and the distinct passing-case inventory are
+    retained under `/tmp/mb-m6-payload-validation-756jxsvu`; the post-commit audit binds the
+    qualified code to the commit. Eleven Node, 26 store and two CLI process
+    fixtures remain unexecuted. This qualifies debug source, not an installed
+    artifact or the full R1 gate. Atomic writer/path/ownership handoff, complete
+    key-manifest/external-owner reconciliation,
+    other-platform no-creation qualification and common WAL-index/resource
+    budgets remain open with the full R1/R2/R3/release gates.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent
