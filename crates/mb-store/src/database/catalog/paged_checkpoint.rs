@@ -71,9 +71,9 @@ impl CatalogCheckpointTransitionIndex {
     /// proof. `read_trust` must reread independently certified event state and
     /// the trusted previous checkpoint, with no production writer held across
     /// validation. The returned signature alone does not authorize activation:
-    /// coding lifecycle, private/payload joins and the atomic current-state
-    /// publication guard remain
-    /// mandatory. No normal checkpoint producer calls this draft bridge yet.
+    /// full coding transitions/fixed legacy migration, private/payload joins
+    /// and atomic current-state publication remain mandatory. No normal
+    /// checkpoint producer calls this draft bridge yet.
     pub fn sign_paged_checkpoint_header(
         &self,
         keys: &KeyMaterial,
@@ -126,7 +126,8 @@ impl CatalogCheckpointTransitionIndex {
     }
 }
 
-/// Completed public body plus independently checked quorum/event/base binding.
+/// Completed public body, certified coding state, authority transition and
+/// independently checked quorum/event/base binding.
 /// The original certificate, authority and indexed cursors remain available.
 /// There is deliberately no constructor from a manifest or header alone.
 pub struct CatalogQuorumPagedCheckpointIndex {
@@ -459,21 +460,20 @@ mod tests {
         let mut short = work;
         short.bytes -= 1;
         let index = fixture.joined(short, CatalogCodingCoveragePolicy::Current);
-        let previous_trust = fixture.previous_trust();
         let calls = Cell::new(0);
         assert!(
             index
-                .validate_authority_transition(
-                    Some(CatalogCheckpointPrevious::Legacy {
-                        certificate: &fixture.sources.certificate,
-                        trust: &previous_trust,
-                    }),
+                .validate_certified_coding_state(
                     budget(),
                     || {
                         calls.set(calls.get() + 1);
-                        Ok(trust.clone())
+                        Ok(CatalogCheckpointCodingTrust {
+                            checkpoint: trust.clone(),
+                            retained_groups: 1,
+                            retired_groups: 0,
+                        })
                     },
-                    |_, _| panic!("exhausted header budget read a writer")
+                    |_, _| panic!("exhausted header budget read coding authority")
                 )
                 .is_err()
         );
@@ -488,6 +488,7 @@ mod tests {
             "checkpoint-authority-complete",
             "packing-complete",
             "packing-coding-directory-complete",
+            "checkpoint-certified-coding-complete",
             "checkpoint-authority-transition-complete",
         ] {
             let index = fixture

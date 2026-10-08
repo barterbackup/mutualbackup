@@ -1647,6 +1647,30 @@ separately below.
     See ADR 0002. Coding lifecycle/fixed legacy migration, full retention/quota
     policy, private/payload custody, atomic durable ownership/publication and
     normal producer/retained 1 TiB/release qualification remain required below.
+  - [x] Require an exact certified-current variable coding state proof before
+    authority transition and draft paged signing. Independently supplied event
+    snapshots include complete retained/retired group counts; bounded trusted
+    point lookups bind each original group ID/profile, signed transcript hash
+    and add/retire/retention events. Include unrelated and retired groups until
+    certified forgetting, and recheck current placement for every covered packed
+    sector. Historical placement alone cannot authorize current coverage. Use
+    the same encrypted scratch store, with atomic completion, exact group/sector
+    EOFs and rollback after ignored writes, missing/extra rows, stale snapshots,
+    unavailable history or real storage exhaustion. Debit the complete public
+    input and bounded comparison work in all three dimensions before lookups;
+    carry this work into the authority transition without resetting its budget.
+    Internal row access avoids rereading descriptors at every point, while
+    preserving row/geometry checks and full completion checks around the scan.
+    Six fixtures cover original identity/lifecycle substitutions, complete
+    retained counts, unrelated/retired history, historical coverage rejection,
+    admission and late failure/rebuild across 32 real coding witnesses. Existing
+    paged signing and 4,096-fence spill fixtures require the new proof too.
+    All 170 core and 233 ordinary store tests pass (26 store tests ignored),
+    with strict locked workspace/all-targets Clippy and formatting/diff checks.
+    See ADR 0002. The bounded certified-history reader itself, fixed legacy-group
+    migration, full coding transitions, durable private/payload ownership,
+    full retained capacity/quota policy and normal producer/recovery/release
+    qualification remain required below.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
@@ -1657,7 +1681,8 @@ separately below.
     authority/coding joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body
     and source/bootstrap EOFs, migration-evidence quorum, integration of exact
-    current packed-input coverage, retained coding lifecycle authority and
+    current packed-input coverage, production bounded certified-history
+    snapshot/group lookups, complete retained coding lifecycle transitions and
     fixed legacy-group migration without changing identities. Retain and retire
     remaining logical root references inside coding records and source/native
     payload owners through bounded durable ownership, and guard authority-root

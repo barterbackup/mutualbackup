@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{ControlStore, DatabaseError};
 
 mod bundle;
+mod checkpoint_coding;
 mod checkpoint_retention;
 mod checkpoint_transition;
 mod checkpoint_validation;
@@ -33,6 +34,9 @@ mod source;
 pub use bundle::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
     CatalogBundleState,
+};
+pub use checkpoint_coding::{
+    CatalogCertifiedCodingGroup, CatalogCheckpointCodingStateIndex, CatalogCheckpointCodingTrust,
 };
 pub use checkpoint_retention::{CatalogCheckpointRetention, CatalogCheckpointRetentionState};
 pub use checkpoint_transition::{CatalogCheckpointPrevious, CatalogCheckpointTransitionIndex};

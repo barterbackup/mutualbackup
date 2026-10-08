@@ -1789,6 +1789,21 @@ private/payload custody and durable certified-current publication/retirement
 remain gates before normal consumers or retained 1 TiB qualification. See
 ADR 0002 for fixtures, including spill/exhaustion/rebuild across 4,096 fences.
 
+The authority transition now also requires a completed exact certified-current
+variable coding state proof. A bounded independent event snapshot supplies
+complete retained/retired group counts, and fixed trusted history lookups match
+every original group/profile, signed witness hash and lifecycle against the
+completed directory. Unrelated and retired groups remain until certified
+forgetting. Every packed sector's coverage must use current placement from that
+same snapshot. One disposable transaction checks exact EOFs and rechecks trust
+before issuing the proof; the authority successor carries its complete public
+and comparison-work ledger forward. Bounded internal rows avoid per-point
+descriptor rereads, with completion checks around the scan. This strengthens
+the draft signing bridge, without activating normal producers. A production
+bounded certified-history reader, fixed legacy migration, complete coding
+transitions, quota/private/payload and atomic durable publication/retirement
+remain required. No signed layouts or original group/witness identities change.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

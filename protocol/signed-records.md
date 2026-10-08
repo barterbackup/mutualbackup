@@ -190,8 +190,9 @@ and ordered quorum signature layout; it is a header codec fixture, not evidence
 of a complete body/coverage or state-transition validation.
 
 The store bridge signs and binds only a completed current-coverage public proof
-with a completed authority successor comparison. It compares exact member
-records and roots/ledger, and rereads independent event and previous-checkpoint
+with exact certified-current variable coding state and a completed authority
+successor comparison. It compares exact member records and roots/ledger, and
+rereads independent event and previous-checkpoint
 snapshots before and after the operation. The private wrapper preserves the
 original certificate, transition and indexed body; a raw header, manifest or
 body proof cannot create it. These draft APIs do not authorize production
@@ -200,6 +201,26 @@ and fixed legacy-group migration, private/bootstrap/native joins, payload
 custody, durable transitive ownership and an atomic current-state publication
 or retirement guard remain mandatory. No normal producer, peer version or
 seed-only consumer is enabled by this header.
+
+`CatalogCheckpointCodingStateIndex` requires a separately trusted consistent
+certified event snapshot, with complete retained and retired variable-group
+counts. Fixed trusted point facts bind every original group ID/profile, original
+signed transcript hash and exact add/retire/retention events. Their reader must
+verify original delegation, historical membership/domains and bound add evidence
+(including verified legacy add bindings); a proposal is never that authority.
+The directory retains unrelated and retired groups until certified forgetting.
+Every packed-sector coverage row must resolve to an active group with current
+placement under the same snapshot. Exact group/sector EOFs and a final snapshot
+recheck precede the private completion marker. No production writer is held.
+The whole public input and conservative fixed row/member/marker work share a
+required trusted byte/page/record budget, carried into the authority successor.
+Point reads use already verified indexed facts; history ingestion/replay needs
+its own enclosing admission before this phase, without resetting that debt.
+Internal joins check completion around the full scan without rereading large
+descriptors per point. A raw directory proof cannot proceed directly to signing.
+This proves the supplied certified variable state; the production bounded
+history reader, fixed legacy-group migration, complete coding transitions and
+the remaining enclosing publication/ownership gates are still required.
 
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone

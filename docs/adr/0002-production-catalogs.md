@@ -3204,3 +3204,86 @@ fixed legacy-group migration, full retention/quota policy, private/bootstrap/
 native and information/parity payload custody, complete durable ownership and
 atomic certified-current publication/retirement guards remain required. The
 normal producer/recovery/retained-capacity and platform/release gates stay open.
+
+## Exact certified variable coding state before paged signing (2026-10-08)
+
+`CatalogCheckpointCodingStateIndex` now binds a completed public proposal to one
+independently certified current variable coding state before authority successor
+comparison and draft signing. The former public-body-to-transition route has
+moved to this private completed wrapper. A raw manifest, header or directory
+proof cannot construct it. `CatalogCheckpointTransitionIndex` retains this
+coding proof and exposes the original body/cursors through its existing accessor.
+No normal checkpoint producer calls these draft APIs.
+
+`CatalogCheckpointCodingTrust` contains the bounded independent checkpoint/event
+snapshot and complete retained/retired variable-group counts. Counts are trusted
+certified-history scalars, never copied from the proposed root. Every original
+directory group is matched through a fixed `CatalogCertifiedCodingGroup` point
+lookup: guild, original group ID and profile, plain BLAKE3 hash of the complete
+original signed witness, add event, retirement event and retention deadline must
+all agree. The required trusted reader must check original delegation,
+historical membership/domains and bound add evidence, including legacy add
+bindings, from the same certified snapshot. The convenience fact constructor
+bounds the typed descriptor before legacy identity hashing and checks group
+identity/shape; it is data, not a certificate or authority token.
+Implementing the production bounded certified-history reader remains required;
+this stage does not use the flat `DynamicGuildState` or clone its group history.
+Point reads return already verified fixed indexed facts. History ingestion or
+replay must be admitted separately by the enclosing job before this phase;
+the callback cannot hide a catalog-sized replay inside a fixed point lookup.
+
+Complete trusted counts and exact cursor EOF prevent a proposed subset from
+dropping retained history. Unrelated and retired groups remain until certified
+forgetting. Fixed placement rows record current eligibility without caching a
+catalog-sized collection in memory. Every original packed-sector row and its
+coverage point must resolve to an active group whose trusted authorization is
+`CurrentPlacement`. Historical authority can preserve other retained groups,
+but cannot cover current packed input. All groups and sectors must reach exact
+declared counts; missing/extra rows cannot turn a valid prefix into completion.
+
+The new join uses the same encrypted disposable store and one transaction. It
+checks empty namespaces before writing, verifies every insert/readback, rereads
+the independent snapshot and rechecks all earlier completion markers before
+publishing its own marker. The marker binds the original header hash, exact
+trusted snapshot/count hash and admitted work. Ignored writes, stale snapshots,
+unavailable certified facts and late row/storage errors return no usable proof.
+Signing/binding checks the new marker as well as authority, packing, directory
+and authority-transition completion. The original signed layouts, group IDs,
+transcript hashes, coding ranges and protocol vectors remain unchanged.
+
+A required separate trusted job budget admits the entire public input and
+conservative scan/point/writeback work before the first history lookup. Checked
+accounting charges fixed data rows at 256 bytes, roster rows at 512 bytes and
+fixed markers at 4 KiB, with independent record and page-occurrence caps. The
+authority successor carries this admitted work forward before adding the prior
+public input and authority comparison; it cannot reset the coding debt. The
+existing proof retains its original public-input budget too. Internal bounded
+row access preserves all geometry and canonical checks while completion is
+checked around the scan. It avoids repeated large descriptor reads for millions
+of group and coverage points; public cursor entry points retain their guards.
+This is work admission, not the full retained dataset/guild or physical quota
+policy, which remains open under R3-SINGLE-OWNER-METADATA.
+
+Six new fixtures cover bounded typed descriptors, original witness/profile/
+lifecycle substitutions, independent count/member/event mismatch, missing and
+failed trusted history,
+retired/unrelated retained groups, current versus historical coverage, all
+budget dimensions, arithmetic bounds, stale/error final snapshots, orphan and
+ignored writes, missing/extra original rows, late failure across 32 real coding
+witnesses, actual SQLite page-limit exhaustion, rollback and fresh rebuilding.
+The existing signing/completion and 4,096-fence spill fixtures now require this
+proof too. This remains structural metadata evidence, not real retained 1 TiB
+payload qualification. The existing authority format still requires retained
+revisions; no empty-certificate semantics are introduced.
+
+Validation: all 170 locked core library tests pass. The final locked store
+library run, with four test threads, passes all 233 ordinary tests (26 ignored),
+including the final typed-descriptor bound and coding-debt regression. Strict
+locked workspace/all-targets Clippy and formatting/diff checks pass. No
+network/native, release/platform or real retained 1 TiB runtime gate was rerun.
+
+Fixed legacy-group migration, full original coding lifecycle transitions,
+production certified-history indexing, private/bootstrap/native and information/
+parity payload custody, complete durable ownership and atomic certified-current
+publication/retirement guards remain required. Normal consumers, full retained
+capacity/quota and release/platform gates stay open.

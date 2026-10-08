@@ -285,6 +285,13 @@ impl CatalogPackingCodingDirectoryIndex {
         id: [u8; 32],
     ) -> Result<Option<CatalogCodingCoverage>, CatalogStoreError> {
         self.require_complete()?;
+        self.coverage_row(id)
+    }
+
+    pub(super) fn coverage_row(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<CatalogCodingCoverage>, CatalogStoreError> {
         let Some(bytes) = self
             .packing
             .store
@@ -293,7 +300,7 @@ impl CatalogPackingCodingDirectoryIndex {
             return Ok(None);
         };
         let value: CatalogCodingCoverage = decode_row(&bytes)?;
-        if self.packing.sector(id)?.is_none()
+        if self.packing.sector_row(id)?.is_none()
             || value.group_id == [0; 32]
             || value.holder.0 == [0; 32]
             || self.group(value.group_id)?.is_none_or(|group| {
@@ -311,6 +318,13 @@ impl CatalogPackingCodingDirectoryIndex {
         after: Option<[u8; 32]>,
     ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
         self.require_complete()?;
+        self.next_group_row(after)
+    }
+
+    pub(super) fn next_group_row(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
         let Some((key, bytes)) = self.packing.store.next_record_bounded(
             GROUPS,
             after.as_ref().map(|id| id.as_slice()),

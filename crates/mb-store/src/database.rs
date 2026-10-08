@@ -27,9 +27,10 @@ pub use anchor_discovery::{
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingDirectoryIndex,
-    CatalogCertifiedCodingIndex, CatalogCertifiedPackingIndex, CatalogCheckpointAuthorityContext,
-    CatalogCheckpointAuthorityIndex, CatalogCheckpointAuthorityValidation,
-    CatalogCheckpointCodingDirectoryIndex, CatalogCheckpointPackingIndex,
+    CatalogCertifiedCodingGroup, CatalogCertifiedCodingIndex, CatalogCertifiedPackingIndex,
+    CatalogCheckpointAuthorityContext, CatalogCheckpointAuthorityIndex,
+    CatalogCheckpointAuthorityValidation, CatalogCheckpointCodingDirectoryIndex,
+    CatalogCheckpointCodingStateIndex, CatalogCheckpointCodingTrust, CatalogCheckpointPackingIndex,
     CatalogCheckpointPrevious, CatalogCheckpointRetention, CatalogCheckpointRetentionState,
     CatalogCheckpointTransitionIndex, CatalogCheckpointWriterAuthorization,
     CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,

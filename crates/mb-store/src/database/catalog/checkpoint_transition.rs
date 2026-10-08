@@ -396,7 +396,7 @@ fn exact(count: u64, expected: u64) -> Result<(), CatalogStoreError> {
     }
     Ok(())
 }
-fn snapshot_hash(trust: &PagedCheckpointTrust) -> Result<[u8; 32], CatalogStoreError> {
+pub(super) fn snapshot_hash(trust: &PagedCheckpointTrust) -> Result<[u8; 32], CatalogStoreError> {
     trust.validate()?;
     Ok(canonical_hash_bounded(
         &(
@@ -522,7 +522,7 @@ struct Manifest {
     work: Work,
 }
 
-impl CatalogCheckpointCodingDirectoryIndex {
+impl CatalogCheckpointCodingStateIndex {
     /// Compare a completed proposal with the exact independently trusted prior
     /// state. `budget` admits both complete public inputs and all bounded local
     /// row work without resetting either input's debt. `read_current_writer`
@@ -542,8 +542,8 @@ impl CatalogCheckpointCodingDirectoryIndex {
     ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError> {
         let trust = read_trust()?;
         let header = self.header(&trust)?;
-        let store = &self.index().packing().store;
-        let counts = Counts::paged(&self);
+        let store = &self.index().index().packing().store;
+        let counts = Counts::paged(self.index());
         let mut old_counts = Counts::default();
         let mut old_work = Work::default();
         let mut old_snapshot = None;
@@ -616,8 +616,8 @@ impl CatalogCheckpointCodingDirectoryIndex {
                 Some(CatalogCheckpointPrevious::Paged(previous)) => previous.trust().members.len(),
                 None => 0,
             };
-        let work = header
-            .represented_work()?
+        let work = self
+            .represented_work()
             .checked_add(old_work)?
             .checked_add(scan_reservation(counts, old_counts, is_legacy, members)?)?;
         budget.remaining_after(work)?;
@@ -819,16 +819,20 @@ impl CatalogCheckpointCodingDirectoryIndex {
 }
 
 /// Complete bounded public authority transition under one trusted job budget.
-/// Signing/binding requires this private completion proof. Coding lifecycle,
-/// private/payload joins and atomic durable publication remain separate gates.
+/// Signing/binding requires this proof and its exact certified coding state.
+/// Full coding transitions/fixed legacy migration, private/payload joins and
+/// atomic durable publication remain separate gates.
 pub struct CatalogCheckpointTransitionIndex {
-    index: CatalogCheckpointCodingDirectoryIndex,
+    index: CatalogCheckpointCodingStateIndex,
     trust: PagedCheckpointTrust,
     manifest: Manifest,
     budget: Work,
 }
 impl CatalogCheckpointTransitionIndex {
     pub fn index(&self) -> &CatalogCheckpointCodingDirectoryIndex {
+        self.index.index()
+    }
+    pub fn coding_state(&self) -> &CatalogCheckpointCodingStateIndex {
         &self.index
     }
     pub fn trust(&self) -> &PagedCheckpointTrust {
@@ -848,6 +852,7 @@ impl CatalogCheckpointTransitionIndex {
             || self.manifest.snapshot_hash != snapshot_hash(&self.trust)?
             || self
                 .index
+                .index()
                 .index()
                 .packing()
                 .store
@@ -961,7 +966,8 @@ mod tests {
         trust: &PagedCheckpointTrust,
     ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError> {
         fixture
-            .joined(budget(), CatalogCodingCoveragePolicy::Current)
+            .certified(budget(), CatalogCodingCoveragePolicy::Current, trust)
+            .unwrap()
             .validate_authority_transition(
                 Some(CatalogCheckpointPrevious::Paged(previous)),
                 budget(),
@@ -1048,7 +1054,8 @@ mod tests {
         let mut trust = initial.trust();
         trust.previous = None;
         let index = initial
-            .joined(budget(), CatalogCodingCoveragePolicy::Current)
+            .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+            .unwrap()
             .validate_authority_transition(
                 None,
                 budget(),
@@ -1186,7 +1193,8 @@ mod tests {
         let (fixture, previous) = previous();
         let (mut next, trust) = successor(&fixture, &previous);
         let index = next
-            .joined(budget(), CatalogCodingCoveragePolicy::Current)
+            .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+            .unwrap()
             .validate_authority_transition(
                 Some(CatalogCheckpointPrevious::Paged(&previous)),
                 budget(),
@@ -1227,7 +1235,8 @@ mod tests {
             }
             let calls = Cell::new(0);
             let result = fixture
-                .joined(budget(), CatalogCodingCoveragePolicy::Current)
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap()
                 .validate_authority_transition(
                     Some(CatalogCheckpointPrevious::Legacy {
                         certificate: &old,
@@ -1248,7 +1257,8 @@ mod tests {
             let trust = fixture.trust();
             let old_trust = fixture.previous_trust();
             let result = fixture
-                .joined(budget(), CatalogCodingCoveragePolicy::Current)
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap()
                 .validate_authority_transition(
                     Some(CatalogCheckpointPrevious::Legacy {
                         certificate: &fixture.sources.certificate,
@@ -1290,7 +1300,8 @@ mod tests {
         // the trusted first revision and must fail the previous-state join.
         assert!(
             fixture
-                .joined(budget(), CatalogCodingCoveragePolicy::Current)
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap()
                 .validate_authority_transition(
                     Some(CatalogCheckpointPrevious::Legacy {
                         certificate: &fixture.sources.certificate,
@@ -1339,7 +1350,8 @@ mod tests {
                 hash: old.hash().unwrap(),
             });
             let result = fixture
-                .joined(budget(), CatalogCodingCoveragePolicy::Current)
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap()
                 .validate_authority_transition(
                     Some(CatalogCheckpointPrevious::Legacy {
                         certificate: &old,
@@ -1511,9 +1523,38 @@ mod tests {
         append(&mut next, 1);
         let admitted = paged(&mut next, &previous, &trust).unwrap();
         let work = admitted.represented_work();
+        let public = admitted
+            .index()
+            .header(&trust)
+            .unwrap()
+            .represented_work()
+            .unwrap();
+        let coding = admitted.coding_state().represented_work();
+        let coding_rows = Work {
+            bytes: coding.bytes.checked_sub(public.bytes).unwrap(),
+            page_occurrences: coding
+                .page_occurrences
+                .checked_sub(public.page_occurrences)
+                .unwrap(),
+            records: coding.records.checked_sub(public.records).unwrap(),
+        };
+        assert!(coding_rows.bytes > 0 && coding_rows.records > 0);
+        let reset = work.remaining_after(coding_rows).unwrap();
         drop(admitted);
+        assert!(
+            next.certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap()
+                .validate_authority_transition(
+                    Some(CatalogCheckpointPrevious::Paged(&previous)),
+                    reset,
+                    || Ok(trust.clone()),
+                    |_, _| panic!("reset coding debt requested a current writer")
+                )
+                .is_err()
+        );
         let rebuilt = next
-            .joined(budget(), CatalogCodingCoveragePolicy::Current)
+            .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+            .unwrap()
             .validate_authority_transition(
                 Some(CatalogCheckpointPrevious::Paged(&previous)),
                 work,
@@ -1531,7 +1572,8 @@ mod tests {
                 _ => limit.records -= 1,
             }
             assert!(
-                next.joined(budget(), CatalogCodingCoveragePolicy::Current)
+                next.certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                    .unwrap()
                     .validate_authority_transition(
                         Some(CatalogCheckpointPrevious::Paged(&previous)),
                         limit,
@@ -1543,7 +1585,8 @@ mod tests {
         }
         let calls = Cell::new(0);
         assert!(
-            next.joined(budget(), CatalogCodingCoveragePolicy::Current)
+            next.certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap()
                 .validate_authority_transition(
                     Some(CatalogCheckpointPrevious::Paged(&previous)),
                     budget(),
@@ -1564,7 +1607,8 @@ mod tests {
         regressed.event_sequence -= 1;
         next.context.event_sequence = regressed.event_sequence;
         assert!(
-            next.joined(budget(), CatalogCodingCoveragePolicy::Current)
+            next.certified(budget(), CatalogCodingCoveragePolicy::Current, &regressed)
+                .unwrap()
                 .validate_authority_transition(
                     Some(CatalogCheckpointPrevious::Paged(&previous)),
                     budget(),
@@ -1620,8 +1664,11 @@ mod tests {
         let trust = fixture.trust();
         let old_trust = fixture.previous_trust();
         for kind in KINDS {
-            let index = fixture.joined(budget(), CatalogCodingCoveragePolicy::Current);
+            let index = fixture
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap();
             index
+                .index()
                 .index()
                 .packing()
                 .store
@@ -1642,8 +1689,10 @@ mod tests {
             );
         }
         for kind in KINDS {
-            let index = fixture.joined(budget(), CatalogCodingCoveragePolicy::Current);
-            index.index().packing().store.database_shell_statement(&format!("CREATE TEMP TRIGGER ignore_transition BEFORE INSERT ON scratch.protocol_records WHEN NEW.kind='{kind}' BEGIN SELECT RAISE(IGNORE); END"), false).unwrap();
+            let index = fixture
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap();
+            index.index().index().packing().store.database_shell_statement(&format!("CREATE TEMP TRIGGER ignore_transition BEFORE INSERT ON scratch.protocol_records WHEN NEW.kind='{kind}' BEGIN SELECT RAISE(IGNORE); END"), false).unwrap();
             assert!(
                 index
                     .validate_authority_transition(
@@ -1660,8 +1709,10 @@ mod tests {
             );
         }
         for mode in 0..4 {
-            let index = fixture.joined(budget(), CatalogCodingCoveragePolicy::Current);
-            let store = &index.index().packing().store;
+            let index = fixture
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap();
+            let store = &index.index().index().packing().store;
             let key: Key = (&fixture.paged().value).into();
             let bytes = store
                 .get_record_bounded(IDENTITIES, &key.index_key(), ROW_BYTES)
@@ -1781,8 +1832,10 @@ mod tests {
         let trust = fixture.trust();
         let old_trust = fixture.previous_trust();
         for mode in 0..2 {
-            let index = fixture.joined(budget(), CatalogCodingCoveragePolicy::Current);
-            let store = &index.index().packing().store;
+            let index = fixture
+                .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+                .unwrap();
+            let store = &index.index().index().packing().store;
             if mode == 0 {
                 let pages = store
                     .database_shell_statement("PRAGMA scratch.page_count", false)
@@ -1829,7 +1882,8 @@ mod tests {
         }
         let calls = Cell::new(0);
         let index = fixture
-            .joined(budget(), CatalogCodingCoveragePolicy::Current)
+            .certified(budget(), CatalogCodingCoveragePolicy::Current, &trust)
+            .unwrap()
             .validate_authority_transition(
                 Some(CatalogCheckpointPrevious::Legacy {
                     certificate: &fixture.sources.certificate,

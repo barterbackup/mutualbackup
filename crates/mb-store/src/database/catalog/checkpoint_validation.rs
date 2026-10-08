@@ -817,8 +817,8 @@ impl CatalogCheckpointPackingIndex {
 }
 
 /// Complete public authority/packing/directory joins in one admitted scratch
-/// store. Certified transition/signatures, event rechecks, private and payload
-/// ownership are still mandatory before production checkpoint activation.
+/// store. Exact certified coding state, authority transition/signatures, event
+/// rechecks and private/payload ownership remain mandatory before activation.
 pub struct CatalogCheckpointCodingDirectoryIndex {
     authority: CatalogCheckpointAuthorityValidation,
     source_count: u64,
@@ -1100,8 +1100,8 @@ pub(super) mod tests {
             limit: CatalogCodingTraversalBudget,
             policy: CatalogCodingCoveragePolicy,
         ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError> {
-            let current = self.joined(limit, policy);
             let trust = self.trust();
+            let current = self.certified(limit, policy, &trust)?;
             let previous_trust = self.previous_trust();
             current.validate_authority_transition(
                 Some(CatalogCheckpointPrevious::Legacy {
@@ -1128,6 +1128,58 @@ pub(super) mod tests {
             budget: CatalogCodingTraversalBudget,
             policy: CatalogCodingCoveragePolicy,
         ) -> CatalogCheckpointCodingDirectoryIndex {
+            self.joined_with_entry(budget, policy).0
+        }
+        pub(crate) fn certified(
+            &mut self,
+            limit: CatalogCodingTraversalBudget,
+            policy: CatalogCodingCoveragePolicy,
+            trust: &mb_core::PagedCheckpointTrust,
+        ) -> Result<CatalogCheckpointCodingStateIndex, CatalogStoreError> {
+            let (index, original) = self.joined_with_entry(limit, policy);
+            let trust = CatalogCheckpointCodingTrust {
+                checkpoint: trust.clone(),
+                retained_groups: 1,
+                retired_groups: 0,
+            };
+            let original = CatalogCertifiedCodingGroup::from_retained(
+                &original.retained,
+                mb_core::canonical_hash_bounded(
+                    &original.transcript,
+                    mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                )?,
+                CatalogCodingAuthorization::CurrentPlacement,
+            )?;
+            index.validate_certified_coding_state(
+                budget(),
+                || Ok(trust.clone()),
+                |id, _| Ok((id == original.lifecycle.group_id).then_some(original)),
+            )
+        }
+        pub(crate) fn joined_with_entry(
+            &mut self,
+            budget: CatalogCodingTraversalBudget,
+            policy: CatalogCodingCoveragePolicy,
+        ) -> (
+            CatalogCheckpointCodingDirectoryIndex,
+            mb_core::CatalogCodingEntry,
+        ) {
+            let (index, mut entries) =
+                self.joined_with_groups(budget, policy, |_, entries| entries);
+            (index, entries.pop().unwrap())
+        }
+        pub(crate) fn joined_with_groups(
+            &mut self,
+            budget: CatalogCodingTraversalBudget,
+            policy: CatalogCodingCoveragePolicy,
+            select: impl FnOnce(
+                &super::super::packing_validation::tests::Fixture,
+                Vec<mb_core::CatalogCodingEntry>,
+            ) -> Vec<mb_core::CatalogCodingEntry>,
+        ) -> (
+            CatalogCheckpointCodingDirectoryIndex,
+            Vec<mb_core::CatalogCodingEntry>,
+        ) {
             let (packing, packing_pages) = self
                 .sources
                 .packing(&self.sources.records, &self.sources.bytes);
@@ -1163,6 +1215,8 @@ pub(super) mod tests {
             };
             let entry =
                 super::super::coding_coverage::tests::entry(&inputs, [0, 1, 2], 701, 2, None);
+            let mut entries = select(&inputs, vec![entry]);
+            entries.sort_by_key(|entry| entry.retained.group.id);
             let mut pages = Pages::new();
             let mut sink = |page: CatalogPageRef, bytes| {
                 pages.insert(page.hash, bytes);
@@ -1174,9 +1228,12 @@ pub(super) mod tests {
                 budget,
             )
             .unwrap();
-            builder.push_group(&entry, &mut sink).unwrap();
+            for entry in &entries {
+                builder.push_group(entry, &mut sink).unwrap();
+            }
             let coding = builder.finish(&mut sink).unwrap();
-            self.build(budget)
+            let index = self
+                .build(budget)
                 .unwrap()
                 .validate_packing(packing, |page| fetch(&packing_pages, page))
                 .unwrap()
@@ -1186,7 +1243,8 @@ pub(super) mod tests {
                     |page| fetch(&pages, page),
                     |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
                 )
-                .unwrap()
+                .unwrap();
+            (index, entries)
         }
     }
 

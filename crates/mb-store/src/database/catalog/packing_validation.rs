@@ -18,7 +18,7 @@ const ROW_BYTES: usize = 256;
 const KEY_BYTES: usize = 104;
 const HEADERS: &str = "packing-source";
 const CHUNKS: &str = "packing-chunk";
-const SECTORS: &str = "packing-sector";
+pub(super) const SECTORS: &str = "packing-sector";
 const COMPLETE: &str = "packing-complete";
 
 /// Local join configuration, with an aggregate budget including both streams
@@ -289,6 +289,15 @@ impl CatalogPackingIndex {
 
     pub fn sector(&self, id: [u8; 32]) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
         self.require_complete()?;
+        self.sector_row(id)
+    }
+
+    // Internal bounded joins check completion before/after their full scan.
+    // Keep all row/geometry checks without rereading the marker per point.
+    pub(super) fn sector_row(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
         let Some((sector, _)) = row::<CatalogPackingSector>(&self.store, SECTORS, &id)? else {
             return Ok(None);
         };
