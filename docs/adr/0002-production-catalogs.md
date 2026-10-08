@@ -2671,3 +2671,45 @@ The enclosing paged certificate, current guild-event/lifecycle authority join,
 fixed legacy-group migration, guarded retirement, normal capture/coding/
 checkpoint/retention/seed-only consumers, quotas, incremental work and real
 retained 1 TiB/release/platform qualification remain open.
+
+
+### Single-owner metadata capacity shortfall (2026-10-08)
+
+A focused audit after `cbb78bd` checks the existing stable-slot allocator as well
+as canonical codec sizes. With four 16 KiB slots per 64 KiB sector, one owner
+leaves one slot reserved for a future different owner. Three dense source
+sectors therefore produce four packed sectors, as an actual allocator fixture
+verifies. The earlier fully occupied coding-only sizing result remains valid
+for its stated information-input geometry; it does not describe the packing
+required by a single protected dataset's one-owner sources.
+
+For 1 TiB of dense data source sectors, this policy needs 16,777,216 sources,
+22,369,622 packed sectors and 7,456,541 default 3+2 codewords. A real compact
+witness with the supported 256-byte certified domains supplies the codec size.
+Subtracting all three maximum-width u64 expansions and all five possible
+sample-index expansions yields a necessary 8,415-byte lower bound per group
+for this supported witness family. This gives 62,746,792,515 coding bytes and
+at least 1,021,270 coding leaf occurrences, without stream/index/root overhead.
+The current coding forest's one-million-page aggregate ceiling cannot admit
+that shape even though its four primitive 16 GiB byte trees can hold the bytes.
+
+Canonical compact descriptors (using minimum-width sector indices and allowing
+for the final partially occupied sector) add at least 7,046,430,806 bytes;
+complete-source headers/subtrees add 4,596,957,192 bytes. Together these sections
+already require at least 74,390,180,513 represented bytes, exceeding the staging
+join's 64 GiB combined ceiling. Signed public source trees, encrypted private
+recipes/namespace pages and their coding inputs, bootstrap/control records,
+retained revisions, Git history and replacement witnesses are still excluded.
+The calculation extrapolates allocator/codec geometry; it does not materialize
+or qualify an actual 1 TiB capture, producer, recovery or retained dataset.
+
+`single_owner_dense_one_tib_requires_more_than_one_million_coding_pages` pins
+this necessary lower bound without requiring that future admission keep the
+current limitation. Its focused test, formatting/diff checks and strict locked
+workspace/all-targets Clippy pass. Primitive and signed layouts remain unchanged. R3-SINGLE-OWNER-METADATA remains open: the enclosing policy
+and directories must admit the required dataset geometry, account for every
+section and retained owner, and declare dataset/file/history/guild limits.
+Raising parser constants alone, assuming unrelated owners fill the reserved
+slots, or relying on the isolated fully occupied sizing fixture does not resolve
+that requirement. Normal producers remain gated on that complete design and
+runtime qualification.

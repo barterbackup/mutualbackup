@@ -1712,6 +1712,17 @@ and all coding parts in one atomic local bundle. Certified guild-event/lifecycle
 validation, the enclosing certificate and full consumer/retention/quota/runtime
 qualification remain required; this is a staging join. See ADR 0002 for validation.
 
+A subsequent allocator/codec audit finds that single-owner 1 TiB admission
+requires a different aggregate policy from the isolated fully occupied sizing
+case. The existing reserved cross-owner slot requires 22,369,622 packed sectors
+and 7,456,541 default coding groups. At supported maximum domain lengths, a
+necessary lower bound is 1,021,270 coding leaves and 74,390,180,513 combined
+packing/coding bytes, before signed source trees/private metadata/history.
+This exceeds the current aggregate limits. The focused reproducible audit passes;
+R3-SINGLE-OWNER-METADATA now records the required enclosing admission/directory/
+quota correction. Consumer activation and actual retained-data qualification
+remain gated on that complete design, without narrowing the 1 TiB dataset target.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

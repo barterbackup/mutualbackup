@@ -1366,6 +1366,24 @@ separately below.
   - [ ] Derive and enforce the enclosing packing/coding metadata capacity across
     descriptor, source-proof and coding streams for the required retained 1 TiB
     geometry. Individual stream caps do not qualify their combined admission.
+  - [ ] **R3-SINGLE-OWNER-METADATA / P1 — Admit the required single-owner
+    geometry under the complete checkpoint policy.** Audit following `cbb78bd`
+    reproduces the existing allocator's reserved cross-owner slot: three dense
+    sources produce four packed sectors. A 1 TiB dataset with one owner needs
+    22,369,622 packed sectors and 7,456,541 default 3+2 coding groups. With
+    supported 256-byte certified domains, even stripping scalar-width/sample
+    expansion gives at least 62,746,792,515 coding bytes and 1,021,270 coding
+    leaves. Packing descriptors and source proofs bring the lower bound to
+    74,390,180,513 bytes before signed source trees, private metadata or history.
+    This exceeds the current one-million-page coding-forest and 64 GiB combined
+    admission. The focused codec/allocator audit passes and preserves this
+    necessary lower bound; strict locked workspace/all-targets Clippy and
+    formatting/diff checks pass. It does not qualify a backup. Derive enclosing
+    section/dataset/guild budgets, retained quotas and directory/sharding
+    behavior from the full required geometry before enabling producers. Do not
+    assume other owners will fill the reserved slots, silently narrow the
+    supported domain/dataset target, or treat isolated fully occupied coding
+    sizes as complete 1 TiB admission. See ADR 0002.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

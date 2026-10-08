@@ -1571,6 +1571,129 @@ mod tests {
     }
 
     #[test]
+    fn single_owner_dense_one_tib_requires_more_than_one_million_coding_pages() {
+        // Audit the actual allocator, rather than assume four occupied slots.
+        // One owner leaves a slot available for a future different owner.
+        let profile = crate::PackingProfile {
+            format_version: 1,
+            sector_size: 65536,
+            slot_size: 16384,
+        };
+        let owner = keys()[0].node_id();
+        let inputs = (1..=3)
+            .map(|index| {
+                let bytes = vec![index; profile.sector_size as usize];
+                crate::PackingInput {
+                    owner,
+                    protected_root: [4; 32],
+                    object_id: [index; 32],
+                    source_commitment: Some(merkle_commit(&bytes).unwrap()),
+                    bytes,
+                }
+            })
+            .collect();
+        let packed = crate::pack_incremental(profile, None, inputs).unwrap();
+        assert_eq!(packed.catalog.sectors.len(), 4);
+        for sector in &packed.catalog.sectors {
+            assert_eq!(
+                sector
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.source().is_some())
+                    .count(),
+                3
+            );
+        }
+        let sources = (1_u64 << 40) / u64::from(profile.sector_size);
+        let packed_sectors = (sources * 4).div_ceil(3);
+        let groups = packed_sectors.div_ceil(3);
+        assert_eq!(packed_sectors, 22_369_622);
+        assert_eq!(groups, 7_456_541);
+
+        // A real default compact witness with the maximum supported certified
+        // domain lengths. Strip *all* optional scalar-width expansion: three
+        // u64 fields can each shrink by nine bytes, and five sampled leaf
+        // indices by one. This is a lower bound for this supported family,
+        // independent of the particular epoch/timestamps/random challenge.
+        let entry = entry(2, 1, 65536, 256);
+        let (root, _) = build(&[entry], CATALOG_MAX_STREAM_BYTES);
+        let per_group_lower = root.parts[0].page.byte_len - 8 - 3 * 9 - 5;
+        let coding_bytes_lower = groups * per_group_lower;
+        let coding_leaves_lower = coding_bytes_lower.div_ceil(CATALOG_LEAF_BYTES as u64);
+        assert!(coding_leaves_lower > 1_000_000);
+        assert!(
+            coding_bytes_lower + CATALOG_CODING_ROOT_BYTES as u64 + 32 < CATALOG_CODING_MAX_BYTES
+        );
+        assert!(groups * root.parts[0].records <= CATALOG_MAX_RECORDS);
+
+        let sector = &packed.catalog.sectors[0];
+        let header = CatalogPackedSectorRecord::Header {
+            format_version: 1,
+            id: sector.id,
+            sector_index: 0,
+            flat_root: sector.flat_root,
+            commitment: sector.commitment.clone(),
+        };
+        let slots = CatalogPackedSectorRecord::CompactSlots {
+            offset: 0,
+            slots: sector
+                .slots
+                .iter()
+                .map(|slot| {
+                    if let Some(source) = slot.source() {
+                        CatalogPackedSlotReference::Data(CatalogPackedChunkReference {
+                            source_key: CatalogPackedSourceId {
+                                owner: source.id.owner,
+                                protected_root: source.id.protected_root,
+                                object_id: source.id.object_id,
+                            }
+                            .key(),
+                            chunk_index: source.id.chunk_index,
+                            content_hash: source.content_hash,
+                        })
+                    } else {
+                        CatalogPackedSlotReference::VirtualZero { source: None }
+                    }
+                })
+                .collect(),
+        };
+        let descriptor_bytes_lower = 8 + packed_sectors * (8
+            + canonical_size_bounded(&header, CATALOG_PACKED_RECORD_BYTES).unwrap() as u64
+            + canonical_size_bounded(&slots, CATALOG_PACKED_RECORD_BYTES).unwrap() as u64)
+            // Only the final sector may have fewer than three occupied slots.
+            - 2 * 66;
+        let source_header = CatalogPackedSourceRecord::Source {
+            format_version: 1,
+            id: CatalogPackedSourceId {
+                owner,
+                protected_root: [4; 32],
+                object_id: [1; 32],
+            },
+            commitment: sector.commitment.clone(),
+        };
+        let subtrees = CatalogPackedSourceRecord::Subtrees {
+            first_chunk: 0,
+            roots: vec![[1; 32]; 4],
+        };
+        let source_bytes = 8 + sources
+            * (8 + canonical_size_bounded(&source_header, CATALOG_PACKED_SOURCE_RECORD_BYTES)
+                .unwrap() as u64
+                + canonical_size_bounded(&subtrees, CATALOG_PACKED_SOURCE_RECORD_BYTES).unwrap()
+                    as u64);
+        assert!(descriptor_bytes_lower < CATALOG_MAX_STREAM_BYTES);
+        assert!(source_bytes < CATALOG_MAX_STREAM_BYTES);
+        assert!(packed_sectors * 2 <= CATALOG_MAX_RECORDS);
+        assert!(sources * 2 <= CATALOG_MAX_RECORDS);
+        let combined_bytes_lower = descriptor_bytes_lower + source_bytes + coding_bytes_lower;
+        assert!(combined_bytes_lower > 64 * 1024 * 1024 * 1024);
+        eprintln!(
+            "single-owner 1 TiB lower bound: {sources} data sources, {packed_sectors} packed sectors, {groups} groups, {per_group_lower} coding bytes/group, {coding_bytes_lower} coding bytes, {coding_leaves_lower} coding leaves, {descriptor_bytes_lower} descriptor bytes, {source_bytes} source-proof bytes, {combined_bytes_lower} combined bytes before signed source trees/private metadata/history"
+        );
+        // This pins a necessary capacity correction. It is not a successful
+        // retained-data runtime gate, and does not raise primitive limits.
+    }
+
+    #[test]
     fn coding_forest_and_original_transcripts_have_fixed_protocol_vectors() {
         let mut entries = (1..=4).map(|id| entry(2, id, 64, 12)).collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.retained.group.id);
