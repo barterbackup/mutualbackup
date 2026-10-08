@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeSet,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
@@ -17,6 +18,7 @@ use mb_core::{
 use mb_store::ControlStore;
 
 use super::LegacyExportReport;
+use super::local_inventory::PreservedInputScope;
 use crate::{Node, P2pClient, P2pConfig, TorMode, build_p2p};
 
 /// An explicitly selected identity-bound peer endpoint: `NODE-ID=MULTIADDR`.
@@ -76,18 +78,120 @@ fn scratch_parent(
     data_dir: &Path,
     anchor_areas: &[PathBuf],
     parity_volumes: &[PathBuf],
+    scope: &PreservedInputScope,
+) -> Result<PathBuf> {
+    scratch_parent_with_native_lookup(
+        candidate,
+        data_dir,
+        anchor_areas,
+        parity_volumes,
+        scope,
+        |path| mb_store::directory_identity(path),
+    )
+}
+
+fn scratch_parent_with_native_lookup(
+    candidate: &Path,
+    data_dir: &Path,
+    anchor_areas: &[PathBuf],
+    parity_volumes: &[PathBuf],
+    scope: &PreservedInputScope,
+    native_identity: impl Fn(
+        &Path,
+    ) -> std::result::Result<mb_store::NativeFileId, mb_store::AnchorError>,
 ) -> Result<PathBuf> {
     let parent = candidate.canonicalize()?;
+    let mut directory_ids = BTreeSet::new();
+    let native_inodes: BTreeSet<_> = scope.native_roots.iter().map(|id| id.inode).collect();
     for input in std::iter::once(data_dir)
         .chain(anchor_areas.iter().map(PathBuf::as_path))
         .chain(parity_volumes.iter().map(PathBuf::as_path))
     {
+        let input = input.canonicalize()?;
+        reject_preserved_parent(&parent, &input)?;
+        let metadata = input.metadata()?;
+        if metadata.is_dir() {
+            directory_ids.insert((metadata.dev(), metadata.ino()));
+        }
+    }
+    for input in &scope.paths {
+        match input.canonicalize() {
+            Ok(input) => {
+                reject_preserved_parent(&parent, &input)?;
+                let metadata = input.metadata()?;
+                if metadata.is_dir() {
+                    directory_ids.insert((metadata.dev(), metadata.ino()));
+                }
+            }
+            // Recovery need not have the original sources or anchor locations.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error).context("cannot inspect preserved input location"),
+        }
+    }
+    for ancestor in parent.ancestors() {
+        let metadata = ancestor.metadata()?;
         ensure!(
-            !parent.starts_with(input.canonicalize()?),
+            !directory_ids.contains(&(metadata.dev(), metadata.ino())),
             "temporary client directory must be outside preserved inputs; select another TMPDIR"
         );
+        if native_inodes.contains(&metadata.ino()) {
+            // Only possible inode matches need a stable filesystem lookup.
+            // If it is unavailable, a renamed preserved root cannot be ruled
+            // out, including after a kernel/filesystem capability change.
+            let identity = native_identity(ancestor).context(
+                "cannot verify temporary client directory ancestry; select another TMPDIR",
+            )?;
+            ensure!(
+                !scope.native_roots.contains(&identity),
+                "temporary client directory must be outside preserved inputs; select another TMPDIR"
+            );
+        }
     }
     Ok(parent)
+}
+
+fn reject_preserved_parent(parent: &Path, input: &Path) -> Result<()> {
+    ensure!(
+        !parent.starts_with(input),
+        "temporary client directory must be outside preserved inputs; select another TMPDIR"
+    );
+    Ok(())
+}
+
+fn peer_client_preflight(
+    keys: &KeyMaterial,
+    data_dir: &Path,
+    candidate: &Path,
+    protected_inputs: &[PathBuf],
+    discover: bool,
+) -> Result<(PathBuf, Option<[u8; 32]>)> {
+    crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
+        let (local_state, scope) = super::local_inventory::collect_with_scope(
+            control,
+            &mut 0,
+            mb_core::V1_MAX_CATALOG_BYTES,
+        )?;
+        mb_core::canonical_size_bounded(&local_state, mb_core::V1_MAX_CATALOG_BYTES)?;
+        drop(local_state);
+        let guild = if discover {
+            Some(
+                crate::node::preserved_guild_certificate(control)?
+                    .context("directory discovery requires the preserved signed guild certificate")?
+                    .genesis
+                    .guild_id,
+            )
+        } else {
+            None
+        };
+        Ok((
+            scratch_parent(candidate, data_dir, protected_inputs, &[], &scope)?,
+            guild,
+        ))
+    })
 }
 
 impl PeerRecovery {
@@ -548,25 +652,17 @@ pub(super) async fn with_peer_recovery<T: Send + 'static>(
             "select surviving peers, not the recovering identity"
         );
     }
-    let discovery_guild = if sources.bootstrap_peers.is_empty() {
-        None
-    } else {
+    let (parent, discovery_guild) = {
         let preserved = data_dir.clone();
         let original_seed = seed.clone();
-        Some(
-            tokio::task::spawn_blocking(move || {
-                let keys = KeyMaterial::from_seed(&original_seed);
-                crate::volume::with_inspected_control_snapshot(&preserved, &keys, |control| {
-                    let certificate = crate::node::preserved_guild_certificate(control)?.context(
-                        "directory discovery requires the preserved signed guild certificate",
-                    )?;
-                    Ok(certificate.genesis.guild_id)
-                })
-            })
-            .await??,
-        )
+        let candidate = std::env::temp_dir();
+        let discover = !sources.bootstrap_peers.is_empty();
+        tokio::task::spawn_blocking(move || {
+            let keys = KeyMaterial::from_seed(&original_seed);
+            peer_client_preflight(&keys, &preserved, &candidate, &protected_inputs, discover)
+        })
+        .await??
     };
-    let parent = scratch_parent(&std::env::temp_dir(), &data_dir, &protected_inputs, &[])?;
     let scratch = tempfile::Builder::new()
         .prefix("mutualbackup-legacy-peer-client-")
         .tempdir_in(parent)?;
@@ -725,14 +821,15 @@ mod tests {
         for path in &paths {
             std::fs::create_dir(path).unwrap();
         }
-        assert!(scratch_parent(temp.path(), &paths[0], &paths[1..2], &paths[2..]).is_ok());
+        let scope = PreservedInputScope::default();
+        assert!(scratch_parent(temp.path(), &paths[0], &paths[1..2], &paths[2..], &scope).is_ok());
         for path in &paths {
-            assert!(scratch_parent(path, &paths[0], &paths[1..2], &paths[2..]).is_err());
+            assert!(scratch_parent(path, &paths[0], &paths[1..2], &paths[2..], &scope).is_err());
             assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
         }
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&paths[0], &alias).unwrap();
-        assert!(scratch_parent(&alias, &paths[0], &paths[1..2], &paths[2..]).is_err());
+        assert!(scratch_parent(&alias, &paths[0], &paths[1..2], &paths[2..], &scope).is_err());
         let first = KeyMaterial::from_seed(&Seed::from_bytes([71; 32])).node_id();
         let second = KeyMaterial::from_seed(&Seed::from_bytes([72; 32])).node_id();
         assert!(
@@ -743,5 +840,224 @@ mod tests {
             .parse::<LegacyExportPeer>()
             .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_peer_scratch_rejects_unverifiable_possible_root_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("catalog");
+        std::fs::create_dir(&data).unwrap();
+        let mut scope = PreservedInputScope::default();
+        // Ordinary temporary filesystems need no enrollment capability when
+        // their ancestry cannot match a preserved native root.
+        assert!(
+            scratch_parent_with_native_lookup(temp.path(), &data, &[], &[], &scope, |_| panic!(
+                "unnecessary stable identity lookup"
+            ))
+            .is_ok()
+        );
+        scope.native_roots.insert(mb_store::NativeFileId {
+            filesystem_id: 7,
+            inode: temp.path().metadata().unwrap().ino(),
+        });
+        let error = scratch_parent_with_native_lookup(temp.path(), &data, &[], &[], &scope, |_| {
+            Err(mb_store::AnchorError::ReflinkUnavailable(
+                std::io::Error::new(std::io::ErrorKind::Unsupported, "stable UUID unavailable"),
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("select another TMPDIR"));
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn legacy_peer_preflight_preserves_closed_catalog_and_registered_inputs() {
+        use crate::control::{GitRepositoryInfo, ProtectedRoot};
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        for wrapped in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("catalog");
+            std::fs::create_dir(&data).unwrap();
+            let root = temp.path().join("source");
+            let history = temp
+                .path()
+                .join(OsString::from_vec(b"history-\xff".to_vec()));
+            for path in [&root, &history] {
+                std::fs::create_dir_all(path.join("nested")).unwrap();
+                std::fs::write(path.join("preserve"), b"original bytes").unwrap();
+            }
+            let alias = temp.path().join("history-alias");
+            std::os::unix::fs::symlink(&history, &alias).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
+            let store = if wrapped {
+                crate::volume::open_control_store(&data, &keys).unwrap().0
+            } else {
+                ControlStore::open(data.join("control.db"), &keys).unwrap()
+            };
+            let id = uuid::Uuid::from_bytes([74; 16]);
+            for path in [&root, &temp.path().join("missing-source")] {
+                let registration = ProtectedRoot {
+                    format_version: 4,
+                    root_id: uuid::Uuid::new_v4(),
+                    path: path.clone(),
+                    filesystem_id: 7,
+                    root_inode: 11,
+                };
+                store
+                    .put_record(
+                        "protected-root",
+                        registration.root_id.as_bytes(),
+                        &mb_core::canonical_bytes(&registration).unwrap(),
+                    )
+                    .unwrap();
+            }
+            store
+                .put_record(
+                    "git-repository",
+                    id.as_bytes(),
+                    &mb_core::canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id: id,
+                        path: history.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            drop(store);
+            let files = || -> std::collections::BTreeMap<_, _> {
+                std::fs::read_dir(&data)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                    })
+                    .collect()
+            };
+            let before = files();
+            assert!(peer_client_preflight(&keys, &data, temp.path(), &[], false).is_ok());
+            for path in [&root, &root.join("nested"), &history, &alias.join("nested")] {
+                let error = peer_client_preflight(&keys, &data, path, &[], false).unwrap_err();
+                assert!(
+                    error.to_string().contains("outside preserved inputs"),
+                    "{error:#}"
+                );
+            }
+            let after = files();
+            assert_eq!(
+                before.keys().collect::<Vec<_>>(),
+                after.keys().collect::<Vec<_>>()
+            );
+            for (name, bytes) in before {
+                assert!(after[&name] == bytes, "changed preserved file: {name:?}");
+            }
+            for path in [&root, &history] {
+                assert_eq!(
+                    std::fs::read(path.join("preserve")).unwrap(),
+                    b"original bytes"
+                );
+                assert_eq!(std::fs::read_dir(path).unwrap().count(), 2);
+                assert_eq!(std::fs::read_dir(path.join("nested")).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a provisioned reflink filesystem"]
+    fn legacy_peer_preflight_rejects_renamed_roots_by_stable_identity() {
+        use crate::control::ProtectedRoot;
+        let parent = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        let temp = tempfile::tempdir_in(parent).unwrap();
+        let data = temp.path().join("catalog");
+        std::fs::create_dir(&data).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
+        let store = ControlStore::open(data.join("control.db"), &keys).unwrap();
+        let mut moved = Vec::new();
+        for owner in ["registration", "binding", "stopped-capture"] {
+            let old = temp.path().join(format!("source-{owner}"));
+            std::fs::create_dir_all(old.join("nested")).unwrap();
+            let native = mb_store::directory_identity(&old).unwrap();
+            let id = uuid::Uuid::new_v4();
+            if owner == "binding" {
+                let binding = mb_store::SourceBackendBinding::guarded_link_freeze_v1(
+                    id,
+                    native.filesystem_id,
+                    native.inode,
+                    mb_store::filesystem_identity(&old).unwrap().mount_id,
+                );
+                store
+                    .put_record(
+                        "source-backend",
+                        id.as_bytes(),
+                        &mb_core::canonical_bytes(&binding).unwrap(),
+                    )
+                    .unwrap();
+            } else if owner == "registration" {
+                let registration = ProtectedRoot {
+                    format_version: 4,
+                    root_id: id,
+                    path: old.clone(),
+                    filesystem_id: native.filesystem_id,
+                    root_inode: native.inode,
+                };
+                store
+                    .put_record(
+                        "protected-root",
+                        id.as_bytes(),
+                        &mb_core::canonical_bytes(&registration).unwrap(),
+                    )
+                    .unwrap();
+            } else {
+                let capture = mb_store::GuardedStoppedCaptureV1 {
+                    format_version: 1,
+                    metadata: mb_store::GuardedViewMetadataV1 {
+                        format_version: 1,
+                        anchor_id: uuid::Uuid::new_v4(),
+                        lower_root_id: native,
+                        root_mode: 0o700,
+                        root_uid: 0,
+                        root_gid: 0,
+                        root_atime_secs: 0,
+                        root_atime_nanos: 0,
+                        root_modified_secs: 0,
+                        root_modified_nanos: 0,
+                        entries: vec![],
+                    },
+                    files: vec![],
+                };
+                store
+                    .put_record(
+                        "guarded-view-stopped-capture-v1",
+                        id.as_bytes(),
+                        &mb_core::canonical_bytes(&capture).unwrap(),
+                    )
+                    .unwrap();
+            }
+            let new = temp.path().join(format!("moved-{owner}"));
+            std::fs::rename(&old, &new).unwrap();
+            moved.push(new);
+        }
+        drop(store);
+        assert!(peer_client_preflight(&keys, &data, temp.path(), &[], false).is_ok());
+        for root in moved {
+            // Inode equality across distinct stable filesystem identities is
+            // not ownership; Btrfs subvolumes can reuse inode numbers.
+            let native = mb_store::directory_identity(&root).unwrap();
+            let mut unrelated = PreservedInputScope::default();
+            unrelated.native_roots.insert(mb_store::NativeFileId {
+                filesystem_id: native.filesystem_id.wrapping_add(1).max(1),
+                inode: native.inode,
+            });
+            assert!(scratch_parent(&root, &data, &[], &[], &unrelated).is_ok());
+            for path in [&root, &root.join("nested")] {
+                let error = peer_client_preflight(&keys, &data, path, &[], false).unwrap_err();
+                assert!(
+                    error.to_string().contains("outside preserved inputs"),
+                    "{error:#}"
+                );
+            }
+            assert_eq!(std::fs::read_dir(root.join("nested")).unwrap().count(), 0);
+        }
     }
 }

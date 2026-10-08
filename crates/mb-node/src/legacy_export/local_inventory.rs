@@ -1,14 +1,19 @@
 //! Preserved local registrations and historical anchor ownership, without
 //! opening a source path, Git runtime, anchor payload or withdrawn mount.
 
-use std::{collections::BTreeMap, os::unix::ffi::OsStrExt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, ensure};
 use mb_core::{
     V1_MAX_CATALOG_BYTES, canonical_bytes_bounded, canonical_size_bounded, decode_canonical,
 };
 use mb_store::{
-    ControlStore, GuardedRevisionCaptureV1, GuardedStoppedCaptureV1, SourceBackendBinding,
+    ControlStore, GuardedRevisionCaptureV1, GuardedStoppedCaptureV1, NativeFileId,
+    SourceBackendBinding,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -89,6 +94,15 @@ pub struct LegacyPreservedRecord {
     pub payload_hash: String,
 }
 
+/// Known exclusions for a temporary peer client. Paths remain exclusions even
+/// when their registrations disagree; neither a hint nor this partial scope is
+/// proof that all retained owners or external Git catalogs have been found.
+#[derive(Default)]
+pub(super) struct PreservedInputScope {
+    pub paths: BTreeSet<PathBuf>,
+    pub native_roots: BTreeSet<NativeFileId>,
+}
+
 fn account<T: Serialize>(item: &T, used: &mut usize, limit: usize) -> Result<()> {
     *used = used
         .checked_add(canonical_size_bounded(item, limit)?)
@@ -114,6 +128,15 @@ pub(super) fn collect(
     used: &mut usize,
     limit: usize,
 ) -> Result<LegacyLocalStateInventory> {
+    collect_with_scope(control, used, limit).map(|(report, _)| report)
+}
+
+pub(super) fn collect_with_scope(
+    control: &ControlStore,
+    used: &mut usize,
+    limit: usize,
+) -> Result<(LegacyLocalStateInventory, PreservedInputScope)> {
+    let mut scope = PreservedInputScope::default();
     let mut report = LegacyLocalStateInventory {
         protected_roots: Vec::new(),
         source_backends: Vec::new(),
@@ -142,6 +165,13 @@ pub(super) fn collect(
             signed_revision_ids: Vec::new(),
         };
         account(&entry, used, limit)?;
+        scope.paths.insert(root.path);
+        if matches!(root.format_version, 3 | 4) {
+            scope.native_roots.insert(NativeFileId {
+                filesystem_id: root.filesystem_id,
+                inode: root.root_inode,
+            });
+        }
         report.protected_roots.push(entry);
         Ok(true)
     })?;
@@ -173,6 +203,10 @@ pub(super) fn collect(
             binding,
         };
         account(&entry, used, limit)?;
+        scope.native_roots.insert(NativeFileId {
+            filesystem_id: entry.binding.filesystem_id,
+            inode: entry.binding.root_inode,
+        });
         report.source_backends.push(entry);
         Ok(true)
     })?;
@@ -197,6 +231,7 @@ pub(super) fn collect(
             signed_revision_ids: Vec::new(),
         };
         account(&entry, used, limit)?;
+        scope.paths.insert(registration.path);
         report.git_repositories.push(entry);
         Ok(true)
     })?;
@@ -240,6 +275,7 @@ pub(super) fn collect(
                         payloads_verified: false,
                     };
                     account(&entry, used, limit)?;
+                    scope.native_roots.insert(capture.metadata.lower_root_id);
                     for file in capture.files {
                         let locator = file.locator;
                         ensure!(
@@ -293,6 +329,14 @@ pub(super) fn collect(
                             content_hash: hex::encode(file.content_hash),
                         };
                         account(&pin, used, limit)?;
+                        // A volume-root hint is a discovery starting point,
+                        // often `/`, not an owned source or anchor directory.
+                        ensure!(
+                            locator.area.path_hint.is_absolute()
+                                && !locator.area.path_hint.as_os_str().as_bytes().contains(&0),
+                            "unsafe preserved anchor area path hint"
+                        );
+                        scope.paths.insert(locator.area.path_hint);
                         entry.anchors.push(pin);
                     }
                     report.guarded_captures.push(entry);
@@ -310,7 +354,7 @@ pub(super) fn collect(
             },
         )?;
     }
-    Ok(report)
+    Ok((report, scope))
 }
 
 impl LegacyLocalStateInventory {
@@ -582,6 +626,23 @@ mod tests {
                 .unwrap();
             drop(store);
             let before = preserved_files(&data);
+            crate::volume::with_inspected_control_snapshot(&data, &keys, |store| {
+                let (_, scope) = collect_with_scope(store, &mut 0, V1_MAX_CATALOG_BYTES)?;
+                ensure!(scope.paths.contains(&root_path) && scope.paths.contains(&history_path));
+                ensure!(scope.native_roots.contains(&capture.metadata.lower_root_id));
+                ensure!(
+                    scope
+                        .paths
+                        .contains(&capture.files[0].locator.area.path_hint)
+                );
+                ensure!(
+                    !scope
+                        .paths
+                        .contains(&capture.files[0].locator.area.volume_root_hint)
+                );
+                Ok(())
+            })
+            .unwrap();
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
@@ -739,7 +800,7 @@ mod tests {
     #[test]
     fn local_inventory_rejects_malformed_ownership_and_registration_without_mutation() {
         let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([49; 32]));
-        for case in 0..10 {
+        for case in 0..12 {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path().join("original");
             fs::create_dir(&data).unwrap();
@@ -781,6 +842,8 @@ mod tests {
                         .put_record("git-repository", id.as_bytes(), b"invalid canonical record")
                         .unwrap();
                 }
+                10 => capture.files[0].locator.area.path_hint = "relative-area".into(),
+                11 => capture.files[0].locator.area.path_hint = raw_path(temp.path(), b"nul\0area"),
                 _ => unreachable!(),
             }
             save(&store, "guarded-view-stopped-capture-v1", id, &capture);

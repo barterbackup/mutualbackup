@@ -12,6 +12,7 @@ if ! command -v btrfs >/dev/null 2>&1; then
 fi
 
 cargo test -p mb-store database::scratch::tests::scratch_btrfs_reserves_rewrite_space_and_reclaims_failed_jobs --locked -- --ignored --exact
+cargo test -p mb-node legacy_export::remote::tests::legacy_peer_preflight_rejects_renamed_roots_by_stable_identity --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::stable_locator_survives_parent_rename --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::single_file_reflink_anchor_preserves_staged_bytes_without_sibling_capture --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::root_capture_excludes_only_a_marked_git_catalog --locked -- --ignored --exact

@@ -153,8 +153,8 @@ Discovery has a 60-second deadline, up to four bundle lookups in flight, existin
 64-provider/64-record query bounds, a 64 KiB encoded bundle-record limit and at
 most 64 selected survivor identities. It creates no directory publication, recovery
 attempt, durable observation or original-state update. Preserved signed genesis
-is required before directory discovery, and temporary client state stays outside
-all preserved inputs. Missing or invalid directory evidence fails discovery;
+is required before directory discovery. Temporary client placement is checked
+before creating client state. Missing or invalid directory evidence fails discovery;
 keep the explicit-peer fallback and preserve all source/history inputs. The real
 fixture below exercises direct QUIC; relay/Tor discovery qualification remains
 part of the full release gates.
@@ -263,8 +263,20 @@ The client uses a separate private temporary workspace and the recovered
 identity's authenticated transport. It never starts the original installation,
 publishes recovery state, repairs shards, enrolls a root or retires source data.
 Original catalog, key and selected local volume state remain read-only.
-`TMPDIR` must resolve outside the preserved installation and selected anchor/
-parity areas; otherwise peer mode rejects it before creating any client state.
+`TMPDIR` must resolve outside the preserved installation, selected anchor/parity
+areas, registered source roots, Git repository paths and typed guarded capture
+anchor-area hints. Peer mode reads these exclusions with the same bounded,
+non-creating snapshot reader used by inventory, including its 32 MiB local-state
+budget. Directory identities also reject
+aliases of existing inputs and renamed roots identified by stable root/backend/
+stopped-capture records. Missing old paths remain compatible with recovery;
+registration formats 1/2 are not interpreted as stable filesystem/inode IDs.
+If an inode could match a preserved root and its stable filesystem identity
+cannot be verified, select another `TMPDIR`; client creation is refused.
+Volume-root hints are discovery locations, not ownership of the entire volume.
+These checks cover known local records. External Git worktrees, other pending
+owners, relocated anchor-area discovery and concurrent path replacement still
+require the remaining R1 isolation qualification. Preserve those inputs too.
 
 Local shards and authenticated zeros are considered first. If insufficient,
 the client requests only the remaining positions needed for reconstruction,

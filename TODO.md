@@ -471,6 +471,37 @@ remain active.
     installed release artifact. Temporary peer-client isolation against the
     registered root/Git/anchor path graph, including missing or relocated hints,
     also remains to be qualified.
+  - [x] Qualify temporary legacy peer-client exclusion of known local preserved
+    inputs. Preflight now reuses the bounded registration/capture decoder and
+    non-creating control snapshot before client initialization for both explicit
+    survivors and bootstrap discovery. Exclude registered roots, backend stable
+    identities (including orphan/mismatched bindings), history-only Git paths,
+    guarded lower-root identities and typed capture anchor-area hints. Check
+    canonical locations, directory device/inode aliases and stable ancestor
+    identities for renamed roots. Do not reinterpret registration formats 1/2;
+    missing original hints remain compatible with recovery. Reject an ambiguous
+    inode match if its stable filesystem identity cannot be verified. A volume
+    discovery hint does not reserve the whole volume as an owned directory.
+    Validation: 22 ordinary inventory/export/range/peer cases, two discovery
+    cases, all 19 ordinary CLI process cases and one separately provisioned Btrfs
+    case pass (44 unique cases; three process cases remain explicitly ignored).
+    New fixtures preserve closed wrapped/legacy catalog bytes and file sets,
+    raw Unix source/history paths and rejected nested/aliased temporary locations.
+    A deterministic unavailable-identity regression rejects an ambiguous inode
+    without requiring stable lookup for unrelated ancestry. Real Btrfs covers
+    renamed registrations, orphan backend bindings, stopped-capture-only roots
+    and equal inode numbers with different stable filesystem IDs. Disposable
+    mount, loop and image cleanup is verified. All four programs build; format
+    and strict locked workspace/all-targets Clippy pass. This qualifies the
+    exercised source slice, not a new installed artifact or the full M6 gate.
+    External Git catalogs and worktrees, other intent/native-anchor/volume owners,
+    relocated anchor-area discovery and concurrent path replacement still require
+    the complete R1
+    isolation gate. Preflight currently inherits the 32 MiB local-state report
+    ceiling; stream and account the ownership scope independently before claiming
+    large retained-graph support, and qualify unavailable old mount hints. Full
+    conversion, upgrade/source-loss and installed/platform qualification remain
+    open.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

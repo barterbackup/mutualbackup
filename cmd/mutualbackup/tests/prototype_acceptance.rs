@@ -3473,6 +3473,42 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     store
         .put_record("guarded-view-mount-v1", b"legacy", b"preserve")
         .unwrap();
+    let registered_source = temp.path().join("preserved-source");
+    let history_only = temp
+        .path()
+        .join(OsString::from_vec(b"history-only-\xff".to_vec()));
+    for path in [&registered_source, &history_only] {
+        fs::create_dir_all(path.join("nested")).unwrap();
+        fs::write(path.join("original"), b"preserve source/history").unwrap();
+    }
+    let root_id = Uuid::new_v4();
+    store
+        .put_record(
+            "protected-root",
+            root_id.as_bytes(),
+            &canonical_bytes(&mb_node::ProtectedRoot {
+                format_version: 4,
+                root_id,
+                path: registered_source.clone(),
+                filesystem_id: 7,
+                root_inode: 10,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let repository_id = Uuid::new_v4();
+    store
+        .put_record(
+            "git-repository",
+            repository_id.as_bytes(),
+            &canonical_bytes(&mb_node::GitRepositoryInfo {
+                format_version: 1,
+                repository_id,
+                path: history_only.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
     for (index, reference) in revision
         .value
         .metadata_sectors
@@ -3518,6 +3554,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
     assert_eq!(inventory.local_state.unclassified_guarded_records.len(), 1);
+    assert_eq!(inventory.local_state.protected_roots.len(), 1);
+    assert_eq!(inventory.local_state.git_repositories.len(), 1);
+    assert!(!inventory.local_state.git_repositories[0].registered_root);
     let preserved = &inventory.local_state.unclassified_guarded_records[0];
     assert_eq!(preserved.kind, "guarded-view-mount-v1");
     assert_eq!(preserved.record_id_hex, hex::encode(b"legacy"));
@@ -3594,21 +3633,40 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let confined_target = temp.path().join("rejected-tmpdir-export");
     confined_args[destination_index] = confined_target.clone().into_os_string();
     let entries_before = fs::read_dir(&catalog).unwrap().count();
-    let child = Command::new(program("mutualbackup"))
-        .args(&confined_args)
-        .env("TMPDIR", &catalog)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let rejected = wait_for_output(child, CLI_TIMEOUT).unwrap();
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr)
-            .contains("temporary client directory must be outside preserved inputs")
-    );
+    let history_alias = temp.path().join("history-alias");
+    std::os::unix::fs::symlink(&history_only, &history_alias).unwrap();
+    for confined in [
+        &catalog,
+        &registered_source.join("nested"),
+        &history_only,
+        &history_alias.join("nested"),
+    ] {
+        for args in [&confined_args, &peer_list_args] {
+            let child = Command::new(program("mutualbackup"))
+                .args(args)
+                .env("TMPDIR", confined)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let rejected = wait_for_output(child, CLI_TIMEOUT).unwrap();
+            assert!(!rejected.status.success());
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr)
+                    .contains("temporary client directory must be outside preserved inputs")
+            );
+        }
+    }
     assert!(!confined_target.exists());
+    for path in [&registered_source, &history_only] {
+        assert_eq!(
+            fs::read(path.join("original")).unwrap(),
+            b"preserve source/history"
+        );
+        assert_eq!(fs::read_dir(path).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(path.join("nested")).unwrap().count(), 0);
+    }
     assert_eq!(fs::read_dir(&catalog).unwrap().count(), entries_before);
     assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     let area_id = Uuid::new_v4();
