@@ -191,6 +191,39 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+`legacy-list` format 13 adds original external Git prune batches and
+primary/linked tracked-removal intents to each preserved repository snapshot.
+The original positional codecs retain every retired native, imported and
+withdrawn root-backed file manifest, plus removal scope/path/indexed-anchor
+and recorded root/file identities. Prune records omit object IDs, so reports
+do not invent an OID association. Empty metadata-only batches and the original
+1,024-anchor limit remain valid;
+canonical/key/namespace/version/shape/identity and duplicate-anchor checks
+open no payload, working path or ownership marker, and never replay removal,
+discover areas or perform physical pruning. SQL uses the existing 32 MiB
+prune-row bound and 4,096-byte stage-path limit; removal rows are bounded to
+that path plus 1 KiB fixed-field allowance. Complete projections share the
+full 32 MiB report limit. Prune source/area hints and aliases, and recorded
+removal roots including renamed or unregistered linked roots, exclude
+output/scratch placement. Separate family coverage flags keep full
+catalog/payload/history verification false, with missing index/object/worktree
+joins visible as unfinished ownership reconciliation. Original-wire
+native/guarded/imported manifests, empty/exact/over batches, primary/linked
+removals, malformed records/keys/scopes/IDs/paths/encoding/rows,
+closed/WAL-only/live catalogs, raw paths, aliases, renamed removal roots,
+JSON/report budgets, late corruption and the real CLI preserve original
+inputs. External Git retirement qualification passes 251 unique cases: 50 export/peer
+cases, all 63 ordinary volume and 111 ordinary Git cases, 20 CLI process
+cases, retained-graph/discovery/withdrawal/graph-intent regressions, and two
+provisioned Btrfs identity/retained-capture cases. All four debug programs
+build; format and strict locked workspace/all-targets Clippy pass. All 284
+source-file and seven program/test-driver hashes remain unchanged, and native
+mount/loop/image cleanup is verified. Evidence and the distinct passing-case
+inventory are retained under `/tmp/mb-m6-git-retirement-validation-woqwv_9q`;
+the post-commit audit binds the code to the commit. This is a focused
+debug-source qualification; complete ordinary/native suites and installed
+artifacts were not rerun.
+
 `legacy-list` format 12 adds original unfinished primary/linked symlink-stage
 journals, preserving both the implicit catalog root in version 1 and the
 explicit catalog root in version 2. The original decoder, canonical

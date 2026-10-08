@@ -3700,6 +3700,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let symlink_source = temp.path().join("preserved-git-symlink-source");
     let symlink_catalog = temp.path().join("preserved-git-symlink-catalog");
     let symlink_area = temp.path().join("preserved-git-symlink-area");
+    let prune_source = temp.path().join("preserved-git-prune-source");
+    let prune_area = temp.path().join("preserved-git-prune-area");
+    let removal_root = temp.path().join("preserved-git-removal-root");
     for path in [
         &object_source,
         &object_area,
@@ -3709,6 +3712,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &symlink_source,
         &symlink_catalog,
         &symlink_area,
+        &prune_source,
+        &prune_area,
+        &removal_root,
     ] {
         fs::create_dir(path).unwrap();
         fs::create_dir(path.join("nested")).unwrap();
@@ -3865,6 +3871,63 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         .unwrap(),
     )
     .unwrap();
+    let prune_anchor_id = Uuid::new_v4();
+    let prune_manifest: mb_store::FileAnchorManifest = mb_core::decode_canonical(
+        &canonical_bytes(&(
+            1_u16,
+            prune_anchor_id,
+            mb_store::StableAnchorAreaLocator {
+                area_id: Uuid::new_v4(),
+                path_hint: prune_area.clone(),
+                filesystem_id: 7,
+                volume_root_hint: temp.path().to_path_buf(),
+            },
+            prune_source.as_os_str().as_bytes().to_vec(),
+            b"retired-\xf7".to_vec(),
+            7_u64,
+            *blake3::hash(b"native!").as_bytes(),
+            (7_u64, 61_u64, 7_u64, 0_i64, 0_i64, 0_i64, 0_i64),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    external_store
+        .put_record(
+            &format!("git-prune-intent-v1/{repository_id}"),
+            b"active",
+            &canonical_bytes(&(1_u16, repository_id, vec![prune_manifest])).unwrap(),
+        )
+        .unwrap();
+    let removal_worktree_id = Uuid::new_v4();
+    let removal_root_id = mb_store::PinnedDirectory::open(&removal_root)
+        .unwrap()
+        .identity()
+        .unwrap();
+    let removal_entry = mb_git::GitIndexEntry {
+        format_version: 1,
+        oid: [35; 20],
+        mode: 0o100644,
+        anchor_id: Uuid::new_v4(),
+    };
+    external_store
+        .put_record(
+            &format!("git-worktree-rm-intent-v1/{repository_id}/{removal_worktree_id}"),
+            b"remove-\xf6",
+            &canonical_bytes(&(
+                1_u16,
+                repository_id,
+                removal_worktree_id,
+                removal_root_id,
+                b"remove-\xf6".to_vec(),
+                &removal_entry,
+                mb_store::NativeFileId {
+                    filesystem_id: removal_root_id.filesystem_id,
+                    inode: 62,
+                },
+            ))
+            .unwrap(),
+        )
+        .unwrap();
     external_store
         .put_record(
             &format!(
@@ -4008,7 +4071,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 12);
+    assert_eq!(inventory.format_version, 13);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -4046,6 +4109,24 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(git_registration.selected_branches_inventoried);
     assert!(git_registration.regular_stage_intents_inventoried);
     assert!(git_registration.symlink_stage_intents_inventoried);
+    assert!(
+        git_registration.prune_intents_inventoried && git_registration.removal_intents_inventoried
+    );
+    assert_eq!(inventory.local_state.pending_git_prunes.len(), 1);
+    let saved_prune = &inventory.local_state.pending_git_prunes[0];
+    assert_eq!(saved_prune.repository_id, repository_id);
+    assert_eq!(saved_prune.record_format, 1);
+    assert_eq!(saved_prune.anchors.len(), 1);
+    assert_eq!(saved_prune.anchors[0].anchor_id, prune_anchor_id);
+    assert!(!saved_prune.payloads_verified);
+    assert_eq!(inventory.local_state.pending_git_removals.len(), 1);
+    let saved_removal = &inventory.local_state.pending_git_removals[0];
+    assert_eq!(saved_removal.repository_id, repository_id);
+    assert_eq!(saved_removal.worktree_id, removal_worktree_id);
+    assert_eq!(saved_removal.recorded_root_identity, removal_root_id);
+    assert_eq!(saved_removal.relative_path_hex, hex::encode(b"remove-\xf6"));
+    assert_eq!(saved_removal.entry, removal_entry);
+    assert!(!saved_removal.payloads_verified);
     assert_eq!(inventory.local_state.pending_git_symlinks.len(), 1);
     let saved_symlink = &inventory.local_state.pending_git_symlinks[0];
     assert_eq!(saved_symlink.repository_id, repository_id);
@@ -4199,6 +4280,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         symlink_source.join("nested"),
         symlink_catalog.join("nested"),
         symlink_area.join("nested"),
+        prune_source.join("nested"),
+        prune_area.join("nested"),
+        removal_root.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -4323,6 +4407,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &symlink_source.join("nested"),
         &symlink_catalog.join("nested"),
         &symlink_area.join("nested"),
+        &prune_source.join("nested"),
+        &prune_area.join("nested"),
+        &removal_root.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -4369,6 +4456,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &symlink_source,
         &symlink_catalog,
         &symlink_area,
+        &prune_source,
+        &prune_area,
+        &removal_root,
     ] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),

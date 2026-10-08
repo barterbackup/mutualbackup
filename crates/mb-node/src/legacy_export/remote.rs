@@ -283,6 +283,19 @@ impl PreservedParentCheck {
                     self.check_hint(&anchor.source_root_hint)?;
                     self.check_hint(&anchor.area.path_hint)?;
                 }
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::RemovalIntent {
+                    recorded_root_identity,
+                    ..
+                }) => self.check_recorded_native(recorded_root_identity)?,
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::PruneIntent {
+                    anchors,
+                    ..
+                }) => {
+                    for anchor in &anchors {
+                        self.check_hint(&anchor.source_root_hint)?;
+                        self.check_hint(&anchor.area.path_hint)?;
+                    }
+                }
                 PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::StageIntent {
                     plan,
                     ..

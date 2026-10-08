@@ -3975,7 +3975,7 @@ mod tests {
             let before_wal = fs::read(database.with_extension("db-wal")).ok();
             let report =
                 crate::inventory_withdrawn_revisions_from_catalog(&keys, area.path()).unwrap();
-            assert_eq!(report.format_version, 12);
+            assert_eq!(report.format_version, 13);
             assert!(!report.retained_history_complete);
             let json = serde_json::to_vec(&report).unwrap();
             assert_eq!(
@@ -4221,7 +4221,7 @@ mod tests {
             assert!(paths.iter().all(|path| !path.exists()));
             let inventory =
                 crate::inventory_withdrawn_revisions_from_catalog(&keys, area.path()).unwrap();
-            assert_eq!(inventory.format_version, 12);
+            assert_eq!(inventory.format_version, 13);
             assert!(!inventory.retained_history_complete);
             let volumes = &inventory.local_state.storage_volumes;
             assert_eq!(volumes.len(), records.len());

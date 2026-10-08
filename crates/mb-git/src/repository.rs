@@ -248,6 +248,19 @@ pub enum PreservedGitRecord {
         scope: crate::GitWorktreeScope,
         intent: Box<crate::stage::PreservedSymlinkStageIntent>,
     },
+    RemovalIntent {
+        scope: crate::GitWorktreeScope,
+        record_format: u16,
+        recorded_root_identity: mb_store::NativeFileId,
+        relative_path: Vec<u8>,
+        entry: crate::GitIndexEntry,
+        recorded_file_identity: mb_store::NativeFileId,
+    },
+    PruneIntent {
+        repository_id: Uuid,
+        record_format: u16,
+        anchors: Vec<FileAnchorManifest>,
+    },
     AnchorAreaLocation {
         repository_id: Uuid,
         area_id: Uuid,
@@ -302,6 +315,8 @@ impl GitRepository {
                 visit(PreservedGitRecord::LinkedWorktree(info))
             })?;
             crate::stage::for_each_preserved_record(catalog, repository_id, &mut visit)?;
+            crate::rm::for_each_preserved_record(catalog, repository_id, &mut visit)?;
+            crate::prune::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, &mut visit)?;
             crate::history::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::head::for_each_preserved_branch(catalog, repository_id, visit)

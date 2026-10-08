@@ -81,6 +81,218 @@ struct RmIntent {
     file_id: NativeFileId,
 }
 
+/// Original tracked-file removals retain their indexed anchor until replay.
+/// Inspect the journal without looking up the index or opening a working file.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_record(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    for prefix in [PRIMARY_PREFIX, LINKED_PREFIX] {
+        control.for_each_record_with_kind_prefix_bounded(
+            prefix,
+            512,
+            crate::stage::MAX_STAGE_PATH_BYTES,
+            crate::stage::MAX_STAGE_PATH_BYTES + 1024,
+            |kind, key, bytes| {
+                let scope = GitWorktreeScope::preserved_from_kind(
+                    kind,
+                    repository_id,
+                    PRIMARY_PREFIX,
+                    LINKED_PREFIX,
+                )?;
+                ensure!(!key.contains(&0), "invalid preserved tracked-removal path");
+                let intent = decode_intent(scope, key, bytes)?;
+                ensure!(
+                    mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes
+                        && !intent.entry.anchor_id.is_nil()
+                        && intent.root_id.filesystem_id != 0
+                        && intent.root_id.inode != 0
+                        && intent.file_id.inode != 0,
+                    "invalid preserved tracked-removal ownership or encoding"
+                );
+                visit(crate::PreservedGitRecord::RemovalIntent {
+                    scope,
+                    record_format: intent.format_version,
+                    recorded_root_identity: intent.root_id,
+                    relative_path: intent.path,
+                    entry: intent.entry,
+                    recorded_file_identity: intent.file_id,
+                })?;
+                Ok(true)
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod preserved_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn preserved_git_rm_intents_keep_original_scopes_and_root_ownership_without_unlinking() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&path, &[217; 32]).unwrap();
+        let repository_id = Uuid::from_u128(217);
+        let linked_id = Uuid::from_u128(218);
+        let root = NativeFileId {
+            filesystem_id: 7,
+            inode: 8,
+        };
+        let file = NativeFileId {
+            filesystem_id: 7,
+            inode: 9,
+        };
+        let entry = GitIndexEntry {
+            format_version: 1,
+            oid: [19; 20],
+            mode: 0o120000,
+            anchor_id: Uuid::from_u128(219),
+        };
+        let primary = intent_kind_for_scope(GitWorktreeScope::primary(repository_id));
+        let linked =
+            intent_kind_for_scope(GitWorktreeScope::linked(repository_id, linked_id).unwrap());
+        let original = |worktree| {
+            canonical_bytes(&(
+                1_u16,
+                repository_id,
+                worktree,
+                root,
+                b"file-\xff".to_vec(),
+                &entry,
+                file,
+            ))
+            .unwrap()
+        };
+        for (kind, worktree) in [(&primary, repository_id), (&linked, linked_id)] {
+            control
+                .put_record(kind, b"file-\xff", &original(worktree))
+                .unwrap();
+        }
+        let snapshot = || {
+            (
+                fs::read(&path).unwrap(),
+                fs::read(path.with_extension("db-wal")).unwrap(),
+            )
+        };
+        let before = snapshot();
+        let mut count = 0;
+        for_each_preserved_record(&control, repository_id, |record| {
+            let crate::PreservedGitRecord::RemovalIntent {
+                scope,
+                record_format,
+                recorded_root_identity,
+                relative_path,
+                entry: actual,
+                recorded_file_identity,
+            } = record
+            else {
+                panic!("wrong record")
+            };
+            assert_eq!(record_format, 1);
+            assert_eq!(scope.repository_id(), repository_id);
+            assert!([repository_id, linked_id].contains(&scope.worktree_id()));
+            assert_eq!(recorded_root_identity, root);
+            assert_eq!(recorded_file_identity, file);
+            assert_eq!(relative_path, b"file-\xff");
+            assert_eq!(actual, entry);
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(snapshot(), before);
+        for kind in [&primary, &linked] {
+            control.delete_record(kind, b"file-\xff").unwrap();
+        }
+        let bytes = original(repository_id);
+        let valid: RmIntent = decode_canonical(&bytes).unwrap();
+        assert_eq!(canonical_bytes(&valid).unwrap(), bytes);
+        let mut boundary = valid.clone();
+        boundary.path = vec![b'x'; crate::stage::MAX_STAGE_PATH_BYTES];
+        control
+            .put_record(
+                &primary,
+                &boundary.path,
+                &canonical_bytes(&boundary).unwrap(),
+            )
+            .unwrap();
+        let before = snapshot();
+        let mut visited_boundary = false;
+        for_each_preserved_record(&control, repository_id, |record| {
+            let crate::PreservedGitRecord::RemovalIntent { relative_path, .. } = record else {
+                panic!("wrong record")
+            };
+            assert_eq!(relative_path.len(), crate::stage::MAX_STAGE_PATH_BYTES);
+            visited_boundary = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(visited_boundary);
+        assert_eq!(snapshot(), before);
+        control.delete_record(&primary, &boundary.path).unwrap();
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        for index in 0..10 {
+            let mut bad = valid.clone();
+            match index {
+                0 => bad.format_version = 2,
+                1 => bad.repository_id = linked_id,
+                2 => bad.worktree_id = linked_id,
+                3 => bad.root_id.filesystem_id = 0,
+                4 => bad.root_id.inode = 0,
+                5 => bad.file_id.inode = 0,
+                6 => bad.file_id.filesystem_id = 8,
+                7 => bad.entry.format_version = 2,
+                8 => bad.entry.mode = 0,
+                _ => bad.entry.anchor_id = Uuid::nil(),
+            }
+            reject(&primary, b"file-\xff", &canonical_bytes(&bad).unwrap());
+        }
+        for key in [
+            b"".as_slice(),
+            b"other",
+            b"../escape",
+            b"a\0b",
+            &vec![b'x'; crate::stage::MAX_STAGE_PATH_BYTES + 1],
+        ] {
+            reject(&primary, key, &bytes);
+        }
+        for kind in [
+            format!("git-rm-intent-v1/{linked_id}"),
+            format!(
+                "git-worktree-rm-intent-v1/{repository_id}/{}",
+                linked_id.simple()
+            ),
+            format!("git-worktree-rm-intent-v1/{repository_id}/{repository_id}"),
+        ] {
+            reject(&kind, b"file-\xff", &bytes);
+        }
+        reject(&primary, b"file-\xff", &[bytes, vec![0]].concat());
+        reject(
+            &primary,
+            b"file-\xff",
+            &vec![0; crate::stage::MAX_STAGE_PATH_BYTES + 1025],
+        );
+        assert!(
+            !temporary
+                .path()
+                .join(OsString::from_vec(b"file-\xff".to_vec()))
+                .exists()
+        );
+    }
+}
+
 pub(crate) fn intent_kind_for_scope(scope: GitWorktreeScope) -> String {
     scope.local_kind(PRIMARY_PREFIX, LINKED_PREFIX)
 }

@@ -42,6 +42,8 @@ pub struct LegacyLocalStateInventory {
     pub git_selected_branches: Vec<LegacyGitSelectedBranch>,
     pub pending_git_stages: Vec<LegacyPendingGitStage>,
     pub pending_git_symlinks: Vec<LegacyPendingGitSymlink>,
+    pub pending_git_removals: Vec<LegacyPendingGitRemoval>,
+    pub pending_git_prunes: Vec<LegacyPendingGitPrune>,
     pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
     pub volume_ownership: Vec<LegacyVolumeOwnership>,
     pub local_sectors: Vec<LegacyLocalSectorRecipe>,
@@ -92,6 +94,8 @@ pub struct LegacyGitRegistration {
     pub selected_branches_inventoried: bool,
     pub regular_stage_intents_inventoried: bool,
     pub symlink_stage_intents_inventoried: bool,
+    pub removal_intents_inventoried: bool,
+    pub prune_intents_inventoried: bool,
     pub signed_revision_ids: Vec<Uuid>,
 }
 
@@ -192,6 +196,67 @@ pub struct LegacyPendingGitSymlink {
     /// None preserves the original primary-worktree implicit catalog root.
     pub catalog_root_hint_hex: Option<String>,
     pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitRemoval {
+    pub repository_id: Uuid,
+    pub worktree_id: Uuid,
+    pub record_format: u16,
+    pub recorded_root_identity: NativeFileId,
+    pub relative_path_hex: String,
+    pub entry: mb_git::GitIndexEntry,
+    pub recorded_file_identity: NativeFileId,
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitPrune {
+    pub repository_id: Uuid,
+    pub record_format: u16,
+    /// The original retirement batch does not retain a Git object ID.
+    pub anchors: Vec<LegacyPruneFileAnchor>,
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPruneFileAnchor {
+    pub manifest_format: u16,
+    pub anchor_id: Uuid,
+    pub area_id: Uuid,
+    pub recorded_area_filesystem_id: u64,
+    pub area_path_hint_hex: String,
+    pub volume_root_hint_hex: String,
+    pub source_path_hint_hex: String,
+    pub source_relative_path_hex: String,
+    pub logical_len: u64,
+    pub content_hash: String,
+    pub recorded_file_identity: Option<NativeFileId>,
+    pub stable_file_identity: Option<NativeFileId>,
+    pub locator_anchor_id: Uuid,
+    pub locator_relative_path_hex: String,
+}
+
+fn prune_file_anchor(anchor: &mb_store::FileAnchorManifest) -> Result<LegacyPruneFileAnchor> {
+    let ownership = anchor.preserved_ownership()?;
+    Ok(LegacyPruneFileAnchor {
+        manifest_format: anchor.format_version,
+        anchor_id: anchor.anchor_id,
+        area_id: anchor.area.area_id,
+        recorded_area_filesystem_id: anchor.area.filesystem_id,
+        area_path_hint_hex: hex::encode(anchor.area.path_hint.as_os_str().as_bytes()),
+        volume_root_hint_hex: hex::encode(anchor.area.volume_root_hint.as_os_str().as_bytes()),
+        source_path_hint_hex: hex::encode(anchor.source_root_hint.as_os_str().as_bytes()),
+        source_relative_path_hex: hex::encode(anchor.source_relative_path.as_os_str().as_bytes()),
+        logical_len: anchor.logical_len,
+        content_hash: hex::encode(anchor.content_hash),
+        recorded_file_identity: ownership.recorded_file_identity,
+        stable_file_identity: ownership.stable_file_identity,
+        locator_anchor_id: ownership.locator_anchor_id,
+        locator_relative_path_hex: hex::encode(
+            ownership.locator_relative_path.as_os_str().as_bytes(),
+        ),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -719,6 +784,46 @@ pub(super) fn collect_external_git_records(
                 account(&entry, used, limit)?;
                 report.pending_git_symlinks.push(entry);
             }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::RemovalIntent {
+                scope,
+                record_format,
+                recorded_root_identity,
+                relative_path,
+                entry,
+                recorded_file_identity,
+            }) => {
+                let entry = LegacyPendingGitRemoval {
+                    repository_id: scope.repository_id(),
+                    worktree_id: scope.worktree_id(),
+                    record_format,
+                    recorded_root_identity,
+                    relative_path_hex: hex::encode(relative_path),
+                    entry,
+                    recorded_file_identity,
+                    payloads_verified: false,
+                };
+                account(&entry, used, limit)?;
+                report.pending_git_removals.push(entry);
+            }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::PruneIntent {
+                repository_id,
+                record_format,
+                anchors,
+            }) => {
+                let mut entry = LegacyPendingGitPrune {
+                    repository_id,
+                    record_format,
+                    anchors: Vec::new(),
+                    payloads_verified: false,
+                };
+                account(&entry, used, limit)?;
+                for anchor in &anchors {
+                    let anchor = prune_file_anchor(anchor)?;
+                    account(&anchor, used, limit)?;
+                    entry.anchors.push(anchor);
+                }
+                report.pending_git_prunes.push(entry);
+            }
             PreservedExternalGitRecord::Record(
                 mb_git::PreservedGitRecord::AnchorAreaLocation {
                     repository_id,
@@ -812,6 +917,8 @@ pub(super) fn collect_external_git_records(
                 registration.selected_branches_inventoried = available;
                 registration.regular_stage_intents_inventoried = available;
                 registration.symlink_stage_intents_inventoried = available;
+                registration.removal_intents_inventoried = available;
+                registration.prune_intents_inventoried = available;
             }
         }
         Ok(())
@@ -1005,6 +1112,8 @@ pub(super) fn collect(
         git_selected_branches: Vec::new(),
         pending_git_stages: Vec::new(),
         pending_git_symlinks: Vec::new(),
+        pending_git_removals: Vec::new(),
+        pending_git_prunes: Vec::new(),
         storage_volumes: Vec::new(),
         volume_ownership: Vec::new(),
         local_sectors: Vec::new(),
@@ -1067,6 +1176,8 @@ pub(super) fn collect(
                     selected_branches_inventoried: false,
                     regular_stage_intents_inventoried: false,
                     symlink_stage_intents_inventoried: false,
+                    removal_intents_inventoried: false,
+                    prune_intents_inventoried: false,
                     signed_revision_ids: Vec::new(),
                 };
                 account(&entry, used, limit)?;
@@ -1360,6 +1471,320 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_export_external_git_prune_and_removal_intents_preserve_retired_and_renamed_owners() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for journal in ["closed", "wal-only", "live"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let data = temporary.path().join("state");
+            let repository = temporary.path().join("repository");
+            let safe = temporary.path().join("safe");
+            for path in [&data, &repository, &safe] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([221; 32]));
+            let repository_id = Uuid::from_u128(221);
+            let linked_id = Uuid::from_u128(222);
+            let control_path = data.join("control.db");
+            let control = ControlStore::open(&control_path, &keys).unwrap();
+            control
+                .put_record(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: repository.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let directory = repository.join(mb_store::GIT_CATALOG_DIRECTORY);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = directory.join(mb_store::GIT_CATALOG_MARKER_FILE);
+            std::fs::write(&marker, mb_store::git_catalog_marker_bytes(repository_id)).unwrap();
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let external_path = directory.join("catalog.db");
+            let external = ControlStore::open_with_key(
+                &external_path,
+                &mb_git::catalog_key(&keys, repository_id),
+            )
+            .unwrap();
+            let mut excluded = Vec::new();
+            let mut anchors = Vec::new();
+            for index in 0..3 {
+                let source = raw_path(temporary.path(), &[b's', b'0' + index as u8, 255]);
+                let area = raw_path(temporary.path(), &[b'a', b'0' + index as u8, 254]);
+                for path in [&source, &area] {
+                    std::fs::create_dir(path).unwrap();
+                    std::fs::create_dir(path.join("nested")).unwrap();
+                    std::fs::write(path.join("original"), b"preserved retirement owner").unwrap();
+                    let alias = temporary.path().join(format!("alias-{}", excluded.len()));
+                    std::os::unix::fs::symlink(path, &alias).unwrap();
+                    excluded.push((path.clone(), alias));
+                }
+                anchors.push(super::owner_tests::blob(&source, &area, index).anchor);
+            }
+            let prune_kind = format!("git-prune-intent-v1/{repository_id}");
+            external
+                .put_record(
+                    &prune_kind,
+                    b"active",
+                    &canonical_bytes(&(1_u16, repository_id, &anchors)).unwrap(),
+                )
+                .unwrap();
+            let mut removals = Vec::new();
+            for index in 0..2 {
+                let root = temporary.path().join(format!("removal-root-{index}"));
+                std::fs::create_dir(&root).unwrap();
+                std::fs::create_dir(root.join("nested")).unwrap();
+                std::fs::write(root.join("original"), b"preserved retirement owner").unwrap();
+                let metadata = std::fs::metadata(&root).unwrap();
+                let root_id = if index == 0 {
+                    NativeFileId {
+                        filesystem_id: metadata.dev(),
+                        inode: metadata.ino(),
+                    }
+                } else {
+                    mb_store::PinnedDirectory::open(&root)
+                        .unwrap()
+                        .identity()
+                        .unwrap()
+                };
+                let worktree_id = if index == 0 { repository_id } else { linked_id };
+                let kind = if index == 0 {
+                    format!("git-rm-intent-v1/{repository_id}")
+                } else {
+                    format!("git-worktree-rm-intent-v1/{repository_id}/{linked_id}")
+                };
+                let entry = mb_git::GitIndexEntry {
+                    format_version: 1,
+                    oid: [33; 20],
+                    mode: if index == 0 { 0o100755 } else { 0o120000 },
+                    anchor_id: Uuid::from_u128(223 + index),
+                };
+                let file_id = NativeFileId {
+                    filesystem_id: root_id.filesystem_id,
+                    inode: 17,
+                };
+                let relative = b"remove-\xfd".to_vec();
+                let original = canonical_bytes(&(
+                    1_u16,
+                    repository_id,
+                    worktree_id,
+                    root_id,
+                    &relative,
+                    &entry,
+                    file_id,
+                ))
+                .unwrap();
+                external.put_record(&kind, &relative, &original).unwrap();
+                let renamed = temporary.path().join(format!("renamed-removal-{index}"));
+                std::fs::rename(&root, &renamed).unwrap();
+                let alias = temporary.path().join(format!("alias-{}", excluded.len()));
+                std::os::unix::fs::symlink(&renamed, &alias).unwrap();
+                excluded.push((renamed, alias));
+                removals.push((worktree_id, root_id, relative, entry, file_id));
+            }
+            let mut writers = Some((control, external));
+            if journal == "closed" {
+                drop(writers.take());
+            }
+            if journal == "wal-only" {
+                for path in [&control_path, &external_path] {
+                    std::fs::remove_file(path.with_extension("db-shm")).unwrap();
+                }
+            }
+            let snapshot = |path: &Path| {
+                let mut files = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        let bytes = if entry.file_name().as_bytes().ends_with(b"-shm") {
+                            std::fs::metadata(entry.path())
+                                .unwrap()
+                                .len()
+                                .to_le_bytes()
+                                .to_vec()
+                        } else {
+                            std::fs::read(entry.path()).unwrap()
+                        };
+                        (entry.file_name(), bytes)
+                    })
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
+            };
+            let before = (snapshot(&data), snapshot(&directory));
+            let report =
+                super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+            assert_eq!(report.format_version, 13);
+            assert!(!report.retained_history_complete);
+            assert!(
+                report.local_state.git_worktrees.is_empty()
+                    && report.local_state.git_indexes.is_empty()
+                    && report.local_state.git_object_anchors.is_empty()
+            );
+            assert_eq!(report.local_state.pending_git_removals.len(), 2);
+            assert_eq!(report.local_state.pending_git_prunes.len(), 1);
+            let registration = &report.local_state.git_repositories[0];
+            assert!(
+                registration.prune_intents_inventoried && registration.removal_intents_inventoried
+            );
+            assert!(!registration.catalog_inventoried);
+            let prune = &report.local_state.pending_git_prunes[0];
+            assert_eq!(prune.repository_id, repository_id);
+            assert_eq!(prune.record_format, 1);
+            assert!(!prune.payloads_verified);
+            assert_eq!(prune.anchors.len(), 3);
+            for anchor in &anchors {
+                let projected = prune
+                    .anchors
+                    .iter()
+                    .find(|entry| entry.anchor_id == anchor.anchor_id)
+                    .unwrap();
+                assert_eq!(*projected, prune_file_anchor(anchor).unwrap());
+            }
+            for (worktree, root_id, relative, index, file_id) in &removals {
+                let removal = report
+                    .local_state
+                    .pending_git_removals
+                    .iter()
+                    .find(|entry| entry.worktree_id == *worktree)
+                    .unwrap();
+                assert_eq!(removal.repository_id, repository_id);
+                assert_eq!(removal.record_format, 1);
+                assert_eq!(removal.recorded_root_identity, *root_id);
+                assert_eq!(removal.recorded_file_identity, *file_id);
+                assert_eq!(removal.relative_path_hex, hex::encode(relative));
+                assert_eq!(removal.entry, *index);
+                assert!(!removal.payloads_verified);
+            }
+            let json = serde_json::to_vec(&report).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<super::super::LegacyRevisionInventory>(&json).unwrap(),
+                report
+            );
+            for (path, alias) in &excluded {
+                for parent in [
+                    path.clone(),
+                    path.join("nested"),
+                    alias.clone(),
+                    alias.join("nested"),
+                ] {
+                    assert!(
+                        super::super::remote::peer_client_preflight(
+                            &keys,
+                            &data,
+                            &parent,
+                            &[],
+                            false
+                        )
+                        .is_err(),
+                        "{journal}: {}",
+                        parent.display()
+                    );
+                    assert!(
+                        super::super::remote::export_parent_preflight(&keys, &data, &parent, &[])
+                            .is_err()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(path.join("original")).unwrap(),
+                    b"preserved retirement owner"
+                );
+                assert_eq!(std::fs::read_dir(path).unwrap().count(), 2);
+                assert_eq!(std::fs::read_dir(path.join("nested")).unwrap().count(), 0);
+            }
+            assert!(
+                super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                    .is_ok()
+            );
+            assert!(
+                super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_ok()
+            );
+            let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+            assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+            assert!(
+                super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err()
+            );
+            crate::volume::with_inspected_control_snapshot(&data, &keys, |control| {
+                let mut report = collect(control, &mut 0, V1_MAX_CATALOG_BYTES)?;
+                let mut used = 0;
+                collect_external_git_records(
+                    control,
+                    &keys,
+                    &mut report,
+                    &mut used,
+                    V1_MAX_CATALOG_BYTES,
+                )?;
+                let mut expected = 0;
+                for entry in &report.pending_git_removals {
+                    account(entry, &mut expected, V1_MAX_CATALOG_BYTES)?;
+                }
+                for entry in &report.pending_git_prunes {
+                    account(entry, &mut expected, V1_MAX_CATALOG_BYTES)?;
+                }
+                assert_eq!(used, expected);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!((snapshot(&data), snapshot(&directory)), before, "{journal}");
+            assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+            if journal == "closed" {
+                for (kind, key) in [
+                    (
+                        format!(
+                            "git-worktree-rm-intent-v1/{repository_id}/{}",
+                            Uuid::from_u128(999)
+                        ),
+                        b"zz-last".as_slice(),
+                    ),
+                    (prune_kind.clone(), b"wrong".as_slice()),
+                ] {
+                    let external = ControlStore::open_with_key(
+                        &external_path,
+                        &mb_git::catalog_key(&keys, repository_id),
+                    )
+                    .unwrap();
+                    external
+                        .put_record(&kind, key, b"corrupt retirement")
+                        .unwrap();
+                    drop(external);
+                    let corrupted = (snapshot(&data), snapshot(&directory));
+                    assert!(
+                        super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data)
+                            .is_err()
+                    );
+                    assert!(
+                        super::super::remote::peer_client_preflight(
+                            &keys,
+                            &data,
+                            &safe,
+                            &[],
+                            false
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                            .is_err()
+                    );
+                    assert_eq!((snapshot(&data), snapshot(&directory)), corrupted);
+                    let external = ControlStore::open_with_key(
+                        &external_path,
+                        &mb_git::catalog_key(&keys, repository_id),
+                    )
+                    .unwrap();
+                    external.delete_record(&kind, key).unwrap();
+                    drop(external);
+                }
+            }
+            drop(writers);
+        }
+    }
+
+    #[test]
     fn legacy_export_external_git_symlink_stages_preserve_original_phases_and_target_privacy() {
         use mb_store::{SourceFileCapturePlan, StableAnchorAreaLocator};
         use std::os::unix::fs::PermissionsExt;
@@ -1616,7 +2041,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 12);
+            assert_eq!(report.format_version, 13);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -1993,7 +2418,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&catalog_directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 12);
+            assert_eq!(report.format_version, 13);
             assert!(!report.retained_history_complete);
             assert!(report.local_state.git_worktrees.is_empty());
             assert!(report.local_state.git_indexes.is_empty());
@@ -2344,7 +2769,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 12);
+            assert_eq!(report.format_version, 13);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_object_anchors.len(), 3);
             assert_eq!(report.local_state.git_indexes.len(), 3);
@@ -2707,7 +3132,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 12);
+            assert_eq!(report.format_version, 13);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_worktrees.len(), 3);
             let json = serde_json::to_vec(&report).unwrap();
@@ -2834,7 +3259,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 12);
+        assert_eq!(report.format_version, 13);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.local_sectors.len(), 1);
         let entry = &report.local_state.local_sectors[0];
@@ -2956,7 +3381,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 12);
+        assert_eq!(report.format_version, 13);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.volume_ownership.len(), 1);
         let entry = &report.local_state.volume_ownership[0];
@@ -3009,7 +3434,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 12);
+        assert_eq!(report.format_version, 13);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -3428,7 +3853,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 12);
+            assert_eq!(report.format_version, 13);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

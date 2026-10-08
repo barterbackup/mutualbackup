@@ -80,6 +80,53 @@ struct PruneIntent {
     anchors: Vec<FileAnchorManifest>,
 }
 
+/// Inspect original retired-anchor batches, including withdrawn root-backed
+/// manifests, without normal prune admission, area discovery or physical removal.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_record(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    let expected = intent_kind(repository_id);
+    control.for_each_record_with_kind_prefix_bounded(
+        INTENT_PREFIX,
+        512,
+        ACTIVE.len(),
+        mb_core::V1_MAX_CATALOG_BYTES,
+        |kind, key, bytes| {
+            ensure!(
+                kind == expected && key == ACTIVE,
+                "invalid preserved Git prune namespace or key"
+            );
+            let intent: PruneIntent = decode_canonical(bytes)?;
+            ensure!(
+                intent.format_version == 1
+                    && intent.repository_id == repository_id
+                    && intent.anchors.len() <= MAX_BATCH_RECORDS
+                    && mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                "invalid preserved Git prune batch or encoding"
+            );
+            let mut seen = HashSet::new();
+            for anchor in &intent.anchors {
+                anchor.preserved_ownership()?;
+                ensure!(
+                    seen.insert(anchor.anchor_id),
+                    "duplicate preserved Git prune anchor"
+                );
+            }
+            visit(crate::PreservedGitRecord::PruneIntent {
+                repository_id,
+                record_format: intent.format_version,
+                anchors: intent.anchors,
+            })?;
+            Ok(true)
+        },
+    )?;
+    Ok(())
+}
+
 struct Candidate {
     kind: String,
     key: Vec<u8>,
@@ -346,6 +393,179 @@ fn collect_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserved_git_prune_batches_keep_original_retired_anchors_without_deletion_or_discovery() {
+        use mb_store::{GuardedRootFileBacking, NativeFileId, StableAnchorAreaLocator};
+        use std::{fs, path::PathBuf};
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&path, &[220; 32]).unwrap();
+        let repository_id = Uuid::from_u128(220);
+        let make_anchor = |index: u128, guarded: bool, imported: bool| {
+            let anchor_id = Uuid::from_u128(300 + index);
+            let area = StableAnchorAreaLocator {
+                area_id: Uuid::from_u128(400 + index),
+                path_hint: temporary.path().join("missing-area"),
+                filesystem_id: 7,
+                volume_root_hint: temporary.path().to_path_buf(),
+            };
+            let source = temporary
+                .path()
+                .join("missing-source")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec();
+            let relative = if imported {
+                format!(".mutualbackup/git-import-{anchor_id}").into_bytes()
+            } else {
+                b"file-\xff".to_vec()
+            };
+            let version = (
+                7_u64,
+                if imported { 0_u64 } else { 9 },
+                13_u64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+            );
+            let bytes = if guarded {
+                canonical_bytes(&(
+                    2_u16,
+                    anchor_id,
+                    area,
+                    source,
+                    relative,
+                    13_u64,
+                    [1_u8; 32],
+                    version,
+                    GuardedRootFileBacking {
+                        root_anchor_id: Uuid::from_u128(500 + index),
+                        captured_relative_path: PathBuf::from("captured/file"),
+                        native_id: NativeFileId {
+                            filesystem_id: 7,
+                            inode: 9,
+                        },
+                    },
+                ))
+                .unwrap()
+            } else {
+                canonical_bytes(&(
+                    1_u16, anchor_id, area, source, relative, 13_u64, [1_u8; 32], version,
+                ))
+                .unwrap()
+            };
+            let anchor: FileAnchorManifest = decode_canonical(&bytes).unwrap();
+            assert_eq!(canonical_bytes(&anchor).unwrap(), bytes);
+            anchor
+        };
+        let anchors = vec![
+            make_anchor(0, false, false),
+            make_anchor(1, true, false),
+            make_anchor(2, false, true),
+        ];
+        let bytes = canonical_bytes(&(1_u16, repository_id, &anchors)).unwrap();
+        let kind = intent_kind(repository_id);
+        control.put_record(&kind, ACTIVE, &bytes).unwrap();
+        let snapshot = || {
+            (
+                fs::read(&path).unwrap(),
+                fs::read(path.with_extension("db-wal")).unwrap(),
+            )
+        };
+        let before = snapshot();
+        let mut count = 0;
+        for_each_preserved_record(&control, repository_id, |record| {
+            let crate::PreservedGitRecord::PruneIntent {
+                repository_id: actual,
+                record_format,
+                anchors: actual_anchors,
+            } = record
+            else {
+                panic!("wrong record")
+            };
+            assert_eq!(actual, repository_id);
+            assert_eq!(record_format, 1);
+            assert_eq!(actual_anchors, anchors);
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(snapshot(), before);
+        control.delete_record(&kind, ACTIVE).unwrap();
+        for count in [0, super::MAX_BATCH_RECORDS] {
+            let anchors = (0..count)
+                .map(|index| make_anchor(index as u128, false, false))
+                .collect::<Vec<_>>();
+            control
+                .put_record(
+                    &kind,
+                    ACTIVE,
+                    &canonical_bytes(&(1_u16, repository_id, anchors)).unwrap(),
+                )
+                .unwrap();
+            assert!(for_each_preserved_record(&control, repository_id, |_| Ok(())).is_ok());
+            control.delete_record(&kind, ACTIVE).unwrap();
+        }
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        reject(
+            &format!("git-prune-intent-v1/{}", Uuid::from_u128(999)),
+            ACTIVE,
+            &bytes,
+        );
+        reject(&kind, b"wrong", &bytes);
+        reject(&kind, b"active-long", &bytes);
+        reject(
+            &kind,
+            ACTIVE,
+            &canonical_bytes(&(2_u16, repository_id, &anchors)).unwrap(),
+        );
+        reject(
+            &kind,
+            ACTIVE,
+            &canonical_bytes(&(1_u16, Uuid::nil(), &anchors)).unwrap(),
+        );
+        reject(
+            &kind,
+            ACTIVE,
+            &canonical_bytes(&(1_u16, repository_id, vec![anchors[0].clone(); 2])).unwrap(),
+        );
+        let too_many = (0..=super::MAX_BATCH_RECORDS)
+            .map(|index| make_anchor(index as u128, false, false))
+            .collect::<Vec<_>>();
+        reject(
+            &kind,
+            ACTIVE,
+            &canonical_bytes(&(1_u16, repository_id, too_many)).unwrap(),
+        );
+        for index in 0..4 {
+            let mut bad = anchors[0].clone();
+            match index {
+                0 => bad.anchor_id = Uuid::nil(),
+                1 => bad.area.area_id = Uuid::nil(),
+                2 => bad.logical_len += 1,
+                _ => bad.area.path_hint = PathBuf::from("relative"),
+            }
+            reject(
+                &kind,
+                ACTIVE,
+                &canonical_bytes(&(1_u16, repository_id, vec![bad])).unwrap(),
+            );
+        }
+        reject(&kind, ACTIVE, &[bytes, vec![0]].concat());
+        reject(&kind, ACTIVE, &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1]);
+        assert!(!temporary.path().join("missing-area").exists());
+        assert!(!temporary.path().join("missing-source").exists());
+    }
 
     #[test]
     fn physical_prune_pins_recipes_and_index_and_keeps_one_source_per_filesystem() {
