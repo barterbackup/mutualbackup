@@ -12,7 +12,7 @@ pub const CATALOG_CODING_DIRECTORY_ROOT_BYTES: usize = 512;
 /// Local limits from the enclosing authenticated admission policy, never from
 /// an untrusted directory's own claims. The eventual checkpoint must debit its
 /// other sections before supplying the remaining budget here.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogCodingTraversalBudget {
     pub bytes: u64,
     pub page_occurrences: u64,
@@ -20,14 +20,44 @@ pub struct CatalogCodingTraversalBudget {
 }
 
 impl CatalogCodingTraversalBudget {
+    pub fn checked_add(self, work: Self) -> Result<Self, CatalogError> {
+        Ok(Self {
+            bytes: self
+                .bytes
+                .checked_add(work.bytes)
+                .ok_or(CatalogError::Bounds)?,
+            page_occurrences: self
+                .page_occurrences
+                .checked_add(work.page_occurrences)
+                .ok_or(CatalogError::Bounds)?,
+            records: self
+                .records
+                .checked_add(work.records)
+                .ok_or(CatalogError::Bounds)?,
+        })
+    }
+
+    /// Debit other admitted sections before constructing a nested reader. Each
+    /// dimension is independent; exhaustion never wraps or resets the budget.
+    pub fn remaining_after(self, work: Self) -> Result<Self, CatalogError> {
+        Ok(Self {
+            bytes: self
+                .bytes
+                .checked_sub(work.bytes)
+                .ok_or(CatalogError::Bounds)?,
+            page_occurrences: self
+                .page_occurrences
+                .checked_sub(work.page_occurrences)
+                .ok_or(CatalogError::Bounds)?,
+            records: self
+                .records
+                .checked_sub(work.records)
+                .ok_or(CatalogError::Bounds)?,
+        })
+    }
+
     fn check(self, work: Self) -> Result<(), CatalogError> {
-        if work.bytes > self.bytes
-            || work.page_occurrences > self.page_occurrences
-            || work.records > self.records
-        {
-            return Err(CatalogError::Bounds);
-        }
-        Ok(())
+        self.remaining_after(work).map(|_| ())
     }
 }
 

@@ -11,8 +11,8 @@ use super::packing_validation::unwrap_stream;
 use super::*;
 use crate::RecordScratchStore;
 
-const MANIFEST_BYTES: usize = 4096;
-const ROW_BYTES: usize = 256;
+pub(super) const MANIFEST_BYTES: usize = 4096;
+pub(super) const ROW_BYTES: usize = 256;
 const GROUPS: &str = "packing-coding-group";
 const COVERAGE: &str = "packing-coding-coverage";
 const COMPLETE: &str = "packing-coding-complete";
@@ -106,7 +106,7 @@ pub struct CatalogIndexedCodingGroup {
     pub retain_through_event: Option<u64>,
 }
 
-fn put<T: Serialize>(
+pub(super) fn put<T: Serialize>(
     store: &RecordScratchStore,
     kind: &str,
     key: &[u8],
@@ -122,7 +122,7 @@ fn put<T: Serialize>(
     Ok(())
 }
 
-fn decode_row<T: serde::de::DeserializeOwned + Serialize>(
+pub(super) fn decode_row<T: serde::de::DeserializeOwned + Serialize>(
     bytes: &[u8],
 ) -> Result<T, CatalogStoreError> {
     let value: T = decode_canonical(bytes)?;
@@ -130,6 +130,22 @@ fn decode_row<T: serde::de::DeserializeOwned + Serialize>(
         return Err(DatabaseError::Integrity.into());
     }
     Ok(value)
+}
+
+pub(super) fn ensure_empty(packing: &CatalogPackingIndex) -> Result<(), CatalogStoreError> {
+    for kind in [GROUPS, COVERAGE, COMPLETE]
+        .into_iter()
+        .chain(super::coding_directory_coverage::KINDS)
+    {
+        if packing
+            .store
+            .next_record_bounded(kind, None, 32, MANIFEST_BYTES)?
+            .is_some()
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn build(
@@ -145,15 +161,7 @@ pub(super) fn build(
     if packing.manifest != manifest.packing {
         return Err(DatabaseError::Conflict.into());
     }
-    for kind in [GROUPS, COVERAGE, COMPLETE] {
-        if packing
-            .store
-            .next_record_bounded(kind, None, 32, MANIFEST_BYTES)?
-            .is_some()
-        {
-            return Err(DatabaseError::Conflict.into());
-        }
-    }
+    ensure_empty(packing)?;
     let mut pending = packing.manifest.descriptors.sectors;
     let mut reader = CatalogCodingReader::new(manifest.coding.scope, manifest.coding.root.clone())?;
     while let Some(entry) = unwrap_stream(reader.next_group(fetch))? {
@@ -173,58 +181,114 @@ pub(super) fn build(
             },
             ROW_BYTES,
         )?;
-        for (index, role) in group.roles.iter().enumerate() {
-            let ShardRoleV2::Information(info) = role else {
-                continue;
-            };
-            if info.sector.virtual_zero {
-                continue;
-            }
-            let Some(sector) = packing.sector(info.sector.id)? else {
-                continue;
-            };
-            let plan = &entry.transcript.value.plan.value;
-            if info.sector.commitment != sector.commitment
-                || info.sector.logical_len != sector.commitment.byte_len
-                || group.profile.shard_size != sector.commitment.byte_len
-                || plan
-                    .information_root(index)
-                    .is_some_and(|root| root != sector.flat_root)
-            {
-                return Err(DatabaseError::Conflict.into());
-            }
-            if plan.information_root(index).is_none()
-                || entry.retained.retired_at_event.is_some()
-                || manifest.policy == CatalogCodingCoveragePolicy::Current
-                    && (authority != CatalogCodingAuthorization::CurrentPlacement
-                        || sector.flat_root != sector.commitment.root && plan.format_version != 3)
-            {
-                continue;
-            }
-            if packing
-                .store
-                .get_record_bounded(COVERAGE, &sector.id, ROW_BYTES)?
-                .is_none()
-            {
-                put(
-                    &packing.store,
-                    COVERAGE,
-                    &sector.id,
-                    &CatalogCodingCoverage {
-                        group_id: group.id,
-                        shard_index: index as u16,
-                        holder: info.owner,
-                    },
-                    ROW_BYTES,
-                )?;
-                pending = pending.checked_sub(1).ok_or(DatabaseError::Integrity)?;
-            }
-        }
+        cover_entry(
+            packing,
+            &entry,
+            authority,
+            manifest.policy,
+            COVERAGE,
+            &mut pending,
+        )?;
     }
+
     if pending != 0 {
         return Err(DatabaseError::NotReady.into());
     }
     put(&packing.store, COMPLETE, b"root", manifest, MANIFEST_BYTES)
+}
+
+pub(super) fn cover_entry(
+    packing: &CatalogPackingIndex,
+    entry: &CatalogCodingEntry,
+    authority: CatalogCodingAuthorization,
+    policy: CatalogCodingCoveragePolicy,
+    coverage: &str,
+    pending: &mut u64,
+) -> Result<(), CatalogStoreError> {
+    let group = &entry.retained.group;
+    for (index, role) in group.roles.iter().enumerate() {
+        let ShardRoleV2::Information(info) = role else {
+            continue;
+        };
+        if info.sector.virtual_zero {
+            continue;
+        }
+        let Some(sector) = packing.sector(info.sector.id)? else {
+            continue;
+        };
+        let plan = &entry.transcript.value.plan.value;
+        if info.sector.commitment != sector.commitment
+            || info.sector.logical_len != sector.commitment.byte_len
+            || group.profile.shard_size != sector.commitment.byte_len
+            || plan
+                .information_root(index)
+                .is_some_and(|root| root != sector.flat_root)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        if plan.information_root(index).is_none()
+            || entry.retained.retired_at_event.is_some()
+            || policy == CatalogCodingCoveragePolicy::Current
+                && (authority != CatalogCodingAuthorization::CurrentPlacement
+                    || sector.flat_root != sector.commitment.root && plan.format_version != 3)
+        {
+            continue;
+        }
+        if packing
+            .store
+            .get_record_bounded(coverage, &sector.id, ROW_BYTES)?
+            .is_none()
+        {
+            put(
+                &packing.store,
+                coverage,
+                &sector.id,
+                &CatalogCodingCoverage {
+                    group_id: group.id,
+                    shard_index: index as u16,
+                    holder: info.owner,
+                },
+                ROW_BYTES,
+            )?;
+            *pending = pending.checked_sub(1).ok_or(DatabaseError::Integrity)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_group(
+    group: &CatalogIndexedCodingGroup,
+    sequence: u64,
+    page: CatalogPageRef,
+) -> Result<(), CatalogStoreError> {
+    page.validate()?;
+    let range = group.range;
+    let end = range
+        .offset
+        .checked_add(u64::from(range.len))
+        .ok_or(DatabaseError::Integrity)?;
+    if group.profile.validate().is_err()
+        || page.hash == [0; 32]
+        || usize::from(range.part) >= mb_core::CATALOG_CODING_PARTS
+        || range.group_id == [0; 32]
+        || range.transcript_hash == [0; 32]
+        || range.offset < 8
+        || range.len == 0
+        || range.len as usize > mb_core::CATALOG_CODING_GROUP_BYTES
+        || end > page.byte_len
+        || group.added_at_event == 0
+        || group.added_at_event > sequence
+        || group.retired_at_event.is_some() != group.retain_through_event.is_some()
+        || group
+            .retired_at_event
+            .is_some_and(|event| event < group.added_at_event || event > sequence)
+        || group
+            .retain_through_event
+            .is_some_and(|event| event < group.retired_at_event.unwrap_or(0))
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(())
 }
 
 /// Created only after both packing EOFs, the complete coding forest and exact
@@ -333,31 +397,11 @@ impl CatalogPackingCodingIndex {
             .parts
             .get(usize::from(range.part))
             .ok_or(DatabaseError::Integrity)?;
-        let end = range
-            .offset
-            .checked_add(u64::from(range.len))
-            .ok_or(DatabaseError::Integrity)?;
-        if group.profile.validate().is_err()
-            || range.group_id == [0; 32]
-            || range.transcript_hash == [0; 32]
-            || range.offset < 8
-            || range.len == 0
-            || range.len as usize > mb_core::CATALOG_CODING_GROUP_BYTES
-            || end > part.page.byte_len
-            || group.added_at_event == 0
-            || group.added_at_event > self.manifest.coding.root.guild_event_sequence
-            || group.retired_at_event.is_some() != group.retain_through_event.is_some()
-            || group.retired_at_event.is_some_and(|event| {
-                event < group.added_at_event
-                    || event > self.manifest.coding.root.guild_event_sequence
-            })
-            || group
-                .retain_through_event
-                .is_some_and(|event| event < group.retired_at_event.unwrap_or(0))
-        {
-            return Err(DatabaseError::Integrity.into());
-        }
-        Ok(())
+        validate_group(
+            group,
+            self.manifest.coding.root.guild_event_sequence,
+            part.page,
+        )
     }
 
     pub fn next_group(

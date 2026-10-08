@@ -2789,3 +2789,83 @@ which verifies rejection before the affected forest's ownership hook or evidence
 fetch. Strict locked workspace/all-targets Clippy, formatting and diff checks
 pass. No network/native/release or real retained 1 TiB runtime gate was rerun
 for this codec and local ownership slice.
+
+### Directory packing coverage and shared authority admission (2026-10-08)
+
+`CatalogPackingCodingDirectoryIndex` joins the complete coding directory to the
+already completed packing index in the same admitted encrypted scratch store.
+It requires complete replayed nested/directory EOF, external authorization of
+every original witness and exact eligible active coverage for every verified
+packed input before its completion marker exists. Both forest and directory
+joins use the same coverage rules: exact commitments/geometry/signed roots,
+no virtual or retired coverage, explicit current versus historical placement,
+and full-byte witnesses for current flat-root inputs. Overlapping replacements
+and unrelated retained history preserve their original witnesses. Fixed index
+rows add the original part reference to the existing bounded group metadata;
+point reads authenticate and replay one witness without a directory scan.
+
+The new local descriptor requires a trusted byte/page/record budget separately
+at decode and construction. It charges one fixed 4096-byte combined envelope,
+both packing streams, directory frames and all original evidence occurrences.
+The directory's existing 512-byte root reservation is part of that envelope,
+not an additional duplicate charge. Packing and already admitted authority work
+are debited before the directory reader is constructed. Checked addition and
+subtraction reject overflow/exhaustion before fetch. The standalone packing API
+requires the caller to debit any external authority/other sections first; the
+certified source wrapper carries and debits its own prefix automatically.
+
+`CatalogCertifiedCodingDirectoryIndex` preserves the trusted legacy source base
+and complete signed candidate cursor across the join. Prefix bytes/pages retain
+their existing accounting. Its new record ledger counts one bounded legacy
+certificate, each signed paged candidate or migration evidence object, and every
+framed paged-source record occurrence. Repeated source roots count again even
+when the disposable source table deduplicates their physical identities. This
+ledger does not count fields inside the already bounded flat certificate as
+separate framed records or make that legacy verifier scalable. Current certified
+guild-event/lifecycle authorization and publication fences remain external.
+
+The original single-forest API, serialized local descriptors/index rows and
+signed protocol bytes remain unchanged. Both join paths reject orphan state in
+either namespace. Ignored inserts and all late fetch/order/summary/authority
+failures roll back the entire directory join, preserving the admitted packing
+proof. The directory path allocates no second scratch store and keeps fixed
+bounded local rows and one decoded witness at a time.
+
+Focused fixtures cover 15 forests, overlapping/retired/unrelated groups, exact
+witness seek, missing/virtual/retired/unbound coverage, historical/current
+placement, empty inputs, every budget dimension and prefix debit, overflow,
+malformed cursors, ignored writes, both namespace orphan directions and late
+failure after valid prefixes. A 768-source/256-forest fixture spills past the
+1 MiB cache, fails at the admitted storage limit without a usable prefix, and
+rebuilds in a fresh admitted index. The certified-source fixture verifies the
+original base/candidate cursor, exact three-dimensional prefix continuity and
+budget rejection before fetch; existing evidence/repeated-candidate fixtures
+also pin the new record ledger.
+
+A structural fixture uses the single-owner audit's necessary 1 TiB source,
+packed-sector and group geometry. The combined local descriptor admits its
+necessary byte/page/record counts under an explicitly supplied budget even when
+bytes/pages exceed the old combined ceilings and aggregate records exceed one
+original tree's record cap. The previous combined join had no separate aggregate
+record ceiling; the new required record budget is explicit. Its references and summaries are
+synthetic and represent lower bounds, not a complete upper-bound policy or a
+completed packing/coding proof. It does not materialize or qualify large data.
+The full dataset/file/extent/Git/history/guild policy, retained quota reservations
+and normal consumers remain required under R3-SINGLE-OWNER-METADATA.
+
+This completed disposable proof activates no checkpoint and owns no durable
+payloads. The separate coding-retention journal can own the directory's logical
+forest roots, but the enclosing checkpoint owner must bind those dependencies
+and both packing roots with certified-current guards. A fixed ordinary bundle
+containing only the directory and packing roots would omit logical forest
+ownership. Composite authority/packing/coding/private and payload ownership,
+full paged certification, normal capture/retention/seed consumers, incremental
+work and all retained 1 TiB, release and platform gates remain open.
+
+Validation: all eight focused directory fixtures and the expanded certified
+source/coding fixture pass. The full locked regression passes all 161 core and
+197 ordinary store tests (26 store tests ignored), including both existing
+forest joins and durable authority/coding ownership. Formatting/diff checks and
+strict locked workspace/all-targets Clippy pass. No network/native/release,
+other-platform or real retained 1 TiB runtime qualification is implied by this
+staging index and accounting change.

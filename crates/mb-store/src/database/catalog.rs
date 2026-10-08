@@ -15,6 +15,7 @@ use super::{ControlStore, DatabaseError};
 mod bundle;
 mod checkpoint_retention;
 mod coding_coverage;
+mod coding_directory_coverage;
 mod coding_retention;
 mod coding_validation;
 mod native_validation;
@@ -33,14 +34,19 @@ pub use coding_coverage::{
     CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,
     CatalogIndexedCodingGroup, CatalogPackingCodingIndex, CatalogPackingCodingValidation,
 };
+pub use coding_directory_coverage::{
+    CatalogIndexedDirectoryCodingGroup, CatalogPackingCodingDirectoryIndex,
+    CatalogPackingCodingDirectoryValidation,
+};
 pub use coding_retention::{CatalogCodingRetention, CatalogCodingRetentionState};
 pub use coding_validation::{CatalogCodingValidation, CatalogValidatedCoding};
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };
 pub use packing_authority::{
-    CatalogCertifiedCodingIndex, CatalogCertifiedPackingIndex, CatalogPackingAuthority,
-    CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
+    CatalogCertifiedCodingDirectoryIndex, CatalogCertifiedCodingIndex,
+    CatalogCertifiedPackingIndex, CatalogPackingAuthority, CatalogPackingAuthorityBase,
+    CatalogPackingAuthorizedSource,
 };
 pub use packing_validation::{
     CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingSector, CatalogPackingValidation,

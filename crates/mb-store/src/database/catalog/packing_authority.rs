@@ -6,10 +6,11 @@
 
 use mb_core::{
     CATALOG_MAX_RECORDS, CATALOG_MAX_STREAM_BYTES, CatalogCheckpointRevisionKey,
-    CatalogPackedSourceId, LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN,
-    LegacyPackingAttestation, LegacyPackingBinding, MerkleCommitment, NodeId,
-    PAGED_USER_REVISION_BYTES, PagedRevisionSourceReader, PagedUserRevision, QuorumCheckpoint,
-    SignedRecord, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, WriterFence, canonical_bytes_bounded,
+    CatalogCodingDirectoryRoot, CatalogCodingTraversalBudget, CatalogPackedSourceId,
+    LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingAttestation,
+    LegacyPackingBinding, MerkleCommitment, NodeId, PAGED_USER_REVISION_BYTES,
+    PagedRevisionSourceReader, PagedUserRevision, QuorumCheckpoint, SignedRecord,
+    V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, WriterFence, canonical_bytes_bounded,
     canonical_size_bounded, packing_protected_root,
 };
 
@@ -221,6 +222,9 @@ pub struct CatalogPackingAuthority {
     candidates: u64,
     bytes: u64,
     pages: u64,
+    // One record per bounded signed envelope/evidence object, plus every
+    // framed paged-source occurrence (including repeated referenced trees).
+    records: u64,
 }
 
 impl CatalogPackingAuthority {
@@ -262,6 +266,7 @@ impl CatalogPackingAuthority {
             candidates: 0,
             bytes: legacy_bytes,
             pages: 0,
+            records: 1,
         };
         job.store
             .with_record_transaction(|| -> Result<(), CatalogStoreError> {
@@ -442,6 +447,11 @@ impl CatalogPackingAuthority {
         let bytes = encoded(signed, PAGED_USER_REVISION_BYTES)?;
         let extra_bytes = bytes.len() as u64 + body.sources.records.page.byte_len;
         let extra_pages = body.sources.records.page.page_occurrences;
+        let records = self
+            .records
+            .checked_add(1)
+            .and_then(|records| records.checked_add(body.sources.records.records))
+            .ok_or(CatalogError::Bounds)?;
         self.check_budget(extra_bytes, extra_pages)?;
         let mut new_sources = 0;
         let mut authenticated_sources = 0;
@@ -495,6 +505,7 @@ impl CatalogPackingAuthority {
         self.candidates += 1;
         self.bytes += extra_bytes;
         self.pages += extra_pages;
+        self.records = records;
         self.check_budget(0, 0)?;
         Ok(self)
     }
@@ -525,6 +536,7 @@ impl CatalogPackingAuthority {
         signed: &SignedRecord<LegacyPackingBinding>,
     ) -> Result<Self, CatalogStoreError> {
         let bytes = encoded(signed, EVIDENCE_BYTES)?;
+        let records = self.records.checked_add(1).ok_or(CatalogError::Bounds)?;
         self.check_budget(bytes.len() as u64, 0)?;
         signed.verify(LEGACY_PACKING_BINDING_DOMAIN)?;
         let value = &signed.value;
@@ -547,6 +559,7 @@ impl CatalogPackingAuthority {
             })?;
         self.authenticated += u64::from(new);
         self.bytes += bytes.len() as u64;
+        self.records = records;
         Ok(self)
     }
 
@@ -555,6 +568,7 @@ impl CatalogPackingAuthority {
         signed: &SignedRecord<LegacyPackingAttestation>,
     ) -> Result<Self, CatalogStoreError> {
         let bytes = encoded(signed, EVIDENCE_BYTES)?;
+        let records = self.records.checked_add(1).ok_or(CatalogError::Bounds)?;
         self.check_budget(bytes.len() as u64, 0)?;
         signed.verify(LEGACY_PACKING_ATTESTATION_DOMAIN)?;
         let value = &signed.value;
@@ -605,6 +619,7 @@ impl CatalogPackingAuthority {
             })?;
         self.authenticated += u64::from(new);
         self.bytes += bytes.len() as u64;
+        self.records = records;
         Ok(self)
     }
 
@@ -649,6 +664,7 @@ impl CatalogPackingAuthority {
             candidates: self.candidates,
             authority_bytes: self.bytes,
             authority_pages: self.pages,
+            authority_records: self.records,
             index: CatalogPackingIndex {
                 manifest,
                 store: self.store,
@@ -664,6 +680,7 @@ pub struct CatalogCertifiedPackingIndex {
     candidates: u64,
     authority_bytes: u64,
     authority_pages: u64,
+    authority_records: u64,
     index: CatalogPackingIndex,
 }
 
@@ -775,6 +792,68 @@ fn check_coding_work(
         return Err(CatalogError::Bounds.into());
     }
     Ok((bytes, pages))
+}
+
+/// The trusted source base, complete candidates and all three dimensions of
+/// admitted authority work survive the directory join. Current guild-event
+/// authority and complete enclosing checkpoint validation remain mandatory.
+pub struct CatalogCertifiedCodingDirectoryIndex {
+    base: CatalogPackingAuthorityBase,
+    candidates: u64,
+    index: CatalogPackingCodingDirectoryIndex,
+}
+
+impl CatalogCertifiedPackingIndex {
+    pub fn validate_coding_directory(
+        self,
+        coding: CatalogCodingDirectoryRoot,
+        policy: CatalogCodingCoveragePolicy,
+        budget: CatalogCodingTraversalBudget,
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+        authorize: impl FnMut(
+            &mb_core::CatalogCodingEntry,
+        ) -> Result<CatalogCodingAuthorization, CatalogStoreError>,
+    ) -> Result<CatalogCertifiedCodingDirectoryIndex, CatalogStoreError> {
+        let index = self.index.validate_directory_with_prior(
+            coding,
+            policy,
+            budget,
+            CatalogCodingTraversalBudget {
+                bytes: self.authority_bytes,
+                page_occurrences: self.authority_pages,
+                records: self.authority_records,
+            },
+            fetch,
+            authorize,
+        )?;
+        Ok(CatalogCertifiedCodingDirectoryIndex {
+            base: self.base,
+            candidates: self.candidates,
+            index,
+        })
+    }
+}
+
+impl CatalogCertifiedCodingDirectoryIndex {
+    pub fn base(&self) -> CatalogPackingAuthorityBase {
+        self.base
+    }
+    pub fn candidate_count(&self) -> u64 {
+        self.candidates
+    }
+    pub fn index(&self) -> &CatalogPackingCodingDirectoryIndex {
+        &self.index
+    }
+    pub fn represented_work(&self) -> Result<CatalogCodingTraversalBudget, CatalogStoreError> {
+        self.index.manifest().validate(self.index.budget())?;
+        self.index.manifest().represented_work()
+    }
+    pub fn next_paged_revision(
+        &self,
+        after: Option<CatalogCheckpointRevisionKey>,
+    ) -> Result<Option<SignedRecord<PagedUserRevision>>, CatalogStoreError> {
+        next_candidate(self.index.packing(), after)
+    }
 }
 
 impl CatalogCertifiedCodingIndex {
@@ -1157,6 +1236,10 @@ mod tests {
         let authority = authority
             .with_paged_revision(&next, |page| fetch(&candidate_pages, page))
             .unwrap();
+        assert_eq!(
+            authority.records,
+            1 + 2 * (1 + candidate.value.sources.records.records)
+        );
         let checked = authority
             .validate_packing(manifest, |page| fetch(&pages, page))
             .unwrap();
@@ -1480,6 +1563,7 @@ mod tests {
             .unwrap()
             .with_legacy_binding(&fixture.binding(1))
             .unwrap();
+        assert_eq!(authority.records, 3);
         authority
             .validate_packing(manifest, |page| fetch(&pages, page))
             .unwrap();
@@ -1502,6 +1586,7 @@ mod tests {
             .unwrap()
             .with_legacy_attestation(&fixture.attestation(1, 1))
             .unwrap();
+        assert_eq!(authority.records, 4);
         authority
             .validate_packing(manifest, |page| fetch(&pages, page))
             .unwrap();
@@ -1823,11 +1908,26 @@ mod tests {
             scope: manifest.scope,
             root: builder.finish(&mut sink).unwrap(),
         };
+        let mut directory = mb_core::CatalogCodingDirectoryBuilder::new(
+            manifest.scope,
+            100,
+            CatalogCodingTraversalBudget {
+                bytes: 96 * 1024 * 1024 * 1024,
+                page_occurrences: 2_000_000,
+                records: 64_000_000,
+            },
+        )
+        .unwrap();
+        for entry in entries {
+            directory.push_group(entry, &mut sink).unwrap();
+        }
+        let directory = directory.finish(&mut sink).unwrap();
         let authority = fixture
             .authority()
             .with_paged_revision(&candidate, |page| fetch(&candidate_pages, page))
             .unwrap();
         let (authority_bytes, authority_pages) = (authority.bytes, authority.pages);
+        let authority_records = authority.records;
         let checked = authority
             .validate_packing(manifest, |page| fetch(&pages, page))
             .unwrap();
@@ -1869,6 +1969,87 @@ mod tests {
         }
         assert_eq!(
             checked
+                .index()
+                .read_group(entry.retained.group.id, |page| fetch(&coding_pages, page))
+                .unwrap(),
+            Some(entry.clone())
+        );
+        let prior_work = CatalogCodingTraversalBudget {
+            bytes: authority_bytes,
+            page_occurrences: authority_pages,
+            records: authority_records,
+        };
+        assert_eq!(
+            authority_records,
+            2 + candidate.value.sources.records.records
+        );
+        let proposed = CatalogPackingCodingDirectoryValidation {
+            format_version: 1,
+            packing: manifest,
+            coding: directory,
+            policy: CatalogCodingCoveragePolicy::Current,
+            prior_work,
+        };
+        let work = proposed.represented_work().unwrap();
+        let rebuild = || {
+            fixture
+                .authority()
+                .with_paged_revision(&candidate, |page| fetch(&candidate_pages, page))
+                .unwrap()
+                .validate_packing(manifest, |page| fetch(&pages, page))
+                .unwrap()
+        };
+        for dimension in 0..3 {
+            let mut limit = work;
+            match dimension {
+                0 => limit.bytes -= 1,
+                1 => limit.page_occurrences -= 1,
+                _ => limit.records -= 1,
+            }
+            assert!(
+                rebuild()
+                    .validate_coding_directory(
+                        directory,
+                        proposed.policy,
+                        limit,
+                        |_| panic!("over-budget certified directory fetched pages"),
+                        |_| panic!("over-budget certified directory authorized groups")
+                    )
+                    .is_err()
+            );
+        }
+        let joined = rebuild()
+            .validate_coding_directory(
+                directory,
+                proposed.policy,
+                work,
+                |page| fetch(&coding_pages, page),
+                |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
+            )
+            .unwrap();
+        assert_eq!(joined.base(), base);
+        assert_eq!(joined.candidate_count(), 1);
+        assert_eq!(joined.index().manifest(), proposed);
+        assert_eq!(joined.represented_work().unwrap(), work);
+        assert_eq!(
+            joined.index().manifest().coding_budget(work).unwrap(),
+            directory.work().unwrap()
+        );
+        assert_eq!(
+            joined.next_paged_revision(None).unwrap(),
+            Some(candidate.clone())
+        );
+        assert!(
+            joined
+                .next_paged_revision(Some((&candidate.value).into()))
+                .unwrap()
+                .is_none()
+        );
+        for sector in &packing.sectors {
+            assert!(joined.index().coverage(sector.id).unwrap().is_some());
+        }
+        assert_eq!(
+            joined
                 .index()
                 .read_group(entry.retained.group.id, |page| fetch(&coding_pages, page))
                 .unwrap(),

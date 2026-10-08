@@ -1375,8 +1375,10 @@ separately below.
     expansion gives at least 62,746,792,515 coding bytes and 1,021,270 coding
     leaves. Packing descriptors and source proofs bring the lower bound to
     74,390,180,513 bytes before signed source trees, private metadata or history.
-    This exceeds the current one-million-page coding-forest and 64 GiB combined
-    admission. The focused codec/allocator audit passes and preserves this
+    This exceeds the original one-million-page coding-forest and 64 GiB combined
+    admission. The directory codecs and joins below remove that single-forest
+    assumption in staging; the complete enclosing policy is still required.
+    The focused codec/allocator audit passes and preserves this
     necessary lower bound; strict locked workspace/all-targets Clippy and
     formatting/diff checks pass. It does not qualify a backup. Derive enclosing
     section/dataset/guild budgets, retained quotas and directory/sharding
@@ -1547,9 +1549,32 @@ separately below.
     packing coverage, payload ownership and guarded retirement remain required.
     All 161 core and 189 ordinary store tests pass (26 store tests ignored),
     with strict locked workspace/all-targets Clippy and formatting/diff checks.
-    See ADR 0002. The earlier packing/coding index still consumes
-    one bounded forest; directory integration, complete enclosing admission,
-    quotas, normal consumers and real retained 1 TiB qualification remain open.
+    See ADR 0002. The original single-forest packing/coding index remains
+    available; directory coverage integration follows below. Complete enclosing
+    admission, quotas, normal consumers and real retained 1 TiB qualification
+    remain open.
+  - [x] Join complete coding directories to exact packed-input coverage in the
+    same admitted encrypted index. Reuse current/historical coverage rules,
+    require all nested EOFs and every external authorization, preserve original
+    witness locations and reject cross-join orphan rows. Carry the certified
+    source base, bounded candidate cursor and complete byte/page/record prefix
+    into one required trusted total budget; debit packing before directory
+    traversal. Preserve the existing single-forest API and signed formats.
+    Fixtures cover 15 forests with replacements/unrelated history, prefix
+    rollback, ignored writes, malformed cursors, empty inputs, before-fetch
+    admission and 256 forests with real scratch spill/exhaustion/rebuild.
+    A structural single-owner lower-bound fixture exceeds the old combined
+    byte/page ceilings; its aggregate record budget also exceeds one tree's
+    record cap while each original tree remains bounded. Synthetic references do not
+    establish a completed index or real retained-data qualification. See ADR 0002.
+    All 161 core and 197 ordinary store tests pass (26 store tests ignored),
+    with strict locked workspace/all-targets Clippy and formatting/diff checks.
+  - [ ] Bind the completed directory coverage proof, both packing roots and
+    every logical forest reference into the enclosing durable checkpoint owner.
+    Retaining a directory root alone, or combining independent local journals
+    without certified-current checkpoint guards, is insufficient. Preserve
+    complete public/private source and payload ownership through publication,
+    cancellation, replay, successor sharing and bounded retirement.
   - [ ] Complete the enclosing paged checkpoint certificate and full
     authority/coding joins, including current guild-event membership/writer
     fences, retained tombstones, globally unique revision IDs, all legacy/body

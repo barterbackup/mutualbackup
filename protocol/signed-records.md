@@ -145,6 +145,15 @@ publishes only after replayed globally ordered EOF. This owns public metadata;
 enclosing certified authority/coverage, payload ownership, quotas and checkpoint
 activation remain separate required joins. No peer publication version changes.
 
+The directory packing coverage proof carries previously admitted source-authority
+bytes, page occurrences and records into the required enclosing budget and
+debits both packing streams before traversing coding forests. Record work counts
+framed records and bounded signed authority objects, including repeated source
+tree occurrences. Its local descriptor reserves one 4096-byte envelope including
+the directory root reservation. Original signed/forest layouts remain unchanged;
+fixed witness locations belong to the completed disposable index. Durable
+composite checkpoint ownership and current certified authority remain required.
+
 The recovery-string vector records whitespace normalization, Argon2id v1.3
 parameters and derived identities. Other vector files are hexadecimal raw
 Postcard or CBOR unless their extension says JSON.
