@@ -1,6 +1,7 @@
 //! Bounded previous-state authority comparison. This proves public revision,
-//! tombstone and writer transitions, not coding lifecycle, private joins,
-//! payload custody or durable checkpoint publication.
+//! tombstone and writer transitions. The concrete history route also checks
+//! original ancestry and variable coding states; private joins, payload custody
+//! and durable checkpoint publication remain outside this disposable proof.
 
 use mb_core::{
     CATALOG_CHECKPOINT_RECORD_BYTES, CatalogCheckpointAuthorityRecord as R,
@@ -49,6 +50,7 @@ const KINDS: [&str; 7] = [
 /// Legacy trust is a certified historical event snapshot, including the epoch
 /// witness absent from formats 3/4. Paged predecessors require a completed,
 /// quorum-bound public transition proof; no raw header can stand in for one.
+#[derive(Clone, Copy)]
 pub enum CatalogCheckpointPrevious<'a> {
     Legacy {
         certificate: &'a QuorumCheckpoint,
@@ -520,6 +522,40 @@ struct Manifest {
     snapshot_hash: [u8; 32],
     previous_snapshot_hash: Option<[u8; 32]>,
     work: Work,
+    certified_history: bool,
+}
+
+struct HistoryCheck<F> {
+    work: Work,
+    certified: bool,
+    verify: F,
+}
+
+fn history_reservation(
+    current: Counts,
+    old: Counts,
+    groups: u64,
+) -> Result<Work, CatalogStoreError> {
+    let rows = current
+        .fences
+        .checked_add(old.fences)
+        .and_then(|count| count.checked_add(groups))
+        .and_then(|count| count.checked_mul(8))
+        .and_then(|count| count.checked_add(64))
+        .ok_or(CatalogError::Bounds)?;
+    Ok(Work {
+        bytes: rows
+            .checked_mul(ROW_BYTES as u64)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    2 * mb_core::GUILD_AUTHORITY_SNAPSHOT_BYTES as u64
+                        + 16 * DESCRIPTOR_BYTES as u64,
+                )
+            })
+            .ok_or(CatalogError::Bounds)?,
+        records: rows,
+        page_occurrences: 0,
+    })
 }
 
 impl CatalogCheckpointCodingStateIndex {
@@ -534,12 +570,184 @@ impl CatalogCheckpointCodingStateIndex {
         self,
         previous: Option<CatalogCheckpointPrevious<'_>>,
         budget: Work,
+        read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+        read_current_writer: impl FnMut(
+            NodeId,
+            &PagedCheckpointTrust,
+        ) -> Result<Option<WriterFence>, CatalogStoreError>,
+    ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError> {
+        self.validate_authority_transition_checked(
+            previous,
+            budget,
+            read_trust,
+            read_current_writer,
+            HistoryCheck {
+                work: Work::default(),
+                certified: false,
+                verify: |_: &Self, _: &PagedCheckpointTrust| Ok(()),
+            },
+        )
+    }
+
+    /// Use one completed original-history projection for current retained
+    /// fences, latest writer authority, exact event ancestry and both coding
+    /// states. Paged predecessor groups must exactly match the historical
+    /// certified prefix, including unrelated/retired and forgotten/re-added
+    /// incarnations. Fixed legacy groups still need their explicit migration;
+    /// this route fails closed for those rather than changing original IDs.
+    pub fn validate_certified_history_authority_transition(
+        self,
+        previous: Option<CatalogCheckpointPrevious<'_>>,
+        history: &CatalogGuildHistoryIndex,
+        budget: Work,
+        mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+    ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError> {
+        let view = history.view(&mut read_trust)?;
+        let current = Counts::paged(self.index());
+        let old = match previous {
+            Some(CatalogCheckpointPrevious::Legacy { certificate, .. }) => {
+                canonical_size_bounded(certificate, V1_MAX_CATALOG_BYTES)?;
+                Counts::legacy(certificate)
+            }
+            Some(CatalogCheckpointPrevious::Paged(previous)) => Counts::paged(previous.index()),
+            None => Counts::default(),
+        };
+        let old_groups = match previous {
+            Some(CatalogCheckpointPrevious::Paged(previous)) => {
+                previous
+                    .certificate()
+                    .checkpoint
+                    .coding
+                    .summary
+                    .coding
+                    .groups
+            }
+            _ => 0,
+        };
+        let groups = self
+            .trust()
+            .retained_groups
+            .checked_add(old_groups)
+            .ok_or(CatalogError::Bounds)?;
+        let mut work = history_reservation(current, old, groups)?;
+        if self.history_work() != history.represented_work() {
+            work = work.checked_add(history.represented_work())?;
+        }
+        self.validate_authority_transition_checked(
+            previous,
+            budget,
+            &mut read_trust,
+            |owner, trust| view.current_writer(owner, trust),
+            HistoryCheck {
+                work,
+                certified: true,
+                verify: |index: &Self, trust: &PagedCheckpointTrust| {
+                    index.recheck_history_points(&view, trust)?;
+                    let store = &index.index().index().packing().store;
+                    let current = View {
+                        store,
+                        names: PAGED,
+                        counts: current,
+                        guild_id: trust.guild_id,
+                        generation: trust.next_generation()?,
+                    };
+                    current.each_fence(|fence| {
+                        let original = view
+                            .writer_key(fence.owner, fence.epoch, trust)?
+                            .ok_or(DatabaseError::NotReady)?;
+                        if original.public_key != fence.public_key {
+                            return Err(ModelError::InvalidWriterFence.into());
+                        }
+                        Ok(())
+                    })?;
+                    if let Some(previous) = previous {
+                        let old_trust = match previous {
+                            CatalogCheckpointPrevious::Legacy { trust, .. } => trust,
+                            CatalogCheckpointPrevious::Paged(previous) => previous.trust(),
+                        };
+                        let prefix =
+                            view.at(old_trust, CatalogGuildHistoryView::snapshot_lookup_work())?;
+                        let (old_store, names, generation) = match previous {
+                            CatalogCheckpointPrevious::Legacy { certificate, .. } => {
+                                if !certificate.checkpoint.coding_groups.is_empty()
+                                    || prefix.coding_trust().retained_groups != 0
+                                {
+                                    return Err(DatabaseError::NotReady.into());
+                                }
+                                (store, LEGACY, certificate.checkpoint.generation)
+                            }
+                            CatalogCheckpointPrevious::Paged(previous) => {
+                                let coding = prefix.coding_trust();
+                                let summary =
+                                    previous.certificate().checkpoint.coding.summary.coding;
+                                if summary.groups != coding.retained_groups
+                                    || summary.retired_groups != coding.retired_groups
+                                {
+                                    return Err(DatabaseError::Conflict.into());
+                                }
+                                let mut after = None;
+                                let mut count = 0_u64;
+                                while let Some(group) =
+                                    previous.index().index().next_group_row(after)?
+                                {
+                                    let id = group.group.range.group_id;
+                                    let original =
+                                        prefix.coding_group(id)?.ok_or(DatabaseError::NotReady)?;
+                                    if !original.matches(group, coding) {
+                                        return Err(DatabaseError::Conflict.into());
+                                    }
+                                    count = count
+                                        .checked_add(1)
+                                        .filter(|count| *count <= summary.groups)
+                                        .ok_or(DatabaseError::Integrity)?;
+                                    after = Some(id);
+                                }
+                                exact(count, summary.groups)?;
+                                (
+                                    &previous.index().index().packing().store,
+                                    PAGED,
+                                    previous.certificate().checkpoint.generation,
+                                )
+                            }
+                        };
+                        let old_view = View {
+                            store: old_store,
+                            names,
+                            counts: old,
+                            guild_id: old_trust.guild_id,
+                            generation,
+                        };
+                        old_view.each_fence(|fence| {
+                            let original = prefix
+                                .writer_key(fence.owner, fence.epoch)?
+                                .ok_or(DatabaseError::NotReady)?;
+                            if original.public_key != fence.public_key {
+                                return Err(ModelError::InvalidWriterFence.into());
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    history.view(|| Ok(trust.clone()))?;
+                    Ok(())
+                },
+            },
+        )
+    }
+
+    fn validate_authority_transition_checked<F>(
+        self,
+        previous: Option<CatalogCheckpointPrevious<'_>>,
+        budget: Work,
         mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
         mut read_current_writer: impl FnMut(
             NodeId,
             &PagedCheckpointTrust,
         ) -> Result<Option<WriterFence>, CatalogStoreError>,
-    ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError> {
+        history: HistoryCheck<F>,
+    ) -> Result<CatalogCheckpointTransitionIndex, CatalogStoreError>
+    where
+        F: FnOnce(&Self, &PagedCheckpointTrust) -> Result<(), CatalogStoreError>,
+    {
         let trust = read_trust()?;
         let header = self.header(&trust)?;
         let store = &self.index().index().packing().store;
@@ -618,15 +826,17 @@ impl CatalogCheckpointCodingStateIndex {
             };
         let work = self
             .represented_work()
+            .checked_add(history.work)?
             .checked_add(old_work)?
             .checked_add(scan_reservation(counts, old_counts, is_legacy, members)?)?;
         budget.remaining_after(work)?;
         let manifest = Manifest {
-            format_version: 1,
+            format_version: 2,
             checkpoint_hash: header.hash()?,
             snapshot_hash: snapshot_hash(&trust)?,
             previous_snapshot_hash: old_snapshot,
             work,
+            certified_history: history.certified,
         };
         encoded(&manifest, DESCRIPTOR_BYTES)?;
         let current = View {
@@ -658,6 +868,7 @@ impl CatalogCheckpointCodingStateIndex {
                 }
                 None => {}
             }
+            (history.verify)(&self, &trust)?;
             if let Some(old) = &previous_view {
                 old.each_fence(|fence| {
                     if current.historical_fence(&fence)? != Some(fence) {
@@ -820,8 +1031,9 @@ impl CatalogCheckpointCodingStateIndex {
 
 /// Complete bounded public authority transition under one trusted job budget.
 /// Signing/binding requires this proof and its exact certified coding state.
-/// Full coding transitions/fixed legacy migration, private/payload joins and
-/// atomic durable publication remain separate gates.
+/// The concrete history route records original variable coding comparisons.
+/// Fixed legacy migration, private/payload joins and atomic durable publication
+/// remain separate gates.
 pub struct CatalogCheckpointTransitionIndex {
     index: CatalogCheckpointCodingStateIndex,
     trust: PagedCheckpointTrust,
@@ -829,6 +1041,11 @@ pub struct CatalogCheckpointTransitionIndex {
     budget: Work,
 }
 impl CatalogCheckpointTransitionIndex {
+    /// Whether the original-history join, ancestry and full variable coding
+    /// predecessor comparison were completed for this draft transition.
+    pub fn has_certified_history_transition(&self) -> bool {
+        self.manifest.certified_history
+    }
     pub fn index(&self) -> &CatalogCheckpointCodingDirectoryIndex {
         self.index.index()
     }
@@ -847,7 +1064,7 @@ impl CatalogCheckpointTransitionIndex {
     pub(super) fn require_complete(&self) -> Result<(), CatalogStoreError> {
         let header = self.index.header(&self.trust)?;
         self.budget.remaining_after(self.manifest.work)?;
-        if self.manifest.format_version != 1
+        if self.manifest.format_version != 2
             || self.manifest.checkpoint_hash != header.hash()?
             || self.manifest.snapshot_hash != snapshot_hash(&self.trust)?
             || self

@@ -1038,11 +1038,19 @@ pub(super) mod tests {
             &mut self,
             limit: CatalogCodingTraversalBudget,
         ) -> Result<CatalogCheckpointAuthorityIndex, CatalogStoreError> {
+            let members = self.members().to_vec();
+            self.build_with_members(limit, &members)
+        }
+        fn build_with_members(
+            &mut self,
+            limit: CatalogCodingTraversalBudget,
+            members: &[Member],
+        ) -> Result<CatalogCheckpointAuthorityIndex, CatalogStoreError> {
             let root = self.root();
             CatalogCheckpointAuthorityIndex::build(
                 self.context,
                 root,
-                self.members(),
+                members,
                 limit,
                 RecordScratchStore::new(8 << 20)?,
                 |scope, section, page| {
@@ -1168,19 +1176,25 @@ pub(super) mod tests {
                 self.joined_with_groups(budget, policy, |_, entries| entries);
             (index, entries.pop().unwrap())
         }
-        pub(crate) fn joined_with_groups(
-            &mut self,
-            budget: CatalogCodingTraversalBudget,
-            policy: CatalogCodingCoveragePolicy,
-            select: impl FnOnce(
-                &super::super::packing_validation::tests::Fixture,
-                Vec<mb_core::CatalogCodingEntry>,
-            ) -> Vec<mb_core::CatalogCodingEntry>,
+        pub(crate) fn packing_inputs_with_byte_roots(
+            &self,
         ) -> (
-            CatalogCheckpointCodingDirectoryIndex,
-            Vec<mb_core::CatalogCodingEntry>,
+            CatalogPackingValidation,
+            Pages,
+            super::super::packing_validation::tests::Fixture,
         ) {
-            let (packing, packing_pages) = self
+            self.packing_inputs_mode(true)
+        }
+
+        fn packing_inputs_mode(
+            &self,
+            byte_roots: bool,
+        ) -> (
+            CatalogPackingValidation,
+            Pages,
+            super::super::packing_validation::tests::Fixture,
+        ) {
+            let (mut packing, mut packing_pages) = self
                 .sources
                 .packing(&self.sources.records, &self.sources.bytes);
             let old = &self.sources.certificate.checkpoint.revisions[0].value;
@@ -1201,7 +1215,7 @@ pub(super) mod tests {
                     .collect(),
             )
             .unwrap();
-            let inputs = super::super::packing_validation::tests::Fixture {
+            let mut inputs = super::super::packing_validation::tests::Fixture {
                 manifest: packing,
                 pages: Default::default(),
                 roles: [Vec::new(), Vec::new()],
@@ -1213,8 +1227,69 @@ pub(super) mod tests {
                     .map(|sector| sector.bytes)
                     .collect(),
             };
-            let entry =
-                super::super::coding_coverage::tests::entry(&inputs, [0, 1, 2], 701, 2, None);
+            if byte_roots {
+                // Build new descriptors with supported version-two byte-root
+                // semantics before any group ID or certificate is created.
+                // Versions three through five bind the Merkle root instead.
+                let mut builder = mb_core::CatalogPackedSectorBuilder::new_compact(
+                    packing.scope,
+                    2,
+                    packing.descriptors.profile,
+                )
+                .unwrap();
+                let mut sink = |page: CatalogPageRef, bytes| {
+                    packing_pages.insert(page.hash, bytes);
+                    Ok::<_, ()>(())
+                };
+                for (sector, bytes) in inputs.sectors.iter_mut().zip(&inputs.bytes) {
+                    sector.flat_root = mb_core::sector_root(bytes);
+                    sector.id = sector.calculate_id(packing.descriptors.profile).unwrap();
+                    builder.push_sector(sector, &mut sink).unwrap();
+                }
+                packing.descriptors = builder.finish(&mut sink).unwrap();
+                inputs.manifest = packing;
+            }
+            (packing, packing_pages, inputs)
+        }
+
+        pub(crate) fn joined_with_groups(
+            &mut self,
+            budget: CatalogCodingTraversalBudget,
+            policy: CatalogCodingCoveragePolicy,
+            select: impl FnOnce(
+                &super::super::packing_validation::tests::Fixture,
+                Vec<mb_core::CatalogCodingEntry>,
+            ) -> Vec<mb_core::CatalogCodingEntry>,
+        ) -> (
+            CatalogCheckpointCodingDirectoryIndex,
+            Vec<mb_core::CatalogCodingEntry>,
+        ) {
+            let members = self.members().to_vec();
+            self.joined_with_groups_and_members(budget, policy, &members, false, select)
+        }
+
+        pub(crate) fn joined_with_groups_and_members(
+            &mut self,
+            budget: CatalogCodingTraversalBudget,
+            policy: CatalogCodingCoveragePolicy,
+            members: &[Member],
+            byte_roots: bool,
+            select: impl FnOnce(
+                &super::super::packing_validation::tests::Fixture,
+                Vec<mb_core::CatalogCodingEntry>,
+            ) -> Vec<mb_core::CatalogCodingEntry>,
+        ) -> (
+            CatalogCheckpointCodingDirectoryIndex,
+            Vec<mb_core::CatalogCodingEntry>,
+        ) {
+            let (packing, packing_pages, inputs) = self.packing_inputs_mode(byte_roots);
+            let entry = super::super::coding_coverage::tests::entry(
+                &inputs,
+                [0, 1, 2],
+                701,
+                if byte_roots { 3 } else { 2 },
+                None,
+            );
             let mut entries = select(&inputs, vec![entry]);
             entries.sort_by_key(|entry| entry.retained.group.id);
             let mut pages = Pages::new();
@@ -1233,7 +1308,7 @@ pub(super) mod tests {
             }
             let coding = builder.finish(&mut sink).unwrap();
             let index = self
-                .build(budget)
+                .build_with_members(budget, members)
                 .unwrap()
                 .validate_packing(packing, |page| fetch(&packing_pages, page))
                 .unwrap()

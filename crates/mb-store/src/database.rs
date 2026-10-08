@@ -35,12 +35,13 @@ pub use catalog::{
     CatalogCheckpointTransitionIndex, CatalogCheckpointWriterAuthorization,
     CatalogCodingAuthorization, CatalogCodingCoverage, CatalogCodingCoveragePolicy,
     CatalogCodingRetention, CatalogCodingRetentionState, CatalogCodingValidation,
-    CatalogGuildHistoryIndex, CatalogGuildHistoryObject, CatalogGuildHistorySource,
-    CatalogGuildHistoryView, CatalogIndexedCodingGroup, CatalogIndexedDirectoryCodingGroup,
-    CatalogIntent, CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,
-    CatalogPackingAuthority, CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
-    CatalogPackingCodingDirectoryIndex, CatalogPackingCodingDirectoryValidation,
-    CatalogPackingCodingIndex, CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
+    CatalogGuildHistoryIndex, CatalogGuildHistoryObject, CatalogGuildHistorySnapshot,
+    CatalogGuildHistorySource, CatalogGuildHistoryView, CatalogIndexedCodingGroup,
+    CatalogIndexedDirectoryCodingGroup, CatalogIntent, CatalogIntentState, CatalogNativeValidation,
+    CatalogNativeValidationState, CatalogPackingAuthority, CatalogPackingAuthorityBase,
+    CatalogPackingAuthorizedSource, CatalogPackingCodingDirectoryIndex,
+    CatalogPackingCodingDirectoryValidation, CatalogPackingCodingIndex,
+    CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
     CatalogPackingCodingValidation, CatalogPackingIndex, CatalogPackingPlacement,
     CatalogPackingSector, CatalogPackingValidation, CatalogPublicationView,
     CatalogQuorumPagedCheckpointIndex, CatalogSectorSource, CatalogSourceSweep, CatalogStoreError,
@@ -670,6 +671,46 @@ impl ControlStore {
             Some(Some(bytes)) => Ok(Some(bytes)),
             Some(None) => Err(DatabaseError::Integrity),
         }
+    }
+
+    /// Read the greatest key in a bounded inclusive index range. SQL checks
+    /// both blob limits before allocation; no catalog is materialized/sorted.
+    pub fn record_at_or_before_bounded(
+        &self,
+        kind: &str,
+        lower: &[u8],
+        upper: &[u8],
+        key_limit: usize,
+        payload_limit: usize,
+    ) -> Result<Option<ProtocolRecordRow>, DatabaseError> {
+        if lower > upper {
+            return Err(DatabaseError::Integrity);
+        }
+        let key_limit = i64::try_from(key_limit).map_err(|_| DatabaseError::Integrity)?;
+        let payload_limit = i64::try_from(payload_limit).map_err(|_| DatabaseError::Integrity)?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN length(record_id) <= ?4 THEN record_id END,
+                    CASE WHEN length(bytes) <= ?5 THEN bytes END
+             FROM protocol_records WHERE kind = ?1 AND record_id >= ?2 AND record_id <= ?3
+             ORDER BY record_id DESC LIMIT 1",
+                params![kind, lower, upper, key_limit, payload_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(key, bytes)| {
+            Ok((
+                key.ok_or(DatabaseError::Integrity)?,
+                bytes.ok_or(DatabaseError::Integrity)?,
+            ))
+        })
+        .transpose()
     }
 
     /// Read one key/payload after an exclusive cursor using the record index.

@@ -3379,3 +3379,89 @@ migration, private/bootstrap/native and information/parity payload ownership,
 atomic certified-current publication/retirement, complete aggregate quotas and
 real retained 1 TiB/release/platform qualification remain required. This reader
 does not activate a peer format or change any original signed identity.
+
+## Original-history prefixes and paged coding successors (2026-10-08)
+
+The disposable history projection now retains a fixed original tip for genesis
+and every certified event, plus a fixed row for every variable coding Add
+incarnation. The latter is keyed by original group ID and big-endian Add
+sequence. Retirement and forgetting update the row through checked conditional
+writes; forgetting removes the full retained descriptor but preserves its
+original profile, signed witness hash and lifecycle. The final replay checks
+every retained descriptor against its archive row and reaches exact archive
+EOF/count. All new metadata, reads, writes and readbacks use the existing work
+meter and disposable transaction. Ignored archive updates and capacity errors
+cannot produce a completed projection.
+
+`CatalogGuildHistorySnapshot` is a private-construction historical-prefix view.
+Admission reserves the bounded event tip and 128 KiB epoch roster before reads.
+The supplied historical trust must match the independently replayed original
+guild/genesis, exact sequence/head, membership epoch, quorum and active roster.
+Retained/retired counts come from the original prefix, never from the proposed
+checkpoint. One indexed inclusive reverse range read resolves the most recent
+Add at or before that prefix. SQL checks key/payload lengths before allocating
+either blob. Canonical fixed-row checks apply; later retirement is clipped and
+forgetting at/before the prefix returns absence. A later re-Add of the same
+original group ID cannot replace the old prefix's witness. Historical writer
+lookups exclude future activation and clip future revocation while preserving
+authorized retained keys after owner removal. No witness replay, incarnation
+scan or catalog-sized in-memory collection is hidden in a point lookup.
+
+`validate_certified_history_authority_transition` uses this concrete projection
+for current placement, both complete variable coding states, retained writer
+history and latest current writer authority. It rechecks current fixed group
+facts and placement, then requires the predecessor's exact original event head
+and roster on the same certified chain. Paged predecessor directory counts and
+every original group/profile/witness/lifecycle must match that prefix through
+exact EOF. Every retained fence in both bodies must match the original writer
+epoch/public key; later revocation does not rewrite authorized history. The
+existing full original revision/tombstone/UUID successor comparison then runs.
+A larger event sequence or membership epoch with a valid quorum cannot admit
+a forked predecessor. The original quorum-bound paged predecessor remains
+required, and no original signed envelope or group identity is regenerated.
+
+Legacy certificates retain their original decoder, 32 MiB bound, hash and
+quorum verification. An empty coding prefix can migrate through this route.
+A legacy certificate containing fixed groups, or omitting variable groups
+retained at its original prefix, fails closed pending explicit migration. This
+does not reinterpret fixed groups or silently discard historical authority.
+
+The complete replay/prior-work ledger carries into the comparison once. A
+coding proof which already admitted that history does not pay the same replay
+again; a fixed-fact proof admits it here. Checked reservations admit both full
+public inputs and all extra historical point/scan work in bytes, records and
+page occurrences before the history joins. The existing scratch transaction
+covers temporary legacy indexing, successor checks and the completion marker.
+Late unavailable history, stale independent trust or missing rows yields no
+usable successor. The private marker records whether concrete original-history
+validation completed, exposed by `has_certified_history_transition`. The
+external-authorizer draft route still exists; normal publication must require
+the concrete history checks when integrated.
+
+Three prefix fixtures compare every original state with the bounded historical
+view, including writer activation/revocation, retire/forget/re-Add, changed
+placement, admission, malformed/oversized/missing rows and ignored updates.
+Four end-to-end fixtures start from actual five-member genesis, certified
+membership/writer events, original source-owner signatures, an original bound
+version-three coding witness and eleven-member quorum certificates. They cover
+initial signing, a paged successor with a different signed witness after
+Forget/re-Add of the same group ID, retained writer-key substitution, exact
+work carry/no-double-charge, under-admission in every dimension, missing old
+incarnations and fresh rebuilding, changed final trust, a later valid quorum
+fork and empty legacy migration versus omitted variable history. These fixtures
+build new packing descriptors with supported version-two whole-byte-root
+semantics from actual packed bytes before creating any coding group/certificate;
+they preserve all subsequently certified IDs, original witnesses and revisions.
+No production packing layout, signed codec or protocol vector changes.
+
+Validation: the full locked Store library run passes all 250 ordinary tests
+(26 ignored), with four test threads. Strict locked workspace/all-targets Clippy
+and formatting/diff checks pass. The final focused archive/range regression
+also passes. Core production code is unchanged in this step;
+its previous 174-test passing run remains the recorded core evidence. These
+remain structural metadata fixtures, not retained 1 TiB payload or
+history-index spill qualification. Normal durable compact-tip publication and
+incremental history maintenance, archive retention/compaction under complete
+quota policy, fixed legacy migration, private/bootstrap/native and information/
+parity payload custody, atomic certified-current ownership/publication/retirement
+and all retained-capacity, native/platform/release gates remain open.

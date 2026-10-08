@@ -1816,10 +1816,24 @@ include exact lifecycle and current placement; revoked latest writer keys never
 fall back to older incarnations. The draft coding join can consume this token
 and carry its whole replay/prior-work ledger into authority validation. Failure,
 stale trust or missing original evidence yields no completed projection.
+The projection also retains fixed original event tips and all variable coding
+incarnations, including forgotten groups. A bounded historical-prefix lookup
+checks the exact original head, epoch/quorum and roster; indexed range reads
+preserve an earlier incarnation after the same original ID is re-added. The
+concrete history authority-transition route checks both complete coding states,
+every retained writer fence and predecessor ancestry against that original
+chain, then performs the existing revision/tombstone successor comparison.
+It carries the replay ledger forward once and admits all additional history
+comparisons before point reads. Actual quorum-bound predecessor/successor
+fixtures cover a changed signed witness after Forget/re-Add, certified forks,
+unavailable old incarnations and an empty legacy prefix. Fixed legacy groups
+and legacy bodies omitting retained variable history fail closed pending their
+explicit migration. The external-authorizer draft route remains available;
+normal publication must require the concrete history checks.
 This does not integrate normal consumers, publish a durable compact current tip,
-migrate fixed legacy groups, compare full coding successors or own payloads.
-Those gates and complete aggregate quota/retained 1 TiB/release qualification
-remain required. See ADR 0002 for the bounded-reader validation evidence.
+migrate fixed legacy groups or own payloads. Incremental history maintenance,
+archive retention/compaction, complete aggregate quota/retained 1 TiB and release
+qualification remain required. See ADR 0002 for the validation evidence.
 
 ### Historical implementation and validation record (before scope correction)
 

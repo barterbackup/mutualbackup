@@ -94,7 +94,7 @@ impl CatalogCertifiedCodingGroup {
         })
     }
 
-    fn matches(
+    pub(super) fn matches(
         self,
         group: CatalogIndexedDirectoryCodingGroup,
         trust: &CatalogCheckpointCodingTrust,
@@ -115,6 +115,7 @@ struct Manifest {
     checkpoint_hash: [u8; 32],
     snapshot_hash: [u8; 32],
     work: Work,
+    history_work: Work,
 }
 
 fn scan_reservation(groups: u64, sectors: u64, members: usize) -> Result<Work, CatalogStoreError> {
@@ -317,10 +318,11 @@ impl CatalogCheckpointCodingDirectoryIndex {
             )?)?;
         budget.remaining_after(work)?;
         let manifest = Manifest {
-            format_version: 1,
+            format_version: 2,
             checkpoint_hash: header.hash()?,
             snapshot_hash: trust.hash()?,
             work,
+            history_work: prior_work,
         };
         self.index().packing().store.with_record_transaction(|| {
             build(
@@ -342,6 +344,52 @@ impl CatalogCheckpointCodingDirectoryIndex {
 }
 
 impl CatalogCheckpointCodingStateIndex {
+    pub(super) fn history_work(&self) -> Work {
+        self.manifest.history_work
+    }
+
+    pub(super) fn recheck_history_points(
+        &self,
+        history: &CatalogGuildHistoryView<'_>,
+        trust: &PagedCheckpointTrust,
+    ) -> Result<(), CatalogStoreError> {
+        let header = self.header(trust)?;
+        let coding = history.coding_trust();
+        if coding != self.trust {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let mut after = None;
+        let mut count = 0_u64;
+        while let Some(group) = self.index.index().next_group_row(after)? {
+            let id = group.group.range.group_id;
+            let fact = history
+                .coding_group(id, &coding)?
+                .ok_or(DatabaseError::NotReady)?;
+            let placement = self
+                .index
+                .index()
+                .packing()
+                .store
+                .get_record_bounded(PLACEMENT, &id, ROW_BYTES)?
+                .ok_or(DatabaseError::NotReady)?;
+            if !fact.matches(group, &coding)
+                || decode_row::<bool>(&placement)?
+                    && !(group.group.retired_at_event.is_none()
+                        && fact.authorization == CatalogCodingAuthorization::CurrentPlacement)
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            count = count
+                .checked_add(1)
+                .filter(|count| *count <= coding.retained_groups)
+                .ok_or(DatabaseError::Integrity)?;
+            after = Some(id);
+        }
+        if count != header.coding.summary.coding.groups {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(())
+    }
     pub fn index(&self) -> &CatalogCheckpointCodingDirectoryIndex {
         &self.index
     }
@@ -364,7 +412,7 @@ impl CatalogCheckpointCodingStateIndex {
         let header = self.index.header(trust)?;
         self.budget.remaining_after(self.manifest.work)?;
         let store = &self.index.index().packing().store;
-        if self.manifest.format_version != 1
+        if self.manifest.format_version != 2
             || self.manifest.checkpoint_hash != header.hash()?
             || self.manifest.snapshot_hash != self.trust.hash()?
             || store
@@ -486,10 +534,11 @@ mod tests {
         (
             header,
             Manifest {
-                format_version: 1,
+                format_version: 2,
                 checkpoint_hash: header.hash().unwrap(),
                 snapshot_hash: trust.hash().unwrap(),
                 work,
+                history_work: Work::default(),
             },
         )
     }

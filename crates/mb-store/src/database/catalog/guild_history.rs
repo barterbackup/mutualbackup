@@ -14,6 +14,9 @@ use super::checkpoint_transition::snapshot_hash;
 use super::*;
 use crate::RecordScratchStore;
 
+mod historical;
+pub use historical::CatalogGuildHistorySnapshot;
+
 const MEMBERS: &str = "guild-history-membership";
 const WRITERS: &str = "guild-history-writer";
 const LATEST_WRITER: &str = "guild-history-latest-writer";
@@ -22,7 +25,9 @@ const LATEST_RECOVERY: &str = "guild-history-latest-recovery";
 const GROUPS: &str = "guild-history-group";
 const FACTS: &str = "guild-history-coding-fact";
 const COMPLETE: &str = "guild-history-complete";
-const KINDS: [&str; 8] = [
+const EVENTS: &str = "guild-history-event-tip";
+const ARCHIVE: &str = "guild-history-coding-incarnation";
+const KINDS: [&str; 10] = [
     MEMBERS,
     WRITERS,
     LATEST_WRITER,
@@ -31,6 +36,8 @@ const KINDS: [&str; 8] = [
     GROUPS,
     FACTS,
     COMPLETE,
+    EVENTS,
+    ARCHIVE,
 ];
 const ROW_BYTES: usize = 256;
 const RECOVERY_BYTES: usize = 6144;
@@ -146,6 +153,7 @@ struct Manifest {
     snapshot_hash: [u8; 32],
     retained_groups: u64,
     retired_groups: u64,
+    incarnations: u64,
     work: Work,
 }
 
@@ -325,9 +333,11 @@ impl CatalogGuildHistoryIndex {
                     GUILD_AUTHORITY_SNAPSHOT_BYTES,
                     None,
                 )?;
+                historical::write_tip(&store, &mut meter, &snapshot, 0, 0)?;
                 let mut after = None;
                 let mut retained = 0_u64;
                 let mut retired = 0_u64;
+                let mut incarnations = 0_u64;
                 loop {
                     meter.metadata()?;
                     let Some((sequence, length)) = source.next_event(after)? else {
@@ -361,6 +371,9 @@ impl CatalogGuildHistoryIndex {
                             &mut retired,
                         )
                     })?;
+                    if certified.event.kind.coding_group_add().is_some() {
+                        incarnations = incarnations.checked_add(1).ok_or(CatalogError::Bounds)?;
+                    }
                     if snapshot.membership_epoch != epoch {
                         write(
                             &store,
@@ -372,6 +385,7 @@ impl CatalogGuildHistoryIndex {
                             None,
                         )?;
                     }
+                    historical::write_tip(&store, &mut meter, &snapshot, retained, retired)?;
                     after = Some(sequence);
                 }
                 if !matches_tip(&snapshot, &checkpoint) {
@@ -403,6 +417,12 @@ impl CatalogGuildHistoryIndex {
                         group.transcript_hash,
                         CatalogCodingAuthorization::Retained,
                     )?;
+                    historical::check_retained(
+                        &store,
+                        &mut meter,
+                        &group,
+                        checkpoint.event_sequence,
+                    )?;
                     let fact = Fact {
                         guild_id: public.guild_id,
                         lifecycle: public.lifecycle,
@@ -418,11 +438,19 @@ impl CatalogGuildHistoryIndex {
                 if count != retained || retired_count != retired || read_trust()? != checkpoint {
                     return Err(DatabaseError::Conflict.into());
                 }
+                historical::check_archive(
+                    &store,
+                    &mut meter,
+                    incarnations,
+                    checkpoint.event_sequence,
+                    checkpoint.guild_id,
+                )?;
                 let manifest = Manifest {
-                    format_version: 1,
+                    format_version: 2,
                     snapshot_hash: hash,
                     retained_groups: retained,
                     retired_groups: retired,
+                    incarnations,
                     work: meter.used,
                 };
                 // Already reserved above. Check ignored writes and exact readback.
@@ -712,6 +740,7 @@ fn apply_effect(
                 GROUP_BYTES,
                 None,
             )?;
+            historical::add(store, meter, group, sequence, expected)?;
             *retained = retained.checked_add(1).ok_or(CatalogError::Bounds)?;
         }
         GuildEventKind::RetireCodingGroup {
@@ -726,6 +755,7 @@ fn apply_effect(
             }
             group.retained.retired_at_event = Some(sequence);
             group.retained.retain_through_event = Some(*retain_through_event);
+            historical::retire(store, meter, &group, sequence)?;
             write(
                 store,
                 meter,
@@ -748,6 +778,7 @@ fn apply_effect(
             {
                 return Err(DatabaseError::Conflict.into());
             }
+            historical::forget(store, meter, &group, sequence)?;
             meter.metadata()?;
             store.delete_record_if_value(GROUPS, group_id, &old)?;
             if get::<Group>(store, meter, GROUPS, group_id, GROUP_BYTES)?.is_some() {

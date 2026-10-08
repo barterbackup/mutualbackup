@@ -950,3 +950,764 @@ fn actual_control_store_source_reads_metadata_before_original_bounded_records() 
         .is_err()
     );
 }
+
+#[test]
+fn historical_prefixes_preserve_original_lifecycle_and_writer_incarnations() {
+    let mut history = History::new(false, 4);
+    let owner = history.keys[0].node_id();
+    let group_id = history.entry.retained.group.id;
+    history.push(GuildEventKind::RotateWriterKey {
+        owner,
+        epoch: 2,
+        public_key: history.keys[1].node_id().0,
+    });
+    history.push(GuildEventKind::RevokeWriterKey { owner, epoch: 2 });
+    let retired = history.state.event_sequence + 1;
+    history.push(GuildEventKind::RetireCodingGroup {
+        group_id,
+        retain_through_event: retired,
+    });
+    history.push(GuildEventKind::ForgetCodingGroup { group_id });
+    history.add(true);
+    history.push(GuildEventKind::RelabelMember {
+        node_id: owner,
+        failure_domain: "changed-current-domain".into(),
+    });
+    let index = history.build();
+    let current = history.trust();
+    let view = index.view(|| Ok(current.clone())).unwrap();
+    let first = GuildAuthoritySnapshot::from_genesis(&history.genesis).unwrap();
+    let mut replay = DynamicGuildState::new(
+        first.guild_id,
+        first.event_head,
+        first.quorum,
+        first.active_members().cloned().collect(),
+    )
+    .unwrap();
+    for sequence in 0..=current.event_sequence {
+        if sequence != 0 {
+            replay
+                .apply_event(
+                    &QuorumGuildEvent::decode_bounded(&history.source.events[&sequence]).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut trust = current.clone();
+        trust.event_sequence = replay.event_sequence;
+        trust.event_head = replay.event_head;
+        trust.authority.membership_epoch = replay.membership_epoch;
+        trust.authority.quorum = replay.quorum;
+        trust.members = replay.active_members().cloned().collect();
+        let prefix = view
+            .at(&trust, CatalogGuildHistoryView::snapshot_lookup_work())
+            .unwrap();
+        assert_eq!(
+            prefix.coding_trust().retained_groups,
+            replay.coding_groups.len() as u64
+        );
+        assert_eq!(
+            prefix.coding_trust().retired_groups,
+            replay
+                .coding_groups
+                .iter()
+                .filter(|group| group.retired_at_event.is_some())
+                .count() as u64
+        );
+        let expected = replay
+            .coding_groups
+            .iter()
+            .find(|group| group.group.id == group_id)
+            .map(|retained| {
+                CatalogCertifiedCodingGroup::from_retained(
+                    retained,
+                    *blake3::hash(&canonical_bytes(&history.entry.transcript).unwrap()).as_bytes(),
+                    CatalogCodingAuthorization::Retained,
+                )
+                .unwrap()
+            });
+        assert_eq!(
+            prefix.coding_group(group_id).unwrap(),
+            expected,
+            "event {sequence}"
+        );
+        assert!(prefix.coding_group([0; 32]).unwrap().is_none());
+        assert!(prefix.coding_group([255; 32]).unwrap().is_none());
+        for epoch in 1..=3 {
+            assert_eq!(
+                prefix.writer_key(owner, epoch).unwrap().as_ref(),
+                replay
+                    .writer_keys
+                    .iter()
+                    .find(|entry| entry.owner == owner && entry.epoch == epoch),
+                "writer epoch {epoch} at event {sequence}"
+            );
+        }
+    }
+    assert_eq!(index.manifest.incarnations, 2);
+    let coding = view.coding_trust();
+    assert_eq!(
+        view.coding_group(group_id, &coding)
+            .unwrap()
+            .unwrap()
+            .authorization,
+        CatalogCodingAuthorization::Retained
+    );
+    assert_eq!(
+        view.coding_group(group_id, &coding)
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .added_at_event,
+        11
+    );
+}
+
+#[test]
+fn historical_snapshot_admission_and_exact_event_roster_checks_precede_authority() {
+    let history = History::new(false, 4);
+    let index = history.build();
+    let current = history.trust();
+    let view = index.view(|| Ok(current.clone())).unwrap();
+    let work = CatalogGuildHistoryView::snapshot_lookup_work();
+    for dimension in [0, 1] {
+        let mut short = work;
+        if dimension == 0 {
+            short.bytes -= 1;
+        } else {
+            short.records -= 1;
+        }
+        assert!(view.at(&current, short).is_err());
+    }
+    for mode in 0..6 {
+        let mut damaged = current.clone();
+        match mode {
+            0 => damaged.event_head = [99; 32],
+            1 => damaged.authority.membership_epoch -= 1,
+            2 => damaged.members[0].failure_domain.push('x'),
+            3 => damaged.genesis_hash = [99; 32],
+            4 => damaged.event_sequence += 1,
+            _ => damaged.authority.quorum.rule = mb_core::QuorumRule::Majority,
+        }
+        assert!(view.at(&damaged, work).is_err(), "mode {mode}");
+    }
+    let event_key = current.event_sequence.to_be_bytes();
+    let original = index
+        .store
+        .get_record_bounded(EVENTS, &event_key, ROW_BYTES)
+        .unwrap()
+        .unwrap();
+    index
+        .store
+        .delete_record_if_value(EVENTS, &event_key, &original)
+        .unwrap();
+    assert!(view.at(&current, work).is_err());
+    index
+        .store
+        .put_record_if_absent(EVENTS, &event_key, &original)
+        .unwrap();
+    let mut tip: historical::Tip = decode_canonical(&original).unwrap();
+    tip.sequence -= 1;
+    let damaged = canonical_bytes(&tip).unwrap();
+    index
+        .store
+        .replace_record_if_value(EVENTS, &event_key, &original, &damaged)
+        .unwrap();
+    assert!(view.at(&current, work).is_err());
+    index
+        .store
+        .replace_record_if_value(EVENTS, &event_key, &damaged, &original)
+        .unwrap();
+    let epoch_key = current.authority.membership_epoch.to_be_bytes();
+    let roster = index
+        .store
+        .get_record_bounded(MEMBERS, &epoch_key, GUILD_AUTHORITY_SNAPSHOT_BYTES)
+        .unwrap()
+        .unwrap();
+    index
+        .store
+        .delete_record_if_value(MEMBERS, &epoch_key, &roster)
+        .unwrap();
+    assert!(view.at(&current, work).is_err());
+}
+
+#[test]
+fn historical_archive_updates_and_range_reads_fail_closed() {
+    let mut history = History::new(false, 4);
+    let id = history.entry.retained.group.id;
+    let retired = history.state.event_sequence + 1;
+    history.push(GuildEventKind::RetireCodingGroup {
+        group_id: id,
+        retain_through_event: retired,
+    });
+    history.push(GuildEventKind::ForgetCodingGroup { group_id: id });
+    let store = RecordScratchStore::new(8 << 20).unwrap();
+    store.database_shell_statement(&format!("CREATE TEMP TRIGGER ignore_archive_update BEFORE UPDATE ON scratch.protocol_records WHEN NEW.kind='{ARCHIVE}' BEGIN SELECT RAISE(IGNORE); END"), false).unwrap();
+    assert!(
+        CatalogGuildHistoryIndex::build(
+            store,
+            &history.genesis,
+            budget(),
+            Work::default(),
+            || Ok(history.trust()),
+            &mut history.source.clone()
+        )
+        .is_err()
+    );
+    let index = history.build();
+    let current = history.trust();
+    let view = index.view(|| Ok(current.clone())).unwrap();
+    let prefix = view
+        .at(&current, CatalogGuildHistoryView::snapshot_lookup_work())
+        .unwrap();
+    let row = index
+        .store
+        .next_record_bounded(ARCHIVE, None, 40, ROW_BYTES)
+        .unwrap()
+        .unwrap();
+    index
+        .store
+        .replace_record_if_value(ARCHIVE, &row.0, &row.1, &vec![0; ROW_BYTES + 1])
+        .unwrap();
+    assert!(prefix.coding_group(id).is_err());
+    let range = RecordScratchStore::new(1 << 20).unwrap();
+    for key in [b"a1", b"a2", b"b1"] {
+        range.put_record_if_absent("range", key, key).unwrap();
+    }
+    assert_eq!(
+        range
+            .record_at_or_before_bounded("range", b"a", b"a9", 2, 2)
+            .unwrap(),
+        Some((b"a2".to_vec(), b"a2".to_vec()))
+    );
+    assert!(
+        range
+            .record_at_or_before_bounded("range", b"c", b"c9", 2, 2)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        range
+            .record_at_or_before_bounded("range", b"a", b"a9", 1, 2)
+            .is_err()
+    );
+    assert!(
+        range
+            .record_at_or_before_bounded("range", b"a", b"a9", 2, 1)
+            .is_err()
+    );
+    assert!(
+        range
+            .record_at_or_before_bounded("range", b"z", b"a", 2, 2)
+            .is_err()
+    );
+}
+
+fn real_checkpoint() -> (super::super::checkpoint_validation::tests::Fixture, History) {
+    use mb_core::CatalogCheckpointAuthorityRecord as R;
+    let mut fixture = super::super::checkpoint_validation::tests::Fixture::new(true, false);
+    let (_, _, packing) = fixture.packing_inputs_with_byte_roots();
+    let entry =
+        super::super::coding_coverage::tests::entry_at_epoch(&packing, [0, 1, 2], 701, 3, None, 7);
+    let mut keys = (11..14)
+        .map(|seed| KeyMaterial::from_seed(&Seed::from_bytes([seed; 32])))
+        .collect::<Vec<_>>();
+    keys.extend((0..8).map(|index| {
+        let mut seed = [index as u8 + 38; 32];
+        seed[..8].copy_from_slice(&701_u64.to_be_bytes());
+        KeyMaterial::from_seed(&Seed::from_bytes(seed))
+    }));
+    let mut members = fixture.sources.certificate.checkpoint.members.clone();
+    members.extend((0..2).map(|index| Member {
+        node_id: keys[index + 3].node_id(),
+        recovery_public_key: keys[index + 3].recovery_public_key(),
+        failure_domain: format!("701:{index:012}"),
+    }));
+    members.sort_by_key(|member| member.node_id);
+    let genesis = GuildGenesis {
+        format_version: 1,
+        guild_id: fixture.context.guild_id,
+        coordinator: keys[0].node_id(),
+        members,
+    };
+    let mut signatures = keys
+        .iter()
+        .filter(|key| {
+            genesis
+                .members
+                .iter()
+                .any(|member| member.node_id == key.node_id())
+        })
+        .map(|key| genesis.member_signature(key).unwrap())
+        .collect::<Vec<_>>();
+    signatures.sort_by_key(|signature| signature.signer);
+    let genesis = QuorumGuildGenesis {
+        genesis,
+        signatures,
+    };
+    let initial = GuildAuthoritySnapshot::from_genesis(&genesis).unwrap();
+    let state = DynamicGuildState::new(
+        initial.guild_id,
+        initial.event_head,
+        initial.quorum,
+        initial.active_members().cloned().collect(),
+    )
+    .unwrap();
+    let mut history = History {
+        keys,
+        genesis,
+        state,
+        source: Source::default(),
+        entry,
+    };
+    history.push(GuildEventKind::RotateWriterKey {
+        owner: history.keys[0].node_id(),
+        epoch: 1,
+        public_key: fixture.sources.writer.verifying_key().to_bytes(),
+    });
+    for index in 2..8 {
+        history.push(GuildEventKind::AddMember {
+            member: Member {
+                node_id: history.keys[index + 3].node_id(),
+                recovery_public_key: history.keys[index + 3].recovery_public_key(),
+                failure_domain: format!("701:{index:012}"),
+            },
+        });
+    }
+    history.add(false);
+    fixture.context.generation = 1;
+    fixture.context.event_sequence = history.state.event_sequence;
+    fixture.context.event_head = history.state.event_head;
+    fixture.context.authority = history.trust().authority;
+    fixture
+        .records
+        .retain(|record| !matches!(record, R::Member(_)));
+    fixture
+        .records
+        .extend(history.state.active_members().cloned().map(R::Member));
+    (fixture, history)
+}
+
+fn real_reader(history: &History, trust: &PagedCheckpointTrust) -> CatalogGuildHistoryIndex {
+    CatalogGuildHistoryIndex::build(
+        RecordScratchStore::new(16 << 20).unwrap(),
+        &history.genesis,
+        budget(),
+        Work::default(),
+        || Ok(trust.clone()),
+        &mut history.source.clone(),
+    )
+    .unwrap()
+}
+
+fn real_body(
+    fixture: &mut super::super::checkpoint_validation::tests::Fixture,
+    history: &History,
+    reader: &CatalogGuildHistoryIndex,
+    trust: &PagedCheckpointTrust,
+    concrete: bool,
+) -> CatalogCheckpointCodingStateIndex {
+    use mb_core::CatalogCheckpointAuthorityRecord as R;
+    fixture.context.generation = trust.next_generation().unwrap();
+    fixture.context.event_sequence = trust.event_sequence;
+    fixture.context.event_head = trust.event_head;
+    fixture.context.authority = trust.authority;
+    fixture
+        .records
+        .retain(|record| !matches!(record, R::Member(_)));
+    fixture
+        .records
+        .extend(trust.members.iter().cloned().map(R::Member));
+    let mut original = history.entry.clone();
+    original.retained = history
+        .state
+        .coding_groups
+        .iter()
+        .find(|group| group.group.id == original.retained.group.id)
+        .unwrap()
+        .clone();
+    let (body, _) = fixture.joined_with_groups_and_members(
+        budget(),
+        CatalogCodingCoveragePolicy::Current,
+        &trust.members,
+        true,
+        |_, _| vec![original],
+    );
+    if concrete {
+        body.validate_certified_history_coding_state(reader, budget(), || Ok(trust.clone()))
+            .unwrap()
+    } else {
+        let view = reader.view(|| Ok(trust.clone())).unwrap();
+        body.validate_certified_coding_state(
+            budget(),
+            || Ok(view.coding_trust()),
+            |id, trust| view.coding_group(id, trust),
+        )
+        .unwrap()
+    }
+}
+
+fn real_certificate(
+    transition: CatalogCheckpointTransitionIndex,
+    history: &History,
+) -> CatalogQuorumPagedCheckpointIndex {
+    let trust = transition.trust().clone();
+    let mut checkpoint = None;
+    let mut signatures = Vec::new();
+    for key in &history.keys {
+        if trust
+            .members
+            .iter()
+            .any(|member| member.node_id == key.node_id())
+        {
+            let (body, signature) = transition
+                .sign_paged_checkpoint_header(key, || Ok(trust.clone()))
+                .unwrap();
+            checkpoint = Some(body);
+            signatures.push(signature);
+        }
+    }
+    signatures.sort_by_key(|signature| signature.signer);
+    transition
+        .bind_paged_checkpoint_header(
+            mb_core::QuorumPagedCheckpoint {
+                checkpoint: checkpoint.unwrap(),
+                signatures,
+            },
+            || Ok(trust.clone()),
+        )
+        .unwrap()
+}
+
+fn readd_with_new_witness(history: &mut History) {
+    let group_id = history.entry.retained.group.id;
+    let retired = history.state.event_sequence + 1;
+    history.push(GuildEventKind::RetireCodingGroup {
+        group_id,
+        retain_through_event: retired,
+    });
+    history.push(GuildEventKind::ForgetCodingGroup { group_id });
+    let mut transcript = history.entry.transcript.value.clone();
+    transcript.verified_at_unix_seconds -= 1;
+    history.entry.transcript = mb_core::SignedRecord::sign(
+        mb_core::CODING_TRANSCRIPT_DOMAIN,
+        transcript,
+        history.keys.last().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        replay_coding_transcript(&history.entry.transcript).unwrap(),
+        CodingReplayFinding::Verified
+    );
+    history.add(false);
+}
+
+#[test]
+fn real_history_certifies_original_public_body_and_paged_successor_after_readd() {
+    let (mut fixture, mut history) = real_checkpoint();
+    let initial = history.trust();
+    let reader = real_reader(&history, &initial);
+    let body = real_body(&mut fixture, &history, &reader, &initial, true);
+    assert_eq!(body.history_work(), reader.represented_work());
+    let transition = body
+        .validate_certified_history_authority_transition(None, &reader, budget(), || {
+            Ok(initial.clone())
+        })
+        .unwrap();
+    assert!(transition.has_certified_history_transition());
+    let previous = real_certificate(transition, &history);
+    let old_group = previous
+        .index()
+        .index()
+        .next_group_row(None)
+        .unwrap()
+        .unwrap();
+    readd_with_new_witness(&mut history);
+    let mut current = history.trust();
+    current.previous = Some(mb_core::PagedCheckpointParent {
+        generation: previous.certificate().checkpoint.generation,
+        hash: previous.certificate().hash().unwrap(),
+    });
+    let reader = real_reader(&history, &current);
+    let body = real_body(&mut fixture, &history, &reader, &current, true);
+    let new_group = body.index().index().next_group_row(None).unwrap().unwrap();
+    assert_eq!(
+        old_group.group.range.group_id,
+        new_group.group.range.group_id
+    );
+    assert_ne!(
+        old_group.group.range.transcript_hash,
+        new_group.group.range.transcript_hash
+    );
+    assert_eq!(old_group.group.added_at_event, 8);
+    assert_eq!(new_group.group.added_at_event, 11);
+    let transition = body
+        .validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Paged(&previous)),
+            &reader,
+            budget(),
+            || Ok(current.clone()),
+        )
+        .unwrap();
+    let work = transition.represented_work();
+    assert!(transition.has_certified_history_transition());
+    let successor = real_certificate(transition, &history);
+    assert_eq!(
+        successor.certificate().checkpoint.parent,
+        Some(previous.certificate().hash().unwrap())
+    );
+    successor.recheck_header(|| Ok(current.clone())).unwrap();
+    // A fixed-fact caller which has not already admitted replay pays exactly
+    // the same total; an already admitted history ledger is not charged twice.
+    let body = real_body(&mut fixture, &history, &reader, &current, false);
+    assert_eq!(body.history_work(), Work::default());
+    let transition = body
+        .validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Paged(&previous)),
+            &reader,
+            work,
+            || Ok(current.clone()),
+        )
+        .unwrap();
+    assert_eq!(transition.represented_work(), work);
+}
+
+#[test]
+fn real_history_transition_admits_all_debt_and_rejects_missing_old_incarnations() {
+    let (mut fixture, mut history) = real_checkpoint();
+    let initial = history.trust();
+    let reader = real_reader(&history, &initial);
+    let body = real_body(&mut fixture, &history, &reader, &initial, true);
+    let previous = real_certificate(
+        body.validate_certified_history_authority_transition(None, &reader, budget(), || {
+            Ok(initial.clone())
+        })
+        .unwrap(),
+        &history,
+    );
+    readd_with_new_witness(&mut history);
+    let mut current = history.trust();
+    current.previous = Some(mb_core::PagedCheckpointParent {
+        generation: 1,
+        hash: previous.certificate().hash().unwrap(),
+    });
+    let reader = real_reader(&history, &current);
+    let body = real_body(&mut fixture, &history, &reader, &current, true);
+    let exact = body
+        .validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Paged(&previous)),
+            &reader,
+            budget(),
+            || Ok(current.clone()),
+        )
+        .unwrap()
+        .represented_work();
+    let old = reader
+        .store
+        .next_record_bounded(ARCHIVE, None, 40, ROW_BYTES)
+        .unwrap()
+        .unwrap();
+    reader
+        .store
+        .delete_record_if_value(ARCHIVE, &old.0, &old.1)
+        .unwrap();
+    for dimension in 0..3 {
+        let body = real_body(&mut fixture, &history, &reader, &current, true);
+        let mut short = exact;
+        match dimension {
+            0 => short.bytes -= 1,
+            1 => short.page_occurrences -= 1,
+            _ => short.records -= 1,
+        }
+        assert!(matches!(
+            body.validate_certified_history_authority_transition(
+                Some(CatalogCheckpointPrevious::Paged(&previous)),
+                &reader,
+                short,
+                || Ok(current.clone())
+            ),
+            Err(CatalogStoreError::Page(CatalogError::Bounds))
+        ));
+    }
+    let body = real_body(&mut fixture, &history, &reader, &current, true);
+    assert!(
+        body.validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Paged(&previous)),
+            &reader,
+            exact,
+            || Ok(current.clone())
+        )
+        .is_err()
+    );
+    let rebuilt = real_reader(&history, &current);
+    let body = real_body(&mut fixture, &history, &rebuilt, &current, true);
+    body.validate_certified_history_authority_transition(
+        Some(CatalogCheckpointPrevious::Paged(&previous)),
+        &rebuilt,
+        exact,
+        || Ok(current.clone()),
+    )
+    .unwrap();
+    let body = real_body(&mut fixture, &history, &rebuilt, &current, true);
+    let mut reads = 0;
+    assert!(
+        body.validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Paged(&previous)),
+            &rebuilt,
+            budget(),
+            || {
+                reads += 1;
+                let mut snapshot = current.clone();
+                if reads == 3 {
+                    snapshot.event_head = [99; 32];
+                }
+                Ok(snapshot)
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(reads, 3);
+    previous.recheck_header(|| Ok(initial.clone())).unwrap();
+
+    // Retained fences must also match original writer history, even when no
+    // new revision needs a latest-writer lookup in the successor comparison.
+    let row = rebuilt
+        .store
+        .next_record_bounded(WRITERS, None, 40, ROW_BYTES)
+        .unwrap()
+        .unwrap();
+    let mut writer: WriterKeyEpoch = decode_canonical(&row.1).unwrap();
+    writer.public_key = history.keys[1].node_id().0;
+    rebuilt
+        .store
+        .replace_record_if_value(WRITERS, &row.0, &row.1, &canonical_bytes(&writer).unwrap())
+        .unwrap();
+    let body = real_body(&mut fixture, &history, &rebuilt, &current, true);
+    assert!(matches!(
+        body.validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Paged(&previous)),
+            &rebuilt,
+            budget(),
+            || Ok(current.clone())
+        ),
+        Err(CatalogStoreError::Model(ModelError::InvalidWriterFence))
+    ));
+}
+
+#[test]
+fn real_history_rejects_a_later_quorum_certified_fork_of_the_previous_event_tip() {
+    let (mut fixture, history) = real_checkpoint();
+    let initial = history.trust();
+    let reader = real_reader(&history, &initial);
+    let body = real_body(&mut fixture, &history, &reader, &initial, true);
+    let previous = real_certificate(
+        body.validate_certified_history_authority_transition(None, &reader, budget(), || {
+            Ok(initial.clone())
+        })
+        .unwrap(),
+        &history,
+    );
+
+    let (mut fixture, mut fork) = real_checkpoint();
+    let genesis = GuildAuthoritySnapshot::from_genesis(&fork.genesis).unwrap();
+    fork.state = DynamicGuildState::new(
+        genesis.guild_id,
+        genesis.event_head,
+        genesis.quorum,
+        genesis.active_members().cloned().collect(),
+    )
+    .unwrap();
+    for bytes in fork.source.events.values().take(7) {
+        fork.state
+            .apply_event(&QuorumGuildEvent::decode_bounded(bytes).unwrap())
+            .unwrap();
+    }
+    fork.source.events.retain(|sequence, _| *sequence <= 7);
+    let mut transcript = fork.entry.transcript.value.clone();
+    transcript.verified_at_unix_seconds -= 1;
+    fork.entry.transcript = mb_core::SignedRecord::sign(
+        mb_core::CODING_TRANSCRIPT_DOMAIN,
+        transcript,
+        fork.keys.last().unwrap(),
+    )
+    .unwrap();
+    fork.add(false);
+    fork.push(GuildEventKind::SetQuorum {
+        policy: fork.state.quorum,
+    });
+    let mut current = fork.trust();
+    current.previous = Some(mb_core::PagedCheckpointParent {
+        generation: 1,
+        hash: previous.certificate().hash().unwrap(),
+    });
+    assert_eq!(initial.genesis_hash, current.genesis_hash);
+    assert_eq!(initial.members, current.members);
+    assert!(initial.event_sequence < current.event_sequence);
+    assert!(initial.authority.membership_epoch < current.authority.membership_epoch);
+    let reader = real_reader(&fork, &current);
+    let body = real_body(&mut fixture, &fork, &reader, &current, true);
+    assert!(matches!(
+        body.validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Paged(&previous)),
+            &reader,
+            budget(),
+            || Ok(current.clone())
+        ),
+        Err(CatalogStoreError::Database(DatabaseError::Conflict))
+    ));
+    previous.recheck_header(|| Ok(initial.clone())).unwrap();
+}
+
+#[test]
+fn real_history_migrates_an_empty_legacy_prefix_and_rejects_omitted_variable_history() {
+    for sequence in [7, 8] {
+        let (mut fixture, history) = real_checkpoint();
+        let mut old = history.trust();
+        old.event_sequence = sequence;
+        old.event_head = QuorumGuildEvent::decode_bounded(&history.source.events[&sequence])
+            .unwrap()
+            .event
+            .hash()
+            .unwrap();
+        let mut certificate = fixture.sources.certificate.clone();
+        certificate.checkpoint.genesis_hash = old.genesis_hash;
+        certificate.checkpoint.members = old.members.clone();
+        certificate.checkpoint.authority = Some(old.authority);
+        certificate.signatures.clear();
+        for key in &history.keys {
+            certificate.add_signature(key).unwrap();
+        }
+        certificate.verify().unwrap();
+        assert!(certificate.checkpoint.coding_groups.is_empty());
+        let mut current = history.trust();
+        current.previous = Some(mb_core::PagedCheckpointParent {
+            generation: 1,
+            hash: certificate.hash().unwrap(),
+        });
+        let reader = real_reader(&history, &current);
+        let body = real_body(&mut fixture, &history, &reader, &current, true);
+        let transition = body.validate_certified_history_authority_transition(
+            Some(CatalogCheckpointPrevious::Legacy {
+                certificate: &certificate,
+                trust: &old,
+            }),
+            &reader,
+            budget(),
+            || Ok(current.clone()),
+        );
+        if sequence == 7 {
+            let transition = transition.unwrap();
+            assert!(transition.has_certified_history_transition());
+            let successor = real_certificate(transition, &history);
+            assert_eq!(successor.certificate().checkpoint.generation, 2);
+            assert_eq!(
+                successor.certificate().checkpoint.parent,
+                Some(certificate.hash().unwrap())
+            );
+        } else {
+            assert!(matches!(
+                transition,
+                Err(CatalogStoreError::Database(DatabaseError::NotReady))
+            ));
+        }
+    }
+}

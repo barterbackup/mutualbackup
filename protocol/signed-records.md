@@ -229,9 +229,25 @@ and lifecycle; current writers use the latest incarnation with no revoked-key
 fallback. The scoped decoders preserve all original signed layouts and hashes.
 The concrete coding-join entry point carries the history reader's complete
 replay/prior work into successor validation. Missing original evidence or stale
-trust fails closed, with atomic disposable completion. Durable compact tip
-publication and normal bounded history consumers, fixed legacy-group migration,
-complete coding successors and enclosing publication/ownership remain required.
+trust fails closed, with atomic disposable completion.
+
+The disposable projection retains fixed event tips and coding incarnations
+after forgetting. Its bounded historical-prefix view checks the exact original
+event head, membership epoch, quorum, roster and independently replayed retained
+counts. A fixed indexed range read resolves the original group/witness/lifecycle
+at that prefix, even after the same ID is forgotten and re-added. Historical
+writer lookups exclude later activation and clip later revocation. The concrete
+`validate_certified_history_authority_transition` entry point checks current
+and previous complete coding state and all retained writer fences against this
+same original chain. A higher event sequence/epoch alone cannot authorize a
+forked predecessor. An empty legacy coding prefix is supported; fixed legacy
+groups or legacy omission of retained variable groups fail closed pending
+explicit migration. Replay debt is carried once, with all additional history
+comparisons admitted before point reads. The private transition marker records
+whether this route completed. The external-authorizer draft route still exists;
+future normal publication must require the concrete history checks. Durable
+compact tip publication, incremental consumers, archive retention/compaction,
+fixed legacy migration and enclosing publication/ownership remain required.
 
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone

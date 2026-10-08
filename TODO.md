@@ -1696,6 +1696,28 @@ separately below.
     checks. Durable compact certified-tip indexing and normal consumers,
     complete previous-checkpoint coding/fixed legacy migration, aggregate
     physical/dataset/guild quota and retained 1 TiB/release gates remain open.
+  - [x] Join paged predecessor and successor authority to exact original-history
+    prefixes. Retain fixed event tips and every variable coding incarnation,
+    including forgotten groups, in the disposable encrypted projection. Bounded
+    prefix lookups check exact original head, epoch/quorum, roster and retained
+    counts; one indexed range read resolves a historical group after later
+    Forget/re-Add of the same ID. The concrete history transition checks both
+    complete coding states, original witness hashes/lifecycles, current placement
+    and every retained writer fence against the original chain, then performs
+    the existing full revision/tombstone comparison. Admit replay work once and
+    all additional history work before point reads; bind this route in the
+    private completion marker. Genuine original genesis/events, source-owner
+    writer authority, coding witnesses and quorum-bound paged certificates
+    exercise successors, forks, changed witnesses, missing incarnations, writer
+    substitution, stale trust and every budget dimension. Empty legacy coding
+    prefixes migrate; fixed legacy groups and omitted retained variable history
+    fail closed. All 250 ordinary locked Store tests pass (26 ignored), with
+    strict locked workspace/all-targets Clippy and formatting/diff checks; see
+    ADR 0002. The external-authorizer draft route remains available; normal
+    publication must require concrete history checks.
+    Durable compact tip/incremental consumers, archive retention/compaction,
+    fixed legacy migration, payload/private ownership, complete capacity/quota
+    and retained 1 TiB/platform/release gates remain open.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
@@ -1707,7 +1729,8 @@ separately below.
     fences, retained tombstones, globally unique revision IDs, all legacy/body
     and source/bootstrap EOFs, migration-evidence quorum, integration of exact
     current packed-input coverage, durable compact certified-history tip and
-    normal bounded snapshot/group lookup integration, complete retained coding lifecycle transitions and
+    normal bounded snapshot/group lookup integration, production integration of
+    the complete retained variable coding lifecycle comparisons and
     fixed legacy-group migration without changing identities. Retain and retire
     remaining logical root references inside coding records and source/native
     payload owners through bounded durable ownership, and guard authority-root

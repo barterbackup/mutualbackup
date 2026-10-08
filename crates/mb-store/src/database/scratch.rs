@@ -216,6 +216,18 @@ impl RecordScratchStore {
             .next_record_bounded(kind, after, key_limit, payload_limit)
     }
 
+    pub fn record_at_or_before_bounded(
+        &self,
+        kind: &str,
+        lower: &[u8],
+        upper: &[u8],
+        key_limit: usize,
+        payload_limit: usize,
+    ) -> Result<Option<ProtocolRecordRow>, DatabaseError> {
+        self.records
+            .record_at_or_before_bounded(kind, lower, upper, key_limit, payload_limit)
+    }
+
     pub fn for_each_record_bounded(
         &self,
         kind: &str,
