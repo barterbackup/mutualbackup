@@ -1737,6 +1737,24 @@ separately below.
     downgrade projection rebuilding or complete durable history indexes; those
     and checkpoint ownership/publication, capacity/quota and qualification
     remain required.
+  - [x] Persist bounded historical membership epochs for normal coding-attempt
+    authority checks. Verified ingestion adds at most one immutable bounded
+    roster row and advances a fixed completion marker in the original event/
+    compact-tip transaction. Bind each row to the unchanged original genesis
+    and exact original certificate bytes; bound SQL reads and reject missing,
+    corrupt, stale or concurrently changed indexed rows. New guilds index from
+    epoch one; older/recovered states declare a contiguous indexed suffix and
+    retain original legacy replay below it. Current attempt checks use the
+    compact roster; historical cleanup uses indexed epoch lookups without
+    materializing accumulated writer/recovery/coding vectors or a full-state
+    history cache. Original plan signatures, placement/domain rules, current
+    epoch fencing and deadline semantics remain enforced. All 428 ordinary Node
+    tests are covered across the broad and final targeted runs (21 ignored),
+    with strict locked workspace/all-targets Clippy and formatting/diff checks;
+    see ADR 0002 for the timing-failure/rerun evidence and remaining gates.
+    Bounded legacy-prefix rebuilding, durable writer/recovery/group indexes,
+    flat mutation replacement, history retention/quota, checkpoint ownership/
+    publication and all retained 1 TiB/platform/release gates remain required.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

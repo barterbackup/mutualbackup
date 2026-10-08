@@ -3529,3 +3529,81 @@ history validation, rather than failing early on a stale fixture projection.
 This does not qualify a retained 1 TiB dataset, indexed coding-history spill,
 full quota policy, private/payload ownership, normal paged checkpoint production
 or the remaining native/platform/release gates.
+
+## Durable bounded membership epochs for coding authority (2026-10-08)
+
+Normal coding-attempt authority checks now use bounded current and historical
+membership projections. `guild-authority-membership-v1` stores one immutable
+bounded roster per indexed membership epoch, including removed members, quorum,
+the original genesis hash and its original event tip. Each row also binds the
+exact original certificate bytes, including signatures, with a local checksum.
+Rows have a 128 KiB plus 128 byte SQL payload limit; the completion marker in
+`guild-authority-membership-tip-v1` has a 256 byte limit. These are private local
+projections of already verified original authority, with no signed-layout,
+record-identity or wire-version changes.
+
+The existing verified genesis/recovery/event publisher prepares at most one new
+epoch row outside the production writer and publishes it with the exact original
+accepted records, inherited flat state, compact tip and pending-record cleanup
+in one transaction. Non-membership events preserve the existing epoch row and
+only advance the fixed marker. Expected marker/row checks, checked insertion,
+CAS and exact readbacks reject ignored, corrupted and cross-record SQL writes;
+final checks after compact publication include the existing and new epoch rows.
+Accepted original-record readbacks and final genesis/tip checks also run after
+all projection writes; final deletion checks reject recreated pending records.
+This closes a late-write ordering gap without adding another whole-state
+readback: the existing accepted-record checks move to the end of publication.
+Idempotent ingestion preserves an existing epoch's original tip. This bounds the
+additional index mutation; the inherited full dynamic-state mutation still
+needs replacement by complete indexed history maintenance.
+
+Fresh guilds index from epoch one. Older or fully recovered states without the
+index seed an explicitly marked contiguous suffix at their current epoch; they
+do not manufacture old epoch rows from a later roster. Requests below this
+suffix retain the existing original-history replay path. Missing or malformed
+rows inside the completed suffix, stale markers or changed original certificate
+bytes fail closed without legacy fallback. Lookup checks the installed original
+genesis, current compact authority/tail, requested epoch identity and original
+certificate, then rereads the marker, compact tip and epoch row. Normal indexed
+reads do not traverse the full event chain, materialize writer/recovery/coding
+vectors or populate the inherited full-state historical cache. Historical
+lookup reuses the genesis/certificate already checked for that lookup, and
+preparation reuses the accepted genesis snapshot; neither decodes and verifies
+the same original genesis again merely to compare the epoch-one row.
+
+Current attempt checks use the compact roster and retain the original signed
+plan validation, root-binding frame budget, membership/placement rules and
+deadline. Historical replay/cleanup uses the requested indexed epoch and
+retains its original placement/domain authority even after removal or relabeling;
+it remains independent of the current attempt deadline, as before.
+
+Five new fixtures exercise real original genesis and signed writer, Add/Remove/
+Relabel/SetQuorum events, signed coding plans, current versus historical fencing,
+expired cleanup, invalid signatures/domains, reopen and an unreadable unused
+2 MiB flat state. Faults cover ignored/corrupted epoch/marker writes, compact or
+marker triggers corrupting other epoch rows, original events or flat state,
+recreated pending records, initial publication rollback and
+valid retry. Negative lookups cover bounded SQL payloads, missing/wrong epochs,
+checksums, changed historical certificate signatures and missing originals.
+Legacy suffix fixtures verify original replay below the indexed range and
+refusal to fall back for missing rows inside it. The older export-peer fixtures
+explicitly omit both local projection markers when directly injecting legacy
+history, keeping their original evidence-validation cases meaningful.
+
+Validation: the full locked Node library run with four threads passed 427
+ordinary tests (21 ignored). Its only failure was a successful survivor export
+exceeding the fixture's unchanged ten-second assertion for bypassing an unused
+unavailable peer. After the final publication-check ordering and genesis-work
+reuse changes, the serial eleven-target rerun passes all ten authority fixtures
+and the complete survivor-export fixture. A four-thread fourteen-target rerun
+also passes all ten authority fixtures and all four legacy-export peer fixtures,
+including the original timing assertion. All 428 ordinary Node tests are covered
+across the broad and final targeted runs; this is not a claim that a single full
+run passed under the final tree. The original topology/release gates remain open.
+Strict locked workspace/all-targets Clippy and formatting/diff checks pass.
+
+Bounded legacy-prefix/downgrade rebuilding, durable writer/recovery/group
+indexes, flat mutation replacement, archive retention and complete quota policy,
+private/bootstrap/native and information/parity payload custody, atomic
+certified-current publication/retirement, retained 1 TiB qualification and all
+remaining native/platform/release gates remain open.

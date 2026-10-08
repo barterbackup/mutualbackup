@@ -1846,9 +1846,23 @@ malformed/stale projections. Stores without the projection retain the existing
 legacy path until an accepted install/recovery/event publishes it; malformed
 projections do not fall back. This is local authority projection, not a new
 peer certificate or an indexed coding-history proof. Flat event mutations,
-historical replay, automatic legacy/downgrade projection rebuilding, durable
+legacy historical replay, automatic legacy/downgrade projection rebuilding, durable
 writer/recovery/coding indexes and atomic checkpoint publication still need
 their bounded integration and the full remaining qualification gates.
+
+Normal current and historical coding-attempt authority checks now consume
+bounded rosters. Verified ingestion adds one immutable historical roster row
+when membership/quorum changes, and advances a fixed completion marker in the
+original event/compact-tip transaction. Rows preserve their original genesis
+and exact original certificate bytes, with bounded SQL reads, local checksums
+and final authority/row rereads. Missing or corrupt indexed epochs fail closed.
+New guilds index from epoch one; older/recovered states declare their indexed
+suffix and retain original legacy replay below it. Indexed checks avoid growing
+writer/recovery/coding vectors and the old full-state historical cache while
+preserving original plan signatures, historical placement, current epoch fences
+and deadlines. Bounded legacy-prefix rebuilding, archive retention/quota,
+durable key/group indexes, flat mutation replacement, checkpoint ownership/
+publication and full retained-capacity/platform/release gates remain required.
 
 ### Historical implementation and validation record (before scope correction)
 

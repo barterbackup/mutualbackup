@@ -9488,14 +9488,16 @@ impl Node {
 
     fn validate_coding_attempt_plan(&self, plan: &SignedRecord<CodingAttemptPlan>) -> Result<()> {
         self.validate_signed_coding_attempt(plan)?;
-        let state = self
-            .dynamic_guild_state()?
+        let state = guild_authority::read_or_legacy(&self.control)?
             .context("node has no dynamic guild state")?;
         crate::network::validate_root_binding_frame_budget(
             &plan.value,
             state.active_members().count(),
         )?;
-        state.validate_attempt(&plan.value, unix_seconds())?;
+        state.validate_attempt_authority(&plan.value)?;
+        if plan.value.expires_at_unix_seconds < unix_seconds() {
+            anyhow::bail!("coding attempt has expired");
+        }
         Ok(())
     }
 
@@ -9504,9 +9506,23 @@ impl Node {
         plan: &SignedRecord<CodingAttemptPlan>,
     ) -> Result<()> {
         self.validate_signed_coding_attempt(plan)?;
-        let state = self.dynamic_guild_state_for_membership_epoch(plan.value.membership_epoch)?;
+        let state = self.membership_authority_for_epoch(plan.value.membership_epoch)?;
         state.validate_attempt_authority(&plan.value)?;
         Ok(())
+    }
+
+    fn membership_authority_for_epoch(
+        &self,
+        membership_epoch: u64,
+    ) -> Result<mb_core::GuildAuthoritySnapshot> {
+        if let Some(authority) =
+            guild_authority::read_membership_epoch(&self.control, membership_epoch)?
+        {
+            return Ok(authority);
+        }
+        Ok(mb_core::GuildAuthoritySnapshot::from_state(
+            &self.dynamic_guild_state_for_membership_epoch(membership_epoch)?,
+        )?)
     }
 
     fn dynamic_guild_state_for_membership_epoch(
@@ -15176,6 +15192,9 @@ pub(crate) mod tests {
                 .delete_record("guild-authority-tip-v1", b"primary")
                 .unwrap();
             node.control
+                .delete_record("guild-authority-membership-tip-v1", b"primary")
+                .unwrap();
+            node.control
                 .commit_checkpoint(
                     &state.guild_id,
                     1,
@@ -16075,6 +16094,9 @@ pub(crate) mod tests {
                 // Keep all subsequent corrupt-evidence cases on that path.
                 node.control
                     .delete_record("guild-authority-tip-v1", b"primary")
+                    .unwrap();
+                node.control
+                    .delete_record("guild-authority-membership-tip-v1", b"primary")
                     .unwrap();
                 node.control
                     .put_record(

@@ -8,6 +8,14 @@ const KIND: &str = "guild-authority-tip-v1";
 const KEY: &[u8] = b"primary";
 const BYTES: usize = GUILD_AUTHORITY_SNAPSHOT_BYTES + 128;
 
+mod membership;
+pub(super) fn read_membership_epoch(
+    control: &ControlStore,
+    epoch: u64,
+) -> Result<Option<GuildAuthoritySnapshot>> {
+    membership::read(control, epoch)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Record {
     format_version: u16,
@@ -49,19 +57,9 @@ fn decode(bytes: &[u8]) -> Result<Record> {
     Ok(record)
 }
 
-fn check_tail(control: &ControlStore, record: &Record) -> Result<()> {
+fn check_original_tip(control: &ControlStore, record: &Record) -> Result<()> {
     let snapshot = &record.authority;
     let after = snapshot.event_sequence.to_be_bytes();
-    if control
-        .next_record_metadata_bounded(
-            "guild-event",
-            (snapshot.event_sequence != 0).then_some(after.as_slice()),
-            8,
-        )?
-        .is_some()
-    {
-        anyhow::bail!("compact guild authority is behind original event history");
-    }
     if snapshot.event_sequence == 0 {
         if snapshot.event_head != record.genesis_hash || snapshot.membership_epoch != 1 {
             anyhow::bail!("compact genesis authority has a different tip");
@@ -81,7 +79,26 @@ fn check_tail(control: &ControlStore, record: &Record) -> Result<()> {
     Ok(())
 }
 
-fn check_genesis(control: &ControlStore, record: &Record) -> Result<()> {
+fn check_tail(control: &ControlStore, record: &Record) -> Result<()> {
+    let sequence = record.authority.event_sequence;
+    let after = sequence.to_be_bytes();
+    if control
+        .next_record_metadata_bounded(
+            "guild-event",
+            (sequence != 0).then_some(after.as_slice()),
+            8,
+        )?
+        .is_some()
+    {
+        anyhow::bail!("compact guild authority is behind original event history");
+    }
+    check_original_tip(control, record)
+}
+
+fn check_genesis(
+    control: &ControlStore,
+    record: &Record,
+) -> Result<(InstalledGuild, GuildAuthoritySnapshot)> {
     let bytes = control
         .get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?
         .context("compact guild authority has no installed genesis")?;
@@ -93,7 +110,7 @@ fn check_genesis(control: &ControlStore, record: &Record) -> Result<()> {
     {
         anyhow::bail!("compact guild authority belongs to another genesis");
     }
-    Ok(())
+    Ok((installed, genesis))
 }
 
 /// Fixed reads only. A missing projection permits the existing legacy path;
@@ -183,6 +200,14 @@ pub(super) fn publish(
     let before = before
         .map(|authority| make(next.genesis_hash, authority.clone()))
         .transpose()?;
+    let membership = membership::prepare(
+        control,
+        installed,
+        &initial,
+        &next,
+        before.as_ref(),
+        records,
+    )?;
     control.with_record_transaction(|| -> Result<()> {
         if control.get_record_bounded(KIND, KEY, BYTES)? != expected {
             anyhow::bail!("compact guild authority changed before publication");
@@ -192,20 +217,13 @@ pub(super) fn publish(
             check_tail(control, before)?;
         }
         for (kind, id, bytes) in records {
-            if kind == KIND {
+            if kind == KIND || membership::owns_kind(kind) {
                 anyhow::bail!("accepted record batch cannot substitute compact authority");
             }
             control.put_record(kind, id, bytes)?;
-            if control
-                .get_record_bounded(kind, id, bytes.len())?
-                .as_deref()
-                != Some(bytes)
-            {
-                anyhow::bail!("accepted guild record write did not persist exact bytes");
-            }
         }
         for (kind, id) in deletions {
-            if kind == KIND {
+            if kind == KIND || membership::owns_kind(kind) {
                 anyhow::bail!("accepted record batch cannot delete compact authority");
             }
             let existed = control.record_length(kind, id)?.is_some();
@@ -215,8 +233,7 @@ pub(super) fn publish(
                 anyhow::bail!("accepted guild record deletion did not persist");
             }
         }
-        check_genesis(control, &next)?;
-        check_tail(control, &next)?;
+        membership.publish(control)?;
         match &expected {
             Some(old) => control.replace_record_if_value(KIND, KEY, old, &encoded)?,
             None => {
@@ -228,6 +245,25 @@ pub(super) fn publish(
         if control.get_record_bounded(KIND, KEY, BYTES)?.as_deref() != Some(encoded.as_slice()) {
             anyhow::bail!("compact guild authority write did not persist exact bytes");
         }
+        // Check accepted records after every projection mutation. A later
+        // trigger/write must not invalidate an earlier successful readback.
+        check_genesis(control, &next)?;
+        check_tail(control, &next)?;
+        for (kind, id, bytes) in records {
+            if control
+                .get_record_bounded(kind, id, bytes.len())?
+                .as_deref()
+                != Some(bytes)
+            {
+                anyhow::bail!("accepted guild record write did not persist exact bytes");
+            }
+        }
+        for (kind, id) in deletions {
+            if control.record_length(kind, id)?.is_some() {
+                anyhow::bail!("accepted guild record deletion changed during publication");
+            }
+        }
+        membership.check(control)?;
         Ok(())
     })
 }
@@ -237,7 +273,7 @@ mod tests {
     use super::super::tests::recovery_guild_fixture;
     use super::*;
 
-    fn fixture() -> (tempfile::TempDir, Seed, Node, Vec<KeyMaterial>) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Seed, Node, Vec<KeyMaterial>) {
         let temp = tempfile::tempdir().unwrap();
         let (seed, certificate, peers) = recovery_guild_fixture();
         let mut node = Node::open(temp.path(), seed.clone()).unwrap();
@@ -248,7 +284,11 @@ mod tests {
         (temp, seed, node, keys)
     }
 
-    fn event(node: &Node, keys: &[KeyMaterial], kind: mb_core::GuildEventKind) -> QuorumGuildEvent {
+    pub(super) fn event(
+        node: &Node,
+        keys: &[KeyMaterial],
+        kind: mb_core::GuildEventKind,
+    ) -> QuorumGuildEvent {
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let event = GuildEvent {
             format_version: 1,
@@ -270,7 +310,7 @@ mod tests {
         QuorumGuildEvent { event, signatures }
     }
 
-    fn relabel(node: &Node, keys: &[KeyMaterial]) -> QuorumGuildEvent {
+    pub(super) fn relabel(node: &Node, keys: &[KeyMaterial]) -> QuorumGuildEvent {
         event(
             node,
             keys,

@@ -262,6 +262,20 @@ fail closed. Full indexed history, automatic legacy/downgrade rebuilding and
 paged checkpoint publication remain separate integration gates. Existing signed
 layouts and wire versions are unchanged.
 
+Normal coding-attempt checks also use bounded current or durably indexed
+historical rosters. Verified ingestion atomically adds at most one historical
+membership row per epoch change and advances a fixed completion marker with
+the original event and compact tip. Each row binds the original genesis and
+exact original certificate bytes; SQL payload bounds, checksums, original-tip
+checks and final row/authority rereads reject damaged or stale indexed state.
+New guilds index from epoch one. Older/recovered states declare a contiguous
+indexed suffix; epochs below it retain original legacy replay. A missing row
+inside that suffix never triggers fallback. These are private local indexes,
+not new peer certificates or full-history/payload ownership proofs. Original
+plan signature, membership/domain, current-epoch and deadline rules remain;
+legacy-prefix rebuilding and complete key/group/history quota integration
+remain required.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the
