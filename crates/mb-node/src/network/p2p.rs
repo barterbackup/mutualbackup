@@ -1960,7 +1960,7 @@ impl P2pClient {
             .call(
                 peer,
                 PeerRequest::SignGuildEvent {
-                    event: Box::new(event),
+                    event: Box::new(event.clone()),
                 },
             )
             .await?;
@@ -1970,6 +1970,10 @@ impl P2pClient {
         if signature.signer != peer {
             bail!("peer returned another member's guild event signature");
         }
+        // Reject the peer's invalid response before it reaches durable quorum
+        // collection. Other reachable members can still certify this event.
+        mb_core::verify_guild_event_signature(&event, &signature)
+            .context("peer returned an invalid guild event signature")?;
         Ok(signature)
     }
 
@@ -2002,7 +2006,7 @@ impl P2pClient {
             .call(
                 peer,
                 PeerRequest::SignCodingGroupEvent {
-                    event: Box::new(event),
+                    event: Box::new(event.clone()),
                     transcript: Box::new(transcript),
                 },
             )
@@ -2013,6 +2017,8 @@ impl P2pClient {
         if signature.signer != peer {
             bail!("peer returned another member's coding-group event signature");
         }
+        mb_core::verify_guild_event_signature(&event, &signature)
+            .context("peer returned an invalid coding-group event signature")?;
         Ok(signature)
     }
 
@@ -32946,13 +32952,48 @@ mod tests {
 
     #[tokio::test]
     async fn majority_lifecycle_event_does_not_wait_for_minority_signers() {
+        exercise_guild_signer_responses(GuildSignerResponses::SlowMinority, false).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_minority_signature_does_not_abort_a_valid_lifecycle_majority() {
+        exercise_guild_signer_responses(GuildSignerResponses::InvalidMinority, false).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_minority_signature_does_not_abort_a_valid_coding_majority() {
+        exercise_guild_signer_responses(GuildSignerResponses::InvalidMinority, true).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_lifecycle_signature_preserves_unanimous_retry_progress() {
+        exercise_guild_signer_responses(GuildSignerResponses::InvalidUnanimous, false).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_coding_signature_preserves_unanimous_retry_progress() {
+        exercise_guild_signer_responses(GuildSignerResponses::InvalidUnanimous, true).await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum GuildSignerResponses {
+        SlowMinority,
+        InvalidMinority,
+        InvalidUnanimous,
+    }
+
+    async fn exercise_guild_signer_responses(case: GuildSignerResponses, coding: bool) {
         let temp = tempfile::tempdir().unwrap();
         let mut nodes = active_test_guild_nodes(temp.path()).await;
         let (unanimous_state, _, _, quorum_event) = prepare_guild_administration(
             &mut nodes[0],
             GuildAdministration::SetQuorum(QuorumPolicy {
                 format_version: 1,
-                rule: QuorumRule::Majority,
+                rule: if case == GuildSignerResponses::InvalidUnanimous {
+                    QuorumRule::Unanimous
+                } else {
+                    QuorumRule::Majority
+                },
             }),
         )
         .unwrap();
@@ -32973,7 +33014,7 @@ mod tests {
 
         let coordinator = Arc::new(Mutex::new(nodes.remove(0)));
         let relabeled = nodes[3].keys().node_id();
-        let (state, mut guild, local_id, event) = prepare_guild_administration(
+        let (state, mut guild, local_id, mut event) = prepare_guild_administration(
             &mut coordinator.lock().unwrap(),
             GuildAdministration::RelabelMember {
                 node_id: relabeled,
@@ -32984,6 +33025,64 @@ mod tests {
         for peer in &mut guild.peers {
             peer.endpoints.clear();
         }
+        let transcript = coding.then(|| {
+            let bytes = vec![239; V1_SECTOR_SIZE];
+            let sector = SectorRef {
+                id: [240; 32],
+                root: sector_root(&bytes),
+                logical_len: bytes.len() as u32,
+            };
+            let commitment = merkle_commit(&bytes).unwrap();
+            let lane = variable_coding_lane(
+                state.guild_id,
+                Uuid::from_bytes([241; 16]),
+                0,
+                &[VariableInformationInput {
+                    owner: local_id,
+                    sector: &sector,
+                    commitment: &commitment,
+                }],
+                &guild.peers,
+            )
+            .unwrap();
+            let group = materialize_variable_lane(&lane, std::slice::from_ref(&bytes));
+            let information = group.roles[..usize::from(group.profile.data_shards)]
+                .iter()
+                .map(|role| match role {
+                    ShardRoleV2::Information(role) if role.sector.virtual_zero => {
+                        vec![0; group.profile.shard_size as usize]
+                    }
+                    ShardRoleV2::Information(_) => bytes.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let shards = encode(group.profile, information).unwrap();
+            let keys = (73_u8..=77)
+                .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value; 32])))
+                .map(|key| (key.node_id(), key))
+                .collect();
+            let transcript = signed_replacement_transcript(
+                &group,
+                &shards,
+                &keys,
+                [242; 32],
+                state.membership_epoch,
+                243,
+                None,
+                false,
+                true,
+            );
+            assert_eq!(
+                replay_coding_transcript(&transcript).unwrap(),
+                mb_core::CodingReplayFinding::Verified
+            );
+            event.format_version = 2;
+            event.kind = mb_core::GuildEventKind::AddCodingGroupBound {
+                group,
+                transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
+            };
+            transcript
+        });
         let signatures_by_peer = nodes
             .iter()
             .map(|node| {
@@ -33008,30 +33107,93 @@ mod tests {
         let observed = coordinator.clone();
         let expected = event.clone();
         let expected_state = state.clone();
+        let expected_transcript = transcript.clone();
         let worker = tokio::spawn(async move {
             let mut signatures_by_peer = signatures_by_peer;
             let mut sign_responses = Vec::new();
-            for _ in 0..4 {
+            while sign_responses.len() < 4 {
+                let command = rx.recv().await.expect("all signatures must be requested");
+                if let Command::AddLearnedAddress { response, .. } = command {
+                    response.send(Ok(())).unwrap();
+                    continue;
+                }
                 let Command::Request {
                     recipient,
                     request,
                     response,
                     ..
-                } = rx.recv().await.expect("all signatures must be requested")
+                } = command
                 else {
                     panic!("unexpected command during signature collection");
                 };
-                let PeerRequest::SignGuildEvent { event } = *request else {
-                    panic!("expected a lifecycle signature request");
+                let proposed = match *request {
+                    PeerRequest::SignGuildEvent { event } if !coding => event,
+                    PeerRequest::SignCodingGroupEvent { event, transcript } if coding => {
+                        assert_eq!(Some(*transcript), expected_transcript);
+                        event
+                    }
+                    _ => panic!("expected the original guild signature request"),
                 };
-                assert_eq!(*event, expected);
+                assert_eq!(*proposed, expected);
                 sign_responses.push((recipient, response));
             }
-            let held_minority = sign_responses.split_off(2);
+            // Deliver the invalid response first while the honest replies
+            // are still held. It must not cancel a reachable valid majority.
+            let invalid = if case != GuildSignerResponses::SlowMinority {
+                let (recipient, response) = sign_responses.remove(0);
+                let signature = signatures_by_peer.remove(&recipient).unwrap();
+                let mut damaged = signature.clone();
+                damaged.signature[0] ^= 1;
+                response
+                    .send(Ok(PeerResponse::GuildEventSignature(damaged)))
+                    .unwrap();
+                Some((recipient, signature))
+            } else {
+                None
+            };
+            let held_minority = if case == GuildSignerResponses::InvalidUnanimous {
+                Vec::new()
+            } else {
+                sign_responses.split_off(2)
+            };
             for (recipient, response) in sign_responses {
                 let signature = signatures_by_peer.remove(&recipient).unwrap();
                 response
                     .send(Ok(PeerResponse::GuildEventSignature(signature)))
+                    .unwrap();
+            }
+            if case == GuildSignerResponses::InvalidUnanimous {
+                // Retry only the failed signer of the same locked event.
+                let command = loop {
+                    let command = rx.recv().await.expect("the missing signer must be retried");
+                    if let Command::AddLearnedAddress { response, .. } = command {
+                        response.send(Ok(())).unwrap();
+                    } else {
+                        break command;
+                    }
+                };
+                let Command::Request {
+                    recipient,
+                    request,
+                    response,
+                    ..
+                } = command
+                else {
+                    panic!("expected the original signature retry");
+                };
+                let proposed = match *request {
+                    PeerRequest::SignGuildEvent { event } if !coding => event,
+                    PeerRequest::SignCodingGroupEvent { event, transcript } if coding => {
+                        assert_eq!(Some(*transcript), expected_transcript);
+                        event
+                    }
+                    _ => panic!("retry must retain the original signature request"),
+                };
+                assert_eq!(*proposed, expected);
+                let (missing, signature) = invalid.as_ref().unwrap();
+                assert_eq!(recipient, *missing);
+                response
+                    .send(Ok(PeerResponse::GuildEventSignature(signature.clone())))
                     .unwrap();
             }
             let mut installed = BTreeSet::new();
@@ -33045,11 +33207,26 @@ mod tests {
                 else {
                     panic!("unexpected command during lifecycle installation");
                 };
-                let PeerRequest::InstallGuildEvent { certified } = *request else {
-                    panic!("expected a certified lifecycle event");
+                let certified = match *request {
+                    PeerRequest::InstallGuildEvent { certified } if !coding => certified,
+                    PeerRequest::InstallCodingGroupEvent {
+                        certified,
+                        transcript,
+                    } if coding => {
+                        assert_eq!(Some(*transcript), expected_transcript);
+                        certified
+                    }
+                    _ => panic!("expected the original certified guild event"),
                 };
                 assert_eq!(certified.event, expected);
-                assert_eq!(certified.signatures.len(), 3);
+                if case == GuildSignerResponses::InvalidUnanimous {
+                    assert_eq!(certified.signatures.len(), 5);
+                } else {
+                    assert_eq!(certified.signatures.len(), 3);
+                    assert!(certified.signatures.iter().all(|signature| {
+                        Some(signature.signer) != invalid.as_ref().map(|(signer, _)| *signer)
+                    }));
+                }
                 expected_state.verify_event(&certified).unwrap();
                 assert_eq!(
                     observed
@@ -33071,13 +33248,53 @@ mod tests {
             );
         });
 
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            commit_plain_guild_event(coordinator.clone(), &p2p, state, guild, local_id, event),
-        )
-        .await
-        .expect("a certified majority must not wait for slow minority signers")
-        .unwrap();
+        let commit = || async {
+            match &transcript {
+                Some(transcript) => {
+                    commit_verified_coding_group(coordinator.clone(), &p2p, transcript).await
+                }
+                None => {
+                    commit_plain_guild_event(
+                        coordinator.clone(),
+                        &p2p,
+                        state.clone(),
+                        guild.clone(),
+                        local_id,
+                        event.clone(),
+                    )
+                    .await
+                }
+            }
+        };
+        if case == GuildSignerResponses::InvalidUnanimous {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), commit())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            let node = coordinator.lock().unwrap();
+            assert_eq!(node.dynamic_guild_state().unwrap().unwrap(), state);
+            let local = mb_core::sign_guild_event(&event, node.keys()).unwrap();
+            let pending = node.collect_guild_event_signature(&event, local).unwrap();
+            assert_eq!(
+                pending.len(),
+                4,
+                "all honest progress must survive the failed pass"
+            );
+            assert!(
+                state
+                    .verify_event(&QuorumGuildEvent {
+                        event: event.clone(),
+                        signatures: pending
+                    })
+                    .is_err()
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(10), commit())
+            .await
+            .expect("a reachable certified quorum must finish despite the invalid response")
+            .unwrap();
         worker.await.unwrap();
         assert_eq!(
             coordinator

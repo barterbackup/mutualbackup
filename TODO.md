@@ -2154,6 +2154,27 @@ remain active.
   durable retry. Keep the historical evidence below; later successes do not
   explain the original 5,400-second outlier.
 
+  - [x] Reject an invalid peer signature before entering durable quorum
+    collection. Previously the client checked the response's signer ID only;
+    an invalid signature then aborted collection and cancelled honest pending
+    replies, allowing one bad member to prevent an available majority. Both
+    ordinary lifecycle and coding Add clients now verify the exact proposed
+    event and report a failed peer reply through the existing collection loop.
+    Persistence, proposal-lock and current-state errors still abort normally.
+    Both new majority regressions fail with signature validation errors before
+    the fix and pass afterward. Two unanimous regressions preserve all four
+    honest signatures without advancing the event, then request only the
+    missing signer and require all five valid signatures before installation.
+    Coding cases use an actually replay-verified full-information transcript.
+    Those four cases, the existing slow-minority majority case, partial-signature
+    reopen fixture and active guild administration test pass (seven functions).
+    Formatting and strict workspace/all-targets Clippy pass. The complete
+    ordinary Node suite is being run separately; the focused cases alone do
+    not qualify that suite or the provisioned topology.
+    This fixes a demonstrated response-path defect; there is no evidence that
+    invalid signatures caused the historical relay-only stall. Its diagnosis,
+    repeated exact-source topology and release gates remain open.
+
   Existing investigation and validation record:
 
   Added correlated event diagnostics to signature failures and dissemination:
