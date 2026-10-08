@@ -1,0 +1,594 @@
+//! Normal durable consumers of the shared original-history validator.
+use super::*;
+use mb_core::CatalogCodingTraversalBudget as Work;
+use mb_store::{
+    CatalogDurableGuildHistory as History, CatalogGuildHistoryMutation as Mutation,
+    CatalogGuildHistoryObject as Object, CatalogGuildHistorySource, CatalogStoreError,
+};
+
+// One event and its original evidence/point rows, using existing envelope
+// bounds. This is a per-step admission bound, not an unlimited replay job.
+fn budget() -> Work {
+    Work {
+        bytes: (3 * mb_core::CATALOG_CODING_TRANSCRIPT_BYTES
+            + 32 * (GUILD_EVENT_BYTES + GUILD_AUTHORITY_SNAPSHOT_BYTES)
+            + mb_core::LEGACY_CODING_ADD_BINDING_BYTES) as u64,
+        records: 512,
+        page_occurrences: 0,
+    }
+}
+
+struct Source<'a> {
+    control: &'a ControlStore,
+    records: &'a [ControlRecord],
+}
+impl Source<'_> {
+    fn location(object: Object) -> (&'static str, Vec<u8>) {
+        match object {
+            Object::Event(sequence) => ("guild-event", sequence.to_be_bytes().to_vec()),
+            Object::Transcript(hash) => ("coding-event-transcript", hash.to_vec()),
+            Object::LegacyBinding(hash) => ("coding-legacy-add-binding", hash.to_vec()),
+        }
+    }
+    fn pending(&self, object: Object) -> Option<&[u8]> {
+        let (name, key) = Self::location(object);
+        self.records
+            .iter()
+            .find(|(kind, id, _)| kind == name && id == &key)
+            .map(|(_, _, bytes)| bytes.as_slice())
+    }
+}
+impl CatalogGuildHistorySource for Source<'_> {
+    fn next_event(
+        &mut self,
+        after: Option<u64>,
+    ) -> std::result::Result<Option<(u64, usize)>, CatalogStoreError> {
+        let mut source = self.control;
+        source.next_event(after)
+    }
+    fn length(&mut self, object: Object) -> std::result::Result<Option<usize>, CatalogStoreError> {
+        if let Some(bytes) = self.pending(object) {
+            return Ok(Some(bytes.len()));
+        }
+        let mut source = self.control;
+        source.length(object)
+    }
+    fn read(
+        &mut self,
+        object: Object,
+        cap: usize,
+    ) -> std::result::Result<Option<Vec<u8>>, CatalogStoreError> {
+        if let Some(bytes) = self.pending(object) {
+            if bytes.len() > cap {
+                return Err(mb_core::CatalogError::Bounds.into());
+            }
+            return Ok(Some(bytes.to_vec()));
+        }
+        let mut source = self.control;
+        source.read(object, cap)
+    }
+}
+
+pub(super) fn owns_kind(kind: &str) -> bool {
+    History::owns_record_kind(kind)
+}
+
+pub(super) fn prepare(
+    control: &ControlStore,
+    installed: &InstalledGuild,
+    next: &Record,
+    before: Option<&Record>,
+    records: &[ControlRecord],
+) -> Result<Mutation> {
+    let Some(history) = History::read(control)? else {
+        // A recovered/older history starts at independently verified genesis.
+        // Its bounded catch-up remains explicit; no later state invents rows.
+        return Ok(History::prepare_genesis(
+            control,
+            &installed.certificate,
+            budget(),
+        )?);
+    };
+    let expected = before.unwrap_or(next);
+    if history.genesis_hash() != next.genesis_hash
+        || history.authority().guild_id != next.authority.guild_id
+        || history.authority().event_sequence > expected.authority.event_sequence
+    {
+        anyhow::bail!("durable original history conflicts with accepted authority");
+    }
+    if history.authority().event_sequence < expected.authority.event_sequence {
+        check_original_tip(
+            control,
+            &make(next.genesis_hash, history.authority().clone())?,
+        )?;
+        return Ok(history.prepare_guard());
+    }
+    if history.authority() != &expected.authority {
+        anyhow::bail!("durable original history has another roster or event head");
+    }
+    if before.is_none() {
+        return Ok(history.prepare_guard());
+    }
+    let mut source = Source { control, records };
+    let event = source
+        .read(
+            Object::Event(next.authority.event_sequence),
+            GUILD_EVENT_BYTES,
+        )?
+        .context("accepted original event is unavailable for indexed publication")?;
+    let event = QuorumGuildEvent::decode_bounded(&event)?;
+    let mutation = history.prepare_advance(control, &event, budget(), &mut source)?;
+    if mutation.authority() != &next.authority {
+        anyhow::bail!("indexed original event produced a different accepted roster or tip");
+    }
+    Ok(mutation)
+}
+
+pub(super) fn advance(control: &ControlStore) -> Result<bool> {
+    let Some(current_bytes) = control.get_record_bounded(KIND, KEY, BYTES)? else {
+        return Ok(false);
+    };
+    let current = decode(&current_bytes)?;
+    let (installed, _) = check_genesis(control, &current)?;
+    check_tail(control, &current)?;
+    let history = History::read(control)?;
+    let mut original = None;
+    let mutation = match history {
+        None => History::prepare_genesis(control, &installed.certificate, budget())?,
+        Some(history) => {
+            if history.genesis_hash() != current.genesis_hash
+                || history.authority().guild_id != current.authority.guild_id
+                || history.authority().event_sequence > current.authority.event_sequence
+            {
+                anyhow::bail!("durable original history belongs to another current authority");
+            }
+            if history.authority().event_sequence == current.authority.event_sequence {
+                if history.authority() != &current.authority {
+                    anyhow::bail!("durable original history has a conflicting current tip");
+                }
+                return Ok(false);
+            }
+            check_original_tip(
+                control,
+                &make(current.genesis_hash, history.authority().clone())?,
+            )?;
+            let sequence = history
+                .authority()
+                .event_sequence
+                .checked_add(1)
+                .context("original history sequence exhausted")?;
+            let key = sequence.to_be_bytes();
+            let bytes = control
+                .get_record_bounded("guild-event", &key, GUILD_EVENT_BYTES)?
+                .context("original history catch-up lacks an event")?;
+            let event = QuorumGuildEvent::decode_bounded(&bytes)?;
+            let mutation = history.prepare_advance(
+                control,
+                &event,
+                budget(),
+                &mut Source {
+                    control,
+                    records: &[],
+                },
+            )?;
+            original = Some((key, bytes));
+            mutation
+        }
+    };
+    control.with_record_transaction(|| -> Result<()> {
+        if control.get_record_bounded(KIND, KEY, BYTES)?.as_deref()
+            != Some(current_bytes.as_slice())
+        {
+            anyhow::bail!("accepted authority changed during original history catch-up");
+        }
+        if let Some((key, bytes)) = &original
+            && control
+                .get_record_bounded("guild-event", key, GUILD_EVENT_BYTES)?
+                .as_deref()
+                != Some(bytes.as_slice())
+        {
+            anyhow::bail!("original event changed during indexed catch-up");
+        }
+        mutation.apply_in_transaction(control)?;
+        check_tail(control, &current)?;
+        mutation.verify_published(control)?;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+pub(super) fn retained_group(
+    control: &ControlStore,
+    guild: [u8; 32],
+    id: [u8; 32],
+) -> Result<mb_core::RetainedCodingGroup> {
+    let original =
+        control.get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?;
+    let compact = read_record(control)?;
+    let current = match &compact {
+        Some(record) => record.authority.clone(),
+        None => read_or_legacy(control)?.context("node has no dynamic guild state")?,
+    };
+    if current.guild_id != guild {
+        anyhow::bail!("variable coding group belongs to another guild");
+    }
+    if let Some(history) = History::read(control)? {
+        let genesis_hash = match &compact {
+            Some(record) => record.genesis_hash,
+            None => decode_installed_guild(
+                original
+                    .as_deref()
+                    .context("indexed group has no original genesis")?,
+            )?
+            .certificate
+            .hash()?,
+        };
+        if history.genesis_hash() != genesis_hash
+            || history.authority().guild_id != guild
+            || history.authority().event_sequence > current.event_sequence
+        {
+            anyhow::bail!("indexed group belongs to another original history");
+        }
+        if history.authority().event_sequence == current.event_sequence {
+            let retained = history
+                .view(control, history.genesis_hash(), &current)?
+                .retained_group(id)?
+                .context("variable coding group is unavailable")?;
+            if control.get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?
+                != original
+            {
+                anyhow::bail!("original group genesis changed during lookup");
+            }
+            if let Some(record) = &compact {
+                if control.get_record_bounded(KIND, KEY, BYTES)?
+                    != Some(mb_core::canonical_bytes_bounded(record, BYTES)?)
+                {
+                    anyhow::bail!("group authority changed during lookup");
+                }
+                check_tail(control, record)?;
+            } else if read_or_legacy(control)?.as_ref() != Some(&current) {
+                anyhow::bail!("legacy group authority changed during lookup");
+            }
+            return Ok(retained);
+        }
+        check_original_tip(
+            control,
+            &make(history.genesis_hash(), history.authority().clone())?,
+        )?;
+    }
+    // Compatibility only while a verified original-prefix rebuild is absent
+    // or incomplete. A present malformed/current index never falls back.
+    let state: DynamicGuildState = decode_canonical(
+        &control
+            .get_record("guild-dynamic-state", KEY)?
+            .context("legacy group state is unavailable")?,
+    )?;
+    state.validate()?;
+    if GuildAuthoritySnapshot::from_state(&state)? != current {
+        anyhow::bail!("legacy group state differs from current authority");
+    }
+    state
+        .coding_groups
+        .into_iter()
+        .find(|group| group.group.id == id)
+        .context("variable coding group is unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::guild_authority::tests::{event, fixture, relabel};
+    use crate::node::tests::test_coding_transcript;
+
+    fn group(
+        node: &Node,
+        keys: &[KeyMaterial],
+    ) -> (
+        QuorumGuildEvent,
+        SignedRecord<CodingVerificationTranscript>,
+        Vec<Vec<u8>>,
+    ) {
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let members = state.active_members().collect::<Vec<_>>();
+        let remotes = members
+            .iter()
+            .filter(|member| member.node_id != node.keys.node_id())
+            .collect::<Vec<_>>();
+        let local = members
+            .iter()
+            .find(|member| member.node_id == node.keys.node_id())
+            .unwrap();
+        let profile = mb_core::CodingProfile::new(1, 1, 64);
+        let shards = mb_core::encode(profile, vec![vec![91; 64]]).unwrap();
+        let plan = CodingAttemptPlan {
+            format_version: 3,
+            attempt_id: [191; 16],
+            checkpoint_hash: [192; 32],
+            membership_epoch: state.membership_epoch,
+            geometry: mb_core::CodingPlanGeometry {
+                format_version: 1,
+                guild_id: state.guild_id,
+                profile,
+                information: vec![mb_core::InformationRoleV2 {
+                    owner: remotes[0].node_id,
+                    failure_domain: remotes[0].failure_domain.clone(),
+                    sector: mb_core::RangeSectorRef {
+                        id: [193; 32],
+                        commitment: merkle_commit(&shards[0]).unwrap(),
+                        logical_len: 64,
+                        virtual_zero: false,
+                    },
+                }],
+                parity: vec![mb_core::ParityPlacementV2 {
+                    holder: local.node_id,
+                    failure_domain: local.failure_domain.clone(),
+                    row: 0,
+                }],
+            },
+            delegator: remotes[1].node_id,
+            coding_coordinator: remotes[2].node_id,
+            verification_coordinator: remotes[3].node_id,
+            expires_at_unix_seconds: unix_seconds() + 600,
+            information_roots: Some(vec![sector_root(&shards[0])]),
+        };
+        let delegator = keys
+            .iter()
+            .find(|key| key.node_id() == plan.delegator)
+            .unwrap();
+        let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, delegator).unwrap();
+        let transcript = test_coding_transcript(plan, &shards, keys);
+        let event = GuildEvent {
+            format_version: 2,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::AddCodingGroupBound {
+                group: transcript.value.manifest.value.group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|key| sign_guild_event(&event, key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        (QuorumGuildEvent { event, signatures }, transcript, shards)
+    }
+
+    #[test]
+    fn durable_history_serves_real_shards_after_reopen_without_flat_state() {
+        let (temp, seed, mut node, keys) = fixture();
+        let (add, transcript, shards) = group(&node, &keys);
+        let descriptor = transcript.value.manifest.value.group.clone();
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: descriptor.guild_id,
+            group_id: descriptor.id,
+            shard_index: 1,
+            commitment: merkle_commit(&shards[1]).unwrap(),
+            bytes: shards[1].clone(),
+        };
+        node.stage_coding_parity(&transcript.value.plan, &transcript.value.manifest, &object)
+            .unwrap();
+        node.activate_coding_attempt(&transcript).unwrap();
+        node.install_coding_group_event(add, transcript).unwrap();
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+            .unwrap();
+        assert_eq!(
+            node.variable_shard_for_guild(&descriptor.guild_id, &descriptor.id, 1)
+                .unwrap(),
+            shards[1]
+        );
+        let reader = node.reader_config().open().unwrap();
+        assert_eq!(
+            reader
+                .variable_shard_for_guild(&descriptor.guild_id, &descriptor.id, 1)
+                .unwrap(),
+            shards[1]
+        );
+        assert!(
+            node.variable_shard_for_guild(&[99; 32], &descriptor.id, 1)
+                .is_err()
+        );
+        assert!(
+            node.variable_shard_for_guild(&descriptor.guild_id, &descriptor.id, 0)
+                .is_err()
+        );
+        assert!(node.dynamic_guild_state().is_err());
+    }
+
+    #[test]
+    fn durable_history_legacy_catch_up_requires_each_original_event_and_witness() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let (add, transcript, _) = group(&node, &keys);
+        let hash = add.event.hash().unwrap();
+        let descriptor = transcript.value.manifest.value.group.clone();
+        node.install_coding_group_event(add, transcript).unwrap();
+        let relabel = relabel(&node, &keys);
+        node.install_guild_event(relabel).unwrap();
+        // Model a store predating this index; preserve all original records.
+        node.control
+            .database_shell_statement(
+                "DELETE FROM protocol_records WHERE kind LIKE 'guild-original-%'",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            retained_group(&node.control, descriptor.guild_id, descriptor.id)
+                .unwrap()
+                .group,
+            descriptor
+        );
+        assert!(node.advance_guild_history_index().unwrap());
+        assert_eq!(
+            History::read(&node.control)
+                .unwrap()
+                .unwrap()
+                .authority()
+                .event_sequence,
+            0
+        );
+        let witness = node
+            .control
+            .get_record("coding-event-transcript", &hash)
+            .unwrap()
+            .unwrap();
+        node.control
+            .delete_record("coding-event-transcript", &hash)
+            .unwrap();
+        assert!(
+            node.advance_guild_history_index().is_err(),
+            "the group-key witness cannot replace missing original Add evidence"
+        );
+        assert_eq!(
+            History::read(&node.control)
+                .unwrap()
+                .unwrap()
+                .authority()
+                .event_sequence,
+            0
+        );
+        node.control
+            .put_record("coding-event-transcript", &hash, &witness)
+            .unwrap();
+        assert!(node.advance_guild_history_index().unwrap());
+        assert_eq!(
+            History::read(&node.control)
+                .unwrap()
+                .unwrap()
+                .authority()
+                .event_sequence,
+            1
+        );
+        assert!(node.advance_guild_history_index().unwrap());
+        assert!(!node.advance_guild_history_index().unwrap());
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert_eq!(
+            retained_group(&node.control, descriptor.guild_id, descriptor.id)
+                .unwrap()
+                .group,
+            descriptor
+        );
+    }
+
+    #[test]
+    fn durable_history_completed_corrupt_or_missing_rows_never_use_flat_fallback() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let (add, transcript, _) = group(&node, &keys);
+        let descriptor = transcript.value.manifest.value.group.clone();
+        node.install_coding_group_event(add, transcript).unwrap();
+        let bytes = node
+            .control
+            .get_record("guild-original-group", &descriptor.id)
+            .unwrap()
+            .unwrap();
+        for bad in [vec![0], vec![0; GUILD_EVENT_BYTES + 65]] {
+            node.control
+                .put_record("guild-original-group", &descriptor.id, &bad)
+                .unwrap();
+            assert!(retained_group(&node.control, descriptor.guild_id, descriptor.id).is_err());
+            assert!(
+                node.dynamic_guild_state()
+                    .unwrap()
+                    .unwrap()
+                    .coding_groups
+                    .iter()
+                    .any(|retained| retained.group == descriptor)
+            );
+        }
+        node.control
+            .delete_record("guild-original-group", &descriptor.id)
+            .unwrap();
+        assert!(retained_group(&node.control, descriptor.guild_id, descriptor.id).is_err());
+        node.control
+            .put_record("guild-original-group", &descriptor.id, &bytes)
+            .unwrap();
+        assert_eq!(
+            retained_group(&node.control, descriptor.guild_id, descriptor.id)
+                .unwrap()
+                .group,
+            descriptor
+        );
+    }
+
+    #[test]
+    fn durable_history_normal_publication_faults_preserve_original_and_all_authority_records() {
+        for fault in 0..6 {
+            let (_temp, _seed, mut node, keys) = fixture();
+            let certified = event(
+                &node,
+                &keys,
+                mb_core::GuildEventKind::RelabelMember {
+                    node_id: node.keys.node_id(),
+                    failure_domain: "history-fault-domain".to_owned(),
+                },
+            );
+            let before = ["guild-dynamic-state", KIND, "guild-original-tip-v1"]
+                .map(|kind| node.control.get_record(kind, KEY).unwrap());
+            let partial = pending_guild_event_signatures_id(&certified.event);
+            node.control
+                .put_record("guild-event-partial-signatures", &partial, b"preserve")
+                .unwrap();
+            let sql = match fault {
+                0 => {
+                    "CREATE TEMP TRIGGER original_fault BEFORE INSERT ON protocol_records WHEN NEW.kind='guild-original-members' BEGIN SELECT RAISE(IGNORE); END"
+                }
+                1 => {
+                    "CREATE TEMP TRIGGER original_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN SELECT RAISE(IGNORE); END"
+                }
+                2 => {
+                    "CREATE TEMP TRIGGER original_fault AFTER INSERT ON protocol_records WHEN NEW.kind='guild-original-event' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-dynamic-state'; END"
+                }
+                3 => {
+                    "CREATE TEMP TRIGGER original_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='guild-authority-tip-v1' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-original-tip-v1'; END"
+                }
+                4 => {
+                    "CREATE TEMP TRIGGER original_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='guild-authority-tip-v1' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-original-members'; END"
+                }
+                _ => {
+                    "CREATE TEMP TRIGGER original_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN INSERT INTO protocol_records(kind,record_id,bytes) VALUES ('guild-event-partial-signatures', X'00', X'00'); UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-event'; END"
+                }
+            };
+            node.control.database_shell_statement(sql, false).unwrap();
+            assert!(
+                node.install_guild_event(certified.clone()).is_err(),
+                "fault {fault}"
+            );
+            assert_eq!(
+                ["guild-dynamic-state", KIND, "guild-original-tip-v1"]
+                    .map(|kind| node.control.get_record(kind, KEY).unwrap()),
+                before
+            );
+            assert!(
+                node.control
+                    .get_record("guild-event", &1_u64.to_be_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                node.control
+                    .get_record("guild-event-partial-signatures", &partial)
+                    .unwrap()
+                    .as_deref(),
+                Some(b"preserve".as_slice())
+            );
+            node.control
+                .database_shell_statement("DROP TRIGGER original_fault", false)
+                .unwrap();
+            node.install_guild_event(certified).unwrap();
+            assert_eq!(
+                History::read(&node.control)
+                    .unwrap()
+                    .unwrap()
+                    .authority()
+                    .event_sequence,
+                1
+            );
+        }
+    }
+}

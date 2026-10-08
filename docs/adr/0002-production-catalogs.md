@@ -3607,3 +3607,118 @@ indexes, flat mutation replacement, archive retention and complete quota policy,
 private/bootstrap/native and information/parity payload custody, atomic
 certified-current publication/retirement, retained 1 TiB qualification and all
 remaining native/platform/release gates remain open.
+
+## Incremental durable original guild history and bounded group readers (2026-10-08)
+
+`CatalogDurableGuildHistory` persists the shared original-history validator's
+point rows in the encrypted production control store. Eight private
+`guild-original-*` namespaces contain historical membership rosters, writer and
+recovery epochs/latest pointers, retained groups, every original prefix tip and
+all coding incarnations. Each bounded row has a fixed 64 byte header binding
+its original genesis and a checksum over its original row kind, key and canonical
+payload. The bounded `guild-original-tip-v1` marker contains the exact verified
+original-prefix authority, lifecycle counts and cumulative represented work.
+These are local projections created by checked publication, not new peer
+certificates or authenticated substitutes for missing original evidence.
+Their descriptor duplication, prefix/incarnation rows, scratch reservations
+and retained original evidence must enter the complete metadata and physical
+quota policy; bounded point access does not establish a retained-capacity fit.
+
+Preparation verifies independently signed original genesis, or advances exactly
+one original certificate from the existing verified prefix. It uses the existing
+`advance_indexed` and full original-history effect validator: original quorum
+and subject signatures, membership/quorum transitions, exact writer/recovery
+rotation and revocation, group placement, original Add-bound transcript hash or
+mandatory legacy quorum binding, bounded transcript replay, historical attempt
+membership, retirement deadlines, forgetting and same-ID re-addition all retain
+their existing rules. It copies only the event's selected point rows into a
+bounded encrypted disposable SQL overlay, with a 1 MiB page cache and a roughly
+2 MiB database ceiling. Linux scratch admission uses the control store's mount
+and reserves its checkpoint/WAL exposure. No original proof, witness replay or
+scratch filesystem operation holds the production SQL writer.
+
+The private prepared mutation guards the old marker and each selected original
+point row, applies checked insert/CAS/delete operations, then verifies the exact
+published marker and rows. The normal Node publisher joins it to the transaction
+containing accepted original records, the inherited flat state, compact
+current authority, historical membership rows and pending cleanup. Final
+original-record, deletion and projection readbacks occur after all mutations,
+including the compact-tip write. Preparation conservatively reserves marker
+encoding/guard/write/readbacks, repeated namespace admission, selected input
+guards, durable writes and both publication readbacks in its per-event ledger.
+An unchanged verified-prefix guard rereads its marker without rewriting it or
+adding old evidence again to the cumulative original-history ledger.
+
+New guilds index from original genesis and advance with normal ingestion. Older
+or recovered histories without this index start at independently verified
+original genesis; a later roster never fabricates earlier key/group rows.
+Peer reconciliation follows legacy-Add rebinding with at most sixteen local
+steps, ending the batch when a completed step exhausts its 25 ms cooperative
+allowance. Each step rereads one bounded original event and its required original
+evidence, validates outside the writer, then guards the current compact tip and
+original event bytes while publishing. Missing original Add witnesses or legacy
+bindings stop the prefix without advancing it or substituting a group-key
+witness. This is a bounded catch-up facility, not a qualification of migration
+throughput or complete upgrade/downgrade behavior. Older stores missing the
+compact current-tip projection still need its automatic rebuild path.
+
+Normal Node/reader variable-shard serving, the emergency reader's group lookup
+and the group lookup in variable repair use bounded retained-group point reads
+when this original index reaches the current independent compact authority.
+They check the original genesis and current original tail, exact indexed scope,
+row identity/checksum/lifecycle and final row/marker/authority stability. The
+lookup reuses the already checked compact record and compares original genesis
+bytes at the end, avoiding redundant genesis signature replay for the same
+lookup. Existing holder assignments, payload Merkle roots and live-checkpoint
+checks remain. A current missing or damaged indexed group fails closed even
+when the flat state contains a valid-looking copy. An explicitly incomplete
+original prefix retains the compatibility flat-state reader until catch-up;
+this remaining compatibility allocation is not a bounded-history claim.
+
+Five new Store fixtures cover both original bound and legacy Adds, every
+original event variant, rotation/revocation, retire/forget/re-add, reopen after
+each event, exact correspondence with original full-state effects, cumulative
+and exact step budgets, missing original witnesses/bindings, invalid signatures
+before witness I/O, stale prepared prefixes/point rows, bounded corrupt row
+reads and ignored/corrupt/cross-record SQL writes. Publication faults include
+ignored group updates/deletions and a late marker trigger recreating a deleted
+group, with rollback and valid retry. Four new Node fixtures cover actual
+signed witnesses and physical parity, reopen, serving through both Node and
+reader with an unreadable unused 2 MiB flat state, wrong guild/holder, truthful
+legacy-prefix catch-up with missing original Add evidence, refusal to fall back
+for corrupt/missing current rows, and original-record/authority/pending-cleanup
+rollback and retry under SQL faults.
+Legacy checkpoint-only peer fixtures explicitly omit all local authority/history
+projections when directly injecting synthetic full state without an original
+event log. A verified genesis projection beside that synthetic later tail is
+not a valid model of an older store; the rootless-replacement audit correctly
+rejects a group missing from that projected history. The fixture adjustment
+preserves its checks that physically available wrong-byte/rootless groups cannot
+authenticate a retained revision, along with the separate completed-index
+corruption tests that forbid compatibility fallback.
+
+Validation: the broad locked Store library run passes 254 ordinary tests
+(26 ignored). After final publication-accounting/deletion-guard changes and
+the distinct-witness re-add assertion, all five original durable-history
+fixtures pass on the final tree. All 255 ordinary Store tests are covered
+across those runs. The broad locked Node library run with four threads passes
+431 ordinary tests (21 ignored); its only failure is the legacy rootless audit
+fixture retaining a genesis projection beside synthetic later state. Direct
+reproduction confirms that failure. After the explicit legacy-fixture correction,
+the final four-thread eighteen-target run passes all fourteen authority
+fixtures and all four peer fixtures using the corrected helper, including the
+rootless audit, packed restore/cold recovery, parity-only cold recovery and
+ready-local recovery quorum checks. All 432 ordinary Node tests are covered
+across broad and final targeted runs. These are combined validation results,
+not a claim that a single full run passed under the final tree. The survivor
+export's unchanged timing assertion passes in the broad Node run. Intentionally
+ignored provisioned/native/topology cases are not qualified by these runs.
+Strict locked workspace/all-targets Clippy and formatting/diff checks pass.
+
+Complete flat-state mutation replacement, normal writer/recovery-reader
+integration, automatic old-store compact-tip rebuilding, migration throughput,
+archive retention/compaction, complete metadata/quota admission, certified-current
+checkpoint publication/retirement, private/bootstrap/native and information/
+parity payload custody, retained 1 TiB qualification and all remaining native/
+platform/release gates remain required. Signed record layouts, hashes and wire
+versions are unchanged; normal paged checkpoint producers remain disabled.

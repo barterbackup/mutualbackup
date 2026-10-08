@@ -17,6 +17,22 @@ struct Archived {
     forgotten_at: Option<u64>,
 }
 
+impl Tip {
+    pub(super) fn initial(snapshot: &GuildAuthoritySnapshot) -> Self {
+        Self {
+            sequence: 0,
+            head: snapshot.event_head,
+            membership_epoch: 1,
+            retained: 0,
+            retired: 0,
+        }
+    }
+}
+
+pub(super) fn incarnation_key(id: [u8; 32], added: u64) -> [u8; 40] {
+    key(id, added)
+}
+
 fn key(id: [u8; 32], added: u64) -> [u8; 40] {
     let mut key = [0; 40];
     key[..32].copy_from_slice(&id);

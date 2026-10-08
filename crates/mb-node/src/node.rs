@@ -1039,22 +1039,8 @@ impl NodeReader {
         group_id: &[u8; 32],
         shard_index: u16,
     ) -> Result<Vec<u8>> {
-        let state: DynamicGuildState = decode_canonical(
-            &self
-                .control
-                .get_record("guild-dynamic-state", b"primary")?
-                .context("node has no dynamic guild state")?,
-        )?;
-        state.validate()?;
-        if state.guild_id != *guild_id {
-            anyhow::bail!("variable coding group belongs to another guild");
-        }
-        let group = &state
-            .coding_groups
-            .iter()
-            .find(|retained| retained.group.id == *group_id)
-            .context("variable coding group is unavailable")?
-            .group;
+        let retained = guild_authority::retained_group(&self.control, *guild_id, *group_id)?;
+        let group = &retained.group;
         let role = group
             .roles
             .get(usize::from(shard_index))
@@ -1110,26 +1096,14 @@ impl NodeReader {
             .control
             .checkpoint_head(guild_id)?
             .context("variable emergency shard checkpoint is unavailable")?;
-        let state: DynamicGuildState = decode_canonical(
-            &self
-                .control
-                .get_record("guild-dynamic-state", b"primary")?
-                .context("node has no dynamic guild state")?,
-        )?;
-        state.validate()?;
-        let group = &state
-            .coding_groups
-            .iter()
-            .find(|retained| retained.group.id == *group_id)
-            .context("variable coding group is unavailable")?
-            .group;
+        let retained = guild_authority::retained_group(&self.control, *guild_id, *group_id)?;
+        let group = &retained.group;
         let commitment = match group.roles.get(usize::from(shard_index)) {
             Some(ShardRoleV2::Information(information)) => &information.sector.commitment,
             Some(ShardRoleV2::Parity(parity)) => &parity.commitment,
             None => anyhow::bail!("variable emergency shard index is outside its group"),
         };
-        if state.guild_id != *guild_id
-            || marker.format_version != 1
+        if marker.format_version != 1
             || marker.checkpoint_hash != head_hash
             || marker.group_id != *group_id
             || marker.shard_index != shard_index
@@ -4147,6 +4121,10 @@ impl Node {
             state.validate()?;
         }
         Ok(state)
+    }
+
+    pub(crate) fn advance_guild_history_index(&self) -> Result<bool> {
+        guild_authority::advance_original_history(&self.control)
     }
 
     pub fn sign_guild_event_proposal(&self, event: &GuildEvent) -> Result<MemberSignature> {
@@ -9434,17 +9412,7 @@ impl Node {
         group_id: &[u8; 32],
         shard_index: u16,
     ) -> Result<Vec<u8>> {
-        let state = self
-            .dynamic_guild_state()?
-            .context("node has no dynamic guild state")?;
-        if state.guild_id != *guild_id {
-            anyhow::bail!("variable coding group belongs to another guild");
-        }
-        let retained = state
-            .coding_groups
-            .iter()
-            .find(|retained| retained.group.id == *group_id)
-            .context("variable coding group is unavailable")?;
+        let retained = guild_authority::retained_group(&self.control, *guild_id, *group_id)?;
         let role = retained
             .group
             .roles
@@ -10119,16 +10087,12 @@ impl Node {
         let checkpoint = self
             .current_checkpoint_from_hash(checkpoint_hash)?
             .context("variable repair checkpoint is unavailable")?;
-        let state = self
-            .dynamic_guild_state()?
-            .context("variable repair requires dynamic guild state")?;
-        let group = state
-            .coding_groups
-            .iter()
-            .find(|retained| retained.group.id == group_id)
-            .context("variable repair group is not retained")?
-            .group
-            .clone();
+        let group = guild_authority::retained_group(
+            &self.control,
+            checkpoint.checkpoint.guild_id,
+            group_id,
+        )?
+        .group;
         if !variable_group_protects_checkpoint(&checkpoint.checkpoint, &group) {
             anyhow::bail!("variable repair group protects no live checkpoint sector");
         }
@@ -18359,6 +18323,13 @@ pub(crate) mod tests {
             .unwrap()
             .map(|parent| parent.hash().unwrap());
         assert_eq!(checkpoint.checkpoint.parent, parent_hash);
+        // These legacy checkpoint fixtures inject full state without its
+        // original event log. Model a store predating the local projections,
+        // rather than leaving a verified genesis tip beside a synthetic tail.
+        node.control.database_shell_statement(
+            "DELETE FROM protocol_records WHERE kind IN ('guild-authority-tip-v1', 'guild-authority-membership-v1', 'guild-authority-membership-tip-v1') OR kind LIKE 'guild-original-%'",
+            false,
+        ).unwrap();
         node.control
             .put_record(
                 "guild-dynamic-state",

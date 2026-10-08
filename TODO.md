@@ -1755,6 +1755,26 @@ separately below.
     Bounded legacy-prefix rebuilding, durable writer/recovery/group indexes,
     flat mutation replacement, history retention/quota, checkpoint ownership/
     publication and all retained 1 TiB/platform/release gates remain required.
+  - [x] Incrementally persist original guild-history effects and use bounded
+    retained-group lookups for ordinary Node/reader shard serving and the group
+    lookup in variable repair. Reuse the original-history validator for every
+    unchanged original event, quorum/subject signatures, writer/recovery key
+    transitions, historical placement, original Add-bound witness (or original
+    legacy quorum binding), retirement, forgetting and same-ID reincarnation.
+    Prepare one event in a bounded disposable overlay outside the durable SQL
+    writer; atomically publish guarded point mutations and a verified-prefix
+    marker with accepted original records, compact authority, membership rows
+    and pending cleanup. Persist historical event tips/incarnations as well as
+    current key/group rows. New guilds advance this index with normal ingestion;
+    older/recovered stores start at independently verified genesis and catch up
+    one bounded original event at a time in peer reconciliation. An incomplete
+    prefix explicitly retains the compatibility reader; missing/corrupt current
+    rows never fall back. See ADR 0002 for exact validation evidence. This does
+    not complete flat-state mutation replacement, key-reader integration,
+    automatic compact-tip rebuilding for older stores, legacy migration
+    throughput/qualification, archive retention/compaction, metadata/quota policy,
+    paged checkpoint ownership/publication or retained 1 TiB/platform/release
+    gates; all remain required.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

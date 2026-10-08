@@ -1864,6 +1864,26 @@ and deadlines. Bounded legacy-prefix rebuilding, archive retention/quota,
 durable key/group indexes, flat mutation replacement, checkpoint ownership/
 publication and full retained-capacity/platform/release gates remain required.
 
+Original guild-history effects now also have a durable incremental index.
+Each accepted event prepares only its bounded affected point rows in disposable
+encrypted scratch, reusing the original certificate, key, coding-witness and
+lifecycle validators. Guarded point mutations and the verified-prefix marker
+join the original event/state/roster transaction; publication rereads the
+selected rows after its final mutation. The index preserves every original
+prefix tip and coding incarnation, including forgotten/re-added groups. Normal
+Node and reader shard serving, emergency-reader group lookup and the group
+lookup in variable repair use fixed bounded retained-group reads, preserving
+holder, payload-root and checkpoint checks. They do not decode the growing
+flat guild-state blob when the index is current. New guilds advance normally;
+older/recovered stores rebuild from verified original genesis in bounded steps
+during peer reconciliation, requiring original event-bound evidence. An
+incomplete prefix retains the explicit legacy compatibility reader; damaged
+current rows fail closed. Local index checksums are corruption checks, never
+new signatures or peer certificates. Complete flat mutation replacement,
+key-reader integration, old-store compact-tip rebuilding, migration throughput,
+archive retention/compaction, full quota policy, enclosing checkpoint custody
+and all retained-capacity/platform/release gates remain required.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

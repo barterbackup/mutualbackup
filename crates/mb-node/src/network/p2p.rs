@@ -8343,6 +8343,19 @@ async fn run_peer_reconciliation(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Resu
                 }
             }
         }
+        // Replay at most a bounded batch, releasing the Node between events.
+        // Original proof work stays outside the production SQL writer.
+        let history_started = std::time::Instant::now();
+        for _ in 0..16 {
+            match node_blocking(node.clone(), |node| node.advance_guild_history_index()).await {
+                Ok(true) if history_started.elapsed() < Duration::from_millis(25) => {}
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "original guild history index is waiting for evidence");
+                    break;
+                }
+            }
+        }
         if let Err(error) = sync_checkpoint_head_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "certified checkpoint-head synchronization failed");
         }

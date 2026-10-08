@@ -6,6 +6,450 @@ use mb_core::{
 };
 use std::collections::BTreeMap;
 
+fn durable(control: &ControlStore) -> CatalogDurableGuildHistory {
+    CatalogDurableGuildHistory::read(control).unwrap().unwrap()
+}
+
+fn advance_durable(control: &ControlStore, history: &History) {
+    let sequence = durable(control).authority().event_sequence + 1;
+    let event = QuorumGuildEvent::decode_bounded(&history.source.events[&sequence]).unwrap();
+    durable(control)
+        .prepare_advance(control, &event, budget(), &mut history.source.clone())
+        .unwrap()
+        .commit(control)
+        .unwrap();
+}
+
+#[test]
+fn durable_original_history_reopens_and_matches_all_original_event_effects() {
+    for legacy in [false, true] {
+        let mut history = History::new(legacy, 4);
+        let owner = history.keys[0].node_id();
+        let id = history.entry.retained.group.id;
+        history.push(GuildEventKind::RotateWriterKey {
+            owner,
+            epoch: 2,
+            public_key: history.keys[1].node_id().0,
+        });
+        let (envelope, _) =
+            create_recovery_key_envelope(&history.keys[0], history.state.guild_id, 2).unwrap();
+        history.push(GuildEventKind::RotateRecoveryKey { envelope });
+        history.push(GuildEventKind::RevokeWriterKey { owner, epoch: 2 });
+        history.push(GuildEventKind::RevokeRecoveryKey {
+            subject: owner,
+            epoch: 2,
+        });
+        history.push(GuildEventKind::RetireCodingGroup {
+            group_id: id,
+            retain_through_event: history.state.event_sequence + 1,
+        });
+        history.push(GuildEventKind::ForgetCodingGroup { group_id: id });
+        let old_witness_hash =
+            *blake3::hash(&canonical_bytes(&history.entry.transcript).unwrap()).as_bytes();
+        let mut witness = history.entry.transcript.value.clone();
+        witness.verified_at_unix_seconds -= 1;
+        history.entry.transcript = mb_core::SignedRecord::sign(
+            mb_core::CODING_TRANSCRIPT_DOMAIN,
+            witness,
+            history.keys.last().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            replay_coding_transcript(&history.entry.transcript).unwrap(),
+            CodingReplayFinding::Verified
+        );
+        let new_witness_hash =
+            *blake3::hash(&canonical_bytes(&history.entry.transcript).unwrap()).as_bytes();
+        assert_ne!(old_witness_hash, new_witness_hash);
+        history.add(legacy);
+        history.push(GuildEventKind::RelabelMember {
+            node_id: owner,
+            failure_domain: "original-history-new-domain".to_owned(),
+        });
+        history.push(GuildEventKind::SetQuorum {
+            policy: history.state.quorum,
+        });
+        history.push(GuildEventKind::RemoveMember { node_id: owner });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("durable.db");
+        let control = ControlStore::open(&path, &history.keys[0]).unwrap();
+        let initial = GuildAuthoritySnapshot::from_genesis(&history.genesis).unwrap();
+        let mut state = DynamicGuildState::new(
+            initial.guild_id,
+            initial.event_head,
+            initial.quorum,
+            initial.active_members().cloned().collect(),
+        )
+        .unwrap();
+        CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+            .unwrap()
+            .commit(&control)
+            .unwrap();
+        drop(control);
+        for bytes in history.source.events.values() {
+            let control = ControlStore::open(&path, &history.keys[0]).unwrap();
+            let old = durable(&control);
+            let event = QuorumGuildEvent::decode_bounded(bytes).unwrap();
+            let mutation = old
+                .prepare_advance(&control, &event, budget(), &mut history.source.clone())
+                .unwrap();
+            let work = old
+                .represented_work()
+                .checked_add(mutation.step_work())
+                .unwrap();
+            mutation.commit(&control).unwrap();
+            assert!(
+                old.view(&control, old.genesis_hash(), old.authority())
+                    .is_err()
+            );
+            state.apply_event(&event).unwrap();
+            let current = durable(&control);
+            assert_eq!(current.represented_work(), work);
+            assert_eq!(
+                current.authority(),
+                &GuildAuthoritySnapshot::from_state(&state).unwrap()
+            );
+            let view = current
+                .view(&control, current.genesis_hash(), current.authority())
+                .unwrap();
+            assert_eq!(
+                view.retained_group(id).unwrap().as_ref(),
+                state
+                    .coding_groups
+                    .iter()
+                    .find(|group| group.group.id == id)
+            );
+            for writer in &state.writer_keys {
+                assert_eq!(
+                    view.writer_key(writer.owner, writer.epoch)
+                        .unwrap()
+                        .as_ref(),
+                    Some(writer)
+                );
+            }
+            for recovery in &state.recovery_keys {
+                assert_eq!(
+                    view.recovery_key(recovery.envelope.subject, recovery.envelope.epoch)
+                        .unwrap()
+                        .as_ref(),
+                    Some(recovery)
+                );
+            }
+        }
+        assert_eq!(state, history.state);
+        let control = ControlStore::open(&path, &history.keys[0]).unwrap();
+        let encoded = control
+            .get_record("guild-original-group", &id)
+            .unwrap()
+            .unwrap();
+        let current_group: Group = decode_canonical(&encoded[64..]).unwrap();
+        assert_eq!(current_group.transcript_hash, new_witness_hash);
+        // Forgotten incarnations and every original prefix remain indexed.
+        assert!(
+            control
+                .get_record(
+                    "guild-original-incarnation",
+                    &historical::incarnation_key(id, 6)
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            control
+                .get_record("guild-original-event", &state.event_sequence.to_be_bytes())
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn durable_original_history_has_exact_step_budgets_and_rejects_missing_original_witnesses() {
+    let history = History::new(true, 4);
+    let directory = tempfile::tempdir().unwrap();
+    let control =
+        ControlStore::open(directory.path().join("durable.db"), &history.keys[0]).unwrap();
+    let initial =
+        CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget()).unwrap();
+    let exact = initial.step_work();
+    assert!(
+        CatalogDurableGuildHistory::prepare_genesis(
+            &control,
+            &history.genesis,
+            Work {
+                bytes: exact.bytes - 1,
+                ..exact
+            }
+        )
+        .is_err()
+    );
+    CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, exact)
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    for _ in 0..5 {
+        advance_durable(&control, &history);
+    }
+    let old = durable(&control);
+    let event = QuorumGuildEvent::decode_bounded(&history.source.events[&6]).unwrap();
+    let mutation = old
+        .prepare_advance(&control, &event, budget(), &mut history.source.clone())
+        .unwrap();
+    let exact = mutation.step_work();
+    for low in [
+        Work {
+            bytes: exact.bytes - 1,
+            ..exact
+        },
+        Work {
+            records: exact.records - 1,
+            ..exact
+        },
+    ] {
+        assert!(
+            old.prepare_advance(&control, &event, low, &mut history.source.clone())
+                .is_err()
+        );
+        assert_eq!(durable(&control).authority(), old.authority());
+    }
+    for object in [
+        CatalogGuildHistoryObject::Transcript(event.event.hash().unwrap()),
+        CatalogGuildHistoryObject::LegacyBinding(event.event.hash().unwrap()),
+    ] {
+        let mut source = history.source.clone();
+        source.objects.remove(&object);
+        assert!(
+            old.prepare_advance(&control, &event, budget(), &mut source)
+                .is_err()
+        );
+        assert_eq!(durable(&control).authority(), old.authority());
+    }
+    let mut forged = event.clone();
+    forged.signatures[0].signature[0] ^= 1;
+    let mut source = history.source.clone();
+    assert!(
+        old.prepare_advance(&control, &forged, budget(), &mut source)
+            .is_err()
+    );
+    assert!(
+        source.reads.is_empty(),
+        "invalid original certificate must precede witness I/O"
+    );
+    old.prepare_advance(&control, &event, exact, &mut history.source.clone())
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    assert!(
+        mutation.commit(&control).is_err(),
+        "a prepared original prefix cannot be reused"
+    );
+}
+
+#[test]
+fn durable_original_history_publication_faults_roll_back_and_retry() {
+    for fault in 0..6 {
+        let history = History::new(false, 4);
+        let directory = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open(directory.path().join("durable.db"), &history.keys[0]).unwrap();
+        CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+            .unwrap()
+            .commit(&control)
+            .unwrap();
+        let old = durable(&control);
+        let event = QuorumGuildEvent::decode_bounded(&history.source.events[&1]).unwrap();
+        let mutation = old
+            .prepare_advance(&control, &event, budget(), &mut history.source.clone())
+            .unwrap();
+        assert!(mutation.apply_in_transaction(&control).is_err());
+        let sql = match fault {
+            0 => {
+                "CREATE TEMP TRIGGER original_fault BEFORE INSERT ON protocol_records WHEN NEW.kind='guild-original-members' BEGIN SELECT RAISE(IGNORE); END"
+            }
+            1 => {
+                "CREATE TEMP TRIGGER original_fault AFTER INSERT ON protocol_records WHEN NEW.kind='guild-original-event' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind=NEW.kind AND record_id=NEW.record_id; END"
+            }
+            2 => {
+                "CREATE TEMP TRIGGER original_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN SELECT RAISE(IGNORE); END"
+            }
+            3 => {
+                "CREATE TEMP TRIGGER original_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-original-members'; END"
+            }
+            4 => {
+                "CREATE TEMP TRIGGER original_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind=NEW.kind AND record_id=NEW.record_id; END"
+            }
+            _ => {
+                "CREATE TEMP TRIGGER original_fault BEFORE INSERT ON protocol_records WHEN NEW.kind='guild-original-event' BEGIN SELECT RAISE(IGNORE); END"
+            }
+        };
+        control.database_shell_statement(sql, false).unwrap();
+        assert!(mutation.commit(&control).is_err(), "fault {fault}");
+        assert_eq!(durable(&control).authority(), old.authority());
+        assert!(
+            control
+                .get_record("guild-original-members", &2_u64.to_be_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            control
+                .get_record("guild-original-event", &1_u64.to_be_bytes())
+                .unwrap()
+                .is_none()
+        );
+        control
+            .database_shell_statement("DROP TRIGGER original_fault", false)
+            .unwrap();
+        mutation.commit(&control).unwrap();
+        assert_eq!(durable(&control).authority().event_sequence, 1);
+    }
+}
+
+#[test]
+fn durable_original_history_point_rows_fail_closed_on_corruption_and_oversize() {
+    let history = History::new(false, 4);
+    let directory = tempfile::tempdir().unwrap();
+    let control =
+        ControlStore::open(directory.path().join("durable.db"), &history.keys[0]).unwrap();
+    CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    for _ in 0..6 {
+        advance_durable(&control, &history);
+    }
+    let current = durable(&control);
+    let id = history.entry.retained.group.id;
+    let bytes = control
+        .get_record("guild-original-group", &id)
+        .unwrap()
+        .unwrap();
+    for index in [0, 32, bytes.len() - 1] {
+        let mut corrupt = bytes.clone();
+        corrupt[index] ^= 1;
+        control
+            .put_record("guild-original-group", &id, &corrupt)
+            .unwrap();
+        assert!(
+            current
+                .view(&control, current.genesis_hash(), current.authority())
+                .unwrap()
+                .retained_group(id)
+                .is_err()
+        );
+    }
+    control
+        .put_record(
+            "guild-original-group",
+            &id,
+            &vec![0; GUILD_EVENT_BYTES + 65],
+        )
+        .unwrap();
+    assert!(
+        current
+            .view(&control, current.genesis_hash(), current.authority())
+            .unwrap()
+            .retained_group(id)
+            .is_err()
+    );
+    control
+        .put_record("guild-original-group", &id, &bytes)
+        .unwrap();
+    assert_eq!(
+        current
+            .view(&control, current.genesis_hash(), current.authority())
+            .unwrap()
+            .retained_group(id)
+            .unwrap()
+            .unwrap(),
+        history.state.coding_groups[0]
+    );
+}
+
+#[test]
+fn durable_original_history_guards_selected_rows_and_rolls_back_forgotten_group_deletion() {
+    let mut history = History::new(false, 4);
+    let id = history.entry.retained.group.id;
+    history.push(GuildEventKind::RetireCodingGroup {
+        group_id: id,
+        retain_through_event: 7,
+    });
+    history.push(GuildEventKind::ForgetCodingGroup { group_id: id });
+    let directory = tempfile::tempdir().unwrap();
+    let control =
+        ControlStore::open(directory.path().join("durable.db"), &history.keys[0]).unwrap();
+    CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    for _ in 0..6 {
+        advance_durable(&control, &history);
+    }
+    let current = durable(&control);
+    let retire = QuorumGuildEvent::decode_bounded(&history.source.events[&7]).unwrap();
+    let mutation = current
+        .prepare_advance(&control, &retire, budget(), &mut history.source.clone())
+        .unwrap();
+    let old = control
+        .get_record("guild-original-group", &id)
+        .unwrap()
+        .unwrap();
+    control
+        .put_record("guild-original-group", &id, &[0])
+        .unwrap();
+    assert!(
+        mutation.commit(&control).is_err(),
+        "a prepared transition must guard its original selected row"
+    );
+    assert_eq!(durable(&control).authority(), current.authority());
+    control
+        .put_record("guild-original-group", &id, &old)
+        .unwrap();
+    control.database_shell_statement("CREATE TEMP TRIGGER original_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='guild-original-group' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+    assert!(mutation.commit(&control).is_err());
+    assert_eq!(
+        control.get_record("guild-original-group", &id).unwrap(),
+        Some(old)
+    );
+    control
+        .database_shell_statement("DROP TRIGGER original_fault", false)
+        .unwrap();
+    mutation.commit(&control).unwrap();
+    let current = durable(&control);
+    let forget = QuorumGuildEvent::decode_bounded(&history.source.events[&8]).unwrap();
+    let mutation = current
+        .prepare_advance(&control, &forget, budget(), &mut history.source.clone())
+        .unwrap();
+    for sql in [
+        "CREATE TEMP TRIGGER original_fault BEFORE DELETE ON protocol_records WHEN OLD.kind='guild-original-group' BEGIN SELECT RAISE(IGNORE); END".to_owned(),
+        format!("CREATE TEMP TRIGGER original_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN INSERT INTO protocol_records(kind,record_id,bytes) VALUES ('guild-original-group',X'{}',X'00'); END", blake3::Hash::from_bytes(id).to_hex()),
+    ] {
+        control.database_shell_statement(&sql, false).unwrap();
+        assert!(mutation.commit(&control).is_err());
+        assert_eq!(durable(&control).authority(), current.authority());
+        assert!(current.view(&control, current.genesis_hash(), current.authority()).unwrap().retained_group(id).unwrap().unwrap().retired_at_event.is_some());
+        control.database_shell_statement("DROP TRIGGER original_fault", false).unwrap();
+    }
+    mutation.commit(&control).unwrap();
+    assert!(
+        durable(&control)
+            .view(&control, current.genesis_hash(), mutation.authority())
+            .unwrap()
+            .retained_group(id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        control
+            .get_record(
+                "guild-original-incarnation",
+                &historical::incarnation_key(id, 6)
+            )
+            .unwrap()
+            .is_some()
+    );
+}
+
 fn budget() -> Work {
     Work {
         bytes: 1 << 30,

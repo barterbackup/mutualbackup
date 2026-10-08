@@ -1,6 +1,6 @@
-//! Durable bounded authority projection for ordinary membership readers.
-//! Publication shares the accepted original event/state transaction. This
-//! does not replace retained writer/recovery/coding indexes or their proofs.
+//! Durable bounded projections of verified original guild authority.
+//! Original records, current/historical rosters and original-history point
+//! mutations share the accepted event/state transaction.
 use super::*;
 use mb_core::{GUILD_AUTHORITY_SNAPSHOT_BYTES, GUILD_EVENT_BYTES, GuildAuthoritySnapshot};
 
@@ -9,6 +9,18 @@ const KEY: &[u8] = b"primary";
 const BYTES: usize = GUILD_AUTHORITY_SNAPSHOT_BYTES + 128;
 
 mod membership;
+mod original_history;
+
+pub(super) fn advance_original_history(control: &ControlStore) -> Result<bool> {
+    original_history::advance(control)
+}
+pub(super) fn retained_group(
+    control: &ControlStore,
+    guild: [u8; 32],
+    group: [u8; 32],
+) -> Result<mb_core::RetainedCodingGroup> {
+    original_history::retained_group(control, guild, group)
+}
 pub(super) fn read_membership_epoch(
     control: &ControlStore,
     epoch: u64,
@@ -116,6 +128,10 @@ fn check_genesis(
 /// Fixed reads only. A missing projection permits the existing legacy path;
 /// malformed/stale projections never fall back to a different authority.
 pub(super) fn read(control: &ControlStore) -> Result<Option<GuildAuthoritySnapshot>> {
+    Ok(read_record(control)?.map(|record| record.authority))
+}
+
+fn read_record(control: &ControlStore) -> Result<Option<Record>> {
     let Some(bytes) = control.get_record_bounded(KIND, KEY, BYTES)? else {
         return Ok(None);
     };
@@ -125,7 +141,7 @@ pub(super) fn read(control: &ControlStore) -> Result<Option<GuildAuthoritySnapsh
     if control.get_record_bounded(KIND, KEY, BYTES)?.as_deref() != Some(bytes.as_slice()) {
         anyhow::bail!("compact guild authority changed during lookup");
     }
-    Ok(Some(record.authority))
+    Ok(Some(record))
 }
 
 pub(super) fn read_or_legacy(control: &ControlStore) -> Result<Option<GuildAuthoritySnapshot>> {
@@ -208,6 +224,8 @@ pub(super) fn publish(
         before.as_ref(),
         records,
     )?;
+    let original_history =
+        original_history::prepare(control, installed, &next, before.as_ref(), records)?;
     control.with_record_transaction(|| -> Result<()> {
         if control.get_record_bounded(KIND, KEY, BYTES)? != expected {
             anyhow::bail!("compact guild authority changed before publication");
@@ -217,13 +235,13 @@ pub(super) fn publish(
             check_tail(control, before)?;
         }
         for (kind, id, bytes) in records {
-            if kind == KIND || membership::owns_kind(kind) {
+            if kind == KIND || membership::owns_kind(kind) || original_history::owns_kind(kind) {
                 anyhow::bail!("accepted record batch cannot substitute compact authority");
             }
             control.put_record(kind, id, bytes)?;
         }
         for (kind, id) in deletions {
-            if kind == KIND || membership::owns_kind(kind) {
+            if kind == KIND || membership::owns_kind(kind) || original_history::owns_kind(kind) {
                 anyhow::bail!("accepted record batch cannot delete compact authority");
             }
             let existed = control.record_length(kind, id)?.is_some();
@@ -234,6 +252,7 @@ pub(super) fn publish(
             }
         }
         membership.publish(control)?;
+        original_history.apply_in_transaction(control)?;
         match &expected {
             Some(old) => control.replace_record_if_value(KIND, KEY, old, &encoded)?,
             None => {
@@ -264,6 +283,7 @@ pub(super) fn publish(
             }
         }
         membership.check(control)?;
+        original_history.verify_published(control)?;
         Ok(())
     })
 }

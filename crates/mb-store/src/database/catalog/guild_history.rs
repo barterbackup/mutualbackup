@@ -16,6 +16,10 @@ use crate::RecordScratchStore;
 
 mod historical;
 pub use historical::CatalogGuildHistorySnapshot;
+mod durable;
+pub use durable::{
+    CatalogDurableGuildHistory, CatalogDurableGuildHistoryView, CatalogGuildHistoryMutation,
+};
 
 const MEMBERS: &str = "guild-history-membership";
 const WRITERS: &str = "guild-history-writer";

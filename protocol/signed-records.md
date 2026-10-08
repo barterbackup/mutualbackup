@@ -276,6 +276,26 @@ plan signature, membership/domain, current-epoch and deadline rules remain;
 legacy-prefix rebuilding and complete key/group/history quota integration
 remain required.
 
+The normal original-history index incrementally reuses this validator, including
+full non-membership effects and original witness/binding replay. Its private
+local rows preserve membership epochs, writer/recovery histories, retained
+groups, all original event-prefix tips and forgotten coding incarnations.
+Each row binds the original genesis, namespace/key and canonical payload with a
+local checksum; a bounded completion marker names exactly the verified prefix.
+Only a prepared original transition can publish its guarded point changes,
+atomically with the accepted original event, compact authority and membership
+rows. Proof and disposable scratch work occur outside the production writer;
+final exact readbacks detect ignored, corrupt and cross-record writes. Normal
+shard-serving group lookups require the current independent compact authority
+and original genesis/tail, with final marker/row/authority checks. A missing or
+damaged current indexed group never triggers legacy fallback. Older/recovered
+stores may explicitly use their existing compatibility reader while rebuilding
+from original genesis one bounded original event at a time; unavailable original
+Add evidence stops that prefix without substituting a group-key witness.
+These indexes change no signed record, identity or wire layout. Flat mutation
+replacement, complete key-reader/migration/quota integration and enclosing
+checkpoint/payload ownership remain separate requirements.
+
 The authority successor comparison preserves every previous historical fence
 and every retained original signed revision unless an exact monotone tombstone
 retires its prefix. A new/advanced floor must identify a revision present in the
