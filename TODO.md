@@ -1569,6 +1569,22 @@ separately below.
     establish a completed index or real retained-data qualification. See ADR 0002.
     All 161 core and 197 ordinary store tests pass (26 store tests ignored),
     with strict locked workspace/all-targets Clippy and formatting/diff checks.
+  - [x] Bind the completed directory coverage proof to one durable local
+    packing/coding metadata owner. Require the exact admitted manifest and
+    budget; acquire both packing roots and the directory atomically, pin every
+    logical forest part before original witness replay, and publish only after
+    all local packing/coding EOFs. Resume interrupted acquisition with a rebuilt
+    equivalent proof; fence failed jobs and release one root per cleanup step.
+    Shared successors survive capture retirement and acquisition/cleanup reopen.
+    A shared bounded journal preserves existing authority/coding version-one
+    bytes and pin namespaces. Six fixtures cover 23 roots beyond fixed bundle
+    capacity, 128-forest local tail corruption, ignored writes, exact proof/budget
+    binding, carried authority work, empty-root deduplication and namespace
+    separation. All 161 core and 205 ordinary store tests pass (26 store tests
+    ignored), with strict locked workspace/all-targets Clippy and formatting/diff
+    checks. See ADR 0002. This owns packing/coding metadata only; the enclosing
+    checkpoint ownership, certified-current guards and payload owners below
+    remain required. No normal consumer or real retained 1 TiB gate is qualified.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

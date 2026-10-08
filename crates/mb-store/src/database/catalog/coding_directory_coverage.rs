@@ -235,7 +235,7 @@ impl CatalogPackingCodingDirectoryIndex {
         self.budget
     }
 
-    fn require_complete(&self) -> Result<(), CatalogStoreError> {
+    pub(super) fn require_complete(&self) -> Result<(), CatalogStoreError> {
         self.packing.require_complete()?;
         let expected = canonical_bytes_bounded(&self.manifest, MANIFEST_BYTES)?;
         if self
@@ -355,7 +355,7 @@ impl CatalogPackingCodingDirectoryIndex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::coding_coverage::tests::entry;
     use super::super::packing_validation::tests::{Fixture as PackingFixture, fixture};
     use super::*;
@@ -365,16 +365,16 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    struct Fixture {
-        packing: PackingFixture,
-        entries: Vec<CatalogCodingEntry>,
-        root: CatalogCodingDirectoryRoot,
-        forests: Vec<CatalogCodingRoot>,
-        pages: HashMap<[u8; 32], Vec<u8>>,
+    pub(crate) struct Fixture {
+        pub(crate) packing: PackingFixture,
+        pub(crate) entries: Vec<CatalogCodingEntry>,
+        pub(crate) root: CatalogCodingDirectoryRoot,
+        pub(crate) forests: Vec<CatalogCodingRoot>,
+        pub(crate) pages: HashMap<[u8; 32], Vec<u8>>,
     }
 
     impl Fixture {
-        fn new(count: u32) -> Self {
+        pub(crate) fn new(count: u32) -> Self {
             let packing = fixture(count, true);
             let entries = (0..count as usize)
                 .step_by(3)
@@ -471,13 +471,13 @@ mod tests {
                 prior_work,
             }
         }
-        fn fetch(&self, page: CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError> {
+        pub(crate) fn fetch(&self, page: CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError> {
             self.pages
                 .get(&page.hash)
                 .cloned()
                 .ok_or_else(|| DatabaseError::NotReady.into())
         }
-        fn build(
+        pub(crate) fn build(
             &self,
             maximum: u64,
         ) -> Result<CatalogPackingCodingDirectoryIndex, CatalogStoreError> {

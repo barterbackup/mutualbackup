@@ -2869,3 +2869,74 @@ forest joins and durable authority/coding ownership. Formatting/diff checks and
 strict locked workspace/all-targets Clippy pass. No network/native/release,
 other-platform or real retained 1 TiB runtime qualification is implied by this
 staging index and accounting change.
+
+### Completed directory proof and combined local metadata ownership (2026-10-08)
+
+`ControlStore::retain_catalog_packing_coding` now accepts a completed
+`CatalogPackingCodingDirectoryIndex`, binding its exact immutable manifest and
+trusted byte/page/record budget into one durable local journal. A descriptor
+alone cannot start or resume this operation. The completed packing and directory
+markers are required before acquisition and again before publication. A reused
+job ID must match both manifest and budget exactly; cancelled IDs never resume.
+
+Both packing byte-tree roots and the coding-directory byte-tree root acquire
+their pins in one short transaction. Initial failures roll back the journal and
+all three roles. The subsequent typed source and descriptor readers require full
+authenticated local EOF; compact descriptors resolve original source identities
+through the already completed admitted index. The directory reader pins each
+bounded forest's logical part roots before evidence reads, replays original
+witnesses, and requires every nested and globally ordered directory EOF before
+publishing the journal. These traversals hold no production database writer and
+allocate no catalog-sized root vector or second scratch index. Original staging
+owners must survive until successful publication.
+
+Crash-interrupted Building jobs replay idempotently with a rebuilt equivalent
+completed proof. A traversal or publication failure cancels only a still-Building
+job; it cannot cancel another worker's completed publication. Cancelled cleanup
+releases one authenticated dependency, pin and counter update per transaction,
+with ordinary bounded page GC following the byte-tree edges. Independent
+successors retain shared roots after predecessor cleanup and capture retirement.
+The new 17-byte pin namespace uses prefix three, distinct from authority and
+coding journals and from 16-byte capture IDs.
+
+The authority, coding and combined owners now share the bounded journal's
+canonical read, exact descriptor binding, pin/dependency readback, counter CAS
+and incremental cleanup code. Existing version-one authority/coding journal and
+dependency layouts, namespaces and pin prefixes are preserved. Independent
+copies of the original journal enum and field order verify all three state
+encodings and decode compatibility. Per-policy walkers and scope restrictions
+remain separate.
+
+Traversal admission still charges every logical occurrence, including repeated
+roots and the previously admitted authority prefix. Ownership counters charge
+distinct packing/coding root closures. They exclude authority work, which this
+owner does not acquire. In the empty case the identical two packing roots share
+one physical pin while all three logical top-level occurrences remain charged.
+This does not increase any original tree, forest, staging-intent or fixed bundle
+limit, or derive the enclosing retained dataset/file/history/guild quota policy.
+
+Six combined-owner fixtures cover 23 distinct roots beyond fixed bundle
+capacity, original capture retirement, shared successors, acquisition and
+cleanup reopen, rebuilt proofs, budget substitution, carried authority work,
+empty-root deduplication, incomplete markers, orphan/scope rejection and all pin
+namespaces. Ignored counter, pin, dependency, publication and cleanup writes
+cannot expose partial ownership. A 384-source/128-forest fixture corrupts late
+local source/descriptor leaves below valid pinned roots and the final logical
+coding root; each attempt fails without publishing a prefix. Fault bytes are
+repaired before ordinary authenticated GC is exercised.
+
+This is one combined local packing/coding metadata owner. It does not certify
+current guild-event membership, writer fences or coding lifecycle, own authority,
+owner-private/native/bootstrap metadata or information/parity payloads, activate
+a checkpoint, or guard retirement of a certified current checkpoint. The
+enclosing checkpoint must bind those remaining owners and publication/retirement
+guards; independent journals alone do not establish that guarantee. The parent
+checkpoint-ownership TODO, R3-SINGLE-OWNER-METADATA, normal capture/retention/seed
+consumers and all retained 1 TiB, release and platform gates remain open.
+
+Validation: all 20 focused authority/coding/combined retention fixtures pass.
+The full locked regression passes all 161 core and 205 ordinary store tests
+(26 store tests ignored), including the expanded carried-prefix and atomic
+initial-failure checks. Strict locked workspace/all-targets Clippy and
+formatting/diff checks pass. No network/native/release, other-platform or real
+retained 1 TiB runtime gate was rerun for this local ownership slice.

@@ -6,6 +6,7 @@ use mb_core::{
     CatalogStreamError,
 };
 
+use super::retention_journal::{self as journal, Dependency};
 use super::*;
 
 const JOURNAL: &str = "catalog-coding-retention-v1";
@@ -40,198 +41,53 @@ impl CatalogCodingRetention {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum CatalogCodingRetentionState {
-    Building,
-    Published,
-    Cancelled,
-}
+pub use journal::CatalogRetentionState as CatalogCodingRetentionState;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct JournalRecord {
-    format_version: u16,
-    retention: CatalogCodingRetention,
-    state: CatalogCodingRetentionState,
-    roots: u64,
-    bytes: u64,
-    pages: u64,
-}
+#[cfg(test)]
+type JournalRecord = journal::JournalRecord<CatalogCodingRetention>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct Dependency {
-    scope: CatalogScope,
-    section: CatalogSection,
-    root: CatalogPageRef,
-}
+impl journal::Retention for CatalogCodingRetention {
+    const JOURNAL: &'static str = JOURNAL;
+    const JOURNAL_BYTES: usize = JOURNAL_BYTES;
+    const DEPENDENCIES: &'static str = "catalog-coding-dependency-v1";
+    const PIN_PREFIX: u8 = 2;
 
-impl Dependency {
-    fn validate(self, retention: CatalogCodingRetention) -> Result<(), CatalogStoreError> {
-        self.scope.validate(self.section)?;
-        self.root.validate()?;
-        if self.scope != retention.scope() || self.section != CatalogSection::Coding {
-            return Err(DatabaseError::Conflict.into());
-        }
-        Ok(())
+    fn id(self) -> Uuid {
+        self.id
     }
-
-    fn page(self) -> PageMetadata {
-        PageMetadata {
-            format_version: 1,
-            scope: self.scope,
-            section: self.section,
-            reference: self.root,
-        }
+    fn validate(self) -> Result<(), CatalogStoreError> {
+        CatalogCodingRetention::validate(self)
+    }
+    fn work(self) -> Result<(u64, u64), CatalogStoreError> {
+        let work = self.coding.work()?;
+        Ok((work.bytes, work.page_occurrences))
+    }
+    fn allows(self, scope: CatalogScope, section: CatalogSection) -> bool {
+        scope == self.scope() && section == CatalogSection::Coding
     }
 }
 
+#[cfg(test)]
 fn dependencies(id: Uuid) -> String {
-    format!("catalog-coding-dependency-v1/{}", id.simple())
+    journal::dependencies::<CatalogCodingRetention>(id)
 }
-
+#[cfg(test)]
 fn pin_id(id: Uuid) -> [u8; 17] {
-    // Capture pins are 16 bytes; authority-retention pins use prefix one.
-    // Prefix two separates coding ownership even when local job IDs coincide.
-    let mut key = [0; 17];
-    key[0] = 2;
-    key[1..].copy_from_slice(id.as_bytes());
-    key
+    journal::pin_id::<CatalogCodingRetention>(id)
 }
-
 fn read_journal(
     connection: &Connection,
     id: Uuid,
-) -> Result<Option<JournalRecord>, CatalogStoreError> {
-    if id.is_nil() {
-        return Err(DatabaseError::Conflict.into());
-    }
-    let Some(bytes) = bounded_record(connection, JOURNAL, id.as_bytes(), JOURNAL_BYTES)? else {
-        return Ok(None);
-    };
-    let record: JournalRecord = decode_canonical(&bytes)?;
-    record.retention.validate()?;
-    if record.format_version != 1
-        || record.retention.id != id
-        || record.roots > record.pages
-        || record.pages > record.retention.coding.work()?.page_occurrences
-        || record.bytes > record.retention.coding.work()?.bytes
-        || (record.roots == 0) != (record.pages == 0)
-        || (record.roots == 0) != (record.bytes == 0)
-        || (record.state == CatalogCodingRetentionState::Published && record.roots == 0)
-        || canonical_bytes(&record)? != bytes
-    {
-        return Err(DatabaseError::Integrity.into());
-    }
-    Ok(Some(record))
+) -> Result<Option<journal::JournalRecord<CatalogCodingRetention>>, CatalogStoreError> {
+    journal::read(connection, id)
 }
-
-fn require_journal(
-    connection: &Connection,
-    retention: CatalogCodingRetention,
-) -> Result<JournalRecord, CatalogStoreError> {
-    let record = read_journal(connection, retention.id)?.ok_or(DatabaseError::NotReady)?;
-    if record.retention != retention {
-        return Err(DatabaseError::Conflict.into());
-    }
-    Ok(record)
-}
-
-fn write_journal(
-    connection: &Connection,
-    previous: JournalRecord,
-    next: JournalRecord,
-) -> Result<(), CatalogStoreError> {
-    let bytes = canonical_bytes(&next)?;
-    if bytes.len() > JOURNAL_BYTES {
-        return Err(DatabaseError::Integrity.into());
-    }
-    let written = connection.execute(
-        "UPDATE protocol_records SET bytes = ?3
-         WHERE kind = ?1 AND record_id = ?2 AND bytes = ?4",
-        params![
-            JOURNAL,
-            previous.retention.id.as_bytes(),
-            bytes,
-            canonical_bytes(&previous)?
-        ],
-    )?;
-    if written != 1 || read_journal(connection, previous.retention.id)? != Some(next) {
-        return Err(DatabaseError::Conflict.into());
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn retain_root(
     connection: &Connection,
     retention: CatalogCodingRetention,
     dependency: Dependency,
 ) -> Result<(), CatalogStoreError> {
-    dependency.validate(retention)?;
-    let previous = require_journal(connection, retention)?;
-    if previous.state != CatalogCodingRetentionState::Building {
-        return Err(DatabaseError::Conflict.into());
-    }
-    read_page(connection, dependency.page())?;
-    let kind = dependencies(retention.id);
-    let bytes = canonical_bytes(&dependency)?;
-    let existing = bounded_record(connection, &kind, &dependency.root.hash, RECORD_BYTES)?;
-    if let Some(existing) = existing {
-        if existing != bytes
-            || bounded_record(
-                connection,
-                &pins(dependency.root.hash),
-                &pin_id(retention.id),
-                0,
-            )?
-            .as_deref()
-                != Some(&[])
-        {
-            return Err(DatabaseError::Integrity.into());
-        }
-        return Ok(());
-    }
-    let mut next = previous;
-    next.roots = next
-        .roots
-        .checked_add(1)
-        .ok_or(DatabaseError::CapacityExceeded)?;
-    next.bytes = next
-        .bytes
-        .checked_add(dependency.root.byte_len)
-        .ok_or(DatabaseError::CapacityExceeded)?;
-    next.pages = next
-        .pages
-        .checked_add(dependency.root.page_occurrences)
-        .ok_or(DatabaseError::CapacityExceeded)?;
-    if next.pages > retention.coding.work()?.page_occurrences
-        || next.bytes > retention.coding.work()?.bytes
-    {
-        return Err(DatabaseError::CapacityExceeded.into());
-    }
-    insert_exact(connection, &kind, &dependency.root.hash, &bytes)?;
-    insert_exact(
-        connection,
-        &pins(dependency.root.hash),
-        &pin_id(retention.id),
-        &[],
-    )?;
-    if bounded_record(connection, &kind, &dependency.root.hash, RECORD_BYTES)?.as_deref()
-        != Some(&bytes)
-        || bounded_record(
-            connection,
-            &pins(dependency.root.hash),
-            &pin_id(retention.id),
-            0,
-        )?
-        .as_deref()
-            != Some(&[])
-    {
-        return Err(DatabaseError::Integrity.into());
-    }
-    connection.execute(
-        "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
-        params![GC, dependency.root.hash],
-    )?;
-    write_journal(connection, previous, next)
+    journal::retain(connection, retention, dependency)
 }
 
 fn stream_error(error: CatalogStreamError<CatalogStoreError>) -> CatalogStoreError {
@@ -265,42 +121,10 @@ impl ControlStore {
         {
             let transaction =
                 Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-            match read_journal(&transaction, retention.id)? {
-                Some(record)
-                    if record.retention != retention
-                        || record.state == CatalogCodingRetentionState::Cancelled =>
-                {
-                    return Err(DatabaseError::Conflict.into());
-                }
-                Some(record) if record.state == CatalogCodingRetentionState::Published => {
-                    return Ok(());
-                }
-                Some(_) => {}
-                None => {
-                    let orphan: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind = ?1)",
-                        [dependencies(retention.id)],
-                        |row| row.get(0),
-                    )?;
-                    if orphan {
-                        return Err(DatabaseError::Integrity.into());
-                    }
-                    insert_exact(
-                        &transaction,
-                        JOURNAL,
-                        retention.id.as_bytes(),
-                        &canonical_bytes(&JournalRecord {
-                            format_version: 1,
-                            retention,
-                            state: CatalogCodingRetentionState::Building,
-                            roots: 0,
-                            bytes: 0,
-                            pages: 0,
-                        })?,
-                    )?;
-                }
+            if journal::begin(&transaction, retention)? == CatalogCodingRetentionState::Published {
+                return Ok(());
             }
-            retain_root(&transaction, retention, control)?;
+            journal::retain(&transaction, retention, control)?;
             transaction.commit()?;
         }
         let result = (|| {
@@ -317,7 +141,7 @@ impl ControlStore {
                         &self.connection,
                         TransactionBehavior::Immediate,
                     )?;
-                    retain_root(
+                    journal::retain(
                         &transaction,
                         retention,
                         Dependency {
@@ -337,13 +161,7 @@ impl ControlStore {
             {}
             let transaction =
                 Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-            let previous = require_journal(&transaction, retention)?;
-            if previous.state != CatalogCodingRetentionState::Building {
-                return Err(DatabaseError::Conflict.into());
-            }
-            let mut next = previous;
-            next.state = CatalogCodingRetentionState::Published;
-            write_journal(&transaction, previous, next)?;
+            journal::publish(&transaction, retention)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -352,12 +170,7 @@ impl ControlStore {
             // worker. Only fence a job that is still Building.
             let transaction =
                 Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-            let previous = require_journal(&transaction, retention)?;
-            if previous.state == CatalogCodingRetentionState::Building {
-                let mut next = previous;
-                next.state = CatalogCodingRetentionState::Cancelled;
-                write_journal(&transaction, previous, next)?;
-            }
+            journal::cancel_building(&transaction, retention)?;
             transaction.commit()?;
         }
         result
@@ -376,12 +189,7 @@ impl ControlStore {
     pub fn cancel_catalog_coding_retention(&self, id: Uuid) -> Result<(), CatalogStoreError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let previous = read_journal(&transaction, id)?.ok_or(DatabaseError::NotReady)?;
-        if previous.state != CatalogCodingRetentionState::Cancelled {
-            let mut next = previous;
-            next.state = CatalogCodingRetentionState::Cancelled;
-            write_journal(&transaction, previous, next)?;
-        }
+        journal::cancel::<CatalogCodingRetention>(&transaction, id)?;
         transaction.commit()?;
         Ok(())
     }
@@ -392,53 +200,9 @@ impl ControlStore {
     pub fn release_catalog_coding_root(&self, id: Uuid) -> Result<bool, CatalogStoreError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let previous = read_journal(&transaction, id)?.ok_or(DatabaseError::NotReady)?;
-        if previous.state != CatalogCodingRetentionState::Cancelled {
-            return Err(DatabaseError::Conflict.into());
-        }
-        let kind = dependencies(id);
-        let Some(hash) = candidate_hash(&transaction, &kind, &[])? else {
-            if previous.roots != 0 {
-                return Err(DatabaseError::Integrity.into());
-            }
-            return Ok(false);
-        };
-        let bytes = bounded_record(&transaction, &kind, &hash, RECORD_BYTES)?
-            .ok_or(DatabaseError::Integrity)?;
-        let dependency: Dependency = decode_canonical(&bytes)?;
-        dependency.validate(previous.retention)?;
-        if dependency.root.hash != hash
-            || canonical_bytes(&dependency)? != bytes
-            || metadata(&transaction, hash)? != dependency.page()
-            || bounded_record(&transaction, &pins(hash), &pin_id(id), 0)?.as_deref() != Some(&[])
-        {
-            return Err(DatabaseError::Integrity.into());
-        }
-        let mut next = previous;
-        next.roots = next.roots.checked_sub(1).ok_or(DatabaseError::Integrity)?;
-        next.bytes = next
-            .bytes
-            .checked_sub(dependency.root.byte_len)
-            .ok_or(DatabaseError::Integrity)?;
-        next.pages = next
-            .pages
-            .checked_sub(dependency.root.page_occurrences)
-            .ok_or(DatabaseError::Integrity)?;
-        let removed = transaction.execute(
-            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
-            params![kind, hash, bytes],
-        )?;
-        let unpinned = transaction.execute(
-            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
-            params![pins(hash), pin_id(id), &[] as &[u8]],
-        )?;
-        if removed != 1 || unpinned != 1 {
-            return Err(DatabaseError::Conflict.into());
-        }
-        write_journal(&transaction, previous, next)?;
-        queue_unreferenced(&transaction, hash)?;
+        let released = journal::release::<CatalogCodingRetention>(&transaction, id)?;
         transaction.commit()?;
-        Ok(true)
+        Ok(released)
     }
 }
 
@@ -459,6 +223,37 @@ mod tests {
 
     fn keys() -> KeyMaterial {
         KeyMaterial::from_seed(&Seed::from_bytes([181; 32]))
+    }
+
+    #[test]
+    fn coding_retention_v1_journal_and_pin_layout_remain_unchanged() {
+        use CatalogCodingRetentionState::*;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ControlStore::open(directory.path().join("control.db"), &keys()).unwrap();
+        let fixture = fixture(&store, 1, false);
+        journal::assert_v1_layout(
+            &store.connection,
+            fixture.retention,
+            fixture.retention.coding.records.page,
+        );
+        assert_eq!(
+            store
+                .catalog_coding_retention(fixture.retention.id)
+                .unwrap()
+                .unwrap()
+                .1,
+            Cancelled
+        );
+        let pin = pin_id(fixture.retention.id);
+        assert_eq!(pin[0], 2);
+        assert_eq!(&pin[1..], fixture.retention.id.as_bytes());
+        assert_eq!(
+            dependencies(fixture.retention.id),
+            format!(
+                "catalog-coding-dependency-v1/{}",
+                fixture.retention.id.simple()
+            )
+        );
     }
 
     fn fixture(store: &ControlStore, count: u64, duplicate: bool) -> Fixture {

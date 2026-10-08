@@ -20,10 +20,12 @@ mod coding_retention;
 mod coding_validation;
 mod native_validation;
 mod packing_authority;
+mod packing_coding_retention;
 mod packing_validation;
 mod paged_data;
 mod paged_revision;
 mod paged_sector;
+mod retention_journal;
 mod source;
 pub use bundle::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
@@ -47,6 +49,9 @@ pub use packing_authority::{
     CatalogCertifiedCodingDirectoryIndex, CatalogCertifiedCodingIndex,
     CatalogCertifiedPackingIndex, CatalogPackingAuthority, CatalogPackingAuthorityBase,
     CatalogPackingAuthorizedSource,
+};
+pub use packing_coding_retention::{
+    CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
 };
 pub use packing_validation::{
     CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingSector, CatalogPackingValidation,

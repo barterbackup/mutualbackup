@@ -1723,6 +1723,29 @@ R3-SINGLE-OWNER-METADATA now records the required enclosing admission/directory/
 quota correction. Consumer activation and actual retained-data qualification
 remain gated on that complete design, without narrowing the 1 TiB dataset target.
 
+Coding directories now retain the original bounded forests and signed witnesses
+under one trusted byte/page/record traversal budget. The completed directory
+join proves exact eligible packed-input coverage in the same admitted encrypted
+index, carries the source-authority prefix and original witness locations, and
+requires every nested EOF and external authorization. Directory and combined
+structural fixtures remove the old single-forest admission assumption; they
+remain synthetic lower-bound evidence, not a full retained 1 TiB policy or runtime
+qualification.
+
+A combined local metadata journal now requires that completed proof and binds
+both packing roots, the directory and all logical forest parts. Initial roots
+acquire atomically; bounded part acquisition precedes local witness replay, and
+publication requires complete local packing/coding EOF. Interrupted jobs replay
+with the exact proof/budget; cancelled cleanup releases one root per transaction,
+preserving shared successors across reopen and capture retirement. Authority,
+coding and combined journals share bounded ownership machinery while preserving
+existing version-one layouts and pin namespaces. This remains local public
+metadata ownership: certified-current checkpoint publication/retirement guards,
+authority/private/native/bootstrap and information/parity payload ownership,
+the full enclosing capacity/quota policy, normal consumers and the original
+Milestone 6 closure gates remain required. Validation is recorded in ADR 0002
+and TODO.md; the enclosing checkpoint-ownership item remains open.
+
 ### Historical implementation and validation record (before scope correction)
 
 The following record preserves prior code and test evidence. References to

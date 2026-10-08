@@ -142,6 +142,21 @@ fn row<T: serde::de::DeserializeOwned + Serialize>(
     Ok(Some((value, bytes)))
 }
 
+fn resolve_source(
+    store: &RecordScratchStore,
+    profile: mb_core::PackingProfile,
+    key: [u8; 32],
+) -> Result<CatalogPackedSourceId, CatalogStoreError> {
+    let (header, _) = row::<SourceHeader>(store, HEADERS, &key)?.ok_or(DatabaseError::NotReady)?;
+    if header.id.key() != key
+        || header.commitment.byte_len != profile.sector_size
+        || header.commitment.validate().is_err()
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(header.id)
+}
+
 pub(super) fn unwrap_stream<T>(
     result: Result<T, CatalogStreamError<CatalogStoreError>>,
 ) -> Result<T, CatalogStoreError> {
@@ -172,6 +187,13 @@ pub struct CatalogPackingIndex {
 }
 
 impl CatalogPackingIndex {
+    pub(super) fn source_id(
+        &self,
+        key: [u8; 32],
+    ) -> Result<CatalogPackedSourceId, CatalogStoreError> {
+        self.require_complete()?;
+        resolve_source(&self.store, self.manifest.descriptors.profile, key)
+    }
     /// Roots must already be authenticated. The required authorization callback
     /// must bind each exact source commitment to certified revision/member and
     /// writer authority. The caller supplies a private, physically admitted
@@ -367,17 +389,7 @@ pub(super) fn build_index(
         merkle_zero_subtree_root(profile.slot_size).map_err(|_| CatalogError::InvalidPage)?;
     let zero_hash = zero_content_hash(profile.slot_size);
     let mut reader = CatalogPackedSectorReader::new(manifest.scope, manifest.descriptors)?;
-    let mut resolve = |key: [u8; 32]| {
-        let (header, _) =
-            row::<SourceHeader>(store, HEADERS, &key)?.ok_or(DatabaseError::NotReady)?;
-        if header.id.key() != key
-            || header.commitment.byte_len != profile.sector_size
-            || header.commitment.validate().is_err()
-        {
-            return Err(DatabaseError::Integrity.into());
-        }
-        Ok(header.id)
-    };
+    let mut resolve = |key| resolve_source(store, profile, key);
     let mut active: Option<ActiveSector> = None;
     while let Some(record) = unwrap_stream(reader.next_record_with_sources(fetch, &mut resolve))? {
         match record {
