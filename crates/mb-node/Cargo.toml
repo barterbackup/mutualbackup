@@ -48,3 +48,4 @@ zeroize.workspace = true
 
 [dev-dependencies]
 cddl-cat.workspace = true
+tracing-subscriber.workspace = true

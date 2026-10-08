@@ -486,6 +486,7 @@ enum Command {
         peer: PeerId,
         addresses: Vec<Multiaddr>,
         expires_at_unix_seconds: u64,
+        authority: Option<EndpointAuthority>,
         response: oneshot::Sender<Result<()>>,
     },
     SetRelayMembers {
@@ -548,6 +549,8 @@ struct PendingRequest {
     attempts: u8,
     deadline: tokio::time::Instant,
     started_at: tokio::time::Instant,
+    signature_span: tracing::Span,
+    transport_attempt: Option<RequestTransportAttempt>,
     response: Option<oneshot::Sender<Result<PeerResponse>>>,
     _permit: OwnedSemaphorePermit,
 }
@@ -561,9 +564,85 @@ impl PendingRequest {
 
     fn finish(&mut self, result: Result<PeerResponse>) {
         if let Some(response) = self.response.take() {
+            self.trace_signature_request(
+                "finished",
+                None,
+                result.as_ref().err().map(|error| format!("{error:#}")),
+            );
             let _ = response.send(result);
         }
     }
+
+    fn trace_signature_request(
+        &self,
+        stage: &'static str,
+        observed_connection: Option<ConnectionId>,
+        error: Option<String>,
+    ) {
+        if self.signature_span.is_disabled() {
+            return;
+        }
+        let _entered = self.signature_span.enter();
+        let attempt = self.transport_attempt.as_ref();
+        let authority = attempt.and_then(|attempt| attempt.endpoint_authority);
+        tracing::info!(
+            stage,
+            attempts = self.attempts,
+            transport_tier = self.transport_tier,
+            selected_connection = ?attempt.map(|attempt| attempt.connection),
+            session_sequence = ?attempt.and_then(|attempt| attempt.session_sequence),
+            path = ?attempt.and_then(|attempt| attempt.path),
+            remote_address = ?attempt.and_then(|attempt| attempt.remote_address.as_ref()),
+            endpoint_source = ?authority.map(|authority| authority.source),
+            endpoint_sequence = ?authority.map(|authority| authority.sequence),
+            endpoint_record_hash = ?authority.map(|authority| hex::encode(authority.record_hash)),
+            ?observed_connection,
+            ?error,
+            "guild signature request progress"
+        );
+    }
+}
+
+// Diagnostic identity only: durable endpoint selection still validates and
+// orders signed records before handing their address set to the event loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EndpointAuthority {
+    source: &'static str,
+    sequence: u64,
+    record_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequestTransportAttempt {
+    connection: ConnectionId,
+    session_sequence: Option<u64>,
+    path: Option<P2pPath>,
+    remote_address: Option<Multiaddr>,
+    endpoint_authority: Option<EndpointAuthority>,
+}
+
+fn signature_request_span(request: &SignedRecord<PeerRequestEnvelope>) -> tracing::Span {
+    let (event, kind, attempt_id) = match &request.value.request {
+        PeerRequest::SignGuildEvent { event } => (event, "lifecycle", None),
+        PeerRequest::SignCodingGroupEvent { event, transcript } => (
+            event,
+            "coding-add",
+            Some(hex::encode(transcript.value.plan.value.attempt_id)),
+        ),
+        _ => return tracing::Span::none(),
+    };
+    tracing::info_span!(
+        "guild_signature_request",
+        request_id = %hex::encode(request.value.request_id),
+        requester = %request.signer,
+        signer = ?request.value.recipient.map(|signer| signer.to_string()),
+        guild_id = %hex::encode(event.guild_id),
+        sequence = event.sequence,
+        event_hash = ?event.hash().ok().map(hex::encode),
+        kind,
+        group_id = ?event.kind.coding_group_add().map(|(group, _)| hex::encode(group.id)),
+        ?attempt_id,
+    )
 }
 
 struct RequestCancellation {
@@ -598,6 +677,7 @@ struct InboundResult {
     request_id: request_response::InboundRequestId,
     channel: request_response::ResponseChannel<SignedRecord<PeerResponseEnvelope>>,
     response: Result<SignedRecord<PeerResponseEnvelope>>,
+    signature_span: tracing::Span,
     permit: OwnedSemaphorePermit,
 }
 
@@ -611,6 +691,7 @@ struct LearnedAddresses {
     addresses: BTreeSet<Multiaddr>,
     expires_at: tokio::time::Instant,
     signed_record: bool,
+    authority: Option<EndpointAuthority>,
 }
 
 struct RecoveryAddresses {
@@ -651,6 +732,7 @@ struct SessionRuntime {
     sequence: u64,
     peer: PeerId,
     path: P2pPath,
+    remote_address: Option<Multiaddr>,
     direction: P2pSessionDirection,
     opened_at_unix_seconds: u64,
     opened_at: tokio::time::Instant,
@@ -1724,6 +1806,7 @@ impl P2pClient {
         peer: NodeId,
         addresses: Vec<Multiaddr>,
         expires_at_unix_seconds: u64,
+        authority: Option<EndpointAuthority>,
     ) -> Result<()> {
         let peer = peer.libp2p_peer_id()?;
         let (response, receiver) = oneshot::channel();
@@ -1732,6 +1815,7 @@ impl P2pClient {
                 peer,
                 addresses,
                 expires_at_unix_seconds,
+                authority,
                 response,
             })
             .await
@@ -3496,6 +3580,7 @@ impl P2pEventLoop {
                 sequence,
                 peer,
                 path,
+                remote_address: None,
                 direction,
                 opened_at_unix_seconds: unix_seconds(),
                 opened_at: tokio::time::Instant::now(),
@@ -3838,9 +3923,30 @@ impl P2pEventLoop {
                 pending.transport_tier = tier;
                 pending.attempts = pending.attempts.saturating_add(1);
                 pending.started_at = tokio::time::Instant::now();
+                // Keep the exact attempt's authority after endpoint replacement
+                // or expiry; a late failure must not be attributed to its retry.
+                pending.transport_attempt = Some(RequestTransportAttempt {
+                    connection,
+                    session_sequence: self
+                        .sessions
+                        .get(&connection)
+                        .map(|session| session.sequence),
+                    path: self.application_path(connection),
+                    remote_address: self
+                        .sessions
+                        .get(&connection)
+                        .and_then(|session| session.remote_address.clone()),
+                    endpoint_authority: self.learned_addresses.get(&peer).and_then(|known| {
+                        (known.expires_at > tokio::time::Instant::now())
+                            .then_some(known.authority)
+                            .flatten()
+                    }),
+                });
+                pending.trace_signature_request("dispatched", Some(connection), None);
                 self.pending_requests.insert(outbound_id, pending);
             }
             Err(_) => {
+                pending.trace_signature_request("connection-unavailable", Some(connection), None);
                 // The composed request-response behaviour should observe the
                 // same Swarm lifecycle before this event loop. Treat any
                 // mismatch as a stale path and re-establish the selected tier.
@@ -3920,6 +4026,7 @@ impl P2pEventLoop {
             .position(|pending| pending.cancellation_id == cancellation_id)
         {
             if let Some(pending) = self.queued_requests.remove(position) {
+                pending.trace_signature_request("caller-cancelled-while-queued", None, None);
                 self.forget_transport_selection_if_unretained(pending.peer);
             }
             return;
@@ -3929,6 +4036,7 @@ impl P2pEventLoop {
             .values_mut()
             .find(|pending| pending.cancellation_id == cancellation_id)
         {
+            pending.trace_signature_request("caller-cancelled-in-flight", None, None);
             pending.response.take();
         }
         // libp2p request-response has no cancellation primitive. Keep a
@@ -4002,8 +4110,10 @@ impl P2pEventLoop {
                         request_id,
                         channel,
                         response,
+                        signature_span,
                         permit,
                     } = result;
+                    let _entered = signature_span.enter();
                     // A completed request no longer consumes worker capacity.
                     // Release it before the response becomes observable so a
                     // caller's next sequential request cannot be rejected as
@@ -4639,6 +4749,7 @@ impl P2pEventLoop {
         peer: PeerId,
         addresses: Vec<Multiaddr>,
         expires_at_unix_seconds: u64,
+        authority: Option<EndpointAuthority>,
     ) -> Result<()> {
         if addresses.len() > MAX_ENDPOINTS_PER_PEER {
             bail!("peer published too many endpoints");
@@ -4667,12 +4778,30 @@ impl P2pEventLoop {
         );
         // Even an empty signed endpoint set withdraws earlier hints. Keep its
         // expiry so stale roster and Identify addresses cannot revive it.
+        if let Some(authority) = authority
+            && self
+                .learned_addresses
+                .get(&peer)
+                .and_then(|known| known.authority)
+                != Some(authority)
+        {
+            tracing::info!(
+                %peer,
+                endpoint_source = authority.source,
+                endpoint_sequence = authority.sequence,
+                endpoint_record_hash = %hex::encode(authority.record_hash),
+                expires_at_unix_seconds,
+                endpoints = normalized.len(),
+                "updated peer routing authority"
+            );
+        }
         self.learned_addresses.insert(
             peer,
             LearnedAddresses {
                 addresses: normalized,
                 expires_at: tokio::time::Instant::now() + lifetime,
                 signed_record: true,
+                authority,
             },
         );
         self.reconcile_policy_addresses(peer);
@@ -4707,6 +4836,7 @@ impl P2pEventLoop {
                 addresses: BTreeSet::new(),
                 expires_at: tokio::time::Instant::now() + DHT_TTL,
                 signed_record: false,
+                authority: None,
             });
         learned.addresses.insert(address);
         learned.expires_at = tokio::time::Instant::now() + DHT_TTL;
@@ -4749,6 +4879,7 @@ impl P2pEventLoop {
                     addresses: BTreeSet::new(),
                     expires_at: tokio::time::Instant::now() + DHT_TTL,
                     signed_record: false,
+                    authority: None,
                 });
         if !addresses.addresses.contains(&address)
             && addresses.addresses.len() >= MAX_ENDPOINTS_PER_PEER
@@ -4972,10 +5103,15 @@ impl P2pEventLoop {
                 peer,
                 addresses,
                 expires_at_unix_seconds,
+                authority,
                 response,
             } => {
-                let result =
-                    self.replace_learned_addresses(peer, addresses, expires_at_unix_seconds);
+                let result = self.replace_learned_addresses(
+                    peer,
+                    addresses,
+                    expires_at_unix_seconds,
+                    authority,
+                );
                 let _ = response.send(result);
             }
             Command::SetRelayMembers { members, response } => {
@@ -5040,7 +5176,8 @@ impl P2pEventLoop {
                                 let request_bytes = cbor_wire_len(&request).unwrap_or(0);
                                 let now = tokio::time::Instant::now();
                                 let transport_tier = self.selected_transport_tier(peer);
-                                self.queue_or_dispatch_request(PendingRequest {
+                                let signature_span = signature_request_span(&request);
+                                let pending = PendingRequest {
                                     cancellation_id,
                                     peer,
                                     recipient,
@@ -5053,9 +5190,13 @@ impl P2pEventLoop {
                                     attempts: 0,
                                     deadline: now + LOGICAL_REQUEST_TIMEOUT,
                                     started_at: now,
+                                    signature_span,
+                                    transport_attempt: None,
                                     response: Some(response),
                                     _permit: permit,
-                                });
+                                };
+                                pending.trace_signature_request("accepted", None, None);
+                                self.queue_or_dispatch_request(pending);
                             }
                             Err(error) => {
                                 let _ = response.send(Err(error.into()));
@@ -5495,6 +5636,12 @@ impl P2pEventLoop {
                         P2pSessionDirection::Inbound
                     },
                 );
+                if let Some(session) = self.sessions.get_mut(&connection_id) {
+                    session.remote_address = Some(match &endpoint {
+                        ConnectedPoint::Dialer { address, .. } => address.clone(),
+                        ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.clone(),
+                    });
+                }
                 if established_path == P2pPath::Direct {
                     let local_prefers_dialer = self.swarm.local_peer_id() < &peer_id;
                     let paired_punch = self.connection_paths.iter().find_map(
@@ -5669,6 +5816,16 @@ impl P2pEventLoop {
                             tracing::warn!(%peer, "application signer does not match libp2p peer");
                             return;
                         }
+                        let signature_span = signature_request_span(&request);
+                        if !signature_span.is_disabled() {
+                            tracing::info!(
+                                parent: &signature_span,
+                                %peer,
+                                ?connection_id,
+                                ?path,
+                                "received guild signature request"
+                            );
+                        }
                         let service = self.service.clone();
                         let config = self.server_config.clone();
                         let sender = self.inbound_sender.clone();
@@ -5715,21 +5872,39 @@ impl P2pEventLoop {
                             .lock()
                             .expect("inbound worker pause lock is poisoned")
                             .take();
+                        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
                         self.inbound_workers.spawn_blocking(move || {
-                            let response = process_peer_request(service, &config, request);
-                            let _ = sender.blocking_send(InboundResult {
-                                peer,
-                                path,
-                                request_id,
-                                channel,
-                                response,
-                                permit,
-                            });
-                            #[cfg(test)]
-                            if let Some(worker_pause) = worker_pause {
-                                let _ = worker_pause.reached.send(());
-                                let _ = worker_pause.release.recv();
-                            }
+                            tracing::dispatcher::with_default(&dispatcher, || {
+                                let _entered = signature_span.enter();
+                                let response = process_peer_request(service, &config, request);
+                                if !signature_span.is_disabled() {
+                                    let error = match &response {
+                                        Ok(response) => response
+                                            .value
+                                            .result
+                                            .as_ref()
+                                            .err()
+                                            .map(ToString::to_string),
+                                        Err(error) => Some(format!("{error:#}")),
+                                    };
+                                    tracing::info!(?error, "guild signature worker completed");
+                                }
+                                drop(_entered);
+                                let _ = sender.blocking_send(InboundResult {
+                                    peer,
+                                    path,
+                                    request_id,
+                                    channel,
+                                    response,
+                                    signature_span,
+                                    permit,
+                                });
+                                #[cfg(test)]
+                                if let Some(worker_pause) = worker_pause {
+                                    let _ = worker_pause.reached.send(());
+                                    let _ = worker_pause.release.recv();
+                                }
+                            })
                         });
                     }
                     request_response::Message::Response {
@@ -5752,6 +5927,11 @@ impl P2pEventLoop {
                             } else {
                                 Err(anyhow::anyhow!("libp2p response came from the wrong peer"))
                             };
+                            pending.trace_signature_request(
+                                "response-received",
+                                Some(connection_id),
+                                result.as_ref().err().map(|error| format!("{error:#}")),
+                            );
                             self.record_request_result(path, pending.started_at, result.is_ok());
                             if let Some(path) = path {
                                 let actual_tier = path_preference_rank(self.tor_mode, path);
@@ -5781,6 +5961,11 @@ impl P2pEventLoop {
             } => {
                 if let Some(mut pending) = self.pending_requests.remove(&request_id) {
                     let request_peer = pending.peer;
+                    pending.trace_signature_request(
+                        "transport-failed",
+                        Some(connection_id),
+                        Some(error.to_string()),
+                    );
                     let path = self.request_failure_path(peer, connection_id);
                     self.record_request_result(
                         path.or_else(|| self.selected_path_hint(peer)),
@@ -9940,6 +10125,11 @@ async fn apply_endpoint_record(
     p2p: &P2pClient,
     endpoint: SignedRecord<mb_core::EndpointRecord>,
 ) -> Result<()> {
+    let authority = EndpointAuthority {
+        source: "endpoint-record",
+        sequence: endpoint.value.sequence,
+        record_hash: *blake3::hash(&canonical_bytes(&endpoint)?).as_bytes(),
+    };
     let member = endpoint.value.publisher;
     let expires_at_unix_seconds = endpoint.value.expires_at_unix_seconds;
     let mut addresses = Vec::with_capacity(endpoint.value.endpoints.len());
@@ -9954,7 +10144,7 @@ async fn apply_endpoint_record(
         }
         addresses.push(address);
     }
-    p2p.replace_learned_peer_addresses(member, addresses, expires_at_unix_seconds)
+    p2p.replace_learned_peer_addresses(member, addresses, expires_at_unix_seconds, Some(authority))
         .await
 }
 
@@ -10475,6 +10665,12 @@ async fn recover_from_dht_once(
                 peer.member.node_id,
                 addresses,
                 candidate.locator.expires_at_unix_seconds,
+                Some(EndpointAuthority {
+                    source: "recovery-bundle",
+                    sequence: candidate.observation.selected.value.sequence,
+                    record_hash: *blake3::hash(&canonical_bytes(&candidate.observation.selected)?)
+                        .as_bytes(),
+                }),
             )
             .await
         {
@@ -21088,6 +21284,390 @@ mod tests {
         .await
     }
 
+    #[derive(Clone, Default)]
+    struct SignatureTraceLog(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SignatureTraceLog {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SignatureTraceLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + use<> {
+            let log = self.clone();
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_target(false)
+                .without_time()
+                .with_writer(move || log.clone())
+                .finish()
+        }
+    }
+
+    async fn install_signature_trace_endpoint(
+        client: &P2pClient,
+        event_loop: &mut P2pEventLoop,
+        keys: &KeyMaterial,
+        sequence: u64,
+        addresses: Vec<String>,
+    ) -> EndpointAuthority {
+        let record = SignedRecord::sign(
+            b"mutualbackup/endpoint-record/v1",
+            mb_core::EndpointRecord {
+                format_version: 1,
+                publisher: keys.node_id(),
+                sequence,
+                expires_at_unix_seconds: unix_seconds() + 300,
+                endpoints: addresses,
+            },
+            keys,
+        )
+        .unwrap();
+        let authority = EndpointAuthority {
+            source: "endpoint-record",
+            sequence,
+            record_hash: *blake3::hash(&canonical_bytes(&record).unwrap()).as_bytes(),
+        };
+        let applied = tokio::spawn({
+            let client = client.clone();
+            async move { apply_endpoint_record(&client, record).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        applied.await.unwrap().unwrap();
+        authority
+    }
+
+    #[tokio::test]
+    async fn signature_request_trace_keeps_each_attempts_connection_and_endpoint_authority() {
+        let log = SignatureTraceLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([120; 32]);
+        let local_id = KeyMaterial::from_seed(&seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target_keys = KeyMaterial::from_seed(&Seed::from_bytes([121; 32]));
+        let target = target_keys.node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let first_authority = install_signature_trace_endpoint(
+            &client,
+            &mut event_loop,
+            &target_keys,
+            11,
+            vec![format!("/ip4/192.0.2.121/udp/44000/quic-v1/p2p/{peer}")],
+        )
+        .await;
+        let direct = ConnectionId::new_unchecked(1210);
+        event_loop
+            .connection_paths
+            .insert(direct, (peer, P2pPath::Direct));
+        event_loop.record_session_open(
+            direct,
+            peer,
+            P2pPath::Direct,
+            P2pSessionDirection::Outbound,
+        );
+        register_request_connection(&mut event_loop, peer, direct);
+        let event = GuildEvent {
+            format_version: 2,
+            guild_id: [122; 32],
+            sequence: 37,
+            parent: [123; 32],
+            kind: mb_core::GuildEventKind::RemoveMember { node_id: target },
+        };
+        let call = tokio::spawn({
+            let client = client.clone();
+            let event = event.clone();
+            async move { client.sign_guild_event(target, event).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        let first = *event_loop.pending_requests.keys().next().unwrap();
+        let pending = &event_loop.pending_requests[&first];
+        let request_id = pending.request_id;
+        let request_hash = pending.request_hash;
+        assert_eq!(
+            pending
+                .transport_attempt
+                .as_ref()
+                .unwrap()
+                .endpoint_authority,
+            Some(first_authority)
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                next_request_dispatch(&mut event_loop)
+            )
+            .await
+            .unwrap(),
+            direct
+        );
+
+        let relay_id = KeyMaterial::from_seed(&Seed::from_bytes([124; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let second_authority = install_signature_trace_endpoint(
+            &client,
+            &mut event_loop,
+            &target_keys,
+            12,
+            vec![format!(
+                "/ip4/192.0.2.124/udp/44000/quic-v1/p2p/{relay_id}/p2p-circuit/p2p/{peer}"
+            )],
+        )
+        .await;
+        // Replacement must not rewrite the still-in-flight failed attempt.
+        assert_eq!(
+            event_loop.pending_requests[&first]
+                .transport_attempt
+                .as_ref()
+                .unwrap()
+                .endpoint_authority,
+            Some(first_authority)
+        );
+        let relayed = ConnectionId::new_unchecked(1211);
+        event_loop
+            .connection_paths
+            .insert(relayed, (peer, P2pPath::RelayFallback));
+        event_loop.record_session_open(
+            relayed,
+            peer,
+            P2pPath::RelayFallback,
+            P2pSessionDirection::Inbound,
+        );
+        register_request_connection(&mut event_loop, peer, relayed);
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: direct,
+            request_id: first,
+            error: request_response::OutboundFailure::Timeout,
+        });
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                next_request_dispatch(&mut event_loop)
+            )
+            .await
+            .unwrap(),
+            relayed
+        );
+        let retry = *event_loop.pending_requests.keys().next().unwrap();
+        let pending = &event_loop.pending_requests[&retry];
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.request_hash, request_hash);
+        assert_eq!(pending.attempts, 2);
+        assert_eq!(
+            pending
+                .transport_attempt
+                .as_ref()
+                .unwrap()
+                .endpoint_authority,
+            Some(second_authority)
+        );
+        let response = SignedRecord::sign(
+            PEER_RESPONSE_DOMAIN,
+            PeerResponseEnvelope {
+                format_version: super::super::PEER_WIRE_FORMAT_VERSION,
+                request_id,
+                recipient: local_id,
+                request_hash,
+                result: Ok(PeerResponse::GuildEventSignature(
+                    mb_core::sign_guild_event(&event, &target_keys).unwrap(),
+                )),
+            },
+            &target_keys,
+        )
+        .unwrap();
+        event_loop.handle_peer_event(request_response::Event::Message {
+            peer,
+            connection_id: relayed,
+            message: request_response::Message::Response {
+                request_id: retry,
+                response,
+            },
+        });
+        call.await.unwrap().unwrap();
+        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(client.outbound_permits.available_permits(), 8);
+
+        let text = log.text();
+        let failed = text
+            .lines()
+            .find(|line| line.contains("stage=\"transport-failed\""))
+            .unwrap();
+        let received = text
+            .lines()
+            .find(|line| line.contains("stage=\"response-received\""))
+            .unwrap();
+        for line in [failed, received] {
+            assert!(line.contains(&hex::encode(request_id)), "{line}");
+            assert!(line.contains(&hex::encode(event.hash().unwrap())), "{line}");
+            assert!(line.contains("sequence=37"), "{line}");
+        }
+        assert!(
+            failed.contains(&hex::encode(first_authority.record_hash)),
+            "{failed}"
+        );
+        assert!(
+            !failed.contains(&hex::encode(second_authority.record_hash)),
+            "{failed}"
+        );
+        assert!(
+            failed.contains(&format!("selected_connection=Some({direct:?})")),
+            "{failed}"
+        );
+        assert!(failed.contains("endpoint_sequence=Some(11)"), "{failed}");
+        assert!(
+            received.contains(&hex::encode(second_authority.record_hash)),
+            "{received}"
+        );
+        assert!(
+            received.contains(&format!("selected_connection=Some({relayed:?})")),
+            "{received}"
+        );
+        assert!(
+            received.contains("endpoint_sequence=Some(12)"),
+            "{received}"
+        );
+        assert!(received.contains("session_sequence=Some(2)"), "{received}");
+    }
+
+    #[tokio::test]
+    async fn signature_request_trace_reaches_the_real_inbound_admission_worker() {
+        let log = SignatureTraceLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let temp = tempfile::tempdir().unwrap();
+        let first = Node::open(temp.path().join("first"), Seed::from_bytes([129; 32])).unwrap();
+        let second = Node::open(temp.path().join("second"), Seed::from_bytes([130; 32])).unwrap();
+        let first_id = first.keys().node_id();
+        let second_id = second.keys().node_id();
+        let (first_client, first_loop) =
+            build_p2p(Arc::new(Mutex::new(first)), config(first_id)).unwrap();
+        let (second_client, second_loop) =
+            build_p2p(Arc::new(Mutex::new(second)), config(second_id)).unwrap();
+        let first_task = tokio::spawn(first_loop.run());
+        let second_task = tokio::spawn(second_loop.run());
+        let address = listening_address(&second_client).await;
+        first_client
+            .add_peer_address(second_id, address)
+            .await
+            .unwrap();
+        let event = GuildEvent {
+            format_version: 2,
+            guild_id: [131; 32],
+            sequence: 39,
+            parent: [132; 32],
+            kind: mb_core::GuildEventKind::RemoveMember { node_id: second_id },
+        };
+        // An unaffiliated requester must reach the real signer-side admission
+        // rejection, whose local state/lock diagnostics carry the same RPC ID.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            first_client.sign_guild_event(second_id, event.clone()),
+        )
+        .await;
+        first_client.shutdown().await.unwrap();
+        second_client.shutdown().await.unwrap();
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+        assert!(result.unwrap().is_err());
+        let text = log.text();
+        let sent = text
+            .lines()
+            .find(|line| line.contains("stage=\"dispatched\""))
+            .unwrap();
+        assert!(sent.contains("remote_address=Some("), "{sent}");
+        assert!(sent.contains(&second_id.to_string()), "{sent}");
+        let request_id = sent
+            .split("request_id=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let received = text
+            .lines()
+            .find(|line| line.contains("received guild signature request"))
+            .unwrap();
+        let admission = text
+            .lines()
+            .find(|line| line.contains("guild transition caller failed local membership admission"))
+            .unwrap();
+        let completed = text
+            .lines()
+            .find(|line| line.contains("guild signature worker completed"))
+            .unwrap();
+        for line in [received, admission, completed] {
+            assert!(line.contains(&format!("request_id={request_id}")), "{line}");
+            assert!(line.contains(&hex::encode(event.hash().unwrap())), "{line}");
+        }
+        assert!(admission.contains("locked_event_hash=None"), "{admission}");
+        assert!(completed.contains("error=Some("), "{completed}");
+    }
+
+    #[tokio::test]
+    async fn signature_request_trace_reports_a_queued_deadline_without_claiming_a_dispatch() {
+        let log = SignatureTraceLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([125; 32]);
+        let local_id = KeyMaterial::from_seed(&seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([126; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        event_loop
+            .add_learned_address(peer, "/ip4/192.0.2.126/udp/44000/quic-v1".parse().unwrap())
+            .unwrap();
+        let event = GuildEvent {
+            format_version: 2,
+            guild_id: [127; 32],
+            sequence: 38,
+            parent: [128; 32],
+            kind: mb_core::GuildEventKind::RemoveMember { node_id: target },
+        };
+        let call = tokio::spawn(async move { client.sign_guild_event(target, event).await });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert!(event_loop.pending_requests.is_empty());
+        let pending = event_loop.queued_requests.front_mut().unwrap();
+        let request_id = pending.request_id;
+        pending.deadline = tokio::time::Instant::now();
+        event_loop.maintain_requests();
+        assert!(
+            call.await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("deadline expired")
+        );
+        assert!(event_loop.queued_requests.is_empty());
+        let text = log.text();
+        assert!(!text.contains("stage=\"dispatched\""), "{text}");
+        let finished = text
+            .lines()
+            .find(|line| line.contains("stage=\"finished\""))
+            .unwrap();
+        assert!(finished.contains(&hex::encode(request_id)), "{finished}");
+        assert!(finished.contains("attempts=0"), "{finished}");
+        assert!(finished.contains("selected_connection=None"), "{finished}");
+        assert!(finished.contains("deadline expired"), "{finished}");
+    }
+
     #[test]
     fn writer_fence_rejects_a_superseded_incarnation() {
         fn revision(owner: NodeId, epoch: u64, writer: &ed25519_dalek::SigningKey) -> UserRevision {
@@ -24011,14 +24591,14 @@ mod tests {
         assert!(!event_loop.persistent_addresses.contains_key(&peer));
         assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
         event_loop
-            .replace_learned_addresses(peer, vec![first.clone()], unix_seconds() + 300)
+            .replace_learned_addresses(peer, vec![first.clone()], unix_seconds() + 300, None)
             .unwrap();
         assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
         event_loop.record_transfer(peer, Some(P2pPath::Direct), 10, 20);
         assert!(event_loop.transfer_counters.contains_key(&peer));
         assert!(event_loop.path_transfer_counters.contains_key(&peer));
         event_loop
-            .replace_learned_addresses(peer, vec![second.clone()], unix_seconds() + 300)
+            .replace_learned_addresses(peer, vec![second.clone()], unix_seconds() + 300, None)
             .unwrap();
         assert_eq!(
             event_loop.learned_addresses[&peer]
@@ -24038,7 +24618,7 @@ mod tests {
             BTreeSet::from([normalize_known_address(peer, second).unwrap()])
         );
         event_loop
-            .replace_learned_addresses(peer, Vec::new(), unix_seconds() + 300)
+            .replace_learned_addresses(peer, Vec::new(), unix_seconds() + 300, None)
             .unwrap();
         event_loop.add_learned_address(peer, first.clone()).unwrap();
         event_loop
@@ -24122,7 +24702,12 @@ mod tests {
             PolicyDialKind::Selected,
         ));
         event_loop
-            .replace_learned_addresses(peer, vec![current_relay.clone()], unix_seconds() + 300)
+            .replace_learned_addresses(
+                peer,
+                vec![current_relay.clone()],
+                unix_seconds() + 300,
+                None,
+            )
             .unwrap();
         assert!(
             event_loop
@@ -24145,7 +24730,7 @@ mod tests {
             BTreeSet::from([normalize_known_address(peer, current_relay).unwrap()])
         );
         event_loop
-            .replace_learned_addresses(peer, Vec::new(), unix_seconds() + 300)
+            .replace_learned_addresses(peer, Vec::new(), unix_seconds() + 300, None)
             .unwrap();
         assert!(event_loop.retained_peer_addresses(peer).is_empty());
     }
@@ -24164,7 +24749,7 @@ mod tests {
         let old: Multiaddr = "/ip4/127.0.0.1/udp/4401/quic-v1".parse().unwrap();
         let replacement: Multiaddr = "/ip4/127.0.0.1/udp/4402/quic-v1".parse().unwrap();
         event_loop
-            .replace_learned_addresses(peer, vec![old.clone()], unix_seconds() + 300)
+            .replace_learned_addresses(peer, vec![old.clone()], unix_seconds() + 300, None)
             .unwrap();
         let tier = path_preference_rank(event_loop.tor_mode, P2pPath::Direct);
         assert!(event_loop.start_policy_dial(
@@ -24175,7 +24760,7 @@ mod tests {
         ));
         let old_dial = *event_loop.policy_dials.keys().next().unwrap();
         event_loop
-            .replace_learned_addresses(peer, vec![replacement.clone()], unix_seconds() + 300)
+            .replace_learned_addresses(peer, vec![replacement.clone()], unix_seconds() + 300, None)
             .unwrap();
         assert!(event_loop.policy_dials[&old_dial].superseded);
         assert!(!event_loop.policy_dial_exists(peer, tier));
@@ -24217,6 +24802,7 @@ mod tests {
                     addresses: BTreeSet::new(),
                     expires_at: tokio::time::Instant::now() + DHT_TTL,
                     signed_record: false,
+                    authority: None,
                 },
             );
         }

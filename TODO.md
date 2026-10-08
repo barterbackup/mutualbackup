@@ -2244,6 +2244,28 @@ remain active.
     transport replacement. This is additional release-artifact evidence, not a
     causal explanation or closure of the historical missing-signer stall.
 
+  - [x] Correlate lifecycle/coding Add signature RPCs with their transport
+    attempts. A request span binds the wire request ID, requester/signer, guild,
+    event sequence/hash and coding group/attempt. Dispatch, failure, retry,
+    response, deadline and caller-cancellation diagnostics retain each attempt's
+    exact connection, session, path and remote address. The routing authority
+    snapshot includes its source, sequence and signed-record hash; endpoint
+    records and recovery bundles remain distinct. A replacement or expiry does
+    not relabel an in-flight attempt. Signer workers and their admission/lock
+    diagnostics retain the same request span across the blocking-worker boundary.
+    Both topology fixtures enable these request diagnostics and existing durable
+    lock/partial-signature debug records in their private archived daemon logs.
+    Three new tests pass: a failed direct request followed by a relay retry on a
+    newer signed endpoint set, an undispatched queued deadline, and a real QUIC
+    admission rejection correlated through the signer worker. Forty affected
+    transport/endpoint/quorum regressions and six worker/admission/reopen cases
+    also pass, including all four invalid-signer regressions and retained partial
+    signatures. All 19 ordinary process cases pass; the three provisioned cases
+    remain excluded from that ordinary run. Formatting and strict
+    workspace/all-targets Clippy pass.
+    These are diagnostic and deterministic source-level checks;
+    the historical stall's cause and repeated provisioned fault matrix stay open.
+
   Existing investigation and validation record:
 
   Added correlated event diagnostics to signature failures and dissemination:
@@ -2254,8 +2276,8 @@ remain active.
   same event, including the remaining signer set at debug level. Strict
   workspace/all-targets Clippy passes; the reopen/signature-isolation,
   majority-with-slow-minority, bounded dissemination, and unrecovered-member
-  admission fixtures pass. This improves future diagnosis; connection/endpoint
-  correlation and reproduction of the original stall remain open.
+  admission fixtures pass. The request/connection/endpoint correlation is now
+  implemented above; reproduction and diagnosis of the original stall remain open.
 
   The 2026-10-06 withdrawal-audit workspace run, overlapping native artifact
   compilation, failed `mixed_packed_group_replacement_reclaims_obsolete_ready_shards`

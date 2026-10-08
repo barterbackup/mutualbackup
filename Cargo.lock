@@ -3973,6 +3973,7 @@ dependencies = [
  "tor-proto",
  "tor-rtcompat",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "walkdir",
  "zeroize",

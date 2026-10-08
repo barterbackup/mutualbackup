@@ -45,6 +45,9 @@ const MIN_BULK_TRANSFER_BYTES: u64 = 64 * 1024;
 const PROCESS_SMALL_BACKUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROCESS_LARGE_BACKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const PROCESS_TOPOLOGY_BACKUP_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+// Retain request/connection correlation and durable signature-lock evidence in
+// archived topology logs without enabling verbose transport-library logging.
+const TOPOLOGY_LOG_FILTER: &str = "warn,mb_node::network::p2p=info,mb_node::node=debug";
 
 fn process_topology_backup_timeout() -> Duration {
     match std::env::var("MUTUALBACKUP_TEST_TOPOLOGY_BACKUP_TIMEOUT_SECONDS") {
@@ -1444,7 +1447,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         .enumerate()
         .map(|(index, config)| {
             let mut daemon = Daemon::new(config.clone(), run_root.join(format!("p{index}.log")));
-            daemon.set_env("RUST_LOG", "warn");
+            daemon.set_env("RUST_LOG", TOPOLOGY_LOG_FILTER);
             if index == 0 && uses_cargo_debug_programs() {
                 daemon.set_env("MUTUALBACKUP_TEST_FAIL_BEFORE_LOCAL_GUILD_INSTALL", "1");
             }
@@ -1730,7 +1733,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     );
     let mut recovered_daemon =
         Daemon::new(recovered_config.clone(), run_root.join("recovered.log"));
-    recovered_daemon.set_env("RUST_LOG", "warn");
+    recovered_daemon.set_env("RUST_LOG", TOPOLOGY_LOG_FILTER);
     recovered_daemon.start();
     wait_for_status(
         &recovered_socket,
@@ -1855,7 +1858,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         storage_recovered_config.clone(),
         run_root.join("storage-recovered.log"),
     );
-    storage_recovered_daemon.set_env("RUST_LOG", "warn");
+    storage_recovered_daemon.set_env("RUST_LOG", TOPOLOGY_LOG_FILTER);
     storage_recovered_daemon.start();
     wait_for_status(
         &storage_recovered_socket,
@@ -2383,7 +2386,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
         if index == 0 {
             daemon.args.push(os("--locked"));
         }
-        daemon.set_env("RUST_LOG", "warn");
+        daemon.set_env("RUST_LOG", TOPOLOGY_LOG_FILTER);
         daemon.start();
         if let Some(lock) = startup_lock {
             assert!(
@@ -2553,7 +2556,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
         },
     );
     let mut recovered = Daemon::new(recovered_config, run_root.join("recovered-p1.log"));
-    recovered.set_env("RUST_LOG", "warn");
+    recovered.set_env("RUST_LOG", TOPOLOGY_LOG_FILTER);
     recovered.start();
     let status = wait_for_status_text(
         &recovered_socket,
