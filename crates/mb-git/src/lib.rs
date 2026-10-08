@@ -97,9 +97,9 @@ pub use repository::{
 #[cfg(target_os = "linux")]
 pub use rm::GitRmError;
 pub use stage::{
-    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, has_pending_stages,
-    pending_stage_paths, remove_cached, resume_pending_stages, stage_file, staged_entries,
-    staged_entry,
+    GitIndexEntry, PreservedSymlinkStageIntent, StageError, abandon_pending_stage, anchors_for_oid,
+    has_pending_stages, pending_stage_paths, remove_cached, resume_pending_stages, stage_file,
+    staged_entries, staged_entry,
 };
 #[cfg(target_os = "linux")]
 pub use status::{GitChange, GitStatus, GitStatusChange, StatusError};

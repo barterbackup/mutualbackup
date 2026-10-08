@@ -3697,12 +3697,18 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let cached_area = temp.path().join("preserved-git-cached-area");
     let stage_source = temp.path().join("preserved-git-stage-source");
     let stage_area = temp.path().join("preserved-git-stage-area");
+    let symlink_source = temp.path().join("preserved-git-symlink-source");
+    let symlink_catalog = temp.path().join("preserved-git-symlink-catalog");
+    let symlink_area = temp.path().join("preserved-git-symlink-area");
     for path in [
         &object_source,
         &object_area,
         &cached_area,
         &stage_source,
         &stage_area,
+        &symlink_source,
+        &symlink_catalog,
+        &symlink_area,
     ] {
         fs::create_dir(path).unwrap();
         fs::create_dir(path.join("nested")).unwrap();
@@ -3757,6 +3763,78 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
                 b"unfinished-\xfa".to_vec(),
                 0o100755_u32,
                 stage_plan,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let symlink_root_id = mb_store::PinnedDirectory::open(&symlink_source)
+        .unwrap()
+        .identity()
+        .unwrap();
+    let symlink_catalog_root_id = mb_store::PinnedDirectory::open(&symlink_catalog)
+        .unwrap()
+        .identity()
+        .unwrap();
+    let symlink_temp_name = format!("symlink-input-{}", Uuid::new_v4());
+    let symlink_temp_path =
+        std::path::Path::new(mb_store::GIT_CATALOG_DIRECTORY).join(&symlink_temp_name);
+    let symlink_target = b"private-symlink-target-\xf9".to_vec();
+    let symlink_temp_id = mb_store::NativeFileId {
+        filesystem_id: symlink_catalog_root_id.filesystem_id,
+        inode: 53,
+    };
+    let symlink_plan = mb_store::SourceFileCapturePlan::GuardedLinkFreezeV1(
+        mb_core::decode_canonical(
+            &canonical_bytes(&(
+                1_u16,
+                Uuid::new_v4(),
+                symlink_catalog.as_os_str().as_bytes().to_vec(),
+                symlink_catalog_root_id,
+                symlink_temp_path.as_os_str().as_bytes().to_vec(),
+                (
+                    symlink_temp_id.filesystem_id,
+                    symlink_temp_id.inode,
+                    symlink_target.len() as u64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                ),
+                0o100600_u32,
+                mb_store::StableAnchorAreaLocator {
+                    area_id: Uuid::new_v4(),
+                    path_hint: symlink_area.clone(),
+                    filesystem_id: symlink_temp_id.filesystem_id,
+                    volume_root_hint: temp.path().to_path_buf(),
+                },
+            ))
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    external_store
+        .put_record(
+            &format!("git-worktree-symlink-stage-intent-v1/{repository_id}/{worktree_id}"),
+            b"link-\xf8",
+            &canonical_bytes(&(
+                2_u16,
+                repository_id,
+                symlink_source.as_os_str().as_bytes().to_vec(),
+                symlink_root_id,
+                mb_store::NativeFileId {
+                    filesystem_id: symlink_catalog_root_id.filesystem_id,
+                    inode: 52,
+                },
+                b"link-\xf8".to_vec(),
+                mb_store::NativeFileId {
+                    filesystem_id: symlink_root_id.filesystem_id,
+                    inode: 54,
+                },
+                &symlink_target,
+                &symlink_temp_name,
+                Some(symlink_temp_id),
+                Some(symlink_plan),
+                Some(symlink_catalog.as_os_str().as_bytes().to_vec()),
             ))
             .unwrap(),
         )
@@ -3930,7 +4008,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 11);
+    assert_eq!(inventory.format_version, 12);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -3967,6 +4045,32 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(git_registration.metadata_objects_inventoried);
     assert!(git_registration.selected_branches_inventoried);
     assert!(git_registration.regular_stage_intents_inventoried);
+    assert!(git_registration.symlink_stage_intents_inventoried);
+    assert_eq!(inventory.local_state.pending_git_symlinks.len(), 1);
+    let saved_symlink = &inventory.local_state.pending_git_symlinks[0];
+    assert_eq!(saved_symlink.repository_id, repository_id);
+    assert_eq!(saved_symlink.worktree_id, worktree_id);
+    assert_eq!(saved_symlink.record_format, 2);
+    assert_eq!(saved_symlink.relative_path_hex, hex::encode(b"link-\xf8"));
+    assert_eq!(saved_symlink.recorded_root_identity, symlink_root_id);
+    assert_eq!(
+        saved_symlink.catalog_root_hint_hex,
+        Some(hex::encode(symlink_catalog.as_os_str().as_bytes()))
+    );
+    assert_eq!(saved_symlink.recorded_temp_identity, Some(symlink_temp_id));
+    assert_eq!(saved_symlink.temp_name, symlink_temp_name);
+    assert_eq!(saved_symlink.target_bytes, symlink_target.len() as u64);
+    assert_eq!(
+        saved_symlink.target_hash,
+        hex::encode(blake3::hash(&symlink_target).as_bytes())
+    );
+    assert_eq!(
+        saved_symlink.plan.as_ref().unwrap().backend,
+        mb_store::SourceBackendKind::GuardedLinkFreezeV1
+    );
+    assert!(!saved_symlink.payloads_verified);
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("private-symlink-target"));
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains(&hex::encode(&symlink_target)));
     assert_eq!(inventory.local_state.pending_git_stages.len(), 1);
     let saved_stage = &inventory.local_state.pending_git_stages[0];
     assert_eq!(saved_stage.repository_id, repository_id);
@@ -4092,6 +4196,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         stage_source.join("nested"),
         stage_area.join("nested"),
         stage_alias.join("nested"),
+        symlink_source.join("nested"),
+        symlink_catalog.join("nested"),
+        symlink_area.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -4213,6 +4320,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &stage_source.join("nested"),
         &stage_area.join("nested"),
         &stage_alias.join("nested"),
+        &symlink_source.join("nested"),
+        &symlink_catalog.join("nested"),
+        &symlink_area.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -4256,6 +4366,9 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &cached_area,
         &stage_source,
         &stage_area,
+        &symlink_source,
+        &symlink_catalog,
+        &symlink_area,
     ] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),

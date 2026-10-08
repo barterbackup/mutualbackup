@@ -191,6 +191,36 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+`legacy-list` format 12 adds original unfinished primary/linked symlink-stage
+journals, preserving both the implicit catalog root in version 1 and the
+explicit catalog root in version 2. The original decoder, canonical
+re-encoding and bounded SQL key/row reads retain scope, raw
+source/relative/catalog hints, recorded source/root/catalog/temporary
+identities, temporary name and optional native/guarded/raw file capture plan.
+Captured symlink target bytes remain private: summaries expose only length and
+BLAKE3 digest. Validation opens no working symlink, source, temporary input or
+anchor and never admits a backend, captures or replays the operation.
+Root/catalog hints and identities, plus optional plan source/area ownership,
+exclude export/scratch parents including aliases and renamed roots. A separate
+symlink-stage coverage flag leaves full catalog/payload/history verification
+false, and complete projections share the full 32 MiB report budget.
+Original-wire tests cover both versions before temporary creation, after
+creation and after each supported plan is saved; closed/WAL-only/live
+catalogs, raw paths, renamed roots, aliases, JSON/target privacy, exact/over
+report budgets, malformed keys/scopes/paths/identities/versions/target
+geometry/plans/encoding/rows, late corruption and the real CLI preserve
+original inputs. External Git symlink-stage qualification passes 248 unique cases: 49
+export/peer cases, all 63 ordinary volume and 109 ordinary Git cases, 20 CLI
+process cases, retained-graph/discovery/withdrawal/graph-intent regressions,
+and two provisioned Btrfs identity/retained-capture cases. All four debug
+programs build; format and strict locked workspace/all-targets Clippy pass.
+All 284 source-file and seven program/test-driver hashes remain unchanged, and
+native mount/loop/image cleanup is verified. Evidence and the distinct
+passing-case inventory are retained under
+`/tmp/mb-m6-symlink-stage-validation-w3ygmtna`; the post-commit audit binds
+the code to the commit. This is a focused debug-source qualification; complete
+ordinary/native suites and installed artifacts were not rerun.
+
 `legacy-list` format 11 adds original unfinished regular-file staging intents
 from primary and linked external Git scopes. The unchanged ReflinkV1, guarded
 link-freeze V1 and raw ReflinkV2 plan layouts are inspected without backend

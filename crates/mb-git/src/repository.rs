@@ -244,6 +244,10 @@ pub enum PreservedGitRecord {
         git_mode: u32,
         plan: Box<mb_store::SourceFileCapturePlan>,
     },
+    SymlinkStageIntent {
+        scope: crate::GitWorktreeScope,
+        intent: Box<crate::stage::PreservedSymlinkStageIntent>,
+    },
     AnchorAreaLocation {
         repository_id: Uuid,
         area_id: Uuid,

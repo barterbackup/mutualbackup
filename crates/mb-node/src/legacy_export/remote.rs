@@ -297,6 +297,26 @@ impl PreservedParentCheck {
                     }
                 }
                 PreservedExternalGitRecord::Record(
+                    mb_git::PreservedGitRecord::SymlinkStageIntent { intent, .. },
+                ) => {
+                    self.check_hint(&intent.source_root)?;
+                    self.check_recorded_native(intent.recorded_root_identity)?;
+                    self.check_recorded_native(intent.recorded_catalog_identity)?;
+                    if let Some(root) = &intent.catalog_root {
+                        self.check_hint(root)?;
+                    }
+                    if let Some(plan) = &intent.plan {
+                        let ownership = plan.preserved_ownership()?;
+                        self.check_hint(ownership.source_root)?;
+                        self.check_hint(&ownership.area.path_hint)?;
+                        if let Some(identity) = ownership.stable_root_identity {
+                            self.check_native(identity)?;
+                        } else {
+                            self.check_recorded_native(ownership.recorded_root_identity)?;
+                        }
+                    }
+                }
+                PreservedExternalGitRecord::Record(
                     mb_git::PreservedGitRecord::AnchorAreaLocation { path, .. },
                 ) => {
                     if path.is_absolute() {

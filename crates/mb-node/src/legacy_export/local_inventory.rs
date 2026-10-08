@@ -41,6 +41,7 @@ pub struct LegacyLocalStateInventory {
     pub git_metadata_objects: Vec<LegacyGitMetadataObject>,
     pub git_selected_branches: Vec<LegacyGitSelectedBranch>,
     pub pending_git_stages: Vec<LegacyPendingGitStage>,
+    pub pending_git_symlinks: Vec<LegacyPendingGitSymlink>,
     pub storage_volumes: Vec<LegacyStorageVolumeRegistration>,
     pub volume_ownership: Vec<LegacyVolumeOwnership>,
     pub local_sectors: Vec<LegacyLocalSectorRecipe>,
@@ -90,6 +91,7 @@ pub struct LegacyGitRegistration {
     pub metadata_objects_inventoried: bool,
     pub selected_branches_inventoried: bool,
     pub regular_stage_intents_inventoried: bool,
+    pub symlink_stage_intents_inventoried: bool,
     pub signed_revision_ids: Vec<Uuid>,
 }
 
@@ -169,6 +171,26 @@ pub struct LegacyPendingGitStage {
     pub relative_path_hex: String,
     pub git_mode: u32,
     pub plan: LegacyFileCapturePlan,
+    pub payloads_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitSymlink {
+    pub repository_id: Uuid,
+    pub worktree_id: Uuid,
+    pub record_format: u16,
+    pub source_root_hint_hex: String,
+    pub recorded_root_identity: NativeFileId,
+    pub recorded_catalog_identity: NativeFileId,
+    pub relative_path_hex: String,
+    pub recorded_source_identity: NativeFileId,
+    pub target_bytes: u64,
+    pub target_hash: String,
+    pub temp_name: String,
+    pub recorded_temp_identity: Option<NativeFileId>,
+    pub plan: Option<LegacyFileCapturePlan>,
+    /// None preserves the original primary-worktree implicit catalog root.
+    pub catalog_root_hint_hex: Option<String>,
     pub payloads_verified: bool,
 }
 
@@ -672,6 +694,32 @@ pub(super) fn collect_external_git_records(
                 report.pending_git_stages.push(entry);
             }
             PreservedExternalGitRecord::Record(
+                mb_git::PreservedGitRecord::SymlinkStageIntent { scope, intent },
+            ) => {
+                let entry = LegacyPendingGitSymlink {
+                    repository_id: scope.repository_id(),
+                    worktree_id: scope.worktree_id(),
+                    record_format: intent.record_format,
+                    source_root_hint_hex: hex::encode(intent.source_root.as_os_str().as_bytes()),
+                    recorded_root_identity: intent.recorded_root_identity,
+                    recorded_catalog_identity: intent.recorded_catalog_identity,
+                    relative_path_hex: hex::encode(intent.relative_path),
+                    recorded_source_identity: intent.recorded_source_identity,
+                    target_bytes: intent.target_bytes,
+                    target_hash: hex::encode(intent.target_hash),
+                    temp_name: intent.temp_name,
+                    recorded_temp_identity: intent.recorded_temp_identity,
+                    plan: intent.plan.as_ref().map(file_capture_plan).transpose()?,
+                    catalog_root_hint_hex: intent
+                        .catalog_root
+                        .as_ref()
+                        .map(|path| hex::encode(path.as_os_str().as_bytes())),
+                    payloads_verified: false,
+                };
+                account(&entry, used, limit)?;
+                report.pending_git_symlinks.push(entry);
+            }
+            PreservedExternalGitRecord::Record(
                 mb_git::PreservedGitRecord::AnchorAreaLocation {
                     repository_id,
                     area_id,
@@ -763,6 +811,7 @@ pub(super) fn collect_external_git_records(
                 registration.metadata_objects_inventoried = available;
                 registration.selected_branches_inventoried = available;
                 registration.regular_stage_intents_inventoried = available;
+                registration.symlink_stage_intents_inventoried = available;
             }
         }
         Ok(())
@@ -955,6 +1004,7 @@ pub(super) fn collect(
         git_metadata_objects: Vec::new(),
         git_selected_branches: Vec::new(),
         pending_git_stages: Vec::new(),
+        pending_git_symlinks: Vec::new(),
         storage_volumes: Vec::new(),
         volume_ownership: Vec::new(),
         local_sectors: Vec::new(),
@@ -1016,6 +1066,7 @@ pub(super) fn collect(
                     metadata_objects_inventoried: false,
                     selected_branches_inventoried: false,
                     regular_stage_intents_inventoried: false,
+                    symlink_stage_intents_inventoried: false,
                     signed_revision_ids: Vec::new(),
                 };
                 account(&entry, used, limit)?;
@@ -1309,6 +1360,427 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_export_external_git_symlink_stages_preserve_original_phases_and_target_privacy() {
+        use mb_store::{SourceFileCapturePlan, StableAnchorAreaLocator};
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(Serialize)]
+        struct OriginalIntent {
+            format_version: u16,
+            repository_id: Uuid,
+            source_root: Vec<u8>,
+            root_id: NativeFileId,
+            catalog_id: NativeFileId,
+            relative_path: Vec<u8>,
+            source_id: NativeFileId,
+            target: Vec<u8>,
+            temp_name: String,
+            temp_id: Option<NativeFileId>,
+            plan: Option<SourceFileCapturePlan>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            catalog_root: Option<Vec<u8>>,
+        }
+        for journal in ["closed", "wal-only", "live"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let data = temporary.path().join("state");
+            let repository = temporary.path().join("repository");
+            let source = raw_path(temporary.path(), b"symlink-source-\xff");
+            let catalog_root = raw_path(temporary.path(), b"symlink-catalog-\xfe");
+            let area = raw_path(temporary.path(), b"symlink-area-\xfd");
+            let safe = temporary.path().join("safe");
+            for path in [&data, &repository, &source, &catalog_root, &area, &safe] {
+                std::fs::create_dir(path).unwrap();
+            }
+            for path in [&source, &catalog_root, &area] {
+                std::fs::create_dir(path.join("nested")).unwrap();
+                std::fs::write(path.join("original"), b"preserved symlink owner").unwrap();
+            }
+            for path in [&source, &catalog_root] {
+                std::fs::create_dir(path.join(mb_store::GIT_CATALOG_DIRECTORY)).unwrap();
+            }
+            let source_id = mb_store::PinnedDirectory::open(&source)
+                .unwrap()
+                .identity()
+                .unwrap();
+            let catalog_root_id = mb_store::PinnedDirectory::open(&catalog_root)
+                .unwrap()
+                .identity()
+                .unwrap();
+            let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([212; 32]));
+            let repository_id = Uuid::from_u128(212);
+            let linked_id = Uuid::from_u128(213);
+            let control_path = data.join("control.db");
+            let control = ControlStore::open(&control_path, &keys).unwrap();
+            control
+                .put_record(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: repository.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let directory = repository.join(mb_store::GIT_CATALOG_DIRECTORY);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = directory.join(mb_store::GIT_CATALOG_MARKER_FILE);
+            std::fs::write(&marker, mb_store::git_catalog_marker_bytes(repository_id)).unwrap();
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let external_path = directory.join("catalog.db");
+            let external = ControlStore::open_with_key(
+                &external_path,
+                &mb_git::catalog_key(&keys, repository_id),
+            )
+            .unwrap();
+            let target = b"private-symlink-target-\xfc".to_vec();
+            let temp_name = format!("symlink-input-{}", Uuid::from_u128(214));
+            let mut expected = Vec::new();
+            for format in [1_u16, 2] {
+                let (root, root_id) = if format == 1 {
+                    (&source, source_id)
+                } else {
+                    (&catalog_root, catalog_root_id)
+                };
+                let catalog_id =
+                    mb_store::PinnedDirectory::open(root.join(mb_store::GIT_CATALOG_DIRECTORY))
+                        .unwrap()
+                        .identity()
+                        .unwrap();
+                let kind = if format == 1 {
+                    format!("git-symlink-stage-intent-v1/{repository_id}")
+                } else {
+                    format!("git-worktree-symlink-stage-intent-v1/{repository_id}/{linked_id}")
+                };
+                let temp_id = NativeFileId {
+                    filesystem_id: root_id.filesystem_id,
+                    inode: 52,
+                };
+                let locator = StableAnchorAreaLocator {
+                    area_id: Uuid::from_u128(215 + format as u128),
+                    path_hint: area.clone(),
+                    filesystem_id: root_id.filesystem_id,
+                    volume_root_hint: temporary.path().to_path_buf(),
+                };
+                for phase in 0..5 {
+                    let plan = if phase < 2 {
+                        None
+                    } else {
+                        let relative =
+                            PathBuf::from(mb_store::GIT_CATALOG_DIRECTORY).join(&temp_name);
+                        let capture_id =
+                            Uuid::from_u128(220 + u128::from(format) * 10 + phase as u128);
+                        let version = (
+                            temp_id.filesystem_id,
+                            temp_id.inode,
+                            target.len() as u64,
+                            0_i64,
+                            0_i64,
+                            0_i64,
+                            0_i64,
+                        );
+                        Some(if phase == 3 {
+                            SourceFileCapturePlan::GuardedLinkFreezeV1(
+                                decode_canonical(
+                                    &canonical_bytes(&(
+                                        1_u16,
+                                        capture_id,
+                                        root.as_os_str().as_bytes().to_vec(),
+                                        root_id,
+                                        relative.as_os_str().as_bytes().to_vec(),
+                                        version,
+                                        0o100600_u32,
+                                        &locator,
+                                    ))
+                                    .unwrap(),
+                                )
+                                .unwrap(),
+                            )
+                        } else {
+                            let root_plan: mb_store::ReflinkCapturePlan = decode_canonical(
+                                &canonical_bytes(&(
+                                    1_u16,
+                                    capture_id,
+                                    root.as_os_str().as_bytes().to_vec(),
+                                    &locator,
+                                    (
+                                        root_id.filesystem_id,
+                                        root_id.inode,
+                                        0_u64,
+                                        0_i64,
+                                        0_i64,
+                                        0_i64,
+                                        0_i64,
+                                    ),
+                                    0o40700_u32,
+                                    0_i64,
+                                    0_u32,
+                                ))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            if phase == 2 {
+                                SourceFileCapturePlan::ReflinkV1(
+                                    decode_canonical(
+                                        &canonical_bytes(&(
+                                            1_u16,
+                                            root_plan,
+                                            relative.to_str().unwrap(),
+                                            version,
+                                        ))
+                                        .unwrap(),
+                                    )
+                                    .unwrap(),
+                                )
+                            } else {
+                                SourceFileCapturePlan::ReflinkRawV2(
+                                    decode_canonical(
+                                        &canonical_bytes(&(
+                                            2_u16,
+                                            root_plan,
+                                            relative.as_os_str().as_bytes().to_vec(),
+                                            version,
+                                        ))
+                                        .unwrap(),
+                                    )
+                                    .unwrap(),
+                                )
+                            }
+                        })
+                    };
+                    let relative_path = [format!("link-{phase}-").as_bytes(), &[251]].concat();
+                    let original = OriginalIntent {
+                        format_version: format,
+                        repository_id,
+                        source_root: source.as_os_str().as_bytes().to_vec(),
+                        root_id: source_id,
+                        catalog_id,
+                        relative_path: relative_path.clone(),
+                        source_id: NativeFileId {
+                            filesystem_id: source_id.filesystem_id,
+                            inode: 51,
+                        },
+                        target: target.clone(),
+                        temp_name: temp_name.clone(),
+                        temp_id: (phase > 0).then_some(temp_id),
+                        plan,
+                        catalog_root: (format == 2)
+                            .then(|| catalog_root.as_os_str().as_bytes().to_vec()),
+                    };
+                    external
+                        .put_record(&kind, &relative_path, &canonical_bytes(&original).unwrap())
+                        .unwrap();
+                    expected.push((format, phase, original));
+                }
+            }
+            let renamed_source = temporary.path().join("renamed-source");
+            let renamed_catalog = temporary.path().join("renamed-catalog");
+            std::fs::rename(&source, &renamed_source).unwrap();
+            std::fs::rename(&catalog_root, &renamed_catalog).unwrap();
+            let mut excluded = Vec::new();
+            for path in [&renamed_source, &renamed_catalog, &area] {
+                let alias = temporary.path().join(format!("alias-{}", excluded.len()));
+                std::os::unix::fs::symlink(path, &alias).unwrap();
+                excluded.push((path.clone(), alias));
+            }
+            let mut writers = Some((control, external));
+            if journal == "closed" {
+                drop(writers.take());
+            }
+            if journal == "wal-only" {
+                for path in [&control_path, &external_path] {
+                    std::fs::remove_file(path.with_extension("db-shm")).unwrap();
+                }
+            }
+            let snapshot = |path: &Path| {
+                let mut files = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        let bytes = if entry.file_name().as_bytes().ends_with(b"-shm") {
+                            std::fs::metadata(entry.path())
+                                .unwrap()
+                                .len()
+                                .to_le_bytes()
+                                .to_vec()
+                        } else {
+                            std::fs::read(entry.path()).unwrap()
+                        };
+                        (entry.file_name(), bytes)
+                    })
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
+            };
+            let before = (snapshot(&data), snapshot(&directory));
+            let report =
+                super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+            assert_eq!(report.format_version, 12);
+            assert!(!report.retained_history_complete);
+            assert!(
+                report.local_state.git_worktrees.is_empty()
+                    && report.local_state.git_indexes.is_empty()
+                    && report.local_state.pending_git_stages.is_empty()
+            );
+            assert_eq!(report.local_state.pending_git_symlinks.len(), 10);
+            assert!(report.local_state.git_repositories[0].symlink_stage_intents_inventoried);
+            assert!(!report.local_state.git_repositories[0].catalog_inventoried);
+            for (format, phase, original) in &expected {
+                let worktree_id = if *format == 1 {
+                    repository_id
+                } else {
+                    linked_id
+                };
+                let entry = report
+                    .local_state
+                    .pending_git_symlinks
+                    .iter()
+                    .find(|entry| {
+                        entry.worktree_id == worktree_id
+                            && entry.relative_path_hex == hex::encode(&original.relative_path)
+                    })
+                    .unwrap();
+                assert_eq!(entry.record_format, *format);
+                assert_eq!(entry.recorded_root_identity, original.root_id);
+                assert_eq!(entry.recorded_catalog_identity, original.catalog_id);
+                assert_eq!(entry.recorded_source_identity, original.source_id);
+                assert_eq!(entry.recorded_temp_identity, original.temp_id);
+                assert_eq!(entry.temp_name, temp_name);
+                assert_eq!(
+                    entry.catalog_root_hint_hex,
+                    original.catalog_root.as_ref().map(hex::encode)
+                );
+                assert_eq!(entry.target_bytes, target.len() as u64);
+                assert_eq!(
+                    entry.target_hash,
+                    hex::encode(blake3::hash(&target).as_bytes())
+                );
+                assert_eq!(
+                    entry.plan,
+                    original
+                        .plan
+                        .as_ref()
+                        .map(file_capture_plan)
+                        .transpose()
+                        .unwrap()
+                );
+                assert_eq!(entry.plan.is_some(), *phase >= 2);
+                assert!(!entry.payloads_verified);
+            }
+            let json = serde_json::to_vec(&report).unwrap();
+            assert!(!String::from_utf8_lossy(&json).contains("private-symlink-target"));
+            assert!(!String::from_utf8_lossy(&json).contains(&hex::encode(&target)));
+            assert_eq!(
+                serde_json::from_slice::<super::super::LegacyRevisionInventory>(&json).unwrap(),
+                report
+            );
+            for (path, alias) in &excluded {
+                for parent in [
+                    path.clone(),
+                    path.join("nested"),
+                    alias.clone(),
+                    alias.join("nested"),
+                ] {
+                    assert!(
+                        super::super::remote::peer_client_preflight(
+                            &keys,
+                            &data,
+                            &parent,
+                            &[],
+                            false
+                        )
+                        .is_err(),
+                        "{journal}: {}",
+                        parent.display()
+                    );
+                    assert!(
+                        super::super::remote::export_parent_preflight(&keys, &data, &parent, &[])
+                            .is_err()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(path.join("original")).unwrap(),
+                    b"preserved symlink owner"
+                );
+                assert_eq!(std::fs::read_dir(path.join("nested")).unwrap().count(), 0);
+            }
+            assert!(
+                super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                    .is_ok()
+            );
+            assert!(
+                super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_ok()
+            );
+            let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+            assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+            assert!(
+                super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err()
+            );
+            crate::volume::with_inspected_control_snapshot(&data, &keys, |control| {
+                let mut report = collect(control, &mut 0, V1_MAX_CATALOG_BYTES)?;
+                let mut used = 0;
+                collect_external_git_records(
+                    control,
+                    &keys,
+                    &mut report,
+                    &mut used,
+                    V1_MAX_CATALOG_BYTES,
+                )?;
+                let mut exact = 0;
+                for entry in &report.pending_git_symlinks {
+                    account(entry, &mut exact, V1_MAX_CATALOG_BYTES)?;
+                }
+                assert_eq!(used, exact);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!((snapshot(&data), snapshot(&directory)), before);
+            assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+            if journal == "closed" {
+                let external = ControlStore::open_with_key(
+                    &external_path,
+                    &mb_git::catalog_key(&keys, repository_id),
+                )
+                .unwrap();
+                external
+                    .put_record(
+                        &format!(
+                            "git-worktree-symlink-stage-intent-v1/{repository_id}/{}",
+                            Uuid::from_u128(999)
+                        ),
+                        b"zz-last",
+                        b"broken symlink",
+                    )
+                    .unwrap();
+                drop(external);
+                let corrupted = (snapshot(&data), snapshot(&directory));
+                assert!(
+                    super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).is_err()
+                );
+                assert!(
+                    super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                        .is_err()
+                );
+                assert!(
+                    super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                        .is_err()
+                );
+                assert_eq!((snapshot(&data), snapshot(&directory)), corrupted);
+            }
+            for root in [&renamed_source, &renamed_catalog] {
+                assert_eq!(
+                    std::fs::read_dir(root.join(mb_store::GIT_CATALOG_DIRECTORY))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+            drop(writers);
+        }
+    }
+
+    #[test]
     fn legacy_export_external_git_regular_stage_plans_preserve_original_inputs_and_renamed_roots() {
         use mb_store::{ReflinkCapturePlan, SourceFileCapturePlan, StableAnchorAreaLocator};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1521,7 +1993,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&catalog_directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 11);
+            assert_eq!(report.format_version, 12);
             assert!(!report.retained_history_complete);
             assert!(report.local_state.git_worktrees.is_empty());
             assert!(report.local_state.git_indexes.is_empty());
@@ -1872,7 +2344,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 11);
+            assert_eq!(report.format_version, 12);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_object_anchors.len(), 3);
             assert_eq!(report.local_state.git_indexes.len(), 3);
@@ -2235,7 +2707,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 11);
+            assert_eq!(report.format_version, 12);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_worktrees.len(), 3);
             let json = serde_json::to_vec(&report).unwrap();
@@ -2362,7 +2834,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 11);
+        assert_eq!(report.format_version, 12);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.local_sectors.len(), 1);
         let entry = &report.local_state.local_sectors[0];
@@ -2484,7 +2956,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 11);
+        assert_eq!(report.format_version, 12);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.volume_ownership.len(), 1);
         let entry = &report.local_state.volume_ownership[0];
@@ -2537,7 +3009,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 11);
+        assert_eq!(report.format_version, 12);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -2956,7 +3428,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 11);
+            assert_eq!(report.format_version, 12);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

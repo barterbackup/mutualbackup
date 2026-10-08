@@ -203,6 +203,24 @@ impl From<SymlinkStageIntentV1> for SymlinkStageIntent {
     }
 }
 
+/// Metadata from an original unfinished symlink add. The captured target is
+/// deliberately represented by its size and digest, never its plaintext bytes.
+#[derive(Clone, Debug)]
+pub struct PreservedSymlinkStageIntent {
+    pub record_format: u16,
+    pub source_root: PathBuf,
+    pub recorded_root_identity: NativeFileId,
+    pub recorded_catalog_identity: NativeFileId,
+    pub relative_path: Vec<u8>,
+    pub recorded_source_identity: NativeFileId,
+    pub target_bytes: u64,
+    pub target_hash: [u8; 32],
+    pub temp_name: String,
+    pub recorded_temp_identity: Option<NativeFileId>,
+    pub plan: Option<SourceFileCapturePlan>,
+    pub catalog_root: Option<PathBuf>,
+}
+
 /// Classify capture journals before catalog initialization or replay. A legacy
 /// intent can survive its backend binding, including in a linked worktree.
 pub(crate) fn require_native_stage_state(control: &ControlStore) -> anyhow::Result<()> {
@@ -230,7 +248,7 @@ pub(crate) fn require_native_stage_state(control: &ControlStore) -> anyhow::Resu
     Ok(())
 }
 
-/// Preserve original object mappings, indexes and regular-file stage intents.
+/// Preserve original object mappings, indexes and file/symlink stage intents.
 /// No anchor payload, source path, marker or normal replay helper is opened.
 #[cfg(target_os = "linux")]
 pub(crate) fn for_each_preserved_record(
@@ -241,6 +259,78 @@ pub(crate) fn for_each_preserved_record(
     use anyhow::{Context, ensure};
     use std::os::unix::ffi::OsStrExt;
 
+    for prefix in [SYMLINK_INTENT_PREFIX, WORKTREE_SYMLINK_INTENT_PREFIX] {
+        control.for_each_record_with_kind_prefix_bounded(
+            prefix,
+            512,
+            MAX_STAGE_PATH_BYTES,
+            mb_core::V1_MAX_CATALOG_BYTES,
+            |kind, key, bytes| {
+                let scope = GitWorktreeScope::preserved_from_kind(
+                    kind,
+                    repository_id,
+                    SYMLINK_INTENT_PREFIX,
+                    WORKTREE_SYMLINK_INTENT_PREFIX,
+                )?;
+                ensure!(!key.contains(&0), "invalid preserved Git symlink path");
+                let intent = decode_symlink_intent(bytes, repository_id, key)?;
+                ensure!(
+                    mb_core::canonical_bytes_bounded(&intent, bytes.len())? == bytes,
+                    "noncanonical preserved Git symlink intent"
+                );
+                for path in [Some(&intent.source_root), intent.catalog_root.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    ensure!(
+                        !path.as_os_str().as_bytes().contains(&0)
+                            && path.components().all(|part| matches!(
+                                part,
+                                Component::RootDir | Component::Normal(_)
+                            ))
+                            && path.components().collect::<PathBuf>().as_os_str()
+                                == path.as_os_str(),
+                        "unsafe preserved Git symlink root hint"
+                    );
+                }
+                for identity in [
+                    Some(intent.root_id),
+                    Some(intent.catalog_id),
+                    Some(intent.source_id),
+                    intent.temp_id,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    ensure!(
+                        identity.filesystem_id != 0 && identity.inode != 0,
+                        "invalid preserved Git symlink identity"
+                    );
+                }
+                if let Some(plan) = &intent.plan {
+                    plan.preserved_ownership()?;
+                }
+                visit(crate::PreservedGitRecord::SymlinkStageIntent {
+                    scope,
+                    intent: Box::new(PreservedSymlinkStageIntent {
+                        record_format: intent.format_version,
+                        source_root: intent.source_root,
+                        recorded_root_identity: intent.root_id,
+                        recorded_catalog_identity: intent.catalog_id,
+                        relative_path: key.to_vec(),
+                        recorded_source_identity: intent.source_id,
+                        target_bytes: intent.target.len() as u64,
+                        target_hash: *blake3::hash(&intent.target).as_bytes(),
+                        temp_name: intent.temp_name,
+                        recorded_temp_identity: intent.temp_id,
+                        plan: intent.plan,
+                        catalog_root: intent.catalog_root,
+                    }),
+                })?;
+                Ok(true)
+            },
+        )?;
+    }
     for prefix in [INTENT_PREFIX, WORKTREE_STAGE_INTENT_PREFIX] {
         control.for_each_record_with_kind_prefix_bounded(
             prefix,
@@ -1335,6 +1425,218 @@ mod tests {
     };
     use crate::GitWorktreeScope;
     use crate::merge::{MergeSession, merge_state_for_scope, store_merge_session_for_scope};
+
+    #[test]
+    fn preserved_git_symlink_stage_intents_keep_original_versions_and_hide_target_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&path, &[207; 32]).unwrap();
+        let repository_id = Uuid::from_u128(207);
+        let linked_id = Uuid::from_u128(208);
+        let identity = mb_store::NativeFileId {
+            filesystem_id: 4,
+            inode: 12,
+        };
+        let primary = format!("git-symlink-stage-intent-v1/{repository_id}");
+        let linked = format!("git-worktree-symlink-stage-intent-v1/{repository_id}/{linked_id}");
+        let target = b"private-target-\xff".to_vec();
+        let source_root = temporary.path().join("missing-source");
+        let separate_catalog = temporary.path().join("missing-catalog");
+        let temp_name = format!("symlink-input-{}", Uuid::from_u128(209));
+        let original = super::SymlinkStageIntentV1 {
+            format_version: 1,
+            repository_id,
+            source_root: source_root.clone(),
+            root_id: identity,
+            catalog_id: identity,
+            relative_path: PathBuf::from("link"),
+            source_id: identity,
+            target: target.clone(),
+            temp_name: temp_name.clone(),
+            temp_id: None,
+            plan: None,
+        };
+        let original_bytes = canonical_bytes(&original).unwrap();
+        let valid = super::SymlinkStageIntent::from(original);
+        let mut planned = None;
+        for (kind, separate) in [(&primary, false), (&linked, true)] {
+            for phase in 0..3 {
+                let mut intent = valid.clone();
+                intent.relative_path = PathBuf::from(format!("link-{phase}"));
+                if separate {
+                    intent.format_version = 2;
+                    intent.catalog_root = Some(separate_catalog.clone());
+                }
+                if phase > 0 {
+                    intent.temp_id = Some(identity);
+                }
+                if phase == 2 {
+                    let root = intent.catalog_root.as_deref().unwrap_or(&source_root);
+                    let relative = PathBuf::from(GIT_CATALOG_DIRECTORY).join(&temp_name);
+                    intent.plan = Some(SourceFileCapturePlan::GuardedLinkFreezeV1(
+                        mb_core::decode_canonical(
+                            &canonical_bytes(&(
+                                1_u16,
+                                Uuid::from_u128(210),
+                                root.as_os_str().as_encoded_bytes().to_vec(),
+                                identity,
+                                relative.as_os_str().as_encoded_bytes().to_vec(),
+                                (
+                                    4_u64,
+                                    12_u64,
+                                    target.len() as u64,
+                                    0_i64,
+                                    0_i64,
+                                    0_i64,
+                                    0_i64,
+                                ),
+                                0o100644_u32,
+                                StableAnchorAreaLocator {
+                                    area_id: Uuid::from_u128(211),
+                                    path_hint: temporary.path().join("missing-area"),
+                                    filesystem_id: 4,
+                                    volume_root_hint: temporary.path().to_path_buf(),
+                                },
+                            ))
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    ));
+                }
+                let bytes = canonical_bytes(&intent).unwrap();
+                if phase == 2 && separate {
+                    planned = Some(intent.clone());
+                }
+                control
+                    .put_record(
+                        kind,
+                        intent.relative_path.as_os_str().as_encoded_bytes(),
+                        &bytes,
+                    )
+                    .unwrap();
+            }
+        }
+        let snapshot = || {
+            (
+                fs::read(&path).unwrap(),
+                fs::read(path.with_extension("db-wal")).unwrap(),
+            )
+        };
+        let before = snapshot();
+        let mut rows = Vec::new();
+        super::for_each_preserved_record(&control, repository_id, |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 6);
+        for row in rows {
+            let crate::PreservedGitRecord::SymlinkStageIntent { scope, intent } = row else {
+                panic!("wrong record")
+            };
+            assert_eq!(scope.repository_id(), repository_id);
+            assert_eq!(intent.target_bytes, target.len() as u64);
+            assert_eq!(intent.target_hash, *blake3::hash(&target).as_bytes());
+            assert_eq!(intent.source_root, source_root);
+            assert_eq!(intent.recorded_root_identity, identity);
+            assert_eq!(intent.recorded_catalog_identity, identity);
+            assert_eq!(intent.recorded_source_identity, identity);
+            assert_eq!(intent.temp_name, temp_name);
+            let phase = intent.relative_path.last().unwrap() - b'0';
+            assert_eq!(intent.recorded_temp_identity.is_some(), phase > 0);
+            assert_eq!(intent.plan.is_some(), phase == 2);
+            if scope.worktree_id() == repository_id {
+                assert_eq!(intent.record_format, 1);
+                assert!(intent.catalog_root.is_none());
+            } else {
+                assert_eq!(scope.worktree_id(), linked_id);
+                assert_eq!(intent.record_format, 2);
+                assert_eq!(intent.catalog_root, Some(separate_catalog.clone()));
+            }
+        }
+        assert_eq!(snapshot(), before);
+        for kind in [&primary, &linked] {
+            for phase in 0..3 {
+                control
+                    .delete_record(kind, format!("link-{phase}").as_bytes())
+                    .unwrap();
+            }
+        }
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(super::for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        for index in 0..13 {
+            let mut bad = valid.clone();
+            match index {
+                0 => bad.format_version = 3,
+                1 => bad.repository_id = linked_id,
+                2 => bad.source_root = PathBuf::from("/bad\0root"),
+                3 => bad.source_root = PathBuf::from("/a/../b"),
+                4 => bad.root_id.inode = 0,
+                5 => bad.catalog_id.filesystem_id = 0,
+                6 => bad.source_id.inode = 0,
+                7 => bad.target.clear(),
+                8 => bad.target = vec![b'x'; 4096],
+                9 => bad.target = b"a\0b".to_vec(),
+                10 => bad.temp_name = "../escape".into(),
+                11 => bad.catalog_root = Some(separate_catalog.clone()),
+                _ => {
+                    bad.temp_id = Some(mb_store::NativeFileId {
+                        filesystem_id: 4,
+                        inode: 0,
+                    })
+                }
+            }
+            reject(&primary, b"link", &canonical_bytes(&bad).unwrap());
+        }
+        let planned = planned.unwrap();
+        let mut missing_temporary = planned.clone();
+        missing_temporary.temp_id = None;
+        reject(
+            &linked,
+            b"link-2",
+            &canonical_bytes(&missing_temporary).unwrap(),
+        );
+        let mut wrong_plan_root = planned;
+        wrong_plan_root.catalog_root = Some(temporary.path().join("different-catalog"));
+        reject(
+            &linked,
+            b"link-2",
+            &canonical_bytes(&wrong_plan_root).unwrap(),
+        );
+        for key in [
+            b"".as_slice(),
+            b"other",
+            b"../escape",
+            b"a\0b",
+            &vec![b'x'; super::MAX_STAGE_PATH_BYTES + 1],
+        ] {
+            reject(&primary, key, &original_bytes);
+        }
+        for kind in [
+            format!("git-symlink-stage-intent-v1/{linked_id}"),
+            format!(
+                "git-worktree-symlink-stage-intent-v1/{repository_id}/{}",
+                linked_id.simple()
+            ),
+            format!("git-worktree-symlink-stage-intent-v1/{repository_id}/{repository_id}"),
+        ] {
+            reject(&kind, b"link", &original_bytes);
+        }
+        reject(&primary, b"link", &[original_bytes, vec![0]].concat());
+        reject(
+            &primary,
+            b"link",
+            &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1],
+        );
+        assert!(!source_root.exists());
+        assert!(!separate_catalog.exists());
+        assert!(!temporary.path().join("missing-area").exists());
+    }
 
     #[test]
     fn preserved_git_regular_stage_intents_validate_original_scopes_keys_and_plans_without_replay()
