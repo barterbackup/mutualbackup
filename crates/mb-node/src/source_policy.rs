@@ -6,10 +6,38 @@
 use anyhow::{Result, bail};
 use mb_core::{KeyMaterial, decode_canonical};
 use mb_store::{ControlStore, SourceBackendBinding, WITHDRAWN_GUARDED_BACKEND};
+use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use crate::control::GitRepositoryInfo;
 use crate::control::ProtectedRoot;
+
+/// Reject withdrawn state before any catalog writer, migration or replay opens.
+/// A fresh installation has no catalog to inspect. Linux inspections forbid
+/// journal creation and use one preserved read snapshot for all namespaces.
+pub(crate) fn require_native_source_state_from_catalog(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::symlink_metadata(data_dir.join("control.db")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
+            require_native_source_state(control, keys)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(control) = crate::volume::inspect_control_store(data_dir, keys)? {
+            require_native_source_state(&control, keys)?;
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn require_native_source_state(
     control: &ControlStore,
@@ -59,8 +87,195 @@ mod tests {
     use std::fs;
     use uuid::Uuid;
 
+    #[cfg(target_os = "linux")]
+    fn directory_bytes(
+        path: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, (usize, blake3::Hash)> {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let bytes = fs::read(entry.path()).unwrap();
+                (entry.file_name(), (bytes.len(), blake3::hash(&bytes)))
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn control_with_key_format(data: &Path, keys: &KeyMaterial, format: u8) -> ControlStore {
+        if format == 0 {
+            return ControlStore::open(data.join("control.db"), keys).unwrap();
+        }
+        let (control, _) = crate::volume::open_control_store(data, keys).unwrap();
+        if format == 1 {
+            return control;
+        }
+        // A durable envelope can precede completion of the legacy rekey.
+        control.rekey(&keys.database_key(b"control.db")).unwrap();
+        ControlStore::open(data.join("control.db"), keys).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn retained_signed_guarded_history_stops_startup_without_root_records() {
+    fn startup_admission_does_not_create_a_missing_installation() {
+        let area = tempfile::tempdir().unwrap();
+        let data = area.path().join("absent/node");
+        require_native_source_state_from_catalog(
+            &data,
+            &KeyMaterial::from_seed(&Seed::from_bytes([90; 32])),
+        )
+        .unwrap();
+        assert_eq!(fs::read_dir(area.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_admission_preserves_closed_and_live_catalogs_across_key_formats() {
+        for format in 0..3 {
+            for live in [false, true] {
+                for withdrawn in [false, true] {
+                    let area = tempfile::tempdir().unwrap();
+                    let data = area.path();
+                    let seed = Seed::from_bytes([90; 32]);
+                    let keys = KeyMaterial::from_seed(&seed);
+                    drop(Node::lock_data_dir(data).unwrap());
+                    let control = control_with_key_format(data, &keys, format);
+                    control
+                        .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                        .unwrap();
+                    control
+                        .put_record(
+                            if withdrawn {
+                                "guarded-view-mount-v1"
+                            } else {
+                                "native-test"
+                            },
+                            b"id",
+                            b"preserved",
+                        )
+                        .unwrap();
+                    let control = if live {
+                        Some(control)
+                    } else {
+                        drop(control);
+                        None
+                    };
+                    let before = directory_bytes(data);
+                    let result = require_native_source_state_from_catalog(data, &keys);
+                    if withdrawn {
+                        assert!(result.unwrap_err().to_string().contains("withdrawn"));
+                        let error = Node::open(data, seed).err().unwrap();
+                        assert!(error.to_string().contains("withdrawn"), "{error:#}");
+                    } else {
+                        result.unwrap();
+                    }
+                    let mut after = directory_bytes(data);
+                    let mut before = before;
+                    assert_eq!(
+                        after.keys().collect::<Vec<_>>(),
+                        before.keys().collect::<Vec<_>>()
+                    );
+                    if live {
+                        // SQLite may update read marks in the writer's shared
+                        // in-process mapping. Database/WAL bytes stay intact.
+                        let name = std::ffi::OsStr::new("control.db-shm");
+                        assert_eq!(after[name].0, before[name].0);
+                        after.remove(name);
+                        before.remove(name);
+                    }
+                    assert_eq!(after, before, "format={format}, live={live}");
+                    drop(control);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_admission_reads_wal_only_commits_before_migration_or_replay() {
+        for format in 0..3 {
+            for withdrawn in [false, true] {
+                let area = tempfile::tempdir().unwrap();
+                let source = area.path().join("source");
+                let data = area.path().join("node");
+                fs::create_dir(&source).unwrap();
+                drop(Node::lock_data_dir(&data).unwrap());
+                let seed = Seed::from_bytes([90; 32]);
+                let keys = KeyMaterial::from_seed(&seed);
+                let mut control = control_with_key_format(&source, &keys, format);
+                control
+                    .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                    .unwrap();
+                let kind = if withdrawn {
+                    "guarded-view-mount-v1"
+                } else {
+                    "native-test"
+                };
+                control.put_record(kind, b"id", b"only in WAL").unwrap();
+                control
+                    .begin_operation(&[7; 16], "ensure-filler", &[8; 32], &[9; 32])
+                    .unwrap();
+                for name in ["control.db", "control.db-wal", "control.key"] {
+                    if source.join(name).exists() {
+                        fs::copy(source.join(name), data.join(name)).unwrap();
+                    }
+                }
+                drop(control);
+                let before = directory_bytes(&data);
+                let result = require_native_source_state_from_catalog(&data, &keys);
+                if withdrawn {
+                    assert!(result.unwrap_err().to_string().contains("withdrawn"));
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(directory_bytes(&data), before);
+                let opened = Node::open(&data, seed);
+                if withdrawn {
+                    assert!(opened.err().unwrap().to_string().contains("withdrawn"));
+                    assert_eq!(directory_bytes(&data), before);
+                } else {
+                    drop(opened.unwrap());
+                    crate::volume::with_inspected_control_snapshot(&data, &keys, |reader| {
+                        assert_eq!(reader.get_record(kind, b"id")?.unwrap(), b"only in WAL");
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_admission_rejects_incomplete_or_rollback_journals_without_mutation() {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let area = tempfile::tempdir().unwrap();
+            let data = area.path();
+            drop(Node::lock_data_dir(data).unwrap());
+            let seed = Seed::from_bytes([90; 32]);
+            let keys = KeyMaterial::from_seed(&seed);
+            let mut control = control_with_key_format(data, &keys, 0);
+            control
+                .begin_operation(&[7; 16], "ensure-filler", &[8; 32], &[9; 32])
+                .unwrap();
+            drop(control);
+            fs::write(
+                data.join(format!("control.db{suffix}")),
+                b"preserved journal",
+            )
+            .unwrap();
+            let before = directory_bytes(data);
+            let error = Node::open(data, seed).err().unwrap();
+            assert!(
+                error.to_string().contains("incomplete or rollback journal"),
+                "{error:#}"
+            );
+            assert_eq!(directory_bytes(data), before);
+        }
+    }
+
+    #[test]
+    fn retained_signed_history_selects_native_or_withdrawn_startup_without_root_records() {
         use ed25519_dalek::SigningKey;
         use mb_core::{
             GuildCheckpoint, Member, QuorumCheckpoint, SectorPurpose, SignedRecord,
@@ -68,7 +283,7 @@ mod tests {
             make_sector_id,
         };
 
-        for private_format in [6_u16, 7] {
+        for private_format in [1_u16, 6, 7] {
             for kind in ["user-revision", "user-revision-head", "guild-checkpoint"] {
                 let area = tempfile::tempdir().unwrap();
                 let data = area.path();
@@ -164,6 +379,14 @@ mod tests {
                     data.join("parity.db"),
                 ];
                 let original: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+                if private_format == 1 {
+                    require_native_source_state_from_catalog(data, &keys).unwrap();
+                    for (path, original) in paths.iter().zip(&original) {
+                        assert_eq!(&fs::read(path).unwrap(), original);
+                    }
+                    drop(Node::open(data, seed).unwrap());
+                    continue;
+                }
                 let error = match Node::open(data, seed) {
                     Err(error) => error,
                     Ok(_) => {

@@ -353,7 +353,7 @@ impl ControlStore {
         if id.is_nil() || revision.is_nil() {
             return Err(DatabaseError::Conflict.into());
         }
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let tx = self.read_snapshot()?;
         let catalog = read(&tx, id, revision)?;
         if catalog.is_some() {
             let record = journal::read::<CatalogPagedCheckpointRetention>(&tx, id)?

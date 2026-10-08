@@ -102,8 +102,7 @@ impl ControlStore {
         &self,
         sector_id: [u8; 32],
     ) -> Result<Option<CatalogSectorSource>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let source = read_source(&transaction, sector_id)?;
         transaction.commit()?;
         Ok(source)

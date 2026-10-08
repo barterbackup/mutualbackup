@@ -412,8 +412,7 @@ impl ControlStore {
         &self,
         id: Uuid,
     ) -> Result<Option<PagedCatalogSnapshot>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let result = snapshot(&transaction, id)?;
         transaction.commit()?;
         Ok(result)
@@ -426,8 +425,7 @@ impl ControlStore {
         id: Uuid,
         sector: [u8; 32],
     ) -> Result<Option<PagedCatalogPageSource>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let result = page_source(&transaction, id, sector)?;
         transaction.commit()?;
         Ok(result)
@@ -439,8 +437,7 @@ impl ControlStore {
         id: Uuid,
         sector: [u8; 32],
     ) -> Result<Option<(PagedCatalogPageSource, Vec<u8>)>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let result = if let Some(source) = page_source(&transaction, id, sector)? {
             let encoded = read_page(
                 &transaction,
@@ -537,8 +534,7 @@ impl ControlStore {
         &self,
         sector_id: [u8; 32],
     ) -> Result<Option<PagedCatalogSnapshot>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let owner: Option<Option<Vec<u8>>> = transaction
             .query_row(
                 "SELECT CASE WHEN length(record_id) = 16 AND length(bytes) = 0

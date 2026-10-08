@@ -160,62 +160,67 @@ fn require_native_pinned_catalog_state(
         return Ok(());
     };
     let identity = database.metadata()?;
-    let catalog = ControlStore::open_existing_read_only_with_key(
+    ControlStore::with_preserved_read_only_snapshot(
         directory.descriptor_path().join(CATALOG_DATABASE),
-        database_key,
-    )?;
-    let native_binding = catalog
-        .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())?
-        .is_some();
-    catalog.for_each_record_value(SOURCE_BACKEND_KIND, |bytes| {
-        let record: GitSourceBackendRecord =
-            mb_core::decode_canonical(bytes).map_err(|_| RepositoryError::Conflict)?;
-        if record.format_version != 1
-            || record.repository_id != repository_id
-            || mb_core::canonical_bytes(&record).map_err(|_| RepositoryError::Conflict)? != bytes
-        {
-            return Err(RepositoryError::Conflict.into());
-        }
-        record.backend.require_supported()?;
-        Ok(())
-    })?;
-    for prefix in ["git-guarded-", "guarded-", "link-freeze-"] {
-        if catalog.has_records_with_kind_prefix(prefix)? {
-            return Err(AnchorError::UnsupportedSourceOperation(
-                mb_store::WITHDRAWN_GUARDED_BACKEND,
-            )
-            .into());
-        }
-    }
-    crate::stage::require_native_stage_state(&catalog)?;
-    // A root-backed blob can outlive its stage receipt or backend binding.
-    // Inspect its historical manifest rather than inferring native ownership.
-    catalog.for_each_record_value_with_kind_prefix("git-object-anchor-v1/", |bytes| {
-        let anchor: FileAnchorManifest = mb_core::decode_canonical(bytes)?;
-        let hint = crate::catalog_anchor::hint(&catalog, &anchor)?;
-        match anchor.require_native_ownership_with_area_hint(hint.as_deref()) {
-            // A bound native catalog may retain damaged or unavailable copies
-            // for repair. Its other verified copies remain usable. An unbound
-            // catalog needs available provenance before backend migration.
-            Err(AnchorError::AnchorAreaCollision(_)
-                | AnchorError::AnchorAreaDiscoveryPending
-                | AnchorError::AnchorAreaDiscoveryLimit) if native_binding => Ok(()),
-            Err(error @ (AnchorError::AnchorAreaCollision(_)
-                | AnchorError::AnchorAreaDiscoveryPending
-                | AnchorError::AnchorAreaDiscoveryLimit)) => Err(anyhow::Error::new(error).context(
-                "cannot classify an unbound Git anchor; preserve the original catalog and make its anchor area available",
-            )),
-            result => result.map_err(Into::into),
-        }
-    })?;
-    let current = directory
-        .open_child_file(CATALOG_DATABASE)?
-        .ok_or(RepositoryError::Conflict)?
-        .metadata()?;
-    if identity.dev() != current.dev() || identity.ino() != current.ino() {
-        return Err(RepositoryError::Conflict.into());
-    }
-    Ok(())
+        &[*database_key],
+        |catalog| {
+            let native_binding = catalog
+                .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())?
+                .is_some();
+            catalog.for_each_record_value(SOURCE_BACKEND_KIND, |bytes| {
+                let record: GitSourceBackendRecord =
+                    mb_core::decode_canonical(bytes).map_err(|_| RepositoryError::Conflict)?;
+                if record.format_version != 1
+                    || record.repository_id != repository_id
+                    || mb_core::canonical_bytes(&record).map_err(|_| RepositoryError::Conflict)?
+                        != bytes
+                {
+                    return Err(RepositoryError::Conflict.into());
+                }
+                record.backend.require_supported()?;
+                Ok(())
+            })?;
+            for prefix in ["git-guarded-", "guarded-", "link-freeze-"] {
+                if catalog.has_records_with_kind_prefix(prefix)? {
+                    return Err(AnchorError::UnsupportedSourceOperation(
+                        mb_store::WITHDRAWN_GUARDED_BACKEND,
+                    )
+                    .into());
+                }
+            }
+            crate::stage::require_native_stage_state(catalog)?;
+            // A root-backed blob can outlive its stage receipt or backend binding.
+            // Inspect its historical manifest rather than inferring native ownership.
+            let inspect_anchor = |bytes: &[u8]| -> anyhow::Result<()> {
+                let anchor: FileAnchorManifest = mb_core::decode_canonical(bytes)?;
+                let hint = crate::catalog_anchor::hint(catalog, &anchor)?;
+                match anchor.require_native_ownership_with_area_hint(hint.as_deref()) {
+                    // A bound native catalog may retain damaged or unavailable
+                    // copies for repair. An unbound catalog needs available
+                    // provenance before backend migration.
+                    Err(AnchorError::AnchorAreaCollision(_)
+                        | AnchorError::AnchorAreaDiscoveryPending
+                        | AnchorError::AnchorAreaDiscoveryLimit) if native_binding => Ok(()),
+                    Err(error @ (AnchorError::AnchorAreaCollision(_)
+                        | AnchorError::AnchorAreaDiscoveryPending
+                        | AnchorError::AnchorAreaDiscoveryLimit)) => Err(anyhow::Error::new(error).context(
+                        "cannot classify an unbound Git anchor; preserve the original catalog and make its anchor area available",
+                    )),
+                    result => result.map_err(Into::into),
+                }
+            };
+            catalog
+                .for_each_record_value_with_kind_prefix("git-object-anchor-v1/", inspect_anchor)?;
+            let current = directory
+                .open_child_file(CATALOG_DATABASE)?
+                .ok_or(RepositoryError::Conflict)?
+                .metadata()?;
+            if identity.dev() != current.dev() || identity.ino() != current.ino() {
+                return Err(RepositoryError::Conflict.into());
+            }
+            Ok(())
+        },
+    )
 }
 
 impl GitRepository {
@@ -260,12 +265,12 @@ impl GitRepository {
         }
         require_native_pinned_catalog_state(&directory, repository_id, key)?;
         let path = directory.descriptor_path().join(CATALOG_DATABASE);
-        let catalog = if write {
-            ControlStore::open_existing_with_key(path, key)?
+        if write {
+            let catalog = ControlStore::open_existing_with_key(path, key)?;
+            operation(&catalog)
         } else {
-            ControlStore::open_existing_read_only_with_key(path, key)?
-        };
-        operation(&catalog)
+            ControlStore::with_preserved_read_only_snapshot(path, &[*key], operation)
+        }
     }
 
     pub fn init(
@@ -2158,6 +2163,180 @@ mod tests {
     }
 
     #[test]
+    fn preserved_catalog_admission_and_discovery_read_live_and_wal_only_state() {
+        for wal_only in [false, true] {
+            for withdrawn in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let pinned = PinnedDirectory::open(root).unwrap();
+                let repository_id = Uuid::new_v4();
+                let area = Uuid::new_v4();
+                let key = [89; 32];
+                let directory = root.join(GIT_CATALOG_DIRECTORY);
+                fs::create_dir(&directory).unwrap();
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(
+                    directory.join(GIT_CATALOG_MARKER_FILE),
+                    git_catalog_marker_bytes(repository_id),
+                )
+                .unwrap();
+                fs::write(root.join("payload"), b"preserved source").unwrap();
+                let path = directory.join(CATALOG_DATABASE);
+                let source = if wal_only {
+                    root.join("writer.db")
+                } else {
+                    path.clone()
+                };
+                let catalog = ControlStore::open_with_key(&source, &key).unwrap();
+                catalog
+                    .put_record(
+                        SOURCE_BACKEND_KIND,
+                        repository_id.as_bytes(),
+                        &mb_core::canonical_bytes(&GitSourceBackendRecord {
+                            format_version: 1,
+                            repository_id,
+                            backend: SourceBackendKind::ReflinkV1,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                catalog
+                    .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                    .unwrap();
+                catalog
+                    .put_record(
+                        mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                        area.as_bytes(),
+                        b"unreadable journal",
+                    )
+                    .unwrap();
+                catalog
+                    .put_record(
+                        if withdrawn {
+                            "git-guarded-prune-intent-v1/test"
+                        } else {
+                            "git-checkout-intent-v1/test"
+                        },
+                        b"pending",
+                        b"blocked intent",
+                    )
+                    .unwrap();
+                let catalog = if wal_only {
+                    fs::copy(&source, &path).unwrap();
+                    fs::copy(root.join("writer.db-wal"), directory.join("catalog.db-wal")).unwrap();
+                    drop(catalog);
+                    None
+                } else {
+                    Some(catalog)
+                };
+                let before = catalog_directory_bytes(&directory);
+                let admission = require_native_catalog_state(root, repository_id, &key);
+                let discovery =
+                    GitRepository::anchor_discovery_jobs(&pinned, repository_id, &key, None);
+                if withdrawn {
+                    assert!(admission.unwrap_err().to_string().contains("withdrawn"));
+                    assert!(discovery.unwrap_err().to_string().contains("withdrawn"));
+                    assert!(
+                        GitRepository::reset_anchor_area_discovery(
+                            &pinned,
+                            repository_id,
+                            &key,
+                            area
+                        )
+                        .is_err()
+                    );
+                    let error = GitRepository::init(root, repository_id, &key)
+                        .err()
+                        .unwrap();
+                    assert!(error.to_string().contains("withdrawn"), "{error}");
+                } else {
+                    admission.unwrap();
+                    let page = discovery.unwrap();
+                    assert_eq!(page.jobs.len(), 1);
+                    assert_eq!(page.jobs[0].area_id, area);
+                    assert_eq!(page.jobs[0].attempt, None);
+                }
+                let mut after = catalog_directory_bytes(&directory);
+                let mut before = before;
+                assert_eq!(
+                    after.keys().collect::<Vec<_>>(),
+                    before.keys().collect::<Vec<_>>()
+                );
+                if !wal_only {
+                    // The writer's in-process Unix SHM mapping can also serve
+                    // this reader. SQLite may update transient read marks.
+                    let name = std::ffi::OsStr::new("catalog.db-shm");
+                    assert_eq!(after[name].0, before[name].0);
+                    after.remove(name);
+                    before.remove(name);
+                }
+                assert_eq!(after, before, "wal_only={wal_only}, withdrawn={withdrawn}");
+                assert_eq!(fs::read(root.join("payload")).unwrap(), b"preserved source");
+                drop(catalog);
+            }
+        }
+    }
+
+    fn catalog_directory_bytes(
+        path: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, (usize, blake3::Hash)> {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let bytes = fs::read(entry.path()).unwrap();
+                (entry.file_name(), (bytes.len(), blake3::hash(&bytes)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn catalog_admission_rejects_incomplete_and_rollback_journals_before_writers() {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let pinned = PinnedDirectory::open(root).unwrap();
+            let repository_id = Uuid::new_v4();
+            let key = [89; 32];
+            let directory = root.join(GIT_CATALOG_DIRECTORY);
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                directory.join(GIT_CATALOG_MARKER_FILE),
+                git_catalog_marker_bytes(repository_id),
+            )
+            .unwrap();
+            let path = directory.join(CATALOG_DATABASE);
+            drop(ControlStore::open_with_key(&path, &key).unwrap());
+            fs::write(
+                directory.join(format!("catalog.db{suffix}")),
+                b"preserved journal",
+            )
+            .unwrap();
+            let before = catalog_directory_bytes(&directory);
+            let error = require_native_catalog_state(root, repository_id, &key).unwrap_err();
+            assert!(
+                error.to_string().contains("incomplete or rollback journal"),
+                "{error:#}"
+            );
+            assert!(
+                GitRepository::anchor_discovery_jobs(&pinned, repository_id, &key, None).is_err()
+            );
+            assert!(
+                GitRepository::reset_anchor_area_discovery(
+                    &pinned,
+                    repository_id,
+                    &key,
+                    Uuid::new_v4()
+                )
+                .is_err()
+            );
+            assert!(GitRepository::init(root, repository_id, &key).is_err());
+            assert_eq!(catalog_directory_bytes(&directory), before);
+        }
+    }
+
+    #[test]
     fn discovery_maintenance_preserves_git_intents_and_rejects_withdrawn_catalogs() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -2201,12 +2380,14 @@ mod tests {
             .unwrap();
         drop(catalog);
         let original = fs::read(&path).unwrap();
+        let original_files = catalog_directory_bytes(&directory);
         let page =
             GitRepository::anchor_discovery_jobs(&pinned, repository_id, &key, None).unwrap();
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].area_id, area);
         assert_eq!(page.jobs[0].attempt, None);
         assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(catalog_directory_bytes(&directory), original_files);
         assert!(
             GitRepository::reset_anchor_area_discovery(&pinned, Uuid::new_v4(), &key, area)
                 .is_err()
@@ -2273,15 +2454,20 @@ mod tests {
             .unwrap();
         drop(catalog);
         let original = fs::read(&database).unwrap();
+        let original_files = catalog_directory_bytes(&catalog_dir);
         require_native_catalog_state(&root, repository_id, &key).unwrap();
         assert_eq!(fs::read(&database).unwrap(), original);
-        let catalog = ControlStore::open_existing_read_only_with_key(&database, &key).unwrap();
-        assert!(
-            catalog
-                .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(catalog_directory_bytes(&catalog_dir), original_files);
+        ControlStore::with_preserved_read_only_snapshot(&database, &[key], |catalog| {
+            assert!(
+                catalog
+                    .get_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())?
+                    .is_none()
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(catalog_directory_bytes(&catalog_dir), original_files);
     }
 
     #[test]
@@ -2343,6 +2529,7 @@ mod tests {
                 .unwrap();
             drop(catalog);
             let original = fs::read(&path).unwrap();
+            let original_files = catalog_directory_bytes(&directory);
             let error = require_native_catalog_state(root, repository_id, &key).unwrap_err();
             assert!(error.to_string().contains("withdrawn"), "{kind}: {error:#}");
             assert_eq!(fs::read(&path).unwrap(), original);
@@ -2352,6 +2539,7 @@ mod tests {
             assert!(error.to_string().contains("withdrawn"), "{kind}: {error}");
             assert_eq!(fs::read(&path).unwrap(), original);
             assert!(!directory.join(GIT_CATALOG_MARKER_FILE).exists());
+            assert_eq!(catalog_directory_bytes(&directory), original_files);
         }
     }
 

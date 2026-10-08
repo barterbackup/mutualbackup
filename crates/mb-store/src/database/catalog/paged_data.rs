@@ -197,7 +197,7 @@ impl ControlStore {
         sector: [u8; 32],
         after: Option<Uuid>,
     ) -> Result<Option<(Uuid, Option<PagedCatalogDataSource>)>, CatalogStoreError> {
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let tx = self.read_snapshot()?;
         let prefix = "catalog-paged-data-source-v1/";
         let cursor = after.map(sources).unwrap_or_default();
         let kind: Option<Option<String>> = tx
@@ -311,7 +311,7 @@ impl ControlStore {
         id: Uuid,
         sector: [u8; 32],
     ) -> Result<Option<PagedCatalogDataSource>, CatalogStoreError> {
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let tx = self.read_snapshot()?;
         let result = read_source(&tx, id, sector)?;
         tx.commit()?;
         Ok(result)

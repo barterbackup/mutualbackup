@@ -53,10 +53,7 @@ use crate::snapshot::{
     resume_restore_publication, retire_revision_anchor_with_recipe_pins, revision_git_backup,
     revision_head_id,
 };
-use crate::volume::{
-    StorageScrubReport, StorageVolumes, VolumeReaderConfig, inspect_control_store,
-    open_control_store,
-};
+use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
 type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
@@ -1245,9 +1242,7 @@ impl Node {
     pub fn open_locked(locked: LockedDataDir, seed: Seed) -> Result<Self> {
         let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
-        if let Some(control) = inspect_control_store(&data_dir, &keys)? {
-            crate::source_policy::require_native_source_state(&control, &keys)?;
-        }
+        crate::source_policy::require_native_source_state_from_catalog(&data_dir, &keys)?;
         let (mut control, control_database_key) = open_control_store(&data_dir, &keys)?;
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;

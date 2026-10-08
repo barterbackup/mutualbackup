@@ -385,7 +385,7 @@ impl ControlStore {
         if id.is_nil() {
             return Err(DatabaseError::Conflict.into());
         }
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let tx = self.read_snapshot()?;
         let payload = read(&tx, id, group, shard)?;
         if payload.is_some() {
             let record = journal::read::<CatalogPagedCheckpointRetention>(&tx, id)?
@@ -523,7 +523,7 @@ impl ControlStore {
         shard: u16,
         root: [u8; 32],
     ) -> Result<bool, CatalogStoreError> {
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let tx = self.read_snapshot()?;
         let pinned = is_pinned(&tx, storage, shard, root)?;
         tx.commit()?;
         Ok(pinned)

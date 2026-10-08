@@ -45,7 +45,7 @@ impl ControlStore {
         &self,
         sector: [u8; 32],
     ) -> Result<Option<PagedCatalogSectorSource>, CatalogStoreError> {
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let tx = self.read_snapshot()?;
         let version = super::super::stored_schema_version(&tx)?;
         if matches!(version, 1..=3 | 5..=9) {
             tx.commit()?;

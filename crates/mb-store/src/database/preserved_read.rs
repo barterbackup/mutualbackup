@@ -4,10 +4,13 @@
 //! This VFS forces read-only file opens and rejects deletion. Existing WALs use
 //! SQLite's read-only shared-memory path. A journal-free catalog can be read as
 //! immutable only while its identity/version and journal absence remain unchanged.
+//! A WAL without shared memory uses SQLite's private heap index, with the same
+//! version guard on both input files instead of shared writer locks.
 
 use std::{
     fs,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    io::Read,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -21,7 +24,9 @@ use super::{
 };
 
 const VFS_NAME: &std::ffi::CStr = c"mutualbackup-preserved-read";
+const PRIVATE_WAL_VFS_NAME: &std::ffi::CStr = c"mutualbackup-preserved-private-wal";
 static PARENT_VFS: OnceLock<usize> = OnceLock::new();
+static PRIVATE_WAL_PARENT_VFS: OnceLock<usize> = OnceLock::new();
 static REGISTERED_VFS: OnceLock<i32> = OnceLock::new();
 
 unsafe extern "C" fn read_only_open(
@@ -31,10 +36,30 @@ unsafe extern "C" fn read_only_open(
     flags: i32,
     out_flags: *mut i32,
 ) -> i32 {
+    unsafe { open_read_only(PARENT_VFS.get(), name, file, flags, out_flags) }
+}
+
+unsafe extern "C" fn private_wal_read_only_open(
+    _vfs: *mut ffi::sqlite3_vfs,
+    name: ffi::sqlite3_filename,
+    file: *mut ffi::sqlite3_file,
+    flags: i32,
+    out_flags: *mut i32,
+) -> i32 {
+    unsafe { open_read_only(PRIVATE_WAL_PARENT_VFS.get(), name, file, flags, out_flags) }
+}
+
+unsafe fn open_read_only(
+    parent: Option<&usize>,
+    name: ffi::sqlite3_filename,
+    file: *mut ffi::sqlite3_file,
+    flags: i32,
+    out_flags: *mut i32,
+) -> i32 {
     if name.is_null() {
         return ffi::SQLITE_READONLY;
     }
-    let Some(parent) = PARENT_VFS.get() else {
+    let Some(parent) = parent else {
         return ffi::SQLITE_IOERR;
     };
     let parent = *parent as *mut ffi::sqlite3_vfs;
@@ -70,28 +95,43 @@ fn register_vfs() -> Result<()> {
             if code != ffi::SQLITE_OK {
                 return code;
             }
-            // Only the built-in Unix VFS has the base-table-only context this
-            // copied adapter uses. An arbitrary default VFS can embed private
-            // state beyond sqlite3_vfs and must not be copied this way.
-            let parent = ffi::sqlite3_vfs_find(c"unix".as_ptr());
-            if parent.is_null() {
-                return ffi::SQLITE_NOTFOUND;
+            // Only built-in Unix VFS tables have the base-table-only context
+            // these copied adapters use. Arbitrary VFS implementations may
+            // embed private state beyond sqlite3_vfs.
+            for (parent_name, name, slot, open) in [
+                (
+                    c"unix",
+                    VFS_NAME,
+                    &PARENT_VFS,
+                    read_only_open as unsafe extern "C" fn(_, _, _, _, _) -> _,
+                ),
+                (
+                    c"unix-none",
+                    PRIVATE_WAL_VFS_NAME,
+                    &PRIVATE_WAL_PARENT_VFS,
+                    private_wal_read_only_open as unsafe extern "C" fn(_, _, _, _, _) -> _,
+                ),
+            ] {
+                let parent = ffi::sqlite3_vfs_find(parent_name.as_ptr());
+                // Never read later fields from an older VFS object.
+                if parent.is_null() || (*parent).iVersion < 3 {
+                    return ffi::SQLITE_NOTFOUND;
+                }
+                if slot.set(parent as usize).is_err() {
+                    return ffi::SQLITE_MISUSE;
+                }
+                let mut vfs = *parent;
+                vfs.iVersion = 3;
+                vfs.pNext = std::ptr::null_mut();
+                vfs.zName = name.as_ptr();
+                vfs.xOpen = Some(open);
+                vfs.xDelete = Some(reject_delete);
+                let code = ffi::sqlite3_vfs_register(Box::into_raw(Box::new(vfs)), 0);
+                if code != ffi::SQLITE_OK {
+                    return code;
+                }
             }
-            // A version-3 VFS guarantees the complete callback-table layout
-            // copied below. Never read later fields from an older VFS object.
-            if (*parent).iVersion < 3 {
-                return ffi::SQLITE_NOTFOUND;
-            }
-            if PARENT_VFS.set(parent as usize).is_err() {
-                return ffi::SQLITE_MISUSE;
-            }
-            let mut vfs = *parent;
-            vfs.iVersion = 3;
-            vfs.pNext = std::ptr::null_mut();
-            vfs.zName = VFS_NAME.as_ptr();
-            vfs.xOpen = Some(read_only_open);
-            vfs.xDelete = Some(reject_delete);
-            ffi::sqlite3_vfs_register(Box::into_raw(Box::new(vfs)), 0)
+            ffi::SQLITE_OK
         }
     });
     ensure!(
@@ -137,6 +177,47 @@ fn journal_paths(path: &Path) -> [PathBuf; 3] {
     })
 }
 
+fn validate_private_wal_header(path: &Path, length: u64) -> Result<()> {
+    // SQLite silently ignores an invalid WAL header. Admission must not treat
+    // that as a complete view of retained history. Frame recovery, including
+    // interrupted transactions/tails, remains SQLite's responsibility.
+    if length == 0 {
+        return Ok(());
+    }
+    let mut header = [0; 32];
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?
+        .read_exact(&mut header)?;
+    let big_word = |bytes: &[u8]| u32::from_be_bytes(bytes.try_into().unwrap());
+    let magic = big_word(&header[..4]);
+    let word = |bytes: &[u8]| {
+        if magic & 1 == 0 {
+            u32::from_le_bytes(bytes.try_into().unwrap())
+        } else {
+            big_word(bytes)
+        }
+    };
+    let mut checksum = [0_u32; 2];
+    for pair in header[..24].as_chunks::<8>().0 {
+        checksum[0] = checksum[0]
+            .wrapping_add(word(&pair[..4]))
+            .wrapping_add(checksum[1]);
+        checksum[1] = checksum[1]
+            .wrapping_add(word(&pair[4..]))
+            .wrapping_add(checksum[0]);
+    }
+    ensure!(
+        magic & !1 == 0x377f_0682
+            && big_word(&header[4..8]) == 3_007_000
+            && big_word(&header[8..12]) == 4096
+            && checksum == [big_word(&header[24..28]), big_word(&header[28..32])],
+        "preserved catalog WAL header is invalid or incompatible; preserve every database/journal file and inspect a separate complete snapshot; see docs/guarded-withdrawal.md"
+    );
+    Ok(())
+}
+
 fn uri(path: &Path, immutable: bool) -> Result<String> {
     let path = std::path::absolute(path)?;
     let mut uri = String::from("file:");
@@ -170,13 +251,22 @@ pub(super) fn inspect<T>(
         .map(|path| version(path))
         .collect::<Result<_>>()?;
     let immutable = journal_versions.iter().all(Option::is_none);
+    let private_wal = journal_versions[0]
+        .as_ref()
+        .is_some_and(|wal| wal.len == 0 || wal.len >= 32)
+        && journal_versions[1].is_none()
+        && journal_versions[2].is_none();
     ensure!(
         immutable
+            || private_wal
             || (journal_versions[0].is_some()
                 && journal_versions[1].is_some()
                 && journal_versions[2].is_none()),
         "preserved catalog has incomplete or rollback journal state; preserve every database/journal file and inspect a separate complete snapshot; see docs/guarded-withdrawal.md"
     );
+    if private_wal {
+        validate_private_wal_header(&journals[0], journal_versions[0].as_ref().unwrap().len)?;
+    }
     let uri = uri(path, immutable)?;
     let mut opened = None;
     let mut last_error = None;
@@ -187,8 +277,20 @@ pub(super) fn inspect<T>(
                 OpenFlags::SQLITE_OPEN_READ_ONLY
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX
                     | OpenFlags::SQLITE_OPEN_URI,
-                VFS_NAME.to_str()?,
+                if private_wal {
+                    PRIVATE_WAL_VFS_NAME
+                } else {
+                    VFS_NAME
+                }
+                .to_str()?,
             )?;
+            if private_wal {
+                // Unlike URI nolock=1 (which disables WAL), this keeps SQLite's
+                // WAL pager enabled and selects its private heap wal-index.
+                // A native exclusive lock requires a writable fd. unix-none
+                // avoids that lock; version guards must protect both files.
+                connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+            }
             let connection = configure_encrypted_connection(connection, key, true)?;
             if meta_value(&connection, "database_kind")?.as_deref() != Some(b"control") {
                 return Err(DatabaseError::IncompatibleSchema.into());
@@ -211,22 +313,25 @@ pub(super) fn inspect<T>(
             Err(error) => last_error = Some(error),
         }
     }
-    let control = match opened {
-        Some(control) => control,
-        None => {
-            return Err(last_error
-                .unwrap_or_else(|| anyhow::anyhow!("no database key supplied"))
-                .context("preserved control catalog rejected available database keys"));
-        }
+    let result = match opened {
+        Some(control) => control.with_read_only_snapshot(|| operation(&control)),
+        None => Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("no database key supplied"))
+            .context("preserved control catalog rejected available database keys")),
     };
-    let result = control.with_read_only_snapshot(|| operation(&control));
-    if immutable {
+    if immutable || private_wal {
         ensure!(
             version(path)?.as_ref() == Some(&before)
                 && journals
                     .iter()
-                    .all(|path| matches!(version(path), Ok(None))),
-            "preserved catalog changed during immutable inspection; stop its writer and retry"
+                    .zip(&journal_versions)
+                    .all(|(path, before)| matches!(version(path), Ok(after) if &after == before)),
+            "preserved catalog changed during {} inspection; stop its writer and retry",
+            if immutable {
+                "immutable"
+            } else {
+                "private WAL"
+            },
         );
     }
     result
@@ -236,6 +341,137 @@ pub(super) fn inspect<T>(
 mod tests {
     use super::*;
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    fn offline_wal_fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let writer = ControlStore::open_with_key(&source, &[7; 32]).unwrap();
+        writer.put_record("root", b"id", b"checkpointed").unwrap();
+        writer
+            .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+            .unwrap();
+        writer.put_record("root", b"id", b"only in WAL").unwrap();
+        let path = temp.path().join("preserved.db");
+        fs::copy(&source, &path).unwrap();
+        fs::copy(&journal_paths(&source)[0], &journal_paths(&path)[0]).unwrap();
+        drop(writer);
+        (temp, path)
+    }
+
+    #[test]
+    fn preserved_wal_without_shared_memory_reads_commits_without_creating_files() {
+        let (_temp, path) = offline_wal_fixture();
+        let wal = journal_paths(&path)[0].clone();
+        // A crash may leave a partial final frame after the last commit.
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .unwrap()
+            .write_all(b"interrupted tail")
+            .unwrap();
+        let before = [fs::read(&path).unwrap(), fs::read(&wal).unwrap()];
+        inspect(&path, &[[8; 32], [7; 32]], |reader| {
+            assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"only in WAL");
+            assert!(reader.put_record("root", b"id", b"changed").is_err());
+            assert!(!journal_paths(&path)[1].exists());
+            assert!(!journal_paths(&path)[2].exists());
+            Ok(())
+        })
+        .unwrap();
+        assert!(inspect(&path, &[[8; 32]], |_| Ok(())).is_err());
+        assert_eq!([fs::read(&path).unwrap(), fs::read(&wal).unwrap()], before);
+        assert!(!journal_paths(&path)[1].exists());
+        assert!(!journal_paths(&path)[2].exists());
+    }
+
+    #[test]
+    fn offline_wal_with_empty_shared_memory_recovers_its_index_without_writing() {
+        let (_temp, path) = offline_wal_fixture();
+        let journals = journal_paths(&path);
+        fs::write(&journals[1], b"").unwrap();
+        let before = [fs::read(&path).unwrap(), fs::read(&journals[0]).unwrap()];
+        inspect(&path, &[[7; 32]], |reader| {
+            assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"only in WAL");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            [fs::read(&path).unwrap(), fs::read(&journals[0]).unwrap()],
+            before
+        );
+        assert_eq!(fs::metadata(&journals[1]).unwrap().len(), 0);
+        assert!(!journals[2].exists());
+    }
+
+    #[test]
+    fn private_wal_inspection_rejects_input_changes_and_new_shared_memory() {
+        for create_shm in [false, true] {
+            let (_temp, path) = offline_wal_fixture();
+            let journals = journal_paths(&path);
+            let result = inspect(&path, &[[7; 32]], |reader| {
+                assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"only in WAL");
+                if create_shm {
+                    fs::write(&journals[1], b"another writer's shared memory")?;
+                } else {
+                    fs::write(&journals[0], b"replaced WAL")?;
+                }
+                Ok("must not return stale inspection")
+            });
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed during private WAL inspection")
+            );
+            assert!(!journals[2].exists());
+        }
+    }
+
+    #[test]
+    fn private_wal_inspection_rejects_corrupt_headers_without_ignoring_history() {
+        for offset in [0, 4, 8, 16, 24] {
+            let (_temp, path) = offline_wal_fixture();
+            let journals = journal_paths(&path);
+            let mut wal = fs::read(&journals[0]).unwrap();
+            wal[offset] ^= 1;
+            fs::write(&journals[0], &wal).unwrap();
+            let main = fs::read(&path).unwrap();
+            let result: Result<()> =
+                inspect(&path, &[[7; 32]], |_| panic!("corrupt WAL was ignored"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("WAL header is invalid")
+            );
+            assert_eq!(fs::read(&path).unwrap(), main);
+            assert_eq!(fs::read(&journals[0]).unwrap(), wal);
+            assert!(!journals[1].exists());
+            assert!(!journals[2].exists());
+        }
+    }
+
+    #[test]
+    fn empty_preserved_wal_uses_main_catalog_without_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let writer = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        writer.put_record("root", b"id", b"checkpointed").unwrap();
+        drop(writer);
+        let main = fs::read(&path).unwrap();
+        let journals = journal_paths(&path);
+        fs::write(&journals[0], b"").unwrap();
+        inspect(&path, &[[7; 32]], |reader| {
+            assert_eq!(reader.get_record("root", b"id")?.unwrap(), b"checkpointed");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), main);
+        assert_eq!(fs::metadata(&journals[0]).unwrap().len(), 0);
+        assert!(!journals[1].exists());
+        assert!(!journals[2].exists());
+    }
 
     #[test]
     fn closed_preserved_snapshot_escapes_raw_uri_names_and_creates_no_journals() {

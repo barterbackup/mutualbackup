@@ -19,6 +19,7 @@ mod anchor_discovery;
 mod catalog;
 #[cfg(target_os = "linux")]
 mod preserved_read;
+mod read_snapshot;
 mod scratch;
 #[cfg(target_os = "linux")]
 mod scratch_space;
@@ -270,6 +271,8 @@ impl ControlStore {
     /// Read preserved control metadata without creating or deleting database
     /// journals. Journal-free catalogs are version-checked immutable reads;
     /// existing WAL/SHM pairs retain SQLite's live read-snapshot behavior.
+    /// A WAL without SHM uses SQLite's private index and version-checks both
+    /// files, rejecting concurrent changes before returning the result.
     #[cfg(target_os = "linux")]
     pub fn with_preserved_read_only_snapshot<T>(
         path: impl AsRef<Path>,

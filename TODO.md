@@ -618,6 +618,41 @@ remain active.
     ownership changes, no-creation qualification for other catalog readers,
     incomplete-journal recovery, retained conversion,
     upgrade/source-loss and the remaining M6 release gates remain open.
+  - [x] Qualify non-creating Linux Node/Git catalog admission and Git discovery
+    listing with native WAL crash compatibility. These readers now use the
+    preserved SQLite snapshot before catalog migration, key publication or
+    replay. A WAL without SHM uses SQLite's private heap index after validating
+    its header; main/WAL versions and sidecar absence must remain unchanged
+    before returning. Empty WALs and interrupted transaction tails are supported;
+    partial/corrupt headers, SHM-only and rollback state reject without repair.
+    Existing complete WAL/SHM pairs keep live read snapshots; SQLite can update
+    transient read marks in an existing writer's shared in-process mapping.
+    Regression fixtures cover wrapped/legacy/interrupted-rekey keys, withdrawn
+    rows committed only to WAL, native restart, unchanged original file sets,
+    wrong keys, header corruption and changes during inspection. Broader checks
+    exposed nested catalog read transactions while native metadata was rendered
+    during admission. Catalog readers now reuse the enclosing read-only snapshot
+    without committing or rolling it back; ordinary writer nesting checks remain.
+    A fast signed native-header fixture and snapshot lifecycle/error-unwind
+    regression cover that correction. Qualification passes 961 unique cases:
+    474 ordinary Node, 288 store, 102 Git and 19 CLI process tests; all 64
+    provisioned Git cases, 11 native Node cases, extent sharing/prune, the
+    stock-Git bridge and raw Unix CLI/daemon/Git paths. All four debug programs
+    build, formatting and strict locked workspace/all-targets Clippy pass, and
+    all 284 source-file and ten program/test-driver hashes remain unchanged.
+    The packed-checkpoint native case exceeded an initial 900-second harness
+    cap after its third retention checkpoint. Its failed-attempt evidence is
+    retained separately; the unfinished cases pass against the same frozen
+    inputs with a 2,400-second outer cap for that case and unchanged application
+    phase deadlines. Mount, loop and image cleanup is verified. Evidence and
+    the distinct passing-case inventory are retained under
+    `/tmp/mb-m6-admission-validation-m6aad954`; the post-commit audit binds the
+    qualified code to the commit. Eleven Node, 26 store and two CLI process
+    fixtures remain unexecuted. This qualifies debug source, not an installed
+    artifact or the full R1 gate. Data-directory lock creation and permission
+    adjustment still precede admission; other legacy/payload readers,
+    full journal recovery, atomic admission-to-writer handoff, common WAL-index
+    resource budgets and full R1/R2/R3/release gates remain open.
   - [x] Include available selected-peer checkpoint history in `legacy-list`
     with repeatable `--peer NODE-ID=MULTIADDR`. The preserved signed genesis binds
     guild/origin; head/page hashes, canonical encoding, quorum and exact parent

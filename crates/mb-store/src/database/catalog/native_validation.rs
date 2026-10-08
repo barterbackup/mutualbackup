@@ -436,8 +436,7 @@ impl ControlStore {
         id: Uuid,
         expected_scope: CatalogScope,
     ) -> Result<Option<(CatalogNativeValidation, CatalogBundleState)>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let snapshot = native_snapshot(&transaction, id, expected_scope)?;
         transaction.commit()?;
         Ok(snapshot)
@@ -651,8 +650,7 @@ impl ControlStore {
         id: Uuid,
         sector: SectorId,
     ) -> Result<Option<CatalogSectorRecord>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         require_verified(&transaction, id)?;
         let record = bounded_record(
             &transaction,
@@ -677,8 +675,7 @@ impl ControlStore {
         id: Uuid,
         group: u64,
     ) -> Result<Option<CatalogValidatedLink>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let validation = require_verified(&transaction, id)?;
         let record = read_link(&transaction, id, group)?;
         if record.as_ref().is_some_and(|record| {

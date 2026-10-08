@@ -267,8 +267,7 @@ impl ControlStore {
         &self,
         id: Uuid,
     ) -> Result<Option<(CatalogBundle, CatalogBundleState)>, CatalogStoreError> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let transaction = self.read_snapshot()?;
         let snapshot = bundle_snapshot(&transaction, id)?;
         transaction.commit()?;
         Ok(snapshot)

@@ -238,15 +238,47 @@ Sixty-four Git, 26 store and three CLI process fixtures remain ignored. These
 results qualify the exercised source; installed releases, complete ownership
 inventory, retained conversion and the full M6 release gates remain open.
 
-Inventory opens forbid database/journal creation and deletion. A catalog with no
+Preserved catalog opens forbid database/journal creation and deletion. A catalog with no
 journal files uses an immutable read only while its file identity, size, mtime,
 ctime and journal absence remain unchanged; a concurrent change fails the whole
-inventory. Existing WAL/SHM pairs use SQLite read snapshots without checkpointing
-the original database or WAL. Incomplete WAL/SHM pairs and rollback journals are
-rejected before SQLite opens them. Preserve all files from that installation and
+inspection. Existing WAL/SHM pairs use SQLite read snapshots without checkpointing
+the original database or WAL; an existing writer's shared mapping may update
+transient read marks. A WAL without SHM uses SQLite's private in-memory index,
+after checking the WAL header's format, page size and checksum. Both database and
+WAL versions and the absence of SHM/rollback journals must remain unchanged until
+inspection finishes. SQLite recovers committed frames and ignores an interrupted
+transaction tail without writing an index beside the original. Empty WALs are
+accepted. Partial or corrupt headers in WAL-only inputs, SHM without WAL and
+rollback journals are rejected before SQLite opens them. Preserve all files from that installation and
 inspect a separate complete snapshot; never delete or checkpoint its original
-journals to make an inventory succeed. These stricter opens apply to `legacy-list`
-and placement preflight. The catalog reader used for export payload recovery and
+journals to make an inspection succeed. These stricter opens apply to `legacy-list`,
+placement preflight, Linux Node catalog admission, Git catalog admission and
+Git discovery listing. Catalog read operations reuse an enclosing read-only
+snapshot without committing or rolling it back, including metadata rendering
+during native admission.
+
+The admission/WAL increment was qualified on Linux on 2026-10-08 with 961 unique
+passing cases: 474 ordinary Node, 288 store, 102 Git and 19 CLI process tests;
+all 64 provisioned Git cases, 11 native Node cases, extent sharing/prune, the
+stock-Git bridge and raw Unix CLI/daemon/Git paths. Native checks include
+signed-history pruning/reopen and format-7 packed checkpoint retention, obsolete
+coding-group retirement and two independent seed-only recoveries. All four debug
+programs build; formatting and strict locked workspace/all-targets Clippy pass.
+The 284 source files and ten program/test drivers keep their hashes through
+qualification. The packed-checkpoint case exceeded an initial 900-second outer
+harness cap; its log and failed-attempt evidence remain separate. Unfinished
+checks passed on unchanged inputs with a 2,400-second outer cap for that case
+and unchanged application phase deadlines. Mount, loop and image cleanup is
+verified. Evidence, frozen manifests and the distinct passing-case inventory
+are retained under `/tmp/mb-m6-admission-validation-m6aad954`; the post-commit
+audit binds the qualified code to its commit. Eleven Node, 26 store and two CLI
+process fixtures remain unexecuted. This qualifies the exercised debug source;
+installed artifacts and the full M6 gates remain open.
+
+The Node data-directory lock and permission adjustment still precede catalog
+admission; this does not yet establish rejection before every filesystem mutation.
+The private WAL index uses memory proportional to its frame count; common R2/R3
+metadata/resource budgets remain open. The catalog reader used for export payload recovery and
 other legacy readers still require separate no-creation qualification under R1.
 
 The report's `signed_format` describes the public revision format, not private

@@ -567,7 +567,7 @@ impl ControlStore {
     ) -> Result<Vec<u8>, CatalogStoreError> {
         reference.validate()?;
         scope.validate(section)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.read_snapshot()?;
         let bytes = read_page(
             &transaction,
             PageMetadata {
