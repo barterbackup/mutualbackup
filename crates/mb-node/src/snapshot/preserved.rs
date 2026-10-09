@@ -569,7 +569,7 @@ mod tests {
             let before_wal = fs::read(database.with_extension("db-wal")).ok();
             let report =
                 crate::inventory_withdrawn_revisions_from_catalog(&keys, area.path()).unwrap();
-            assert_eq!(report.format_version, 16);
+            assert_eq!(report.format_version, 17);
             assert!(!report.retained_history_complete);
             let entries = &report.local_state.local_sectors;
             assert_eq!(entries.len(), fixtures.len());

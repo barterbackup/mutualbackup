@@ -264,6 +264,7 @@ pub enum PreservedGitRecord {
     WorktreeRemovalIntent(Box<crate::worktree::PreservedWorktreeRemoval>),
     FetchIntent(Box<crate::fetch::PreservedFetchIntent>),
     MergeSession(Box<crate::merge::PreservedMergeSession>),
+    CheckoutIntent(Box<crate::checkout::PreservedCheckoutIntent>),
     MergeBlobIntent(Box<crate::merge::PreservedMergeBlob>),
     BlobImportIntent {
         repository_id: Uuid,
@@ -338,6 +339,7 @@ impl GitRepository {
             crate::worktree::for_each_preserved_removal(catalog, repository_id, &mut visit)?;
             crate::fetch::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::merge::for_each_preserved_record(catalog, repository_id, &mut visit)?;
+            crate::checkout::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, &mut visit)?;
             crate::history::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::head::for_each_preserved_branch(catalog, repository_id, visit)

@@ -315,6 +315,744 @@ struct CheckoutIntentV11 {
     old_index_hash: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreservedCheckoutPhase {
+    Preparing,
+    Applying,
+    Cleanup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreservedNativeContentRoot {
+    pub logical_len: u64,
+    pub content_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedCheckoutFile {
+    pub oid: [u8; 20],
+    pub mode: u32,
+    pub anchor_id: Uuid,
+    pub native_root: Option<PreservedNativeContentRoot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedCheckoutEntry {
+    pub path: Vec<u8>,
+    pub old: Option<PreservedCheckoutFile>,
+    pub old_id: Option<NativeFileId>,
+    pub new: Option<PreservedCheckoutFile>,
+    pub new_id: Option<NativeFileId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedCheckoutDirectory {
+    pub path: Vec<u8>,
+    pub staged_id: Option<NativeFileId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedCheckoutRemovedDirectory {
+    pub path: Vec<u8>,
+    pub old_id: NativeFileId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreservedCheckoutIntent {
+    pub scope: GitWorktreeScope,
+    pub record_format: u16,
+    pub envelope_format: Option<u16>,
+    /// Original primary journals did not record a root directory identity.
+    pub recorded_root_identity: Option<NativeFileId>,
+    pub advance_ref: bool,
+    pub target_ref: Option<Vec<u8>>,
+    pub old_branch: String,
+    pub old_oid: [u8; 20],
+    pub new_branch: String,
+    pub new_oid: [u8; 20],
+    pub staging_name: String,
+    pub staging_id: Option<NativeFileId>,
+    pub phase: PreservedCheckoutPhase,
+    pub entries: Vec<PreservedCheckoutEntry>,
+    pub directories: Vec<PreservedCheckoutDirectory>,
+    pub removed_directories: Vec<PreservedCheckoutRemovedDirectory>,
+    pub selected_paths: Vec<Vec<u8>>,
+    pub target_index: Vec<(Vec<u8>, GitIndexEntry)>,
+    pub old_index_hash: Option<[u8; 32]>,
+}
+
+/// Decode every original checkout/restore/reset journal without touching the
+/// worktree, staged files, refs, index or anchors. Version-specific layouts and
+/// separately serialized native roots stay intact.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_preserved_record(
+    control: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(crate::PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    for prefix in [INTENT_PREFIX, WORKTREE_INTENT_PREFIX] {
+        control.for_each_record_with_kind_prefix_bounded(
+            prefix,
+            512,
+            INTENT_KEY.len(),
+            mb_core::V1_MAX_CATALOG_BYTES,
+            |kind, key, bytes| {
+                let scope = GitWorktreeScope::preserved_from_kind(
+                    kind,
+                    repository_id,
+                    INTENT_PREFIX,
+                    WORKTREE_INTENT_PREFIX,
+                )?;
+                ensure!(key == INTENT_KEY, "invalid preserved Git checkout key");
+                let (intent, root, envelope_format) = if scope.worktree_id() == repository_id {
+                    (decode_intent(bytes, repository_id)?, None, None)
+                } else {
+                    match bytes.first().copied() {
+                        Some(1) => {
+                            let wrapper: LinkedCheckoutIntent = decode_canonical(bytes)?;
+                            ensure!(
+                                wrapper.format_version == 1
+                                    && wrapper.worktree_id == scope.worktree_id(),
+                                "invalid preserved linked checkout identity"
+                            );
+                            (wrapper.checkout, Some(wrapper.root_id), Some(1))
+                        }
+                        Some(2) => {
+                            let wrapper: LinkedCheckoutIntentV2 = decode_canonical(bytes)?;
+                            ensure!(
+                                wrapper.format_version == 2
+                                    && wrapper.worktree_id == scope.worktree_id(),
+                                "invalid preserved linked restore identity"
+                            );
+                            (
+                                wrapper.checkout.into_intent()?,
+                                Some(wrapper.root_id),
+                                Some(2),
+                            )
+                        }
+                        Some(3) => {
+                            let wrapper: LinkedCheckoutIntentV3 = decode_canonical(bytes)?;
+                            ensure!(
+                                wrapper.format_version == 3
+                                    && wrapper.worktree_id == scope.worktree_id(),
+                                "invalid preserved linked partial reset identity"
+                            );
+                            (
+                                wrapper.checkout.into_intent()?,
+                                Some(wrapper.root_id),
+                                Some(3),
+                            )
+                        }
+                        _ => anyhow::bail!("invalid preserved linked checkout envelope"),
+                    }
+                };
+                validate_intent(&intent, repository_id)?;
+                let identity = |id: NativeFileId| {
+                    ensure!(
+                        id.filesystem_id != 0 && id.inode != 0,
+                        "invalid preserved checkout filesystem identity"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                };
+                for id in root.into_iter().chain(intent.staging_id) {
+                    identity(id)?;
+                }
+                // Re-encoding through the original versioned writer also rejects
+                // a linked envelope incompatible with its embedded format.
+                let encoded = encode_intent_for_scope(
+                    scope,
+                    root.unwrap_or(NativeFileId {
+                        filesystem_id: 0,
+                        inode: 0,
+                    }),
+                    &intent,
+                )?;
+                ensure!(encoded == bytes, "noncanonical preserved checkout layout");
+                let path = |path: &[u8]| {
+                    ensure!(!path.contains(&0), "invalid preserved checkout path");
+                    relative_path(path)?;
+                    Ok::<_, anyhow::Error>(())
+                };
+                for entry in &intent.entries {
+                    path(&entry.path)?;
+                    for id in entry.old_id.into_iter().chain(entry.new_id) {
+                        identity(id)?;
+                    }
+                    for file in entry.old.iter().chain(&entry.new) {
+                        ensure!(
+                            matches!(file.mode, 0o100644 | 0o100755 | 0o120000),
+                            "invalid preserved checkout file mode"
+                        );
+                    }
+                    if let Some(file) = &entry.new {
+                        ensure!(
+                            !file.anchor_id.is_nil(),
+                            "missing preserved checkout target anchor"
+                        );
+                    }
+                }
+                for directory in &intent.directories {
+                    path(&directory.path)?;
+                    if let Some(id) = directory.staged_id {
+                        identity(id)?;
+                    }
+                }
+                for directory in &intent.removed_directories {
+                    path(&directory.path)?;
+                    identity(directory.old_id)?;
+                }
+                for selected in &intent.selected_paths {
+                    path(selected)?;
+                }
+                for (selected, entry) in &intent.target_index {
+                    path(selected)?;
+                    ensure!(
+                        !entry.anchor_id.is_nil(),
+                        "missing preserved reset index anchor"
+                    );
+                }
+                let file = |file: CheckoutFile| PreservedCheckoutFile {
+                    oid: file.oid,
+                    mode: file.mode,
+                    anchor_id: file.anchor_id,
+                    native_root: file.native_root.map(|root| PreservedNativeContentRoot {
+                        logical_len: root.logical_len,
+                        content_hash: root.content_hash,
+                    }),
+                };
+                let record = PreservedCheckoutIntent {
+                    scope,
+                    record_format: intent.format_version,
+                    envelope_format,
+                    recorded_root_identity: root,
+                    advance_ref: intent.advance_ref,
+                    target_ref: intent.target_ref,
+                    old_branch: intent.old_branch,
+                    old_oid: intent.old_oid,
+                    new_branch: intent.new_branch,
+                    new_oid: intent.new_oid,
+                    staging_name: intent.staging_name,
+                    staging_id: intent.staging_id,
+                    phase: match intent.phase {
+                        Phase::Preparing => PreservedCheckoutPhase::Preparing,
+                        Phase::Applying => PreservedCheckoutPhase::Applying,
+                        Phase::Cleanup => PreservedCheckoutPhase::Cleanup,
+                    },
+                    entries: intent
+                        .entries
+                        .into_iter()
+                        .map(|entry| PreservedCheckoutEntry {
+                            path: entry.path,
+                            old: entry.old.map(file),
+                            old_id: entry.old_id,
+                            new: entry.new.map(file),
+                            new_id: entry.new_id,
+                        })
+                        .collect(),
+                    directories: intent
+                        .directories
+                        .into_iter()
+                        .map(|entry| PreservedCheckoutDirectory {
+                            path: entry.path,
+                            staged_id: entry.staged_id,
+                        })
+                        .collect(),
+                    removed_directories: intent
+                        .removed_directories
+                        .into_iter()
+                        .map(|entry| PreservedCheckoutRemovedDirectory {
+                            path: entry.path,
+                            old_id: entry.old_id,
+                        })
+                        .collect(),
+                    selected_paths: intent.selected_paths,
+                    target_index: intent.target_index,
+                    old_index_hash: intent.old_index_hash,
+                };
+                visit(crate::PreservedGitRecord::CheckoutIntent(Box::new(record)))?;
+                Ok(true)
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod preserved_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn preserved_checkout_versions_keep_original_native_roots_indexes_and_directory_owners_without_replay()
+     {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("catalog.db");
+        let control = ControlStore::open_with_key(&database, &[253; 32]).unwrap();
+        let repository_id = Uuid::from_u128(259);
+        let scopes = [
+            GitWorktreeScope::primary(repository_id),
+            GitWorktreeScope::linked(repository_id, Uuid::from_u128(260)).unwrap(),
+        ];
+        let identity = NativeFileId {
+            filesystem_id: 7,
+            inode: 8,
+        };
+        let make = |format| {
+            let unchanged = matches!(format, 7..=11);
+            let advance = matches!(format, 3 | 4 | 6);
+            let file = |anchor_id| CheckoutFile {
+                oid: [3; 20],
+                mode: 0o100644,
+                anchor_id,
+                native_root: None,
+            };
+            let mut old = file(Uuid::from_u128(261));
+            if matches!(format, 9..=11) {
+                old.anchor_id = Uuid::nil();
+                old.native_root = Some(NativeContentRoot {
+                    logical_len: 17,
+                    content_hash: [4; 32],
+                });
+            }
+            let new = file(Uuid::from_u128(262));
+            let path = b"dir/file-\xff".to_vec();
+            CheckoutIntent {
+                format_version: format,
+                advance_ref: advance,
+                target_ref: match format {
+                    4 => Some(b"refs/heads/source".to_vec()),
+                    6 => Some(b"refs/remotes/origin/source".to_vec()),
+                    _ => None,
+                },
+                repository_id,
+                old_branch: "main".into(),
+                old_oid: if format == 5 { [0; 20] } else { [1; 20] },
+                new_branch: if unchanged || advance {
+                    "main".into()
+                } else {
+                    "topic".into()
+                },
+                new_oid: if unchanged { [1; 20] } else { [2; 20] },
+                staging_name: format!("checkout-{}", Uuid::from_u128(263)),
+                staging_id: None,
+                phase: Phase::Preparing,
+                entries: vec![CheckoutEntry {
+                    path: path.clone(),
+                    old: Some(old),
+                    old_id: Some(identity),
+                    new: Some(new),
+                    new_id: None,
+                }],
+                directories: if format == 1 {
+                    Vec::new()
+                } else {
+                    vec![CheckoutDirectory {
+                        path: b"dir".to_vec(),
+                        staged_id: None,
+                    }]
+                },
+                removed_directories: if format == 1 {
+                    Vec::new()
+                } else {
+                    vec![CheckoutRemovedDirectory {
+                        path: b"removed".to_vec(),
+                        old_id: identity,
+                    }]
+                },
+                selected_paths: if format == 11 {
+                    vec![path.clone()]
+                } else {
+                    Vec::new()
+                },
+                target_index: if format == 11 {
+                    vec![(
+                        path,
+                        GitIndexEntry {
+                            format_version: 1,
+                            oid: [3; 20],
+                            mode: 0o100644,
+                            anchor_id: Uuid::from_u128(262),
+                        },
+                    )]
+                } else {
+                    Vec::new()
+                },
+                old_index_hash: (format == 11).then_some([5; 32]),
+            }
+        };
+        // Independent original positional fields, including native roots that
+        // the in-memory CheckoutIntent deliberately skips during serialization.
+        let original = |intent: &CheckoutIntent| match intent.format_version {
+            1 => canonical_bytes(&(
+                intent.format_version,
+                intent.repository_id,
+                &intent.old_branch,
+                intent.old_oid,
+                &intent.new_branch,
+                intent.new_oid,
+                &intent.staging_name,
+                intent.staging_id,
+                intent.phase,
+                &intent.entries,
+            ))
+            .unwrap(),
+            2 => canonical_bytes(&(
+                intent.format_version,
+                intent.repository_id,
+                &intent.old_branch,
+                intent.old_oid,
+                &intent.new_branch,
+                intent.new_oid,
+                &intent.staging_name,
+                intent.staging_id,
+                intent.phase,
+                &intent.entries,
+                &intent.directories,
+                &intent.removed_directories,
+            ))
+            .unwrap(),
+            3 => canonical_bytes(&(
+                intent.format_version,
+                intent.advance_ref,
+                intent.repository_id,
+                &intent.old_branch,
+                intent.old_oid,
+                &intent.new_branch,
+                intent.new_oid,
+                &intent.staging_name,
+                intent.staging_id,
+                intent.phase,
+                &intent.entries,
+                &intent.directories,
+                &intent.removed_directories,
+            ))
+            .unwrap(),
+            4..=8 => canonical_bytes(&(
+                intent.format_version,
+                intent.advance_ref,
+                &intent.target_ref,
+                intent.repository_id,
+                &intent.old_branch,
+                intent.old_oid,
+                &intent.new_branch,
+                intent.new_oid,
+                &intent.staging_name,
+                intent.staging_id,
+                intent.phase,
+                &intent.entries,
+                &intent.directories,
+                &intent.removed_directories,
+            ))
+            .unwrap(),
+            9 | 10 => {
+                let roots = intent
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.old.as_ref().and_then(|old| {
+                            old.native_root.map(|root| {
+                                (entry.path.clone(), (root.logical_len, root.content_hash))
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                canonical_bytes(&(
+                    intent.format_version,
+                    intent.advance_ref,
+                    &intent.target_ref,
+                    intent.repository_id,
+                    &intent.old_branch,
+                    intent.old_oid,
+                    &intent.new_branch,
+                    intent.new_oid,
+                    &intent.staging_name,
+                    intent.staging_id,
+                    intent.phase,
+                    &intent.entries,
+                    &intent.directories,
+                    &intent.removed_directories,
+                    roots,
+                ))
+                .unwrap()
+            }
+            11 => canonical_bytes(&(
+                11_u16,
+                CheckoutIntentV9::from_intent(intent),
+                &intent.selected_paths,
+                &intent.target_index,
+                intent.old_index_hash.unwrap(),
+            ))
+            .unwrap(),
+            _ => panic!("unsupported original fixture"),
+        };
+        let snapshot = || {
+            [database.clone(), database.with_extension("db-wal")].map(|path| fs::read(path).ok())
+        };
+        for format in 1..=11 {
+            let intent = make(format);
+            let bytes = original(&intent);
+            assert_eq!(encode_intent(&intent).unwrap(), bytes);
+            assert_eq!(decode_intent(&bytes, repository_id).unwrap(), intent);
+            for scope in scopes {
+                let bytes = if scope == scopes[0] {
+                    bytes.clone()
+                } else {
+                    match format {
+                        9 | 10 => canonical_bytes(&(
+                            2_u16,
+                            scope.worktree_id(),
+                            identity,
+                            CheckoutIntentV9::from_intent(&intent),
+                        ))
+                        .unwrap(),
+                        11 => canonical_bytes(&(
+                            3_u16,
+                            scope.worktree_id(),
+                            identity,
+                            CheckoutIntentV11::from_intent(&intent).unwrap(),
+                        ))
+                        .unwrap(),
+                        _ => canonical_bytes(&(1_u16, scope.worktree_id(), identity, &intent))
+                            .unwrap(),
+                    }
+                };
+                assert_eq!(
+                    encode_intent_for_scope(scope, identity, &intent).unwrap(),
+                    bytes
+                );
+                let kind = intent_kind_for_scope(scope);
+                control.put_record(&kind, INTENT_KEY, &bytes).unwrap();
+                let before = snapshot();
+                let mut seen = false;
+                for_each_preserved_record(&control, repository_id, |record| {
+                    let crate::PreservedGitRecord::CheckoutIntent(actual) = record else {
+                        panic!("wrong record")
+                    };
+                    assert_eq!(actual.scope, scope);
+                    assert_eq!(actual.record_format, format);
+                    assert_eq!(
+                        actual.recorded_root_identity,
+                        (scope == scopes[1]).then_some(identity)
+                    );
+                    assert_eq!(
+                        actual.envelope_format,
+                        (scope == scopes[1]).then_some(if format == 11 {
+                            3
+                        } else if format >= 9 {
+                            2
+                        } else {
+                            1
+                        })
+                    );
+                    assert_eq!(actual.phase, PreservedCheckoutPhase::Preparing);
+                    assert_eq!(actual.advance_ref, intent.advance_ref);
+                    assert_eq!(actual.target_ref, intent.target_ref);
+                    assert_eq!(actual.old_branch, intent.old_branch);
+                    assert_eq!(actual.new_branch, intent.new_branch);
+                    assert_eq!(actual.old_oid, intent.old_oid);
+                    assert_eq!(actual.new_oid, intent.new_oid);
+                    assert_eq!(actual.entries[0].path, intent.entries[0].path);
+                    assert_eq!(actual.entries[0].old_id, Some(identity));
+                    assert_eq!(actual.entries[0].new_id, None);
+                    let old = actual.entries[0].old.as_ref().unwrap();
+                    assert_eq!(
+                        old.anchor_id,
+                        intent.entries[0].old.as_ref().unwrap().anchor_id
+                    );
+                    assert_eq!(
+                        old.native_root,
+                        if format >= 9 {
+                            Some(PreservedNativeContentRoot {
+                                logical_len: 17,
+                                content_hash: [4; 32],
+                            })
+                        } else {
+                            None
+                        }
+                    );
+                    assert_eq!(actual.directories.len(), usize::from(format != 1));
+                    assert_eq!(actual.removed_directories.len(), usize::from(format != 1));
+                    assert_eq!(actual.selected_paths, intent.selected_paths);
+                    assert_eq!(actual.target_index, intent.target_index);
+                    assert_eq!(actual.old_index_hash, intent.old_index_hash);
+                    seen = true;
+                    Ok(())
+                })
+                .unwrap();
+                assert!(seen);
+                assert_eq!(snapshot(), before);
+                control.delete_record(&kind, INTENT_KEY).unwrap();
+            }
+        }
+        for phase in [Phase::Applying, Phase::Cleanup] {
+            let mut intent = make(11);
+            intent.phase = phase;
+            intent.staging_id = Some(identity);
+            intent.entries[0].new_id = Some(identity);
+            intent.directories[0].staged_id = Some(identity);
+            control
+                .put_record(
+                    &intent_kind_for_scope(scopes[0]),
+                    INTENT_KEY,
+                    &original(&intent),
+                )
+                .unwrap();
+            for_each_preserved_record(&control, repository_id, |record| {
+                let crate::PreservedGitRecord::CheckoutIntent(actual) = record else {
+                    panic!("wrong record")
+                };
+                assert_eq!(actual.staging_id, Some(identity));
+                assert_eq!(actual.directories[0].staged_id, Some(identity));
+                assert_eq!(
+                    actual.phase,
+                    if phase == Phase::Applying {
+                        PreservedCheckoutPhase::Applying
+                    } else {
+                        PreservedCheckoutPhase::Cleanup
+                    }
+                );
+                Ok(())
+            })
+            .unwrap();
+            control
+                .delete_record(&intent_kind_for_scope(scopes[0]), INTENT_KEY)
+                .unwrap();
+        }
+        let reject = |kind: &str, key: &[u8], bytes: &[u8]| {
+            control.put_record(kind, key, bytes).unwrap();
+            let before = snapshot();
+            assert!(for_each_preserved_record(&control, repository_id, |_| Ok(())).is_err());
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, key).unwrap();
+        };
+        let valid = make(8);
+        let kind = intent_kind_for_scope(scopes[0]);
+        for index in 0..12 {
+            let mut bad = valid.clone();
+            match index {
+                0 => bad.repository_id = Uuid::nil(),
+                1 => bad.advance_ref = true,
+                2 => bad.staging_name = "unsafe".into(),
+                3 => bad.entries[0].path = b"bad\0path".to_vec(),
+                4 => bad.entries[0].old_id = None,
+                5 => {
+                    bad.entries[0].old_id = Some(NativeFileId {
+                        filesystem_id: 0,
+                        inode: 8,
+                    })
+                }
+                6 => bad.entries[0].new.as_mut().unwrap().anchor_id = Uuid::nil(),
+                7 => bad.entries[0].new.as_mut().unwrap().mode = 0o040000,
+                8 => bad.entries[0].path = b"../escape".to_vec(),
+                9 => bad.phase = Phase::Applying,
+                10 => bad.entries.push(bad.entries[0].clone()),
+                _ => bad.directories.push(bad.directories[0].clone()),
+            }
+            reject(&kind, INTENT_KEY, &canonical_bytes(&bad).unwrap());
+        }
+        for family in 0..5 {
+            for count in [MAX_CHECKOUT_FILES, MAX_CHECKOUT_FILES + 1] {
+                let mut bounded = make(if family >= 3 { 11 } else { 8 });
+                match family {
+                    0 => {
+                        bounded.entries = (0..count)
+                            .map(|index| {
+                                let mut entry = bounded.entries[0].clone();
+                                entry.path = format!("file-{index:05}").into_bytes();
+                                entry
+                            })
+                            .collect()
+                    }
+                    1 => {
+                        bounded.directories = (0..count)
+                            .map(|index| CheckoutDirectory {
+                                path: format!("dir-{index:05}").into_bytes(),
+                                staged_id: None,
+                            })
+                            .collect()
+                    }
+                    2 => {
+                        bounded.removed_directories = (0..count)
+                            .map(|index| CheckoutRemovedDirectory {
+                                path: format!("dir-{index:05}").into_bytes(),
+                                old_id: identity,
+                            })
+                            .collect()
+                    }
+                    3 => {
+                        bounded.selected_paths = (0..count)
+                            .map(|index| format!("file-{index:05}").into_bytes())
+                            .collect()
+                    }
+                    _ => {
+                        bounded.target_index = (0..count)
+                            .map(|index| {
+                                (
+                                    format!("file-{index:05}").into_bytes(),
+                                    bounded.target_index[0].1.clone(),
+                                )
+                            })
+                            .collect()
+                    }
+                }
+                let bytes = original(&bounded);
+                control.put_record(&kind, INTENT_KEY, &bytes).unwrap();
+                let before = snapshot();
+                assert_eq!(
+                    for_each_preserved_record(&control, repository_id, |_| Ok(())).is_ok(),
+                    count == MAX_CHECKOUT_FILES
+                );
+                assert_eq!(snapshot(), before);
+                control.delete_record(&kind, INTENT_KEY).unwrap();
+            }
+        }
+        for length in [
+            crate::stage::MAX_STAGE_PATH_BYTES,
+            crate::stage::MAX_STAGE_PATH_BYTES + 1,
+        ] {
+            let mut bounded = valid.clone();
+            bounded.entries[0].path = vec![b'a'; length];
+            control
+                .put_record(&kind, INTENT_KEY, &original(&bounded))
+                .unwrap();
+            assert_eq!(
+                for_each_preserved_record(&control, repository_id, |_| Ok(())).is_ok(),
+                length == crate::stage::MAX_STAGE_PATH_BYTES
+            );
+            control.delete_record(&kind, INTENT_KEY).unwrap();
+        }
+        let bytes = original(&valid);
+        reject(&kind, b"wrong", &bytes);
+        reject(&kind, INTENT_KEY, &[bytes, vec![0]].concat());
+        reject(
+            &kind,
+            INTENT_KEY,
+            &vec![0; mb_core::V1_MAX_CATALOG_BYTES + 1],
+        );
+        reject(
+            &intent_kind_for_scope(scopes[1]),
+            INTENT_KEY,
+            &canonical_bytes(&(1_u16, Uuid::from_u128(999), identity, &valid)).unwrap(),
+        );
+        reject(
+            &intent_kind_for_scope(scopes[1]),
+            INTENT_KEY,
+            &canonical_bytes(&(
+                1_u16,
+                scopes[1].worktree_id(),
+                NativeFileId {
+                    filesystem_id: 7,
+                    inode: 0,
+                },
+                &valid,
+            ))
+            .unwrap(),
+        );
+        assert!(!temporary.path().join(&valid.staging_name).exists());
+    }
+}
+
 struct CheckoutTarget<'a> {
     old_branch: &'a str,
     old_oid: Option<Oid>,

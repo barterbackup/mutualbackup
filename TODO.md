@@ -781,6 +781,45 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Inventory original checkout, restore and reset ownership journals.
+    `legacy-list` format 17 inventories original checkout/restore/reset
+    versions 1 through 11 and linked-worktree envelopes 1 through 3. Pure
+    version-specific decoders and original writers preserve canonical
+    positional layouts, including separately serialized old native-content
+    roots and version-11 selected paths, target index and prior-index digest.
+    Reports retain original branch/ref/commit selection,
+    preparing/applying/cleanup phase, staging name/identity, every old/new
+    file OID/mode/anchor/identity, staged and removed directory identities,
+    native length/hash and linked root identity. Primary journals never
+    recorded a root directory ID and keep it absent; older unanchored files
+    without native roots remain unverified. Original 8,192-entry family and
+    4,096-byte path limits, 32 MiB rows, canonical scopes/keys/envelopes,
+    nonzero recorded identities and file/index shapes validate before report
+    or placement. Every projected nested item shares the complete report
+    limit. No worktree, staged file or anchor is opened and no checkout,
+    index/ref update, restore or reset is replayed. Placement excludes
+    recorded linked roots, staging directories and staged/removed
+    child-directory identities after rename or relocation, including both
+    filesystem-ID eras and aliases. Complete physical file/anchor/root joins,
+    especially relocated primary roots without a recorded directory ID, remain
+    unresolved. Original-wire all-version/envelope/phase cases, exact/over
+    path and all family cardinalities, malformed originals,
+    closed/WAL-only/live catalogs, JSON/report bounds, late corruption and
+    actual CLI placement preserve original inputs. Family coverage leaves full
+    catalog/history/payload verification false. External Git checkout qualification passes 260 unique cases: 54 export/peer
+    cases, all 63 ordinary volume and 115 Git cases, 21 CLI process cases,
+    retained-graph/discovery/withdrawal/graph-intent regressions and two
+    provisioned Btrfs identity/retained-capture cases. All four debug programs
+    build; format and strict locked workspace/all-targets Clippy pass. All 284
+    source-file and seven program/test-driver hashes remain unchanged, and
+    native mount/loop/image cleanup is verified. Evidence and the distinct
+    passing-case inventory are retained under
+    `/tmp/mb-m6-checkout-inventory-validation-b89n2aw8`; the post-commit audit
+    binds the code to the commit. This is focused debug-source qualification;
+    complete ordinary/native Node suites, installed artifacts and other
+    platforms were not rerun.
+    Complete ownership/history joins, atomic admission, shared budgets,
+    capacity and all remaining milestone gates stay open.
   - [x] Inventory original primary and linked Git merge ownership journals.
     `legacy-list` format 16 adds original primary and linked-worktree merge
     sessions and generated-blob intents. Pure canonical v1 session/blob codecs

@@ -1,6 +1,164 @@
 //! Validated pending Git graph metadata and its retained file-anchor ownership.
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LegacyGitCheckoutPhase {
+    Preparing,
+    Applying,
+    Cleanup,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitNativeContentRoot {
+    pub logical_len: u64,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitCheckoutFile {
+    pub oid: String,
+    pub mode: u32,
+    pub anchor_id: Uuid,
+    pub native_root: Option<LegacyGitNativeContentRoot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitCheckoutEntry {
+    pub relative_path_hex: String,
+    pub old: Option<LegacyGitCheckoutFile>,
+    pub recorded_old_identity: Option<NativeFileId>,
+    pub new: Option<LegacyGitCheckoutFile>,
+    pub recorded_new_identity: Option<NativeFileId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitCheckoutDirectory {
+    pub relative_path_hex: String,
+    pub recorded_staged_identity: Option<NativeFileId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitRemovedDirectory {
+    pub relative_path_hex: String,
+    pub recorded_old_identity: NativeFileId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyGitCheckoutIndex {
+    pub relative_path_hex: String,
+    pub entry: mb_git::GitIndexEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPendingGitCheckout {
+    pub repository_id: Uuid,
+    pub worktree_id: Uuid,
+    pub record_format: u16,
+    pub envelope_format: Option<u16>,
+    pub recorded_root_identity: Option<NativeFileId>,
+    pub advance_ref: bool,
+    pub target_ref_hex: Option<String>,
+    pub old_branch: String,
+    pub old_oid: String,
+    pub new_branch: String,
+    pub new_oid: String,
+    pub staging_name: String,
+    pub recorded_staging_identity: Option<NativeFileId>,
+    pub phase: LegacyGitCheckoutPhase,
+    pub entries: Vec<LegacyGitCheckoutEntry>,
+    pub directories: Vec<LegacyGitCheckoutDirectory>,
+    pub removed_directories: Vec<LegacyGitRemovedDirectory>,
+    pub selected_paths_hex: Vec<String>,
+    pub target_index: Vec<LegacyGitCheckoutIndex>,
+    pub old_index_hash: Option<String>,
+    pub payloads_verified: bool,
+}
+
+pub(super) fn report_checkout(
+    intent: mb_git::PreservedCheckoutIntent,
+    used: &mut usize,
+    limit: usize,
+) -> Result<LegacyPendingGitCheckout> {
+    let mut report = LegacyPendingGitCheckout {
+        repository_id: intent.scope.repository_id(),
+        worktree_id: intent.scope.worktree_id(),
+        record_format: intent.record_format,
+        envelope_format: intent.envelope_format,
+        recorded_root_identity: intent.recorded_root_identity,
+        advance_ref: intent.advance_ref,
+        target_ref_hex: intent.target_ref.map(hex::encode),
+        old_branch: intent.old_branch,
+        old_oid: hex::encode(intent.old_oid),
+        new_branch: intent.new_branch,
+        new_oid: hex::encode(intent.new_oid),
+        staging_name: intent.staging_name,
+        recorded_staging_identity: intent.staging_id,
+        phase: match intent.phase {
+            mb_git::PreservedCheckoutPhase::Preparing => LegacyGitCheckoutPhase::Preparing,
+            mb_git::PreservedCheckoutPhase::Applying => LegacyGitCheckoutPhase::Applying,
+            mb_git::PreservedCheckoutPhase::Cleanup => LegacyGitCheckoutPhase::Cleanup,
+        },
+        entries: Vec::new(),
+        directories: Vec::new(),
+        removed_directories: Vec::new(),
+        selected_paths_hex: Vec::new(),
+        target_index: Vec::new(),
+        old_index_hash: intent.old_index_hash.map(hex::encode),
+        payloads_verified: false,
+    };
+    account(&report, used, limit)?;
+    let file = |file: mb_git::PreservedCheckoutFile| LegacyGitCheckoutFile {
+        oid: hex::encode(file.oid),
+        mode: file.mode,
+        anchor_id: file.anchor_id,
+        native_root: file.native_root.map(|root| LegacyGitNativeContentRoot {
+            logical_len: root.logical_len,
+            content_hash: hex::encode(root.content_hash),
+        }),
+    };
+    for entry in intent.entries {
+        let entry = LegacyGitCheckoutEntry {
+            relative_path_hex: hex::encode(entry.path),
+            old: entry.old.map(file),
+            recorded_old_identity: entry.old_id,
+            new: entry.new.map(file),
+            recorded_new_identity: entry.new_id,
+        };
+        account(&entry, used, limit)?;
+        report.entries.push(entry);
+    }
+    for entry in intent.directories {
+        let entry = LegacyGitCheckoutDirectory {
+            relative_path_hex: hex::encode(entry.path),
+            recorded_staged_identity: entry.staged_id,
+        };
+        account(&entry, used, limit)?;
+        report.directories.push(entry);
+    }
+    for entry in intent.removed_directories {
+        let entry = LegacyGitRemovedDirectory {
+            relative_path_hex: hex::encode(entry.path),
+            recorded_old_identity: entry.old_id,
+        };
+        account(&entry, used, limit)?;
+        report.removed_directories.push(entry);
+    }
+    for path in intent.selected_paths {
+        let path = hex::encode(path);
+        account(&path, used, limit)?;
+        report.selected_paths_hex.push(path);
+    }
+    for (path, entry) in intent.target_index {
+        let entry = LegacyGitCheckoutIndex {
+            relative_path_hex: hex::encode(path),
+            entry,
+        };
+        account(&entry, used, limit)?;
+        report.target_index.push(entry);
+    }
+    Ok(report)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyGitPrivateText {
     pub bytes: u64,

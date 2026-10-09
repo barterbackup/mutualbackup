@@ -289,6 +289,24 @@ impl PreservedParentCheck {
                     self.check_hint(&intent.source_root)?;
                     self.check_hint(&intent.source_path)?;
                 }
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::CheckoutIntent(
+                    intent,
+                )) => {
+                    if let Some(root) = intent.recorded_root_identity {
+                        self.check_recorded_native(root)?;
+                    }
+                    if let Some(staging) = intent.staging_id {
+                        self.check_recorded_native(staging)?;
+                    }
+                    for directory in intent.directories {
+                        if let Some(id) = directory.staged_id {
+                            self.check_recorded_native(id)?;
+                        }
+                    }
+                    for directory in intent.removed_directories {
+                        self.check_recorded_native(directory.old_id)?;
+                    }
+                }
                 PreservedExternalGitRecord::Record(
                     mb_git::PreservedGitRecord::MergeBlobIntent(intent),
                 ) => {

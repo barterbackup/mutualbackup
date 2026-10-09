@@ -3849,6 +3849,10 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let import_area = temp.path().join("preserved-blob-import-area");
     let merge_source = temp.path().join("preserved-merge-blob-source");
     let merge_area = temp.path().join("preserved-merge-blob-area");
+    let checkout_root = temp.path().join("preserved-checkout-root");
+    let checkout_stage = temp.path().join("preserved-checkout-stage");
+    let checkout_child = temp.path().join("preserved-checkout-child");
+    let checkout_removed = temp.path().join("preserved-checkout-removed");
     for path in [
         &object_source,
         &object_area,
@@ -3870,6 +3874,10 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &import_area,
         &merge_source,
         &merge_area,
+        &checkout_root,
+        &checkout_stage,
+        &checkout_child,
+        &checkout_removed,
     ] {
         fs::create_dir(path).unwrap();
         fs::create_dir(path.join("nested")).unwrap();
@@ -3883,6 +3891,8 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     std::os::unix::fs::symlink(&import_source, &import_alias).unwrap();
     let merge_alias = temp.path().join("merge-blob-source-alias");
     std::os::unix::fs::symlink(&merge_source, &merge_alias).unwrap();
+    let checkout_alias = temp.path().join("checkout-child-alias");
+    std::os::unix::fs::symlink(&checkout_child, &checkout_alias).unwrap();
     let stage_root_id = mb_store::PinnedDirectory::open(&stage_source)
         .unwrap()
         .identity()
@@ -4229,6 +4239,65 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     let merge_root_id = directory_id(&merge_source);
     let merge_anchor_id = Uuid::new_v4();
     let merge_area_id = Uuid::new_v4();
+    let checkout_root_id = directory_id(&checkout_root);
+    let checkout_stage_id = directory_id(&checkout_stage);
+    let checkout_child_id = directory_id(&checkout_child);
+    let checkout_removed_id = directory_id(&checkout_removed);
+    let checkout_path = b"child/restored-\xf2".to_vec();
+    let checkout_index = mb_git::GitIndexEntry {
+        format_version: 1,
+        oid: object_oid,
+        mode: 0o100644,
+        anchor_id,
+    };
+    // These original identities survive independent directory relocation.
+    external_store
+        .put_record(
+            &format!("git-worktree-checkout-intent-v1/{repository_id}/{worktree_id}"),
+            b"active",
+            &canonical_bytes(&(
+                3_u16,
+                worktree_id,
+                checkout_root_id,
+                (
+                    11_u16,
+                    (
+                        11_u16,
+                        false,
+                        None::<Vec<u8>>,
+                        repository_id,
+                        "topic",
+                        commit_sha1,
+                        "topic",
+                        commit_sha1,
+                        format!("checkout-{}", Uuid::new_v4()),
+                        Some(checkout_stage_id),
+                        1_u8,
+                        vec![(
+                            checkout_path.clone(),
+                            Some(([46_u8; 20], 0o100644_u32, Uuid::nil())),
+                            Some(mb_store::NativeFileId {
+                                filesystem_id: checkout_root_id.filesystem_id,
+                                inode: 65,
+                            }),
+                            Some((object_oid, 0o100644_u32, anchor_id)),
+                            Some(mb_store::NativeFileId {
+                                filesystem_id: checkout_root_id.filesystem_id,
+                                inode: 66,
+                            }),
+                        )],
+                        vec![(b"child".to_vec(), Some(checkout_child_id))],
+                        vec![(b"removed".to_vec(), checkout_removed_id)],
+                        vec![(checkout_path.clone(), (17_u64, [45_u8; 32]))],
+                    ),
+                    vec![checkout_path.clone()],
+                    vec![(checkout_path.clone(), &checkout_index)],
+                    [47_u8; 32],
+                ),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
     let fetch_anchor_id = Uuid::new_v4();
     let import_area_id = Uuid::new_v4();
     let import_root_plan: mb_store::ReflinkCapturePlan = mb_core::decode_canonical(
@@ -4469,7 +4538,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 16);
+    assert_eq!(inventory.format_version, 17);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -4635,6 +4704,45 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert_eq!(merge.result_mode, 0o100755);
     assert_eq!(merge.plan.logical_len, 17);
     assert!(!merge.payloads_verified);
+    assert!(git_registration.checkout_intents_inventoried);
+    assert_eq!(inventory.local_state.pending_git_checkouts.len(), 1);
+    let checkout = &inventory.local_state.pending_git_checkouts[0];
+    assert_eq!(checkout.worktree_id, worktree_id);
+    assert_eq!(checkout.record_format, 11);
+    assert_eq!(checkout.envelope_format, Some(3));
+    assert_eq!(checkout.recorded_root_identity, Some(checkout_root_id));
+    assert_eq!(checkout.recorded_staging_identity, Some(checkout_stage_id));
+    assert_eq!(checkout.phase, mb_node::LegacyGitCheckoutPhase::Applying);
+    assert_eq!(
+        checkout.entries[0].relative_path_hex,
+        hex::encode(&checkout_path)
+    );
+    assert_eq!(
+        checkout.entries[0].old.as_ref().unwrap().native_root,
+        Some(mb_node::LegacyGitNativeContentRoot {
+            logical_len: 17,
+            content_hash: hex::encode([45; 32])
+        })
+    );
+    assert_eq!(
+        checkout.entries[0].new.as_ref().unwrap().anchor_id,
+        anchor_id
+    );
+    assert_eq!(
+        checkout.directories[0].recorded_staged_identity,
+        Some(checkout_child_id)
+    );
+    assert_eq!(
+        checkout.removed_directories[0].recorded_old_identity,
+        checkout_removed_id
+    );
+    assert_eq!(
+        checkout.selected_paths_hex,
+        vec![hex::encode(&checkout_path)]
+    );
+    assert_eq!(checkout.target_index[0].entry, checkout_index);
+    assert_eq!(checkout.old_index_hash, Some(hex::encode([47; 32])));
+    assert!(!checkout.payloads_verified);
     for private in [
         "private cli author",
         "private-cli@example.test",
@@ -4810,6 +4918,11 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         merge_source.join("nested"),
         merge_area.join("nested"),
         merge_alias.join("nested"),
+        checkout_root.join("nested"),
+        checkout_stage.join("nested"),
+        checkout_child.join("nested"),
+        checkout_removed.join("nested"),
+        checkout_alias.join("nested"),
     ] {
         let destination = parent.join("rejected-export");
         let rejected = run_output(
@@ -4948,6 +5061,11 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &merge_source.join("nested"),
         &merge_area.join("nested"),
         &merge_alias.join("nested"),
+        &checkout_root.join("nested"),
+        &checkout_stage.join("nested"),
+        &checkout_child.join("nested"),
+        &checkout_removed.join("nested"),
+        &checkout_alias.join("nested"),
     ] {
         for args in [&confined_args, &peer_list_args] {
             let child = Command::new(program("mutualbackup"))
@@ -5006,6 +5124,10 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         &import_area,
         &merge_source,
         &merge_area,
+        &checkout_root,
+        &checkout_stage,
+        &checkout_child,
+        &checkout_removed,
     ] {
         assert_eq!(
             fs::read(path.join("original")).unwrap(),

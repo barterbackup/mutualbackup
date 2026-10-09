@@ -60,7 +60,11 @@ pub use blob_catalog::{
     GitBlobRecord,
 };
 #[cfg(target_os = "linux")]
-pub use checkout::CheckoutError;
+pub use checkout::{
+    CheckoutError, PreservedCheckoutDirectory, PreservedCheckoutEntry, PreservedCheckoutFile,
+    PreservedCheckoutIntent, PreservedCheckoutPhase, PreservedCheckoutRemovedDirectory,
+    PreservedNativeContentRoot,
+};
 #[cfg(target_os = "linux")]
 pub use diff::{DiffError, GitDiff};
 #[cfg(target_os = "linux")]
