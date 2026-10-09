@@ -221,6 +221,45 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+Linux data-directory locking now pins the directory and opens .node.lock
+relative to that descriptor with openat2
+beneath/no-symlink/no-magic-link/no-cross-mount resolution. Existing locks
+must be empty regular files with one hard link, owned by the caller; the
+directory must also belong to the caller. Existing lock files open read-only,
+fresh files use exclusive creation with mode 0600 and newly created data
+directories/parents use mode 0700. No directory or lock permission change
+precedes the exclusive flock. Keyed catalog admission repeats after
+acquisition, then visible directory and lock identities are rechecked before
+and after descriptor-based permission normalization to 0700/0600; open_locked
+repeats admission and identity checks before opening the writable control
+store. Deterministic directory/lock replacement, linked/nonregular/nonempty
+locks and a rejected second live owner preserve original modes, identities,
+timestamps and bytes. A real automatic-daemon regression covers
+linked/nonempty locks and a live owner before socket creation. A provisioned
+native regression covers file bind mounts and foreign-owned files/directories.
+Historical original lock producers leave an empty file, so this adds no lock
+wire format. Unavailable safe-resolution support or unreadable ownership
+inputs fail closed. The checks do not make later path-based control/volume
+writers atomic against namespace replacement or close the remaining
+source-admission/lifecycle race, complete history/payload ownership joins,
+installed artifacts or platform gates. A before-fix actual-daemon probe
+reproduces both mode changes on a rejected live-owner claim, using unchanged
+program hashes; evidence is retained under
+`/tmp/mb-m6-data-lock-before-probe-1cg0cqym`. Startup-lock ownership
+qualification passes 541 unique cases: all 508 ordinary Node cases (including
+the eight local-control protocol cases), all 22 ordinary CLI process cases,
+three daemon startup cases and eight explicitly run native/foreign-UID cases.
+Native cases include Btrfs init/worktree/backend/retained-capture reopen,
+renamed-root and bind-descendant placement, bind-file/foreign-owned data locks
+and foreign-UID unlock-secret protection. Namespace-changing cases finish
+before ordinary suites start. All four debug programs build; format and strict
+locked workspace/all-targets Clippy pass. All 285 source-file and seven
+program/test-driver hashes remain unchanged, and native mount/loop/image
+cleanup is verified. Evidence and the distinct passing-case inventory are
+retained under `/tmp/mb-m6-data-lock-validation-1ofgdbb1`; the post-commit
+audit binds the code to the commit. This is debug-source qualification; other
+ignored Node cases, installed artifacts and other platforms were not rerun.
+
 Peer scratch and export placement now compare available preserved path hints
 in Linux filesystem coordinates as well as pathname ancestry and recorded
 directory identities. Binding a descendant outside its original root no longer

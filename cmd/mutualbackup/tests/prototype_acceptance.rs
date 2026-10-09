@@ -549,6 +549,144 @@ fn automatic_unlock_rejects_withdrawn_catalog_before_lock_or_socket_mutation() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn automatic_unlock_rejects_unowned_data_lock_without_mutation() {
+    use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
+
+    fn stamp(path: &Path) -> (u64, u64, u32, u64, u32, u32, u64, i64, i64, i64, i64) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.nlink(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    }
+
+    for kind in ["symlink", "hardlink", "nonempty", "live-owner"] {
+        let temp = tempfile::tempdir().unwrap();
+        set_private(temp.path());
+        let data = temp.path().join("state");
+        let seed_file = temp.path().join("node.seed");
+        let recovery = "correct-horse-battery-staple-2026!";
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--data-dir"),
+                os(&data),
+                os("--seed-file"),
+                os(&seed_file),
+            ],
+            recovery.as_bytes(),
+            CLI_TIMEOUT,
+        )
+        .unwrap();
+        let lock = data.join(".node.lock");
+        if lock.exists() {
+            fs::remove_file(&lock).unwrap();
+        }
+        let outside = temp.path().join("outside-lock");
+        fs::write(&outside, b"").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o640)).unwrap();
+        let _owner = match kind {
+            "symlink" => {
+                std::os::unix::fs::symlink(&outside, &lock).unwrap();
+                None
+            }
+            "hardlink" => {
+                fs::hard_link(&outside, &lock).unwrap();
+                None
+            }
+            "nonempty" => {
+                fs::write(&lock, b"preserved unrelated lock bytes").unwrap();
+                None
+            }
+            "live-owner" => {
+                Some(Node::open(&data, Seed::from_recovery_string(recovery).unwrap()).unwrap())
+            }
+            _ => unreachable!(),
+        };
+        if kind != "symlink" {
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o750)).unwrap();
+        let snapshot = || {
+            let files = fs::read_dir(&data)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name();
+                    let bytes = fs::read(entry.path()).unwrap();
+                    // A live SQLite owner's shared index is synchronization state;
+                    // compare its extent, and compare every durable byte exactly.
+                    let content = if name == "control.db-shm" {
+                        bytes.len().to_le_bytes().to_vec()
+                    } else {
+                        bytes
+                    };
+                    (
+                        name.clone(),
+                        (
+                            if name == "control.db-shm" {
+                                None
+                            } else {
+                                Some(stamp(&entry.path()))
+                            },
+                            content,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            (
+                stamp(&data),
+                files,
+                stamp(&outside),
+                fs::read(&outside).unwrap(),
+            )
+        };
+        let before = snapshot();
+        let output = run_output(
+            program("mutualbackupd"),
+            &[
+                os("--data-dir"),
+                os(&data),
+                os("--seed-file"),
+                os(&seed_file),
+                os("--control-socket"),
+                os(data.join("control.sock")),
+                os("--failure-domain"),
+                os("data-lock-preservation"),
+                os("--listen"),
+                os("/ip4/127.0.0.1/udp/0/quic-v1"),
+                os("--tor-mode"),
+                os("disable-tor"),
+            ],
+            CLI_TIMEOUT,
+        )
+        .unwrap();
+        assert!(!output.status.success(), "{kind}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = match kind {
+            "symlink" => "cannot safely open node data lock",
+            "hardlink" | "nonempty" => "independently owned regular file",
+            "live-owner" => "already in use",
+            _ => unreachable!(),
+        };
+        assert!(stderr.contains(expected), "{kind}: {stderr}");
+        assert_eq!(before, snapshot(), "{kind}");
+        assert!(!data.join("control.sock").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn manual_unlock_preserves_withdrawn_catalog_before_and_after_rejected_secrets() {
     use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
     for journal in 0..3 {

@@ -774,6 +774,62 @@ pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
 pub struct LockedDataDir {
     path: PathBuf,
     _lock: Arc<File>,
+    #[cfg(target_os = "linux")]
+    directory: Arc<File>,
+}
+
+impl LockedDataDir {
+    #[cfg(target_os = "linux")]
+    fn require_current_identity(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let pinned = self.directory.metadata()?;
+        let visible = fs::symlink_metadata(&self.path)?;
+        anyhow::ensure!(
+            visible.is_dir()
+                && (visible.dev(), visible.ino()) == (pinned.dev(), pinned.ino())
+                && pinned.uid() == unsafe { libc::geteuid() },
+            "node data directory changed while acquiring ownership"
+        );
+        let current = open_data_dir_lock_file_at(&self.directory, false)?.metadata()?;
+        let owned = self._lock.metadata()?;
+        anyhow::ensure!(
+            current.is_file()
+                && (current.dev(), current.ino()) == (owned.dev(), owned.ino())
+                && owned.nlink() == 1
+                && owned.len() == 0
+                && owned.uid() == unsafe { libc::geteuid() },
+            "node data lock changed while acquiring ownership"
+        );
+        Ok(())
+    }
+
+    fn make_private(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            self.require_current_identity()?;
+            let pinned = self.directory.metadata()?;
+            if pinned.mode() & 0o7777 != 0o700 {
+                self.directory
+                    .set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        set_private_directory(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if self._lock.metadata()?.mode() & 0o7777 != 0o600 {
+                self._lock
+                    .set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        // Restricting the directory closes the writable-parent interval for
+        // other users. Recheck the visible claim after that transition too.
+        #[cfg(target_os = "linux")]
+        self.require_current_identity()?;
+        Ok(())
+    }
 }
 
 pub struct Node {
@@ -1222,15 +1278,43 @@ impl Node {
     }
     pub(crate) fn lock_data_dir(data_dir: impl AsRef<Path>) -> Result<LockedDataDir> {
         let data_dir = data_dir.as_ref();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(data_dir)?;
+        }
+        #[cfg(not(target_os = "linux"))]
         fs::create_dir_all(data_dir)?;
         let data_dir = data_dir
             .canonicalize()
             .with_context(|| format!("cannot resolve data directory {}", data_dir.display()))?;
-        set_private_directory(&data_dir)?;
+        #[cfg(target_os = "linux")]
+        let directory = {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let directory = Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&data_dir)?,
+            );
+            anyhow::ensure!(
+                directory.metadata()?.uid() == unsafe { libc::geteuid() },
+                "node data directory must be owned by the current user"
+            );
+            directory
+        };
+        #[cfg(target_os = "linux")]
+        let lock = Arc::new(open_data_dir_lock_at(&directory)?);
+        #[cfg(not(target_os = "linux"))]
         let lock = Arc::new(open_data_dir_lock(&data_dir)?);
         Ok(LockedDataDir {
             path: data_dir,
             _lock: lock,
+            #[cfg(target_os = "linux")]
+            directory,
         })
     }
 
@@ -1250,7 +1334,14 @@ impl Node {
         )?;
         #[cfg(not(target_os = "linux"))]
         let _ = seed;
-        Self::lock_data_dir(data_dir)
+        let locked = Self::lock_data_dir(data_dir)?;
+        #[cfg(target_os = "linux")]
+        crate::source_policy::require_native_source_state_from_catalog(
+            &locked.path,
+            &KeyMaterial::from_seed(seed),
+        )?;
+        locked.make_private()?;
+        Ok(locked)
     }
 
     pub fn open(data_dir: impl AsRef<Path>, seed: Seed) -> Result<Self> {
@@ -1262,6 +1353,7 @@ impl Node {
         let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
         crate::source_policy::require_native_source_state_from_catalog(&data_dir, &keys)?;
+        locked.make_private()?;
         let (mut control, control_database_key) = open_control_store(&data_dir, &keys)?;
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
@@ -14987,6 +15079,70 @@ fn publication_slot(
     *hasher.finalize().as_bytes()
 }
 
+#[cfg(target_os = "linux")]
+fn open_data_dir_lock_file_at(directory: &File, create: bool) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let flags = libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | if create {
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL
+        } else {
+            libc::O_RDONLY
+        };
+    let how = OpenHow {
+        flags: flags as u64,
+        mode: if create { 0o600 } else { 0 },
+        // BENEATH, NO_SYMLINKS, NO_MAGICLINKS and NO_XDEV include file
+        // bind mounts. The data directory itself need not expose a UUID.
+        resolve: 0x08 | 0x04 | 0x02 | 0x01,
+    };
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            directory.as_raw_fd(),
+            c".node.lock".as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor as i32) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_data_dir_lock_at(directory: &File) -> Result<File> {
+    use fs2::FileExt;
+    use std::os::unix::fs::MetadataExt;
+    let file = match open_data_dir_lock_file_at(directory, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            open_data_dir_lock_file_at(directory, true)?
+        }
+        Err(error) => return Err(error).context("cannot safely open node data lock"),
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.len() == 0
+            && metadata.nlink() == 1
+            && metadata.uid() == unsafe { libc::geteuid() },
+        "node data lock must be an empty, independently owned regular file"
+    );
+    FileExt::try_lock_exclusive(&file).context("node data directory is already in use")?;
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn open_data_dir_lock(data_dir: &Path) -> Result<File> {
     use fs2::FileExt;
 
@@ -14997,16 +15153,11 @@ fn open_data_dir_lock(data_dir: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
     FileExt::try_lock_exclusive(&file).context("node data directory is already in use")?;
     Ok(file)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn set_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -18683,6 +18834,288 @@ pub(crate) mod tests {
         assert!(Node::open(temp.path(), Seed::from_bytes([91; 32])).is_err());
         drop(first);
         Node::open(temp.path(), Seed::from_bytes([91; 32])).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn data_lock_rejects_linked_nonregular_and_nonempty_inputs_without_permission_changes() {
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, PermissionsExt},
+        };
+        fn stamp(path: &Path) -> (u64, u64, u32, u64, i64, i64, i64, i64) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        }
+        for kind in ["symlink", "hardlink", "fifo", "directory", "nonempty"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            fs::create_dir(&data).unwrap();
+            let source = temp.path().join("original");
+            let original: &[u8] = if kind == "hardlink" {
+                b""
+            } else {
+                b"original outside bytes"
+            };
+            fs::write(&source, original).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+            let lock = data.join(".node.lock");
+            match kind {
+                "symlink" => std::os::unix::fs::symlink(&source, &lock).unwrap(),
+                "hardlink" => fs::hard_link(&source, &lock).unwrap(),
+                "fifo" => {
+                    let name = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o640) }, 0);
+                }
+                "directory" => fs::create_dir(&lock).unwrap(),
+                "nonempty" => fs::write(&lock, b"preserved lock-path bytes").unwrap(),
+                _ => unreachable!(),
+            }
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+            let before = [stamp(&data), stamp(&lock), stamp(&source)];
+            let seed = Seed::from_bytes([178; 32]);
+            assert!(
+                Node::lock_data_dir_with_seed(&data, &seed).is_err(),
+                "{kind}"
+            );
+            assert!(Node::open(&data, seed).is_err(), "{kind}");
+            assert_eq!(
+                [stamp(&data), stamp(&lock), stamp(&source)],
+                before,
+                "{kind}"
+            );
+            assert_eq!(fs::read(&source).unwrap(), original);
+            assert_eq!(fs::read_dir(&data).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn data_lock_rejection_preserves_live_owner_modes_and_reopen_normalizes_after_ownership() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let fresh_parent = temp.path().join("fresh-parent");
+        let fresh = fresh_parent.join("fresh-data");
+        let fresh_claim = Node::lock_data_dir(&fresh).unwrap();
+        for path in [&fresh_parent, &fresh] {
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
+        assert_eq!(
+            fs::metadata(fresh.join(".node.lock")).unwrap().mode() & 0o777,
+            0o600
+        );
+        drop(fresh_claim);
+        let data = temp.path().join("data");
+        let seed = Seed::from_bytes([179; 32]);
+        let owner = Node::open(&data, seed.clone()).unwrap();
+        let lock = data.join(".node.lock");
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o640)).unwrap();
+        let stamp = |path: &Path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let before = [stamp(&data), stamp(&lock)];
+        assert!(Node::lock_data_dir_with_seed(&data, &seed).is_err());
+        assert!(Node::open(&data, seed.clone()).is_err());
+        assert_eq!([stamp(&data), stamp(&lock)], before);
+        drop(owner);
+        let _locked = Node::lock_data_dir_with_seed(&data, &seed).unwrap();
+        assert_eq!(fs::metadata(&data).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires provisioned Linux bind mounts and ownership changes"]
+    fn data_lock_rejects_bind_mounted_and_foreign_owned_files_without_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::process::Command;
+        struct Mount(PathBuf);
+        impl Drop for Mount {
+            fn drop(&mut self) {
+                let binary = std::env::var_os("MUTUALBACKUP_TEST_UMOUNT_BIN")
+                    .unwrap_or_else(|| "umount".into());
+                let output = Command::new("sudo")
+                    .arg("-n")
+                    .arg(binary)
+                    .arg(&self.0)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "cannot unmount lock fixture: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        for kind in ["bind-file", "foreign-file", "foreign-directory"] {
+            let temporary = tempfile::tempdir_in(&root).unwrap();
+            let data = temporary.path().join("data");
+            fs::create_dir(&data).unwrap();
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+            let lock = data.join(".node.lock");
+            fs::write(&lock, b"").unwrap();
+            let outside = temporary.path().join("outside-original");
+            fs::write(&outside, b"").unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o640)).unwrap();
+            let _mounted = if kind != "bind-file" {
+                fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+                let target = if kind == "foreign-directory" {
+                    fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+                    &data
+                } else {
+                    &lock
+                };
+                let binary = std::env::var_os("MUTUALBACKUP_TEST_CHOWN_BIN")
+                    .unwrap_or_else(|| "chown".into());
+                let output = Command::new("sudo")
+                    .arg("-n")
+                    .arg(binary)
+                    .arg("65534:65534")
+                    .arg(target)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "cannot prepare foreign lock fixture: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_ne!(target.metadata().unwrap().uid(), unsafe { libc::geteuid() });
+                None
+            } else {
+                let binary = std::env::var_os("MUTUALBACKUP_TEST_MOUNT_BIN")
+                    .unwrap_or_else(|| "mount".into());
+                let output = Command::new("sudo")
+                    .arg("-n")
+                    .arg(binary)
+                    .arg("--bind")
+                    .arg(&outside)
+                    .arg(&lock)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "cannot bind lock fixture: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    (
+                        lock.metadata().unwrap().dev(),
+                        lock.metadata().unwrap().ino()
+                    ),
+                    (
+                        outside.metadata().unwrap().dev(),
+                        outside.metadata().unwrap().ino()
+                    )
+                );
+                Some(Mount(lock.clone()))
+            };
+            let stamp = |path: &Path| {
+                let m = path.metadata().unwrap();
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.mode(),
+                    m.uid(),
+                    m.gid(),
+                    m.len(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                )
+            };
+            let before = [stamp(&data), stamp(&lock), stamp(&outside)];
+            let seed = Seed::from_bytes([181; 32]);
+            assert!(Node::lock_data_dir_with_seed(&data, &seed).is_err());
+            assert!(Node::open(&data, seed).is_err());
+            assert_eq!([stamp(&data), stamp(&lock), stamp(&outside)], before);
+            assert_eq!(fs::read_dir(&data).unwrap().count(), 1);
+            assert!(fs::read(&outside).unwrap().is_empty());
+            if kind == "foreign-directory" {
+                let binary = std::env::var_os("MUTUALBACKUP_TEST_CHOWN_BIN")
+                    .unwrap_or_else(|| "chown".into());
+                let output = Command::new("sudo")
+                    .arg("-n")
+                    .arg(binary)
+                    .arg(format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                        libc::getegid()
+                    }))
+                    .arg(&data)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "cannot restore test-owned directory for cleanup"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn data_lock_handoff_rejects_replaced_directory_and_lock_before_permission_changes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for replace_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            fs::create_dir(&data).unwrap();
+            let locked = Node::lock_data_dir(&data).unwrap();
+            let old = if replace_directory {
+                let moved = temp.path().join("moved");
+                fs::rename(&data, &moved).unwrap();
+                fs::create_dir(&data).unwrap();
+                moved.join(".node.lock")
+            } else {
+                let moved = data.join("held-lock");
+                fs::rename(data.join(".node.lock"), &moved).unwrap();
+                fs::write(data.join(".node.lock"), b"").unwrap();
+                moved
+            };
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+            fs::set_permissions(old.parent().unwrap(), fs::Permissions::from_mode(0o751)).unwrap();
+            fs::set_permissions(&old, fs::Permissions::from_mode(0o640)).unwrap();
+            let stamp = |path: &Path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            };
+            let before = [stamp(&data), stamp(old.parent().unwrap()), stamp(&old)];
+            let files = || {
+                fs::read_dir(&data)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let names = files();
+            assert!(Node::open_locked(locked, Seed::from_bytes([180; 32])).is_err());
+            assert_eq!(
+                [stamp(&data), stamp(old.parent().unwrap()), stamp(&old)],
+                before
+            );
+            assert_eq!(files(), names);
+            assert!(!data.join("control.db").exists());
+        }
     }
 
     #[test]
