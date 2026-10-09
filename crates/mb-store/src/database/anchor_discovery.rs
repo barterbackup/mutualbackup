@@ -11,7 +11,7 @@ use uuid::Uuid;
 pub const ANCHOR_DISCOVERY_JOURNAL_KIND: &str = "anchor-area-discovery-v1";
 const MAX_JOBS: usize = 32;
 const JOURNAL_BYTES: usize = ANCHOR_DISCOVERY_CHECKPOINT_BYTES + 64;
-const FENCE_KIND: &str = "anchor-area-discovery-fence-v1";
+pub const ANCHOR_DISCOVERY_FENCE_KIND: &str = "anchor-area-discovery-fence-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AnchorDiscoveryJobStatus {
@@ -39,6 +39,51 @@ struct Journal {
 }
 
 impl ControlStore {
+    /// Validate saved location assistance without resuming scans, opening source
+    /// paths, or changing journals/fences. These records never confer ownership.
+    pub fn validate_preserved_anchor_discovery_records(&self) -> anyhow::Result<()> {
+        for (expected_kind, limit) in [
+            (ANCHOR_DISCOVERY_JOURNAL_KIND, JOURNAL_BYTES),
+            (ANCHOR_DISCOVERY_FENCE_KIND, 16),
+        ] {
+            self.for_each_record_with_kind_prefix_bounded(
+                expected_kind,
+                512,
+                16,
+                limit,
+                |kind, key, bytes| {
+                    let area_id = Uuid::from_slice(key)?;
+                    anyhow::ensure!(
+                        kind == expected_kind && !area_id.is_nil(),
+                        "invalid preserved anchor discovery identity"
+                    );
+                    if kind == ANCHOR_DISCOVERY_JOURNAL_KIND {
+                        let journal: Journal = mb_core::decode_canonical(bytes)?;
+                        anyhow::ensure!(
+                            journal.version == 1
+                                && !journal.attempt.is_nil()
+                                && journal.cursor.len() <= ANCHOR_DISCOVERY_CHECKPOINT_BYTES
+                                && mb_core::canonical_bytes_bounded(&journal, bytes.len())?
+                                    == bytes,
+                            "invalid preserved anchor discovery journal"
+                        );
+                        AnchorAreaDiscovery::validate_preserved_checkpoint(
+                            area_id,
+                            &journal.cursor,
+                        )?;
+                    } else {
+                        anyhow::ensure!(
+                            !Uuid::from_slice(bytes)?.is_nil(),
+                            "invalid preserved anchor discovery fence"
+                        );
+                    }
+                    Ok(true)
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// Inspect one bounded page without opening any source or changing progress.
     /// An unreadable journal still appears, so operators can reset it explicitly.
     pub fn anchor_discovery_jobs(
@@ -119,7 +164,7 @@ impl ControlStore {
         if transaction.execute(
             "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
-            params![FENCE_KIND, area_id.as_bytes(), &fence],
+            params![ANCHOR_DISCOVERY_FENCE_KIND, area_id.as_bytes(), &fence],
         )? != 1
         {
             return Err(DatabaseError::Conflict);
@@ -132,7 +177,7 @@ impl ControlStore {
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let existing: Option<Option<Vec<u8>>> = transaction.query_row("SELECT CASE WHEN length(bytes) = 16 THEN bytes END FROM protocol_records WHERE kind = ?1 AND record_id = ?2", params![FENCE_KIND, area_id.as_bytes()], |row| row.get(0)).optional()?;
+        let existing: Option<Option<Vec<u8>>> = transaction.query_row("SELECT CASE WHEN length(bytes) = 16 THEN bytes END FROM protocol_records WHERE kind = ?1 AND record_id = ?2", params![ANCHOR_DISCOVERY_FENCE_KIND, area_id.as_bytes()], |row| row.get(0)).optional()?;
         let fence = match existing {
             Some(Some(bytes)) if Uuid::from_slice(&bytes).is_ok_and(|id| !id.is_nil()) => bytes,
             Some(_) => return Err(DatabaseError::Integrity),
@@ -310,7 +355,7 @@ impl ControlStore {
             rusqlite::TransactionBehavior::Immediate,
         )?;
         if let Some(expected_fence) = fence {
-            let current: Option<Option<Vec<u8>>> = transaction.query_row("SELECT CASE WHEN length(bytes) = 16 THEN bytes END FROM protocol_records WHERE kind = ?1 AND record_id = ?2", params![FENCE_KIND, area_id.as_bytes()], |row| row.get(0)).optional()?;
+            let current: Option<Option<Vec<u8>>> = transaction.query_row("SELECT CASE WHEN length(bytes) = 16 THEN bytes END FROM protocol_records WHERE kind = ?1 AND record_id = ?2", params![ANCHOR_DISCOVERY_FENCE_KIND, area_id.as_bytes()], |row| row.get(0)).optional()?;
             if current.as_ref().and_then(Option::as_deref) != Some(expected_fence) {
                 return Ok(false);
             }
@@ -598,7 +643,11 @@ mod tests {
         );
         // Explicit reset also repairs malformed assistance fences, without loading them.
         store
-            .put_record(FENCE_KIND, area.as_bytes(), &vec![0; JOURNAL_BYTES + 1])
+            .put_record(
+                ANCHOR_DISCOVERY_FENCE_KIND,
+                area.as_bytes(),
+                &vec![0; JOURNAL_BYTES + 1],
+            )
             .unwrap();
         assert!(store.discovery_fence(area).is_err());
         assert!(!store.reset_anchor_area_discovery(area).unwrap());

@@ -85,6 +85,63 @@ struct Checkpoint {
 }
 
 impl AnchorAreaDiscovery {
+    /// Check the saved cursor's wire structure without touching its paths.
+    pub(crate) fn validate_preserved_checkpoint(
+        area_id: Uuid,
+        bytes: &[u8],
+    ) -> Result<(), AnchorError> {
+        if bytes.len() > ANCHOR_DISCOVERY_CHECKPOINT_BYTES {
+            return Err(AnchorError::AnchorAreaDiscoveryLimit);
+        }
+        let saved: Checkpoint = decode_canonical(bytes).map_err(|_| AnchorError::UnsafePath)?;
+        if saved.version != 1
+            || saved.area.area_id != area_id
+            || saved.frames.len() > MAX_DEPTH
+            || saved.roots.len() > MAX_ROOTS
+            || saved.roots.first() != Some(&saved.area.volume_root_hint)
+            || saved.next_root > saved.roots.len()
+            || (!saved.frames.is_empty() && saved.found.is_some())
+            || canonical_bytes_bounded(&saved, ANCHOR_DISCOVERY_CHECKPOINT_BYTES)
+                .map_err(|_| AnchorError::UnsafePath)?
+                != bytes
+        {
+            return Err(AnchorError::UnsafePath);
+        }
+        check_path(&saved.area.path_hint)?;
+        check_path(&saved.area.volume_root_hint)?;
+        for root in &saved.roots {
+            check_path(root)?;
+        }
+        let active_root = saved
+            .next_root
+            .checked_sub(1)
+            .and_then(|index| saved.roots.get(index));
+        let mut parent = active_root.map(PathBuf::as_path);
+        for (index, frame) in saved.frames.iter().enumerate() {
+            check_path(&frame.path)?;
+            if frame.cookie < 0
+                || frame.stamp.identity.filesystem_id != saved.area.filesystem_id
+                || if index == 0 {
+                    Some(frame.path.as_path()) != parent
+                } else {
+                    frame.path.parent() != parent
+                }
+            {
+                return Err(AnchorError::UnsafePath);
+            }
+            parent = Some(&frame.path);
+        }
+        for candidate in [&saved.candidate, &saved.found].into_iter().flatten() {
+            check_path(&candidate.path)?;
+            if candidate.identity.filesystem_id != saved.area.filesystem_id
+                || !active_root.is_some_and(|root| candidate.path.starts_with(root))
+            {
+                return Err(AnchorError::UnsafePath);
+            }
+        }
+        Ok(())
+    }
+
     pub fn start(area: &StableAnchorAreaLocator) -> Result<Self, AnchorError> {
         check_path(&area.path_hint)?;
         check_path(&area.volume_root_hint)?;

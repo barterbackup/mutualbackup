@@ -1,5 +1,7 @@
 /target/
 /result
+/result-*
+__pycache__/
 /dist/
 /.mutualbackup/
 /.docker-lab/

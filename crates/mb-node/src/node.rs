@@ -770,9 +770,15 @@ pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
 ///
 /// Keyed catalog admission precedes creation of this claim. A manual daemon
 /// waits for its unlock secret before acquiring it.
-#[derive(Clone)]
 pub struct LockedDataDir {
     path: PathBuf,
+    lease: DataDirLease,
+}
+
+// Only internal readers share the ownership lifetime. The public startup
+// claim is move-only, so callers cannot open two Nodes with the same flock.
+#[derive(Clone)]
+struct DataDirLease {
     _lock: Arc<File>,
     #[cfg(target_os = "linux")]
     directory: Arc<File>,
@@ -782,7 +788,7 @@ impl LockedDataDir {
     #[cfg(target_os = "linux")]
     fn require_current_identity(&self) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
-        let pinned = self.directory.metadata()?;
+        let pinned = self.lease.directory.metadata()?;
         let visible = fs::symlink_metadata(&self.path)?;
         anyhow::ensure!(
             visible.is_dir()
@@ -790,8 +796,8 @@ impl LockedDataDir {
                 && pinned.uid() == unsafe { libc::geteuid() },
             "node data directory changed while acquiring ownership"
         );
-        let current = open_data_dir_lock_file_at(&self.directory, false)?.metadata()?;
-        let owned = self._lock.metadata()?;
+        let current = open_data_dir_lock_file_at(&self.lease.directory, false)?.metadata()?;
+        let owned = self.lease._lock.metadata()?;
         anyhow::ensure!(
             current.is_file()
                 && (current.dev(), current.ino()) == (owned.dev(), owned.ino())
@@ -808,9 +814,10 @@ impl LockedDataDir {
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             self.require_current_identity()?;
-            let pinned = self.directory.metadata()?;
+            let pinned = self.lease.directory.metadata()?;
             if pinned.mode() & 0o7777 != 0o700 {
-                self.directory
+                self.lease
+                    .directory
                     .set_permissions(fs::Permissions::from_mode(0o700))?;
             }
         }
@@ -819,8 +826,9 @@ impl LockedDataDir {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if self._lock.metadata()?.mode() & 0o7777 != 0o600 {
-                self._lock
+            if self.lease._lock.metadata()?.mode() & 0o7777 != 0o600 {
+                self.lease
+                    ._lock
                     .set_permissions(fs::Permissions::from_mode(0o600))?;
             }
         }
@@ -834,13 +842,15 @@ impl LockedDataDir {
 
 pub struct Node {
     data_dir: PathBuf,
-    _data_dir_lock: LockedDataDir,
     keys: Arc<KeyMaterial>,
     control: ControlStore,
     control_database_key: [u8; 32],
     volumes: StorageVolumes,
     volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
     membership_history_cache: Mutex<Option<MembershipHistoryCache>>,
+    // Fields drop in declaration order. Keep the claim until all owned
+    // catalogs, volumes and reader caches have finished closing.
+    _data_dir_lock: LockedDataDir,
 }
 
 struct MembershipHistoryCache {
@@ -854,12 +864,16 @@ pub(crate) struct NodeReaderConfig {
     control_path: PathBuf,
     control_database_key: [u8; 32],
     volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
+    // Keep the claim while this handle can open or use a writable catalog.
+    _data_dir_lease: DataDirLease,
 }
 
 pub(crate) struct NodeReader {
     keys: Arc<KeyMaterial>,
     control: ControlStore,
     volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
+    // Keep the claim while this handle can open or use a writable catalog.
+    _data_dir_lease: DataDirLease,
 }
 
 impl NodeReaderConfig {
@@ -868,6 +882,7 @@ impl NodeReaderConfig {
             keys: self.keys.clone(),
             control: ControlStore::open_with_key(&self.control_path, &self.control_database_key)?,
             volume_readers: self.volume_readers.clone(),
+            _data_dir_lease: self._data_dir_lease.clone(),
         })
     }
 
@@ -1312,9 +1327,11 @@ impl Node {
         let lock = Arc::new(open_data_dir_lock(&data_dir)?);
         Ok(LockedDataDir {
             path: data_dir,
-            _lock: lock,
-            #[cfg(target_os = "linux")]
-            directory,
+            lease: DataDirLease {
+                _lock: lock,
+                #[cfg(target_os = "linux")]
+                directory,
+            },
         })
     }
 
@@ -3243,6 +3260,7 @@ impl Node {
             control_path: self.control.path().to_path_buf(),
             control_database_key: self.control_database_key,
             volume_readers: self.volume_readers.clone(),
+            _data_dir_lease: self._data_dir_lock.lease.clone(),
         }
     }
 
@@ -18838,6 +18856,52 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn data_lock_lease_outlives_node_through_reader_configs_and_open_readers() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([212; 32]);
+        let node = Node::open(temp.path(), seed.clone()).unwrap();
+        node.control
+            .put_record(
+                "ownership-lease-fixture",
+                b"id",
+                b"preserved original bytes",
+            )
+            .unwrap();
+        let configuration = node.reader_config();
+        let cloned_configuration = configuration.clone();
+        drop(node);
+        assert!(
+            Node::open(temp.path(), seed.clone()).is_err(),
+            "a saved reader configuration must retain exclusive data ownership"
+        );
+        let reader = cloned_configuration.open().unwrap();
+        drop(configuration);
+        assert!(Node::open(temp.path(), seed.clone()).is_err());
+        drop(cloned_configuration);
+        assert!(
+            Node::open(temp.path(), seed.clone()).is_err(),
+            "an open writable reader must retain exclusive data ownership"
+        );
+        assert_eq!(
+            reader
+                .control
+                .get_record("ownership-lease-fixture", b"id")
+                .unwrap(),
+            Some(b"preserved original bytes".to_vec())
+        );
+        drop(reader);
+        let reopened = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            reopened
+                .control
+                .get_record("ownership-lease-fixture", b"id")
+                .unwrap(),
+            Some(b"preserved original bytes".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn data_lock_rejects_linked_nonregular_and_nonempty_inputs_without_permission_changes() {
         use std::os::unix::{
             ffi::OsStrExt,
@@ -22251,6 +22315,7 @@ pub(crate) mod tests {
         let tail = node.guild_event_tail(0, genesis_hash).unwrap();
         assert_eq!(tail.events.len(), 4);
 
+        drop(reader);
         drop(node);
         let node = Node::open(temp.path(), local_seed).unwrap();
         let reopened = node.dynamic_guild_state().unwrap().unwrap();

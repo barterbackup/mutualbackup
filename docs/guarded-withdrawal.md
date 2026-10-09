@@ -221,6 +221,66 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+The public LockedDataDir startup claim is now move-only; only private reader
+leases share its held flock and Linux directory descriptor. Node declares its
+claim after every owned catalog, storage volume and reader cache, retaining
+exclusivity until those resources finish destruction. Saved NodeReaderConfig
+values and each opened NodeReader retain the same lease; their catalogs close
+before releasing it. A configuration can open a reader after the original Node
+is dropped, while a new Node remains excluded until every configuration and
+reader is released. The before-fix regression under
+`/tmp/mb-m6-ownership-lease-negative-3485uua1` confirms that the old
+implementation admitted a second Node while a saved writable-reader
+configuration still existed; its expected failure and unchanged source/driver
+hashes are retained. The new regression covers cloned configurations, opening
+after Node destruction, reader-only ownership, final release and exact
+stored-record reopen. This binds ownership lifetime, not atomic path/source
+admission: saved reader paths and later control/volume writers still need
+complete pinned-directory and leaf handoff. Full history/payload joins,
+enclosing budgets, installed artifacts and other-platform qualification remain
+open. The native Git source-loss fixture now shuts down and releases the
+original owner and its workers before normal startup acquires a new claim. It
+retains the same advertised QUIC endpoint, with a 30-second retry limited to
+address-in-use while the old transport drains. Normal P2P event-loop shutdown
+explicitly removes its owned direct, relay and Tor listeners before draining
+inbound workers, so QUIC closes its endpoint instead of continuing to accept
+old-address dials after the loop exits. Shutdown also disconnects peers and
+drains listener/connection events with a 30-second bound, allowing
+backpressured connection tasks to release their muxers and sockets. The
+existing worker-shutdown regression also verifies reuse of the released UDP
+port. The heavy five-node native fixture now uses four runtime workers,
+matching the daemon runtime and keeping synchronous catalog work from starving
+all QUIC drivers; the original port and phase deadlines remain unchanged.
+
+Ownership lifetime and recovery inventory source qualification passes 1231
+unique cases: all 1221 ordinary workspace/all-targets cases and ten explicitly
+run native/foreign-UID cases. Native coverage includes Btrfs Git
+init/worktree/backend/retained-capture reopen, private-manifest publication
+and interrupted-key resume, renamed-root and bind-descendant placement,
+bind-file/foreign-owned locks, foreign-UID unlock-secret protection and the
+full native Git retained/source-loss/repeated-owner-loss recovery case with a
+closed-owner restart at the original QUIC endpoint. Namespace-changing cases
+do not overlap ordinary suites. All four debug programs build; format, strict
+locked workspace/all-targets Clippy, Docker lab safety and packaged
+acceptance-driver checks pass. Rust source, locked manifest and
+program/test-driver hashes remain unchanged, and native mount/loop/image
+cleanup is verified. Evidence and the distinct passing-case inventory are
+retained under `/tmp/mb-recovery-validation-c_g8ed23`. The native
+owner-restart/repeated-recovery fixture also passes a separate repeat against
+the same source and artifact hashes, with verified cleanup and evidence under
+`/tmp/mb-recovery-socket-diagnostics-ld8vcx31`. This is debug-source
+qualification; other ignored cases, installed artifacts, the enclosing
+metadata budget, normal paged backup/retention/seed-recovery integration and
+other platforms remain open.
+
+Normal Git discovery journals and fences are validated as local location
+assistance during preserved catalog inventory. Inspection checks their saved
+structure without resuming discovery or opening the source. These records do
+not block otherwise safe recovery placement. Supported Git refs up to 8,192
+bytes remain inspectable; unknown records keep their existing key/body bounds
+and still block placement. Corrupt known records reject inspection without
+changing the original catalog.
+
 Private storage manifests now open without following the final symlink or
 blocking on a FIFO, validate ownership/mode/type and the existing 64 KiB limit
 on the opened descriptor, and check descriptor and visible-path versions after

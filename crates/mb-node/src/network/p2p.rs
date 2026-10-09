@@ -3410,6 +3410,19 @@ impl P2pEventLoop {
         if let Err(error) = &result {
             self.fail_startup(format!("{error:#}"));
         }
+        // Removing a QUIC listener closes its endpoint and rejects new
+        // connections. Dropping the swarm alone can leave its endpoint driver
+        // alive while peers continue dialing the old advertised address.
+        let listeners = self
+            .direct_listeners
+            .keys()
+            .chain(self.relay_listeners.keys())
+            .copied()
+            .chain(self.tor_listener.as_ref().map(|(listener, _)| *listener))
+            .collect::<HashSet<_>>();
+        for listener in listeners {
+            self.swarm.remove_listener(listener);
+        }
         self.inbound_results.close();
         while let Some(worker) = self.inbound_workers.join_next().await {
             if let Err(error) = worker {
@@ -3418,6 +3431,35 @@ impl P2pEventLoop {
                     result = Err(anyhow::anyhow!("peer request worker panicked: {error}"));
                 }
             }
+        }
+        // Connection tasks can be waiting to deliver buffered events. Keep
+        // consuming the swarm while closing them so they release their muxers
+        // and the QUIC endpoint, rather than leaving detached tasks behind.
+        let peers = self.swarm.connected_peers().copied().collect::<Vec<_>>();
+        for peer in peers {
+            let _ = self.swarm.disconnect_peer_id(peer);
+        }
+        let drained = tokio::time::timeout(Duration::from_secs(30), async {
+            while self.swarm.listeners().next().is_some()
+                || self
+                    .swarm
+                    .network_info()
+                    .connection_counters()
+                    .num_connections()
+                    != 0
+            {
+                if let Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) =
+                    self.swarm.next().await
+                {
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                }
+            }
+        })
+        .await;
+        if drained.is_err() && result.is_ok() {
+            result = Err(anyhow::anyhow!(
+                "peer transport did not drain during shutdown"
+            ));
         }
         result
     }
@@ -32904,8 +32946,16 @@ mod tests {
         let first_task = tokio::spawn(first_loop.run());
         let mut second_task = tokio::spawn(second_loop.run());
 
+        let second_address = listening_address(&second_client).await;
+        let second_port = second_address
+            .iter()
+            .find_map(|protocol| match protocol {
+                libp2p::multiaddr::Protocol::Udp(port) => Some(port),
+                _ => None,
+            })
+            .unwrap();
         first_client
-            .add_peer_address(second_id, listening_address(&second_client).await)
+            .add_peer_address(second_id, second_address)
             .await
             .unwrap();
         let (reached, reached_receiver) = oneshot::channel();
@@ -32936,6 +32986,24 @@ mod tests {
         );
         release.send(()).unwrap();
         second_task.await.unwrap().unwrap();
+
+        let socket_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, second_port)) {
+                Ok(socket) => {
+                    drop(socket);
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        error.kind() == std::io::ErrorKind::AddrInUse
+                            && tokio::time::Instant::now() < socket_deadline,
+                        "shutdown retained its UDP listener: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
 
         first_client.shutdown().await.unwrap();
         first_task.await.unwrap().unwrap();
@@ -35117,7 +35185,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    // Match the daemon runtime: five nodes' synchronous catalog work must not
+    // starve every QUIC driver and inflate its connection-draining timers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     async fn native_git_graph_recovers_from_format_seven_packed_checkpoint() {
         use std::os::unix::fs::PermissionsExt;
@@ -35176,13 +35246,8 @@ mod tests {
         let mut nodes = Vec::new();
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
-        let mut owner_directory = Some(Node::lock_data_dir(run_root.join("node-1")).unwrap());
         for (index, seed) in seeds.iter().cloned().enumerate() {
-            let node = if index == 1 {
-                Node::open_locked(owner_directory.as_ref().unwrap().clone(), seed).unwrap()
-            } else {
-                Node::open(run_root.join(format!("node-{index}")), seed).unwrap()
-            };
+            let node = Node::open(run_root.join(format!("node-{index}")), seed).unwrap();
             let node_id = node.keys().node_id();
             let node = Arc::new(Mutex::new(node));
             let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
@@ -35409,7 +35474,7 @@ mod tests {
         std::fs::remove_dir_all(&source).unwrap();
         wipe_owner_payload_areas();
         {
-            let mut owner = nodes[1].lock().unwrap();
+            let owner = nodes[1].lock().unwrap();
             // Force reconstruction from peers: control ownership survives,
             // while local packed caches, recovery downloads and READY payloads
             // are gone along with the native source and anchor areas.
@@ -35428,19 +35493,100 @@ mod tests {
                     )
                     .unwrap();
             }
-            // Reload all control/volume state through the normal startup path
-            // under the existing exclusive directory claim. The writer mutex
-            // prevents background jobs from observing the replacement halfway.
-            *owner = Node::open_locked(owner_directory.take().unwrap(), seeds[1].clone())
-                .expect("retained migration must reopen after source and anchor loss");
-            for reference in &signed.value.data_sectors {
-                assert!(
-                    owner
-                        .sector_for_guild(&genesis.genesis.guild_id, &reference.id)
-                        .is_err()
-                );
+        }
+        // Close the owner and every worker before acquiring a new claim. A
+        // mutex around a live Node cannot substitute for its ownership lifetime.
+        clients[1].shutdown().await.unwrap();
+        tasks.remove(1).await.unwrap().unwrap();
+        for group in [
+            &mut peer_exchange_tasks,
+            &mut dht_publication_tasks,
+            &mut coding_tasks,
+            &mut holder_cleanup_tasks,
+        ] {
+            let task = group.remove(1);
+            task.abort();
+            let _ = task.await;
+        }
+        clients.remove(1);
+        let old_owner = nodes.remove(1);
+        let closing_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while Arc::strong_count(&old_owner) != 1 {
+            assert!(
+                tokio::time::Instant::now() < closing_deadline,
+                "owner workers retained the old Node during restart"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(old_owner);
+        let owner = Node::open(run_root.join("node-1"), seeds[1].clone())
+            .expect("retained migration must reopen after source and anchor loss");
+        for reference in &signed.value.data_sectors {
+            assert!(
+                owner
+                    .sector_for_guild(&genesis.genesis.guild_id, &reference.id)
+                    .is_err()
+            );
+        }
+        let owner_id = owner.keys().node_id();
+        let owner = Arc::new(Mutex::new(owner));
+        let mut reopened_config = config(owner_id);
+        reopened_config.listen_addresses = vec![addresses[1].clone()];
+        reopened_config.bootstrap_addresses = vec![endpoints[0].parse().unwrap()];
+        // Quinn's endpoint driver can retain its UDP socket while dropped
+        // connections drain. Keep the original advertised endpoint and wait
+        // only for that concrete bind failure; other startup errors fail here.
+        let socket_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let socket_address = addresses[1]
+            .iter()
+            .find_map(|protocol| match protocol {
+                libp2p::multiaddr::Protocol::Ip4(address) => Some(address),
+                _ => None,
+            })
+            .unwrap();
+        let socket_port = addresses[1]
+            .iter()
+            .find_map(|protocol| match protocol {
+                libp2p::multiaddr::Protocol::Udp(port) => Some(port),
+                _ => None,
+            })
+            .unwrap();
+        loop {
+            match std::net::UdpSocket::bind((socket_address, socket_port)) {
+                Ok(socket) => {
+                    drop(socket);
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        error.kind() == std::io::ErrorKind::AddrInUse
+                            && tokio::time::Instant::now() < socket_deadline,
+                        "owner transport failed to release its UDP endpoint: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
             }
         }
+        let (client, event_loop) = build_p2p(owner.clone(), reopened_config).unwrap();
+        nodes.insert(1, owner.clone());
+        clients.insert(1, client.clone());
+        tasks.insert(1, tokio::spawn(event_loop.run()));
+        peer_exchange_tasks.insert(
+            1,
+            tokio::spawn(run_peer_exchange(owner.clone(), client.clone())),
+        );
+        dht_publication_tasks.insert(
+            1,
+            tokio::spawn(run_dht_publications(owner.clone(), client.clone())),
+        );
+        coding_tasks.insert(
+            1,
+            tokio::spawn(run_delegated_coding_jobs(owner.clone(), client.clone())),
+        );
+        holder_cleanup_tasks.insert(
+            1,
+            tokio::spawn(run_coding_holder_cleanup_jobs(owner, client)),
+        );
         eprintln!("native Git retained migration: source and anchors erased; control reopened");
         tokio::time::timeout(
             Duration::from_secs(180),

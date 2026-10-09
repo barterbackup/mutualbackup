@@ -359,6 +359,7 @@ impl GitRepository {
             crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, &mut visit)?;
             crate::history::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::head::for_each_preserved_branch(catalog, repository_id, &mut visit)?;
+            catalog.validate_preserved_anchor_discovery_records()?;
             for_each_unclassified_preserved_record(catalog, repository_id, visit)
         })
     }
@@ -2121,16 +2122,19 @@ fn for_each_unclassified_preserved_record(
             .as_ref()
             .map(|(kind, key)| (kind.as_str(), key.as_slice())),
         512,
-        crate::stage::MAX_STAGE_PATH_BYTES,
+        crate::GIT_REF_NAME_BYTES.max(crate::stage::MAX_STAGE_PATH_BYTES),
     )? {
         let known = kind == SOURCE_BACKEND_KIND
             || kind == "anchor-area-location"
+            || kind == mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND
+            || kind == mb_store::ANCHOR_DISCOVERY_FENCE_KIND
             || KNOWN_PREFIXES
                 .iter()
                 .any(|prefix| kind.starts_with(*prefix));
         if !known {
             anyhow::ensure!(
-                length <= mb_core::V1_MAX_CATALOG_BYTES,
+                key.len() <= crate::stage::MAX_STAGE_PATH_BYTES
+                    && length <= mb_core::V1_MAX_CATALOG_BYTES,
                 "unclassified preserved Git record exceeds its row bound"
             );
             let bytes = catalog
@@ -2222,6 +2226,195 @@ mod tests {
     use mb_store::{GIT_CATALOG_DIRECTORY, git_catalog_marker};
 
     use super::*;
+
+    #[test]
+    fn preserved_inventory_accepts_discovery_assistance_and_supported_long_refs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository_id = Uuid::from_u128(280);
+        let directory = temporary.path().join(GIT_CATALOG_DIRECTORY);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = directory.join(GIT_CATALOG_MARKER_FILE);
+        std::fs::write(&marker, git_catalog_marker_bytes(repository_id)).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let key = [254; 32];
+        let control = ControlStore::open_with_key(directory.join(CATALOG_DATABASE), &key).unwrap();
+        let area_id = Uuid::from_u128(281);
+        let missing_area = temporary.path().join("unavailable-area");
+        let area = mb_store::StableAnchorAreaLocator {
+            area_id,
+            path_hint: missing_area.clone(),
+            filesystem_id: 7,
+            volume_root_hint: temporary.path().to_path_buf(),
+        };
+        let cursor = mb_store::AnchorAreaDiscovery::start(&area)
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+        let attempt = Uuid::from_u128(282);
+        let journal = canonical_bytes(&(1_u8, attempt, 7_u64, &cursor)).unwrap();
+        // Use the normal completion producer: staging leaves this durable fence.
+        control
+            .remember_anchor_area_location(area_id, &missing_area)
+            .unwrap();
+        control
+            .put_record(
+                mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                area_id.as_bytes(),
+                &journal,
+            )
+            .unwrap();
+        let ref_kind = format!("git-ref-v1/{repository_id}");
+        for length in [4096, 4097, crate::GIT_REF_NAME_BYTES] {
+            let name = format!("refs/heads/{}", "x".repeat(length - 11));
+            control
+                .put_record(
+                    &ref_kind,
+                    name.as_bytes(),
+                    &canonical_bytes(&(1_u16, [1_u8; 20])).unwrap(),
+                )
+                .unwrap();
+        }
+        let snapshot = || {
+            let mut files = std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let bytes = if entry.file_name().as_encoded_bytes().ends_with(b"-shm") {
+                        std::fs::metadata(entry.path())
+                            .unwrap()
+                            .len()
+                            .to_le_bytes()
+                            .to_vec()
+                    } else {
+                        std::fs::read(entry.path()).unwrap()
+                    };
+                    (entry.file_name(), bytes)
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        };
+        let inspect = || {
+            let before = snapshot();
+            let mut refs = Vec::new();
+            GitRepository::for_each_preserved_record(
+                temporary.path(),
+                repository_id,
+                &key,
+                |record| {
+                    match record {
+                        PreservedGitRecord::Reference { name, .. } => refs.push(name.len()),
+                        PreservedGitRecord::AnchorAreaLocation { .. } => {}
+                        _ => panic!("discovery assistance must not become opaque ownership"),
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            refs.sort();
+            assert_eq!(refs, [4096, 4097, crate::GIT_REF_NAME_BYTES]);
+            assert_eq!(snapshot(), before);
+            assert!(!missing_area.exists());
+        };
+        inspect();
+        let bad_ref = format!(
+            "refs/heads/{}",
+            "x".repeat(crate::GIT_REF_NAME_BYTES + 1 - 11)
+        );
+        control
+            .put_record(
+                &ref_kind,
+                bad_ref.as_bytes(),
+                &canonical_bytes(&(1_u16, [1_u8; 20])).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            GitRepository::for_each_preserved_record(
+                temporary.path(),
+                repository_id,
+                &key,
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        control
+            .delete_record(&ref_kind, bad_ref.as_bytes())
+            .unwrap();
+        let journal_kind = mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND;
+        let fence_kind = mb_store::ANCHOR_DISCOVERY_FENCE_KIND;
+        let original_fence = control
+            .get_record(fence_kind, area_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        for (kind, id, bytes) in [
+            (
+                journal_kind,
+                area_id.as_bytes().to_vec(),
+                canonical_bytes(&(2_u8, attempt, 7_u64, &cursor)).unwrap(),
+            ),
+            (
+                journal_kind,
+                area_id.as_bytes().to_vec(),
+                canonical_bytes(&(1_u8, Uuid::nil(), 7_u64, &cursor)).unwrap(),
+            ),
+            (
+                journal_kind,
+                area_id.as_bytes().to_vec(),
+                canonical_bytes(&(1_u8, attempt, 7_u64, b"corrupt cursor".to_vec())).unwrap(),
+            ),
+            (
+                journal_kind,
+                Uuid::from_u128(283).as_bytes().to_vec(),
+                journal.clone(),
+            ),
+            (
+                journal_kind,
+                Uuid::nil().as_bytes().to_vec(),
+                journal.clone(),
+            ),
+            (journal_kind, vec![1; 17], journal.clone()),
+            (
+                journal_kind,
+                area_id.as_bytes().to_vec(),
+                vec![0; mb_store::ANCHOR_DISCOVERY_CHECKPOINT_BYTES + 65],
+            ),
+            (
+                fence_kind,
+                area_id.as_bytes().to_vec(),
+                Uuid::nil().as_bytes().to_vec(),
+            ),
+            (fence_kind, area_id.as_bytes().to_vec(), vec![1; 17]),
+            (
+                fence_kind,
+                Uuid::nil().as_bytes().to_vec(),
+                original_fence.clone(),
+            ),
+            (fence_kind, vec![1; 17], original_fence.clone()),
+        ] {
+            control.put_record(kind, &id, &bytes).unwrap();
+            let before = snapshot();
+            assert!(
+                GitRepository::for_each_preserved_record(
+                    temporary.path(),
+                    repository_id,
+                    &key,
+                    |_| Ok(())
+                )
+                .is_err()
+            );
+            assert_eq!(snapshot(), before);
+            control.delete_record(kind, &id).unwrap();
+            control
+                .put_record(journal_kind, area_id.as_bytes(), &journal)
+                .unwrap();
+            control
+                .put_record(fence_kind, area_id.as_bytes(), &original_fence)
+                .unwrap();
+        }
+        drop(control);
+        inspect();
+    }
 
     #[test]
     fn preserved_catalog_keeps_original_backend_binding_and_unknown_row_hashes_without_mutation() {

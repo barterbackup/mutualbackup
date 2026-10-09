@@ -1768,9 +1768,40 @@ mod tests {
                     &canonical_bytes(&(1_u16, repository_id, backend)).unwrap(),
                 )
                 .unwrap();
+            let area_id = Uuid::from_u128(273);
+            let area_path = repository.join("missing-discovery-area");
+            external
+                .remember_anchor_area_location(area_id, &area_path)
+                .unwrap();
+            let cursor = mb_store::AnchorAreaDiscovery::start(&mb_store::StableAnchorAreaLocator {
+                area_id,
+                path_hint: area_path.clone(),
+                filesystem_id: 7,
+                volume_root_hint: repository.clone(),
+            })
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+            external
+                .put_record(
+                    mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                    area_id.as_bytes(),
+                    &canonical_bytes(&(1_u8, Uuid::from_u128(274), 7_u64, cursor)).unwrap(),
+                )
+                .unwrap();
+            let long_ref = format!("refs/heads/{}", "x".repeat(mb_git::GIT_REF_NAME_BYTES - 11));
+            external
+                .put_record(
+                    &format!("git-ref-v1/{repository_id}"),
+                    long_ref.as_bytes(),
+                    &canonical_bytes(&(1_u16, [1_u8; 20])).unwrap(),
+                )
+                .unwrap();
             let known =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
             assert!(known.local_state.unclassified_git_records.is_empty());
+            assert_eq!(known.local_state.git_references.len(), 1);
+            assert!(!area_path.exists());
             assert_eq!(
                 known.local_state.git_repositories[0].saved_source_backend,
                 Some(LegacySavedGitBackend {
@@ -1781,6 +1812,22 @@ mod tests {
             assert!(
                 super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_ok()
             );
+            assert!(
+                super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                    .is_ok()
+            );
+            // Keep the independent unknown-owner accounting fixture below
+            // limited to its original backend binding and opaque records.
+            for kind in [
+                "anchor-area-location",
+                mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND,
+                mb_store::ANCHOR_DISCOVERY_FENCE_KIND,
+            ] {
+                external.delete_record(kind, area_id.as_bytes()).unwrap();
+            }
+            external
+                .delete_record(&format!("git-ref-v1/{repository_id}"), long_ref.as_bytes())
+                .unwrap();
             let private_key = b"private unknown Git key";
             let private_body = b"private unknown Git payload";
             for kind in ["git-guarded-original-v1", "future-ownership-record-v2"] {

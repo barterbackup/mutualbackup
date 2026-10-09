@@ -27,7 +27,8 @@ mod scratch_space;
 mod variable_information_upgrade_tests;
 #[cfg(target_os = "linux")]
 pub use anchor_discovery::{
-    ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage, AnchorDiscoveryJobStatus,
+    ANCHOR_DISCOVERY_FENCE_KIND, ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage,
+    AnchorDiscoveryJobStatus,
 };
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
