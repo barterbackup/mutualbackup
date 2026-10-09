@@ -67,10 +67,11 @@ pub use database::{
     CatalogPagedCheckpointRetentionState, CatalogPayloadRetirementView, CatalogPublicationView,
     CatalogQuorumPagedCheckpointIndex, CatalogSectorSource, CatalogSourceSweep, CatalogStoreError,
     CatalogValidatedCoding, CatalogValidatedLink, CheckpointRow, ControlStore, DatabaseError,
-    DatabaseShellResult, KindedProtocolRecordRow, ObjectAttemptState, PAGED_DATA_RECIPE_BYTES,
-    PagedCatalogDataSource, PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
-    ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow, ReadyVariableObject,
-    RecordScratchStore, RecoveryShardLocator, ScratchStorageLimits, VariableParityObject,
+    DatabaseShellResult, KindedProtocolRecordMetadata, KindedProtocolRecordRow, ObjectAttemptState,
+    PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
+    PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore,
+    ProtocolRecordRow, ReadyVariableObject, RecordScratchStore, RecoveryShardLocator,
+    ScratchStorageLimits, VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";

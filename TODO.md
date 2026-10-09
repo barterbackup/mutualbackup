@@ -781,6 +781,42 @@ remain active.
     complete volume receipt/recipe/pin/intent ownership inventory, relocated
     volume discovery, mount-descendant aliases, atomic path/ownership handoff,
     installed-artifact qualification or the full R1/R2/R3/release gates.
+  - [x] Expose original Git backend bindings and unclassified catalog records.
+    `legacy-list` format 18 exposes original Git source-backend bindings and
+    every unclassified external-catalog row. The original private v1 binding
+    retains repository UUID and backend only; it records no root identity and
+    absence never synthesizes one. Its bounded canonical reader accepts
+    historical withdrawn backend metadata without invoking enrollment or
+    replay. Unclassified records expose kind, key/body byte lengths and
+    hashes; raw keys and bodies remain private and ownership verification
+    stays false. Placement rejects any unclassified row before scratch or
+    export creation because its owners cannot be reconciled. A new indexed
+    store lookup returns one bounded owned kind/key and body length, releasing
+    the SQL statement before callers run; unknown bodies are admitted before
+    bounded allocation, while known metadata retains its original 64 MiB
+    limit. The caller holds the existing read snapshot. Kind/key/body
+    boundaries, malformed original bindings, exact unknown limits, known 64
+    MiB metadata, cursor checkpoint release, closed/WAL-only/live catalogs,
+    full report accounting, late corruption and actual CLI
+    diagnostic/placement cases preserve original inputs. The metadata helper
+    does not explain the original missing-signer recovery stall. Complete
+    ref/object/pin/index/worktree and physical source/history joins, relative
+    or relocated owner discovery, atomic writer/path handoff and shared
+    resource budgets remain unresolved. Family visibility does not establish
+    full catalog, history or payload verification. External Git catalog
+    coverage qualification passes 556 unique cases: 55 export/peer cases, all
+    294 ordinary store, 63 volume and 116 Git cases, 21 CLI process cases,
+    retained-graph/discovery/withdrawal/graph-intent regressions and two
+    provisioned Btrfs identity/retained-capture cases. All four debug programs
+    build; format and strict locked workspace/all-targets Clippy pass. All 284
+    source-file and eight program/test-driver hashes remain unchanged, and
+    native mount/loop/image cleanup is verified. Evidence and the distinct
+    passing-case inventory are retained under
+    `/tmp/mb-m6-git-catalog-coverage-validation-ozyro576`; the post-commit
+    audit binds the code to the commit. This is focused debug-source
+    qualification; complete ordinary/native Node suites, installed artifacts
+    and other platforms were not rerun. All remaining milestone and
+    installed/platform gates stay open.
   - [x] Inventory original checkout, restore and reset ownership journals.
     `legacy-list` format 17 inventories original checkout/restore/reset
     versions 1 through 11 and linked-worktree envelopes 1 through 3. Pure

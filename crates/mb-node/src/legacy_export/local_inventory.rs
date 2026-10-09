@@ -36,6 +36,7 @@ pub use git_intents::{
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyLocalStateInventory {
+    pub unclassified_git_records: Vec<LegacyUnclassifiedGitRecord>,
     pub protected_roots: Vec<LegacyRootRegistration>,
     pub source_backends: Vec<LegacySourceBinding>,
     pub git_repositories: Vec<LegacyGitRegistration>,
@@ -91,6 +92,9 @@ pub struct LegacySourceBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyGitRegistration {
+    pub saved_source_backend: Option<LegacySavedGitBackend>,
+    pub source_backend_binding_inventoried: bool,
+    pub unclassified_records_inventoried: bool,
     pub repository_id: Uuid,
     pub path_hex: String,
     pub registered_root: bool,
@@ -118,6 +122,23 @@ pub struct LegacyGitRegistration {
     pub merge_blob_intents_inventoried: bool,
     pub checkout_intents_inventoried: bool,
     pub signed_revision_ids: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacySavedGitBackend {
+    pub record_format: u16,
+    pub backend: mb_store::SourceBackendKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyUnclassifiedGitRecord {
+    pub repository_id: Uuid,
+    pub kind: String,
+    pub record_key_bytes: u64,
+    pub record_key_hash: String,
+    pub record_bytes: u64,
+    pub record_hash: String,
+    pub ownership_verified: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -915,6 +936,47 @@ pub(super) fn collect_external_git_records(
                     .pending_git_fetches
                     .push(git_intents::report_fetch(*intent, used, limit)?);
             }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::SourceBackend {
+                repository_id,
+                record_format,
+                backend,
+            }) => {
+                let entry = LegacySavedGitBackend {
+                    record_format,
+                    backend,
+                };
+                account(&entry, used, limit)?;
+                let registration = report
+                    .git_repositories
+                    .iter_mut()
+                    .find(|entry| entry.repository_id == repository_id)
+                    .context("preserved Git backend has no registration")?;
+                ensure!(
+                    registration.saved_source_backend.is_none(),
+                    "duplicate preserved Git source backend"
+                );
+                registration.saved_source_backend = Some(entry);
+            }
+            PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::Unclassified {
+                repository_id,
+                kind,
+                key_bytes,
+                key_hash,
+                record_bytes,
+                record_hash,
+            }) => {
+                let entry = LegacyUnclassifiedGitRecord {
+                    repository_id,
+                    kind,
+                    record_key_bytes: key_bytes,
+                    record_key_hash: hex::encode(key_hash),
+                    record_bytes,
+                    record_hash: hex::encode(record_hash),
+                    ownership_verified: false,
+                };
+                account(&entry, used, limit)?;
+                report.unclassified_git_records.push(entry);
+            }
             PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::CheckoutIntent(
                 intent,
             )) => {
@@ -1083,6 +1145,8 @@ pub(super) fn collect_external_git_records(
                 registration.merge_sessions_inventoried = available;
                 registration.merge_blob_intents_inventoried = available;
                 registration.checkout_intents_inventoried = available;
+                registration.source_backend_binding_inventoried = available;
+                registration.unclassified_records_inventoried = available;
             }
         }
         Ok(())
@@ -1283,6 +1347,7 @@ pub(super) fn collect(
         pending_git_merge_sessions: Vec::new(),
         pending_git_merge_blobs: Vec::new(),
         pending_git_checkouts: Vec::new(),
+        unclassified_git_records: Vec::new(),
         pending_git_blob_imports: Vec::new(),
         verified_git_fetch_blobs: Vec::new(),
         storage_volumes: Vec::new(),
@@ -1357,6 +1422,9 @@ pub(super) fn collect(
                     merge_sessions_inventoried: false,
                     merge_blob_intents_inventoried: false,
                     checkout_intents_inventoried: false,
+                    saved_source_backend: None,
+                    source_backend_binding_inventoried: false,
+                    unclassified_records_inventoried: false,
                     signed_revision_ids: Vec::new(),
                 };
                 account(&entry, used, limit)?;
@@ -1650,6 +1718,229 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_export_backend_and_unclassified_git_records_remain_private_and_fence_placement() {
+        use std::os::unix::fs::PermissionsExt;
+        for journal in ["closed", "wal-only", "live"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let data = temporary.path().join("state");
+            let repository = temporary.path().join("repository");
+            let safe = temporary.path().join("safe");
+            for path in [&data, &repository, &safe] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([255; 32]));
+            let repository_id = Uuid::from_u128(272);
+            let control_path = data.join("control.db");
+            let control = ControlStore::open(&control_path, &keys).unwrap();
+            control
+                .put_record(
+                    "git-repository",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&GitRepositoryInfo {
+                        format_version: 1,
+                        repository_id,
+                        path: repository.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let directory = repository.join(mb_store::GIT_CATALOG_DIRECTORY);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = directory.join(mb_store::GIT_CATALOG_MARKER_FILE);
+            std::fs::write(&marker, mb_store::git_catalog_marker_bytes(repository_id)).unwrap();
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let external_path = directory.join("catalog.db");
+            let external = ControlStore::open_with_key(
+                &external_path,
+                &mb_git::catalog_key(&keys, repository_id),
+            )
+            .unwrap();
+            let backend = if journal == "closed" {
+                mb_store::SourceBackendKind::GuardedLinkFreezeV1
+            } else {
+                mb_store::SourceBackendKind::ReflinkV1
+            };
+            external
+                .put_record(
+                    "git-source-backend-v1",
+                    repository_id.as_bytes(),
+                    &canonical_bytes(&(1_u16, repository_id, backend)).unwrap(),
+                )
+                .unwrap();
+            let known =
+                super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+            assert!(known.local_state.unclassified_git_records.is_empty());
+            assert_eq!(
+                known.local_state.git_repositories[0].saved_source_backend,
+                Some(LegacySavedGitBackend {
+                    record_format: 1,
+                    backend
+                })
+            );
+            assert!(
+                super::super::remote::export_parent_preflight(&keys, &data, &safe, &[]).is_ok()
+            );
+            let private_key = b"private unknown Git key";
+            let private_body = b"private unknown Git payload";
+            for kind in ["git-guarded-original-v1", "future-ownership-record-v2"] {
+                external
+                    .put_record(kind, private_key, private_body)
+                    .unwrap();
+            }
+            let mut writers = Some((control, external));
+            if journal == "closed" {
+                drop(writers.take());
+            }
+            if journal == "wal-only" {
+                for path in [&control_path, &external_path] {
+                    std::fs::remove_file(path.with_extension("db-shm")).unwrap();
+                }
+            }
+            let snapshot = |path: &Path| {
+                let mut files = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        let bytes = if entry.file_name().as_bytes().ends_with(b"-shm") {
+                            std::fs::metadata(entry.path())
+                                .unwrap()
+                                .len()
+                                .to_le_bytes()
+                                .to_vec()
+                        } else {
+                            std::fs::read(entry.path()).unwrap()
+                        };
+                        (entry.file_name(), bytes)
+                    })
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
+            };
+            let before = (snapshot(&data), snapshot(&directory));
+            let report =
+                super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+            assert_eq!(report.format_version, 18);
+            assert!(!report.retained_history_complete);
+            let registration = &report.local_state.git_repositories[0];
+            assert!(
+                registration.source_backend_binding_inventoried
+                    && registration.unclassified_records_inventoried
+            );
+            assert!(!registration.catalog_inventoried);
+            assert_eq!(
+                registration.saved_source_backend,
+                Some(LegacySavedGitBackend {
+                    record_format: 1,
+                    backend
+                })
+            );
+            assert_eq!(report.local_state.unclassified_git_records.len(), 2);
+            for record in &report.local_state.unclassified_git_records {
+                assert_eq!(record.repository_id, repository_id);
+                assert!(
+                    ["git-guarded-original-v1", "future-ownership-record-v2"]
+                        .contains(&record.kind.as_str())
+                );
+                assert_eq!(record.record_key_bytes, private_key.len() as u64);
+                assert_eq!(
+                    record.record_key_hash,
+                    hex::encode(blake3::hash(private_key).as_bytes())
+                );
+                assert_eq!(record.record_bytes, private_body.len() as u64);
+                assert_eq!(
+                    record.record_hash,
+                    hex::encode(blake3::hash(private_body).as_bytes())
+                );
+                assert!(!record.ownership_verified);
+            }
+            let json = serde_json::to_vec(&report).unwrap();
+            let text = String::from_utf8_lossy(&json);
+            for private in [private_key.as_slice(), private_body.as_slice()] {
+                assert!(!text.contains(std::str::from_utf8(private).unwrap()));
+                assert!(!text.contains(&hex::encode(private)));
+            }
+            assert_eq!(
+                serde_json::from_slice::<super::super::LegacyRevisionInventory>(&json).unwrap(),
+                report
+            );
+            assert!(
+                super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("unclassified Git ownership")
+            );
+            assert!(
+                super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+            let cost = canonical_size_bounded(&report, V1_MAX_CATALOG_BYTES).unwrap();
+            assert!(super::super::inventory::inventory_catalog(&keys, &data, cost, None).is_ok());
+            assert!(
+                super::super::inventory::inventory_catalog(&keys, &data, cost - 1, None).is_err()
+            );
+            crate::volume::with_inspected_control_snapshot(&data, &keys, |control| {
+                let mut local = collect(control, &mut 0, V1_MAX_CATALOG_BYTES)?;
+                let mut used = 0;
+                collect_external_git_records(
+                    control,
+                    &keys,
+                    &mut local,
+                    &mut used,
+                    V1_MAX_CATALOG_BYTES,
+                )?;
+                let mut expected = 0;
+                account(
+                    local.git_repositories[0]
+                        .saved_source_backend
+                        .as_ref()
+                        .unwrap(),
+                    &mut expected,
+                    V1_MAX_CATALOG_BYTES,
+                )?;
+                for record in &local.unclassified_git_records {
+                    account(record, &mut expected, V1_MAX_CATALOG_BYTES)?;
+                }
+                assert_eq!(used, expected);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!((snapshot(&data), snapshot(&directory)), before);
+            if journal == "closed" {
+                let external = ControlStore::open_with_key(
+                    &external_path,
+                    &mb_git::catalog_key(&keys, repository_id),
+                )
+                .unwrap();
+                external
+                    .put_record(
+                        "git-source-backend-v1",
+                        repository_id.as_bytes(),
+                        &canonical_bytes(&(2_u16, repository_id, backend)).unwrap(),
+                    )
+                    .unwrap();
+                drop(external);
+                let corrupted = (snapshot(&data), snapshot(&directory));
+                assert!(
+                    super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).is_err()
+                );
+                assert!(
+                    super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                        .is_err()
+                );
+                assert!(
+                    super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                        .is_err()
+                );
+                assert_eq!((snapshot(&data), snapshot(&directory)), corrupted);
+            }
+            drop(writers);
+        }
+    }
+
+    #[test]
     fn legacy_export_checkout_journals_keep_native_roots_indexes_and_relocated_directory_owners() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         for journal in ["closed", "wal-only", "live"] {
@@ -1847,7 +2138,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -2227,7 +2518,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -2649,7 +2940,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.pending_git_fetches.len(), 2);
             assert_eq!(report.local_state.pending_git_blob_imports.len(), 2);
@@ -2986,7 +3277,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -3292,7 +3583,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -3715,7 +4006,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert!(
                 report.local_state.git_worktrees.is_empty()
@@ -4092,7 +4383,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&catalog_directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert!(report.local_state.git_worktrees.is_empty());
             assert!(report.local_state.git_indexes.is_empty());
@@ -4443,7 +4734,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_object_anchors.len(), 3);
             assert_eq!(report.local_state.git_indexes.len(), 3);
@@ -4766,13 +5057,6 @@ mod tests {
                 std::os::unix::fs::symlink(&moved, &alias).unwrap();
                 locations.push((info, moved, alias));
             }
-            external
-                .put_record(
-                    "git-guarded-stage-receipt-v1/preserved",
-                    b"old",
-                    b"retained opaque evidence",
-                )
-                .unwrap();
             let mut writers = Some((control, external));
             if mode == "closed" {
                 drop(writers.take());
@@ -4806,7 +5090,7 @@ mod tests {
             let before = (snapshot(&data), snapshot(&directory));
             let report =
                 super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             assert_eq!(report.local_state.git_worktrees.len(), 3);
             let json = serde_json::to_vec(&report).unwrap();
@@ -4884,6 +5168,46 @@ mod tests {
                 .unwrap();
                 external
                     .put_record(
+                        "git-guarded-stage-receipt-v1/preserved",
+                        b"old",
+                        b"retained opaque evidence",
+                    )
+                    .unwrap();
+                drop(external);
+                let opaque_before = (snapshot(&data), snapshot(&directory));
+                let opaque =
+                    super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
+                assert_eq!(opaque.local_state.git_worktrees.len(), 3);
+                assert_eq!(opaque.local_state.unclassified_git_records.len(), 1);
+                assert_eq!(
+                    opaque.local_state.unclassified_git_records[0].kind,
+                    "git-guarded-stage-receipt-v1/preserved"
+                );
+                assert_eq!(
+                    opaque.local_state.unclassified_git_records[0].record_hash,
+                    hex::encode(blake3::hash(b"retained opaque evidence").as_bytes())
+                );
+                assert!(
+                    super::super::remote::peer_client_preflight(&keys, &data, &safe, &[], false)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unclassified Git ownership")
+                );
+                assert!(
+                    super::super::remote::export_parent_preflight(&keys, &data, &safe, &[])
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("unclassified Git ownership")
+                );
+                assert_eq!((snapshot(&data), snapshot(&directory)), opaque_before);
+                let external = ControlStore::open_with_key(
+                    &external_path,
+                    &mb_git::catalog_key(&keys, repository_id),
+                )
+                .unwrap();
+                external
+                    .put_record(
                         &format!("git-linked-worktree-v1/{repository_id}"),
                         Uuid::from_u128(999).as_bytes(),
                         b"damaged late worktree",
@@ -4933,7 +5257,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 17);
+        assert_eq!(report.format_version, 18);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.local_sectors.len(), 1);
         let entry = &report.local_state.local_sectors[0];
@@ -5055,7 +5379,7 @@ mod tests {
         let before = preserved_files(&data);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 17);
+        assert_eq!(report.format_version, 18);
         assert!(!report.retained_history_complete);
         assert_eq!(report.local_state.volume_ownership.len(), 1);
         let entry = &report.local_state.volume_ownership[0];
@@ -5108,7 +5432,7 @@ mod tests {
         let before_volume = preserved_files(&volume);
         let report =
             super::super::inventory_withdrawn_revisions_from_catalog(&keys, &data).unwrap();
-        assert_eq!(report.format_version, 17);
+        assert_eq!(report.format_version, 18);
         assert!(!report.retained_history_complete);
         assert!(report.revisions.is_empty());
         let volumes = &report.local_state.storage_volumes;
@@ -5527,7 +5851,7 @@ mod tests {
             let report =
                 super::super::inventory::inventory_withdrawn_revisions_from_catalog(&keys, &data)
                     .unwrap();
-            assert_eq!(report.format_version, 17);
+            assert_eq!(report.format_version, 18);
             assert!(!report.retained_history_complete);
             let local = &report.local_state;
             assert_eq!(local.protected_roots.len(), 3);

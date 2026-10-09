@@ -67,6 +67,7 @@ const CHECKPOINT_LEGACY_EPOCH_KIND: &str = "guild-checkpoint-legacy-epoch";
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 pub type ProtocolRecordRow = (Vec<u8>, Vec<u8>);
 pub type KindedProtocolRecordRow = (String, Vec<u8>, Vec<u8>);
+pub type KindedProtocolRecordMetadata = (String, Vec<u8>, usize);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatabaseShellResult {
@@ -691,6 +692,46 @@ impl ControlStore {
             .optional()?;
         row.map(|(key, length)| {
             Ok((
+                key.ok_or(DatabaseError::Integrity)?,
+                usize::try_from(length).map_err(|_| DatabaseError::Integrity)?,
+            ))
+        })
+        .transpose()
+    }
+
+    /// Return one bounded kind/key and its byte length without materializing
+    /// the payload. The indexed lookup releases its statement before return;
+    /// callers need an enclosing snapshot when admitting and then reading it.
+    pub fn next_kinded_record_metadata_bounded(
+        &self,
+        after: Option<(&str, &[u8])>,
+        kind_limit: usize,
+        key_limit: usize,
+    ) -> Result<Option<KindedProtocolRecordMetadata>, DatabaseError> {
+        let kind_limit = i64::try_from(kind_limit).map_err(|_| DatabaseError::Integrity)?;
+        let key_limit = i64::try_from(key_limit).map_err(|_| DatabaseError::Integrity)?;
+        let sql = if after.is_some() {
+            "SELECT CASE WHEN length(CAST(kind AS BLOB)) <= ?3 THEN kind END,
+                    CASE WHEN length(CAST(record_id AS BLOB)) <= ?4 THEN record_id END,
+                    length(CAST(bytes AS BLOB))
+             FROM protocol_records WHERE (kind, record_id) > (?1, ?2)
+             ORDER BY kind, record_id LIMIT 1"
+        } else {
+            "SELECT CASE WHEN length(CAST(kind AS BLOB)) <= ?3 THEN kind END,
+                    CASE WHEN length(CAST(record_id AS BLOB)) <= ?4 THEN record_id END,
+                    length(CAST(bytes AS BLOB))
+             FROM protocol_records ORDER BY kind, record_id LIMIT 1"
+        };
+        let (kind, key) = after.map_or((None, None), |(kind, key)| (Some(kind), Some(key)));
+        let row: Option<(Option<String>, Option<Vec<u8>>, i64)> = self
+            .connection
+            .query_row(sql, params![kind, key, kind_limit, key_limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        row.map(|(kind, key, length)| {
+            Ok((
+                kind.ok_or(DatabaseError::Integrity)?,
                 key.ok_or(DatabaseError::Integrity)?,
                 usize::try_from(length).map_err(|_| DatabaseError::Integrity)?,
             ))
@@ -4656,6 +4697,136 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn kinded_metadata_lookup_admits_before_payload_and_releases_its_index_cursor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog.db");
+        let key = [173; 32];
+        let store = ControlStore::open_with_key(&path, &key).unwrap();
+        let rows = [
+            ("", b"".to_vec(), 0),
+            ("%", vec![0], 7),
+            ("_", vec![255], 1024 * 1024 + 1),
+            ("last", vec![1, 2], 3),
+        ];
+        for (kind, key, length) in &rows {
+            store.put_record(kind, key, &vec![3; *length]).unwrap();
+        }
+        // Multibyte content is measured in bytes, not Unicode characters.
+        store
+            .connection
+            .execute(
+                "INSERT INTO protocol_records(kind,record_id,bytes) VALUES(?1,?2,?3)",
+                params!["unicode", b"key".as_slice(), "ééé".as_bytes()],
+            )
+            .unwrap();
+        let mut after = None::<(String, Vec<u8>)>;
+        let mut metadata = Vec::new();
+        while let Some((kind, key, length)) = store
+            .next_kinded_record_metadata_bounded(
+                after
+                    .as_ref()
+                    .map(|(kind, key)| (kind.as_str(), key.as_slice())),
+                16,
+                8,
+            )
+            .unwrap()
+        {
+            metadata.push((kind.clone(), key.clone(), length));
+            after = Some((kind, key));
+        }
+        let mut expected = rows
+            .iter()
+            .map(|(kind, key, length)| (kind.to_string(), key.clone(), *length))
+            .collect::<Vec<_>>();
+        expected.push(("unicode".into(), b"key".to_vec(), 6));
+        assert_eq!(metadata, expected);
+        let oversized = &metadata[2];
+        assert_eq!(oversized.2, 1024 * 1024 + 1);
+        assert!(
+            store
+                .get_record_bounded(&oversized.0, &oversized.1, 1024 * 1024)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_record_bounded("unicode", b"key", 8)
+                .unwrap()
+                .unwrap()
+                .len(),
+            6
+        );
+        let other = ControlStore::open_with_key(&path, &key).unwrap();
+        let _metadata = store
+            .next_kinded_record_metadata_bounded(None, 16, 8)
+            .unwrap()
+            .unwrap();
+        let busy: i64 = other
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 0);
+        other
+            .put_record("after-lookup", b"writer", b"live")
+            .unwrap();
+        assert!(
+            store
+                .get_record_bounded("after-lookup", b"writer", 4)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .next_kinded_record_metadata_bounded(None, usize::MAX, 8)
+                .is_err()
+        );
+        assert!(
+            store
+                .next_kinded_record_metadata_bounded(None, 16, usize::MAX)
+                .is_err()
+        );
+        // Simulate damaged historical storage without weakening the normal
+        // STRICT table, which correctly refuses TEXT in its BLOB column.
+        let damaged =
+            ControlStore::open_with_key(temporary.path().join("damaged.db"), &[175; 32]).unwrap();
+        damaged.connection.execute_batch("DROP TABLE protocol_records;
+            CREATE TABLE protocol_records(kind TEXT NOT NULL,record_id BLOB NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(kind,record_id)) WITHOUT ROWID;").unwrap();
+        damaged
+            .connection
+            .execute(
+                "INSERT INTO protocol_records VALUES(?1,?2,?3)",
+                params!["unicode", b"key".as_slice(), "ééé"],
+            )
+            .unwrap();
+        assert_eq!(
+            damaged
+                .next_kinded_record_metadata_bounded(None, 16, 8)
+                .unwrap()
+                .unwrap()
+                .2,
+            6
+        );
+        assert!(damaged.get_record_bounded("unicode", b"key", 8).is_err());
+        for (index, kind, key, valid) in [
+            (0, "€", vec![1, 2], true),
+            (1, "éé", vec![1, 2], false),
+            (2, "€", vec![1, 2, 3], false),
+        ] {
+            let store = ControlStore::open_with_key(
+                temporary.path().join(format!("bounds-{index}.db")),
+                &[174; 32],
+            )
+            .unwrap();
+            store.put_record(kind, &key, b"payload").unwrap();
+            assert_eq!(
+                store
+                    .next_kinded_record_metadata_bounded(None, 3, 2)
+                    .is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]

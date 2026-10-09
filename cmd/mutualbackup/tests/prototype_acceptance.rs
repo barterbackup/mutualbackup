@@ -3824,6 +3824,18 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     .unwrap();
     external_store
         .put_record(
+            "git-source-backend-v1",
+            repository_id.as_bytes(),
+            &canonical_bytes(&(
+                1_u16,
+                repository_id,
+                mb_store::SourceBackendKind::GuardedLinkFreezeV1,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    external_store
+        .put_record(
             &format!("git-linked-worktree-v1/{repository_id}"),
             worktree_id.as_bytes(),
             &canonical_bytes(&worktree_info).unwrap(),
@@ -4538,7 +4550,7 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     );
     let inventory: mb_node::LegacyRevisionInventory =
         serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(inventory.format_version, 17);
+    assert_eq!(inventory.format_version, 18);
     assert!(!inventory.retained_history_complete);
     assert_eq!(inventory.revisions.len(), 1);
     assert_eq!(inventory.revisions[0].revision_id, revision_id);
@@ -4566,6 +4578,18 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
     assert!(!filler_entry.payloads_verified);
     assert!(!inventory.local_state.git_repositories[0].registered_root);
     let git_registration = &inventory.local_state.git_repositories[0];
+    assert!(
+        git_registration.source_backend_binding_inventoried
+            && git_registration.unclassified_records_inventoried
+    );
+    assert_eq!(
+        git_registration.saved_source_backend,
+        Some(mb_node::LegacySavedGitBackend {
+            record_format: 1,
+            backend: mb_store::SourceBackendKind::GuardedLinkFreezeV1
+        })
+    );
+    assert!(inventory.local_state.unclassified_git_records.is_empty());
     assert!(git_registration.external_catalog_available);
     assert!(git_registration.linked_worktrees_inventoried);
     assert!(git_registration.object_anchors_inventoried);
@@ -5406,6 +5430,64 @@ fn legacy_export_cli_runs_offline_and_preserves_original_inputs() {
         original_parity
     );
     assert!(!parity_volume.join(".mutualbackup-volume").exists());
+    assert!(!catalog.join("control.key").exists());
+    let external = mb_store::ControlStore::open_with_key(
+        external_catalog.join("catalog.db"),
+        &mb_git::catalog_key(&keys, repository_id),
+    )
+    .unwrap();
+    let opaque_key = b"private opaque CLI key";
+    let opaque_body = b"private opaque CLI payload";
+    external
+        .put_record("future-ownership-record-v2", opaque_key, opaque_body)
+        .unwrap();
+    drop(external);
+    let opaque_external = external_files();
+    let listed_opaque = run_output(program("mutualbackup"), &list_args, CLI_TIMEOUT).unwrap();
+    assert!(
+        listed_opaque.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed_opaque.stderr)
+    );
+    let opaque_inventory: mb_node::LegacyRevisionInventory =
+        serde_json::from_slice(&listed_opaque.stdout).unwrap();
+    assert_eq!(opaque_inventory.format_version, 18);
+    assert!(!opaque_inventory.retained_history_complete);
+    assert_eq!(
+        opaque_inventory.local_state.unclassified_git_records.len(),
+        1
+    );
+    let opaque = &opaque_inventory.local_state.unclassified_git_records[0];
+    assert_eq!(opaque.repository_id, repository_id);
+    assert_eq!(opaque.kind, "future-ownership-record-v2");
+    assert_eq!(
+        opaque.record_key_hash,
+        hex::encode(blake3::hash(opaque_key).as_bytes())
+    );
+    assert_eq!(
+        opaque.record_hash,
+        hex::encode(blake3::hash(opaque_body).as_bytes())
+    );
+    assert!(!opaque.ownership_verified);
+    for private in [opaque_key.as_slice(), opaque_body.as_slice()] {
+        assert!(
+            !String::from_utf8_lossy(&listed_opaque.stdout)
+                .contains(std::str::from_utf8(private).unwrap())
+        );
+        assert!(!String::from_utf8_lossy(&listed_opaque.stdout).contains(&hex::encode(private)));
+    }
+    let opaque_destination = temp.path().join("opaque-rejected-export");
+    let mut opaque_export = catalog_args.clone();
+    opaque_export[destination_index] = opaque_destination.clone().into_os_string();
+    for args in [&opaque_export, &peer_list_args] {
+        let rejected = run_output(program("mutualbackup"), args, CLI_TIMEOUT).unwrap();
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("unclassified Git ownership"));
+    }
+    assert!(!opaque_destination.exists());
+    assert_eq!(external_files(), opaque_external);
+    assert_eq!(fs::read(catalog.join("control.db")).unwrap(), original);
     assert!(!catalog.join("control.key").exists());
     let invalid = run_output(
         program("mutualbackup"),

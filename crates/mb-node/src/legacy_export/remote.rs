@@ -289,6 +289,16 @@ impl PreservedParentCheck {
                     self.check_hint(&intent.source_root)?;
                     self.check_hint(&intent.source_path)?;
                 }
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::SourceBackend {
+                    ..
+                }) => {}
+                PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::Unclassified {
+                    ..
+                }) => {
+                    anyhow::bail!(
+                        "cannot place recovery output while preserved catalog has unclassified Git ownership records"
+                    );
+                }
                 PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::CheckoutIntent(
                     intent,
                 )) => {

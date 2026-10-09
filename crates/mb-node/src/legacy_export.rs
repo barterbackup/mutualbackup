@@ -25,9 +25,10 @@ pub use local_inventory::{
     LegacyPendingGitMergeBlob, LegacyPendingGitMergeSession, LegacyPendingGitPrune,
     LegacyPendingGitPush, LegacyPendingGitRemoval, LegacyPendingGitStage, LegacyPendingGitSymlink,
     LegacyPendingGitWorktreeRemoval, LegacyPreservedRecord, LegacyPruneFileAnchor,
-    LegacyRetainedAnchor, LegacyRootRegistration, LegacySourceBinding,
-    LegacyStorageVolumeRegistration, LegacyVerifiedFetchAnchor, LegacyVerifiedFetchBlob,
-    LegacyVolumeOwnership, LegacyWorktreeRemovalDirectory, LegacyWorktreeRemovalFile,
+    LegacyRetainedAnchor, LegacyRootRegistration, LegacySavedGitBackend, LegacySourceBinding,
+    LegacyStorageVolumeRegistration, LegacyUnclassifiedGitRecord, LegacyVerifiedFetchAnchor,
+    LegacyVerifiedFetchBlob, LegacyVolumeOwnership, LegacyWorktreeRemovalDirectory,
+    LegacyWorktreeRemovalFile,
 };
 pub use remote::{
     LegacyExportPeer, LegacyPeerInventoryCoverage, LegacyPeerSources,

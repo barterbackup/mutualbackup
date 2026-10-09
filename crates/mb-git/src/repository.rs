@@ -226,6 +226,21 @@ fn require_native_pinned_catalog_state(
 /// Original saved Git ownership records, without source or marker access.
 #[derive(Clone, Debug)]
 pub enum PreservedGitRecord {
+    SourceBackend {
+        repository_id: Uuid,
+        record_format: u16,
+        backend: SourceBackendKind,
+    },
+    /// An original row whose owner semantics are not understood. Key/body
+    /// plaintext stays in the encrypted catalog; hashes allow reconciliation.
+    Unclassified {
+        repository_id: Uuid,
+        kind: String,
+        key_bytes: u64,
+        key_hash: [u8; 32],
+        record_bytes: u64,
+        record_hash: [u8; 32],
+    },
     LinkedWorktree(crate::GitWorktreeInfo),
     ObjectAnchor {
         repository_id: Uuid,
@@ -330,6 +345,7 @@ impl GitRepository {
         mut visit: impl FnMut(PreservedGitRecord) -> anyhow::Result<()>,
     ) -> anyhow::Result<bool> {
         Self::with_preserved_catalog(source_root, repository_id, key, |catalog| {
+            for_each_preserved_source_backend(catalog, repository_id, &mut visit)?;
             crate::worktree::for_each_preserved_worktree(catalog, repository_id, |info| {
                 visit(PreservedGitRecord::LinkedWorktree(info))
             })?;
@@ -342,7 +358,8 @@ impl GitRepository {
             crate::checkout::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, &mut visit)?;
             crate::history::for_each_preserved_record(catalog, repository_id, &mut visit)?;
-            crate::head::for_each_preserved_branch(catalog, repository_id, visit)
+            crate::head::for_each_preserved_branch(catalog, repository_id, &mut visit)?;
+            for_each_unclassified_preserved_record(catalog, repository_id, visit)
         })
     }
 
@@ -2032,6 +2049,111 @@ fn require_source_backend_binding(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn for_each_preserved_source_backend(
+    catalog: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    catalog.for_each_record_with_kind_prefix_bounded(
+        SOURCE_BACKEND_KIND,
+        512,
+        16,
+        512,
+        |kind, key, bytes| {
+            let record: GitSourceBackendRecord = mb_core::decode_canonical(bytes)?;
+            anyhow::ensure!(
+                kind == SOURCE_BACKEND_KIND
+                    && !repository_id.is_nil()
+                    && key == repository_id.as_bytes()
+                    && record.repository_id == repository_id
+                    && record.format_version == 1
+                    && mb_core::canonical_bytes_bounded(&record, bytes.len())? == bytes,
+                "invalid preserved Git source-backend binding"
+            );
+            visit(PreservedGitRecord::SourceBackend {
+                repository_id,
+                record_format: record.format_version,
+                backend: record.backend,
+            })?;
+            Ok(true)
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn for_each_unclassified_preserved_record(
+    catalog: &ControlStore,
+    repository_id: Uuid,
+    mut visit: impl FnMut(PreservedGitRecord) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    const KNOWN_PREFIXES: &[&str] = &[
+        "git-prune-intent-v1/",
+        "git-merge-blob-intent-v1/",
+        "git-worktree-merge-blob-intent-v1/",
+        "git-merge-session-v1/",
+        "git-worktree-merge-session-v1/",
+        "git-head-v1/",
+        "git-worktree-head-v1/",
+        "git-bare-fetch-intent-v1/",
+        "git-bare-fetch-blob-intent-v1/",
+        "git-bare-fetch-verified-v1/",
+        "git-stock-push-intent-v1/",
+        "git-metadata-object-v1/",
+        "git-ref-v1/",
+        "git-checkout-intent-v1/",
+        "git-worktree-checkout-intent-v1/",
+        "git-stage-intent-v1/",
+        "git-symlink-stage-intent-v1/",
+        "git-index-entry-v1/",
+        "git-worktree-stage-intent-v1/",
+        "git-worktree-symlink-stage-intent-v1/",
+        "git-worktree-index-entry-v1/",
+        "git-object-anchor-v1/",
+        "git-linked-worktree-v1/",
+        "git-worktree-remove-intent-v1/",
+        "git-rm-intent-v1/",
+        "git-worktree-rm-intent-v1/",
+    ];
+    let mut after = None::<(String, Vec<u8>)>;
+    while let Some((kind, key, length)) = catalog.next_kinded_record_metadata_bounded(
+        after
+            .as_ref()
+            .map(|(kind, key)| (kind.as_str(), key.as_slice())),
+        512,
+        crate::stage::MAX_STAGE_PATH_BYTES,
+    )? {
+        let known = kind == SOURCE_BACKEND_KIND
+            || kind == "anchor-area-location"
+            || KNOWN_PREFIXES
+                .iter()
+                .any(|prefix| kind.starts_with(*prefix));
+        if !known {
+            anyhow::ensure!(
+                length <= mb_core::V1_MAX_CATALOG_BYTES,
+                "unclassified preserved Git record exceeds its row bound"
+            );
+            let bytes = catalog
+                .get_record_bounded(&kind, &key, mb_core::V1_MAX_CATALOG_BYTES)?
+                .ok_or_else(|| anyhow::anyhow!("unclassified preserved Git record disappeared"))?;
+            anyhow::ensure!(
+                bytes.len() == length,
+                "unclassified preserved Git record changed length"
+            );
+            visit(PreservedGitRecord::Unclassified {
+                repository_id,
+                kind: kind.clone(),
+                key_bytes: key.len() as u64,
+                key_hash: *blake3::hash(&key).as_bytes(),
+                record_bytes: length as u64,
+                record_hash: *blake3::hash(&bytes).as_bytes(),
+            })?;
+        }
+        after = Some((kind, key));
+    }
+    Ok(())
+}
+
 fn initialization_intent_bytes(repository_id: Uuid) -> Vec<u8> {
     format!("{INITIALIZATION_MAGIC}{repository_id}\n").into_bytes()
 }
@@ -2100,6 +2222,242 @@ mod tests {
     use mb_store::{GIT_CATALOG_DIRECTORY, git_catalog_marker};
 
     use super::*;
+
+    #[test]
+    fn preserved_catalog_keeps_original_backend_binding_and_unknown_row_hashes_without_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository_id = Uuid::from_u128(270);
+        let directory = temporary.path().join(GIT_CATALOG_DIRECTORY);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = directory.join(GIT_CATALOG_MARKER_FILE);
+        std::fs::write(&marker, git_catalog_marker_bytes(repository_id)).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let database = directory.join(CATALOG_DATABASE);
+        let key = [255; 32];
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let private_key = b"private unclassified key";
+        let private_body = b"private unclassified payload";
+        for (kind, id, bytes) in [
+            (
+                "git-guarded-original-v1",
+                private_key.as_slice(),
+                private_body.as_slice(),
+            ),
+            ("future-owned-record-v2", b"\0raw-key", b"future bytes"),
+            ("", b"", b""),
+        ] {
+            control.put_record(kind, id, bytes).unwrap();
+        }
+        control
+            .put_record(
+                &format!("git-head-v1/{repository_id}"),
+                b"branch",
+                &canonical_bytes(&(1_u16, "main")).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                &format!("git-index-entry-v1/{repository_id}"),
+                b"tracked",
+                &canonical_bytes(&crate::GitIndexEntry {
+                    format_version: 1,
+                    oid: [1; 20],
+                    mode: 0o100644,
+                    anchor_id: Uuid::from_u128(271),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        for backend in [
+            SourceBackendKind::ReflinkV1,
+            SourceBackendKind::GuardedLinkFreezeV1,
+        ] {
+            let wire = canonical_bytes(&(1_u16, repository_id, backend)).unwrap();
+            assert_eq!(
+                canonical_bytes(
+                    &mb_core::decode_canonical::<GitSourceBackendRecord>(&wire).unwrap()
+                )
+                .unwrap(),
+                wire
+            );
+            control
+                .put_record(SOURCE_BACKEND_KIND, repository_id.as_bytes(), &wire)
+                .unwrap();
+            let before = [database.clone(), database.with_extension("db-wal")]
+                .map(|path| std::fs::read(path).ok());
+            let mut bindings = 0;
+            let mut unknown = 0;
+            let mut known = 0;
+            assert!(
+                GitRepository::for_each_preserved_record(
+                    temporary.path(),
+                    repository_id,
+                    &key,
+                    |record| {
+                        match record {
+                            PreservedGitRecord::SourceBackend {
+                                repository_id: actual,
+                                record_format,
+                                backend: actual_backend,
+                            } => {
+                                assert_eq!(actual, repository_id);
+                                assert_eq!(record_format, 1);
+                                assert_eq!(actual_backend, backend);
+                                bindings += 1;
+                            }
+                            PreservedGitRecord::Unclassified {
+                                repository_id: actual,
+                                kind,
+                                key_bytes,
+                                key_hash,
+                                record_bytes,
+                                record_hash,
+                            } => {
+                                assert_eq!(actual, repository_id);
+                                let (id, body) = match kind.as_str() {
+                                    "git-guarded-original-v1" => {
+                                        (private_key.as_slice(), private_body.as_slice())
+                                    }
+                                    "future-owned-record-v2" => {
+                                        (b"\0raw-key".as_slice(), b"future bytes".as_slice())
+                                    }
+                                    "" => (b"".as_slice(), b"".as_slice()),
+                                    _ => panic!("known row classified as opaque"),
+                                };
+                                assert_eq!(key_bytes, id.len() as u64);
+                                assert_eq!(key_hash, *blake3::hash(id).as_bytes());
+                                assert_eq!(record_bytes, body.len() as u64);
+                                assert_eq!(record_hash, *blake3::hash(body).as_bytes());
+                                unknown += 1;
+                            }
+                            PreservedGitRecord::IndexEntry { .. }
+                            | PreservedGitRecord::SelectedBranch { .. } => known += 1,
+                            _ => panic!("unexpected preserved record"),
+                        }
+                        Ok(())
+                    }
+                )
+                .unwrap()
+            );
+            assert_eq!((bindings, unknown, known), (1, 3, 2));
+            assert_eq!(
+                [database.clone(), database.with_extension("db-wal")]
+                    .map(|path| std::fs::read(path).ok()),
+                before
+            );
+        }
+        for (kind, id, wire) in [
+            (
+                SOURCE_BACKEND_KIND,
+                repository_id.as_bytes().to_vec(),
+                canonical_bytes(&(2_u16, repository_id, SourceBackendKind::ReflinkV1)).unwrap(),
+            ),
+            (
+                SOURCE_BACKEND_KIND,
+                Uuid::from_u128(999).as_bytes().to_vec(),
+                canonical_bytes(&(1_u16, repository_id, SourceBackendKind::ReflinkV1)).unwrap(),
+            ),
+            (
+                SOURCE_BACKEND_KIND,
+                repository_id.as_bytes().to_vec(),
+                canonical_bytes(&(1_u16, Uuid::nil(), SourceBackendKind::ReflinkV1)).unwrap(),
+            ),
+        ] {
+            control.put_record(kind, &id, &wire).unwrap();
+            let before = [database.clone(), database.with_extension("db-wal")]
+                .map(|path| std::fs::read(path).ok());
+            assert!(
+                GitRepository::for_each_preserved_record(
+                    temporary.path(),
+                    repository_id,
+                    &key,
+                    |_| Ok(())
+                )
+                .is_err()
+            );
+            assert_eq!(
+                [database.clone(), database.with_extension("db-wal")]
+                    .map(|path| std::fs::read(path).ok()),
+                before
+            );
+            control.delete_record(kind, &id).unwrap();
+        }
+        control
+            .delete_record(SOURCE_BACKEND_KIND, repository_id.as_bytes())
+            .unwrap();
+        let mut bindings = 0;
+        GitRepository::for_each_preserved_record(temporary.path(), repository_id, &key, |record| {
+            if matches!(record, PreservedGitRecord::SourceBackend { .. }) {
+                bindings += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(bindings, 0);
+        // The unknown-row walk must not narrow the separate original 64 MiB
+        // metadata-object bound or read these known bodies a second time.
+        let metadata_bytes = vec![b'x'; crate::history::MAX_GRAPH_METADATA_BYTES];
+        let metadata_oid =
+            git2::Oid::hash_object(git2::ObjectType::Commit, &metadata_bytes).unwrap();
+        let metadata_kind = format!("git-metadata-object-v1/{repository_id}");
+        control
+            .put_record(
+                &metadata_kind,
+                metadata_oid.as_bytes(),
+                &canonical_bytes(&(1_u16, 1_u8, &metadata_bytes)).unwrap(),
+            )
+            .unwrap();
+        let mut metadata_seen = 0;
+        assert!(
+            GitRepository::for_each_preserved_record(
+                temporary.path(),
+                repository_id,
+                &key,
+                |record| {
+                    if let PreservedGitRecord::MetadataObject { object, .. } = record {
+                        assert_eq!(object.bytes.len(), crate::history::MAX_GRAPH_METADATA_BYTES);
+                        metadata_seen += 1;
+                    }
+                    Ok(())
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(metadata_seen, 1);
+        control
+            .delete_record(&metadata_kind, metadata_oid.as_bytes())
+            .unwrap();
+        for (kind_length, key_length, row_length, valid) in [
+            (512, 4096, mb_core::V1_MAX_CATALOG_BYTES, true),
+            (513, 1, 1, false),
+            (1, 4097, 1, false),
+            (1, 1, mb_core::V1_MAX_CATALOG_BYTES + 1, false),
+        ] {
+            let kind = "x".repeat(kind_length);
+            let id = vec![1; key_length];
+            let bytes = vec![2; row_length];
+            control.put_record(&kind, &id, &bytes).unwrap();
+            let before = [database.clone(), database.with_extension("db-wal")]
+                .map(|path| std::fs::read(path).ok());
+            assert_eq!(
+                GitRepository::for_each_preserved_record(
+                    temporary.path(),
+                    repository_id,
+                    &key,
+                    |_| Ok(())
+                )
+                .is_ok(),
+                valid
+            );
+            assert_eq!(
+                [database.clone(), database.with_extension("db-wal")]
+                    .map(|path| std::fs::read(path).ok()),
+                before
+            );
+            control.delete_record(&kind, &id).unwrap();
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
