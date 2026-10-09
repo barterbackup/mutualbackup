@@ -221,6 +221,42 @@ is reported with `head_branch_recorded: false`, not as a recorded selection.
 Same-revision/guild/root signed metadata availability does not authenticate the
 pending graph or establish that its blob payloads survive.
 
+Peer scratch and export placement now compare available preserved path hints
+in Linux filesystem coordinates as well as pathname ancestry and recorded
+directory identities. Binding a descendant outside its original root no longer
+hides it from exclusion; nested bind mounts and symlink aliases resolve to the
+same kernel superblock device and filesystem-relative path. Btrfs subvolume
+st_dev values differ from the mount-info device; original and bound subvolume
+paths use the latter plus the full filesystem root path, without persisting it
+as a native identity. The mount-table reader preserves raw bytes and the four
+kernel path escapes, validates normalized absolute paths, and shares native
+discovery's existing 256 KiB read and 4,096-byte path bounds. Non-Btrfs device
+mismatch, ambiguous stacked mounts and unavailable or malformed mount metadata
+reject placement before creation. A second bounded mount-table read rejects
+namespace changes during preflight. Parser/coordinate regressions cover
+cross-device and distinct-subvolume paths, exact/over limits, malformed
+escapes and ambiguity. A provisioned Linux regression covers
+closed/WAL-only/live control catalogs and actual nested binds of registered
+Btrfs subvolumes, Git history, catalog descendants and selected anchor areas;
+raw bytes, whitespace, symlink aliases, unchanged catalog/payload bytes and
+empty safe output siblings are checked. Namespace-changing native tests run
+before ordinary qualification jobs. This protects available hints and does not
+discover an unavailable relocated root or prove a recorded-identity-only
+descendant relation. Changes after preflight, reparenting ownership, complete
+history/payload joins, shared enclosing budgets and installed/platform gates
+remain open. Bind-mount placement qualification passes 265 unique cases: 57
+export/peer cases, all 63 ordinary volume and 116 Git cases, 21 CLI process
+cases, retained-graph/discovery/withdrawal/graph-intent regressions and three
+provisioned Btrfs identity/retained-capture/bind-mount cases. All four debug
+programs build; format and strict locked workspace/all-targets Clippy pass.
+All 285 source-file and seven program/test-driver hashes remain unchanged, and
+native mount/loop/image cleanup is verified. Evidence and the distinct
+passing-case inventory are retained under
+`/tmp/mb-m6-mount-alias-validation-ntd2xe3n`; the post-commit audit binds the
+code to the commit. This is focused debug-source qualification; complete
+ordinary/native Node suites, installed artifacts and other platforms were not
+rerun.
+
 `legacy-list` format 18 exposes original Git source-backend bindings and every
 unclassified external-catalog row. The original private v1 binding retains
 repository UUID and backend only; it records no root identity and absence

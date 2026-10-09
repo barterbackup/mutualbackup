@@ -135,6 +135,8 @@ struct PreservedParentCheck {
     ancestors: Vec<PreservedAncestor>,
     ancestor_inodes: BTreeSet<u64>,
     last_hint: Option<PathBuf>,
+    mounts: super::mounts::MountTable,
+    mount_coordinate: super::mounts::Coordinate,
 }
 
 impl PreservedParentCheck {
@@ -155,6 +157,8 @@ impl PreservedParentCheck {
     ) -> Result<Self> {
         let parent = candidate.canonicalize()?;
         ensure!(parent.is_dir(), purpose.parent());
+        let mounts = super::mounts::MountTable::read().context(purpose.unverified())?;
+        let mount_coordinate = mounts.coordinate(&parent).context(purpose.unverified())?;
         let mut ancestors = Vec::new();
         let mut ancestor_inodes = BTreeSet::new();
         for path in parent.ancestors() {
@@ -172,6 +176,8 @@ impl PreservedParentCheck {
             ancestors,
             ancestor_inodes,
             last_hint: None,
+            mounts,
+            mount_coordinate,
         };
         for path in std::iter::once(data_dir).chain(selected_inputs.iter().map(PathBuf::as_path)) {
             checked.reject_canonical_path(&path.canonicalize()?)?;
@@ -181,6 +187,15 @@ impl PreservedParentCheck {
 
     fn reject_canonical_path(&self, input: &Path) -> Result<()> {
         ensure!(!self.parent.starts_with(input), self.purpose.outside());
+        ensure!(
+            !self.mount_coordinate.is_within(
+                &self
+                    .mounts
+                    .coordinate(input)
+                    .context(self.purpose.unverified())?
+            ),
+            self.purpose.outside()
+        );
         let metadata = input.metadata()?;
         ensure!(
             !metadata.is_dir()
@@ -439,6 +454,7 @@ impl PreservedParentCheck {
     }
 
     fn finish(self) -> Result<PathBuf> {
+        self.mounts.require_unchanged()?;
         for (path, ancestor) in self.parent.ancestors().zip(&self.ancestors) {
             let metadata = path.metadata()?;
             ensure!(
@@ -1124,6 +1140,211 @@ async fn discover_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires provisioned Linux bind-mount privileges"]
+    fn legacy_peer_preflight_rejects_bind_mounted_preserved_descendants() {
+        use std::{
+            collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, process::Command,
+        };
+
+        struct Mounted(Vec<PathBuf>);
+        impl Mounted {
+            fn bind(&mut self, source: &Path, target: &Path) {
+                let executable = std::env::var_os("MUTUALBACKUP_TEST_MOUNT_BIN")
+                    .unwrap_or_else(|| "mount".into());
+                let output = Command::new("sudo")
+                    .arg("-n")
+                    .arg(executable)
+                    .arg("--bind")
+                    .arg(source)
+                    .arg(target)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "cannot bind preserved descendant: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                self.0.push(target.to_path_buf());
+            }
+        }
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                let executable = std::env::var_os("MUTUALBACKUP_TEST_UMOUNT_BIN")
+                    .unwrap_or_else(|| "umount".into());
+                for target in self.0.iter().rev() {
+                    let output = Command::new("sudo")
+                        .arg("-n")
+                        .arg(&executable)
+                        .arg(target)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "cannot unmount test descendant {target:?}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+        fn catalog_files(path: &Path) -> BTreeMap<OsString, (u64, Option<blake3::Hash>)> {
+            std::fs::read_dir(path)
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.unwrap();
+                    if !entry.file_type().unwrap().is_file() {
+                        return None;
+                    }
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    let hash =
+                        (entry.file_name() != "control.db-shm").then(|| blake3::hash(&bytes));
+                    Some((entry.file_name(), (bytes.len() as u64, hash)))
+                })
+                .collect()
+        }
+
+        let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        for journal in 0..3 {
+            let temporary = tempfile::tempdir_in(&root).unwrap();
+            let data = temporary.path().join("catalog");
+            std::fs::create_dir(&data).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([177; 32]));
+            let store = ControlStore::open(data.join("control.db"), &keys).unwrap();
+            store
+                .database_shell_statement("PRAGMA wal_autocheckpoint=0", false)
+                .unwrap();
+            let protected = temporary.path().join(OsString::from_vec(
+                b"protected-\xff space\\tab\tline\n".to_vec(),
+            ));
+            let history = temporary.path().join("history");
+            let explicit = temporary.path().join("selected-anchor-area");
+            let btrfs =
+                std::env::var_os("MUTUALBACKUP_TEST_BTRFS_BIN").unwrap_or_else(|| "btrfs".into());
+            let output = Command::new(&btrfs)
+                .args(["subvolume", "create"])
+                .arg(&protected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cannot create test subvolume: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for path in [&data, &protected, &history, &explicit] {
+                std::fs::create_dir_all(path.join("child/deeper")).unwrap();
+                std::fs::write(path.join("child/preserve"), b"original preserved payload").unwrap();
+            }
+            let identity = mb_store::directory_identity(&protected).unwrap();
+            let registration = crate::control::ProtectedRoot {
+                format_version: 4,
+                root_id: uuid::Uuid::new_v4(),
+                path: protected.clone(),
+                filesystem_id: identity.filesystem_id,
+                root_inode: identity.inode,
+            };
+            store
+                .put_record(
+                    "protected-root",
+                    registration.root_id.as_bytes(),
+                    &mb_core::canonical_bytes(&registration).unwrap(),
+                )
+                .unwrap();
+            let repository = crate::control::GitRepositoryInfo {
+                format_version: 1,
+                repository_id: uuid::Uuid::new_v4(),
+                path: history.clone(),
+            };
+            store
+                .put_record(
+                    "git-repository",
+                    repository.repository_id.as_bytes(),
+                    &mb_core::canonical_bytes(&repository).unwrap(),
+                )
+                .unwrap();
+            let data = if journal == 1 {
+                let copy = temporary.path().join("wal-only");
+                std::fs::create_dir(&copy).unwrap();
+                std::fs::create_dir_all(copy.join("child/deeper")).unwrap();
+                std::fs::write(copy.join("child/preserve"), b"original preserved payload").unwrap();
+                for entry in std::fs::read_dir(&data).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_file() && entry.file_name() != "control.db-shm"
+                    {
+                        std::fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+                    }
+                }
+                copy
+            } else {
+                data
+            };
+            let _writer = if journal == 2 {
+                Some(store)
+            } else {
+                drop(store);
+                None
+            };
+            let safe = temporary.path().join("safe");
+            std::fs::create_dir(&safe).unwrap();
+            let inputs = [explicit.clone()];
+            let before = catalog_files(&data);
+            for (index, source) in [&protected, &history, &data, &explicit]
+                .into_iter()
+                .enumerate()
+            {
+                let alias = temporary.path().join(format!("bind-{index}"));
+                let nested = temporary.path().join(format!("nested-bind-{index}"));
+                std::fs::create_dir(&alias).unwrap();
+                std::fs::create_dir(&nested).unwrap();
+                let initial = super::super::mounts::MountTable::read().unwrap();
+                let mut mounts = Mounted(Vec::new());
+                mounts.bind(&source.join("child"), &alias);
+                assert!(initial.require_unchanged().is_err());
+                mounts.bind(&alias.join("deeper"), &nested);
+                let symlink = temporary.path().join(format!("symlink-{index}"));
+                std::os::unix::fs::symlink(&nested, &symlink).unwrap();
+                let owner = source.metadata().unwrap();
+                assert!(!alias.ancestors().any(|ancestor| {
+                    let metadata = ancestor.metadata().unwrap();
+                    (metadata.dev(), metadata.ino()) == (owner.dev(), owner.ino())
+                }));
+                for candidate in [&alias, &alias.join("deeper"), &nested, &symlink] {
+                    let error =
+                        peer_client_preflight(&keys, &data, candidate, &inputs, false).unwrap_err();
+                    assert!(
+                        error.to_string().contains("outside preserved inputs"),
+                        "{error:#}"
+                    );
+                    let error = export_parent_preflight(&keys, &data, candidate, &inputs)
+                        .err()
+                        .unwrap();
+                    assert!(
+                        error.to_string().contains("outside preserved inputs"),
+                        "{error:#}"
+                    );
+                }
+                assert!(peer_client_preflight(&keys, &data, &safe, &inputs, false).is_ok());
+                assert!(export_parent_preflight(&keys, &data, &safe, &inputs).is_ok());
+                assert_eq!(
+                    std::fs::read(source.join("child/preserve")).unwrap(),
+                    b"original preserved payload"
+                );
+                assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 0);
+                drop(mounts);
+            }
+            assert_eq!(catalog_files(&data), before);
+            let output = Command::new(&btrfs)
+                .args(["subvolume", "delete"])
+                .arg(&protected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cannot delete test subvolume: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn legacy_volume_placement_excludes_unselected_registry_paths_without_mutation() {

@@ -3,6 +3,7 @@
 
 mod inventory;
 mod local_inventory;
+mod mounts;
 mod recovery;
 mod remote;
 pub use inventory::{
