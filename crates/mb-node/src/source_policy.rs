@@ -22,7 +22,10 @@ pub(crate) fn require_native_source_state_from_catalog(
     #[cfg(target_os = "linux")]
     {
         match std::fs::symlink_metadata(data_dir.join("control.db")) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::volume::validate_preserved_control_key(data_dir, keys)?;
+                return Ok(());
+            }
             Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
@@ -86,6 +89,160 @@ mod tests {
     use mb_core::{KeyMaterial, Seed, canonical_bytes};
     use std::fs;
     use uuid::Uuid;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_database_does_not_bypass_unsafe_existing_control_key_admission() {
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, PermissionsExt},
+        };
+        for kind in [
+            "dangling",
+            "symlink",
+            "fifo",
+            "directory",
+            "corrupt",
+            "permissive",
+            "wrong-seed",
+            "oversized",
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let data = temporary.path().join("state");
+            fs::create_dir(&data).unwrap();
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+            let seed = Seed::from_bytes([187; 32]);
+            let keys = KeyMaterial::from_seed(&seed);
+            let envelope = keys.wrap_database_key(b"control.db/v2", &[61; 32]).unwrap();
+            let outside = temporary.path().join("outside-key");
+            fs::write(&outside, canonical_bytes(&envelope).unwrap()).unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+            let key = data.join("control.key");
+            match kind {
+                "dangling" => {
+                    std::os::unix::fs::symlink(temporary.path().join("absent"), &key).unwrap()
+                }
+                "symlink" => std::os::unix::fs::symlink(&outside, &key).unwrap(),
+                "fifo" => {
+                    let name = std::ffi::CString::new(key.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "directory" => fs::create_dir(&key).unwrap(),
+                "corrupt" => fs::write(&key, [0xff]).unwrap(),
+                "oversized" => fs::write(&key, vec![0_u8; 64 * 1024 + 1]).unwrap(),
+                "permissive" => {
+                    fs::write(&key, canonical_bytes(&envelope).unwrap()).unwrap();
+                    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                "wrong-seed" => {
+                    let foreign = KeyMaterial::from_seed(&Seed::from_bytes([188; 32]));
+                    let envelope = foreign
+                        .wrap_database_key(b"control.db/v2", &[62; 32])
+                        .unwrap();
+                    fs::write(&key, canonical_bytes(&envelope).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if matches!(kind, "corrupt" | "oversized" | "wrong-seed") {
+                fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let stamp = |path: &Path| {
+                let m = fs::symlink_metadata(path).unwrap();
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.mode(),
+                    m.uid(),
+                    m.gid(),
+                    m.len(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                )
+            };
+            let snapshot = || {
+                let entries = fs::read_dir(&data)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        let kind = entry.file_type().unwrap();
+                        let bytes = if kind.is_symlink() {
+                            fs::read_link(entry.path())
+                                .unwrap()
+                                .as_os_str()
+                                .as_bytes()
+                                .to_vec()
+                        } else if kind.is_file() {
+                            fs::read(entry.path()).unwrap()
+                        } else {
+                            Vec::new()
+                        };
+                        (entry.file_name(), (stamp(&entry.path()), bytes))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                (
+                    stamp(&data),
+                    entries,
+                    stamp(&outside),
+                    fs::read(&outside).unwrap(),
+                )
+            };
+            let before = snapshot();
+            assert!(
+                Node::lock_data_dir_with_seed(&data, &seed).is_err(),
+                "{kind}"
+            );
+            assert!(Node::open(&data, seed).is_err(), "{kind}");
+            assert_eq!(snapshot(), before, "{kind}");
+            assert!(!data.join(".node.lock").exists());
+            assert!(!data.join("control.db").exists());
+            assert!(!data.join("control.sock").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn valid_interrupted_control_key_is_admitted_without_replacement() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temporary = tempfile::tempdir().unwrap();
+        let data = temporary.path().join("state");
+        fs::create_dir(&data).unwrap();
+        let seed = Seed::from_bytes([189; 32]);
+        let keys = KeyMaterial::from_seed(&seed);
+        let envelope = keys.wrap_database_key(b"control.db/v2", &[63; 32]).unwrap();
+        let key = data.join("control.key");
+        let bytes = canonical_bytes(&envelope).unwrap();
+        fs::write(&key, &bytes).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+        let stamp = |path: &Path| {
+            let m = fs::metadata(path).unwrap();
+            (
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        let before = [stamp(&data), stamp(&key)];
+        require_native_source_state_from_catalog(&data, &keys).unwrap();
+        assert_eq!([stamp(&data), stamp(&key)], before);
+        assert_eq!(fs::read_dir(&data).unwrap().count(), 1);
+        let key_identity = stamp(&key);
+        let node = Node::open(&data, seed.clone()).unwrap();
+        assert!(data.join("control.db").is_file());
+        assert_eq!(fs::read(&key).unwrap(), bytes);
+        assert_eq!(stamp(&key), key_identity);
+        drop(node);
+        Node::open(&data, seed).unwrap();
+        assert_eq!(fs::read(&key).unwrap(), bytes);
+        assert_eq!(stamp(&key), key_identity);
+    }
 
     #[cfg(target_os = "linux")]
     fn directory_bytes(

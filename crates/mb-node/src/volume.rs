@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use mb_core::{
     KeyMaterial, MerkleCommitment, MerkleRangeProof, NodeId, SignedRecord, WrappedDatabaseKey,
-    canonical_bytes, decode_canonical,
+    canonical_bytes, canonical_bytes_bounded, decode_canonical,
 };
 use mb_store::{
     ControlStore, DatabaseError, DatabaseShellResult, ParityObject, ParityStore,
@@ -2888,8 +2888,7 @@ pub(crate) fn inspect_control_store(
         Ok(_) => {}
     }
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
-    if envelope_path.exists() {
-        let envelope: WrappedDatabaseKey = read_private_record(&envelope_path)?;
+    if let Some(envelope) = read_private_record_optional::<WrappedDatabaseKey>(&envelope_path)? {
         let database_key = keys
             .unwrap_database_key(b"control.db/v2", &envelope)
             .context("cannot unwrap control database key")?;
@@ -2940,8 +2939,7 @@ pub(crate) fn open_preserved_control_store(
 fn preserved_control_keys(data_dir: &Path, keys: &KeyMaterial) -> Result<Vec<[u8; 32]>> {
     let mut database_keys = Vec::new();
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
-    if envelope_path.exists() {
-        let envelope: WrappedDatabaseKey = read_private_record(&envelope_path)?;
+    if let Some(envelope) = read_private_record_optional::<WrappedDatabaseKey>(&envelope_path)? {
         database_keys.push(
             keys.unwrap_database_key(b"control.db/v2", &envelope)
                 .context("cannot unwrap preserved control database key")?,
@@ -2951,6 +2949,14 @@ fn preserved_control_keys(data_dir: &Path, keys: &KeyMaterial) -> Result<Vec<[u8
     Ok(database_keys)
 }
 
+/// Even an interrupted installation with no database must preserve and
+/// authenticate an existing key envelope before claiming startup ownership.
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_preserved_control_key(data_dir: &Path, keys: &KeyMaterial) -> Result<()> {
+    let _ = preserved_control_keys(data_dir, keys)?;
+    Ok(())
+}
+
 pub(crate) fn open_control_store(
     data_dir: &Path,
     keys: &KeyMaterial,
@@ -2958,8 +2964,7 @@ pub(crate) fn open_control_store(
     let database_path = data_dir.join("control.db");
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
     let database_id = b"control.db/v2";
-    if envelope_path.exists() {
-        let envelope: WrappedDatabaseKey = read_private_record(&envelope_path)?;
+    if let Some(envelope) = read_private_record_optional::<WrappedDatabaseKey>(&envelope_path)? {
         let database_key = keys
             .unwrap_database_key(database_id, &envelope)
             .context("cannot unwrap control database key")?;
@@ -3084,10 +3089,11 @@ fn initialize_volume(
 
 fn read_volume_manifest(root: &Path, keys: &KeyMaterial) -> Result<Option<VolumeManifest>> {
     let manifest_path = root.join(VOLUME_MANIFEST_FILE);
-    if !manifest_path.exists() {
+    let Some(signed) =
+        read_private_record_optional::<SignedRecord<VolumeManifest>>(&manifest_path)?
+    else {
         return Ok(None);
-    }
-    let signed: SignedRecord<VolumeManifest> = read_private_record(&manifest_path)?;
+    };
     signed.verify(VOLUME_MANIFEST_DOMAIN)?;
     validate_manifest(&signed.value, keys.node_id())?;
     if signed.signer != keys.node_id() {
@@ -3770,49 +3776,159 @@ fn require_online_directory(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn read_private_record_optional<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(_) => read_private_record(path).map(Some),
+    }
+}
+
 fn read_private_record<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let metadata = fs::symlink_metadata(path)?;
+    // Validate the opened object, without following a replaced symlink or
+    // blocking on a FIFO between a path metadata check and open.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .context("cannot safely open private storage manifest")?;
+    read_private_record_file(path, &mut file)
+}
+
+fn read_private_record_file<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    file: &mut File,
+) -> Result<T> {
+    let metadata = file.metadata()?;
     if !metadata.is_file()
-        || metadata.file_type().is_symlink()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() as usize > MAX_LOCAL_MANIFEST_BYTES
+        || metadata.len() > MAX_LOCAL_MANIFEST_BYTES as u64
     {
         bail!("private storage manifest has unsafe ownership, mode, type, or size");
     }
+    let version = |m: &fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.mode(),
+            m.uid(),
+            m.gid(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    let before = version(&metadata);
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(path)?
+    Read::by_ref(file)
         .take(MAX_LOCAL_MANIFEST_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_LOCAL_MANIFEST_BYTES {
         bail!("private storage manifest is too large");
     }
-    Ok(decode_canonical(&bytes)?)
+    anyhow::ensure!(
+        version(&file.metadata()?) == before && version(&fs::symlink_metadata(path)?) == before,
+        "private storage manifest changed while being read"
+    );
+    decode_canonical(&bytes).context("cannot decode private storage manifest")
 }
 
 fn write_new_private_record<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = canonical_bytes(value)?;
-    if bytes.len() > MAX_LOCAL_MANIFEST_BYTES {
-        bail!("private storage manifest is too large");
+    let bytes = canonical_bytes_bounded(value, MAX_LOCAL_MANIFEST_BYTES)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let parent = path.parent().context("storage manifest has no parent")?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent)?;
+        let name = std::ffi::CString::new(
+            path.file_name()
+                .context("storage manifest has no name")?
+                .as_bytes(),
+        )?;
+        write_new_private_record_at(&directory, &name, &bytes)
     }
-    let parent = path.parent().context("storage manifest has no parent")?;
-    let temporary = parent.join(format!(".mutualbackup-manifest-{}.tmp", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    let write_result = (|| -> Result<()> {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let parent = path.parent().context("storage manifest has no parent")?;
+        let temporary = parent.join(format!(".mutualbackup-manifest-{}.tmp", Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        let write_result = (|| -> Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::hard_link(&temporary, path)?;
+            fs::remove_file(&temporary)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result
     }
-    write_result
+}
+
+/// Publish the complete file into the pinned parent only if the name is absent.
+/// An anonymous inode has no temporary pathname to replace or clean up after a
+/// failed write, collision, or parent rename. This does not pin later DB writers.
+#[cfg(target_os = "linux")]
+fn write_new_private_record_at(
+    directory: &File,
+    name: &std::ffi::CStr,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    anyhow::ensure!(
+        !name.to_bytes().is_empty()
+            && !name.to_bytes().contains(&b'/')
+            && name.to_bytes() != b"."
+            && name.to_bytes() != b".."
+            && bytes.len() <= MAX_LOCAL_MANIFEST_BYTES,
+        "invalid private storage manifest publication"
+    );
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600 as libc::mode_t,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot allocate anonymous private storage manifest");
+    }
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    // AT_EMPTY_PATH requires privilege. This process's held descriptor through
+    // procfs permits the same no-clobber link for an unprivileged caller.
+    let source = std::ffi::CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    let code = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if code != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot publish new private storage manifest without replacement");
+    }
+    directory.sync_all()?;
+    Ok(())
 }
 
 fn truncated_error(error: &impl std::fmt::Display) -> String {
@@ -3832,6 +3948,245 @@ mod tests {
     use super::*;
     use mb_core::{Seed, V1_SECTOR_SIZE, sector_root};
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    fn private_manifest_publication_fixture(root: &Path) {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let parent = root.join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("file"), b"preserved original").unwrap();
+        fs::create_dir(parent.join("directory")).unwrap();
+        std::os::unix::fs::symlink("missing-original", parent.join("dangling")).unwrap();
+        std::os::unix::fs::symlink("file", parent.join("alias")).unwrap();
+        let stamp = |path: &Path| {
+            let m = fs::symlink_metadata(path).unwrap();
+            (
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.uid(),
+                m.gid(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        let snapshot = |directory: &Path| {
+            let files = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let kind = entry.file_type().unwrap();
+                    let bytes = if kind.is_symlink() {
+                        fs::read_link(entry.path())
+                            .unwrap()
+                            .as_os_str()
+                            .as_bytes()
+                            .to_vec()
+                    } else if kind.is_dir() {
+                        Vec::new()
+                    } else {
+                        fs::read(entry.path()).unwrap()
+                    };
+                    (entry.file_name(), (stamp(&entry.path()), bytes))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (stamp(directory), files)
+        };
+        let value = vec![17_u8; 32];
+        for name in ["file", "directory", "dangling", "alias"] {
+            let before = snapshot(&parent);
+            let error = write_new_private_record(&parent.join(name), &value).unwrap_err();
+            assert!(
+                error.to_string().contains("without replacement"),
+                "{error:#}"
+            );
+            assert_eq!(snapshot(&parent), before, "{name}");
+        }
+        let before = snapshot(&parent);
+        assert!(
+            write_new_private_record(
+                &parent.join("oversized"),
+                &vec![0_u8; MAX_LOCAL_MANIFEST_BYTES]
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(&parent), before);
+        let raw = std::ffi::OsString::from_vec(b"private-\xff space".to_vec());
+        write_new_private_record(&parent.join(&raw), &value).unwrap();
+        assert_eq!(
+            read_private_record::<Vec<u8>>(&parent.join(raw)).unwrap(),
+            value
+        );
+        let exact = vec![23_u8; MAX_LOCAL_MANIFEST_BYTES - 3];
+        assert_eq!(
+            canonical_bytes(&exact).unwrap().len(),
+            MAX_LOCAL_MANIFEST_BYTES
+        );
+        write_new_private_record(&parent.join("exact-bound"), &exact).unwrap();
+        assert_eq!(
+            read_private_record::<Vec<u8>>(&parent.join("exact-bound")).unwrap(),
+            exact
+        );
+
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&parent)
+            .unwrap();
+        let moved = root.join("moved");
+        fs::rename(&parent, &moved).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("pinned-key"), b"replacement input must survive").unwrap();
+        let before = snapshot(&parent);
+        write_new_private_record_at(&directory, c"pinned-key", &canonical_bytes(&value).unwrap())
+            .unwrap();
+        assert_eq!(snapshot(&parent), before);
+        let published = moved.join("pinned-key");
+        assert_eq!(fs::metadata(&published).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(read_private_record::<Vec<u8>>(&published).unwrap(), value);
+        assert!(fs::read_dir(&moved).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .as_bytes()
+                .starts_with(b".mutualbackup-manifest-")
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_manifest_publication_preserves_existing_entries_and_pins_its_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        private_manifest_publication_fixture(temporary.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn private_manifest_btrfs_publication_and_interrupted_key_resume_preserve_inputs() {
+        let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").unwrap();
+        let temporary = tempfile::tempdir_in(root).unwrap();
+        private_manifest_publication_fixture(temporary.path());
+        let data = temporary.path().join("node-state");
+        fs::create_dir(&data).unwrap();
+        let seed = Seed::from_bytes([191; 32]);
+        let keys = KeyMaterial::from_seed(&seed);
+        let envelope = keys.wrap_database_key(b"control.db/v2", &[65; 32]).unwrap();
+        let key = data.join(CONTROL_KEY_FILE);
+        let original = canonical_bytes(&envelope).unwrap();
+        fs::write(&key, &original).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let stamp = || {
+            let m = fs::metadata(&key).unwrap();
+            (
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        let before = stamp();
+        let node = crate::Node::open(&data, seed.clone()).unwrap();
+        assert!(data.join("control.db").is_file());
+        assert_eq!(fs::read(&key).unwrap(), original);
+        assert_eq!(stamp(), before);
+        drop(node);
+        crate::Node::open(&data, seed).unwrap();
+        assert_eq!(fs::read(&key).unwrap(), original);
+        assert_eq!(stamp(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_manifest_reads_reject_links_types_bounds_and_replaced_open_files() {
+        use std::os::unix::ffi::OsStrExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path();
+        let value = vec![41_u8; 16];
+        let original = parent.join("original");
+        fs::write(&original, canonical_bytes(&value).unwrap()).unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&original).unwrap();
+        std::os::unix::fs::symlink(&original, parent.join("symlink")).unwrap();
+        std::os::unix::fs::symlink("missing-target", parent.join("dangling")).unwrap();
+        fs::create_dir(parent.join("directory")).unwrap();
+        let fifo = std::ffi::CString::new(parent.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        for (name, bytes, mode) in [
+            ("oversized", vec![0_u8; MAX_LOCAL_MANIFEST_BYTES + 1], 0o600),
+            ("permissive", canonical_bytes(&value).unwrap(), 0o644),
+            ("corrupt", vec![0xff], 0o600),
+        ] {
+            fs::write(parent.join(name), bytes).unwrap();
+            fs::set_permissions(parent.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for name in [
+            "symlink",
+            "dangling",
+            "directory",
+            "fifo",
+            "oversized",
+            "permissive",
+            "corrupt",
+        ] {
+            let path = parent.join(name);
+            let m = fs::symlink_metadata(&path).unwrap();
+            let stamp = (
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            );
+            assert!(
+                read_private_record_optional::<Vec<u8>>(&path).is_err(),
+                "{name}"
+            );
+            let m = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.mode(),
+                    m.len(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec()
+                ),
+                stamp,
+                "{name}"
+            );
+            assert_eq!(fs::read(&original).unwrap(), before);
+        }
+        assert!(
+            read_private_record_optional::<Vec<u8>>(&parent.join("absent"))
+                .unwrap()
+                .is_none()
+        );
+        let mut held = File::open(&original).unwrap();
+        let moved = parent.join("moved");
+        fs::rename(&original, &moved).unwrap();
+        std::os::unix::fs::symlink(parent.join("corrupt"), &original).unwrap();
+        let error = read_private_record_file::<Vec<u8>>(&original, &mut held).unwrap_err();
+        assert!(
+            error.to_string().contains("changed while being read"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&moved).unwrap(), before);
+        assert_eq!(fs::read(parent.join("corrupt")).unwrap(), [0xff]);
+        assert!(original.is_symlink());
+    }
 
     #[cfg(target_os = "linux")]
     fn preserved_ownership_fixture() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {

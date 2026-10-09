@@ -700,6 +700,53 @@ remain active.
     were not rerun.
     Atomic writer/path/ownership handoff, common resource budgets, installed
     artifacts and the full R1/R2/R3/release gates remain open.
+  - [x] Preserve private storage manifests across key-only restart and publication races.
+    Private storage manifests now open without following the final symlink or
+    blocking on a FIFO, validate ownership/mode/type and the existing 64 KiB
+    limit on the opened descriptor, and check descriptor and visible-path
+    versions after bounded reading. Presence checks use symlink metadata, so
+    dangling control-key and volume-manifest links are preserved as unsafe
+    inputs. A key-only interrupted installation authenticates its existing
+    envelope before startup lock creation or permission changes, even when
+    control.db is absent; valid interrupted keys resume without replacement.
+    New manifest encoding is bounded before allocation/publication. Linux
+    publication pins the parent directory, writes and syncs an anonymous
+    O_TMPFILE inode with mode 0600, then uses an unprivileged held descriptor
+    through procfs to link only an absent target name. Existing files,
+    directories, aliases and dangling links cannot be overwritten; failed
+    writes/collisions leave no named temporary to clean up. A held parent
+    continues to identify the original directory across reparenting. Other
+    Unix builds use a unique private temporary and no-clobber hard-link
+    publication; they remain unqualified. The actual before-fix daemon probe
+    under `/tmp/mb-m6-private-manifest-before-probe-gp56s3gq` reproduces
+    replacement of a dangling control.key link while its outside target stays
+    absent. Anonymous publication primitives pass on workspace/tmp filesystems
+    and provisioned Btrfs under
+    `/tmp/mb-m6-private-manifest-anonymous-probe-dtw8jb9h`, with exact-image
+    cleanup verified. New fixtures cover actual daemon early rejection, unsafe
+    key-only states, valid interrupted initialization/reopen, raw names,
+    exact/over limits, collision preservation, replaced open files and
+    provisioned Btrfs reparenting. Source-admission/control/volume writers
+    still require complete atomic directory handoff and external-owner
+    reconciliation; shared enclosing budgets, complete retained conversion,
+    installed artifacts and platform gates remain open. Private storage
+    manifest qualification passes 547 unique cases: all 512 ordinary Node
+    cases (including the eight local-control protocol cases), all 23 ordinary
+    CLI process cases, three daemon startup cases and nine explicitly run
+    native/foreign-UID cases. Native cases include Btrfs
+    init/worktree/backend/retained-capture reopen, renamed-root and
+    bind-descendant placement, bind-file/foreign-owned data locks, foreign-UID
+    unlock-secret protection and Btrfs private-manifest
+    collision/reparenting/interrupted-key resume. Namespace-changing cases
+    finish before ordinary suites start. All four debug programs build; format
+    and strict locked workspace/all-targets Clippy pass. All 285 source-file
+    and seven program/test-driver hashes remain unchanged, and native
+    mount/loop/image cleanup is verified. Evidence and the distinct
+    passing-case inventory are retained under
+    `/tmp/mb-m6-private-manifest-validation-xk0wnlec`; the post-commit audit
+    binds the code to the commit. This is debug-source qualification; other
+    ignored Node cases, installed artifacts and other platforms were not
+    rerun.
   - [x] Acquire exclusive data-lock ownership before startup permission changes.
     Linux data-directory locking now pins the directory and opens .node.lock
     relative to that descriptor with openat2

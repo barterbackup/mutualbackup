@@ -687,6 +687,127 @@ fn automatic_unlock_rejects_unowned_data_lock_without_mutation() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn automatic_unlock_preserves_unsafe_control_key_before_lock_or_socket_mutation() {
+    use std::{
+        collections::BTreeMap,
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    };
+    for kind in ["dangling", "symlink", "corrupt", "permissive"] {
+        let temporary = tempfile::tempdir().unwrap();
+        set_private(temporary.path());
+        let data = temporary.path().join("state");
+        let seed_file = temporary.path().join("node.seed");
+        let recovery = "correct-horse-battery-staple-2026!";
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--data-dir"),
+                os(&data),
+                os("--seed-file"),
+                os(&seed_file),
+            ],
+            recovery.as_bytes(),
+            CLI_TIMEOUT,
+        )
+        .unwrap();
+        assert!(!data.join("control.db").exists());
+        let keys = KeyMaterial::from_seed(&Seed::from_recovery_string(recovery).unwrap());
+        let envelope = keys.wrap_database_key(b"control.db/v2", &[64; 32]).unwrap();
+        let outside = temporary.path().join("outside-key");
+        fs::write(&outside, canonical_bytes(&envelope).unwrap()).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        let key = data.join("control.key");
+        match kind {
+            "dangling" => {
+                std::os::unix::fs::symlink(temporary.path().join("absent"), &key).unwrap()
+            }
+            "symlink" => std::os::unix::fs::symlink(&outside, &key).unwrap(),
+            "corrupt" => {
+                fs::write(&key, [0xff]).unwrap();
+                fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "permissive" => {
+                fs::write(&key, canonical_bytes(&envelope).unwrap()).unwrap();
+                fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+        let stamp = |path: &Path| {
+            let m = fs::symlink_metadata(path).unwrap();
+            (
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.uid(),
+                m.gid(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        let snapshot = || {
+            let entries = fs::read_dir(&data)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let bytes = if entry.file_type().unwrap().is_symlink() {
+                        fs::read_link(entry.path())
+                            .unwrap()
+                            .as_os_str()
+                            .as_bytes()
+                            .to_vec()
+                    } else {
+                        fs::read(entry.path()).unwrap()
+                    };
+                    (entry.file_name(), (stamp(&entry.path()), bytes))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (
+                stamp(&data),
+                entries,
+                stamp(&outside),
+                fs::read(&outside).unwrap(),
+            )
+        };
+        let before = snapshot();
+        let output = run_output(
+            program("mutualbackupd"),
+            &[
+                os("--data-dir"),
+                os(&data),
+                os("--seed-file"),
+                os(&seed_file),
+                os("--control-socket"),
+                os(data.join("control.sock")),
+                os("--failure-domain"),
+                os("control-key-preservation"),
+                os("--listen"),
+                os("/ip4/127.0.0.1/udp/0/quic-v1"),
+                os("--tor-mode"),
+                os("disable-tor"),
+            ],
+            CLI_TIMEOUT,
+        )
+        .unwrap();
+        assert!(!output.status.success(), "{kind}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("private storage manifest"),
+            "{kind}: {stderr}"
+        );
+        assert_eq!(snapshot(), before, "{kind}");
+        assert!(!data.join(".node.lock").exists());
+        assert!(!data.join("control.db").exists());
+        assert!(!data.join("control.sock").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn manual_unlock_preserves_withdrawn_catalog_before_and_after_rejected_secrets() {
     use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
     for journal in 0..3 {
