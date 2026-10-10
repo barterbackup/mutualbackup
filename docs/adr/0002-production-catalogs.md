@@ -4562,3 +4562,59 @@ indexes, backlinks, source validation, capture manifests, shared pages, packing/
 coding, scratch and WAL/payload headroom. Legacy adoption and normal paged
 capture/retention/seed recovery remain required. The user-deferred dense 1 TiB
 and Windows/macOS runs remain open acceptance gates.
+
+## Explicit enclosing packing admission (2026-10-10)
+
+The two packing record trees are each bounded by 16 GiB and one million page
+occurrences. The original local packing descriptor also imposed those ceilings
+on their sum. That aggregate restriction can reject independently valid streams
+before the enclosing checkpoint policy can account for their complete work.
+
+Local descriptor format two requires a separately supplied trusted
+`CatalogCodingTraversalBudget`; it cannot obtain its limits from its own root
+claims. The budget pays both tree occurrences, both framed record counts and
+the canonical descriptor before any page fetch or source authorization. Each
+original tree keeps its existing schema, scope, bounds and authenticated root.
+Format one and the original unbudgeted decode/build/certified-join APIs preserve
+their aggregate limits. A large supplied budget cannot relax a stream limit or
+silently upgrade a format-one descriptor. Original signed revision/checkpoint
+bytes, packing roots and source identities remain unchanged.
+
+The completed index retains its trusted remaining budget and requires it as
+well as the completion marker before lookups or local bundle construction.
+Explicit legacy-certified joins subtract their admitted source-authority work
+first. Public checkpoint joins subtract the same retained authority debt and
+reserve their combined descriptor. Complete coding-directory joins retain all
+three dimensions of prior work and fund every packing/coding stream. Original
+single-forest APIs remain bounded by their original contract. Durable physical
+scratch/page admission and authenticated source authority remain separate.
+
+Four new fixtures cover each exhausted dimension before I/O, canonical and
+version bounds, truncated source/descriptor inputs, missing trusted admission,
+original aggregate limits, independent stream limits, certified authority debt
+and complete directory witness seeks. One fixture validates declared full-stream
+upper bounds without materializing large streams or payload. Existing public
+mixed-source joins use format two, and budgeted guarded checkpoint fixtures
+carry it through certified original-history proof, retained ownership, reopen
+and bounded cancellation. Frozen qualification passes 178 core, 323 ordinary
+store and 35 paged Node cases, the certified-writer migration entry point and
+provisioned Btrfs native capture/recovery: 538 distinct cases. The ordinary
+suites leave 26 store cases ignored; the selected ignored native case runs
+separately on a disposable 2 GiB filesystem with a logical sparse 1 TiB file.
+This is not dense-capacity qualification. Formatting, strict locked workspace/
+all-targets Clippy, all-target test compilation and four debug builds pass under
+Cargo/rustc 1.99.0. Frozen source, seven binaries and 21 embedded protocol/helper
+inputs match. Native mount/loop/image cleanup is verified. Logs, manifests and
+the distinct passing-case inventory are retained under
+`/tmp/mb-m6-packing-admission-validation-zcytodje`. Other ordinary/native suites
+and installed artifacts were not rerun.
+
+Removing rebuildable incremental caches reclaims about 7.6 GiB, leaving about
+50 GiB in `target`. Qualified binary hashes remain unchanged; cleanup sizes
+and final independent audits are retained with the qualification evidence.
+
+The full section/dataset/guild metadata policy must still derive and fund the
+required single-owner retained geometry, private metadata, data bindings,
+validation facts, capture manifests, physical pages, scratch and SQL/WAL/payload
+headroom. Normal paged producers/retention/seed recovery and deferred dense
+capacity/native-platform qualification remain required.

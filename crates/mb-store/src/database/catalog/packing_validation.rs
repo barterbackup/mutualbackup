@@ -3,11 +3,12 @@
 //! dataset quota reservation, payload verification or durable page ownership.
 
 use mb_core::{
-    CATALOG_MAX_PAGE_OCCURRENCES, CATALOG_MAX_STREAM_BYTES, CatalogPackedSectorReader,
-    CatalogPackedSectorRecord, CatalogPackedSectorRoot, CatalogPackedSourceId,
-    CatalogPackedSourceReader, CatalogPackedSourceRecord, CatalogPackedSourceRoot,
-    CatalogStreamError, MerkleCommitment, MerkleSubtreeAccumulator, PackedSlot, SourceChunkId,
-    canonical_bytes_bounded, canonical_size_bounded, merkle_zero_subtree_root,
+    CATALOG_MAX_PAGE_OCCURRENCES, CATALOG_MAX_RECORDS, CATALOG_MAX_STREAM_BYTES,
+    CatalogCodingTraversalBudget, CatalogPackedSectorReader, CatalogPackedSectorRecord,
+    CatalogPackedSectorRoot, CatalogPackedSourceId, CatalogPackedSourceReader,
+    CatalogPackedSourceRecord, CatalogPackedSourceRoot, CatalogStreamError, MerkleCommitment,
+    MerkleSubtreeAccumulator, PackedSlot, SourceChunkId, canonical_bytes_bounded,
+    canonical_size_bounded, merkle_zero_subtree_root,
 };
 
 use super::*;
@@ -21,8 +22,9 @@ const CHUNKS: &str = "packing-chunk";
 pub(super) const SECTORS: &str = "packing-sector";
 const COMPLETE: &str = "packing-complete";
 
-/// Local join configuration, with an aggregate budget including both streams
-/// and this fixed descriptor. Its source-authority context remains external.
+/// Local join configuration including both streams and this descriptor. Version
+/// one retains the original aggregate ceiling; version two requires a separate
+/// trusted enclosing budget. Its source-authority context remains external.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogPackingValidation {
     pub format_version: u16,
@@ -33,11 +35,20 @@ pub struct CatalogPackingValidation {
 
 impl CatalogPackingValidation {
     pub fn decode(bytes: &[u8]) -> Result<Self, CatalogStoreError> {
+        let manifest = Self::decode_with_budget(bytes, Self::original_budget())?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn decode_with_budget(
+        bytes: &[u8],
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogStoreError> {
         if bytes.is_empty() || bytes.len() > ROOT_BYTES {
             return Err(CatalogError::Bounds.into());
         }
         let manifest: Self = decode_canonical(bytes)?;
-        manifest.validate()?;
+        manifest.validate_with_budget(budget)?;
         if canonical_bytes_bounded(&manifest, ROOT_BYTES)? != bytes {
             return Err(DatabaseError::Integrity.into());
         }
@@ -45,10 +56,46 @@ impl CatalogPackingValidation {
     }
 
     pub fn validate(self) -> Result<(), CatalogStoreError> {
+        if self.format_version != 1 {
+            return Err(CatalogError::InvalidPage.into());
+        }
+        self.validate_with_budget(Self::original_budget())
+    }
+
+    pub(super) fn original_budget() -> CatalogCodingTraversalBudget {
+        CatalogCodingTraversalBudget {
+            bytes: CATALOG_MAX_STREAM_BYTES,
+            page_occurrences: CATALOG_MAX_PAGE_OCCURRENCES,
+            // Both independently bounded streams may use their full record cap.
+            records: 2 * CATALOG_MAX_RECORDS,
+        }
+    }
+
+    /// Includes both stream occurrences, their framed records and the canonical
+    /// descriptor. Callers debit authority and other sections before admission.
+    pub fn represented_work(self) -> Result<CatalogCodingTraversalBudget, CatalogStoreError> {
+        let mut work = CatalogCodingTraversalBudget {
+            bytes: canonical_size_bounded(&self, ROOT_BYTES)? as u64,
+            ..Default::default()
+        };
+        for root in [self.descriptors.records, self.sources.records] {
+            work = work.checked_add(CatalogCodingTraversalBudget {
+                bytes: root.page.byte_len,
+                page_occurrences: root.page.page_occurrences,
+                records: root.records,
+            })?;
+        }
+        Ok(work)
+    }
+
+    pub fn validate_with_budget(
+        self,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<(), CatalogStoreError> {
         self.scope.validate(CatalogSection::Packing)?;
         self.descriptors.validate()?;
         self.sources.validate()?;
-        if self.format_version != 1
+        if !matches!(self.format_version, 1 | 2)
             || self.descriptors.packing_version < 2
             || self.descriptors.profile != self.sources.profile
             || self.descriptors.source_chunks != self.sources.chunks
@@ -56,15 +103,11 @@ impl CatalogPackingValidation {
         {
             return Err(CatalogError::InvalidPage.into());
         }
-        let pages = [self.descriptors.records.page, self.sources.records.page];
-        let bytes = pages.iter().map(|page| page.byte_len).sum::<u64>()
-            + canonical_size_bounded(&self, ROOT_BYTES)? as u64;
-        if bytes > CATALOG_MAX_STREAM_BYTES
-            || pages.iter().map(|page| page.page_occurrences).sum::<u64>()
-                > CATALOG_MAX_PAGE_OCCURRENCES
-        {
-            return Err(CatalogError::Bounds.into());
+        let work = self.represented_work()?;
+        if self.format_version == 1 {
+            Self::original_budget().remaining_after(work)?;
         }
+        budget.remaining_after(work)?;
         Ok(())
     }
 }
@@ -184,6 +227,7 @@ fn zero_content_hash(byte_len: u32) -> [u8; 32] {
 pub struct CatalogPackingIndex {
     pub(super) manifest: CatalogPackingValidation,
     pub(super) store: RecordScratchStore,
+    pub(super) budget: CatalogCodingTraversalBudget,
 }
 
 impl CatalogPackingIndex {
@@ -201,17 +245,41 @@ impl CatalogPackingIndex {
     pub fn build(
         manifest: CatalogPackingValidation,
         store: RecordScratchStore,
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+        authorize: impl FnMut(CatalogPackedSourceId, &MerkleCommitment) -> Result<(), CatalogStoreError>,
+    ) -> Result<Self, CatalogStoreError> {
+        manifest.validate()?;
+        Self::build_with_budget(
+            manifest,
+            CatalogPackingValidation::original_budget(),
+            store,
+            fetch,
+            authorize,
+        )
+    }
+
+    /// Admit all represented packing work against the trusted remaining budget
+    /// before fetching pages or authorizing sources. Physical scratch admission
+    /// and authenticated source authority are still required independently.
+    pub fn build_with_budget(
+        manifest: CatalogPackingValidation,
+        budget: CatalogCodingTraversalBudget,
+        store: RecordScratchStore,
         mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
         mut authorize: impl FnMut(
             CatalogPackedSourceId,
             &MerkleCommitment,
         ) -> Result<(), CatalogStoreError>,
     ) -> Result<Self, CatalogStoreError> {
-        manifest.validate()?;
+        manifest.validate_with_budget(budget)?;
         store.with_record_transaction(|| {
             build_index(manifest, &store, &mut fetch, &mut authorize)
         })?;
-        Ok(Self { manifest, store })
+        Ok(Self {
+            manifest,
+            store,
+            budget,
+        })
     }
 
     pub fn manifest(&self) -> CatalogPackingValidation {
@@ -250,6 +318,7 @@ impl CatalogPackingIndex {
     }
 
     pub(super) fn require_complete(&self) -> Result<(), CatalogStoreError> {
+        self.manifest.validate_with_budget(self.budget)?;
         let expected = canonical_bytes_bounded(&self.manifest, ROOT_BYTES)?;
         if self
             .store
@@ -1086,5 +1155,153 @@ pub(super) mod tests {
         large.validate().unwrap();
         large.sources.records.page.page_occurrences += 1;
         assert!(large.validate().is_err());
+    }
+
+    #[test]
+    fn budgeted_packing_admits_both_full_streams_without_relaxing_individual_bounds() {
+        // Admission geometry only: no large stream or payload is materialized.
+        let mut manifest = fixture(0, true).manifest;
+        let count = 1_u64 << 24;
+        manifest.format_version = 2;
+        manifest.descriptors.sectors = count;
+        manifest.descriptors.slots = count * 4;
+        manifest.descriptors.source_chunks = count * 4;
+        manifest.descriptors.source_bytes = count * 64;
+        manifest.descriptors.records.records = count * 2;
+        manifest.sources.sources = count;
+        manifest.sources.chunks = count * 4;
+        manifest.sources.ciphertext_bytes = count * 64;
+        manifest.sources.records.records = count * 2;
+        for page in [
+            &mut manifest.descriptors.records.page,
+            &mut manifest.sources.records.page,
+        ] {
+            page.byte_len = CATALOG_MAX_STREAM_BYTES;
+            page.height = 3;
+            page.page_occurrences = CATALOG_MAX_PAGE_OCCURRENCES;
+        }
+        manifest.descriptors.validate().unwrap();
+        manifest.sources.validate().unwrap();
+        let work = manifest.represented_work().unwrap();
+        assert!(work.bytes > 2 * CATALOG_MAX_STREAM_BYTES);
+        assert_eq!(work.page_occurrences, 2 * CATALOG_MAX_PAGE_OCCURRENCES);
+        manifest.validate_with_budget(work).unwrap();
+        assert!(manifest.validate().is_err());
+        let bytes = canonical_bytes_bounded(&manifest, ROOT_BYTES).unwrap();
+        assert_eq!(
+            CatalogPackingValidation::decode_with_budget(&bytes, work).unwrap(),
+            manifest
+        );
+        assert!(CatalogPackingValidation::decode(&bytes).is_err());
+        let mut original = manifest;
+        original.format_version = 1;
+        assert!(original.validate_with_budget(work).is_err());
+        let unlimited = CatalogCodingTraversalBudget {
+            bytes: u64::MAX,
+            page_occurrences: u64::MAX,
+            records: u64::MAX,
+        };
+        for role in 0..2 {
+            for dimension in 0..3 {
+                let mut invalid = manifest;
+                let root = if role == 0 {
+                    &mut invalid.descriptors.records
+                } else {
+                    &mut invalid.sources.records
+                };
+                match dimension {
+                    0 => root.page.byte_len += 1,
+                    1 => root.page.page_occurrences += 1,
+                    _ => root.records = CATALOG_MAX_RECORDS + 1,
+                }
+                assert!(invalid.validate_with_budget(unlimited).is_err());
+            }
+        }
+        manifest.format_version = 3;
+        assert!(manifest.validate_with_budget(unlimited).is_err());
+    }
+
+    #[test]
+    fn budgeted_packing_requires_admission_before_fetch_and_preserves_complete_eofs() {
+        let mut fixture = fixture(9, true);
+        fixture.manifest.format_version = 2;
+        let work = fixture.manifest.represented_work().unwrap();
+        assert!(fixture.build(1024 * 1024).is_err());
+        for dimension in 0..3 {
+            let mut limit = work;
+            match dimension {
+                0 => limit.bytes -= 1,
+                1 => limit.page_occurrences -= 1,
+                _ => limit.records -= 1,
+            }
+            assert!(
+                CatalogPackingIndex::build_with_budget(
+                    fixture.manifest,
+                    limit,
+                    RecordScratchStore::new(1024 * 1024).unwrap(),
+                    |_| panic!("exhausted budget fetched packing pages"),
+                    |_, _| panic!("exhausted budget authorized packing sources"),
+                )
+                .is_err()
+            );
+        }
+        let bytes = canonical_bytes_bounded(&fixture.manifest, ROOT_BYTES).unwrap();
+        for end in 0..bytes.len() {
+            assert!(CatalogPackingValidation::decode_with_budget(&bytes[..end], work).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(CatalogPackingValidation::decode_with_budget(&trailing, work).is_err());
+        for root in [
+            fixture.manifest.descriptors.records.page,
+            fixture.manifest.sources.records.page,
+        ] {
+            assert!(
+                CatalogPackingIndex::build_with_budget(
+                    fixture.manifest,
+                    work,
+                    RecordScratchStore::new(1024 * 1024).unwrap(),
+                    |page| {
+                        let mut bytes = fixture.fetch(page)?;
+                        if page == root {
+                            bytes.pop();
+                        }
+                        Ok(bytes)
+                    },
+                    |id, commitment| fixture.authorize(id, commitment),
+                )
+                .is_err()
+            );
+        }
+        let mut index = CatalogPackingIndex::build_with_budget(
+            fixture.manifest,
+            work,
+            RecordScratchStore::new(1024 * 1024).unwrap(),
+            |page| fixture.fetch(page),
+            |id, commitment| fixture.authorize(id, commitment),
+        )
+        .unwrap();
+        for sector in &fixture.sectors {
+            assert!(index.sector(sector.id).unwrap().is_some());
+            for slot in &sector.slots {
+                if let PackedSlot::Data(source) = slot {
+                    assert!(index.placement(source.id).unwrap().is_some());
+                }
+            }
+        }
+        let intents = std::array::from_fn(|_| CatalogIntent {
+            id: Uuid::new_v4(),
+            scope: fixture.manifest.scope,
+            section: CatalogSection::Packing,
+        });
+        let bundle = index.as_local_bundle(Uuid::new_v4(), intents).unwrap();
+        assert_eq!(
+            CatalogPackingValidation::decode_with_budget(&bundle.descriptor, work).unwrap(),
+            fixture.manifest
+        );
+        // The saved trusted budget remains necessary even with a valid marker.
+        index.budget.records -= 1;
+        assert!(index.sector(fixture.sectors[0].id).is_err());
+        assert!(index.as_local_bundle(Uuid::new_v4(), intents).is_err());
     }
 }

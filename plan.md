@@ -1484,6 +1484,24 @@ seven binaries and 21 embedded protocol/helper inputs match; native cleanup is
 verified. Evidence is in `/tmp/mb-m6-shared-recipes-validation-bcp0vuql`. Full
 metadata admission and the normal paged pipeline remain open.
 
+The local packing join now has descriptor format two with a separately supplied
+trusted byte/page/record budget. Each original descriptor/source stream retains
+its individual limits; format one and the original unbudgeted APIs retain their
+combined ceiling. Certified source authority is debited before either stream is
+fetched, and the completed index retains its admitted remaining budget. Coding
+directory and public checkpoint joins fund their complete authority/packing/
+coding work without resetting debt at a section boundary. Four new regressions
+and existing guarded checkpoint ownership fixtures exercise the budgeted path.
+Frozen qualification passes 538 distinct core/store/paged Node/native cases,
+formatting, strict locked workspace/all-targets Clippy, all-target compilation
+and four debug builds under Cargo/rustc 1.99.0. Source, seven binaries and 21
+embedded protocol/helper inputs match; native cleanup is verified. Evidence is
+in `/tmp/mb-m6-packing-admission-validation-zcytodje`. Cache cleanup reclaims
+about 7.6 GiB with qualified binaries preserved. This removes a local aggregate
+admission bottleneck;
+the complete section/dataset/guild policy, private/payload/SQL headroom, normal
+producers and deferred capacity/platform acceptance gates remain open.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

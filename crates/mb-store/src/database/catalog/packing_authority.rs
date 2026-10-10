@@ -629,9 +629,34 @@ impl CatalogPackingAuthority {
     pub fn validate_packing(
         self,
         manifest: CatalogPackingValidation,
-        mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
     ) -> Result<CatalogCertifiedPackingIndex, CatalogStoreError> {
         manifest.validate()?;
+        let work = manifest.represented_work()?;
+        self.check_budget(work.bytes, work.page_occurrences)?;
+        let mut budget = CatalogPackingValidation::original_budget();
+        budget.records = budget
+            .records
+            .checked_add(self.records)
+            .ok_or(CatalogError::Bounds)?;
+        self.validate_packing_with_budget(manifest, budget, fetch)
+    }
+
+    /// The trusted total budget includes this job's admitted source authority;
+    /// its debt is paid before either packing stream is fetched. The original
+    /// unbudgeted API keeps its original aggregate ceiling and version.
+    pub fn validate_packing_with_budget(
+        self,
+        manifest: CatalogPackingValidation,
+        budget: CatalogCodingTraversalBudget,
+        mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<CatalogCertifiedPackingIndex, CatalogStoreError> {
+        let packing_budget = budget.remaining_after(CatalogCodingTraversalBudget {
+            bytes: self.bytes,
+            page_occurrences: self.pages,
+            records: self.records,
+        })?;
+        manifest.validate_with_budget(packing_budget)?;
         if manifest.scope
             != (CatalogScope::Guild {
                 guild_id: self.base.guild_id,
@@ -641,15 +666,6 @@ impl CatalogPackingAuthority {
         {
             return Err(DatabaseError::Conflict.into());
         }
-        let pages = [
-            manifest.descriptors.records.page,
-            manifest.sources.records.page,
-        ];
-        self.check_budget(
-            pages.iter().map(|page| page.byte_len).sum::<u64>()
-                + canonical_size_bounded(&manifest, 2048)? as u64,
-            pages.iter().map(|page| page.page_occurrences).sum(),
-        )?;
         self.store.with_record_transaction(|| {
             build_index(manifest, &self.store, &mut fetch, &mut |id, commitment| {
                 let (source, _) = source(&self.store, id)?;
@@ -668,6 +684,7 @@ impl CatalogPackingAuthority {
             index: CatalogPackingIndex {
                 manifest,
                 store: self.store,
+                budget: packing_budget,
             },
         })
     }
@@ -1192,6 +1209,64 @@ pub(super) mod tests {
             .get(&page.hash)
             .cloned()
             .ok_or_else(|| DatabaseError::NotReady.into())
+    }
+
+    #[test]
+    fn budgeted_certified_packing_debits_source_authority_before_fetching() {
+        let fixture = Fixture::new(true, false);
+        let (mut manifest, pages) = fixture.packing(&fixture.records, &fixture.bytes);
+        manifest.format_version = 2;
+        let job = fixture.authority();
+        let prior = CatalogCodingTraversalBudget {
+            bytes: job.bytes,
+            page_occurrences: job.pages,
+            records: job.records,
+        };
+        let work = prior
+            .checked_add(manifest.represented_work().unwrap())
+            .unwrap();
+        drop(job);
+        assert!(
+            fixture
+                .authority()
+                .validate_packing(manifest, |_| panic!("unbudgeted version two fetched pages"))
+                .is_err()
+        );
+        for dimension in 0..3 {
+            let mut limit = work;
+            match dimension {
+                0 => limit.bytes -= 1,
+                1 => limit.page_occurrences -= 1,
+                _ => limit.records -= 1,
+            }
+            assert!(
+                fixture
+                    .authority()
+                    .validate_packing_with_budget(manifest, limit, |_| panic!(
+                        "unpaid authority or packing work fetched pages"
+                    ))
+                    .is_err()
+            );
+        }
+        assert!(
+            fixture
+                .authority()
+                .validate_packing_with_budget(
+                    manifest,
+                    manifest.represented_work().unwrap(),
+                    |_| panic!("authority debt was omitted")
+                )
+                .is_err()
+        );
+        let checked = fixture
+            .authority()
+            .validate_packing_with_budget(manifest, work, |page| fetch(&pages, page))
+            .unwrap();
+        assert_eq!(checked.manifest(), manifest);
+        assert_eq!(checked.candidate_count(), 0);
+        assert_eq!(checked.index.budget, manifest.represented_work().unwrap());
+        checked.index.require_complete().unwrap();
+        assert!(checked.next_paged_revision(None).unwrap().is_none());
     }
 
     #[test]

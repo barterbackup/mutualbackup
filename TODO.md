@@ -2492,6 +2492,29 @@ and native-platform gates remain open.
       remain unchanged.
       Full enclosing policy and normal producers
       remain required; this is not real retained-capacity qualification.
+    - [x] Admit the complete packing join under an explicitly trusted enclosing
+      byte/page/record budget. Local descriptor format two supports both
+      independently bounded streams without imposing format one's combined
+      16 GiB/one-million-page ceiling. Preserve original unbudgeted APIs and
+      stream limits; debit certified source authority before fetching either
+      stream and retain admission through complete coding-directory/public
+      joins and guarded checkpoint ownership. Four new regressions cover
+      dimensional exhaustion before I/O, canonical/version bounds, damaged
+      EOFs, separate stream limits, authority debt and complete witness seeks.
+      Existing mixed-source and guarded format-nine ownership fixtures exercise
+      packing format two through reopen and bounded cancellation.
+      Frozen qualification passes 178 core, 323 ordinary store, 35 paged Node,
+      the certified-writer migration case and provisioned Btrfs capture/recovery
+      (538 distinct cases). Formatting, strict locked workspace/all-targets
+      Clippy, all-target test compilation and four debug builds pass under
+      Cargo/rustc 1.99.0. Source, seven binaries and 21 embedded protocol/helper
+      inputs match; native cleanup is verified. Evidence is retained under
+      `/tmp/mb-m6-packing-admission-validation-zcytodje`.
+      Incremental-cache cleanup reclaims about 7.6 GiB, leaving about 50 GiB
+      in `target`, with qualified binary hashes preserved.
+      Full section/dataset/guild policy, private/payload/
+      SQL headroom, normal producers and deferred real capacity/platform gates
+      remain open; declared upper-bound roots do not qualify dense storage.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

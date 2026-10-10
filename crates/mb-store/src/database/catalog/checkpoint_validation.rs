@@ -657,7 +657,8 @@ impl CatalogCheckpointAuthorityIndex {
         mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
     ) -> Result<CatalogCheckpointPackingIndex, CatalogStoreError> {
         self.require_complete()?;
-        manifest.validate()?;
+        let packing_budget = self.budget.remaining_after(self.work)?;
+        manifest.validate_with_budget(packing_budget)?;
         if manifest.scope != self.manifest.scope() || manifest.sources.sources != self.source_count
         {
             return Err(DatabaseError::Conflict.into());
@@ -692,6 +693,7 @@ impl CatalogCheckpointAuthorityIndex {
             index: CatalogPackingIndex {
                 manifest,
                 store: self.store,
+                budget: packing_budget,
             },
         })
     }
@@ -1330,7 +1332,10 @@ pub(super) mod tests {
             CatalogCheckpointCodingDirectoryIndex,
             Vec<mb_core::CatalogCodingEntry>,
         ) {
-            let (packing, packing_pages, inputs) = self.packing_inputs_mode(byte_roots);
+            let (mut packing, packing_pages, inputs) = self.packing_inputs_mode(byte_roots);
+            if self.authority_budget.is_some() {
+                packing.format_version = 2;
+            }
             let entry = super::super::coding_coverage::tests::entry(
                 &inputs,
                 [0, 1, 2],
@@ -1438,9 +1443,10 @@ pub(super) mod tests {
             after = Some(source.id);
         }
         assert!(index.next_source(after).unwrap().is_none());
-        let (packing, packing_pages) = fixture
+        let (mut packing, packing_pages) = fixture
             .sources
             .packing(&fixture.sources.records, &fixture.sources.bytes);
+        packing.format_version = 2;
         let old = &fixture.sources.certificate.checkpoint.revisions[0].value;
         let packed = pack_incremental(
             packing.descriptors.profile,

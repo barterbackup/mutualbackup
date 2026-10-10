@@ -47,7 +47,8 @@ impl CatalogPackingCodingDirectoryValidation {
     }
 
     pub fn validate(self, budget: CatalogCodingTraversalBudget) -> Result<(), CatalogStoreError> {
-        self.packing.validate()?;
+        self.packing
+            .validate_with_budget(budget.remaining_after(self.prior_work)?)?;
         if self.format_version != 1 {
             return Err(DatabaseError::Conflict.into());
         }
@@ -526,6 +527,83 @@ pub(super) mod tests {
             );
         }
         packing.require_complete().unwrap();
+    }
+
+    #[test]
+    fn budgeted_packing_directory_keeps_prior_debt_and_complete_witness_joins() {
+        let mut fixture = Fixture::new(9);
+        fixture.packing.manifest.format_version = 2;
+        let prior = CatalogCodingTraversalBudget {
+            bytes: 5000,
+            page_occurrences: 5,
+            records: 7,
+        };
+        let manifest = fixture.manifest(CatalogCodingCoveragePolicy::Current, prior);
+        let total = manifest.represented_work().unwrap();
+        let packing_work = fixture.packing.manifest.represented_work().unwrap();
+        let rebuild = || {
+            CatalogPackingIndex::build_with_budget(
+                fixture.packing.manifest,
+                packing_work,
+                crate::RecordScratchStore::new(4 * 1024 * 1024).unwrap(),
+                |page| fixture.packing.fetch(page),
+                |id, commitment| fixture.packing.authorize(id, commitment),
+            )
+            .unwrap()
+        };
+        for dimension in 0..3 {
+            let mut limit = total;
+            match dimension {
+                0 => limit.bytes -= 1,
+                1 => limit.page_occurrences -= 1,
+                _ => limit.records -= 1,
+            }
+            assert!(
+                rebuild()
+                    .validate_directory_with_prior(
+                        fixture.root,
+                        manifest.policy,
+                        limit,
+                        prior,
+                        |_| panic!("unpaid combined work fetched coding pages"),
+                        |_| panic!("unpaid combined work authorized groups")
+                    )
+                    .is_err()
+            );
+        }
+        let joined = rebuild()
+            .validate_directory_with_prior(
+                fixture.root,
+                manifest.policy,
+                total,
+                prior,
+                |page| fixture.fetch(page),
+                |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
+            )
+            .unwrap();
+        assert_eq!(joined.manifest(), manifest);
+        assert_eq!(joined.budget(), total);
+        let encoded = canonical_bytes_bounded(&manifest, MANIFEST_BYTES).unwrap();
+        assert_eq!(
+            CatalogPackingCodingDirectoryValidation::decode(&encoded, total).unwrap(),
+            manifest
+        );
+        for sector in &fixture.packing.sectors {
+            assert!(joined.coverage(sector.id).unwrap().is_some());
+        }
+        let mut after = None;
+        for expected in &fixture.entries {
+            let group = joined.next_group(after).unwrap().unwrap();
+            assert_eq!(group.group.range.group_id, expected.retained.group.id);
+            assert_eq!(
+                joined
+                    .read_group(group.group.range.group_id, |page| fixture.fetch(page))
+                    .unwrap(),
+                Some(expected.clone())
+            );
+            after = Some(group.group.range.group_id);
+        }
+        assert!(joined.next_group(after).unwrap().is_none());
     }
 
     #[test]
