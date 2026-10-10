@@ -257,6 +257,8 @@ const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_CONTROL_WRITER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static INTERRUPT_AFTER_RECOVERY_STAGING_CREATE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static INTERRUPT_AFTER_RECOVERY_PUBLISH: std::cell::Cell<bool> =
@@ -1387,12 +1389,28 @@ impl Node {
     pub fn open_locked(locked: LockedDataDir, seed: Seed) -> Result<Self> {
         let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
+        #[cfg(target_os = "linux")]
+        locked.require_current_identity()?;
+        #[cfg(target_os = "linux")]
+        let (admission, admitted_key) =
+            crate::source_policy::admit_native_control_writer(&data_dir, &keys)?;
+        #[cfg(not(target_os = "linux"))]
         crate::source_policy::require_native_source_state_from_catalog(&data_dir, &keys)?;
         locked.make_private()?;
+        #[cfg(test)]
+        BEFORE_CONTROL_WRITER.with(|hook| {
+            if let Some(operation) = hook.borrow_mut().take() {
+                operation();
+            }
+        });
+        #[cfg(target_os = "linux")]
+        locked.require_current_identity()?;
         #[cfg(target_os = "linux")]
         let (mut control, control_database_key) = crate::volume::open_control_store_in_directory(
             &mb_store::DatabaseDirectory::from_file(locked.lease.directory.clone())?,
             &keys,
+            &admission,
+            admitted_key.as_ref(),
         )?;
         #[cfg(not(target_os = "linux"))]
         let (mut control, control_database_key) =
@@ -18995,6 +19013,90 @@ pub(crate) mod tests {
                 .unwrap(),
             Some(b"reader update".to_vec())
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_writer_handoff_rejects_replacement_after_native_admission_without_mutation() {
+        use std::os::unix::fs::MetadataExt;
+        type Stamp = (u64, u64, u32, u64, i64, i64, i64, i64);
+        type Snapshot = BTreeMap<std::ffi::OsString, (Vec<u8>, Stamp)>;
+        fn snapshot(path: &Path) -> Snapshot {
+            fs::read_dir(path)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let m = entry.metadata().unwrap();
+                    (
+                        entry.file_name(),
+                        (
+                            fs::read(entry.path()).unwrap(),
+                            (
+                                m.dev(),
+                                m.ino(),
+                                m.mode(),
+                                m.len(),
+                                m.mtime(),
+                                m.mtime_nsec(),
+                                m.ctime(),
+                                m.ctime_nsec(),
+                            ),
+                        ),
+                    )
+                })
+                .collect()
+        }
+        for substitution in ["catalog", "missing", "key", "wal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            let seed = Seed::from_bytes([214; 32]);
+            let node = Node::open(&data, seed.clone()).unwrap();
+            let database_key = node.control_database_key;
+            drop(node);
+            let replacement = temp.path().join("replacement.db");
+            let store = ControlStore::open_with_key(&replacement, &database_key).unwrap();
+            store
+                .put_record("guarded-handoff-fixture", b"intent", b"withdrawn")
+                .unwrap();
+            drop(store);
+            let new_envelope = canonical_bytes(
+                &KeyMaterial::from_seed(&seed)
+                    .wrap_database_key(b"control.db/v2", &database_key)
+                    .unwrap(),
+            )
+            .unwrap();
+            let after_hook = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let recorded = after_hook.clone();
+            let hook_data = data.clone();
+            BEFORE_CONTROL_WRITER.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    match substitution {
+                        "catalog" | "missing" => {
+                            fs::rename(hook_data.join("control.db"), hook_data.join("original.db"))
+                                .unwrap();
+                            if substitution == "catalog" {
+                                fs::copy(&replacement, hook_data.join("control.db")).unwrap();
+                            }
+                        }
+                        "key" => fs::write(hook_data.join("control.key"), &new_envelope).unwrap(),
+                        "wal" => fs::write(hook_data.join("control.db-wal"), b"unadmitted journal")
+                            .unwrap(),
+                        _ => unreachable!(),
+                    }
+                    *recorded.borrow_mut() = Some(snapshot(&hook_data));
+                }));
+            });
+            let result = Node::open(&data, seed);
+            assert!(
+                result.is_err(),
+                "startup must reject a withdrawn catalog substituted after native admission: {substitution}"
+            );
+            assert_eq!(
+                snapshot(&data),
+                after_hook.borrow().clone().unwrap(),
+                "{substitution}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

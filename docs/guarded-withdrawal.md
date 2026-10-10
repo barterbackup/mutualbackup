@@ -242,6 +242,17 @@ The before-fix replacement regression and five Store cases are recorded in R1
 of `TODO.md`. Complete atomic source-admission/leaf/version handoff, initial
 volume setup, external-owner reconciliation, history/payload joins, enclosing
 budgets, installed artifacts and other-platform qualification remain open.
+
+Initial Linux control startup additionally retains its admitted database,
+journal and key-envelope versions through the first writable main-file open.
+SQLite's opened inode is checked before journal-mode changes, schema migration
+or replay. The authenticated read-only key is reused for interrupted rekeys.
+An absent catalog with orphan WAL/SHM/rollback journals rejects before lock
+creation or permission changes: preserve all those files and inspect a separate
+complete snapshot. Directory capabilities also remain held during rekey readback.
+The before-fix replacement failure and qualification are recorded in R1 of
+`TODO.md`; complete namespace/volume/external-owner handoff remains required.
+
 The native Git source-loss fixture now shuts down and releases the
 original owner and its workers before normal startup acquires a new claim. It
 retains the same advertised QUIC endpoint, with a 30-second retry limited to

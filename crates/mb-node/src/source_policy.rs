@@ -12,6 +12,34 @@ use std::path::Path;
 use crate::control::GitRepositoryInfo;
 use crate::control::ProtectedRoot;
 
+#[cfg(target_os = "linux")]
+pub(crate) fn admit_native_control_writer(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+) -> Result<(mb_store::DatabaseOpenGuard, Option<[u8; 32]>)> {
+    let path = data_dir.join("control.db");
+    let guard =
+        mb_store::DatabaseOpenGuard::capture(&path, &[std::ffi::OsStr::new("control.key")])?;
+    let mut admitted_key = None;
+    if guard.requires_existing_catalog() {
+        crate::volume::with_inspected_control_key_snapshot(
+            data_dir,
+            keys,
+            |control, database_key| {
+                control.verify_open_guard(&guard)?;
+                admitted_key = Some(database_key);
+                require_native_source_state(control, keys)?;
+                control.verify_open_guard(&guard)?;
+                Ok(())
+            },
+        )?;
+    } else {
+        require_native_source_state_from_catalog(data_dir, keys)?;
+    }
+    guard.verify_unchanged(&path)?;
+    Ok((guard, admitted_key))
+}
+
 /// Reject withdrawn state before any catalog writer, migration or replay opens.
 /// A fresh installation has no catalog to inspect. Linux inspections forbid
 /// journal creation and use one preserved read snapshot for all namespaces.
@@ -23,7 +51,14 @@ pub(crate) fn require_native_source_state_from_catalog(
     {
         match std::fs::symlink_metadata(data_dir.join("control.db")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let guard = mb_store::DatabaseOpenGuard::capture(&data_dir.join("control.db"), &[])
+                    .map_err(|error| anyhow::anyhow!("control catalog is absent with incomplete journals: {error}; preserve every input and inspect a separate complete snapshot; see docs/guarded-withdrawal.md"))?;
+                anyhow::ensure!(
+                    !guard.requires_existing_catalog(),
+                    "control catalog appeared during startup admission; retry before acquiring ownership"
+                );
                 crate::volume::validate_preserved_control_key(data_dir, keys)?;
+                guard.verify_unchanged(&data_dir.join("control.db"))?;
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
@@ -89,6 +124,94 @@ mod tests {
     use mb_core::{KeyMaterial, Seed, canonical_bytes};
     use std::fs;
     use uuid::Uuid;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_catalog_with_orphan_journals_rejects_before_lock_or_permission_changes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for suffix in ["wal", "shm", "journal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            fs::create_dir(&data).unwrap();
+            fs::set_permissions(&data, fs::Permissions::from_mode(0o751)).unwrap();
+            fs::write(
+                data.join(format!("control.db-{suffix}")),
+                b"preserved orphan",
+            )
+            .unwrap();
+            let stamp = |path: &Path| {
+                let m = fs::metadata(path).unwrap();
+                (
+                    m.ino(),
+                    m.mode(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                )
+            };
+            let before = (stamp(&data), directory_bytes(&data));
+            let seed = Seed::from_bytes([215; 32]);
+            let error = Node::open(&data, seed).err().unwrap();
+            assert!(
+                format!("{error:#}").contains("preserve every input"),
+                "{suffix}"
+            );
+            assert_eq!((stamp(&data), directory_bytes(&data)), before);
+            assert!(!data.join(".node.lock").exists());
+            assert!(!data.join("control.key").exists());
+            assert!(!data.join("control.db").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_admission_returns_the_authenticated_key_without_rekeying_or_journals() {
+        use std::os::unix::fs::PermissionsExt;
+        let seed = Seed::from_bytes([216; 32]);
+        let keys = KeyMaterial::from_seed(&seed);
+        for mode in ["legacy", "wrapped", "interrupted"] {
+            let temp = tempfile::tempdir().unwrap();
+            let database_key = if mode == "wrapped" {
+                [61; 32]
+            } else {
+                keys.database_key(b"control.db")
+            };
+            let path = temp.path().join("control.db");
+            let control = ControlStore::open_with_key(&path, &database_key).unwrap();
+            control.put_record("fixture", b"id", b"admitted").unwrap();
+            drop(control);
+            if mode != "legacy" {
+                let envelope_key = if mode == "interrupted" {
+                    [62; 32]
+                } else {
+                    database_key
+                };
+                let envelope = keys
+                    .wrap_database_key(b"control.db/v2", &envelope_key)
+                    .unwrap();
+                let path = temp.path().join("control.key");
+                fs::write(&path, canonical_bytes(&envelope).unwrap()).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let before = directory_bytes(temp.path());
+            let (guard, selected) = admit_native_control_writer(temp.path(), &keys).unwrap();
+            assert_eq!(selected, Some(database_key), "{mode}");
+            guard.verify_unchanged(&path).unwrap();
+            assert_eq!(directory_bytes(temp.path()), before, "{mode}");
+            assert!(!temp.path().join("control.db-wal").exists());
+            assert!(!temp.path().join("control.db-shm").exists());
+            let node = Node::open(temp.path(), seed.clone()).unwrap();
+            let result = node
+                .database_shell_statement(
+                    None,
+                    "SELECT hex(bytes) FROM protocol_records WHERE kind = 'fixture'",
+                    false,
+                )
+                .unwrap();
+            assert_eq!(result.rows, vec![vec![hex::encode_upper(b"admitted")]]);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

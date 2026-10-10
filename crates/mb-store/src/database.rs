@@ -69,7 +69,7 @@ pub use catalog::{
     PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 #[cfg(target_os = "linux")]
-pub use directory::DatabaseDirectory;
+pub use directory::{DatabaseDirectory, DatabaseOpenGuard};
 #[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
@@ -218,7 +218,15 @@ impl ControlStore {
         self.connection
             .pragma_update(None, "rekey", hex::encode(database_key))?;
         let path = self.path.clone();
+        #[cfg(target_os = "linux")]
+        let directory = self.directory.clone();
         drop(self);
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = directory {
+            let name = path.file_name().ok_or(DatabaseError::Conflict)?;
+            let (connection, _) = directory.connect(name, database_key, true)?;
+            return cipher_integrity_check(&connection);
+        }
         verify_rekeyed_database(&path, database_key)
     }
 
@@ -2308,7 +2316,15 @@ impl ParityStore {
         self.connection
             .pragma_update(None, "rekey", hex::encode(database_key))?;
         let path = self.path.clone();
+        #[cfg(target_os = "linux")]
+        let directory = self.directory.clone();
         drop(self);
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = directory {
+            let name = path.file_name().ok_or(DatabaseError::Conflict)?;
+            let (connection, _) = directory.connect(name, database_key, true)?;
+            return cipher_integrity_check(&connection);
+        }
         verify_rekeyed_database(&path, database_key)
     }
 

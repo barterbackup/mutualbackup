@@ -1345,6 +1345,14 @@ recorded in R1 of `TODO.md` and the production catalog ADR. This increment passe
 source and binary hashes. Complete admission/leaf/version handoff and all other
 open Milestone 6 gates remain required.
 
+Initial Linux control writers now check admitted catalog/journal/key versions
+and SQLite's opened main inode before writable configuration. Read-only key
+selection carries forward through interrupted rekey completion; orphan journals
+without a catalog reject before startup ownership changes. R1 records the actual
+before-fix reproduction and 1,334 distinct passing source cases. This qualifies
+the initial control handoff; complete namespace/volume/external-owner handoff and
+the remaining Milestone 6 gates remain open.
+
 ### Production corrections from the 2026-10-05 source review
 
 These are the correction requirements; completed increments are recorded below.

@@ -41,7 +41,7 @@ pub use anchor::{
 #[cfg(target_os = "linux")]
 pub use database::{
     ANCHOR_DISCOVERY_FENCE_KIND, ANCHOR_DISCOVERY_JOURNAL_KIND, AnchorDiscoveryJobPage,
-    AnchorDiscoveryJobStatus, DatabaseDirectory, PreservedReadGuard,
+    AnchorDiscoveryJobStatus, DatabaseDirectory, DatabaseOpenGuard, PreservedReadGuard,
 };
 pub use database::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,

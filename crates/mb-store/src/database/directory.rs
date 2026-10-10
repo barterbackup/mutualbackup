@@ -35,6 +35,204 @@ pub struct DatabaseDirectory {
     file: Arc<File>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenFileVersion {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    owner: u32,
+    links: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl OpenFileVersion {
+    fn capture(path: &Path) -> Result<Option<Self>, DatabaseError> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            mode: metadata.mode(),
+            owner: metadata.uid(),
+            links: metadata.nlink(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }))
+    }
+
+    fn same_mapping(&self, other: &Self) -> bool {
+        (
+            self.device,
+            self.inode,
+            self.size,
+            self.mode,
+            self.owner,
+            self.links,
+        ) == (
+            other.device,
+            other.inode,
+            other.size,
+            other.mode,
+            other.owner,
+            other.links,
+        )
+    }
+}
+
+/// Bind a completed read-only admission to the first writable main-file open.
+/// Capture before inspection and verify afterwards, then supply this token to
+/// the directory opener. No SQLite journal-mode/schema changes precede its check.
+#[derive(Clone)]
+pub struct DatabaseOpenGuard {
+    main: Option<OpenFileVersion>,
+    journals: [Option<OpenFileVersion>; 3],
+    private_files: Vec<(std::ffi::OsString, Option<OpenFileVersion>)>,
+}
+
+impl DatabaseOpenGuard {
+    pub fn capture(path: &Path, private_files: &[&OsStr]) -> Result<Self, DatabaseError> {
+        if private_files.len() > 16 {
+            return Err(DatabaseError::Conflict);
+        }
+        let parent = path.parent().ok_or(DatabaseError::Conflict)?;
+        let main_name = path.file_name().ok_or(DatabaseError::Conflict)?;
+        if !valid_leaf(main_name.as_bytes()) {
+            return Err(DatabaseError::Conflict);
+        }
+        let mut extras = Vec::with_capacity(private_files.len());
+        for name in private_files {
+            if !valid_leaf(name.as_bytes()) || *name == main_name {
+                return Err(DatabaseError::Conflict);
+            }
+            extras.push((
+                name.to_os_string(),
+                OpenFileVersion::capture(&parent.join(name))?,
+            ));
+        }
+        let journals: [Option<OpenFileVersion>; 3] = Self::journal_paths(path)
+            .iter()
+            .map(|path| OpenFileVersion::capture(path))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| DatabaseError::Conflict)?;
+        let main = OpenFileVersion::capture(path)?;
+        if main.as_ref().is_some_and(|file| file.size == 0)
+            || (main.is_none() && journals.iter().any(Option::is_some))
+        {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        Ok(Self {
+            main,
+            journals,
+            private_files: extras,
+        })
+    }
+
+    pub fn requires_existing_catalog(&self) -> bool {
+        self.main.is_some()
+    }
+
+    pub fn refresh_private_files_after_publication(
+        &self,
+        path: &Path,
+    ) -> Result<Self, DatabaseError> {
+        let mut refreshed = self.clone();
+        refreshed.private_files.clear();
+        refreshed.verify_unchanged(path)?;
+        for (name, _) in &self.private_files {
+            let parent = path.parent().ok_or(DatabaseError::Conflict)?;
+            refreshed
+                .private_files
+                .push((name.clone(), OpenFileVersion::capture(&parent.join(name))?));
+        }
+        Ok(refreshed)
+    }
+
+    fn journal_paths(path: &Path) -> [PathBuf; 3] {
+        ["-wal", "-shm", "-journal"].map(|suffix| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        })
+    }
+
+    pub fn verify_unchanged(&self, path: &Path) -> Result<(), DatabaseError> {
+        if OpenFileVersion::capture(path)? != self.main {
+            return Err(DatabaseError::Conflict);
+        }
+        self.verify_other_inputs(path)
+    }
+
+    fn verify_other_inputs(&self, path: &Path) -> Result<(), DatabaseError> {
+        for (index, (path, expected)) in Self::journal_paths(path)
+            .iter()
+            .zip(&self.journals)
+            .enumerate()
+        {
+            let actual = OpenFileVersion::capture(path)?;
+            // Existing SHM read marks are transient. Its mapping, ownership and
+            // permissions must remain the same; main/WAL/journal versions are exact.
+            let same = if index == 1 {
+                match (expected, &actual) {
+                    (Some(expected), Some(actual)) => expected.same_mapping(actual),
+                    (None, None) => true,
+                    _ => false,
+                }
+            } else {
+                *expected == actual
+            };
+            if !same {
+                return Err(DatabaseError::Conflict);
+            }
+        }
+        let parent = path.parent().ok_or(DatabaseError::Conflict)?;
+        for (name, expected) in &self.private_files {
+            if OpenFileVersion::capture(&parent.join(name))? != *expected {
+                return Err(DatabaseError::Conflict);
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_opened(&self, path: &Path, connection: &Connection) -> Result<(), DatabaseError> {
+        if self.main.is_some() {
+            self.verify_unchanged(path)?;
+        } else {
+            // Opening an admitted absent main file may create only an empty
+            // file. An existing catalog cannot silently become a fresh one.
+            if !OpenFileVersion::capture(path)?.is_some_and(|file| file.size == 0) {
+                return Err(DatabaseError::Conflict);
+            }
+            self.verify_other_inputs(path)?;
+        }
+        let mut moved = 1_i32;
+        // SAFETY: the live connection owns its native main file; SQLite's public
+        // file-control contract writes one int. Unix checks its opened inode
+        // against the current directory-bound pathname, without private ABI access.
+        let code = unsafe {
+            ffi::sqlite3_file_control(
+                connection.handle(),
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_HAS_MOVED,
+                (&mut moved as *mut i32).cast(),
+            )
+        };
+        if code != ffi::SQLITE_OK || moved != 0 {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(())
+    }
+}
+
 impl DatabaseDirectory {
     pub fn open(path: &Path) -> Result<Self, DatabaseError> {
         Self::from_file(Arc::new(
@@ -90,7 +288,20 @@ impl DatabaseDirectory {
         key: &[u8; 32],
         existing: bool,
     ) -> Result<(Connection, PathBuf), DatabaseError> {
+        self.connect_with_guard(name, key, existing, None)
+    }
+
+    fn connect_with_guard(
+        &self,
+        name: &OsStr,
+        key: &[u8; 32],
+        existing: bool,
+        guard: Option<&DatabaseOpenGuard>,
+    ) -> Result<(Connection, PathBuf), DatabaseError> {
         let path = self.leaf(name)?;
+        if let Some(guard) = guard {
+            guard.verify_unchanged(&path)?;
+        }
         register()?;
         let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -108,6 +319,9 @@ impl DatabaseDirectory {
             flags,
             VFS_NAME.to_str().expect("ASCII VFS name"),
         )?;
+        if let Some(guard) = guard {
+            guard.verify_opened(&path, &connection)?;
+        }
         Ok((configure_encrypted(connection, key)?, path))
     }
 }
@@ -210,6 +424,26 @@ fn register() -> Result<(), DatabaseError> {
 }
 
 impl ControlStore {
+    pub fn verify_open_guard(&self, guard: &DatabaseOpenGuard) -> Result<(), DatabaseError> {
+        guard.verify_opened(&self.path, &self.connection)
+    }
+
+    pub fn open_admitted_in_directory_with_key(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        key: &[u8; 32],
+        guard: &DatabaseOpenGuard,
+    ) -> Result<Self, DatabaseError> {
+        let (mut connection, path) =
+            directory.connect_with_guard(name, key, guard.main.is_some(), Some(guard))?;
+        initialize_or_validate_control(&mut connection)?;
+        Ok(Self {
+            connection,
+            path,
+            directory: Some(directory.clone()),
+        })
+    }
+
     pub fn open_in_directory_with_key(
         directory: &DatabaseDirectory,
         name: &OsStr,
@@ -486,5 +720,208 @@ mod tests {
             object
         );
         assert!(std::fs::read_dir(&visible).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn admitted_directory_open_creates_only_a_fresh_catalog_and_reopens_exact_existing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        let path = directory.leaf("control.db").unwrap();
+        let fresh = DatabaseOpenGuard::capture(&path, &[]).unwrap();
+        let store = ControlStore::open_admitted_in_directory_with_key(
+            &directory,
+            OsStr::new("control.db"),
+            &[31; 32],
+            &fresh,
+        )
+        .unwrap();
+        store.put_record("fixture", b"id", b"admitted").unwrap();
+        drop(store);
+        let existing = DatabaseOpenGuard::capture(&path, &[]).unwrap();
+        let store = ControlStore::open_admitted_in_directory_with_key(
+            &directory,
+            OsStr::new("control.db"),
+            &[31; 32],
+            &existing,
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_record("fixture", b"id").unwrap(),
+            Some(b"admitted".to_vec())
+        );
+    }
+
+    #[test]
+    fn admitted_directory_open_rejects_changed_main_journal_and_private_inputs_before_writes() {
+        for change in ["main", "missing", "wal", "shm", "journal", "key", "new-key"] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = DatabaseDirectory::open(temp.path()).unwrap();
+            let path = directory.leaf("control.db").unwrap();
+            let key = directory.leaf("control.key").unwrap();
+            drop(
+                ControlStore::open_in_directory_with_key(
+                    &directory,
+                    OsStr::new("control.db"),
+                    &[32; 32],
+                )
+                .unwrap(),
+            );
+            if change != "new-key" {
+                std::fs::write(&key, b"private key").unwrap();
+            }
+            let guard = DatabaseOpenGuard::capture(&path, &[OsStr::new("control.key")]).unwrap();
+            match change {
+                "main" => {
+                    let bytes = std::fs::read(&path).unwrap();
+                    std::fs::rename(&path, directory.leaf("original.db").unwrap()).unwrap();
+                    std::fs::write(&path, bytes).unwrap();
+                }
+                "missing" => {
+                    std::fs::rename(&path, directory.leaf("original.db").unwrap()).unwrap();
+                }
+                "key" | "new-key" => {
+                    std::fs::write(&key, b"different key").unwrap();
+                }
+                suffix => {
+                    std::fs::write(
+                        directory.leaf(format!("control.db-{suffix}")).unwrap(),
+                        b"journal fixture",
+                    )
+                    .unwrap();
+                }
+            }
+            let snapshot = || {
+                std::fs::read_dir(temp.path())
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+            assert!(
+                ControlStore::open_admitted_in_directory_with_key(
+                    &directory,
+                    OsStr::new("control.db"),
+                    &[32; 32],
+                    &guard,
+                )
+                .is_err(),
+                "{change}"
+            );
+            assert_eq!(snapshot(), before, "{change}");
+        }
+    }
+
+    #[test]
+    fn admitted_open_checks_the_native_main_inode_even_when_path_versions_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        let path = directory.leaf("control.db").unwrap();
+        let original = directory.leaf("original.db").unwrap();
+        let replacement = directory.leaf("replacement.db").unwrap();
+        drop(
+            ControlStore::open_in_directory_with_key(
+                &directory,
+                OsStr::new("control.db"),
+                &[33; 32],
+            )
+            .unwrap(),
+        );
+        std::fs::rename(&path, &original).unwrap();
+        drop(
+            ControlStore::open_in_directory_with_key(
+                &directory,
+                OsStr::new("control.db"),
+                &[34; 32],
+            )
+            .unwrap(),
+        );
+        register().unwrap();
+        let connection = Connection::open_with_flags_and_vfs(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            VFS_NAME.to_str().unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&path, &replacement).unwrap();
+        std::fs::rename(&original, &path).unwrap();
+        let guard = DatabaseOpenGuard::capture(&path, &[]).unwrap();
+        guard.verify_unchanged(&path).unwrap();
+        assert!(guard.verify_opened(&path, &connection).is_err());
+        assert!(!directory.leaf("control.db-wal").unwrap().exists());
+        assert!(!directory.leaf("control.db-shm").unwrap().exists());
+    }
+
+    #[test]
+    fn private_publication_refresh_keeps_the_original_database_and_journal_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        let path = directory.leaf("control.db").unwrap();
+        let key = directory.leaf("control.key").unwrap();
+        drop(
+            ControlStore::open_in_directory_with_key(
+                &directory,
+                OsStr::new("control.db"),
+                &[35; 32],
+            )
+            .unwrap(),
+        );
+        let guard = DatabaseOpenGuard::capture(&path, &[OsStr::new("control.key")]).unwrap();
+        std::fs::write(&key, b"published key").unwrap();
+        assert!(guard.verify_unchanged(&path).is_err());
+        let refreshed = guard
+            .refresh_private_files_after_publication(&path)
+            .unwrap();
+        refreshed.verify_unchanged(&path).unwrap();
+        std::fs::write(
+            directory.leaf("control.db-wal").unwrap(),
+            b"unadmitted journal",
+        )
+        .unwrap();
+        assert!(
+            guard
+                .refresh_private_files_after_publication(&path)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn directory_rekey_and_verification_keep_the_original_root_after_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let visible = temp.path().join("visible");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&visible).unwrap();
+        let directory = DatabaseDirectory::open(&visible).unwrap();
+        let store = ControlStore::open_in_directory_with_key(
+            &directory,
+            OsStr::new("control.db"),
+            &[36; 32],
+        )
+        .unwrap();
+        store.put_record("fixture", b"id", b"original").unwrap();
+        std::fs::rename(&visible, &moved).unwrap();
+        std::fs::create_dir(&visible).unwrap();
+        let replacement =
+            ControlStore::open_with_key(visible.join("control.db"), &[37; 32]).unwrap();
+        replacement
+            .put_record("fixture", b"id", b"replacement")
+            .unwrap();
+        store.rekey(&[38; 32]).unwrap();
+        let reopened = ControlStore::open_existing_in_directory_with_key(
+            &directory,
+            OsStr::new("control.db"),
+            &[38; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.get_record("fixture", b"id").unwrap(),
+            Some(b"original".to_vec())
+        );
+        assert_eq!(
+            replacement.get_record("fixture", b"id").unwrap(),
+            Some(b"replacement".to_vec())
+        );
     }
 }

@@ -2948,6 +2948,29 @@ pub(crate) fn with_inspected_control_snapshot<T>(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn with_inspected_control_key_snapshot<T>(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+    operation: impl FnOnce(&ControlStore, [u8; 32]) -> Result<T>,
+) -> Result<T> {
+    let mut last_error = None;
+    for database_key in preserved_control_keys(data_dir, keys)? {
+        match ControlStore::open_preserved_read_only_with_keys(
+            data_dir.join("control.db"),
+            &[database_key],
+        ) {
+            Ok((control, guard)) => {
+                let result = control.with_read_only_snapshot(|| operation(&control, database_key));
+                guard.verify_unchanged()?;
+                return result;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no control key supplied")))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn open_preserved_control_store(
     data_dir: &Path,
     keys: &KeyMaterial,
@@ -2988,6 +3011,10 @@ pub(crate) fn open_control_store(
         keys,
         #[cfg(target_os = "linux")]
         None,
+        #[cfg(target_os = "linux")]
+        None,
+        #[cfg(target_os = "linux")]
+        None,
     )
 }
 
@@ -2995,22 +3022,49 @@ pub(crate) fn open_control_store(
 pub(crate) fn open_control_store_in_directory(
     directory: &mb_store::DatabaseDirectory,
     keys: &KeyMaterial,
+    admission: &mb_store::DatabaseOpenGuard,
+    admitted_key: Option<&[u8; 32]>,
 ) -> Result<(ControlStore, [u8; 32])> {
-    open_control_store_impl(&directory.path(), keys, Some(directory))
+    open_control_store_impl(
+        &directory.path(),
+        keys,
+        Some(directory),
+        Some(admission),
+        admitted_key,
+    )
 }
 
 fn open_control_store_impl(
     data_dir: &Path,
     keys: &KeyMaterial,
     #[cfg(target_os = "linux")] directory: Option<&mb_store::DatabaseDirectory>,
+    #[cfg(target_os = "linux")] admission: Option<&mb_store::DatabaseOpenGuard>,
+    #[cfg(target_os = "linux")] admitted_key: Option<&[u8; 32]>,
 ) -> Result<(ControlStore, [u8; 32])> {
     let database_path = data_dir.join("control.db");
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
     let database_id = b"control.db/v2";
+    #[cfg(target_os = "linux")]
+    let admission = std::cell::RefCell::new(admission.cloned());
+    #[cfg(target_os = "linux")]
+    if let Some(guard) = admission.borrow().as_ref() {
+        guard.verify_unchanged(&database_path)?;
+    }
     let open = |key: &[u8; 32]| {
         #[cfg(target_os = "linux")]
         if let Some(directory) = directory {
-            return ControlStore::open_in_directory_with_key(
+            let current = admission.borrow().clone();
+            if let Some(guard) = current {
+                let store = ControlStore::open_admitted_in_directory_with_key(
+                    directory,
+                    std::ffi::OsStr::new("control.db"),
+                    key,
+                    &guard,
+                )?;
+                *admission.borrow_mut() = None;
+                return Ok(store);
+            }
+            return ControlStore::open_existing_in_directory_with_key(
                 directory,
                 std::ffi::OsStr::new("control.db"),
                 key,
@@ -3022,6 +3076,14 @@ fn open_control_store_impl(
         let database_key = keys
             .unwrap_database_key(database_id, &envelope)
             .context("cannot unwrap control database key")?;
+        #[cfg(target_os = "linux")]
+        if let Some(admitted_key) = admitted_key
+            && admitted_key != &database_key
+        {
+            let store = open(admitted_key)?;
+            store.rekey(&database_key)?;
+            return Ok((open(&database_key)?, database_key));
+        }
         match open(&database_key) {
             Ok(store) => return Ok((store, database_key)),
             Err(new_key_error) => {
@@ -3038,25 +3100,44 @@ fn open_control_store_impl(
     let mut database_key = [0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut database_key);
     let envelope = keys.wrap_database_key(database_id, &database_key)?;
-    #[cfg(target_os = "linux")]
-    if let Some(directory) = directory {
-        let bytes = canonical_bytes_bounded(&envelope, MAX_LOCAL_MANIFEST_BYTES)?;
-        write_new_private_record_at(
-            directory.file(),
-            &std::ffi::CString::new(CONTROL_KEY_FILE)?,
-            &bytes,
-        )?;
-    } else {
+    let publish_key = || -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(guard) = admission.borrow().as_ref() {
+            guard.verify_unchanged(&database_path)?;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = directory {
+            let bytes = canonical_bytes_bounded(&envelope, MAX_LOCAL_MANIFEST_BYTES)?;
+            write_new_private_record_at(
+                directory.file(),
+                &std::ffi::CString::new(CONTROL_KEY_FILE)?,
+                &bytes,
+            )?;
+        } else {
+            write_new_private_record(&envelope_path, &envelope)?;
+        }
+        #[cfg(not(target_os = "linux"))]
         write_new_private_record(&envelope_path, &envelope)?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    write_new_private_record(&envelope_path, &envelope)?;
+        #[cfg(target_os = "linux")]
+        {
+            let current = admission.borrow().clone();
+            if let Some(guard) = current {
+                *admission.borrow_mut() =
+                    Some(guard.refresh_private_files_after_publication(&database_path)?);
+            }
+        }
+        Ok(())
+    };
     if database_path.exists() {
         let legacy_key = keys.database_key(b"control.db");
+        // Admit the existing file before publishing a new key envelope.
         let store = open(&legacy_key)?;
+        publish_key()?;
         store.rekey(&database_key)?;
         Ok((open(&database_key)?, database_key))
     } else {
+        // New random keys must be durable before creating their catalog.
+        publish_key()?;
         Ok((open(&database_key)?, database_key))
     }
 }

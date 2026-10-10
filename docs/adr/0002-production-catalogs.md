@@ -5102,3 +5102,60 @@ SQL/WAL/scratch budgets, normal paged producers/retention/seed recovery, the top
 signature stall and current installed-artifact qualification remain open. Dense
 1 TiB and native Windows/macOS qualification remain explicitly deferred by the user;
 R1, R2/R3 and Milestone 6 remain open.
+
+## Initial control writer admission (2026-10-10)
+
+Linux startup now captures control-catalog, WAL, rollback-journal and private
+key-envelope versions around read-only source admission. Existing SHM mappings
+retain identity, length, ownership and permission checks while allowing transient
+read marks. The first writable directory opener checks the admitted versions
+before native open and immediately afterwards, including SQLite's public
+HAS_MOVED check against its opened main inode. These checks precede journal-mode
+changes, schema migration and record replay. A disappeared admitted catalog
+cannot become a new empty catalog. An absent catalog with orphan journals rejects
+before lock creation or permission changes, with a preservation procedure.
+
+Read-only admission also returns the authenticated database key. Interrupted
+rekeys open that key directly before completing their existing wrapped target,
+without first trying an unverified writable key. Existing legacy catalogs open
+before new key publication; fresh random keys remain durable before catalog
+creation. Control and parity rekey verification retains the original directory
+capability through close and readback. Signed/schema encodings remain unchanged.
+
+The before-fix regression under `/tmp/mb-m6-control-handoff-negative-drha6hip`
+confirms startup accepted a valid encrypted withdrawn catalog substituted after
+source admission. Its expected failure and frozen source/binary hashes are retained.
+The completed Node case preserves exact file bytes and versions after catalog
+replacement, disappearance, key replacement and newly appearing WAL input.
+Two further Node cases cover orphan WAL/SHM/journal preservation before claiming
+ownership, and legacy/wrapped/interrupted key selection and normal startup.
+Five Store cases cover fresh/existing admission, changed inputs before writes,
+the native opened inode despite matching current pathname versions, private-file
+publication without resetting database/journal versions, and directory-bound
+rekey verification after replacement.
+
+Frozen debug-source qualification passes 1,333 ordinary workspace/all-targets
+cases, including 63 vendored cases, and the provisioned Btrfs retained-capture/
+recovery case: 1,334 distinct passing cases. Eight new cases qualify this
+increment. Ordinary drivers report 121 ignored cases; one runs separately,
+leaving 120 unexecuted. Formatting, strict locked workspace/all-targets
+Clippy, all-target test compilation and four debug program builds pass with the
+8,192-descriptor test limit. All 250 source/manifest files, 23 binaries and
+22 embedded inputs match their frozen hashes. Evidence is retained in
+`/tmp/mb-m6-control-handoff-validation-48sfkfhn`; the post-commit audit binds
+those inputs to the commit. Native mount/loop/image cleanup is verified.
+The native case uses a sparse logical 1 TiB file;
+dense retained capacity and installed-artifact qualification remain open.
+
+Cleanup removes 5 obsolete hashed workspace executables and incremental
+cache, reclaiming 16.07 GiB and leaving 31.5 GiB in `target`. Current outputs,
+prior qualified paths, installed qualification roots and all 23 current
+binary hashes are preserved.
+
+This qualifies initial Linux control admission and writable-open handoff.
+Complete namespace/leaf lifetime and initial volume handoff, external-owner
+reconciliation, complete retained recovery/upgrade policy, enclosing metadata/
+physical quotas and SQL/WAL/scratch budgets, normal paged capture/retention/seed
+recovery, topology/signature diagnosis and current installed-artifact gates remain
+open. Dense 1 TiB and native Windows/macOS qualification remain explicitly deferred;
+R1, R2/R3 and Milestone 6 remain open.
