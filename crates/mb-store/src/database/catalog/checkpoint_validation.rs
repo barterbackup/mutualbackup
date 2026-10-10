@@ -1105,7 +1105,7 @@ pub(super) mod tests {
             let members = self.members().to_vec();
             self.build_with_members(limit, &members)
         }
-        fn build_with_members(
+        pub(crate) fn build_with_members(
             &mut self,
             limit: CatalogCodingTraversalBudget,
             members: &[Member],

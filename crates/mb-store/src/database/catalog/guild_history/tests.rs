@@ -1,3 +1,4 @@
+mod checkpoint_directories;
 mod paged_checkpoint_payload;
 mod paged_checkpoint_retention;
 mod paged_checkpoint_revision;

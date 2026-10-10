@@ -2588,6 +2588,31 @@ and native-platform gates remain open.
       checkpoint activation/retirement and other metadata/payload custody still
       need this proof. Full metadata/physical policy, normal producers/recovery
       and deferred real dense capacity/platform gates remain open.
+    - [x] Carry the completed directory public proof through exact certified
+      current coding, original-history/authority transition and bounded quorum
+      signing/binding. Share the original indexed algorithms and cumulative
+      input/replay/row-work admission; preserve every global sector, retained
+      revision, tombstone, writer and original historical coding incarnation.
+      Directory predecessors keep their exact header/quorum/hash and complete
+      index. Independent trust rereads fence signing/binding. Eleven new cases
+      cover missing/changed/historical coding facts, pre-lookup dimensional
+      exhaustion, ignored/withdrawn proof records, exact original predecessor/
+      writer checks, substituted quorum-valid headers and directory replay.
+      Real signed history qualifies retire/forget/re-add, missing old witnesses,
+      later certified forks, replay debt and format-nine/ten predecessor identity
+      in both directions. Frozen qualification passes 191 core, 360 ordinary
+      Store, 35 paged Node, the certified-writer migration entry point and
+      provisioned Btrfs native recovery (588 distinct cases). Formatting, strict
+      locked workspace/all-targets Clippy, all-target compilation and four debug
+      builds pass. Source, seven binaries and 22 embedded inputs match; native
+      mount/loop/image cleanup is verified. Evidence is retained in
+      `/tmp/mb-m6-directory-certification-validation-6g6tokyt`.
+      Cache cleanup reclaims 8.01 GiB, leaving about 51.4 GiB in
+      `target`, with qualified binary hashes unchanged. Guarded publication must
+      require the full history-transition flag and integrate all private/
+      metadata/payload roles with durable selection/retirement. Full metadata/
+      physical policy, normal producers/recovery and deferred real dense
+      capacity/platform gates remain open.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

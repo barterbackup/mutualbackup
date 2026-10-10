@@ -4889,3 +4889,64 @@ unchanged. Other ordinary/native suites and installed artifacts were not rerun.
 Full section/dataset/guild metadata and physical admission, normal paged
 capture/retention/seed recovery and the deferred real dense capacity/native
 platform gates remain open. R3-SINGLE-OWNER-METADATA and Milestone 6 remain open.
+
+
+## Certified directory checkpoints through original history and quorum (2026-10-10)
+
+Format-ten candidates previously stopped before certified coding, authority
+transition and quorum binding. The completed directory public index now enters
+those same bounded algorithms as the original two-root layout. Private adapters
+expose the exact header work, generation, global sector count and indexed
+coding/sector/coverage rows. They create no flattened packing roots and no
+constructor from a proposed header alone. Default generic proof types preserve
+the original public APIs; new directory aliases carry the precise header and
+certificate types through the completed chain. Existing signed headers, quorum
+layouts and disposable marker schemas are unchanged.
+
+The certified coding scan admits complete public input and conservative fixed
+row work before original group lookups, requires exact retained/retired counts
+and original lifecycle/profile/witness facts, and verifies current placement
+for every globally indexed packed sector. The completed original-history route
+carries its replay debt forward. Both layouts share authority comparisons for
+retained signed revisions, tombstone floors and certified current writers, plus
+exact event ancestry and historical coding-prefix comparisons. A directory
+predecessor supplies its original quorum, header hash and complete index. Budget
+admission charges both public inputs and comparison work without resetting debt;
+an already admitted original-history ledger is not charged twice.
+
+Directory transition proofs can sign their bounded public header and bind its
+exact original quorum with independent trust rereads around key/binding work.
+The wrapper rechecks the whole typed proof chain and exact certificate. As with
+the existing draft bridge, authority-only transitions remain distinguishable by
+`has_certified_history_transition`; guarded publication must require the full
+history route. Signing is not checkpoint activation. Private/bootstrap/native
+and information/parity payload joins, durable selection/retirement and normal
+paged producers still need the directory proof. Existing production ownership
+APIs continue to take the original layout.
+
+Eleven new cases cover certified group omissions/substitutions/lifecycle and
+placement, dimensional pre-lookup admission, changed trust, ignored completion
+writes and withdrawn proof records, original legacy predecessor/current-writer
+checks, substituted quorum-valid headers and directory predecessor replay.
+Real signed genesis/events/transcripts qualify complete directory history and
+quorum successors after retirement/forget/re-add, missing old incarnations,
+later quorum-certified forks, replay debt and original identity across format
+nine/ten predecessors in both directions. Frozen qualification passes 191 core,
+360 ordinary Store, 35 paged Node, the certified-writer migration entry point
+and provisioned Btrfs native capture/recovery: 588 distinct cases. The ordinary
+suites leave 26 Store and one Node case ignored; that native case runs separately
+on disposable Btrfs with a logical sparse 1 TiB file. Formatting, strict locked
+workspace/all-targets Clippy, all-target test compilation and four debug program
+builds pass under Cargo/rustc 1.99.0. Frozen source, seven binaries and 22 embedded
+protocol/helper inputs match. Native mount/loop/image cleanup is independently
+checked. Logs, manifests and the distinct inventory are retained in
+`/tmp/mb-m6-directory-certification-validation-6g6tokyt`; the post-commit audit binds
+those inputs to the commit. Incremental-cache cleanup reclaims 8.01 GiB,
+leaving about 51.4 GiB in `target`, with qualified binary hashes
+unchanged. Other ordinary/native suites and installed artifacts were not rerun.
+
+This completes the staged public directory proof through current coding,
+original-history transition and quorum binding. Full metadata/physical policy,
+guarded public/private checkpoint ownership, payload custody, normal paged
+capture/retention/seed recovery and deferred dense capacity/native platform
+qualification remain open. R3-SINGLE-OWNER-METADATA and Milestone 6 remain open.

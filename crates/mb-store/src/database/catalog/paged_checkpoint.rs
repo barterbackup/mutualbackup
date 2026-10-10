@@ -70,108 +70,141 @@ impl CatalogCheckpointCodingDirectoryIndex {
     }
 }
 
-impl CatalogCheckpointTransitionIndex {
-    /// Sign only the public header backed by this completed current-coverage
-    /// proof. `read_trust` must reread independently certified event state and
-    /// the trusted previous checkpoint, with no production writer held across
-    /// validation. The returned signature alone does not authorize activation:
-    /// full coding transitions/fixed legacy migration, private/payload joins
-    /// and atomic current-state publication remain mandatory. No normal
-    /// checkpoint producer calls this draft bridge yet.
-    pub fn sign_paged_checkpoint_header(
-        &self,
-        keys: &KeyMaterial,
-        mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
-    ) -> Result<(PagedGuildCheckpoint, MemberSignature), CatalogStoreError> {
-        let trust = read_trust()?;
-        let checkpoint = self.header(&trust)?;
-        if trust
-            .members
-            .binary_search_by_key(&keys.node_id(), |member| member.node_id)
-            .is_err()
-        {
-            return Err(ModelError::NonMemberSigner(keys.node_id()).into());
-        }
-        let encoded = canonical_bytes_bounded(&checkpoint, PAGED_GUILD_CHECKPOINT_BYTES)?;
-        let signature = MemberSignature {
-            signer: keys.node_id(),
-            signature: keys.sign(PAGED_GUILD_CHECKPOINT_DOMAIN, &encoded).to_vec(),
-        };
-        if read_trust()? != trust {
-            return Err(DatabaseError::Conflict.into());
-        }
-        self.header(&trust)?;
-        Ok((checkpoint, signature))
-    }
+macro_rules! quorum_binding {
+    ($index:ty, $header:ty, $certificate:ty) => {
+        impl CatalogCheckpointTransitionIndex<$index> {
+            /// Sign only the public header backed by this completed current-coverage
+            /// proof. `read_trust` must reread independently certified event state and
+            /// the trusted previous checkpoint, with no production writer held across
+            /// validation. The returned signature alone does not authorize activation:
+            /// full coding transitions/fixed legacy migration, private/payload joins
+            /// and atomic current-state publication remain mandatory. No normal
+            /// checkpoint producer calls this draft bridge yet.
+            pub fn sign_paged_checkpoint_header(
+                &self,
+                keys: &KeyMaterial,
+                mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+            ) -> Result<($header, MemberSignature), CatalogStoreError> {
+                let trust = read_trust()?;
+                let checkpoint = self.header(&trust)?;
+                if trust
+                    .members
+                    .binary_search_by_key(&keys.node_id(), |member| member.node_id)
+                    .is_err()
+                {
+                    return Err(ModelError::NonMemberSigner(keys.node_id()).into());
+                }
+                let encoded = canonical_bytes_bounded(&checkpoint, PAGED_GUILD_CHECKPOINT_BYTES)?;
+                let signature = MemberSignature {
+                    signer: keys.node_id(),
+                    signature: keys.sign(PAGED_GUILD_CHECKPOINT_DOMAIN, &encoded).to_vec(),
+                };
+                if read_trust()? != trust {
+                    return Err(DatabaseError::Conflict.into());
+                }
+                self.header(&trust)?;
+                Ok((checkpoint, signature))
+            }
 
-    /// Bind exact roots/ledger and original quorum to a completed public proof.
-    /// A cryptographically valid substituted header or historical-only coverage
-    /// cannot acquire this wrapper. This is not a full transition/publication
-    /// token; all remaining private, payload and durable ownership joins apply.
-    pub fn bind_paged_checkpoint_header(
-        self,
-        certificate: QuorumPagedCheckpoint,
-        mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
-    ) -> Result<CatalogQuorumPagedCheckpointIndex, CatalogStoreError> {
-        let trust = read_trust()?;
-        if certificate.checkpoint != self.header(&trust)? {
-            return Err(DatabaseError::Conflict.into());
+            /// Bind exact roots/ledger and original quorum to a completed public proof.
+            /// A cryptographically valid substituted header or historical-only coverage
+            /// cannot acquire this wrapper. This is not a full transition/publication
+            /// token; all remaining private, payload and durable ownership joins apply.
+            pub fn bind_paged_checkpoint_header(
+                self,
+                certificate: $certificate,
+                mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+            ) -> Result<CatalogQuorumPagedCheckpointIndex<$index, $certificate>, CatalogStoreError>
+            {
+                let trust = read_trust()?;
+                if certificate.checkpoint != self.header(&trust)? {
+                    return Err(DatabaseError::Conflict.into());
+                }
+                certificate.verify_header(&trust, self.index().index().budget())?;
+                if read_trust()? != trust {
+                    return Err(DatabaseError::Conflict.into());
+                }
+                self.header(&trust)?;
+                Ok(CatalogQuorumPagedCheckpointIndex {
+                    certificate,
+                    trust,
+                    index: self,
+                })
+            }
         }
-        certificate.verify_header(&trust, self.index().index().budget())?;
-        if read_trust()? != trust {
-            return Err(DatabaseError::Conflict.into());
-        }
-        self.header(&trust)?;
-        Ok(CatalogQuorumPagedCheckpointIndex {
-            certificate,
-            trust,
-            index: self,
-        })
-    }
+    };
 }
+quorum_binding!(
+    CatalogCheckpointCodingDirectoryIndex,
+    PagedGuildCheckpoint,
+    QuorumPagedCheckpoint
+);
+quorum_binding!(
+    CatalogCheckpointCodingDirectoriesIndex,
+    mb_core::PagedGuildCheckpointDirectory,
+    mb_core::QuorumPagedCheckpointDirectory
+);
 
 /// Completed public body, certified coding state, authority transition and
 /// independently checked quorum/event/base binding.
 /// The original certificate, authority and indexed cursors remain available.
 /// There is deliberately no constructor from a manifest or header alone.
-pub struct CatalogQuorumPagedCheckpointIndex {
-    certificate: QuorumPagedCheckpoint,
+pub struct CatalogQuorumPagedCheckpointIndex<
+    I = CatalogCheckpointCodingDirectoryIndex,
+    C = QuorumPagedCheckpoint,
+> {
+    certificate: C,
     trust: PagedCheckpointTrust,
-    index: CatalogCheckpointTransitionIndex,
+    index: CatalogCheckpointTransitionIndex<I>,
 }
 
-impl CatalogQuorumPagedCheckpointIndex {
-    pub fn certificate(&self) -> &QuorumPagedCheckpoint {
+impl<I, C> CatalogQuorumPagedCheckpointIndex<I, C> {
+    pub fn certificate(&self) -> &C {
         &self.certificate
     }
     pub fn trust(&self) -> &PagedCheckpointTrust {
         &self.trust
     }
-    pub fn index(&self) -> &CatalogCheckpointCodingDirectoryIndex {
+    pub fn index(&self) -> &I {
         self.index.index()
     }
-    pub fn transition(&self) -> &CatalogCheckpointTransitionIndex {
+    pub fn transition(&self) -> &CatalogCheckpointTransitionIndex<I> {
         &self.index
     }
-    /// Recheck the exact trusted event/base snapshot before a later enclosing
-    /// operation. A caller still needs its atomic publication/retirement guard.
-    pub fn recheck_header(
-        &self,
-        mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
-    ) -> Result<(), CatalogStoreError> {
-        if read_trust()? != self.trust
-            || self.index.header(&self.trust)? != self.certificate.checkpoint
-        {
-            return Err(DatabaseError::Conflict.into());
-        }
-        self.certificate
-            .verify_header(&self.trust, self.index.index().index().budget())?;
-        if read_trust()? != self.trust {
-            return Err(DatabaseError::Conflict.into());
-        }
-        self.index.header(&self.trust).map(|_| ())
-    }
 }
+macro_rules! recheck_quorum {
+    ($index:ty, $certificate:ty) => {
+        impl CatalogQuorumPagedCheckpointIndex<$index, $certificate> {
+            /// Recheck the exact trusted event/base snapshot before a later enclosing
+            /// operation. A caller still needs its atomic publication/retirement guard.
+            pub fn recheck_header(
+                &self,
+                mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+            ) -> Result<(), CatalogStoreError> {
+                if read_trust()? != self.trust
+                    || self.index.header(&self.trust)? != self.certificate.checkpoint
+                {
+                    return Err(DatabaseError::Conflict.into());
+                }
+                self.certificate
+                    .verify_header(&self.trust, self.index.index().index().budget())?;
+                if read_trust()? != self.trust {
+                    return Err(DatabaseError::Conflict.into());
+                }
+                self.index.header(&self.trust).map(|_| ())
+            }
+        }
+    };
+}
+recheck_quorum!(CatalogCheckpointCodingDirectoryIndex, QuorumPagedCheckpoint);
+recheck_quorum!(
+    CatalogCheckpointCodingDirectoriesIndex,
+    mb_core::QuorumPagedCheckpointDirectory
+);
+pub type CatalogQuorumPagedCheckpointDirectoryIndex = CatalogQuorumPagedCheckpointIndex<
+    CatalogCheckpointCodingDirectoriesIndex,
+    mb_core::QuorumPagedCheckpointDirectory,
+>;
 
 #[cfg(test)]
 mod tests {

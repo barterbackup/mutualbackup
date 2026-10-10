@@ -1600,6 +1600,26 @@ Incremental-cache cleanup reclaims 8.93 GiB with binary hashes preserved.
 Complete metadata/physical policy, normal producers/recovery and deferred real
 capacity/platform gates remain open. See ADR 0002.
 
+The format-ten directory proof now reaches certified-current coding, original
+history/authority transition and bounded quorum binding through the same
+algorithms as formats eight/nine. Exact original lifecycle/witness and current
+placement facts cover every global sector; complete history keeps its debt and
+compares the predecessor's certified prefix. Directory predecessors retain their
+original hashes/headers, with no invented flat roots. Real signed history covers
+retire/forget/re-add, omitted old incarnations, later certified forks and identity
+preservation across format-nine/ten predecessors. Signing/binding reread trust
+and require the complete typed proof. Guarded publication still must require the
+full history flag and integrate every private/metadata/payload role; normal
+producers remain disabled. Eleven new cases pass. Frozen qualification passes
+588 distinct cases: 191 core, 360 ordinary Store, 35 paged Node, the certified-
+writer migration case and provisioned Btrfs native recovery. Formatting, strict
+locked workspace/all-targets Clippy, all-target compilation and four debug builds
+pass. Source, seven binaries and 22 embedded inputs match; native cleanup is
+verified. Evidence is retained in `/tmp/mb-m6-directory-certification-validation-6g6tokyt`.
+Cache cleanup reclaims 8.01 GiB with binary hashes preserved. Full metadata/
+physical policy, durable activation/retirement and normal producers/recovery,
+plus deferred dense capacity/platform gates, remain open. See ADR 0002.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

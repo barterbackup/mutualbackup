@@ -3,10 +3,14 @@
 
 use mb_core::{
     CATALOG_CODING_TRANSCRIPT_BYTES, CatalogCodingLifecycle, CatalogCodingTraversalBudget as Work,
-    CodingProfile, PagedCheckpointTrust, PagedGuildCheckpoint, RetainedCodingGroup,
-    canonical_hash_bounded, canonical_size_bounded,
+    CodingProfile, PagedCheckpointTrust, RetainedCodingGroup, canonical_hash_bounded,
+    canonical_size_bounded,
 };
 
+#[cfg(test)]
+use mb_core::PagedGuildCheckpoint;
+
+use super::checkpoint_body::{Body, Header};
 use super::checkpoint_transition::snapshot_hash;
 use super::checkpoint_validation::MEMBER_BYTES;
 use super::coding_coverage::{ROW_BYTES, decode_row, put};
@@ -147,10 +151,10 @@ fn scan_reservation(groups: u64, sectors: u64, members: usize) -> Result<Work, C
     })
 }
 
-fn build(
-    index: &CatalogCheckpointCodingDirectoryIndex,
+fn build<I: Body>(
+    index: &I,
     trust: &CatalogCheckpointCodingTrust,
-    header: PagedGuildCheckpoint,
+    header: I::Header,
     manifest: Manifest,
     read_trust: &mut impl FnMut() -> Result<CatalogCheckpointCodingTrust, CatalogStoreError>,
     read_group: &mut impl FnMut(
@@ -158,9 +162,9 @@ fn build(
         &CatalogCheckpointCodingTrust,
     ) -> Result<Option<CatalogCertifiedCodingGroup>, CatalogStoreError>,
 ) -> Result<(), CatalogStoreError> {
-    let directory = index.index();
-    let store = &directory.packing().store;
-    let summary = header.coding.summary.coding;
+    let directory = index;
+    let store = directory.store();
+    let summary = header.coding();
     for kind in KINDS {
         if store
             .next_record_bounded(kind, None, 32, DESCRIPTOR_BYTES)?
@@ -172,7 +176,7 @@ fn build(
     let mut after = None;
     let mut groups = 0_u64;
     let mut retired = 0_u64;
-    while let Some(group) = directory.next_group_row(after)? {
+    while let Some(group) = directory.group(after)? {
         groups = groups.checked_add(1).ok_or(CatalogError::Bounds)?;
         if groups > summary.groups {
             return Err(DatabaseError::Integrity.into());
@@ -206,15 +210,15 @@ fn build(
         ROW_BYTES,
     )? {
         sectors = sectors.checked_add(1).ok_or(CatalogError::Bounds)?;
-        if sectors > header.packed_sectors.sectors {
+        if sectors > header.sectors() {
             return Err(DatabaseError::Integrity.into());
         }
         let sector: CatalogPackingSector = decode_row(&bytes)?;
-        if key != sector.id || directory.packing().sector_row(sector.id)? != Some(sector.clone()) {
+        if key != sector.id || directory.sector(sector.id)? != Some(sector.clone()) {
             return Err(DatabaseError::Integrity.into());
         }
         let coverage = directory
-            .coverage_row(sector.id)?
+            .coverage(sector.id)?
             .ok_or(DatabaseError::NotReady)?;
         let placement = store
             .get_record_bounded(PLACEMENT, &coverage.group_id, ROW_BYTES)?
@@ -224,7 +228,7 @@ fn build(
         }
         after = Some(sector.id);
     }
-    if sectors != header.packed_sectors.sectors {
+    if sectors != header.sectors() {
         return Err(DatabaseError::Integrity.into());
     }
     if read_trust()? != *trust || index.header(&trust.checkpoint)? != header {
@@ -237,160 +241,121 @@ fn build(
 /// encrypted index. Only this wrapper can proceed to authority transition and
 /// draft paged signing. Fixed legacy migration, full lifecycle transition/
 /// publication, private joins, payload custody and quotas remain mandatory.
-pub struct CatalogCheckpointCodingStateIndex {
-    index: CatalogCheckpointCodingDirectoryIndex,
+pub struct CatalogCheckpointCodingStateIndex<I = CatalogCheckpointCodingDirectoryIndex> {
+    index: I,
     trust: CatalogCheckpointCodingTrust,
     manifest: Manifest,
     budget: Work,
 }
 
-impl CatalogCheckpointCodingDirectoryIndex {
-    /// `read_trust` and `read_group` must use the same independently certified
-    /// history snapshot. Each lookup returns already verified fixed indexed
-    /// facts for the original retained group, add witness and placement. Any
-    /// history ingestion/replay needs its own enclosing admission before this
-    /// phase; these point reads must not load or replay a catalog-sized state.
-    /// Reject unavailable/unverified history, legacy binding gaps and delegation
-    /// failures rather than deriving facts from this proposal.
-    /// The supplied job budget admits the complete public input and all scan
-    /// work before any group lookup. No production writer spans these calls.
-    pub fn validate_certified_coding_state(
-        self,
-        budget: Work,
-        read_trust: impl FnMut() -> Result<CatalogCheckpointCodingTrust, CatalogStoreError>,
-        read_group: impl FnMut(
-            [u8; 32],
-            &CatalogCheckpointCodingTrust,
-        )
-            -> Result<Option<CatalogCertifiedCodingGroup>, CatalogStoreError>,
-    ) -> Result<CatalogCheckpointCodingStateIndex, CatalogStoreError> {
-        self.validate_certified_coding_state_with_work(
-            budget,
-            Work::default(),
-            read_trust,
-            read_group,
-        )
-    }
+macro_rules! certify_body {
+    ($index:ty) => {
+        impl $index {
+            /// `read_trust` and `read_group` must use the same independently certified
+            /// history snapshot. Each lookup returns already verified fixed indexed
+            /// facts for the original retained group, add witness and placement. Any
+            /// history ingestion/replay needs its own enclosing admission before this
+            /// phase; these point reads must not load or replay a catalog-sized state.
+            /// Reject unavailable/unverified history, legacy binding gaps and delegation
+            /// failures rather than deriving facts from this proposal.
+            /// The supplied job budget admits the complete public input and all scan
+            /// work before any group lookup. No production writer spans these calls.
+            pub fn validate_certified_coding_state(
+                self,
+                budget: Work,
+                read_trust: impl FnMut() -> Result<CatalogCheckpointCodingTrust, CatalogStoreError>,
+                read_group: impl FnMut(
+                    [u8; 32],
+                    &CatalogCheckpointCodingTrust,
+                )
+                    -> Result<Option<CatalogCertifiedCodingGroup>, CatalogStoreError>,
+            ) -> Result<CatalogCheckpointCodingStateIndex<Self>, CatalogStoreError> {
+                validate_with_work(self, budget, Work::default(), read_trust, read_group)
+            }
 
-    /// Use the completed bounded original-history reader and carry its whole
-    /// replay debt into this proof and subsequent authority transitions. The
-    /// independent current tip is rechecked around the enclosing group scan.
-    pub fn validate_certified_history_coding_state(
-        self,
-        history: &CatalogGuildHistoryIndex,
-        budget: Work,
-        mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
-    ) -> Result<CatalogCheckpointCodingStateIndex, CatalogStoreError> {
-        let view = history.view(&mut read_trust)?;
-        self.validate_certified_coding_state_with_work(
-            budget,
-            history.represented_work(),
-            || Ok(history.view(&mut read_trust)?.coding_trust()),
-            |id, trust| view.coding_group(id, trust),
-        )
-    }
-
-    fn validate_certified_coding_state_with_work(
-        self,
-        budget: Work,
-        prior_work: Work,
-        mut read_trust: impl FnMut() -> Result<CatalogCheckpointCodingTrust, CatalogStoreError>,
-        mut read_group: impl FnMut(
-            [u8; 32],
-            &CatalogCheckpointCodingTrust,
-        )
-            -> Result<Option<CatalogCertifiedCodingGroup>, CatalogStoreError>,
-    ) -> Result<CatalogCheckpointCodingStateIndex, CatalogStoreError> {
-        let trust = read_trust()?;
-        trust.validate()?;
-        let header = self.header(&trust.checkpoint)?;
-        let summary = header.coding.summary.coding;
-        if summary.groups != trust.retained_groups || summary.retired_groups != trust.retired_groups
-        {
-            return Err(DatabaseError::Conflict.into());
+            /// Use the completed bounded original-history reader and carry its whole
+            /// replay debt into this proof and subsequent authority transitions. The
+            /// independent current tip is rechecked around the enclosing group scan.
+            pub fn validate_certified_history_coding_state(
+                self,
+                history: &CatalogGuildHistoryIndex,
+                budget: Work,
+                mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+            ) -> Result<CatalogCheckpointCodingStateIndex<Self>, CatalogStoreError> {
+                let view = history.view(&mut read_trust)?;
+                validate_with_work(
+                    self,
+                    budget,
+                    history.represented_work(),
+                    || Ok(history.view(&mut read_trust)?.coding_trust()),
+                    |id, trust| view.coding_group(id, trust),
+                )
+            }
         }
-        let work = prior_work
-            .checked_add(header.represented_work()?)?
-            .checked_add(scan_reservation(
-                summary.groups,
-                header.packed_sectors.sectors,
-                trust.checkpoint.members.len(),
-            )?)?;
-        budget.remaining_after(work)?;
-        let manifest = Manifest {
-            format_version: 2,
-            checkpoint_hash: header.hash()?,
-            snapshot_hash: trust.hash()?,
-            work,
-            history_work: prior_work,
-        };
-        self.index().packing().store.with_record_transaction(|| {
-            build(
-                &self,
-                &trust,
-                header,
-                manifest,
-                &mut read_trust,
-                &mut read_group,
-            )
-        })?;
-        Ok(CatalogCheckpointCodingStateIndex {
-            index: self,
-            trust,
-            manifest,
-            budget,
-        })
+    };
+}
+certify_body!(CatalogCheckpointCodingDirectoryIndex);
+certify_body!(CatalogCheckpointCodingDirectoriesIndex);
+
+fn validate_with_work<I: Body>(
+    index: I,
+    budget: Work,
+    prior_work: Work,
+    mut read_trust: impl FnMut() -> Result<CatalogCheckpointCodingTrust, CatalogStoreError>,
+    mut read_group: impl FnMut(
+        [u8; 32],
+        &CatalogCheckpointCodingTrust,
+    ) -> Result<Option<CatalogCertifiedCodingGroup>, CatalogStoreError>,
+) -> Result<CatalogCheckpointCodingStateIndex<I>, CatalogStoreError> {
+    let trust = read_trust()?;
+    trust.validate()?;
+    let header = index.header(&trust.checkpoint)?;
+    let summary = header.coding();
+    if summary.groups != trust.retained_groups || summary.retired_groups != trust.retired_groups {
+        return Err(DatabaseError::Conflict.into());
     }
+    let work = prior_work
+        .checked_add(header.work()?)?
+        .checked_add(scan_reservation(
+            summary.groups,
+            header.sectors(),
+            trust.checkpoint.members.len(),
+        )?)?;
+    budget.remaining_after(work)?;
+    let manifest = Manifest {
+        format_version: 2,
+        checkpoint_hash: header.hash()?,
+        snapshot_hash: trust.hash()?,
+        work,
+        history_work: prior_work,
+    };
+    index.store().with_record_transaction(|| {
+        build(
+            &index,
+            &trust,
+            header,
+            manifest,
+            &mut read_trust,
+            &mut read_group,
+        )
+    })?;
+    Ok(CatalogCheckpointCodingStateIndex {
+        index,
+        trust,
+        manifest,
+        budget,
+    })
 }
 
-impl CatalogCheckpointCodingStateIndex {
+pub type CatalogCheckpointDirectoriesCodingStateIndex =
+    CatalogCheckpointCodingStateIndex<CatalogCheckpointCodingDirectoriesIndex>;
+
+impl<I> CatalogCheckpointCodingStateIndex<I> {
     pub(super) fn history_work(&self) -> Work {
         self.manifest.history_work
     }
 
-    pub(super) fn recheck_history_points(
-        &self,
-        history: &CatalogGuildHistoryView<'_>,
-        trust: &PagedCheckpointTrust,
-    ) -> Result<(), CatalogStoreError> {
-        let header = self.header(trust)?;
-        let coding = history.coding_trust();
-        if coding != self.trust {
-            return Err(DatabaseError::Conflict.into());
-        }
-        let mut after = None;
-        let mut count = 0_u64;
-        while let Some(group) = self.index.index().next_group_row(after)? {
-            let id = group.group.range.group_id;
-            let fact = history
-                .coding_group(id, &coding)?
-                .ok_or(DatabaseError::NotReady)?;
-            let placement = self
-                .index
-                .index()
-                .packing()
-                .store
-                .get_record_bounded(PLACEMENT, &id, ROW_BYTES)?
-                .ok_or(DatabaseError::NotReady)?;
-            if !fact.matches(group, &coding)
-                || decode_row::<bool>(&placement)?
-                    && !(group.group.retired_at_event.is_none()
-                        && fact.authorization == CatalogCodingAuthorization::CurrentPlacement)
-            {
-                return Err(DatabaseError::Conflict.into());
-            }
-            count = count
-                .checked_add(1)
-                .filter(|count| *count <= coding.retained_groups)
-                .ok_or(DatabaseError::Integrity)?;
-            after = Some(id);
-        }
-        if count != header.coding.summary.coding.groups {
-            return Err(DatabaseError::Integrity.into());
-        }
-        Ok(())
-    }
-    pub fn index(&self) -> &CatalogCheckpointCodingDirectoryIndex {
+    pub fn index(&self) -> &I {
         &self.index
     }
     pub fn trust(&self) -> &CatalogCheckpointCodingTrust {
@@ -402,29 +367,78 @@ impl CatalogCheckpointCodingStateIndex {
     pub fn budget(&self) -> Work {
         self.budget
     }
-    pub(super) fn header(
+}
+
+pub(super) fn recheck_history_points<I: Body>(
+    index: &CatalogCheckpointCodingStateIndex<I>,
+    history: &CatalogGuildHistoryView<'_>,
+    trust: &PagedCheckpointTrust,
+) -> Result<(), CatalogStoreError> {
+    let header = header(index, trust)?;
+    let coding = history.coding_trust();
+    if coding != index.trust {
+        return Err(DatabaseError::Conflict.into());
+    }
+    let mut after = None;
+    let mut count = 0_u64;
+    while let Some(group) = index.index.group(after)? {
+        let id = group.group.range.group_id;
+        let fact = history
+            .coding_group(id, &coding)?
+            .ok_or(DatabaseError::NotReady)?;
+        let placement = index
+            .index
+            .store()
+            .get_record_bounded(PLACEMENT, &id, ROW_BYTES)?
+            .ok_or(DatabaseError::NotReady)?;
+        if !fact.matches(group, &coding)
+            || decode_row::<bool>(&placement)?
+                && !(group.group.retired_at_event.is_none()
+                    && fact.authorization == CatalogCodingAuthorization::CurrentPlacement)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        count = count
+            .checked_add(1)
+            .filter(|count| *count <= coding.retained_groups)
+            .ok_or(DatabaseError::Integrity)?;
+        after = Some(id);
+    }
+    if count != header.coding().groups {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(())
+}
+
+pub(super) fn header<I: Body>(
+    index: &CatalogCheckpointCodingStateIndex<I>,
+    trust: &PagedCheckpointTrust,
+) -> Result<I::Header, CatalogStoreError> {
+    if trust != &index.trust.checkpoint {
+        return Err(DatabaseError::Conflict.into());
+    }
+    let header = index.index.header(trust)?;
+    index.budget.remaining_after(index.manifest.work)?;
+    let store = index.index.store();
+    if index.manifest.format_version != 2
+        || index.manifest.checkpoint_hash != header.hash()?
+        || index.manifest.snapshot_hash != index.trust.hash()?
+        || store
+            .get_record_bounded(COMPLETE, b"root", DESCRIPTOR_BYTES)?
+            .as_deref()
+            != Some(mb_core::canonical_bytes_bounded(&index.manifest, DESCRIPTOR_BYTES)?.as_slice())
+    {
+        return Err(DatabaseError::NotReady.into());
+    }
+    Ok(header)
+}
+#[cfg(test)]
+impl CatalogCheckpointCodingStateIndex {
+    fn header(
         &self,
         trust: &PagedCheckpointTrust,
     ) -> Result<PagedGuildCheckpoint, CatalogStoreError> {
-        if trust != &self.trust.checkpoint {
-            return Err(DatabaseError::Conflict.into());
-        }
-        let header = self.index.header(trust)?;
-        self.budget.remaining_after(self.manifest.work)?;
-        let store = &self.index.index().packing().store;
-        if self.manifest.format_version != 2
-            || self.manifest.checkpoint_hash != header.hash()?
-            || self.manifest.snapshot_hash != self.trust.hash()?
-            || store
-                .get_record_bounded(COMPLETE, b"root", DESCRIPTOR_BYTES)?
-                .as_deref()
-                != Some(
-                    mb_core::canonical_bytes_bounded(&self.manifest, DESCRIPTOR_BYTES)?.as_slice(),
-                )
-        {
-            return Err(DatabaseError::NotReady.into());
-        }
-        Ok(header)
+        header(self, trust)
     }
 }
 
@@ -851,14 +865,14 @@ mod tests {
         };
         let exact = base.checked_add(prior).unwrap();
         let (index, trust, facts) = one();
-        let proof = index
-            .validate_certified_coding_state_with_work(
-                exact,
-                prior,
-                || Ok(trust.clone()),
-                |id, _| Ok(facts.get(&id).copied()),
-            )
-            .unwrap();
+        let proof = validate_with_work(
+            index,
+            exact,
+            prior,
+            || Ok(trust.clone()),
+            |id, _| Ok(facts.get(&id).copied()),
+        )
+        .unwrap();
         assert_eq!(proof.represented_work(), exact);
         proof.header(&trust.checkpoint).unwrap();
         for dimension in 0..3 {
@@ -870,14 +884,14 @@ mod tests {
                 _ => short.records -= 1,
             }
             assert!(
-                index
-                    .validate_certified_coding_state_with_work(
-                        short,
-                        prior,
-                        || Ok(trust.clone()),
-                        |_, _| panic!("under-admitted history debt reached a group lookup")
-                    )
-                    .is_err()
+                validate_with_work(
+                    index,
+                    short,
+                    prior,
+                    || Ok(trust.clone()),
+                    |_, _| panic!("under-admitted history debt reached a group lookup")
+                )
+                .is_err()
             );
         }
     }

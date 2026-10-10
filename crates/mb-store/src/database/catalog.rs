@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{ControlStore, DatabaseError};
 
 mod bundle;
+mod checkpoint_body;
 mod checkpoint_coding;
 mod checkpoint_retention;
 mod checkpoint_transition;
@@ -46,9 +47,13 @@ pub use bundle::{
 };
 pub use checkpoint_coding::{
     CatalogCertifiedCodingGroup, CatalogCheckpointCodingStateIndex, CatalogCheckpointCodingTrust,
+    CatalogCheckpointDirectoriesCodingStateIndex,
 };
 pub use checkpoint_retention::{CatalogCheckpointRetention, CatalogCheckpointRetentionState};
-pub use checkpoint_transition::{CatalogCheckpointPrevious, CatalogCheckpointTransitionIndex};
+pub use checkpoint_transition::{
+    CatalogCheckpointDirectoriesTransitionIndex, CatalogCheckpointPrevious,
+    CatalogCheckpointTransitionIndex,
+};
 pub use checkpoint_validation::{
     CatalogCheckpointAuthorityContext, CatalogCheckpointAuthorityIndex,
     CatalogCheckpointAuthorityValidation, CatalogCheckpointCodingDirectoriesIndex,
@@ -94,7 +99,9 @@ pub use packing_directory_validation::{
 pub use packing_validation::{
     CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingSector, CatalogPackingValidation,
 };
-pub use paged_checkpoint::CatalogQuorumPagedCheckpointIndex;
+pub use paged_checkpoint::{
+    CatalogQuorumPagedCheckpointDirectoryIndex, CatalogQuorumPagedCheckpointIndex,
+};
 pub use paged_checkpoint_payload::{CatalogCheckpointPayload, CatalogPayloadRetirementView};
 pub use paged_checkpoint_retention::{
     CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,

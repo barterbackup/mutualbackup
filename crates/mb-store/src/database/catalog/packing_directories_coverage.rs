@@ -246,6 +246,18 @@ impl CatalogPackingCodingDirectoriesIndex {
         self.require_complete()?;
         self.rows()?.coverage_row(id)
     }
+    pub(super) fn coverage_row(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<CatalogCodingCoverage>, CatalogStoreError> {
+        self.rows()?.coverage_row(id)
+    }
+    pub(super) fn next_group_row(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
+        self.rows()?.next_group_row(after)
+    }
     pub fn next_group(
         &self,
         after: Option<[u8; 32]>,

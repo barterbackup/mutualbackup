@@ -426,6 +426,18 @@ cardinality/commitments and every packing/coding EOF in the same scratch index.
 It carries the original authority debt through both joins and preserves the
 mixed legacy/paged revision cursor. `header_candidate` rechecks the completion
 markers and exact trusted original Member records, including recovery keys and
-failure domains. It grants no signing, transition or activation capability.
-Certified-current coding state, legal previous-history transition and guarded
-public/private/payload ownership must still integrate this proof.
+failure domains. The candidate alone grants no signing, transition or activation
+capability; those require the completed proof stages described below.
+
+The completed format-ten directory public index now uses the original exact
+certified coding, authority/history transition and bounded quorum-binding
+algorithms. Its typed wrappers retain the directory header rather than inventing
+individual packing roots. Original histories compare current and predecessor
+coding incarnations, including retired/forgotten/re-added witnesses, under one
+cumulative replay/input/row-work budget. Directory predecessors preserve their
+original quorum/hash; format-nine and format-ten proofs can compare the same
+original retained signed identities. Signing/binding reread independent trust
+and cannot proceed from a candidate/header alone. The full history-transition
+flag, private/metadata/payload ownership and guarded durable publication remain
+mandatory before activation. Original signed bytes, domains, header/certificate
+layouts and existing disposable marker schemas are unchanged.
