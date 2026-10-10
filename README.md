@@ -177,6 +177,20 @@ outside the disposable filesystem so its unmount and image removal preserve
 the diagnostics. The collector never traverses protected source directories.
 The native Git CI job archives these logs alongside its acceptance transcript.
 
+To test a relay-only signer partition and abrupt coordinator restart:
+
+```sh
+MUTUALBACKUP_TEST_LOG_ROOT=/tmp/mutualbackup-signature-logs \
+  nix develop -c bash scripts/network-smoke.sh /mnt/disposable-btrfs \
+  five_daemons_resume_relay_signature_after_partition_and_coordinator_crash
+```
+
+This case also requires `tc` with netem support. It verifies four durable
+original signatures and their coding transcript from a separate stopped DB/WAL
+copy, then requires the exact event with all five original signatures after
+restart and network repair. Two fresh debug-source runs are recorded in R5 of
+`TODO.md`; the original stall diagnosis and installed-artifact gates remain open.
+
 This Linux-only gate uses disposable network namespaces, veth interfaces,
 port-preserving NAT, and firewall rules to make direct, successful-DCUtR, and
 relay-only paths real rather than inferred. It requires passwordless `sudo` for

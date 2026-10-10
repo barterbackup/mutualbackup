@@ -219,6 +219,10 @@ impl<'a> AuthorityReader<'a> {
     }
 
     fn open_inner(control: &'a ControlStore, require_indexed: bool) -> Result<Option<Self>> {
+        with_read_snapshot(control, || Self::open_in_snapshot(control, require_indexed))
+    }
+
+    fn open_in_snapshot(control: &'a ControlStore, require_indexed: bool) -> Result<Option<Self>> {
         let original =
             control.get_record_bounded("guild-installed", KEY, GUILD_AUTHORITY_SNAPSHOT_BYTES)?;
         let compact = read_record(control)?;
@@ -416,6 +420,10 @@ impl<'a> AuthorityReader<'a> {
     }
 
     pub(crate) fn check(&self) -> Result<()> {
+        with_read_snapshot(self.control, || self.check_in_snapshot())
+    }
+
+    fn check_in_snapshot(&self) -> Result<()> {
         if self.control.get_record_bounded(
             "guild-installed",
             KEY,

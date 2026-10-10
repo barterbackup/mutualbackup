@@ -1353,6 +1353,27 @@ before-fix reproduction and 1,334 distinct passing source cases. This qualifies
 the initial control handoff; complete namespace/volume/external-owner handoff and
 the remaining Milestone 6 gates remain open.
 
+Independent read-only authority/history lookups now use short, composable SQLite
+snapshots. NodeReader control connections are now query-only, so this applies
+to the actual concurrent reader route while keeping its directory lease.
+Deterministic valid-publication interleavings reproduced the exact
+false stale-authority error from the native baseline before the correction;
+a separate regression keeps the final publication fence enforced. The R5
+fixture qualifies a real relay-only signer partition, coordinator crash,
+stopped-catalog cryptographic proof, and same-event recovery with all five
+original signatures. All 380 ordinary Store, 527 ordinary Node and 23 ordinary
+process cases, the default topology and two fresh fault runs pass on frozen
+debug source: 932 distinct cases in 933 executions, with cleanup verified.
+The identical Store binary retains its 380 verified passes. The remaining 553
+positive executions, including the default topology, run freshly. Completed
+activation records also resume their exact authenticated next bound Add after
+restart; a valid-history regression reproduces the former skip and preserves
+the original proposal/signatures and full-signature requirement. The cleanup
+check also preserves that exact unfinished Add instead of treating its absent
+group as forgotten; explicit replan markers remain enforced. The original
+stall diagnosis, complete fault matrix and current installed artifact gates
+remain open; see R5 in `TODO.md`.
+
 ### Production corrections from the 2026-10-05 source review
 
 These are the correction requirements; completed increments are recorded below.

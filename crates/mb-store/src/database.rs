@@ -287,14 +287,18 @@ impl ControlStore {
     }
 
     /// Inspect multiple namespaces from one SQLite read snapshot. Only an
-    /// already read-only connection is accepted; the callback must not begin
-    /// another transaction. Keep remote I/O outside this local snapshot.
+    /// already read-only connection is accepted. Nested calls reuse the caller's
+    /// snapshot; callbacks must not begin another transaction. Keep remote I/O
+    /// outside this local snapshot.
     pub fn with_read_only_snapshot<T>(
         &self,
         operation: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         if !self.is_read_only()? {
             return Err(DatabaseError::Integrity.into());
+        }
+        if !self.connection.is_autocommit() {
+            return operation();
         }
         let transaction = self.connection.unchecked_transaction()?;
         let result = operation()?;
@@ -4702,6 +4706,36 @@ fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nested_read_only_snapshot_reuses_outer_view_without_releasing_it() {
+        use super::ControlStore;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested-snapshot.db");
+        let writer = ControlStore::open_with_key(&path, &[8; 32]).unwrap();
+        writer.put_record("first", b"a", b"old").unwrap();
+        let reader = ControlStore::open_existing_read_only_with_key(&path, &[8; 32]).unwrap();
+        reader
+            .with_read_only_snapshot(|| {
+                assert_eq!(reader.get_record("first", b"a")?.unwrap(), b"old");
+                writer.put_record("first", b"a", b"new")?;
+                reader.with_read_only_snapshot(|| {
+                    assert_eq!(reader.get_record("first", b"a")?.unwrap(), b"old");
+                    Ok(())
+                })?;
+                assert!(
+                    reader
+                        .with_read_only_snapshot(|| -> anyhow::Result<()> {
+                            anyhow::bail!("abort inner read")
+                        })
+                        .is_err()
+                );
+                assert_eq!(reader.get_record("first", b"a")?.unwrap(), b"old");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reader.get_record("first", b"a").unwrap().unwrap(), b"new");
+    }
+
     #[test]
     fn read_only_snapshot_keeps_namespaces_consistent_and_releases_on_error() {
         use super::ControlStore;

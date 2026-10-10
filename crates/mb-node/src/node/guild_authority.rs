@@ -8,6 +8,12 @@ const KIND: &str = "guild-authority-tip-v1";
 const KEY: &[u8] = b"primary";
 const BYTES: usize = GUILD_AUTHORITY_SNAPSHOT_BYTES + 128;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_COMPACT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 mod membership;
 mod original_history;
 
@@ -152,9 +158,33 @@ pub(super) fn read(control: &ControlStore) -> Result<Option<GuildAuthoritySnapsh
 }
 
 fn read_record(control: &ControlStore) -> Result<Option<Record>> {
+    with_read_snapshot(control, || read_record_in_snapshot(control))
+}
+
+// Writable Node operations serialize their connection. Independent read-only
+// connections need one local snapshot for related authority/history queries.
+fn with_read_snapshot<T>(
+    control: &ControlStore,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if control.is_read_only()? {
+        control.with_read_only_snapshot(operation)
+    } else {
+        operation()
+    }
+}
+
+fn read_record_in_snapshot(control: &ControlStore) -> Result<Option<Record>> {
     let Some(bytes) = control.get_record_bounded(KIND, KEY, BYTES)? else {
         return Ok(None);
     };
+    #[cfg(test)]
+    AFTER_COMPACT_READ.with(|hook| {
+        let operation = hook.borrow_mut().take();
+        if let Some(operation) = operation {
+            operation();
+        }
+    });
     let record = decode(&bytes)?;
     check_genesis(control, &record)?;
     check_tail(control, &record)?;
@@ -165,6 +195,10 @@ fn read_record(control: &ControlStore) -> Result<Option<Record>> {
 }
 
 pub(super) fn read_or_legacy(control: &ControlStore) -> Result<Option<GuildAuthoritySnapshot>> {
+    with_read_snapshot(control, || read_or_legacy_in_snapshot(control))
+}
+
+fn read_or_legacy_in_snapshot(control: &ControlStore) -> Result<Option<GuildAuthoritySnapshot>> {
     if let Some(snapshot) = read(control)? {
         return Ok(Some(snapshot));
     }
@@ -359,6 +393,126 @@ mod tests {
                 failure_domain: "compact-new-domain".to_owned(),
             },
         )
+    }
+
+    fn publication_during_compact_read() -> (
+        tempfile::TempDir,
+        ControlStore,
+        GuildAuthoritySnapshot,
+        GuildAuthoritySnapshot,
+    ) {
+        let (temp, _seed, node, keys) = fixture();
+        let installed = node.installed_guild().unwrap().unwrap();
+        let mut next = node.dynamic_guild_state().unwrap().unwrap();
+        let before = GuildAuthoritySnapshot::from_state(&next).unwrap();
+        let certified = relabel(&node, &keys);
+        next.apply_event(&certified).unwrap();
+        let after = GuildAuthoritySnapshot::from_state(&next).unwrap();
+        let records = vec![
+            (
+                "guild-event".to_owned(),
+                certified.event.sequence.to_be_bytes().to_vec(),
+                canonical_bytes(&certified).unwrap(),
+            ),
+            (
+                "guild-dynamic-state".to_owned(),
+                KEY.to_vec(),
+                canonical_bytes(&next).unwrap(),
+            ),
+        ];
+        let reader = ControlStore::open_existing_read_only_with_key(
+            temp.path().join("control.db"),
+            &node.control_database_key,
+        )
+        .unwrap();
+        let writer = ControlStore::open_existing_with_key(
+            temp.path().join("control.db"),
+            &node.control_database_key,
+        )
+        .unwrap();
+        let expected = before.clone();
+        AFTER_COMPACT_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                publish(&writer, &installed, &next, Some(&before), &records, &[]).unwrap();
+            }));
+        });
+        (temp, reader, expected, after)
+    }
+
+    #[test]
+    fn compact_authority_reader_keeps_one_snapshot_across_valid_original_publication() {
+        let (_temp, reader, expected, after) = publication_during_compact_read();
+        assert_eq!(
+            read(&reader).unwrap(),
+            Some(expected),
+            "the reader must see a coherent original authority snapshot"
+        );
+        assert_eq!(read(&reader).unwrap(), Some(after));
+    }
+
+    #[test]
+    fn node_reader_authorization_keeps_one_snapshot_across_valid_original_publication() {
+        let (temp, _seed, node, keys) = fixture();
+        let reader = node.reader_config().open().unwrap();
+        let installed = node.installed_guild().unwrap().unwrap();
+        let mut next = node.dynamic_guild_state().unwrap().unwrap();
+        let before = GuildAuthoritySnapshot::from_state(&next).unwrap();
+        let guild = before.guild_id;
+        let caller = node.keys.node_id();
+        let certified = relabel(&node, &keys);
+        next.apply_event(&certified).unwrap();
+        let records = vec![
+            (
+                "guild-event".to_owned(),
+                certified.event.sequence.to_be_bytes().to_vec(),
+                canonical_bytes(&certified).unwrap(),
+            ),
+            (
+                "guild-dynamic-state".to_owned(),
+                KEY.to_vec(),
+                canonical_bytes(&next).unwrap(),
+            ),
+        ];
+        let writer = ControlStore::open_existing_with_key(
+            temp.path().join("control.db"),
+            &node.control_database_key,
+        )
+        .unwrap();
+        AFTER_COMPACT_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                publish(&writer, &installed, &next, Some(&before), &records, &[]).unwrap();
+            }));
+        });
+        reader.authorize_member(&guild, caller).unwrap();
+        reader.authorize_member(&guild, caller).unwrap();
+        assert!(reader.control.is_read_only().unwrap());
+        assert!(
+            reader
+                .control
+                .put_record("reader-write", b"a", b"b")
+                .is_err()
+        );
+        assert!(
+            node.control
+                .get_record("reader-write", b"a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn original_history_reader_opens_coherently_and_still_rejects_later_publication() {
+        let (_temp, reader, before, after) = publication_during_compact_read();
+        let authority = original_history::AuthorityReader::open(&reader)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.snapshot(), &before);
+        assert!(authority.check().is_err());
+        let current = original_history::AuthorityReader::open(&reader)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.snapshot(), &after);
+        current.check().unwrap();
     }
 
     #[test]

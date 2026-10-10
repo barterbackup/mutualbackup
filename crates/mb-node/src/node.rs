@@ -878,7 +878,7 @@ pub(crate) struct NodeReader {
     keys: Arc<KeyMaterial>,
     control: ControlStore,
     volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
-    // Keep the claim while this handle can open or use a writable catalog.
+    // Keep the claim while this handle uses catalogs and volume readers.
     _data_dir_lease: DataDirLease,
 }
 
@@ -906,6 +906,7 @@ impl NodeReaderConfig {
         };
         #[cfg(not(target_os = "linux"))]
         let control = ControlStore::open_with_key(&self.control_path, &self.control_database_key)?;
+        control.make_query_only()?;
         Ok(NodeReader {
             keys: self.keys.clone(),
             control,
@@ -8712,7 +8713,10 @@ impl Node {
             .context("guild event sequence exhausted")?;
         let locked_group = match self.locked_guild_event_proposal(next_event_sequence)? {
             Some(event) => match event.kind.coding_group_add() {
-                Some((group, transcript_hash)) => Some((group.clone(), transcript_hash)),
+                Some((group, transcript_hash)) => {
+                    state.validate_event_proposal(&event)?;
+                    Some((group.clone(), transcript_hash))
+                }
                 None => return Ok(None),
             },
             None => None,
@@ -8725,8 +8729,28 @@ impl Node {
             {
                 anyhow::bail!("durable coding activation job is invalid");
             }
-            if !job.complete {
+            // A completed group can be forgotten and reused by a later backup.
+            // If that Add is interrupted, its durable proposal owns resumption
+            // even though the original activation job was already completed.
+            let resumes_completed = if job.complete {
+                match &locked_group {
+                    Some((group, Some(expected)))
+                        if job.transcript.value.manifest.value.group == *group =>
+                    {
+                        *blake3::hash(&canonical_bytes(&job.transcript)?).as_bytes() == *expected
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !job.complete || resumes_completed {
                 self.validate_coding_attempt_authority(&job.transcript.value.plan)?;
+                if resumes_completed
+                    && replay_coding_transcript(&job.transcript)? != CodingReplayFinding::Verified
+                {
+                    anyhow::bail!("completed coding activation has invalid locked Add evidence");
+                }
                 if job.transcript.value.plan.value.membership_epoch != current_membership_epoch
                     && state
                         .validate_current_group_placement(
@@ -8749,6 +8773,7 @@ impl Node {
                         continue;
                     }
                 }
+                job.complete = false;
                 job.error = None;
                 self.put_coding_activation_job(&job)?;
                 return Ok(Some(job));
@@ -8807,11 +8832,30 @@ impl Node {
             }
             return Ok(true);
         }
+        let state = self.dynamic_guild_state()?;
+        // A transcript is also persisted before its Add commits. The exact
+        // authenticated next bound Add owns resumption, rather than cleanup,
+        // while that group is still absent from current guild state.
+        if let Some(state) = &state {
+            let next_sequence = state
+                .event_sequence
+                .checked_add(1)
+                .context("guild event sequence exhausted")?;
+            if let Some(event) = self.locked_guild_event_proposal(next_sequence)?
+                && let Some((group, Some(expected))) = event.kind.coding_group_add()
+                && *group == transcript.value.manifest.value.group
+                && expected == *blake3::hash(&canonical_bytes(transcript)?).as_bytes()
+            {
+                state.validate_event_proposal(&event)?;
+                self.validate_coding_group_event_evidence(&event, transcript)?;
+                return Ok(false);
+            }
+        }
         // Retirement and forgetting can both commit before this worker first
         // claims an already verified activation. The exact old transcript is
         // still durable, while the group is absent from current guild state.
         let group_id = transcript.value.manifest.value.group.id;
-        let forgotten = self.dynamic_guild_state()?.is_some_and(|state| {
+        let forgotten = state.is_some_and(|state| {
             !state
                 .coding_groups
                 .iter()
@@ -18895,7 +18939,7 @@ pub(crate) mod tests {
         drop(cloned_configuration);
         assert!(
             Node::open(temp.path(), seed.clone()).is_err(),
-            "an open writable reader must retain exclusive data ownership"
+            "an open reader must retain exclusive data ownership"
         );
         assert_eq!(
             reader
@@ -18991,10 +19035,19 @@ pub(crate) mod tests {
                 .unwrap(),
             replacement_object
         );
-        reader
-            .control
-            .put_record("ownership-directory-fixture", b"id", b"reader update")
-            .unwrap();
+        assert!(
+            reader
+                .control
+                .put_record("ownership-directory-fixture", b"id", b"reader update")
+                .is_err()
+        );
+        assert_eq!(
+            reader
+                .control
+                .get_record("ownership-directory-fixture", b"id")
+                .unwrap(),
+            Some(b"original".to_vec())
+        );
         assert_eq!(
             replacement
                 .control
@@ -19011,7 +19064,7 @@ pub(crate) mod tests {
                 .control
                 .get_record("ownership-directory-fixture", b"id")
                 .unwrap(),
-            Some(b"reader update".to_vec())
+            Some(b"original".to_vec())
         );
     }
 
@@ -22843,6 +22896,221 @@ pub(crate) mod tests {
         let node = Node::open(temp.path(), Seed::from_bytes([210; 32])).unwrap();
         assert!(node.claim_coding_launch().unwrap().is_none());
         assert!(node.claim_delegated_coding().unwrap().is_none());
+        assert!(node.claim_coding_activation().unwrap().is_none());
+    }
+
+    #[test]
+    fn completed_coding_activation_resumes_only_its_locked_readdition_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut keys = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([120 + index; 32])))
+            .collect::<Vec<_>>();
+        keys.sort_by_key(KeyMaterial::node_id);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers.clone())
+            .unwrap();
+        let local_id = node.keys.node_id();
+        let remotes = keys
+            .iter()
+            .filter(|key| key.node_id() != local_id)
+            .collect::<Vec<_>>();
+        let member = |id| peers.iter().find(|peer| peer.member.node_id == id).unwrap();
+        let profile = mb_core::CodingProfile::new(1, 1, 64);
+        let shards = mb_core::encode(profile, vec![vec![37; 64]]).unwrap();
+        let plan = node
+            .sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 3,
+                attempt_id: [191; 16],
+                checkpoint_hash: [192; 32],
+                membership_epoch: 1,
+                geometry: mb_core::CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: certificate.genesis.guild_id,
+                    profile,
+                    information: vec![mb_core::InformationRoleV2 {
+                        owner: remotes[0].node_id(),
+                        failure_domain: member(remotes[0].node_id()).member.failure_domain.clone(),
+                        sector: mb_core::RangeSectorRef {
+                            id: [193; 32],
+                            commitment: merkle_commit(&shards[0]).unwrap(),
+                            logical_len: 64,
+                            virtual_zero: false,
+                        },
+                    }],
+                    parity: vec![mb_core::ParityPlacementV2 {
+                        holder: remotes[1].node_id(),
+                        failure_domain: member(remotes[1].node_id()).member.failure_domain.clone(),
+                        row: 0,
+                    }],
+                },
+                delegator: local_id,
+                coding_coordinator: remotes[2].node_id(),
+                verification_coordinator: remotes[3].node_id(),
+                expires_at_unix_seconds: unix_seconds() + 600,
+                information_roots: Some(vec![sector_root(&shards[0])]),
+            })
+            .unwrap();
+        let transcript = test_coding_transcript(plan.clone(), &shards, &keys);
+        node.accept_coding_transcript(plan.value.coding_coordinator, transcript.clone())
+            .unwrap();
+        let certify = |node: &Node, kind| {
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            let event = GuildEvent {
+                format_version: if matches!(
+                    kind,
+                    mb_core::GuildEventKind::AddCodingGroupBound { .. }
+                ) {
+                    2
+                } else {
+                    1
+                },
+                guild_id: state.guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind,
+            };
+            let signatures = keys
+                .iter()
+                .map(|key| sign_guild_event(&event, key).unwrap())
+                .collect();
+            QuorumGuildEvent { event, signatures }
+        };
+        let group = transcript.value.manifest.value.group.clone();
+        let add = || mb_core::GuildEventKind::AddCodingGroupBound {
+            group: group.clone(),
+            transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
+        };
+        node.install_coding_group_event(certify(&node, add()), transcript.clone())
+            .unwrap();
+        assert!(
+            node.complete_coding_activation(plan.value.attempt_id, true)
+                .unwrap()
+        );
+        let retirement_sequence = node.dynamic_guild_state().unwrap().unwrap().event_sequence + 1;
+        node.install_guild_event(certify(
+            &node,
+            mb_core::GuildEventKind::RetireCodingGroup {
+                group_id: group.id,
+                retain_through_event: retirement_sequence,
+            },
+        ))
+        .unwrap();
+        node.install_guild_event(certify(
+            &node,
+            mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
+        ))
+        .unwrap();
+        assert!(node.claim_coding_activation().unwrap().is_none());
+
+        // The completed transcript can protect a later checkpoint again.
+        // Crash after signing that exact re-addition with one member missing.
+        node.persist_coding_group_transcript(&transcript).unwrap();
+        let proposal = certify(&node, add());
+        let local = node
+            .sign_coding_group_event_proposal(&proposal.event, &transcript)
+            .unwrap();
+        node.collect_guild_event_signature(&proposal.event, local)
+            .unwrap();
+        let missing = remotes[3].node_id();
+        for signature in &proposal.signatures {
+            if signature.signer != missing {
+                node.collect_guild_event_signature(&proposal.event, signature.clone())
+                    .unwrap();
+            }
+        }
+        let original_lock = node.control.records("guild-event-signature-lock").unwrap();
+        let original_partials = node
+            .control
+            .records("guild-event-partial-signatures")
+            .unwrap();
+        drop(node);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let original_job = node
+            .control
+            .get_record("coding-activation-job", &plan.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        let mut other_plan = plan.value.clone();
+        other_plan.checkpoint_hash = [194; 32];
+        let other_plan = node.sign_coding_attempt_plan(other_plan).unwrap();
+        let other_transcript = test_coding_transcript(other_plan, &shards, &keys);
+        assert_eq!(other_transcript.value.manifest.value.group, group);
+        assert_eq!(
+            replay_coding_transcript(&other_transcript).unwrap(),
+            CodingReplayFinding::Verified
+        );
+        let mut other_job: CodingActivationJob = decode_canonical(&original_job).unwrap();
+        assert!(other_job.complete);
+        other_job.transcript = other_transcript;
+        let other_bytes = canonical_bytes(&other_job).unwrap();
+        node.control
+            .put_record(
+                "coding-activation-job",
+                &plan.value.attempt_id,
+                &other_bytes,
+            )
+            .unwrap();
+        assert!(node.claim_coding_activation().unwrap().is_none());
+        assert_eq!(
+            node.control
+                .get_record("coding-activation-job", &plan.value.attempt_id)
+                .unwrap(),
+            Some(other_bytes)
+        );
+        node.control
+            .put_record(
+                "coding-activation-job",
+                &plan.value.attempt_id,
+                &original_job,
+            )
+            .unwrap();
+        let claimed = node
+            .claim_coding_activation()
+            .unwrap()
+            .expect("a completed activation must resume its exact durable coding re-addition");
+        assert_eq!(claimed.transcript, transcript);
+        assert!(!claimed.complete);
+        assert!(
+            !node.coding_activation_needs_replan(&transcript).unwrap(),
+            "an unfinished locked Add must resume rather than clean up its activation"
+        );
+        assert_eq!(
+            node.control.records("guild-event-signature-lock").unwrap(),
+            original_lock
+        );
+        assert_eq!(
+            node.control
+                .records("guild-event-partial-signatures")
+                .unwrap(),
+            original_partials
+        );
+        let local = node
+            .sign_coding_group_event_proposal(&proposal.event, &transcript)
+            .unwrap();
+        let signatures = node
+            .collect_guild_event_signature(&proposal.event, local)
+            .unwrap();
+        assert_eq!(signatures.len(), 4);
+        assert!(
+            node.dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .verify_event(&QuorumGuildEvent {
+                    event: proposal.event.clone(),
+                    signatures,
+                })
+                .is_err()
+        );
+        node.install_coding_group_event(proposal, transcript)
+            .unwrap();
+        assert!(
+            node.complete_coding_activation(plan.value.attempt_id, true)
+                .unwrap()
+        );
+        assert!(node.claim_coding_activation().unwrap().is_none());
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
         assert!(node.claim_coding_activation().unwrap().is_none());
     }
 

@@ -6,8 +6,8 @@ set -euo pipefail
 # addresses are blocked cross-subnet, while DCUtR-observed public addresses are
 # mapped back to the listener ports. The fallback peer has no inbound mapping.
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 DISPOSABLE_REFLINK_DIRECTORY" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: $0 DISPOSABLE_REFLINK_DIRECTORY [TOPOLOGY_CASE]" >&2
   exit 2
 fi
 
@@ -16,6 +16,22 @@ if [[ ! -d "$test_root" ]]; then
   echo "disposable reflink directory does not exist: $test_root" >&2
   exit 2
 fi
+
+topology_case=${2:-five_daemons_recover_latest_snapshot_from_seed_and_dht}
+case "$topology_case" in
+  five_daemons_recover_latest_snapshot_from_seed_and_dht) ;;
+  five_daemons_resume_relay_signature_after_partition_and_coordinator_crash)
+    tc_program=$(command -v tc) || {
+      echo "tc with netem support is required for signature interruption" >&2
+      exit 2
+    }
+    export MUTUALBACKUP_TEST_TC="$tc_program"
+    ;;
+  *)
+    echo "unknown topology fixture: $topology_case" >&2
+    exit 2
+    ;;
+esac
 
 # Artifact qualification uses one previously built and hashed test driver.
 # An explicit invalid driver must fail before creating privileged resources.
@@ -186,10 +202,10 @@ export MUTUALBACKUP_TEST_ENV="$env_program"
 
 if [[ ${MUTUALBACKUP_TEST_PROCESS_BINARY+x} ]]; then
   "$MUTUALBACKUP_TEST_PROCESS_BINARY" \
-    five_daemons_recover_latest_snapshot_from_seed_and_dht \
+    "$topology_case" \
     --ignored --exact --nocapture
 else
   cargo test -p mutualbackup --test prototype_acceptance \
-    five_daemons_recover_latest_snapshot_from_seed_and_dht \
+    "$topology_case" \
     --locked -- --ignored --exact --nocapture
 fi

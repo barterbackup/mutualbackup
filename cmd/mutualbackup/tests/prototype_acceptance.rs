@@ -36,6 +36,10 @@ use binaries::program;
 mod peer_logs;
 use peer_logs::PeerLogArchive;
 
+#[cfg(target_os = "linux")]
+#[path = "support/signature_retry.rs"]
+mod signature_retry;
+
 fn uses_cargo_debug_programs() -> bool {
     cfg!(debug_assertions) && std::env::var_os("MUTUALBACKUP_TEST_BIN_DIR").is_none()
 }
@@ -1856,6 +1860,17 @@ fn raw_unix_paths_survive_cli_daemon_and_git_checkout() {
 #[test]
 #[ignore = "requires an explicitly provisioned reflink test filesystem"]
 fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
+    exercise_five_daemon_seed_recovery(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires provisioned Btrfs, isolated network namespaces and tc netem"]
+fn five_daemons_resume_relay_signature_after_partition_and_coordinator_crash() {
+    exercise_five_daemon_seed_recovery(true);
+}
+
+fn exercise_five_daemon_seed_recovery(interrupt_relay_signature: bool) {
     let topology = ProcessNetworkTopology::from_environment();
     // The Btrfs source path can be long; recovery adds still longer state
     // directory names. Keep every control socket in a short private IPC area.
@@ -2657,16 +2672,35 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         deterministic_bytes(512_047, 89),
     )
     .unwrap();
-    let relay_backup = topology_backup_cli(
-        &sockets[2],
-        process_topology_backup_timeout(),
-        &[
-            &daemons[0].log,
-            &daemons[2].log,
-            &recovered_daemon.log,
-            &storage_recovered_daemon.log,
-        ],
-    );
+    #[cfg(target_os = "linux")]
+    let interrupted_backup = interrupt_relay_signature.then(|| {
+        signature_retry::backup_after_relay_signature_interruption(
+            (&sockets[2], &sockets[0]),
+            &mut daemons[0],
+            &mut storage_recovered_daemon,
+            node_ids[4],
+            &node_ids,
+            process_topology_backup_timeout(),
+            &run_root,
+        )
+    });
+    #[cfg(not(target_os = "linux"))]
+    let interrupted_backup: Option<String> = {
+        assert!(!interrupt_relay_signature);
+        None
+    };
+    let relay_backup = interrupted_backup.unwrap_or_else(|| {
+        topology_backup_cli(
+            &sockets[2],
+            process_topology_backup_timeout(),
+            &[
+                &daemons[0].log,
+                &daemons[2].log,
+                &recovered_daemon.log,
+                &storage_recovered_daemon.log,
+            ],
+        )
+    });
     assert!(relay_backup.contains("state:      Committed"));
     wait_for_peer_transfer(
         &sockets[0],

@@ -3829,6 +3829,112 @@ and native-platform gates remain open.
     independently rechecked after verified resource cleanup under R7. This
     positive run leaves the historical cause and repeated fault matrix open.
 
+  - [x] Keep authority reads coherent and qualify interrupted relay-signature
+    retry.
+    Keep compact authority, original genesis/event history and history-reader
+    admission/final checks coherent on independent read-only connections. The
+    ordinary native topology gate previously failed with `compact guild authority
+    is behind original event history`; a deterministic test reproduced that exact
+    error by atomically publishing a valid original event between the compact read
+    and tail lookup. A second native run reproduced the error in the actual
+    NodeReader route, whose writable control connection had bypassed read-only
+    snapshots. A second deterministic regression reproduces the valid-publication
+    failure through NodeReader authorization. NodeReader control connections are
+    now query-only and reject writes; their directory ownership leases remain
+    retained. Short local SQLite snapshots now cover each related read batch.
+    Nested read-only consumers reuse the caller's snapshot and do not release it
+    on inner errors; writable Node operations retain their serialized connection
+    behavior. A separate regression confirms that an opened history reader still
+    rejects later publication. No snapshot spans remote I/O and malformed/stale
+    projections still fail. Failed topology evidence and its unchanged input audit
+    are retained in `/tmp/mb-m6-relay-retry-validation-fzmn_0gn`; the first
+    deterministic failure is retained in
+    `/tmp/mb-m6-authority-snapshot-negative-3xbhf8wi`. The second failed native
+    run and its input audit are retained in
+    `/tmp/mb-m6-relay-retry-validation-zu1qjpjo`, and the actual NodeReader
+    negative proof is retained in
+    `/tmp/mb-m6-node-reader-snapshot-negative-nc025l9a`.
+
+    The first controlled interruption reached four original signatures and the
+    stopped-catalog proof, but its heal step lost the static default route after
+    link-down. That run was stopped and its complete cleanup verified; diagnosis,
+    logs and unchanged-input audit are retained in
+    `/tmp/mb-m6-relay-retry-validation-636qh4nc`. A disposable namespace probe
+    demonstrates that link-up does not restore this route and explicit replacement
+    restores the exact original IPv4 routes. The fixture now captures and restores
+    those routes on success and guard cleanup, and checks their equality before
+    retrying.
+
+    The route-corrected fault run then exposed another production restart defect:
+    its coding activation job was already complete, but the exact next coding Add
+    retained only four signatures. After restart, backup admission waits for the
+    durable Add while the activation worker skips completed jobs, so no worker
+    resumes that event. The complete run timed out after 2,400 seconds with
+    cleanup and unchanged 316-source/seven-binary audits verified. Read-only
+    durable job/proposal/partial-signature diagnostics are retained in
+    `/tmp/mb-m6-relay-retry-validation-5muxk0l2`. A deterministic valid-history
+    fixture installs, completes, retires and forgets a group, then crashes during
+    its later re-addition; it reproduces the skipped claim before the fix in
+    `/tmp/mb-m6-completed-activation-negative-sz_1ksin`. Claim now reopens a
+    completed activation only for its exact group and transcript hash in the
+    authenticated, current next bound Add proposal, with original plan authority
+    and replay-verified evidence. Other completed jobs remain closed. A different
+    authentic transcript for the same group is rejected without changing its job.
+    The original proposal lock and four signatures remain byte-identical, four
+    signatures still cannot install the event, and completion requires installed
+    coverage. The native stopped-catalog proof records the completion flag at the
+    actual crash. The corrected worker can reclaim and reset that flag before the
+    crash, so the valid-history regression directly qualifies completed-job
+    resumption rather than requiring a timing-dependent native flag.
+
+    A subsequent fresh baseline passed, but the controlled retry exposed a second
+    worker gate: a persisted transcript with a group absent from guild state was
+    treated as forgotten even when its exact bound Add was still pending. The
+    native run timed out at its 2,700-second bound; its live read-only
+    job/lock/partial-signature snapshots, logs, cleanup and unchanged-input audit
+    are retained in `/tmp/mb-m6-relay-retry-validation-5po427ab`. Extending the
+    durable re-addition regression reproduced that exact cleanup decision in
+    `/tmp/mb-m6-pending-add-negative-tk0u62zi`. The cleanup check now preserves
+    resumption for the authenticated, valid current next bound Add with matching
+    group and replay-verified transcript hash. Explicit retirement/replan markers
+    retain precedence, and all other retirement/forgetting behavior remains
+    guarded.
+
+    Run a real relay-only signer partition and abrupt coordinator restart without
+    daemon interruption hooks. The fixture observes the exact coding Add request,
+    partitions the disposable signer namespace after dispatch, and crashes the
+    coordinator only after four durable signatures. A separate complete stopped
+    DB/WAL copy verifies all four original members' signatures, the coordinator's
+    original proposal lock, and the original bounded/replay-verified coding
+    transcript and attempt. Original catalog, WAL, SHM and key file bytes and
+    versions remain unchanged. Restart reuses the same event/attempt and requests
+    only its missing signer; read-only inspection then requires that exact event
+    installed with all five original authentic signatures before accepting backup
+    commit.
+
+    The network script accepts the named fault case explicitly and retains its
+    original default topology selection. Frozen debug-source qualification passes
+    all 380 ordinary Store, 527 ordinary Node and 23 ordinary process cases, the
+    default topology/seed-recovery case, and two fresh complete interruption runs:
+    932 distinct passing cases in 933 positive executions. The 380 Store passes
+    are reused only after verifying the exact binary hash and unchanged Core/Store
+    dependency inputs from its preceding passing run. The other 553 positive
+    executions, including the default topology case, run freshly. The two
+    interruption runs retain different request IDs and correlated
+    event/group/attempt/signer evidence. Formatting, strict locked
+    workspace/all-targets Clippy, shell syntax, four program builds and locked
+    workspace/all-target test compilation pass. All 316 source-file and seven
+    binary hashes match their frozen inputs. Every topology run restores network
+    resources; final mount/loop/image cleanup is verified. Evidence and private
+    peer logs are retained under `/tmp/mb-m6-relay-retry-validation-kuxk5y7s`; the
+    post-commit audit binds the inputs to the commit.
+
+    This qualifies one repeated controlled fault scenario on debug source. The
+    original 3155689 stall diagnosis, complete R5 fault matrix and current
+    installed-artifact qualification remain open. It does not enable normal paged
+    producers or close R1/R2/R3/R5/R7 or Milestone 6; dense 1 TiB and native
+    Windows/macOS qualification remain deferred.
+
   Existing investigation and validation record:
 
   Added correlated event diagnostics to signature failures and dissemination:
