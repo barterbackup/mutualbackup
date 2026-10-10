@@ -4653,3 +4653,59 @@ R5 stays open. This is the listed installed Linux slice, not the full R7 native,
 upgrade, multi-volume, private-Tor, supported-platform or retained-capacity
 matrix. The enclosing metadata policy and normal paged producer/recovery path
 also remain required before production admission is enabled.
+
+## Aggregate retained logical-source guild admission (2026-10-10)
+
+Independent dataset limits allow several owners or protected roots in one guild
+to reserve their entire limit concurrently. The new explicit
+`configure_catalog_retained_source_guild_quota` policy limits their combined
+retained logical data-source bytes, unique per-dataset sources and open jobs.
+Every dataset counter change applies its exact old/new delta to the guild ledger
+inside the same page/source/owner-journal writer. Publication converts credits;
+sharing and native source-location repair add no duplicate charge. Cancellation
+returns unused credits but preserves stored source charges until actual final
+binding or dependency-hold cleanup. Existing signed records and dataset quota
+encodings are unchanged; stores without a configured guild policy keep their
+existing limits.
+
+Initial activation streams existing accounted dataset ledgers under the
+immediate writer. SQL bounds each key/value before row allocation; memory does
+not grow with dataset, revision, source or page counts. Stored cancelled sources
+and outstanding reservations participate in adoption. An over-limit guild,
+missing marker, malformed scope/key/encoding or oversized row rolls back the
+whole activation without changing existing sources or jobs. Grow-only resizing
+preserves outstanding admission without a history scan. Durable guild/dataset
+membership prevents a missing ledger pair from becoming new zero usage; point
+reads verify policy/marker/ledger membership and dataset inclusion. Ignored or
+reverted SQL writes must fail and roll back both ledgers with the enclosing
+owner transaction. The aggregate accessor reports a Guild scope; repeated source
+identities in separate dataset scopes retain their existing independent charges.
+
+Six new Store regressions cover competing datasets/owners/connections, separate
+byte/count/job exhaustion, independent guilds, immutable replay, adoption of
+stored/cancelled/outstanding usage, reopen/read-only behavior, grow-only changes,
+SQL faults throughout activation/publication/cancellation/final cleanup and
+malformed or missing accounting. Existing dependency-hold fixtures now enforce
+the same guild limit, including original-owner cleanup before hold-to-hold
+borrowing/publication and interrupted cancellation. The provisioned Btrfs native
+fixture enforces exact dataset and guild limits through shared retained migration,
+source loss, rejected corrupt repair, interrupted replacement, reopen and retry;
+the aggregate charge remains unchanged. Frozen qualification passes 178 core,
+329 ordinary Store and 35 paged Node cases, the certified-writer migration entry
+point and provisioned native recovery: 544 distinct passing cases. Formatting,
+strict locked workspace/all-targets Clippy, all-target test compilation and all
+four debug program builds pass under Cargo/rustc 1.99.0. Frozen source, seven
+binaries and 21 embedded protocol/helper inputs match through qualification.
+Native mount/loop/image cleanup is independently checked. Evidence is retained
+under `/tmp/mb-m6-guild-source-validation-if3dgpyt`; the post-commit audit binds
+the qualified source and embedded inputs to the commit. Removing only disposable
+incremental caches reclaims 7.48 GiB and leaves about 51.2 GiB in `target`, with
+all qualified binary hashes preserved.
+
+These limits count non-hole authenticated data-source logical bytes. They do not
+fund private/bootstrap metadata, padding, parity/coding payloads, SQL/WAL or
+traversal/scratch. Adopting previously unaccounted paged data remains separate
+from activating a guild limit over existing dataset accounting. Complete section/
+dataset/guild metadata and physical policy, normal paged producers/recovery,
+generation-floor retirement and deferred real capacity/platform qualification
+remain required before production admission is enabled.

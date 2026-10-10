@@ -1421,8 +1421,9 @@ publication converts only newly retained identities and returns unused credits.
 Shared sources remain charged until their last retained binding is cleaned up,
 including cancelled owners, while source-location repair leaves accounting
 unchanged. This counts non-hole source logical bytes and source cardinality;
-sparse lengths, aliases, private/bootstrap metadata, physical payload/parity and
-guild limits still need enclosing policy. The follow-up below adds durable
+sparse lengths, aliases, private/bootstrap metadata and physical payload/parity
+still need enclosing policy. The guild logical-source increment is recorded
+below. The follow-up below adds durable
 dependency ownership across the admission/publication interval.
 Initial enablement over existing paged bindings requires bounded
 adoption and currently rejects before mutation. Frozen qualification passes
@@ -1463,6 +1464,28 @@ This closes incremental source admission for explicit retained
 migration. Full enclosing metadata/payload/SQL/WAL policy, normal producers,
 bounded adoption, generation floors and the deferred capacity/platform gates
 remain open.
+
+Retained logical source admission now also enforces an explicit aggregate limit
+per guild across dataset/owner boundaries. Its byte/source/job counters change
+inside the existing page/source/journal writer; repeated revisions and dependency
+holds preserve one dataset charge until actual final-owner cleanup. Activation
+streams existing accounted dataset ledgers with bounded row allocation in the
+immediate writer, including stored cancelled sources and outstanding credits,
+and rejects over-limit adoption atomically. Immutable replay, independent guilds,
+grow-only policy changes and read-only/reopen behavior are preserved; malformed
+or missing accounting cannot reset admission. Six new regressions and the native
+Btrfs shared-migration/source-loss/interrupted-repair fixture pass with both
+limits enabled. Frozen qualification passes 544 distinct cases: 178 core,
+329 ordinary store, 35 paged Node, the certified-writer migration case and
+provisioned native recovery. Formatting, strict locked workspace/all-targets
+Clippy, all-target test compilation and four debug builds pass. Source, seven
+binaries and 21 embedded protocol/helper inputs match, and native cleanup is
+verified. Evidence is in `/tmp/mb-m6-guild-source-validation-if3dgpyt`.
+Incremental-cache cleanup reclaims about 7.5 GiB with qualified binaries unchanged.
+This is the logical
+data-source limit; private/bootstrap metadata, physical payload/coding, SQL/WAL,
+traversal, previously unaccounted paged-data adoption and normal producers still
+require the complete enclosing policy and deferred capacity/platform gates.
 
 Retained public authority now has an explicitly budgeted format two, selected
 by draft paged checkpoint format nine. Each original tree stays bounded, while

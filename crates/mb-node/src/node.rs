@@ -18054,6 +18054,13 @@ pub(crate) mod tests {
             })
             .unwrap();
         node.control
+            .configure_catalog_retained_source_guild_quota(mb_store::CatalogRetainedSourceQuota {
+                logical_bytes: unique_data.values().map(|length| u64::from(*length)).sum(),
+                sources: unique_data.len() as u64,
+                open_reservations: 8,
+            })
+            .unwrap();
+        node.control
             .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
                 page_bytes: 1024 * 1024,
                 pages: 64,
@@ -18084,6 +18091,16 @@ pub(crate) mod tests {
         assert_eq!(data_usage.open_reservations, 0);
         assert_eq!(data_usage.reserved_logical_bytes, 0);
         assert_eq!(data_usage.reserved_sources, 0);
+        let guild_usage = Some(mb_store::CatalogRetainedSourceUsage {
+            scope: mb_core::CatalogScope::Guild { guild_id: guild },
+            ..data_usage
+        });
+        assert_eq!(
+            node.control
+                .catalog_retained_source_guild_usage(guild)
+                .unwrap(),
+            guild_usage
+        );
         let shared_operation = Uuid::new_v4();
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, shared_operation)
             .unwrap();
@@ -18368,6 +18385,12 @@ pub(crate) mod tests {
             assert_eq!(retry.is_ok(), current.generation == 1);
         }
         assert_eq!(advanced_twice, 1);
+        assert_eq!(
+            node.control
+                .catalog_retained_source_guild_usage(guild)
+                .unwrap(),
+            guild_usage
+        );
         assert_eq!(std::fs::read(ordinary.join("nested/dense")).unwrap(), dense);
         assert_eq!(
             node.prepared_revision_bytes(guild, legacy.value.revision_id)

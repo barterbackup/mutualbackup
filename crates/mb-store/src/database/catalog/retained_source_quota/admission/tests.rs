@@ -1,6 +1,20 @@
 use super::*;
 use std::sync::{Arc, Barrier};
 
+fn assert_guild_usage(store: &ControlStore, scope: CatalogScope) {
+    let dataset = store.catalog_retained_source_usage(scope).unwrap().unwrap();
+    let CatalogScope::Dataset { guild_id, .. } = scope else {
+        unreachable!()
+    };
+    assert_eq!(
+        store.catalog_retained_source_guild_usage(guild_id).unwrap(),
+        Some(CatalogRetainedSourceUsage {
+            scope: CatalogScope::Guild { guild_id },
+            ..dataset
+        })
+    );
+}
+
 #[test]
 fn source_dependency_competing_connections_publish_and_cancel_after_original_cleanup() {
     let temp = tempfile::tempdir().unwrap();
@@ -46,6 +60,7 @@ fn source_dependency_competing_connections_publish_and_cancel_after_original_cle
         }));
     }
     admitted.wait();
+    assert_guild_usage(&store, original.scope);
     assert_eq!(
         paged_data::anchor_count(&store.connection, anchor).unwrap(),
         Some(3)
@@ -66,6 +81,7 @@ fn source_dependency_competing_connections_publish_and_cancel_after_original_cle
         .filter_map(|task| task.join().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(survivor.len(), 1);
+    assert_guild_usage(&store, original.scope);
     assert_eq!(
         store.catalog_retained_source_usage(original.scope).unwrap(),
         used
@@ -85,6 +101,7 @@ fn source_dependency_competing_connections_publish_and_cancel_after_original_cle
     store.cancel_paged_revision_catalog(id).unwrap();
     assert!(store.release_paged_revision_data_source(id).unwrap());
     assert!(!store.paged_data_anchor_is_pinned(new_anchor).unwrap());
+    assert_guild_usage(&store, original.scope);
     assert_eq!(
         store
             .catalog_retained_source_usage(original.scope)
@@ -144,6 +161,13 @@ fn setup(store: &ControlStore) -> (CatalogBundle, CatalogSectorRecord, Uuid) {
     let (bundle, bytes, source) = fixture(store);
     store
         .configure_catalog_retained_source_quota(CatalogRetainedSourceQuota {
+            logical_bytes: source.sector.logical_len.into(),
+            sources: 1,
+            open_reservations: 2,
+        })
+        .unwrap();
+    store
+        .configure_catalog_retained_source_guild_quota(CatalogRetainedSourceQuota {
             logical_bytes: source.sector.logical_len.into(),
             sources: 1,
             open_reservations: 2,
@@ -232,6 +256,7 @@ fn source_dependency_holds_admit_at_capacity_and_survive_final_owner_cleanup_and
     assert_eq!(held.reserved_logical_bytes, 0);
     assert_eq!(held.reserved_sources, 0);
     assert_eq!(held.open_reservations, 1);
+    assert_guild_usage(&store, original.scope);
     store.cancel_paged_revision_catalog(original.id).unwrap();
     assert!(
         store
@@ -251,6 +276,7 @@ fn source_dependency_holds_admit_at_capacity_and_survive_final_owner_cleanup_and
     drop(store);
     let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
     admit(&store, id, original.scope, list).unwrap();
+    assert_guild_usage(&store, original.scope);
     let (next, bytes, next_source) = fixture(&store);
     assert_eq!(source, next_source);
     admit(&store, next.id, next.scope, list).unwrap();
@@ -291,6 +317,7 @@ fn source_dependency_holds_admit_at_capacity_and_survive_final_owner_cleanup_and
         .unwrap();
     assert_eq!(empty.stored_sources, 0);
     assert_eq!(empty.stored_logical_bytes, 0);
+    assert_guild_usage(&store, original.scope);
     assert!(!store.paged_data_anchor_is_pinned(new_anchor).unwrap());
 }
 
@@ -377,6 +404,13 @@ fn source_dependency_admission_rejects_changed_inputs_unfunded_additions_and_non
     // Old conservative reservations keep their original loans on resume.
     store
         .configure_catalog_retained_source_quota(CatalogRetainedSourceQuota {
+            logical_bytes: u64::from(source.sector.logical_len) * 2,
+            sources: 2,
+            open_reservations: 2,
+        })
+        .unwrap();
+    store
+        .configure_catalog_retained_source_guild_quota(CatalogRetainedSourceQuota {
             logical_bytes: u64::from(source.sector.logical_len) * 2,
             sources: 2,
             open_reservations: 2,

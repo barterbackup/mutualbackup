@@ -7,6 +7,7 @@ use mb_core::{CatalogSectorRecord, V1_SECTOR_SIZE};
 use super::*;
 
 pub(super) mod admission;
+mod guild;
 
 const POLICY: &str = "catalog-retained-source-quota-v1";
 const ENABLED: &str = "catalog-retained-source-quota-enabled-v1";
@@ -16,8 +17,9 @@ const RESERVATION: &str = "catalog-retained-source-reservation-v1";
 const SOURCE: &str = "catalog-retained-source-charge-v1";
 const KEY: &[u8] = b"store";
 
-/// Local policy applied independently to every dataset, including its retained
-/// revisions. This does not authorize a source or certify release capacity.
+/// Local byte/source/job limits for retained revisions. Dataset and aggregate
+/// guild policies are configured separately; neither authorizes a source or
+/// certifies release capacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogRetainedSourceQuota {
     pub logical_bytes: u64,
@@ -79,6 +81,10 @@ impl CatalogRetainedSourceUsage {
 
     fn validate(self, quota: CatalogRetainedSourceQuota) -> Result<(), CatalogStoreError> {
         dataset_key(self.scope)?;
+        self.validate_limits(quota)
+    }
+
+    fn validate_limits(self, quota: CatalogRetainedSourceQuota) -> Result<(), CatalogStoreError> {
         quota.validate()?;
         if self
             .stored_logical_bytes
@@ -154,6 +160,9 @@ fn policy(
     let bytes = bounded_record(connection, POLICY, KEY, RECORD_BYTES)?;
     match (enabled.as_deref(), bytes) {
         (None, None) => {
+            if guild::policy(connection)?.is_some() {
+                return Err(DatabaseError::Integrity.into());
+            }
             let existing: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1, ?2, ?3, ?4, ?5, ?6)
                  OR kind GLOB 'catalog-retained-source-hold-owner-v1/*')",
@@ -171,6 +180,7 @@ fn policy(
                 return Err(DatabaseError::Integrity.into());
             }
             quota.validate()?;
+            guild::policy(connection)?;
             Ok(Some(quota))
         }
         _ => Err(DatabaseError::Integrity.into()),
@@ -199,6 +209,7 @@ fn usage(
         _ => return Err(DatabaseError::Integrity.into()),
     };
     result.validate(quota)?;
+    guild::require_dataset_usage(connection, result, enabled.is_some())?;
     Ok(result)
 }
 
@@ -226,6 +237,8 @@ fn write_usage(
     quota: CatalogRetainedSourceQuota,
 ) -> Result<(), CatalogStoreError> {
     usage.validate(quota)?;
+    let previous = self::usage(connection, usage.scope, quota)?;
+    guild::update_dataset_usage(connection, previous, usage)?;
     replace(
         connection,
         LEDGER,
@@ -621,6 +634,7 @@ impl ControlStore {
         if bundle::bundle_snapshot(&self.connection, id)?.is_some() {
             return Err(DatabaseError::Conflict.into());
         }
+        guild::ensure_ledger(&self.connection, scope)?;
         insert_exact(
             &self.connection,
             LEDGER,

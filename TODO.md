@@ -2633,6 +2633,32 @@ and native-platform gates remain open.
       complete metadata/payload/SQL/WAL policy, normal producers, bounded
       existing-paged adoption, generation floors and deferred capacity/platform
       qualification remain open.
+    - [x] Enforce retained logical data-source byte/count/job limits across all
+      datasets and owners in each guild. Dataset credits and guild totals change
+      in the same page/source/journal writer; shared revisions and dependency
+      holds retain one dataset charge until actual final-owner cleanup. Initial
+      guild activation streams already-accounted dataset ledgers one bounded
+      row at a time under the immediate writer, including cancelled stored
+      sources and outstanding jobs. Reject over-limit adoption without mutation;
+      preserve immutable replay, independent guilds, read-only/reopen behavior
+      and grow-only resizing. Missing/corrupt policy, ledger or membership
+      records cannot reset admission. Six new regressions pass, and existing
+      dependency-hold fixtures now enforce the same exact guild limit. The
+      provisioned Btrfs native capture/recovery fixture passes with exact
+      dataset/guild limits through shared migration, source loss, interrupted
+      replacement, reopen and retry. Frozen qualification passes 178 core,
+      329 ordinary store, 35 paged Node, the certified-writer migration case
+      and provisioned native recovery (544 distinct cases). Formatting, strict
+      locked workspace/all-targets Clippy, all-target test compilation and four
+      debug builds pass. Source, seven binaries and 21 embedded protocol/helper
+      inputs match; native mount/loop/image cleanup is verified. Evidence is in
+      `/tmp/mb-m6-guild-source-validation-if3dgpyt`. Incremental-cache cleanup
+      reclaims about 7.5 GiB, leaving about 51 GiB in `target`; qualified binary
+      hashes remain unchanged.
+      This accounts for unique per-dataset non-hole data-source logical bytes;
+      private/bootstrap metadata, physical payload/coding, SQL/WAL, traversal,
+      the complete enclosing policy, adoption of previously unaccounted paged
+      data, normal producers and deferred capacity/platform gates remain open.
   - [x] Join full/compact packing descriptors and source streams through a
     disposable encrypted index. Require a source-authority callback; reject
     duplicate/missing mappings, incomplete coverage, false virtual zeros and
