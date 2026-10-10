@@ -10,7 +10,7 @@ use mb_core::{
 
 use super::packing_validation::{
     PackingStreamManifest, PackingStreams, ROOT_BYTES, build_streams, read_placement, read_sector,
-    unwrap_stream,
+    resolve_source, unwrap_stream,
 };
 use super::*;
 use crate::RecordScratchStore;
@@ -89,9 +89,9 @@ impl PackingStreams for CatalogPackingDirectoryReader {
 }
 
 pub struct CatalogPackingDirectoryIndex {
-    manifest: CatalogPackingDirectoryValidation,
-    budget: CatalogCodingTraversalBudget,
-    store: RecordScratchStore,
+    pub(super) manifest: CatalogPackingDirectoryValidation,
+    pub(super) budget: CatalogCodingTraversalBudget,
+    pub(super) store: RecordScratchStore,
 }
 
 impl CatalogPackingDirectoryIndex {
@@ -108,26 +108,8 @@ impl CatalogPackingDirectoryIndex {
             &MerkleCommitment,
         ) -> Result<(), CatalogStoreError>,
     ) -> Result<Self, CatalogStoreError> {
-        manifest.validate(budget)?;
-        let mut streams = CatalogPackingDirectoryReader::new(
-            manifest.scope,
-            manifest.directory,
-            budget.remaining_after(manifest.envelope_work()?)?,
-        )?;
-        let completion = canonical_bytes_bounded(&manifest, ROOT_BYTES)?;
         store.with_record_transaction(|| {
-            build_streams(
-                &mut streams,
-                PackingStreamManifest {
-                    profile: manifest.directory.profile,
-                    chunks: manifest.directory.summary.source_chunks,
-                    complete_kind: COMPLETE,
-                    completion: &completion,
-                },
-                &store,
-                &mut fetch,
-                &mut authorize,
-            )
+            build_index(manifest, budget, &store, &mut fetch, &mut authorize)
         })?;
         Ok(Self {
             manifest,
@@ -140,7 +122,7 @@ impl CatalogPackingDirectoryIndex {
         self.manifest
     }
 
-    fn require_complete(&self) -> Result<(), CatalogStoreError> {
+    pub(super) fn require_complete(&self) -> Result<(), CatalogStoreError> {
         self.manifest.validate(self.budget)?;
         let expected = canonical_bytes_bounded(&self.manifest, ROOT_BYTES)?;
         if self
@@ -169,6 +151,21 @@ impl CatalogPackingDirectoryIndex {
 
     pub fn sector(&self, id: [u8; 32]) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
         self.require_complete()?;
+        self.sector_row(id)
+    }
+
+    pub(super) fn source_id(
+        &self,
+        key: [u8; 32],
+    ) -> Result<CatalogPackedSourceId, CatalogStoreError> {
+        self.require_complete()?;
+        resolve_source(&self.store, self.manifest.directory.profile, key)
+    }
+
+    pub(super) fn sector_row(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
         read_sector(
             &self.store,
             self.manifest.directory.profile,
@@ -177,6 +174,37 @@ impl CatalogPackingDirectoryIndex {
             id,
         )
     }
+}
+
+pub(super) fn build_index(
+    manifest: CatalogPackingDirectoryValidation,
+    budget: CatalogCodingTraversalBudget,
+    store: &RecordScratchStore,
+    fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    authorize: &mut impl FnMut(
+        CatalogPackedSourceId,
+        &MerkleCommitment,
+    ) -> Result<(), CatalogStoreError>,
+) -> Result<(), CatalogStoreError> {
+    manifest.validate(budget)?;
+    let mut streams = CatalogPackingDirectoryReader::new(
+        manifest.scope,
+        manifest.directory,
+        budget.remaining_after(manifest.envelope_work()?)?,
+    )?;
+    let completion = canonical_bytes_bounded(&manifest, ROOT_BYTES)?;
+    build_streams(
+        &mut streams,
+        PackingStreamManifest {
+            profile: manifest.directory.profile,
+            chunks: manifest.directory.summary.source_chunks,
+            complete_kind: COMPLETE,
+            completion: &completion,
+        },
+        store,
+        fetch,
+        authorize,
+    )
 }
 
 #[cfg(test)]

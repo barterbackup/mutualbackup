@@ -4767,3 +4767,72 @@ policy must fund private/bootstrap metadata, sources, payload, SQL/WAL and
 physical traversal/scratch headroom before enabling normal producers. The
 normal paged capture/retention/seed-recovery path and deferred dense-capacity/
 native-platform qualification gates remain open under R3-SINGLE-OWNER-METADATA.
+
+## Certified sharded packing/coding and transitive ownership (2026-10-10)
+
+The original coding-directory and local combined owner required two individual
+packing roots. `CatalogPackingCodingDirectoriesValidation` now admits a packing
+directory and a coding directory under one trusted remaining budget. Its
+separate local format charges source-authority debt, both directories, every
+referenced stream occurrence and a conservative combined envelope. Exhaustion
+of any byte/page/record dimension fails before coding page I/O or authorization.
+The original packing/coding descriptors and signed layouts remain unchanged.
+
+`CatalogPackingCodingDirectoriesIndex` reuses the original sector-coverage,
+current/historical authorization and bounded witness-row checks in the same
+admitted private scratch store. All groups and both directories must reach
+complete EOF, and every packed sector must have qualifying active coverage.
+Only the exact completed marker admits coverage lookups, ordered group seeks
+or authenticated witness replay; replay also reports its additional work.
+An ignored SQL write, damaged tail, missing coverage or denied authority rolls
+back the whole coding prefix while preserving the completed packing index.
+
+The legacy certificate/source-authority bridge now validates sharded packing
+without resetting imported authority debt, weakening exact source cardinality
+or substituting source commitments. The certified wrappers carry the original
+trusted base, signed candidate cursor and debt through the complete coding join.
+This is the existing migration bridge and required external coding-authority
+callback; it does not certify the enclosing paged public/private checkpoint.
+
+`CatalogPackingCodingDirectoriesRetention` pins both directory roots atomically.
+The packing reader's new part visitor pins each admitted source/descriptor root
+before nested evidence traversal, and the existing coding visitor pins every
+forest part. Short immediate transactions own those pins and counters; the
+walkers hold no production writer. Publication follows every local EOF and
+rechecks the completed proof. Immutable interrupted jobs resume through reopen;
+changed jobs and cancelled identifiers cannot reacquire ownership. The shared
+retention journal uses a new kind and pin prefix five, preserving earlier
+journal and pin layouts. Release retires at most one cancelled root closure per
+transaction. Shared owners preserve all parts until their own final cleanup.
+This owner covers packing/coding metadata; authority/private/bootstrap/native
+and information/parity payload custody still belong to the enclosing checkpoint.
+
+Eleven new core/Store cases cover part visits before I/O and permanent failure
+fencing, dimensional exhaustion, certified scope/cardinality/commitment guards,
+signed candidates carried through a nonempty coding witness, complete global
+coverage and bounded seeks, damaged tails, ignored writes, interruption/reopen,
+changed retries, shared retirement and atomic publication/release. Ownership
+fixtures retain more roots than a local bundle can carry, retire original
+staging intents, reopen and replay both packing and coding before final GC.
+Frozen qualification passes 186 core, 343 ordinary Store and 35 paged Node
+cases, the certified-writer migration entry point and provisioned Btrfs native
+capture/recovery: 566 distinct cases. Ordinary suites leave 26 Store cases and
+one Node case ignored; that native case runs separately on disposable Btrfs
+with a logical sparse 1 TiB file. Formatting, strict locked workspace/all-targets
+Clippy, all-target test compilation and four debug builds pass under Cargo/
+rustc 1.99.0. Source, seven binaries and 21 embedded protocol/helper inputs match.
+Native mount/loop/image cleanup is independently checked. Logs, manifests and
+the distinct passing inventory are retained under
+`/tmp/mb-m6-sharded-joins-validation-omq9ys8p`; the post-commit audit binds the
+qualified source and embedded inputs to the commit. Removing only rebuildable
+incremental caches reclaims 8.65 GiB and leaves about 51.4 GiB in
+`target`, with all seven binary hashes unchanged. Other ordinary/native suites
+and installed artifacts were not rerun.
+
+Complete public/private checkpoint joins, certified-current activation and
+successor retirement must still select and own these exact directories and all
+other metadata/payload roles. Full section/dataset/guild metadata and physical
+admission, normal paged capture/retention/seed recovery and deferred real dense
+capacity/native-platform qualification remain open. This closes the local
+source/coding join and transitive packing/coding metadata handoff, while
+R3-SINGLE-OWNER-METADATA and Milestone 6 remain open.

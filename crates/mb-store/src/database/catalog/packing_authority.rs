@@ -18,6 +18,11 @@ use super::packing_validation::{build_index, unwrap_stream};
 use super::*;
 use crate::RecordScratchStore;
 
+mod directories;
+pub use directories::{
+    CatalogCertifiedCodingDirectoriesIndex, CatalogCertifiedPackingDirectoryIndex,
+};
+
 pub(super) const ROW_BYTES: usize = 256;
 pub(super) const EVIDENCE_BYTES: usize = 512;
 pub(super) const MEMBERS: &str = "packing-authority-member";
@@ -733,8 +738,15 @@ fn next_candidate(
     after: Option<CatalogCheckpointRevisionKey>,
 ) -> Result<Option<SignedRecord<PagedUserRevision>>, CatalogStoreError> {
     index.require_complete()?;
+    next_candidate_from_store(&index.store, after)
+}
+
+fn next_candidate_from_store(
+    store: &RecordScratchStore,
+    after: Option<CatalogCheckpointRevisionKey>,
+) -> Result<Option<SignedRecord<PagedUserRevision>>, CatalogStoreError> {
     let after = after.map(CatalogCheckpointRevisionKey::index_key);
-    let Some((key, bytes)) = index.store.next_record_bounded(
+    let Some((key, bytes)) = store.next_record_bounded(
         CANDIDATES,
         after.as_ref().map(|key| key.as_slice()),
         72,
@@ -1027,7 +1039,7 @@ pub(super) mod tests {
             self.certificate.verify().unwrap();
         }
 
-        fn authority(&self) -> CatalogPackingAuthority {
+        pub(crate) fn authority(&self) -> CatalogPackingAuthority {
             CatalogPackingAuthority::from_legacy_checkpoint(
                 self.certificate.hash().unwrap(),
                 &self.certificate,

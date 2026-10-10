@@ -32,8 +32,9 @@ pub use anchor_discovery::{
 };
 pub use catalog::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
-    CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingDirectoryIndex,
-    CatalogCertifiedCodingGroup, CatalogCertifiedCodingIndex, CatalogCertifiedPackingIndex,
+    CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingDirectoriesIndex,
+    CatalogCertifiedCodingDirectoryIndex, CatalogCertifiedCodingGroup, CatalogCertifiedCodingIndex,
+    CatalogCertifiedPackingDirectoryIndex, CatalogCertifiedPackingIndex,
     CatalogCheckpointAuthorityContext, CatalogCheckpointAuthorityIndex,
     CatalogCheckpointAuthorityValidation, CatalogCheckpointCodingDirectoryIndex,
     CatalogCheckpointCodingStateIndex, CatalogCheckpointCodingTrust, CatalogCheckpointPackingIndex,
@@ -47,6 +48,8 @@ pub use catalog::{
     CatalogIndexedCodingGroup, CatalogIndexedDirectoryCodingGroup, CatalogIntent,
     CatalogIntentState, CatalogNativeValidation, CatalogNativeValidationState,
     CatalogPackingAuthority, CatalogPackingAuthorityBase, CatalogPackingAuthorizedSource,
+    CatalogPackingCodingDirectoriesIndex, CatalogPackingCodingDirectoriesRetention,
+    CatalogPackingCodingDirectoriesRetentionState, CatalogPackingCodingDirectoriesValidation,
     CatalogPackingCodingDirectoryIndex, CatalogPackingCodingDirectoryValidation,
     CatalogPackingCodingIndex, CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
     CatalogPackingCodingValidation, CatalogPackingDirectoryIndex,

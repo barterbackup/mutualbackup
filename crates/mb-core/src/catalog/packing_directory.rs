@@ -446,6 +446,7 @@ impl CatalogPackingDirectoryReader {
     fn next_part<E>(
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+        visit: &mut impl FnMut(CatalogPackingDirectoryRecord) -> Result<(), E>,
     ) -> Result<Option<CatalogPackingDirectoryRecord>, CatalogStreamError<E>> {
         let Some(bytes) = self.directory.next_record(fetch)? else {
             if self.state.summary != self.root.summary {
@@ -467,6 +468,7 @@ impl CatalogPackingDirectoryReader {
         {
             return Err(CatalogError::InvalidPage.into());
         }
+        visit(record).map_err(CatalogStreamError::Storage)?;
         Ok(Some(record))
     }
 
@@ -474,10 +476,20 @@ impl CatalogPackingDirectoryReader {
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
     ) -> Result<Option<CatalogPackedSourceRecord>, CatalogStreamError<E>> {
+        self.next_source_with_part(fetch, &mut |_| Ok(()))
+    }
+
+    /// Visit each admitted part before reading its referenced pages. Durable
+    /// ownership walkers pin that exact root here; failures fence the reader.
+    pub fn next_source_with_part<E>(
+        &mut self,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+        visit: &mut impl FnMut(CatalogPackingDirectoryRecord) -> Result<(), E>,
+    ) -> Result<Option<CatalogPackedSourceRecord>, CatalogStreamError<E>> {
         if self.failed {
             return Err(CatalogError::Failed.into());
         }
-        let result = self.source_inner(fetch);
+        let result = self.source_inner(fetch, visit);
         self.failed = result.is_err();
         result
     }
@@ -485,6 +497,7 @@ impl CatalogPackingDirectoryReader {
     fn source_inner<E>(
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+        visit: &mut impl FnMut(CatalogPackingDirectoryRecord) -> Result<(), E>,
     ) -> Result<Option<CatalogPackedSourceRecord>, CatalogStreamError<E>> {
         if self.sources_done {
             return Ok(None);
@@ -507,7 +520,7 @@ impl CatalogPackingDirectoryReader {
                 }
                 self.source = None;
             }
-            match self.next_part(fetch)? {
+            match self.next_part(fetch, visit)? {
                 Some(CatalogPackingDirectoryRecord::Sources(part)) => {
                     self.source = Some(ActiveSourcePart {
                         part,
@@ -542,10 +555,19 @@ impl CatalogPackingDirectoryReader {
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
         resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, E>,
     ) -> Result<Option<CatalogPackedSectorRecord>, CatalogStreamError<E>> {
+        self.next_sector_with_part(fetch, resolve, &mut |_| Ok(()))
+    }
+
+    pub fn next_sector_with_part<E>(
+        &mut self,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+        resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, E>,
+        visit: &mut impl FnMut(CatalogPackingDirectoryRecord) -> Result<(), E>,
+    ) -> Result<Option<CatalogPackedSectorRecord>, CatalogStreamError<E>> {
         if self.failed {
             return Err(CatalogError::Failed.into());
         }
-        let result = self.sector_inner(fetch, resolve);
+        let result = self.sector_inner(fetch, resolve, visit);
         self.failed = result.is_err();
         result
     }
@@ -554,6 +576,7 @@ impl CatalogPackingDirectoryReader {
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
         resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, E>,
+        visit: &mut impl FnMut(CatalogPackingDirectoryRecord) -> Result<(), E>,
     ) -> Result<Option<CatalogPackedSectorRecord>, CatalogStreamError<E>> {
         if !self.sources_done {
             return Err(CatalogError::InvalidPage.into());
@@ -569,7 +592,7 @@ impl CatalogPackingDirectoryReader {
             let part = if let Some(part) = self.pending.take() {
                 Some(part)
             } else {
-                match self.next_part(fetch)? {
+                match self.next_part(fetch, visit)? {
                     Some(CatalogPackingDirectoryRecord::Sectors(part)) => Some(part),
                     Some(CatalogPackingDirectoryRecord::Sources(_)) => {
                         return Err(CatalogError::InvalidPage.into());

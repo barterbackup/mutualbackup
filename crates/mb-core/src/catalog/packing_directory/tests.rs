@@ -2,6 +2,61 @@ use super::*;
 use crate::{NodeId, PackedSectorDescriptor, PackingInput, pack_incremental};
 use std::collections::{BTreeMap, HashMap};
 
+#[test]
+fn packing_directory_visits_admitted_parts_before_io_and_fences_failed_ownership() {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    let fixture = fixture();
+    let visited = RefCell::new(HashSet::from([fixture.root.records.page.hash]));
+    let mut reader = CatalogPackingDirectoryReader::new(scope(), fixture.root, budget()).unwrap();
+    let mut fetch = |page: CatalogPageRef| {
+        assert!(
+            visited.borrow().contains(&page.hash),
+            "unowned nested root read"
+        );
+        Ok::<_, &'static str>(fixture.pages[&page.hash].clone())
+    };
+    let mut visit = |record: CatalogPackingDirectoryRecord| {
+        assert!(visited.borrow_mut().insert(record.records().page.hash));
+        Ok(())
+    };
+    let mut ids = HashMap::new();
+    while let Some(record) = reader
+        .next_source_with_part(&mut fetch, &mut visit)
+        .unwrap()
+    {
+        if let CatalogPackedSourceRecord::Source { id, .. } = record {
+            ids.insert(id.key(), id);
+        }
+    }
+    while reader
+        .next_sector_with_part(&mut fetch, &mut |key| Ok(ids[&key]), &mut visit)
+        .unwrap()
+        .is_some()
+    {}
+    assert!(reader.is_complete());
+    assert_eq!(
+        visited.borrow().len(),
+        1 + fixture.source_parts.len() + fixture.sector_parts.len()
+    );
+    let mut reader = CatalogPackingDirectoryReader::new(scope(), fixture.root, budget()).unwrap();
+    let mut reads = 0;
+    let mut fetch = |page: CatalogPageRef| {
+        reads += 1;
+        Ok(fixture.pages[&page.hash].clone())
+    };
+    assert!(matches!(
+        reader.next_source_with_part(&mut fetch, &mut |_| Err("pin failed")),
+        Err(CatalogStreamError::Storage("pin failed"))
+    ));
+    assert!(matches!(
+        reader.next_source(&mut fetch),
+        Err(CatalogStreamError::Catalog(CatalogError::Failed))
+    ));
+    assert_eq!(reads, 1);
+    assert!(!reader.is_complete());
+}
+
 fn scope() -> CatalogScope {
     CatalogScope::Guild { guild_id: [7; 32] }
 }

@@ -185,7 +185,7 @@ fn row<T: serde::de::DeserializeOwned + Serialize>(
     Ok(Some((value, bytes)))
 }
 
-fn resolve_source(
+pub(super) fn resolve_source(
     store: &RecordScratchStore,
     profile: mb_core::PackingProfile,
     key: [u8; 32],

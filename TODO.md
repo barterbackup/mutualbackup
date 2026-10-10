@@ -2538,6 +2538,32 @@ and native-platform gates remain open.
       binary hashes preserved. Transitive part ownership, certified authority/
       coding/checkpoint integration, full metadata/physical policy, normal
       producers/recovery and deferred real capacity/platform gates remain open.
+    - [x] Connect sharded packing to complete coding-directory coverage and
+      certified source authority under one trusted byte/page/record budget.
+      Carry the original certified base, exact source commitments/cardinality,
+      signed candidates and authority debt through the join; share original
+      current/historical coverage and bounded witness checks. Retain both
+      directories and every referenced source/descriptor/forest part with one
+      durable local owner, pinning roots before nested traversal and publishing
+      only after every local EOF. Qualify immutable interruption/reopen,
+      changed retries, staging-owner retirement, shared successors and bounded
+      cancellation/GC; ignored acquisition/publication/release writes roll back.
+      Original signed, journal and pin layouts remain unchanged; the new owner
+      uses a separate journal kind and pin prefix five. Eleven new regressions
+      pass, including signed candidates through a nonempty coding witness and
+      ownership of more roots than one local bundle can hold. Frozen
+      qualification passes 186 core, 343 ordinary Store, 35 paged Node, the
+      certified-writer migration case and provisioned Btrfs native recovery
+      (566 distinct cases). Formatting, strict locked workspace/all-targets
+      Clippy, all-target compilation and four debug builds pass. Source,
+      seven binaries and 21 embedded inputs match; native cleanup is verified.
+      Evidence is retained under
+      `/tmp/mb-m6-sharded-joins-validation-omq9ys8p`. Cache cleanup reclaims
+      8.65 GiB, leaving about 51.4 GiB in `target`, with qualified
+      binary hashes preserved. Enclosing public/private/current-checkpoint
+      activation/retirement and other metadata/payload ownership, full metadata/
+      physical policy, normal producers/recovery and deferred real capacity/
+      platform gates remain open.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

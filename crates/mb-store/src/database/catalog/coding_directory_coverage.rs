@@ -13,8 +13,8 @@ use super::coding_coverage::{
 use super::packing_validation::unwrap_stream;
 use super::*;
 
-const GROUPS: &str = "packing-coding-directory-group";
-const COVERAGE: &str = "packing-coding-directory-coverage";
+pub(super) const GROUPS: &str = "packing-coding-directory-group";
+pub(super) const COVERAGE: &str = "packing-coding-directory-coverage";
 const COMPLETE: &str = "packing-coding-directory-complete";
 pub(super) const KINDS: [&str; 3] = [GROUPS, COVERAGE, COMPLETE];
 
@@ -251,26 +251,85 @@ impl CatalogPackingCodingDirectoryIndex {
         Ok(())
     }
 
+    fn rows(&self) -> Result<DirectoryCoverageRows<'_>, CatalogStoreError> {
+        Ok(DirectoryCoverageRows {
+            store: &self.packing.store,
+            scope: self.manifest.packing.scope,
+            root: self.manifest.coding,
+            budget: self.manifest.coding_budget(self.budget)?,
+            profile: self.manifest.packing.descriptors.profile,
+            version: self.manifest.packing.descriptors.packing_version,
+            sectors: self.manifest.packing.descriptors.sectors,
+        })
+    }
+
+    pub fn coverage(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<CatalogCodingCoverage>, CatalogStoreError> {
+        self.require_complete()?;
+        self.coverage_row(id)
+    }
+    pub(super) fn coverage_row(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<CatalogCodingCoverage>, CatalogStoreError> {
+        self.rows()?.coverage_row(id)
+    }
+    pub fn next_group(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
+        self.require_complete()?;
+        self.next_group_row(after)
+    }
+    pub(super) fn next_group_row(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
+        self.rows()?.next_group_row(after)
+    }
+    pub fn read_group(
+        &self,
+        id: [u8; 32],
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<CatalogCodingEntry>, CatalogStoreError> {
+        self.read_group_with_work(id, fetch)
+            .map(|entry| entry.map(|(entry, _)| entry))
+    }
+    pub fn read_group_with_work(
+        &self,
+        id: [u8; 32],
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<(CatalogCodingEntry, CatalogCodingTraversalBudget)>, CatalogStoreError> {
+        self.require_complete()?;
+        self.rows()?.read_group_with_work(id, fetch)
+    }
+}
+
+pub(super) struct DirectoryCoverageRows<'a> {
+    pub(super) store: &'a crate::RecordScratchStore,
+    pub(super) scope: CatalogScope,
+    pub(super) root: CatalogCodingDirectoryRoot,
+    pub(super) budget: CatalogCodingTraversalBudget,
+    pub(super) profile: mb_core::PackingProfile,
+    pub(super) version: u16,
+    pub(super) sectors: u64,
+}
+
+impl DirectoryCoverageRows<'_> {
     fn validate_group(
         &self,
         group: &CatalogIndexedDirectoryCodingGroup,
     ) -> Result<(), CatalogStoreError> {
-        validate_group(
-            &group.group,
-            self.manifest.coding.guild_event_sequence,
-            group.page,
-        )
+        validate_group(&group.group, self.root.guild_event_sequence, group.page)
     }
 
     fn group(
         &self,
         id: [u8; 32],
     ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
-        let Some(bytes) = self
-            .packing
-            .store
-            .get_record_bounded(GROUPS, &id, ROW_BYTES)?
-        else {
+        let Some(bytes) = self.store.get_record_bounded(GROUPS, &id, ROW_BYTES)? else {
             return Ok(None);
         };
         let group: CatalogIndexedDirectoryCodingGroup = decode_row(&bytes)?;
@@ -281,27 +340,22 @@ impl CatalogPackingCodingDirectoryIndex {
         Ok(Some(group))
     }
 
-    pub fn coverage(
-        &self,
-        id: [u8; 32],
-    ) -> Result<Option<CatalogCodingCoverage>, CatalogStoreError> {
-        self.require_complete()?;
-        self.coverage_row(id)
-    }
-
     pub(super) fn coverage_row(
         &self,
         id: [u8; 32],
     ) -> Result<Option<CatalogCodingCoverage>, CatalogStoreError> {
-        let Some(bytes) = self
-            .packing
-            .store
-            .get_record_bounded(COVERAGE, &id, ROW_BYTES)?
-        else {
+        let Some(bytes) = self.store.get_record_bounded(COVERAGE, &id, ROW_BYTES)? else {
             return Ok(None);
         };
         let value: CatalogCodingCoverage = decode_row(&bytes)?;
-        if self.packing.sector_row(id)?.is_none()
+        if super::packing_validation::read_sector(
+            self.store,
+            self.profile,
+            self.version,
+            self.sectors,
+            id,
+        )?
+        .is_none()
             || value.group_id == [0; 32]
             || value.holder.0 == [0; 32]
             || self.group(value.group_id)?.is_none_or(|group| {
@@ -314,19 +368,11 @@ impl CatalogPackingCodingDirectoryIndex {
         Ok(Some(value))
     }
 
-    pub fn next_group(
-        &self,
-        after: Option<[u8; 32]>,
-    ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
-        self.require_complete()?;
-        self.next_group_row(after)
-    }
-
     pub(super) fn next_group_row(
         &self,
         after: Option<[u8; 32]>,
     ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
-        let Some((key, bytes)) = self.packing.store.next_record_bounded(
+        let Some((key, bytes)) = self.store.next_record_bounded(
             GROUPS,
             after.as_ref().map(|id| id.as_slice()),
             32,
@@ -343,27 +389,17 @@ impl CatalogPackingCodingDirectoryIndex {
         Ok(Some(group))
     }
 
-    pub fn read_group(
-        &self,
-        id: [u8; 32],
-        mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
-    ) -> Result<Option<CatalogCodingEntry>, CatalogStoreError> {
-        self.read_group_with_work(id, &mut fetch)
-            .map(|entry| entry.map(|(entry, _)| entry))
-    }
-
-    pub fn read_group_with_work(
+    pub(super) fn read_group_with_work(
         &self,
         id: [u8; 32],
         mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
     ) -> Result<Option<(CatalogCodingEntry, CatalogCodingTraversalBudget)>, CatalogStoreError> {
-        self.require_complete()?;
         let Some(group) = self.group(id)? else {
             return Ok(None);
         };
-        let (entry, work) = unwrap_stream(self.manifest.coding.read_group_with_work(
-            self.manifest.packing.scope,
-            self.manifest.coding_budget(self.budget)?,
+        let (entry, work) = unwrap_stream(self.root.read_group_with_work(
+            self.scope,
+            self.budget,
             group.location(),
             &mut fetch,
         ))?;
@@ -438,7 +474,7 @@ pub(super) mod tests {
             value
         }
 
-        fn rebuild(&mut self) {
+        pub(crate) fn rebuild(&mut self) {
             self.entries.sort_by_key(|entry| entry.retained.group.id);
             self.pages.clear();
             self.forests.clear();

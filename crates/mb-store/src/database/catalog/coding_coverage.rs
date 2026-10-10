@@ -133,12 +133,16 @@ pub(super) fn decode_row<T: serde::de::DeserializeOwned + Serialize>(
 }
 
 pub(super) fn ensure_empty(packing: &CatalogPackingIndex) -> Result<(), CatalogStoreError> {
+    ensure_empty_store(&packing.store)
+}
+
+pub(super) fn ensure_empty_store(store: &RecordScratchStore) -> Result<(), CatalogStoreError> {
     for kind in [GROUPS, COVERAGE, COMPLETE]
         .into_iter()
         .chain(super::coding_directory_coverage::KINDS)
+        .chain(super::packing_directories_coverage::KINDS)
     {
-        if packing
-            .store
+        if store
             .next_record_bounded(kind, None, 32, MANIFEST_BYTES)?
             .is_some()
         {
@@ -205,6 +209,26 @@ pub(super) fn cover_entry(
     coverage: &str,
     pending: &mut u64,
 ) -> Result<(), CatalogStoreError> {
+    cover_entry_with_sector(
+        &packing.store,
+        &mut |id| packing.sector(id),
+        entry,
+        authority,
+        policy,
+        coverage,
+        pending,
+    )
+}
+
+pub(super) fn cover_entry_with_sector(
+    store: &RecordScratchStore,
+    sector: &mut impl FnMut([u8; 32]) -> Result<Option<CatalogPackingSector>, CatalogStoreError>,
+    entry: &CatalogCodingEntry,
+    authority: CatalogCodingAuthorization,
+    policy: CatalogCodingCoveragePolicy,
+    coverage: &str,
+    pending: &mut u64,
+) -> Result<(), CatalogStoreError> {
     let group = &entry.retained.group;
     for (index, role) in group.roles.iter().enumerate() {
         let ShardRoleV2::Information(info) = role else {
@@ -213,7 +237,7 @@ pub(super) fn cover_entry(
         if info.sector.virtual_zero {
             continue;
         }
-        let Some(sector) = packing.sector(info.sector.id)? else {
+        let Some(sector) = sector(info.sector.id)? else {
             continue;
         };
         let plan = &entry.transcript.value.plan.value;
@@ -234,13 +258,12 @@ pub(super) fn cover_entry(
         {
             continue;
         }
-        if packing
-            .store
+        if store
             .get_record_bounded(coverage, &sector.id, ROW_BYTES)?
             .is_none()
         {
             put(
-                &packing.store,
+                store,
                 coverage,
                 &sector.id,
                 &CatalogCodingCoverage {

@@ -1561,6 +1561,27 @@ certified authority/coding/checkpoint integration, complete enclosing metadata
 and physical policy, normal producers/recovery and deferred capacity/platform
 gates remain open; see ADR 0002.
 
+Sharded packing now joins the coding directory under one trusted budget with
+source-authority debt preserved through both boundaries. The certified legacy
+source bridge retains its trusted base, exact commitments/cardinality and signed
+candidate cursor; complete coding coverage and bounded witness replay use the
+original checks in the same private scratch index. A durable combined owner
+pins both directories and every nested source/descriptor/forest root before
+traversal, publishes only after all local EOFs, resumes immutable interrupted
+jobs and releases one cancelled root closure per transaction. Shared owners
+preserve referenced parts after staging owners retire and through reopen.
+Eleven new regressions pass. Frozen qualification passes 566 distinct cases:
+186 core, 343 ordinary Store, 35 paged Node, the certified-writer migration case
+and provisioned Btrfs native recovery. Formatting, strict locked workspace/
+all-targets Clippy, all-target compilation and four debug builds pass. Source,
+seven binaries and 21 embedded inputs match; native cleanup is verified.
+Evidence is retained under `/tmp/mb-m6-sharded-joins-validation-omq9ys8p`.
+Cache cleanup reclaims 8.65 GiB with binary hashes preserved. Full public/
+private checkpoint selection, certified-current activation/retirement and
+metadata/payload custody still need the sharded proof; complete metadata/
+physical policy, normal producers/recovery and deferred capacity/platform
+gates remain open. See ADR 0002.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

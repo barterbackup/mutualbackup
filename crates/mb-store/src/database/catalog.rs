@@ -25,6 +25,8 @@ mod guild_history;
 mod native_validation;
 mod packing_authority;
 mod packing_coding_retention;
+mod packing_directories_coverage;
+mod packing_directories_retention;
 mod packing_directory_validation;
 mod packing_validation;
 mod paged_checkpoint;
@@ -71,12 +73,19 @@ pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,
 };
 pub use packing_authority::{
-    CatalogCertifiedCodingDirectoryIndex, CatalogCertifiedCodingIndex,
+    CatalogCertifiedCodingDirectoriesIndex, CatalogCertifiedCodingDirectoryIndex,
+    CatalogCertifiedCodingIndex, CatalogCertifiedPackingDirectoryIndex,
     CatalogCertifiedPackingIndex, CatalogPackingAuthority, CatalogPackingAuthorityBase,
     CatalogPackingAuthorizedSource,
 };
 pub use packing_coding_retention::{
     CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
+};
+pub use packing_directories_coverage::{
+    CatalogPackingCodingDirectoriesIndex, CatalogPackingCodingDirectoriesValidation,
+};
+pub use packing_directories_retention::{
+    CatalogPackingCodingDirectoriesRetention, CatalogPackingCodingDirectoriesRetentionState,
 };
 pub use packing_directory_validation::{
     CatalogPackingDirectoryIndex, CatalogPackingDirectoryValidation,
