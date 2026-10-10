@@ -18040,11 +18040,25 @@ pub(crate) mod tests {
             .unwrap();
         std::fs::write(source.join("nested/dense"), b"changed working bytes").unwrap();
         let operation = Uuid::new_v4();
+        node.control
+            .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
+                page_bytes: 1024 * 1024,
+                pages: 64,
+                open_reservations: 8,
+            })
+            .unwrap();
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, operation)
             .unwrap();
+        let page_usage = node.control.catalog_storage_usage().unwrap().unwrap();
+        assert_eq!(page_usage.open_reservations, 0);
+        assert_eq!(page_usage.reserved_page_bytes, 0);
         let shared_operation = Uuid::new_v4();
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, shared_operation)
             .unwrap();
+        assert_eq!(
+            node.control.catalog_storage_usage().unwrap(),
+            Some(page_usage)
+        );
         drop(node);
         let mut node = Node::open(&state, seed).unwrap();
         let target = temp.path().join("restored");

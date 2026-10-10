@@ -4209,3 +4209,66 @@ case inventory and cleanup evidence are retained in
 storage increment; normal producer activation, complete R2/R3 capacity and
 quotas, generation floors, installed-artifact/platform/topology and real retained
 1 TiB gates remain open.
+
+## Atomic retained migration page admission (2026-10-10)
+
+The store can now reserve every role of one bounded same-scope bundle under
+one immediate transaction. Requests reject duplicate IDs, mixed scopes and more
+than the existing sixteen bundle roles before mutation. A checked callback can
+write its immutable owner journal in that same transaction using ordinary
+record reads/CAS/writes, without nested transactions or external I/O. Quota,
+late role, callback or ignored-write failures roll back every earlier reservation
+and journal write. Each original per-intent capacity remains immutable on replay.
+Quota status reads both the enabled marker and ledger in one read snapshot.
+
+The explicit retained legacy migration now uses this admission path whenever
+the store has encoded-page quotas enabled. Its existing authenticated native/Git
+dry run counts emitted encoded bytes/pages in six fixed role counters. Complete
+original source/schema/Git byte validation and typed-root validation precede
+admission. Source credits conservatively cover the framed record maximum for
+every legacy data source, emitted private page and bootstrap sector, with full
+leaf/index geometry and the encoded page maximum. This can reserve more than
+the eventual deduplicated storage; publication returns the unused credits.
+Absent Git roles acquire no reservation.
+
+Migration binds all three or six roles and its exact original journal in the
+same writer transaction before external page staging. Unconfigured stores also
+delay journal creation until that authenticated preflight has passed. Completed
+replay keeps its existing read-only source behavior and original identities.
+After admission, interrupted writes remain owned and resumable; cleanup rebuilds
+the disposable source ordering queue only after successful admission.
+
+`fence_catalog` can persist exact cancellation for a role that was never reached
+or for an unreserved Building intent predating quota adoption. It acquires no
+new credits, preserves bundled/source-owner cancellation guards and releases
+existing unused credits through the same ordinary state transaction. Migration
+cancellation applies it to every deterministic role, including absent Git roles;
+cleanup and actual final-owner GC retain their existing bounded steps. Cancelled
+IDs and closed reservation records keep their generation-floor tombstones.
+
+This connects encoded-page admission to existing retained migration. The full
+dataset/history/guild policy, SQL/WAL and payload headroom, traversal work,
+normal paged capture/packing/checkpoint/retention/seed consumers and real dense
+retained 1 TiB qualification remain required. Original signed/page/intent/bundle
+layouts and flat production heads remain unchanged.
+
+Qualification passes all 175 core and 303 ordinary store cases, 34 ordinary
+paged Node cases, the ordinary certified-writer migration entry point and the
+quota-enabled native retained capture/recovery fixture (514 distinct cases).
+The provisioned native case passes in 28.31 seconds on disposable Btrfs and
+verifies shared migration storage before source loss and retained repair.
+The new fixtures cover late-role and owner-journal rollback, cancellation of
+unreached/pre-quota intents, real framed source-tree boundaries, and admission,
+interruption, reopen and cancellation through authenticated legacy migration.
+Existing migration fixtures for formats 1/3/4/5 now exercise configured quota
+publication, shared pages and final-owner GC. The ordinary suites exclude 26
+store cases and one selected native case; that native case is run separately.
+Formatting, strict locked workspace/all-targets Clippy, all-target test
+compilation and four debug program builds pass. Frozen Rust/Cargo source and
+seven program/test-driver hashes remain unchanged; mount/image/loop cleanup is
+verified. Logs, both drivers, manifests and the complete passing-case inventory
+are retained in `/tmp/mb-m6-page-admission-validation-lqep397s`. This is a focused
+debug-source qualification, not complete ordinary/native or installed-artifact
+qualification. The user deferred real dense 1 TiB and native Windows/macOS
+qualification on 2026-10-10 until implementation/other items are ready and
+external resources are available; those acceptance gates remain open.

@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, ensure};
 use mb_core::{
-    CatalogPageRef, KeyMaterial, MerkleCommitment, PAGED_USER_REVISION_VERSION, SectorId,
-    SectorRef, SignedRecord, UserRevision, V1_SECTOR_SIZE, crypt_sector, merkle_commit,
+    CatalogError, CatalogPageRef, KeyMaterial, MerkleCommitment, PAGED_USER_REVISION_VERSION,
+    SectorId, SectorRef, SignedRecord, UserRevision, V1_SECTOR_SIZE, crypt_sector, merkle_commit,
     sector_root,
 };
 use mb_git::GitCatalogStream;
+use mb_store::CatalogPageReservation;
 
 use crate::{NativeCatalogStream, PagedPrivateMetadata, PrivateEntry};
 
@@ -49,6 +50,43 @@ fn ciphertext(
     Ok(bytes)
 }
 
+fn source_page_reservation(sources: u64) -> Result<CatalogPageReservation> {
+    ensure!(
+        sources <= mb_core::CATALOG_MAX_RECORDS,
+        "too many migration sources"
+    );
+    let bytes = sources
+        .checked_mul(4 + mb_core::CATALOG_SECTOR_RECORD_BYTES as u64)
+        .and_then(|bytes| bytes.checked_add(8))
+        .ok_or(CatalogError::Bounds)?;
+    ensure!(
+        bytes <= mb_core::CATALOG_MAX_STREAM_BYTES,
+        "migration source stream exceeds its bound"
+    );
+    let mut nodes = bytes.div_ceil(mb_core::CATALOG_LEAF_BYTES as u64).max(1);
+    let mut pages = nodes;
+    let mut height = 0;
+    while nodes > 1 {
+        nodes = nodes.div_ceil(mb_core::CATALOG_FANOUT as u64);
+        pages = pages.checked_add(nodes).ok_or(CatalogError::Bounds)?;
+        height += 1;
+        ensure!(
+            height <= mb_core::CATALOG_MAX_HEIGHT,
+            "migration source tree is too tall"
+        );
+    }
+    ensure!(
+        pages <= mb_core::CATALOG_MAX_PAGE_OCCURRENCES,
+        "migration source tree has too many pages"
+    );
+    Ok(CatalogPageReservation {
+        page_bytes: pages
+            .checked_mul(mb_core::CATALOG_PAGE_BYTES as u64)
+            .ok_or(CatalogError::Bounds)?,
+        pages,
+    })
+}
+
 impl PagedPrivateMetadata {
     /// Convert every supported legacy private role without replacing heads,
     /// signatures or data addresses. No sink writes occur until source and
@@ -59,6 +97,29 @@ impl PagedPrivateMetadata {
         guild_id: [u8; 32],
         revision: &SignedRecord<UserRevision>,
         load: &mut impl FnMut(&SectorId) -> Result<Vec<u8>>,
+        sink: &mut impl FnMut(PagedPrivateStream, CatalogPageRef, Vec<u8>) -> Result<()>,
+    ) -> Result<Self> {
+        Self::convert_legacy_revision_with_admission(
+            keys,
+            guild_id,
+            revision,
+            load,
+            &mut |_, _| Ok(()),
+            sink,
+        )
+    }
+
+    /// Count exact native/Git encoded pages during the existing authenticated
+    /// dry run. The source role reserves a conservative framed-record/tree
+    /// upper bound covering every data/private-page/bootstrap source. Admission
+    /// runs before external staging, with six fixed counters in migration role
+    /// order. Absent Git roles remain zero and require no reservation.
+    pub(crate) fn convert_legacy_revision_with_admission(
+        keys: &KeyMaterial,
+        guild_id: [u8; 32],
+        revision: &SignedRecord<UserRevision>,
+        load: &mut impl FnMut(&SectorId) -> Result<Vec<u8>>,
+        admit: &mut impl FnMut(&Self, [CatalogPageReservation; 6]) -> Result<()>,
         sink: &mut impl FnMut(PagedPrivateStream, CatalogPageRef, Vec<u8>) -> Result<()>,
     ) -> Result<Self> {
         let (scope, length) = crate::paged_data::legacy_revision_scope(keys, guild_id, revision)?;
@@ -165,20 +226,43 @@ impl PagedPrivateMetadata {
         }
         // Dry-run both typed adapters before any external page staging, so a
         // malformed later role cannot leave an apparently complete first role.
-        let preview_native =
-            native.write_paged_native_entries(scope, &mut |_, _, _| Ok::<_, anyhow::Error>(()))?;
+        let mut reservations = [CatalogPageReservation::default(); 6];
+        let mut count = |index: usize, bytes: Vec<u8>| -> Result<()> {
+            let capacity = &mut reservations[index];
+            capacity.pages = capacity.pages.checked_add(1).ok_or(CatalogError::Bounds)?;
+            capacity.page_bytes = capacity
+                .page_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or(CatalogError::Bounds)?;
+            Ok(())
+        };
+        let preview_native = native
+            .write_paged_native_entries(scope, &mut |stream, _, bytes| {
+                count(stream.index(), bytes)
+            })?;
         let preview_git = git
             .as_ref()
             .map(|git| {
-                git.write_paged_catalog_streams(scope, &mut |_, _, _| Ok::<_, anyhow::Error>(()))
+                git.write_paged_catalog_streams(scope, &mut |stream, _, bytes| {
+                    count(stream.index() + 3, bytes)
+                })
             })
             .transpose()?;
-        Self {
+        let preview = Self {
             format_version: PAGED_USER_REVISION_VERSION,
             native: preview_native,
             git: preview_git,
-        }
-        .validate()?;
+        };
+        preview.validate()?;
+        let sources = reservations
+            .iter()
+            .try_fold(data.len() as u64 + 1, |total, capacity| {
+                total
+                    .checked_add(capacity.pages)
+                    .ok_or(CatalogError::Bounds)
+            })?;
+        reservations[2] = source_page_reservation(sources)?;
+        admit(&preview, reservations)?;
         let native = native.write_paged_native_entries(scope, &mut |stream, page, bytes| {
             sink(PagedPrivateStream::Native(stream), page, bytes)
         })?;
@@ -598,6 +682,182 @@ mod tests {
     }
 
     #[test]
+    fn paged_source_reservation_covers_real_framed_tree_boundaries() {
+        let commitment = merkle_commit(&vec![7; V1_SECTOR_SIZE]).unwrap();
+        for sources in [0, 1, 465, 466, 100_000] {
+            let reservation = source_page_reservation(sources).unwrap();
+            let mut builder = CatalogSectorBuilder::new(scope()).unwrap();
+            let mut stored = CatalogPageReservation::default();
+            let mut sink = |_: CatalogPageRef, bytes: Vec<u8>| -> Result<()> {
+                stored.pages += 1;
+                stored.page_bytes += bytes.len() as u64;
+                Ok(())
+            };
+            for number in 0..sources {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&number.to_be_bytes());
+                builder
+                    .push(
+                        &CatalogSectorRecord {
+                            format_version: 1,
+                            sector: SectorRef {
+                                id,
+                                root: [8; 32],
+                                logical_len: V1_SECTOR_SIZE as u32,
+                            },
+                            commitment: commitment.clone(),
+                        },
+                        &mut sink,
+                    )
+                    .unwrap();
+            }
+            let root = builder.finish(&mut sink).unwrap();
+            assert_eq!(root.records.page.page_occurrences, stored.pages);
+            if sources == 100_000 {
+                assert_eq!(root.records.page.height, 2);
+            }
+            assert!(stored.pages <= reservation.pages);
+            assert!(stored.page_bytes <= reservation.page_bytes);
+        }
+        assert!(source_page_reservation(mb_core::CATALOG_MAX_RECORDS + 1).is_err());
+        assert!(source_page_reservation(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn paged_migration_admission_is_atomic_before_staging_and_cancellation_returns_all_credits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let (legacy, sources, _) = fixture(5, 3, PAYLOAD);
+        let original = canonical_bytes(&legacy).unwrap();
+        store
+            .put_record(
+                "user-revision",
+                legacy.value.revision_id.as_bytes(),
+                &original,
+            )
+            .unwrap();
+        let anchor = retained_migration_source(
+            &store,
+            &temp.path().join("protected"),
+            &legacy.value.data_sectors[0],
+        );
+        let writer = SigningKey::from_bytes(&[72; 32]);
+        let fence = mb_core::WriterFence {
+            owner: keys().node_id(),
+            epoch: 1,
+            public_key: writer.verifying_key().to_bytes(),
+        };
+        let id = Uuid::new_v4();
+        let migration =
+            crate::RetainedLegacyMigration::new(&keys(), [73; 32], &legacy, fence.clone(), id)
+                .unwrap();
+        let quota = mb_store::CatalogStorageQuota {
+            page_bytes: 1024 * 1024,
+            pages: 64,
+            open_reservations: 5,
+        };
+        let initial = store.configure_catalog_storage_quota(quota).unwrap();
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        assert!(
+            crate::RetainedLegacyMigration::load(&store, &keys(), id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.records("catalog-intent-v1").unwrap().is_empty());
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        let initial = store
+            .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
+                open_reservations: 6,
+                ..quota
+            })
+            .unwrap();
+        store.database_shell_statement("CREATE TEMP TRIGGER ignore_quota_journal BEFORE INSERT ON protocol_records WHEN NEW.kind = 'paged-legacy-migration-v1' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        assert!(
+            crate::RetainedLegacyMigration::load(&store, &keys(), id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.records("catalog-intent-v1").unwrap().is_empty());
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        store
+            .database_shell_statement("DROP TRIGGER ignore_quota_journal", false)
+            .unwrap();
+        store.database_shell_statement("CREATE TEMP TRIGGER ignore_quota_page BEFORE INSERT ON protocol_records WHEN NEW.kind = 'catalog-page-v1' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        let admitted = store.catalog_storage_usage().unwrap().unwrap();
+        assert_eq!(admitted.open_reservations, 6);
+        assert!(admitted.reserved_page_bytes > 0);
+        assert_eq!(admitted.stored_pages, 0);
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let pending = crate::RetainedLegacyMigration::load(&store, &keys(), id)
+            .unwrap()
+            .unwrap();
+        pending.cancel(&store).unwrap();
+        while pending.cleanup_step(&store).unwrap() {}
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        assert!(
+            !store
+                .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
+                .unwrap()
+        );
+        assert!(
+            pending
+                .retain(&store, &keys(), &legacy, &writer, &mut |_| anyhow::bail!(
+                    "cancelled migration loaded source"
+                ))
+                .is_err()
+        );
+        let next =
+            crate::RetainedLegacyMigration::new(&keys(), [73; 32], &legacy, fence, Uuid::new_v4())
+                .unwrap();
+        next.retain(&store, &keys(), &legacy, &writer, &mut |id| {
+            Ok(sources[id].clone())
+        })
+        .unwrap();
+        assert_eq!(
+            store
+                .catalog_storage_usage()
+                .unwrap()
+                .unwrap()
+                .open_reservations,
+            0
+        );
+        next.cancel(&store).unwrap();
+        while next.cleanup_step(&store).unwrap() {}
+        while store.collect_catalog_page().unwrap() {}
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        assert_eq!(
+            store
+                .get_record("user-revision", legacy.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert!(anchor.locator.open().is_ok());
+    }
+
+    #[test]
     fn paged_retained_legacy_migration_publishes_all_roles_and_preserves_shared_sources_after_reopen()
      {
         for version in [1, 3, 4, 5] {
@@ -605,6 +865,13 @@ mod tests {
             let path = temp.path().join("control.db");
             let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
             let (legacy, sources, _) = fixture(version, if version == 4 { 1 } else { 3 }, PAYLOAD);
+            let empty_usage = store
+                .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
+                    page_bytes: 1024 * 1024,
+                    pages: 64,
+                    open_reservations: 8,
+                })
+                .unwrap();
             let original = canonical_bytes(&legacy).unwrap();
             store
                 .put_record(
@@ -636,6 +903,11 @@ mod tests {
                     Ok(sources[id].clone())
                 })
                 .unwrap();
+            let published_usage = store.catalog_storage_usage().unwrap().unwrap();
+            assert_eq!(published_usage.open_reservations, 0);
+            assert_eq!(published_usage.reserved_page_bytes, 0);
+            assert_eq!(published_usage.reserved_pages, 0);
+            assert!(published_usage.stored_pages >= if version >= 4 { 6 } else { 3 });
             assert_eq!(migrated.value.parent, Some(legacy.value.hash().unwrap()));
             assert_eq!(migrated.value.sequence, legacy.value.sequence + 1);
             assert!(
@@ -667,6 +939,10 @@ mod tests {
                     Ok(sources[id].clone())
                 })
                 .unwrap();
+            assert_eq!(
+                store.catalog_storage_usage().unwrap(),
+                Some(published_usage)
+            );
             drop(store);
             let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
             let migration = crate::RetainedLegacyMigration::load(&store, &keys(), id)
@@ -696,6 +972,11 @@ mod tests {
             );
             migration.cancel(&store).unwrap();
             while migration.cleanup_step(&store).unwrap() {}
+            while store.collect_catalog_page().unwrap() {}
+            assert_eq!(
+                store.catalog_storage_usage().unwrap(),
+                Some(published_usage)
+            );
             assert!(
                 store
                     .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
@@ -728,6 +1009,7 @@ mod tests {
                     .unwrap()
             );
             while store.collect_catalog_page().unwrap() {}
+            assert_eq!(store.catalog_storage_usage().unwrap(), Some(empty_usage));
             assert_eq!(
                 store
                     .get_record("user-revision", legacy.value.revision_id.as_bytes())

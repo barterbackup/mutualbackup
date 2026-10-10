@@ -1723,6 +1723,9 @@ and native-platform gates remain open.
   production catalog design.** The first-release acceptance target is **1 TiB
   per protected dataset, including retained history**, selected by the user on
   2026-10-06. This is a required target, not current supported capacity.
+  On 2026-10-10 the user deferred the real dense 1 TiB qualification until
+  implementation and other items are ready and an external server is available.
+  Continue implementation and local checks; this acceptance gate remains open.
   `crates/mb-node/src/snapshot.rs` permits 39,488
   data-sector references at 64 KiB each: about 2.41 GiB of represented sector
   data, with sparse extents, shared inodes, and per-file rounding affecting
@@ -2481,6 +2484,27 @@ and native-platform gates remain open.
       payload, traversal, dataset/history and guild quotas remain enclosing
       policy work. Normal producers and verified generation-floor retirement
       remain open.
+    - [x] Admit the native, optional Git and source roles of retained legacy
+      migration together before journal or page staging changes. The existing
+      authenticated dry run counts exact private encoded pages; bounded source
+      framing/tree geometry supplies conservative source credits. The same
+      writer transaction reserves all roles and verifies the immutable migration
+      journal, rolling back every valid prefix on quota or journal failure.
+      Cancellation fences absent and pre-quota roles without acquiring credits;
+      shared pages remain charged until actual GC. Qualification: 175 core,
+      303 ordinary store, 34 paged Node and the ordinary certified-writer
+      migration entry point pass, plus quota-enabled native retained capture/
+      recovery on disposable Btrfs (514 distinct cases). Four new fixtures
+      cover partial-prefix/journal rollback, pre-quota cancellation, source-tree
+      bounds and failure/interruption/cancellation through real migration.
+      Existing version 1/3/4/5 migration fixtures now verify configured quotas,
+      shared storage and final-owner GC. Formatting, strict locked workspace/
+      all-targets Clippy, all-target test compilation and four debug program
+      builds pass; frozen source/seven-binary hashes and native mount/image/loop
+      cleanup are verified. Evidence is in
+      `/tmp/mb-m6-page-admission-validation-lqep397s`.
+      Complete enclosing admission, logical retained data and payload headroom,
+      normal producers, generation floors and retained 1 TiB gates remain open.
   - [x] Join full/compact packing descriptors and source streams through a
     disposable encrypted index. Require a source-authority callback; reject
     duplicate/missing mappings, incomplete coverage, false virtual zeros and
@@ -3292,6 +3316,10 @@ and native-platform gates remain open.
   legacy/export policy. Retain the normal catalog reopen/mismatch regressions.
   Any narrower first release must explicitly defer additional platforms in its
   support matrix, not silently mark their gates completed.
+  On 2026-10-10 the user deferred native Windows/macOS qualification until the
+  tool and other items are ready and additional test resources are available.
+  Backend implementation and local checks continue; the native gates remain
+  open and the supported-platform requirements have not been narrowed.
 
 - [ ] **R5 / P1 — Resolve the existing M6 topology/signature liveness gate.**
   The original provisioned backup stall after relay-only storage recovery remains

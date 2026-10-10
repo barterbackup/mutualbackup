@@ -177,18 +177,20 @@ impl RetainedLegacyMigration {
             "retained migration identity or writer changed"
         );
         let journal = canonical_bytes_bounded(&self.0, JOURNAL_BYTES)?;
-        if control
-            .get_record_bounded(JOURNAL, self.0.id.as_bytes(), JOURNAL_BYTES)?
-            .is_none()
+        if let Some(existing) =
+            control.get_record_bounded(JOURNAL, self.0.id.as_bytes(), JOURNAL_BYTES)?
         {
+            ensure!(
+                existing == journal,
+                "retained migration changed or was cancelled"
+            );
+        } else {
             ensure!(
                 control.catalog_bundle(self.0.id)?.is_none()
                     && control.native_file_catalog_validation(self.0.id)?.is_none(),
                 "migration ID is already owned by another catalog"
             );
         }
-        control.put_record_if_absent(JOURNAL, self.0.id.as_bytes(), &journal)?;
-        self.require_active(control)?;
         if let Some(snapshot) =
             PagedPrivateMetadata::load_local_catalog(control, keys, self.0.id, self.0.scope)?
         {
@@ -198,19 +200,46 @@ impl RetainedLegacyMigration {
                 "retained migration publication is cancelled"
             );
             self.check_publication(&revision.value)?;
+            self.require_active(control)?;
             self.drain_sources(control)?;
             return Ok(revision);
         }
         let authority = PagedLegacyDataAuthority::new(keys, guild_id, legacy)?;
-        // Retries rebuild this disposable ordering index from authenticated
-        // inputs. Durable page ownership survives; stale queue tails do not.
-        self.drain_sources(control)?;
         let roles = self.roles();
-        let private = PagedPrivateMetadata::convert_legacy_revision(
+        let private = PagedPrivateMetadata::convert_legacy_revision_with_admission(
             keys,
             guild_id,
             legacy,
             load,
+            &mut |preview, capacities| {
+                let write_journal = || -> Result<()> {
+                    control.put_record_if_absent(JOURNAL, self.0.id.as_bytes(), &journal)?;
+                    self.require_active(control)
+                };
+                if control.catalog_storage_usage()?.is_some() {
+                    let count = if preview.git.is_some() { 6 } else { 3 };
+                    let requests = roles[..count]
+                        .iter()
+                        .copied()
+                        .zip(capacities[..count].iter().copied())
+                        .collect::<Vec<_>>();
+                    control.with_catalog_page_reservations(&requests, |states| {
+                        ensure!(
+                            states
+                                .iter()
+                                .all(|state| *state == CatalogIntentState::Building),
+                            "migration stream already published"
+                        );
+                        write_journal()
+                    })?;
+                } else {
+                    control.with_record_transaction(write_journal)?;
+                }
+                // Rebuild the disposable ordering index only after complete
+                // authenticated preflight and durable admission. Existing page
+                // ownership survives; stale queue tails do not.
+                self.drain_sources(control)
+            },
             &mut |stream, page, bytes| {
                 self.require_active(control)?;
                 let index = stream.index();
@@ -352,13 +381,7 @@ impl RetainedLegacyMigration {
         }
         for intent in self.roles() {
             // Cancellation also fences roles not reached before interruption.
-            match control.begin_catalog(intent) {
-                Ok(_) => control.cancel_catalog(intent)?,
-                Err(_)
-                    if control.catalog_intent_state(intent).ok()
-                        == Some(CatalogIntentState::Cancelled) => {}
-                Err(error) => return Err(error.into()),
-            }
+            control.fence_catalog(intent)?;
         }
         self.drain_sources(control)
     }

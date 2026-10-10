@@ -173,7 +173,10 @@ pub(super) fn require_reservation(
     match (ledger(connection)?, record, state) {
         (None, None, _) => Ok(()),
         (Some(ledger), Some(record), CatalogIntentState::Building)
-            if !record.closed && ledger.usage.open_reservations != 0 =>
+            if !record.closed
+                && ledger.usage.open_reservations != 0
+                && record.remaining.page_bytes <= ledger.usage.reserved_page_bytes
+                && record.remaining.pages <= ledger.usage.reserved_pages =>
         {
             Ok(())
         }
@@ -291,6 +294,62 @@ pub(super) fn collect(connection: &Connection, page_bytes: u64) -> Result<(), Ca
     write_ledger(connection, record)
 }
 
+fn reserve_intent(
+    connection: &Connection,
+    intent: CatalogIntent,
+    capacity: CatalogPageReservation,
+) -> Result<CatalogIntentState, CatalogStoreError> {
+    capacity.validate()?;
+    let state = begin_intent(connection, intent)?;
+    let mut ledger = ledger(connection)?.ok_or(DatabaseError::NotReady)?;
+    if let Some(existing) = reservation(connection, intent)? {
+        if existing.original != capacity
+            || existing.closed == (state == CatalogIntentState::Building)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+    } else {
+        if state != CatalogIntentState::Building {
+            return Err(DatabaseError::Conflict.into());
+        }
+        ledger.usage.reserved_page_bytes = ledger
+            .usage
+            .reserved_page_bytes
+            .checked_add(capacity.page_bytes)
+            .ok_or(DatabaseError::CapacityExceeded)?;
+        ledger.usage.reserved_pages = ledger
+            .usage
+            .reserved_pages
+            .checked_add(capacity.pages)
+            .ok_or(DatabaseError::CapacityExceeded)?;
+        ledger.usage.open_reservations = ledger
+            .usage
+            .open_reservations
+            .checked_add(1)
+            .ok_or(DatabaseError::CapacityExceeded)?;
+        ledger.usage.validate()?;
+        let record = Reservation {
+            version: 1,
+            intent,
+            original: capacity,
+            remaining: capacity,
+            closed: false,
+        };
+        insert_exact(
+            connection,
+            RESERVATION,
+            intent.id.as_bytes(),
+            &canonical_bytes(&record)?,
+        )?;
+        if reservation(connection, intent)? != Some(record) {
+            return Err(DatabaseError::Integrity.into());
+        }
+        write_ledger(connection, ledger)?;
+    }
+    require_reservation(connection, intent, state)?;
+    Ok(state)
+}
+
 impl ControlStore {
     /// Enable or resize encoded-page quotas. Initial adoption counts existing
     /// physical page rows without loading their blobs. It supplies no source,
@@ -352,7 +411,10 @@ impl ControlStore {
     }
 
     pub fn catalog_storage_usage(&self) -> Result<Option<CatalogStorageUsage>, CatalogStoreError> {
-        Ok(ledger(&self.connection)?.map(|record| record.usage))
+        let snapshot = self.read_snapshot()?;
+        let usage = ledger(&snapshot)?.map(|record| record.usage);
+        snapshot.commit()?;
+        Ok(usage)
     }
 
     /// Reserve before an intent can stage pages. Concurrent writers share one
@@ -363,57 +425,56 @@ impl ControlStore {
         intent: CatalogIntent,
         capacity: CatalogPageReservation,
     ) -> Result<CatalogIntentState, CatalogStoreError> {
-        capacity.validate()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let state = begin_intent(&transaction, intent)?;
-        let mut ledger = ledger(&transaction)?.ok_or(DatabaseError::NotReady)?;
-        if let Some(existing) = reservation(&transaction, intent)? {
-            if existing.original != capacity
-                || existing.closed == (state == CatalogIntentState::Building)
-            {
-                return Err(DatabaseError::Conflict.into());
-            }
-        } else {
-            if state != CatalogIntentState::Building {
-                return Err(DatabaseError::Conflict.into());
-            }
-            ledger.usage.reserved_page_bytes = ledger
-                .usage
-                .reserved_page_bytes
-                .checked_add(capacity.page_bytes)
-                .ok_or(DatabaseError::CapacityExceeded)?;
-            ledger.usage.reserved_pages = ledger
-                .usage
-                .reserved_pages
-                .checked_add(capacity.pages)
-                .ok_or(DatabaseError::CapacityExceeded)?;
-            ledger.usage.open_reservations = ledger
-                .usage
-                .open_reservations
-                .checked_add(1)
-                .ok_or(DatabaseError::CapacityExceeded)?;
-            ledger.usage.validate()?;
-            let record = Reservation {
-                version: 1,
-                intent,
-                original: capacity,
-                remaining: capacity,
-                closed: false,
-            };
-            insert_exact(
-                &transaction,
-                RESERVATION,
-                intent.id.as_bytes(),
-                &canonical_bytes(&record)?,
-            )?;
-            if reservation(&transaction, intent)? != Some(record) {
-                return Err(DatabaseError::Integrity.into());
-            }
-            write_ledger(&transaction, ledger)?;
-        }
+        let state = reserve_intent(&transaction, intent, capacity)?;
         transaction.commit()?;
         Ok(state)
+    }
+
+    /// Reserve all roles of one bounded local bundle atomically. Replay binds
+    /// each original intent/capacity; the caller separately binds the complete
+    /// role manifest to its capture/migration identity.
+    pub fn begin_catalog_with_page_reservations(
+        &self,
+        requests: &[(CatalogIntent, CatalogPageReservation)],
+    ) -> Result<Vec<CatalogIntentState>, CatalogStoreError> {
+        self.with_catalog_page_reservations(requests, |states| Ok(states.to_vec()))
+    }
+
+    /// Reserve a bounded set of same-scope roles and persist its caller-checked
+    /// owner journal in one immediate transaction. The callback may use record
+    /// reads/CAS/writes on this store; it must verify write outcomes and avoid
+    /// nested transactions or external I/O. Any error rolls back every role,
+    /// credit and callback write, including failures after a valid prefix.
+    pub fn with_catalog_page_reservations<T, E: From<CatalogStoreError>>(
+        &self,
+        requests: &[(CatalogIntent, CatalogPageReservation)],
+        operation: impl FnOnce(&[CatalogIntentState]) -> Result<T, E>,
+    ) -> Result<T, E> {
+        if requests.is_empty() || requests.len() > CATALOG_BUNDLE_ROOTS {
+            return Err(CatalogStoreError::from(DatabaseError::CapacityExceeded).into());
+        }
+        for (index, (intent, capacity)) in requests.iter().enumerate() {
+            capacity.validate()?;
+            if intent.scope != requests[0].0.scope
+                || requests[..index]
+                    .iter()
+                    .any(|(previous, _)| previous.id == intent.id)
+            {
+                return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+            }
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(CatalogStoreError::from)?;
+        let mut states = Vec::with_capacity(requests.len());
+        for &(intent, capacity) in requests {
+            states.push(reserve_intent(&transaction, intent, capacity)?);
+        }
+        let result = operation(&states)?;
+        transaction.commit().map_err(CatalogStoreError::from)?;
+        Ok(result)
     }
 }
 
@@ -565,6 +626,157 @@ mod tests {
         assert_eq!(usage.reserved_page_bytes, capacity.page_bytes);
         assert_eq!(usage.reserved_pages, capacity.pages);
         assert_eq!(usage.open_reservations, 1);
+    }
+
+    #[test]
+    fn bundle_admission_and_owner_journal_roll_back_every_partial_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[71; 32]).unwrap();
+        let capacity = CatalogPageReservation {
+            page_bytes: 1024,
+            pages: 1,
+        };
+        let requests = [(intent(1), capacity), (intent(2), capacity)];
+        let quota = CatalogStorageQuota {
+            page_bytes: 2047,
+            pages: 2,
+            open_reservations: 2,
+        };
+        let initial = store.configure_catalog_storage_quota(quota).unwrap();
+        assert!(
+            store
+                .begin_catalog_with_page_reservations(&requests)
+                .is_err()
+        );
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        assert!(store.records(INTENT).unwrap().is_empty());
+        assert!(store.records(RESERVATION).unwrap().is_empty());
+        let initial = store
+            .configure_catalog_storage_quota(CatalogStorageQuota {
+                page_bytes: 2048,
+                ..quota
+            })
+            .unwrap();
+        store.connection.execute_batch(&format!(
+            "CREATE TRIGGER batch_fault BEFORE INSERT ON protocol_records WHEN NEW.kind = '{RESERVATION}' AND NEW.record_id = X'{}' BEGIN SELECT RAISE(IGNORE); END",
+            hex::encode(intent(2).id.as_bytes())
+        )).unwrap();
+        assert!(
+            store
+                .begin_catalog_with_page_reservations(&requests)
+                .is_err()
+        );
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        assert!(store.records(INTENT).unwrap().is_empty());
+        assert!(store.records(RESERVATION).unwrap().is_empty());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER batch_fault")
+            .unwrap();
+        let rejected: Result<(), CatalogStoreError> =
+            store.with_catalog_page_reservations(&requests, |_| {
+                store.put_record("test-owner", b"job", b"journal")?;
+                Err(DatabaseError::Conflict.into())
+            });
+        assert!(rejected.is_err());
+        assert!(store.get_record("test-owner", b"job").unwrap().is_none());
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        assert!(store.records(INTENT).unwrap().is_empty());
+        assert!(store.records(RESERVATION).unwrap().is_empty());
+        let admitted: Result<(), CatalogStoreError> =
+            store.with_catalog_page_reservations(&requests, |states| {
+                assert_eq!(states, [CatalogIntentState::Building; 2]);
+                assert!(store.put_record_if_absent("test-owner", b"job", b"journal")?);
+                Ok(())
+            });
+        admitted.unwrap();
+        let reserved = store.catalog_storage_usage().unwrap();
+        assert_eq!(
+            store
+                .begin_catalog_with_page_reservations(&requests)
+                .unwrap(),
+            [CatalogIntentState::Building; 2]
+        );
+        assert_eq!(store.catalog_storage_usage().unwrap(), reserved);
+        for invalid in [
+            Vec::new(),
+            vec![requests[0]; 2],
+            vec![requests[0]; CATALOG_BUNDLE_ROOTS + 1],
+        ] {
+            assert!(
+                store
+                    .begin_catalog_with_page_reservations(&invalid)
+                    .is_err()
+            );
+        }
+        let mut different = intent(3);
+        different.scope = CatalogScope::Guild { guild_id: [72; 32] };
+        assert!(
+            store
+                .begin_catalog_with_page_reservations(&[requests[0], (different, capacity)])
+                .is_err()
+        );
+        assert_eq!(store.catalog_storage_usage().unwrap(), reserved);
+        for (intent, _) in requests {
+            store.fence_catalog(intent).unwrap();
+        }
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+    }
+
+    #[test]
+    fn cancellation_fences_unreached_and_prequota_intents_without_acquiring_credits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[72; 32]).unwrap();
+        let (root, pages) = pages(b"existing unreserved pending page");
+        store.begin_catalog(intent(1)).unwrap();
+        store
+            .stage_catalog_page(intent(1), root, &pages[0].1)
+            .unwrap();
+        let initial = store
+            .configure_catalog_storage_quota(CatalogStorageQuota {
+                page_bytes: pages[0].1.len() as u64,
+                pages: 1,
+                open_reservations: 1,
+            })
+            .unwrap();
+        for id in [1, 2] {
+            store.fence_catalog(intent(id)).unwrap();
+            store.fence_catalog(intent(id)).unwrap();
+            assert_eq!(
+                store.catalog_intent_state(intent(id)).unwrap(),
+                CatalogIntentState::Cancelled
+            );
+            assert!(store.begin_catalog(intent(id)).is_err());
+            assert!(
+                store
+                    .begin_catalog_with_page_reservation(
+                        intent(id),
+                        CatalogPageReservation::default()
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[72; 32]).unwrap();
+        assert_eq!(
+            store.catalog_intent_state(intent(2)).unwrap(),
+            CatalogIntentState::Cancelled
+        );
+        assert_eq!(
+            store
+                .catalog_page(intent(1).scope, intent(1).section, root)
+                .unwrap(),
+            pages[0].1
+        );
+        while store.release_catalog_pin(intent(1)).unwrap() {}
+        assert!(store.collect_catalog_page().unwrap());
+        assert_eq!(
+            store.catalog_storage_usage().unwrap().unwrap().stored_pages,
+            0
+        );
+        assert!(store.records(RESERVATION).unwrap().is_empty());
     }
 
     #[test]

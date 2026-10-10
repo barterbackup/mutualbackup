@@ -1364,6 +1364,12 @@ before Milestone 7 compatibility freeze. Native Windows/macOS work remains in
 the roadmap; a narrower production platform scope requires an explicit product
 decision rather than treating missing platform support as complete.
 
+On 2026-10-10 the user deferred the real dense 1 TiB recovery run and native
+Windows/macOS qualification until the tool and other items are ready and
+external test resources are available. Continue implementation and local
+qualification. Keep those acceptance gates open; the required retained capacity
+and supported-platform scope have not changed.
+
 The page store now has an explicit encoded-page quota and immutable per-intent
 reservations shared across writer connections. Page staging, root/bundle
 publication, cancellation and actual GC update the ledger in their existing
@@ -1376,6 +1382,21 @@ regression retains its existing unconfigured behavior. The enclosing policy
 still needs SQL/WAL and payload headroom,
 traversal work, dataset/history and guild quotas before normal paged producers
 can be admitted; generation-floor retirement also remains open.
+
+Retained legacy migration now connects to configured page quotas. Its
+authenticated dry run counts native and optional Git pages and bounds source
+tree geometry before atomically reserving all three or six roles and writing
+the immutable migration journal. Late-role or journal failures roll back every
+prefix; interrupted admitted jobs remain resumable, and cancellation fences
+unreached/pre-quota roles without acquiring credits. Frozen qualification passes
+514 distinct core/store/Node/native cases, including configured shared migration
+and final-owner GC for legacy formats 1/3/4/5 and real Btrfs capture/recovery.
+Formatting, strict locked workspace/all-targets Clippy, all-target compilation,
+four debug program builds, source/binary hashes and native cleanup pass.
+Evidence is retained in `/tmp/mb-m6-page-admission-validation-lqep397s`.
+This connects the encoded-page limit to retained migration; enclosing logical
+data/payload headroom, SQL/WAL, traversal, dataset/history/guild policy, normal
+producers and verified generation-floor retirement remain open.
 
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds

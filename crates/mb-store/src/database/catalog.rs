@@ -535,6 +535,24 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Fence an exact intent even if an interrupted job never created it.
+    /// Cancellation acquires no page credits and can also retire an unreserved
+    /// Building intent after quota adoption. Bundled/source-owned roles still
+    /// require their enclosing cancellation before this operation.
+    pub fn fence_catalog(&self, intent: CatalogIntent) -> Result<(), CatalogStoreError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if bounded_record(&transaction, INTENT, intent.id.as_bytes(), RECORD_BYTES)?.is_none() {
+            begin_intent(&transaction, intent)?;
+        }
+        let mut record = read_intent(&transaction, intent)?;
+        bundle::require_unbundled(&transaction, intent)?;
+        record.state = CatalogIntentState::Cancelled;
+        write_intent(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Release one surplus/pending ownership record, preserving a published
     /// root. `false` means no eligible pins remain. Work is independent of the
     /// number of records in other captures or in the remainder of this catalog.
