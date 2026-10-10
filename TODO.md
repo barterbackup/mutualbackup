@@ -2564,6 +2564,30 @@ and native-platform gates remain open.
       activation/retirement and other metadata/payload ownership, full metadata/
       physical policy, normal producers/recovery and deferred real capacity/
       platform gates remain open.
+    - [x] Join complete public format-two authority to sharded packing/coding
+      without resetting the trusted budget or flattening original parts. Keep
+      exact source cardinality/commitments, actual authority debt and mixed
+      legacy/paged revision cursors. Add a separate bounded draft format-ten
+      directory header and quorum decoder; preserve original formats eight/nine
+      and freeze the new shape-only Postcard vector. Candidate construction
+      checks completion markers, current policy, event snapshot and every exact
+      Member recovery key/domain. It grants no production signing or activation
+      capability. Eleven new regressions cover cumulative dimensional exhaustion
+      before I/O, original source/header/cursor joins, strict bounded quorum and
+      canonical decoding, exact trust/policy, damaged tails, withdrawn markers
+      and suppressed SQL writes. Frozen qualification passes 191 core, 349
+      ordinary Store, 35 paged Node, the certified-writer migration entry point
+      and provisioned Btrfs native recovery (577 distinct cases). Formatting,
+      strict locked workspace/all-targets Clippy, all-target test compilation
+      and four debug builds pass. Source, seven binaries and 22 embedded inputs
+      match; native mount/loop/image cleanup is verified. Evidence is retained
+      in `/tmp/mb-m6-public-directories-validation-hwecyke4`.
+      Incremental-cache cleanup reclaims 8.93 GiB, leaving about
+      51.4 GiB in `target`, with qualified binary hashes unchanged.
+      Certified-current coding, legal history transition, guarded public/private
+      checkpoint activation/retirement and other metadata/payload custody still
+      need this proof. Full metadata/physical policy, normal producers/recovery
+      and deferred real dense capacity/platform gates remain open.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

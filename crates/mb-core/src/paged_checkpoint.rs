@@ -23,6 +23,12 @@ pub const PAGED_GUILD_CHECKPOINT_DOMAIN: &[u8] = b"mutualbackup/paged-guild-chec
 const HASH_DOMAIN: &str = "mutualbackup paged guild checkpoint body v1";
 const MEMBERS: usize = 256;
 
+mod directory;
+pub use directory::{
+    PAGED_GUILD_CHECKPOINT_DIRECTORY_VERSION, PagedGuildCheckpointDirectory,
+    QuorumPagedCheckpointDirectory,
+};
+
 /// Independently trusted previous state identity. It can refer to a legacy or
 /// paged checkpoint; the original hash is preserved across migration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,47 +330,55 @@ impl QuorumPagedCheckpoint {
         }
         canonical_bytes_bounded(self, PAGED_QUORUM_CHECKPOINT_BYTES)?;
         let encoded = canonical_bytes_bounded(&self.checkpoint, PAGED_GUILD_CHECKPOINT_BYTES)?;
-        let payload = signing_payload(PAGED_GUILD_CHECKPOINT_DOMAIN, &encoded);
-        let mut previous = None;
-        for signature in &self.signatures {
-            if previous.is_some_and(|signer| signer >= signature.signer)
-                || trust
-                    .members
-                    .binary_search_by_key(&signature.signer, |member| member.node_id)
-                    .is_err()
-                || signature.signature.len() != 64
-            {
-                return Err(CatalogError::InvalidPage);
-            }
-            let key = VerifyingKey::from_bytes(&signature.signer.0).map_err(ModelError::from)?;
-            if key.is_weak() {
-                return Err(ModelError::WeakPublicKey.into());
-            }
-            key.verify_strict(
-                &payload,
-                &Signature::from_slice(&signature.signature).map_err(ModelError::from)?,
-            )
-            .map_err(ModelError::from)?;
-            previous = Some(signature.signer);
-        }
-        let required = trust
-            .authority
-            .quorum
-            .required(trust.members.len())
-            .map_err(|_| CatalogError::InvalidPage)?;
-        if self.signatures.len() < required {
-            return Err(ModelError::InsufficientQuorum {
-                actual: self.signatures.len(),
-                required,
-            }
-            .into());
-        }
-        Ok(())
+        verify_signatures(&self.signatures, trust, &encoded)
     }
 
     pub fn hash(&self) -> Result<[u8; 32], ModelError> {
         self.checkpoint.hash()
     }
+}
+
+fn verify_signatures(
+    signatures: &[MemberSignature],
+    trust: &PagedCheckpointTrust,
+    encoded: &[u8],
+) -> Result<(), CatalogError> {
+    let payload = signing_payload(PAGED_GUILD_CHECKPOINT_DOMAIN, encoded);
+    let mut previous = None;
+    for signature in signatures {
+        if previous.is_some_and(|signer| signer >= signature.signer)
+            || trust
+                .members
+                .binary_search_by_key(&signature.signer, |member| member.node_id)
+                .is_err()
+            || signature.signature.len() != 64
+        {
+            return Err(CatalogError::InvalidPage);
+        }
+        let key = VerifyingKey::from_bytes(&signature.signer.0).map_err(ModelError::from)?;
+        if key.is_weak() {
+            return Err(ModelError::WeakPublicKey.into());
+        }
+        key.verify_strict(
+            &payload,
+            &Signature::from_slice(&signature.signature).map_err(ModelError::from)?,
+        )
+        .map_err(ModelError::from)?;
+        previous = Some(signature.signer);
+    }
+    let required = trust
+        .authority
+        .quorum
+        .required(trust.members.len())
+        .map_err(|_| CatalogError::InvalidPage)?;
+    if signatures.len() < required {
+        return Err(ModelError::InsufficientQuorum {
+            actual: signatures.len(),
+            required,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -375,7 +389,7 @@ mod tests {
         KeyMaterial, PackingProfile, QuorumPolicy, QuorumRule, Seed, canonical_bytes,
     };
 
-    fn fixture() -> (PagedGuildCheckpoint, PagedCheckpointTrust, Vec<KeyMaterial>) {
+    pub(super) fn fixture() -> (PagedGuildCheckpoint, PagedCheckpointTrust, Vec<KeyMaterial>) {
         let keys = [11, 12]
             .into_iter()
             .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value; 32])))

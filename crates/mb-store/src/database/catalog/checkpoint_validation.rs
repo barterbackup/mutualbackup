@@ -19,6 +19,11 @@ use super::packing_validation::{build_index, unwrap_stream};
 use super::*;
 use crate::RecordScratchStore;
 
+mod directories;
+pub use directories::{
+    CatalogCheckpointCodingDirectoriesIndex, CatalogCheckpointPackingDirectoryIndex,
+};
+
 const MANIFEST_BYTES: usize = 2048;
 const COMPLETE: &str = "checkpoint-authority-complete";
 pub(super) const HISTORY: &str = "checkpoint-authority-writer-history";
@@ -779,12 +784,12 @@ fn decode_revision(
     Ok(value)
 }
 
-pub struct CatalogCheckpointPackingIndex {
+pub struct CatalogCheckpointPackingIndex<I = CatalogPackingIndex> {
     authority: CatalogCheckpointAuthorityValidation,
     authority_work: CatalogCodingTraversalBudget,
     source_count: u64,
     budget: CatalogCodingTraversalBudget,
-    index: CatalogPackingIndex,
+    index: I,
 }
 
 impl CatalogCheckpointPackingIndex {
@@ -832,10 +837,10 @@ impl CatalogCheckpointPackingIndex {
 /// Complete public authority/packing/directory joins in one admitted scratch
 /// store. Exact certified coding state, authority transition/signatures, event
 /// rechecks and private/payload ownership remain mandatory before activation.
-pub struct CatalogCheckpointCodingDirectoryIndex {
+pub struct CatalogCheckpointCodingDirectoryIndex<I = CatalogPackingCodingDirectoryIndex> {
     authority: CatalogCheckpointAuthorityValidation,
     source_count: u64,
-    index: CatalogPackingCodingDirectoryIndex,
+    index: I,
 }
 impl CatalogCheckpointCodingDirectoryIndex {
     /// Read one exact revision from the completed, authenticated authority join.
@@ -845,24 +850,11 @@ impl CatalogCheckpointCodingDirectoryIndex {
         key: CatalogCheckpointRevisionKey,
     ) -> Result<Option<CatalogCheckpointAuthorityRecord>, CatalogStoreError> {
         self.require_complete()?;
-        let key = key.index_key();
-        let store = &self.index.packing().store;
-        let identity =
-            read::<super::checkpoint_transition::RevisionIdentity>(store, IDENTITIES, &key)?;
-        let Some(bytes) =
-            store.get_record_bounded(REVISIONS, &key, CATALOG_CHECKPOINT_RECORD_BYTES)?
-        else {
-            if identity.is_some() {
-                return Err(DatabaseError::Integrity.into());
-            }
-            return Ok(None);
-        };
-        let record = decode_revision(&bytes, &key, self.authority.context.guild_id)?;
-        let (identity, _) = identity.ok_or(DatabaseError::Integrity)?;
-        if !identity.matches_reference(&record)? {
-            return Err(DatabaseError::Integrity.into());
-        }
-        Ok(Some(record))
+        revision(
+            &self.index.packing().store,
+            self.authority.context.guild_id,
+            key,
+        )
     }
 
     pub fn authority(&self) -> CatalogCheckpointAuthorityValidation {
@@ -892,6 +884,28 @@ impl CatalogCheckpointCodingDirectoryIndex {
             after,
         )
     }
+}
+
+fn revision(
+    store: &RecordScratchStore,
+    guild_id: [u8; 32],
+    key: CatalogCheckpointRevisionKey,
+) -> Result<Option<CatalogCheckpointAuthorityRecord>, CatalogStoreError> {
+    let key = key.index_key();
+    let identity = read::<super::checkpoint_transition::RevisionIdentity>(store, IDENTITIES, &key)?;
+    let Some(bytes) = store.get_record_bounded(REVISIONS, &key, CATALOG_CHECKPOINT_RECORD_BYTES)?
+    else {
+        if identity.is_some() {
+            return Err(DatabaseError::Integrity.into());
+        }
+        return Ok(None);
+    };
+    let record = decode_revision(&bytes, &key, guild_id)?;
+    let (identity, _) = identity.ok_or(DatabaseError::Integrity)?;
+    if !identity.matches_reference(&record)? {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(Some(record))
 }
 
 #[cfg(test)]
@@ -1056,7 +1070,7 @@ pub(super) mod tests {
                 .find(|record| matches!(record, R::PagedRevision(_)))
                 .unwrap() = R::PagedRevision(signed);
         }
-        fn root(&mut self) -> CatalogCheckpointAuthorityRoot {
+        pub(crate) fn root(&mut self) -> CatalogCheckpointAuthorityRoot {
             self.records.sort_by_key(order);
             let mut builder = match self.authority_budget {
                 Some(budget) => CatalogCheckpointAuthorityBuilder::new_with_budget(
@@ -1081,10 +1095,10 @@ pub(super) mod tests {
             }
             builder.finish(&mut sink).unwrap()
         }
-        fn members(&self) -> &[Member] {
+        pub(crate) fn members(&self) -> &[Member] {
             &self.sources.certificate.checkpoint.members
         }
-        fn build(
+        pub(crate) fn build(
             &mut self,
             limit: CatalogCodingTraversalBudget,
         ) -> Result<CatalogCheckpointAuthorityIndex, CatalogStoreError> {

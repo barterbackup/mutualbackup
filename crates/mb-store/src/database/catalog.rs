@@ -51,7 +51,8 @@ pub use checkpoint_retention::{CatalogCheckpointRetention, CatalogCheckpointRete
 pub use checkpoint_transition::{CatalogCheckpointPrevious, CatalogCheckpointTransitionIndex};
 pub use checkpoint_validation::{
     CatalogCheckpointAuthorityContext, CatalogCheckpointAuthorityIndex,
-    CatalogCheckpointAuthorityValidation, CatalogCheckpointCodingDirectoryIndex,
+    CatalogCheckpointAuthorityValidation, CatalogCheckpointCodingDirectoriesIndex,
+    CatalogCheckpointCodingDirectoryIndex, CatalogCheckpointPackingDirectoryIndex,
     CatalogCheckpointPackingIndex, CatalogCheckpointWriterAuthorization,
 };
 pub use coding_coverage::{

@@ -29,6 +29,8 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures; versions 3–4 require every listed member, while versions 5–7 require their epoch-bound guild quorum |
 | `PagedGuildCheckpoint` (draft public header, formats 8/9) | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `event_sequence`, `event_head`, `authority`, `authority_root`, `authority_records`, `packed_sectors`, `packed_sources`, `coding` | `mutualbackup/paged-guild-checkpoint/v1`; hash derive-key context `mutualbackup paged guild checkpoint body v1`; body/transition and production activation remain separate gates |
 | `QuorumPagedCheckpoint` | `checkpoint`, `signatures` | bounded certificate of paged header signatures under independently trusted current membership/quorum; no member roster is learned from the proposal |
+| `PagedGuildCheckpointDirectory` (draft public header, format 10) | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `event_sequence`, `event_head`, `authority`, `authority_root`, `authority_records`, `packing`, `coding` | same paged signing/hash domains, with distinct canonical version/layout; `packing` is the sharded packing directory, and authority root format 2 is required |
+| `QuorumPagedCheckpointDirectory` | `checkpoint`, `signatures` | bounded certificate of the format-10 header against independent current trust; body, certified coding state, legal transition, private/payload custody and atomic activation remain required |
 | `CatalogCheckpointAuthorityRoot` (staging codec, formats 1/2) | `format_version`, `generation`, `membership_epoch`, `records`, `summary` | authenticated by the paged header; no standalone signature or activation |
 | `CatalogLegacyRevisionRef` (format 1) | `format_version`, `guild_id`, `owner`, `protected_root_id`, `revision_id`, `sequence`, `parent`, `writer_epoch`, `writer_public_key`, `revision_hash`, `body` | `body` authenticates the original signed legacy envelope through guild-scoped Checkpoint pages; original owner/writer domains and revision body hash remain unchanged |
 | `MemberSignature` | `signer`, `signature` | signature domain belongs to containing certificate |
@@ -409,3 +411,21 @@ avoiding another encoded copy. Physical legacy-body references are excluded from
 signed identity equality so repagination cannot rewrite signed authority.
 Checkpoint rosters allow certified shared failure domains; each coding group's
 placement still requires its original distinct-domain checks.
+
+The separate format-10 header replaces the two individual packing roots with
+`CatalogPackingDirectoryRoot`. Its fixed 4 KiB header and 32 KiB certificate
+charge all public authority, packing and coding page/record occurrences under
+one caller-supplied budget. Embedded root envelopes are included in the fixed
+certificate reservation. Original formats 8/9 retain their byte layout and
+aggregate packing limits. The deterministic shape-only
+`paged-checkpoint-directory-v10.postcard.hex` vector freezes the new layout;
+it does not certify complete body data or capacity.
+
+The public Store adapter requires completed format-2 authority, exact source
+cardinality/commitments and every packing/coding EOF in the same scratch index.
+It carries the original authority debt through both joins and preserves the
+mixed legacy/paged revision cursor. `header_candidate` rechecks the completion
+markers and exact trusted original Member records, including recovery keys and
+failure domains. It grants no signing, transition or activation capability.
+Certified-current coding state, legal previous-history transition and guarded
+public/private/payload ownership must still integrate this proof.

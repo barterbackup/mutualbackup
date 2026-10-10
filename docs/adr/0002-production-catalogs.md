@@ -4836,3 +4836,56 @@ admission, normal paged capture/retention/seed recovery and deferred real dense
 capacity/native-platform qualification remain open. This closes the local
 source/coding join and transitive packing/coding metadata handoff, while
 R3-SINGLE-OWNER-METADATA and Milestone 6 remain open.
+
+
+## Public authority joins sharded packing and format-ten headers (2026-10-10)
+
+The completed public authority proof now feeds the sharded packing/coding join
+without flattening its parts or resetting the enclosing budget. Format-two
+authority is mandatory. The adapter checks its completion marker, exact source
+count and commitments, preserves the actual authority ledger, and reserves
+packing/coding work before nested page I/O. Every original source, global sector
+and coding EOF remains required. The resulting typed proof shares bounded mixed
+legacy/paged revision cursors and point reads with the original public index.
+
+A separate draft `PagedGuildCheckpointDirectory` and bounded quorum wrapper use
+format ten. The header replaces the two individual packing roots with the
+packing directory and requires authority root format two. Its 4 KiB header and
+32 KiB certificate charge the public authority ledger and all nested packing/
+coding occurrences under one supplied budget. Formats eight/nine retain their
+original layout, limits and verification behavior. The deterministic shape-only
+Postcard vector freezes the new layout; it is not complete body or capacity
+qualification. Both quorum wrappers share the original strict signature checks.
+
+`header_candidate` requires complete authority/packing/coding markers, current
+coverage policy and the exact independent event/authority snapshot. It compares
+every original Member record, including recovery key and failure domain, and
+uses the completed authority record ledger. This is a candidate only. Certified
+current coding state, legal original-history transition, live trust rereads,
+private/bootstrap/native and information/parity ownership, atomic checkpoint
+selection and successor retirement must still integrate the new proof before
+production signing or activation. The normal producers remain disabled.
+
+Eleven new cases cover bounded canonical/version decoding, incompatible original
+formats, exact cumulative byte/page/record exhaustion, independent trust and
+ledger guards, strict quorum/body binding, oversized nested lengths before
+allocation, completed mixed-source/coding replay, pre-I/O scope/cardinality and
+legacy-authority rejection, original authority debt, exact trusted members,
+current policy/event checks, withdrawn completion markers, damaged tails and
+suppressed SQL completion writes. Frozen qualification passes 191 core, 349
+ordinary Store, 35 paged Node, the certified-writer migration entry point and
+provisioned Btrfs native capture/recovery: 577 distinct cases. Ordinary suites
+leave 26 Store and one Node case ignored; the native case runs separately on
+disposable Btrfs with a logical sparse 1 TiB file. Formatting, strict locked
+workspace/all-targets Clippy, all-target test compilation and four debug program
+builds pass under Cargo/rustc 1.99.0. Frozen source, seven binaries and 22 embedded
+protocol/helper inputs match. Native mount/loop/image cleanup is independently
+checked. Logs, hashes and distinct case inventory are retained in
+`/tmp/mb-m6-public-directories-validation-hwecyke4`; the post-commit audit binds
+those inputs to the commit. Incremental-cache cleanup reclaims 8.93 GiB,
+leaving about 51.4 GiB in `target`, with all qualified binary hashes
+unchanged. Other ordinary/native suites and installed artifacts were not rerun.
+
+Full section/dataset/guild metadata and physical admission, normal paged
+capture/retention/seed recovery and the deferred real dense capacity/native
+platform gates remain open. R3-SINGLE-OWNER-METADATA and Milestone 6 remain open.

@@ -1582,6 +1582,24 @@ metadata/payload custody still need the sharded proof; complete metadata/
 physical policy, normal producers/recovery and deferred capacity/platform
 gates remain open. See ADR 0002.
 
+Completed public format-two authority now joins sharded packing/coding with
+exact original source authority and cumulative debt preserved. The typed proof
+retains mixed legacy/paged revision cursors. A separate bounded draft format-ten
+header carries the packing directory; original formats eight/nine stay intact.
+Its candidate requires all completion markers, current coverage policy and
+exact trusted event/Member records, including recovery keys and domains. It
+still needs certified-current coding, legal history transition, live signing/
+publication guards and all private/metadata/payload custody before activation.
+Eleven new regressions pass. Frozen qualification passes 577 distinct cases:
+191 core, 349 ordinary Store, 35 paged Node, the certified-writer migration case
+and provisioned Btrfs native recovery. Formatting, strict locked workspace/
+all-targets Clippy, all-target compilation and four debug builds pass. Source,
+seven binaries and 22 embedded inputs match; native cleanup is verified.
+Evidence is retained in `/tmp/mb-m6-public-directories-validation-hwecyke4`.
+Incremental-cache cleanup reclaims 8.93 GiB with binary hashes preserved.
+Complete metadata/physical policy, normal producers/recovery and deferred real
+capacity/platform gates remain open. See ADR 0002.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector
