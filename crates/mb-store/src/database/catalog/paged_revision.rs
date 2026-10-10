@@ -1308,10 +1308,12 @@ pub(super) mod tests {
                 view.bind_data_source(&source, anchor, b"source-a")
             })
             .unwrap();
-        store
+        let result = store
             .paged_revision_data_source(bundle.id, source.sector.id)
             .unwrap()
-            .unwrap()
+            .unwrap();
+        paged_data::make_inline_for_test(store, &result);
+        result
     }
 
     #[test]
@@ -1361,6 +1363,7 @@ pub(super) mod tests {
             store.paged_revision_data_source(id, sector).unwrap(),
             Some(moved.clone())
         );
+        paged_data::make_inline_for_test(&store, &moved);
         let exhausted =
             canonical_bytes(&(2_u16, &moved.source, b, moved.recipe.clone(), u64::MAX)).unwrap();
         store.put_record(&kind, &sector, &exhausted).unwrap();

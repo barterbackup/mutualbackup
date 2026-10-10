@@ -1463,6 +1463,27 @@ cleanup is verified. Evidence is in
 Full private/payload/SQL headroom, dataset/guild admission, normal
 producers and the deferred real retained-capacity gate remain open.
 
+Local data recipes now have version-three owner bindings, bounded by 256 bytes,
+with one shared scoped/source/anchor/recipe identity for identical opaque bytes.
+The dictionary retains exact owner backlinks until actual final-owner cleanup;
+each owner keeps an independent repair generation and may transfer to a new
+recipe/anchor without changing another owner's view. Old inline versions one
+and two remain readable and replay without rewriting their original bytes.
+Publication, replacement and cancellation cleanup change recipe references and
+physical pins in the same writer. Missing dependencies, counter/backlink
+disagreement, ignored/reverted SQL writes and malformed lengths fail closed.
+Four local fixtures cover 32 small signed catalogs with real 8 KiB recipe
+sharing, independent repairs, original replay, reopen/cancellation and SQL
+faults. Encoded-value arithmetic for 32 dense 1 TiB references replaces a 4 TiB
+repeated recipe bound with less than 512 GiB of shared recipe and owner values;
+this excludes SQL keys/indexes/WAL, native validation, capture manifests,
+packing/coding and payload. Frozen qualification passes 534 distinct core/store/
+paged Node/native cases, formatting, strict locked workspace/all-targets Clippy,
+all-target compilation and four debug builds under Cargo/rustc 1.99.0. Source,
+seven binaries and 21 embedded protocol/helper inputs match; native cleanup is
+verified. Evidence is in `/tmp/mb-m6-shared-recipes-validation-bcp0vuql`. Full
+metadata admission and the normal paged pipeline remain open.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

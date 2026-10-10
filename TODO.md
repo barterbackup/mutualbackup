@@ -2466,6 +2466,32 @@ and native-platform gates remain open.
       Full private/payload/SQL headroom, dataset/guild policy, normal producers
       and real retained-capacity gates remain
       open; the declared-geometry fixture does not store or recover dense data.
+    - [x] Share identical local data recipes across retained revisions instead
+      of copying an 8 KiB body into every owner binding. Version-three local
+      bindings are bounded by 256 bytes; immutable scoped/source/anchor/recipe
+      identities reference one bounded recipe with exact owner backlinks.
+      Preserve version-one/two bytes and each owner's independent repair
+      generation. Publication, repair and final cancelled-owner cleanup must
+      transfer recipe ownership and physical pins in the same writer and reject
+      ignored/reverted SQL mutations or missing/corrupt dependencies. The new
+      fixtures cover 32 real small signed catalogs sharing an 8 KiB recipe,
+      independent repairs, replay/reopen, cancellation, SQL faults and bounded
+      malformed lengths. Their dense-source calculation reduces a 4 TiB
+      repeated recipe-value bound to less than 512 GiB of shared recipe and
+      binding values; it excludes SQL keys/indexes/WAL, native validation,
+      capture manifests, packing/coding and payload. Frozen qualification passes
+      178 core, 319 ordinary store, 35 paged Node, the certified-writer migration
+      case and provisioned Btrfs capture/recovery (534 distinct cases).
+      Formatting, strict locked workspace/all-targets Clippy, all-target test
+      compilation and four debug builds pass under Cargo/rustc 1.99.0. Source,
+      seven binaries and 21 embedded protocol/helper inputs match; native
+      mount/loop/image cleanup is verified. Evidence is retained in
+      `/tmp/mb-m6-shared-recipes-validation-bcp0vuql`.
+      Removing rebuildable incremental caches after qualification reclaims
+      about 8 GiB, leaving about 50 GiB in `target`; qualified binary hashes
+      remain unchanged.
+      Full enclosing policy and normal producers
+      remain required; this is not real retained-capacity qualification.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

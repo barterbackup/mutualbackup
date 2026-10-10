@@ -56,7 +56,8 @@ pub use catalog::{
     CatalogRetainedSourceQuota, CatalogRetainedSourceReservation, CatalogRetainedSourceUsage,
     CatalogSectorSource, CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage,
     CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES,
-    PagedCatalogDataSource, PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
+    PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
+    PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 #[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;

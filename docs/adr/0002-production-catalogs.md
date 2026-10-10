@@ -4495,3 +4495,70 @@ existing-paged adoption, generation floors, normal paged producers and seed-only
 recovery, topology diagnosis and installed/platform gates remain open. The
 user-deferred dense 1 TiB and native platform runs remain separate acceptance
 gates.
+
+
+## Shared local data recipe ownership (2026-10-10)
+
+Inline local data bindings copied each opaque recipe into every retained
+revision. At the supported 8 KiB recipe limit, 32 dense 1 TiB references could
+copy 4 TiB of recipe values alone. Logical source sharing and public traversal
+budgets did not reduce that local metadata debt.
+
+New bindings use local format three: source, anchor, a 32-byte shared recipe
+identity and the owner-specific generation. They encode within 256 bytes. The
+shared identity hashes a versioned canonical tuple of dataset scope, complete
+source identity/commitment, anchor and exact opaque recipe bytes. Generation is
+excluded, so repairs remain independent per owner. One bounded dictionary
+record retains the original recipe bytes and a reference count. A fixed
+owner backlink prevents double acquisition and permits exact final-owner
+cleanup. Reads check the digest, canonical encoding, expected scope/source/
+anchor, owner backlink and complete reference count before returning bytes.
+
+Publication adds the dictionary reference and owner binding in the same writer
+as source accounting and physical pins. Existing version-one/two bindings
+replay unchanged, and shared bindings replay without another reference.
+Replacement acquires its new identity, changes the generation-fenced owner
+binding, releases its old shared reference and transfers native pins atomically.
+Other owners keep their bytes, locator and generation. Cancellation hides the
+owner immediately; its recipe remains retained until actual bounded binding
+cleanup. The dictionary is removed only after its final backlink is removed.
+Readback checks reject ignored/reverted inserts, updates and deletes.
+
+Versions one and two retain their exact layouts and opaque bytes. Their bounded
+byte deserializer shares format three's 8 KiB limit and rejects oversized or
+impossible length declarations before allocation. Older inline bindings can
+transfer to shared format during an authenticated replacement; this does not
+rewrite untouched legacy bindings or original signed revisions/page roots.
+Test fixtures explicitly retain inline states when qualifying original layouts.
+
+Four new fixtures build 32 real small signed local catalogs sharing an actual
+8 KiB recipe, then verify replay, reopen and final-owner cleanup. They exercise
+independent repairs joining existing recipes, stale/exact retries, physical pin
+conservation, SQL faults and corrupt/missing dependencies. The old version-one
+replay and generation-exhaustion fixtures remain qualified with inline records.
+The dense calculation bounds shared recipe plus owner-binding values below
+512 GiB instead of 4 TiB of repeated recipes. It is encoded-value arithmetic,
+not SQL/index/WAL or dense-data qualification. Distinct locators/recipes remain
+distinct; callers cannot collapse independently retained source replicas.
+Frozen qualification passes all 178 core and 319 ordinary store tests, 35
+paged Node cases, the certified-writer migration entry point and provisioned
+Btrfs retained native capture/recovery (534 distinct cases). The ordinary
+suites exclude 26 store cases and the selected native case, provisioned
+separately. The inventory includes the legacy-information activation/custody
+case once. Formatting, strict locked workspace/all-targets Clippy, all-target
+test compilation and four debug builds pass under Cargo/rustc 1.99.0. Source
+and seven binary hashes remain unchanged; 21 embedded protocol/helper inputs
+match in the independent audit. Native mount/image/loop cleanup is verified.
+Logs, manifests, passing-case inventory and final audits are in
+`/tmp/mb-m6-shared-recipes-validation-bcp0vuql`. Other ordinary/native suites
+and installed artifacts were not rerun.
+
+Removing rebuildable incremental caches after qualification reclaims about
+8 GiB, leaving about 50 GiB in `target`. Qualified binary hashes remain
+unchanged; cleanup sizes and the final audit are retained with the evidence.
+
+Complete section/dataset/guild metadata admission must still fund owner keys,
+indexes, backlinks, source validation, capture manifests, shared pages, packing/
+coding, scratch and WAL/payload headroom. Legacy adoption and normal paged
+capture/retention/seed recovery remain required. The user-deferred dense 1 TiB
+and Windows/macOS runs remain open acceptance gates.

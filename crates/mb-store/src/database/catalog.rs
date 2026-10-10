@@ -85,7 +85,9 @@ pub use paged_checkpoint_payload::{CatalogCheckpointPayload, CatalogPayloadRetir
 pub use paged_checkpoint_retention::{
     CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,
 };
-pub use paged_data::{PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource};
+pub use paged_data::{
+    PAGED_DATA_RECIPE_BYTES, PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource,
+};
 pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCatalogSnapshot};
 pub use paged_sector::PagedCatalogSectorSource;
 pub use retained_source_quota::{

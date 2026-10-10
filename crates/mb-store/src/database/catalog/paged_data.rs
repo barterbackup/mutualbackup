@@ -4,7 +4,10 @@ use mb_core::{CatalogSectorRecord, PagedUserRevision};
 
 use super::*;
 
+mod recipes;
+
 pub const PAGED_DATA_RECIPE_BYTES: usize = 8192;
+pub const PAGED_DATA_SHARED_BINDING_BYTES: usize = 256;
 const RECORD_LIMIT: usize = PAGED_DATA_RECIPE_BYTES + 1024;
 pub(super) const ANCHOR: &str = "catalog-paged-data-anchor-v1";
 
@@ -17,6 +20,7 @@ struct DataSourceRecord {
     version: u16,
     source: CatalogSectorRecord,
     anchor: Uuid,
+    #[serde(deserialize_with = "bounded_recipe")]
     recipe: Vec<u8>,
     generation: u64,
 }
@@ -26,7 +30,57 @@ struct LegacyDataSourceRecord {
     version: u16,
     source: CatalogSectorRecord,
     anchor: Uuid,
+    #[serde(deserialize_with = "bounded_recipe")]
     recipe: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SharedDataSourceRecord {
+    version: u16,
+    source: CatalogSectorRecord,
+    anchor: Uuid,
+    recipe: [u8; 32],
+    generation: u64,
+}
+
+fn bounded_recipe<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
+    struct Bytes;
+    impl<'de> serde::de::Visitor<'de> for Bytes {
+        type Value = Vec<u8>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a nonempty paged data recipe of at most 8192 bytes")
+        }
+        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+            if bytes.is_empty() || bytes.len() > PAGED_DATA_RECIPE_BYTES {
+                return Err(E::custom("invalid paged data recipe length"));
+            }
+            Ok(bytes.to_vec())
+        }
+        fn visit_borrowed_bytes<E: serde::de::Error>(self, bytes: &'de [u8]) -> Result<Vec<u8>, E> {
+            self.visit_bytes(bytes)
+        }
+    }
+    decoder.deserialize_bytes(Bytes)
+}
+
+#[cfg(test)]
+pub(super) fn make_inline_for_test(store: &ControlStore, source: &PagedCatalogDataSource) {
+    recipes::make_inline_for_test(store, source);
+}
+
+fn shared_record(bytes: &[u8]) -> Result<Option<SharedDataSourceRecord>, CatalogStoreError> {
+    if bytes.first() != Some(&3) {
+        return Ok(None);
+    }
+    if bytes.len() > PAGED_DATA_SHARED_BINDING_BYTES {
+        return Err(DatabaseError::Integrity.into());
+    }
+    let record: SharedDataSourceRecord = decode_canonical(bytes)?;
+    if record.version != 3 || canonical_bytes(&record)? != bytes || record.anchor.is_nil() {
+        return Err(DatabaseError::Integrity.into());
+    }
+    record.source.validate()?;
+    Ok(Some(record))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,7 +169,7 @@ pub(super) fn retained_anchor(
         if bundle.scope == scope {
             let bytes = bounded_record(connection, &kind, &source.sector.id, RECORD_LIMIT)?
                 .ok_or(DatabaseError::Integrity)?;
-            let record = decode_record(&bytes, source.sector.id)?;
+            let record = decode_record(connection, id, scope, &bytes, source.sector.id)?;
             if record.source != *source
                 || native_validation::retained_source_record(
                     connection,
@@ -142,7 +196,13 @@ pub(super) fn retained_anchor(
     }
 }
 
-fn decode_record(bytes: &[u8], sector: [u8; 32]) -> Result<DataSourceRecord, CatalogStoreError> {
+fn decode_record(
+    connection: &Connection,
+    id: Uuid,
+    scope: CatalogScope,
+    bytes: &[u8],
+    sector: [u8; 32],
+) -> Result<DataSourceRecord, CatalogStoreError> {
     let record: DataSourceRecord = match bytes.first() {
         Some(1) => {
             let old: LegacyDataSourceRecord = decode_canonical(bytes)?;
@@ -163,6 +223,16 @@ fn decode_record(bytes: &[u8], sector: [u8; 32]) -> Result<DataSourceRecord, Cat
                 return Err(DatabaseError::Integrity.into());
             }
             record
+        }
+        Some(3) => {
+            let shared = shared_record(bytes)?.ok_or(DatabaseError::Integrity)?;
+            DataSourceRecord {
+                version: 2,
+                recipe: recipes::read(connection, id, scope, &shared)?,
+                source: shared.source,
+                anchor: shared.anchor,
+                generation: shared.generation,
+            }
         }
         _ => return Err(DatabaseError::Integrity.into()),
     };
@@ -207,9 +277,14 @@ pub(super) fn bind(
         recipe: recipe.to_vec(),
         generation: 0,
     };
-    let encoded = canonical_bytes(&record)?;
     if let Some(existing) = bounded_record(connection, &kind, &source.sector.id, RECORD_LIMIT)? {
-        if decode_record(&existing, source.sector.id)? != record
+        if decode_record(
+            connection,
+            bundle.id,
+            bundle.scope,
+            &existing,
+            source.sector.id,
+        )? != record
             || anchor_count(connection, anchor)?.is_none()
         {
             return Err(DatabaseError::Conflict.into());
@@ -223,6 +298,8 @@ pub(super) fn bind(
         .checked_add(1)
         .ok_or(DatabaseError::CapacityExceeded)?;
     retained_source_quota::bind(connection, bundle.id, bundle.scope, source)?;
+    let shared = recipes::acquire(connection, bundle.id, bundle.scope, &record)?;
+    let encoded = mb_core::canonical_bytes_bounded(&shared, PAGED_DATA_SHARED_BINDING_BYTES)?;
     insert_exact(connection, &kind, &source.sector.id, &encoded)?;
     if bounded_record(connection, &kind, &source.sector.id, RECORD_LIMIT)?.as_deref()
         != Some(encoded.as_slice())
@@ -247,7 +324,7 @@ pub(super) fn read_source(
     let Some(bytes) = bounded_record(connection, &sources(id), &sector, RECORD_LIMIT)? else {
         return Ok(None);
     };
-    let record = decode_record(&bytes, sector)?;
+    let record = decode_record(connection, id, catalog.bundle.scope, &bytes, sector)?;
     if native_validation::source_record(connection, id, sector)?.as_ref() != Some(&record.source)
         || anchor_count(connection, record.anchor)?.is_none()
     {
@@ -355,17 +432,27 @@ impl ControlStore {
             .ok_or_else(|| CatalogStoreError::from(DatabaseError::CapacityExceeded))?;
         let old_bytes = bounded_record(&tx, &sources(id), &sector, RECORD_LIMIT)?
             .ok_or_else(|| CatalogStoreError::from(DatabaseError::Integrity))?;
-        let encoded = canonical_bytes(&DataSourceRecord {
+        let replacement = DataSourceRecord {
             version: 2,
             source: current.source.clone(),
             anchor,
             recipe: recipe.to_vec(),
             generation,
-        })
-        .map_err(CatalogStoreError::from)?;
+        };
+        let shared = recipes::acquire(&tx, id, current.catalog.bundle.scope, &replacement)?;
+        let encoded = mb_core::canonical_bytes_bounded(&shared, PAGED_DATA_SHARED_BINDING_BYTES)
+            .map_err(CatalogStoreError::from)?;
         if tx.execute("UPDATE protocol_records SET bytes = ?4 WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
             params![sources(id), sector, old_bytes, encoded]).map_err(CatalogStoreError::from)? != 1 {
             return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
+        if bounded_record(&tx, &sources(id), &sector, RECORD_LIMIT)?.as_deref()
+            != Some(encoded.as_slice())
+        {
+            return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+        }
+        if let Some(old) = shared_record(&old_bytes)? {
+            recipes::release(&tx, id, current.catalog.bundle.scope, &old)?;
         }
         if current.anchor != anchor {
             let next_count = anchor_count(&tx, anchor)?;
@@ -446,10 +533,9 @@ impl ControlStore {
                 .ok_or(DatabaseError::Integrity)?
                 .try_into()
                 .map_err(|_| DatabaseError::Integrity)?;
-            let record = decode_record(
-                &bounded_record(&tx, &kind, &key, RECORD_LIMIT)?.ok_or(DatabaseError::Integrity)?,
-                key,
-            )?;
+            let encoded =
+                bounded_record(&tx, &kind, &key, RECORD_LIMIT)?.ok_or(DatabaseError::Integrity)?;
+            let record = decode_record(&tx, id, catalog.bundle.scope, &encoded, key)?;
             let count = anchor_count(&tx, record.anchor)?.ok_or(DatabaseError::Integrity)?;
             if tx.execute(
                 "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
@@ -460,6 +546,9 @@ impl ControlStore {
                 return Err(DatabaseError::Conflict.into());
             }
             retained_source_quota::release(&tx, id, catalog.bundle.scope, &record.source)?;
+            if let Some(shared) = shared_record(&encoded)? {
+                recipes::release(&tx, id, catalog.bundle.scope, &shared)?;
+            }
             change_anchor_count(&tx, record.anchor, Some(count), count - 1)?;
             true
         } else {
