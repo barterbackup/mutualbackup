@@ -152,8 +152,28 @@ fn retire_owner_captures(control: &ControlStore, intents: &[CatalogIntent]) {
 
 #[test]
 fn guarded_checkpoint_owner_keeps_all_public_roots_after_capture_retirement_and_reopen() {
+    public_owner_lifecycle(false);
+}
+
+#[test]
+fn budgeted_checkpoint_owner_keeps_original_history_proof_and_all_roots_through_reopen() {
+    public_owner_lifecycle(true);
+}
+
+fn public_owner_lifecycle(budgeted: bool) {
     let (mut fixture, history) = real_checkpoint();
+    if budgeted {
+        fixture.authority_budget = Some(budget());
+    }
     let proof = paged_owner_proof(&mut fixture, &history, None);
+    assert_eq!(
+        proof.certificate().checkpoint.format_version,
+        if budgeted { 9 } else { 8 }
+    );
+    assert_eq!(
+        proof.certificate().checkpoint.authority_root.format_version,
+        if budgeted { 2 } else { 1 }
+    );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owner.db");
     let control = ControlStore::open(&path, &history.keys[0]).unwrap();

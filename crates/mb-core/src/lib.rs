@@ -104,9 +104,9 @@ pub use packing::{
     unpack_object_from_sectors,
 };
 pub use paged_checkpoint::{
-    PAGED_GUILD_CHECKPOINT_BYTES, PAGED_GUILD_CHECKPOINT_DOMAIN, PAGED_GUILD_CHECKPOINT_VERSION,
-    PAGED_QUORUM_CHECKPOINT_BYTES, PagedCheckpointParent, PagedCheckpointTrust,
-    PagedGuildCheckpoint, QuorumPagedCheckpoint,
+    PAGED_GUILD_CHECKPOINT_BUDGETED_VERSION, PAGED_GUILD_CHECKPOINT_BYTES,
+    PAGED_GUILD_CHECKPOINT_DOMAIN, PAGED_GUILD_CHECKPOINT_VERSION, PAGED_QUORUM_CHECKPOINT_BYTES,
+    PagedCheckpointParent, PagedCheckpointTrust, PagedGuildCheckpoint, QuorumPagedCheckpoint,
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,

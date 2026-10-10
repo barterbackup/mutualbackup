@@ -109,9 +109,11 @@ impl CatalogCheckpointAuthorityValidation {
 
     pub fn validate(self, budget: CatalogCodingTraversalBudget) -> Result<(), CatalogStoreError> {
         self.scope().validate(CatalogSection::Checkpoint)?;
-        self.root.validate()?;
-        if self.format_version != 1
-            || self.context.event_head == [0; 32]
+        self.root.validate_with_budget(budget)?;
+        if !matches!(
+            (self.format_version, self.root.format_version),
+            (1, 1) | (2, 2)
+        ) || self.context.event_head == [0; 32]
             || self.context.generation != self.root.generation
             || self.context.authority.format_version != 1
             || self.context.authority.membership_epoch != self.root.membership_epoch
@@ -294,7 +296,7 @@ impl CatalogCheckpointAuthorityIndex {
         ) -> Result<(), CatalogStoreError>,
     ) -> Result<Self, CatalogStoreError> {
         let manifest = CatalogCheckpointAuthorityValidation {
-            format_version: 1,
+            format_version: root.format_version,
             context,
             root,
         };
@@ -319,7 +321,8 @@ impl CatalogCheckpointAuthorityIndex {
                     return Err(DatabaseError::Conflict.into());
                 }
             }
-            let mut reader = CatalogCheckpointAuthorityReader::new(manifest.scope(), root)?;
+            let mut reader =
+                CatalogCheckpointAuthorityReader::new_with_budget(manifest.scope(), root, budget)?;
             let mut member_index = 0;
             while let Some(record) = unwrap_stream(reader.next_record(&mut |page| {
                 fetch(manifest.scope(), CatalogSection::Checkpoint, page)
@@ -909,6 +912,7 @@ pub(super) mod tests {
         pub(crate) context: CatalogCheckpointAuthorityContext,
         pub(crate) records: Vec<R>,
         pub(crate) pages: Pages,
+        pub(crate) authority_budget: Option<CatalogCodingTraversalBudget>,
     }
 
     fn budget() -> CatalogCodingTraversalBudget {
@@ -1007,6 +1011,7 @@ pub(super) mod tests {
                 context,
                 records,
                 pages,
+                authority_budget: None,
             }
         }
         pub(crate) fn scope(&self) -> CatalogScope {
@@ -1051,11 +1056,19 @@ pub(super) mod tests {
         }
         fn root(&mut self) -> CatalogCheckpointAuthorityRoot {
             self.records.sort_by_key(order);
-            let mut builder = CatalogCheckpointAuthorityBuilder::new(
-                self.scope(),
-                self.context.generation,
-                self.context.authority.membership_epoch,
-            )
+            let mut builder = match self.authority_budget {
+                Some(budget) => CatalogCheckpointAuthorityBuilder::new_with_budget(
+                    self.scope(),
+                    self.context.generation,
+                    self.context.authority.membership_epoch,
+                    budget,
+                ),
+                None => CatalogCheckpointAuthorityBuilder::new(
+                    self.scope(),
+                    self.context.generation,
+                    self.context.authority.membership_epoch,
+                ),
+            }
             .unwrap();
             let mut sink = |page: CatalogPageRef, bytes| {
                 self.pages.insert(page.hash, bytes);
@@ -1360,6 +1373,41 @@ pub(super) mod tests {
             self.pages.extend(pages);
             (index, entries)
         }
+    }
+
+    #[test]
+    fn budgeted_authority_index_preserves_complete_source_joins_and_exact_shared_admission() {
+        let mut fixture = Fixture::new(true, false);
+        fixture.authority_budget = Some(budget());
+        let root = fixture.root();
+        let index = fixture.build(budget()).unwrap();
+        assert_eq!(root.format_version, 2);
+        let manifest = index.manifest();
+        assert_eq!(manifest.format_version, 2);
+        let exact = index.represented_work();
+        assert_eq!(fixture.build(exact).unwrap().represented_work(), exact);
+        let bytes = canonical_bytes(&manifest).unwrap();
+        assert_eq!(
+            CatalogCheckpointAuthorityValidation::decode(&bytes, exact).unwrap(),
+            manifest
+        );
+        let mut wrong_version = manifest;
+        wrong_version.format_version = 1;
+        assert!(wrong_version.validate(budget()).is_err());
+        for dimension in 0..3 {
+            let mut short = exact;
+            match dimension {
+                0 => short.bytes -= 1,
+                1 => short.page_occurrences -= 1,
+                _ => short.records -= 1,
+            }
+            assert!(fixture.build(short).is_err(), "dimension {dimension}");
+        }
+        let mut missing = fixture;
+        missing
+            .pages
+            .remove(&missing.paged().value.sources.records.page.hash);
+        assert!(missing.build(budget()).is_err());
     }
 
     #[test]

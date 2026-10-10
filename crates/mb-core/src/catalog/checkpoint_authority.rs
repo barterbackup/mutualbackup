@@ -265,7 +265,7 @@ impl CatalogCheckpointAuthoritySummary {
             sum.checked_add(count).ok_or(CatalogError::Bounds)
         })
     }
-    fn validate(self, complete: bool) -> Result<(), CatalogError> {
+    fn validate_shape(self, complete: bool) -> Result<(), CatalogError> {
         let paged = self
             .revisions
             .checked_sub(self.legacy_revisions)
@@ -275,15 +275,40 @@ impl CatalogCheckpointAuthoritySummary {
             || complete && (self.members == 0 || self.revisions == 0 || self.writer_fences == 0)
             || self.legacy_bytes < self.legacy_revisions
             || self.legacy_pages < self.legacy_revisions
-            || self.legacy_bytes > self.legacy_revisions * V1_MAX_CATALOG_BYTES as u64
+            || self.legacy_bytes
+                > self
+                    .legacy_revisions
+                    .checked_mul(V1_MAX_CATALOG_BYTES as u64)
+                    .ok_or(CatalogError::Bounds)?
+            || self.legacy_pages
+                > self
+                    .legacy_revisions
+                    .checked_mul(CATALOG_MAX_PAGE_OCCURRENCES)
+                    .ok_or(CatalogError::Bounds)?
             || self.source_bytes < paged * 8
             || self.source_pages < paged
+            || self.source_bytes
+                > paged
+                    .checked_mul(CATALOG_MAX_STREAM_BYTES)
+                    .ok_or(CatalogError::Bounds)?
+            || self.source_pages
+                > paged
+                    .checked_mul(CATALOG_MAX_PAGE_OCCURRENCES)
+                    .ok_or(CatalogError::Bounds)?
             || self.legacy_revisions == 0 && (self.legacy_bytes != 0 || self.legacy_pages != 0)
             || paged == 0 && (self.source_bytes != 0 || self.source_pages != 0)
-            || self
-                .legacy_bytes
-                .checked_add(self.source_bytes)
-                .is_none_or(|bytes| bytes > CATALOG_MAX_STREAM_BYTES)
+        {
+            return Err(CatalogError::Bounds);
+        }
+        Ok(())
+    }
+
+    fn validate(self, complete: bool) -> Result<(), CatalogError> {
+        self.validate_shape(complete)?;
+        if self
+            .legacy_bytes
+            .checked_add(self.source_bytes)
+            .is_none_or(|bytes| bytes > CATALOG_MAX_STREAM_BYTES)
             || self
                 .legacy_pages
                 .checked_add(self.source_pages)
@@ -306,24 +331,37 @@ pub struct CatalogCheckpointAuthorityRoot {
 
 impl CatalogCheckpointAuthorityRoot {
     pub fn decode(bytes: &[u8]) -> Result<Self, CatalogError> {
+        let root = Self::decode_inner(bytes)?;
+        root.validate()?;
+        Ok(root)
+    }
+
+    /// The budget comes from the enclosing trusted policy. Format two counts
+    /// all retained body/source occurrences across individually bounded trees;
+    /// it cannot be decoded through the original format-one entry point.
+    pub fn decode_with_budget(
+        bytes: &[u8],
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
+        let root = Self::decode_inner(bytes)?;
+        root.validate_with_budget(budget)?;
+        Ok(root)
+    }
+
+    fn decode_inner(bytes: &[u8]) -> Result<Self, CatalogError> {
         if bytes.is_empty() || bytes.len() > CATALOG_CHECKPOINT_ROOT_BYTES {
             return Err(CatalogError::Bounds);
         }
         let root: Self = decode_canonical(bytes)?;
-        root.validate()?;
         if canonical_bytes_bounded(&root, CATALOG_CHECKPOINT_ROOT_BYTES)? != bytes {
             return Err(CatalogError::InvalidPage);
         }
         Ok(root)
     }
     pub fn validate(self) -> Result<(), CatalogError> {
-        self.records.validate()?;
+        self.validate_shape()?;
         self.summary.validate(true)?;
         if self.format_version != 1
-            || self.generation == 0
-            || self.generation > i64::MAX as u64
-            || self.membership_epoch == 0
-            || self.records.records != self.summary.records()?
             || self.represented_bytes()? > CATALOG_MAX_STREAM_BYTES
             || self.page_occurrences()? > CATALOG_MAX_PAGE_OCCURRENCES
         {
@@ -331,12 +369,58 @@ impl CatalogCheckpointAuthorityRoot {
         }
         Ok(())
     }
+
+    pub fn validate_with_budget(
+        self,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<(), CatalogError> {
+        match self.format_version {
+            1 => self.validate()?,
+            2 => self.validate_shape()?,
+            _ => return Err(CatalogError::Bounds),
+        }
+        budget.remaining_after(self.minimum_work()?)?;
+        Ok(())
+    }
+
+    fn validate_shape(self) -> Result<(), CatalogError> {
+        self.records.validate()?;
+        self.summary.validate_shape(true)?;
+        if self.generation == 0
+            || self.generation > i64::MAX as u64
+            || self.membership_epoch == 0
+            || self.records.records != self.summary.records()?
+        {
+            return Err(CatalogError::Bounds);
+        }
+        Ok(())
+    }
+
+    /// Nested source frame counts are checked before each revision is returned
+    /// by the reader. Flat legacy source entries require the full store join.
+    pub fn minimum_work(self) -> Result<CatalogCodingTraversalBudget, CatalogError> {
+        Ok(CatalogCodingTraversalBudget {
+            bytes: self.represented_bytes()?,
+            page_occurrences: self.page_occurrences()?,
+            records: self
+                .summary
+                .records()?
+                .checked_add(self.summary.legacy_revisions)
+                .ok_or(CatalogError::Bounds)?,
+        })
+    }
+
     pub fn represented_bytes(self) -> Result<u64, CatalogError> {
+        let envelope = match self.format_version {
+            1 => canonical_size_bounded(&self, CATALOG_CHECKPOINT_ROOT_BYTES)? as u64,
+            2 => CATALOG_CHECKPOINT_ROOT_BYTES as u64,
+            _ => return Err(CatalogError::Bounds),
+        };
         [
             self.records.page.byte_len,
             self.summary.legacy_bytes,
             self.summary.source_bytes,
-            canonical_size_bounded(&self, CATALOG_CHECKPOINT_ROOT_BYTES)? as u64,
+            envelope,
         ]
         .into_iter()
         .try_fold(0_u64, |sum, bytes| {
@@ -423,24 +507,42 @@ struct State {
     guild_id: [u8; 32],
     generation: u64,
     epoch: u64,
+    format_version: u16,
+    budget: CatalogCodingTraversalBudget,
+    record_bytes: u64,
+    nested_records: u64,
     summary: CatalogCheckpointAuthoritySummary,
     previous: Option<Order>,
     previous_revision: Option<([u8; 32], u64)>,
 }
 
 impl State {
-    fn new(scope: CatalogScope, generation: u64, epoch: u64) -> Result<Self, CatalogError> {
+    fn new(
+        scope: CatalogScope,
+        generation: u64,
+        epoch: u64,
+        format_version: u16,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
         scope.validate(CatalogSection::Checkpoint)?;
         let CatalogScope::Guild { guild_id } = scope else {
             return Err(CatalogError::InvalidPage);
         };
-        if generation == 0 || generation > i64::MAX as u64 || epoch == 0 {
+        if generation == 0
+            || generation > i64::MAX as u64
+            || epoch == 0
+            || !matches!(format_version, 1 | 2)
+        {
             return Err(CatalogError::Bounds);
         }
         Ok(Self {
             guild_id,
             generation,
             epoch,
+            format_version,
+            budget,
+            record_bytes: 8,
+            nested_records: 0,
             summary: Default::default(),
             previous: None,
             previous_revision: None,
@@ -472,7 +574,11 @@ impl State {
         Ok(Order::Revision(key))
     }
 
-    fn accept(&mut self, record: &CatalogCheckpointAuthorityRecord) -> Result<(), CatalogError> {
+    fn accept(
+        &mut self,
+        record: &CatalogCheckpointAuthorityRecord,
+        encoded_len: usize,
+    ) -> Result<(), CatalogError> {
         use CatalogCheckpointAuthorityRecord as R;
         let order = match record {
             R::Member(member) => {
@@ -526,6 +632,10 @@ impl State {
                 self.summary.legacy_revisions += 1;
                 self.summary.legacy_bytes += reference.body.byte_len;
                 self.summary.legacy_pages += reference.body.page_occurrences;
+                self.nested_records = self
+                    .nested_records
+                    .checked_add(1)
+                    .ok_or(CatalogError::Bounds)?;
                 self.revision(
                     reference.into(),
                     reference.parent,
@@ -541,6 +651,10 @@ impl State {
                 }
                 self.summary.source_bytes += revision.sources.records.page.byte_len;
                 self.summary.source_pages += revision.sources.records.page.page_occurrences;
+                self.nested_records = self
+                    .nested_records
+                    .checked_add(revision.sources.records.records)
+                    .ok_or(CatalogError::Bounds)?;
                 self.revision(
                     revision.into(),
                     revision.parent,
@@ -598,7 +712,44 @@ impl State {
             return Err(CatalogError::InvalidPage);
         }
         self.previous = Some(order);
-        self.summary.validate(false)
+        if self.format_version == 1 {
+            self.summary.validate(false)
+        } else {
+            self.summary.validate_shape(false)?;
+            self.record_bytes = self
+                .record_bytes
+                .checked_add(4 + encoded_len as u64)
+                .ok_or(CatalogError::Bounds)?;
+            if self.record_bytes > CATALOG_MAX_STREAM_BYTES {
+                return Err(CatalogError::Bounds);
+            }
+            // The record builder packs a dense stream. Include its future
+            // index pages before writing a frame or exposing a nested root.
+            let mut nodes = self.record_bytes.div_ceil(CATALOG_LEAF_BYTES as u64);
+            let mut pages = nodes;
+            while nodes > 1 {
+                nodes = nodes.div_ceil(CATALOG_FANOUT as u64);
+                pages = pages.checked_add(nodes).ok_or(CatalogError::Bounds)?;
+            }
+            self.budget.remaining_after(CatalogCodingTraversalBudget {
+                bytes: self
+                    .record_bytes
+                    .checked_add(CATALOG_CHECKPOINT_ROOT_BYTES as u64)
+                    .and_then(|bytes| bytes.checked_add(self.summary.legacy_bytes))
+                    .and_then(|bytes| bytes.checked_add(self.summary.source_bytes))
+                    .ok_or(CatalogError::Bounds)?,
+                page_occurrences: pages
+                    .checked_add(self.summary.legacy_pages)
+                    .and_then(|pages| pages.checked_add(self.summary.source_pages))
+                    .ok_or(CatalogError::Bounds)?,
+                records: self
+                    .summary
+                    .records()?
+                    .checked_add(self.nested_records)
+                    .ok_or(CatalogError::Bounds)?,
+            })?;
+            Ok(())
+        }
     }
 }
 
@@ -613,9 +764,39 @@ impl CatalogCheckpointAuthorityBuilder {
         generation: u64,
         membership_epoch: u64,
     ) -> Result<Self, CatalogError> {
+        Self::new_inner(
+            scope,
+            generation,
+            membership_epoch,
+            1,
+            CatalogCodingTraversalBudget::default(),
+        )
+    }
+
+    pub fn new_with_budget(
+        scope: CatalogScope,
+        generation: u64,
+        membership_epoch: u64,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
+        budget.remaining_after(CatalogCodingTraversalBudget {
+            bytes: 8 + CATALOG_CHECKPOINT_ROOT_BYTES as u64,
+            page_occurrences: 1,
+            records: 0,
+        })?;
+        Self::new_inner(scope, generation, membership_epoch, 2, budget)
+    }
+
+    fn new_inner(
+        scope: CatalogScope,
+        generation: u64,
+        membership_epoch: u64,
+        format_version: u16,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
         Ok(Self {
             records: CatalogRecordBuilder::new(scope, CatalogSection::Checkpoint)?,
-            state: State::new(scope, generation, membership_epoch)?,
+            state: State::new(scope, generation, membership_epoch, format_version, budget)?,
             failed: false,
         })
     }
@@ -630,7 +811,7 @@ impl CatalogCheckpointAuthorityBuilder {
         let result = (|| {
             let bytes = canonical_bytes_bounded(record, CATALOG_CHECKPOINT_RECORD_BYTES)
                 .map_err(CatalogError::from)?;
-            self.state.accept(record)?;
+            self.state.accept(record, bytes.len())?;
             self.records.push_encoded(&bytes, sink)
         })();
         self.failed = result.is_err();
@@ -644,13 +825,17 @@ impl CatalogCheckpointAuthorityBuilder {
             return Err(CatalogError::Failed.into());
         }
         let root = CatalogCheckpointAuthorityRoot {
-            format_version: 1,
+            format_version: self.state.format_version,
             generation: self.state.generation,
             membership_epoch: self.state.epoch,
             records: self.records.finish(sink)?,
             summary: self.state.summary,
         };
-        root.validate()?;
+        if root.format_version == 1 {
+            root.validate()?;
+        } else {
+            root.validate_with_budget(self.state.budget)?;
+        }
         Ok(root)
     }
 }
@@ -669,9 +854,32 @@ impl CatalogCheckpointAuthorityReader {
         root: CatalogCheckpointAuthorityRoot,
     ) -> Result<Self, CatalogError> {
         root.validate()?;
+        Self::new_inner(scope, root, CatalogCodingTraversalBudget::default())
+    }
+
+    pub fn new_with_budget(
+        scope: CatalogScope,
+        root: CatalogCheckpointAuthorityRoot,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
+        root.validate_with_budget(budget)?;
+        Self::new_inner(scope, root, budget)
+    }
+
+    fn new_inner(
+        scope: CatalogScope,
+        root: CatalogCheckpointAuthorityRoot,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
         Ok(Self {
             records: CatalogRecordReader::new(scope, CatalogSection::Checkpoint, root.records)?,
-            state: State::new(scope, root.generation, root.membership_epoch)?,
+            state: State::new(
+                scope,
+                root.generation,
+                root.membership_epoch,
+                root.format_version,
+                budget,
+            )?,
             root,
             failed: false,
         })
@@ -700,12 +908,31 @@ impl CatalogCheckpointAuthorityReader {
             {
                 return Err(CatalogError::InvalidPage.into());
             }
-            self.state.accept(&record)?;
+            self.state.accept(&record, bytes.len())?;
             // Nested closures are consumed by callers after this record is
             // returned. Reject understated counts/work before exposing the
             // offending reference, not only at the final authority EOF.
             if !self.state.summary.within(self.root.summary) {
                 return Err(CatalogError::InvalidPage.into());
+            }
+            if self.root.format_version == 2 {
+                // Reserve the entire authenticated control stream and every
+                // legacy envelope up front. A trailing authority phase must
+                // not lend its record credits to an exposed source closure.
+                let source_records = self
+                    .state
+                    .nested_records
+                    .checked_sub(self.state.summary.legacy_revisions)
+                    .ok_or(CatalogError::Bounds)?;
+                self.state
+                    .budget
+                    .remaining_after(self.root.minimum_work()?.checked_add(
+                        CatalogCodingTraversalBudget {
+                            bytes: 0,
+                            page_occurrences: 0,
+                            records: source_records,
+                        },
+                    )?)?;
             }
             Ok(Some(record))
         })();
@@ -910,6 +1137,243 @@ mod tests {
             records.push(record);
         }
         Ok(records)
+    }
+
+    #[test]
+    fn budgeted_authority_admits_cumulative_history_without_resetting_source_work() {
+        let fixture = Fixture::new(3);
+        // Claimed dense 1 TiB source geometry, signed and repeated in history.
+        // No source bytes are fabricated or counted as a recovery qualification.
+        let sources = (1_u64 << 24) + 1;
+        let source_bytes = 8 + sources * (4 + CATALOG_SECTOR_RECORD_BYTES as u64);
+        let mut nodes = source_bytes.div_ceil(CATALOG_LEAF_BYTES as u64);
+        let mut source_pages = nodes;
+        while nodes > 1 {
+            nodes = nodes.div_ceil(CATALOG_FANOUT as u64);
+            source_pages += nodes;
+        }
+        let mut records = fixture.records[..4].to_vec();
+        let mut parent = fixture.legacy.value.hash().unwrap();
+        for sequence in 2..=33 {
+            let mut body = fixture.paged.value.clone();
+            body.sequence = sequence;
+            body.revision_id = Uuid::from_u128(sequence as u128 + 100);
+            body.parent = Some(parent);
+            body.sources.records.records = sources;
+            body.sources.logical_bytes =
+                (1_u64 << 40) + u64::from(body.metadata.sector.logical_len);
+            body.sources.records.page = CatalogPageRef {
+                hash: [99; 32],
+                encoded_len: 512,
+                height: 3,
+                byte_len: source_bytes,
+                page_occurrences: source_pages,
+            };
+            let signed = body.sign(&fixture.writer, &fixture.owner).unwrap();
+            parent = signed.value.hash().unwrap();
+            records.push(CatalogCheckpointAuthorityRecord::PagedRevision(signed));
+        }
+        let generous = CatalogCodingTraversalBudget {
+            bytes: 128 << 30,
+            page_occurrences: 2_000_000,
+            records: 1 << 30,
+        };
+        let build = |budget| {
+            let mut pages = fixture.pages.clone();
+            let mut builder =
+                CatalogCheckpointAuthorityBuilder::new_with_budget(fixture.scope(), 3, 2, budget)?;
+            let mut sink = |page: CatalogPageRef, bytes| {
+                pages.insert(page.hash, bytes);
+                Ok::<_, &'static str>(())
+            };
+            for record in &records {
+                builder.push(record, &mut sink)?;
+            }
+            Ok::<_, CatalogStreamError<&'static str>>((builder.finish(&mut sink)?, pages))
+        };
+        let (root, pages) = build(generous).unwrap();
+        assert_eq!(root.format_version, 2);
+        assert_eq!(root.summary.source_bytes, source_bytes * 32);
+        assert_eq!(root.summary.source_pages, source_pages * 32);
+        assert!(root.summary.source_bytes > CATALOG_MAX_STREAM_BYTES);
+        assert!(root.summary.source_pages > CATALOG_MAX_PAGE_OCCURRENCES);
+        assert!(root.validate().is_err());
+        assert!(CatalogCheckpointAuthorityRoot::decode(&canonical_bytes(&root).unwrap()).is_err());
+        assert!(CatalogCheckpointAuthorityReader::new(fixture.scope(), root).is_err());
+        let mut exact = root.minimum_work().unwrap();
+        exact.records += sources * 32;
+        assert_eq!(build(exact).unwrap().0, root);
+        assert_eq!(
+            CatalogCheckpointAuthorityRoot::decode_with_budget(
+                &canonical_bytes(&root).unwrap(),
+                exact
+            )
+            .unwrap(),
+            root
+        );
+        let mut reader =
+            CatalogCheckpointAuthorityReader::new_with_budget(fixture.scope(), root, exact)
+                .unwrap();
+        let mut observed = Vec::new();
+        while let Some(record) = reader.next_record(&mut |page| fetch(&pages, page)).unwrap() {
+            observed.push(record);
+        }
+        assert_eq!(observed, records);
+        for dimension in 0..3 {
+            let mut short = exact;
+            match dimension {
+                0 => short.bytes -= 1,
+                1 => short.page_occurrences -= 1,
+                _ => short.records -= 1,
+            }
+            assert!(build(short).is_err());
+            let reader =
+                CatalogCheckpointAuthorityReader::new_with_budget(fixture.scope(), root, short);
+            if dimension < 2 {
+                assert!(reader.is_err());
+                continue;
+            }
+            let mut reader = reader.unwrap();
+            for expected in &records[..records.len() - 1] {
+                assert_eq!(
+                    reader
+                        .next_record(&mut |page| fetch(&pages, page))
+                        .unwrap()
+                        .as_ref(),
+                    Some(expected)
+                );
+            }
+            assert!(matches!(
+                reader.next_record(&mut |page| fetch(&pages, page)),
+                Err(CatalogStreamError::Catalog(CatalogError::Bounds))
+            ));
+            assert!(matches!(
+                reader.next_record::<&str>(&mut |_| panic!("failed reader fetched")),
+                Err(CatalogStreamError::Catalog(CatalogError::Failed))
+            ));
+        }
+        let mut old = root;
+        old.format_version = 1;
+        assert!(old.validate_with_budget(generous).is_err());
+        let mut understated = root;
+        understated.summary.source_bytes -= 1;
+        let mut reader = CatalogCheckpointAuthorityReader::new_with_budget(
+            fixture.scope(),
+            understated,
+            generous,
+        )
+        .unwrap();
+        for _ in 0..records.len() - 1 {
+            assert!(
+                reader
+                    .next_record(&mut |page| fetch(&pages, page))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(matches!(
+            reader.next_record(&mut |page| fetch(&pages, page)),
+            Err(CatalogStreamError::Catalog(CatalogError::InvalidPage))
+        ));
+    }
+
+    #[test]
+    fn budgeted_authority_preserves_original_layout_and_rejects_untrusted_shapes() {
+        let fixture = Fixture::new(3);
+        let (old, pages, _) = fixture.build(&fixture.records);
+        let mut root = old;
+        root.format_version = 2;
+        let mut expected = canonical_bytes(&old).unwrap();
+        expected[0] = 2;
+        assert_eq!(canonical_bytes(&root).unwrap(), expected);
+        let mut budget = root.minimum_work().unwrap();
+        budget.records += fixture.paged.value.sources.records.records;
+        let mut reader =
+            CatalogCheckpointAuthorityReader::new_with_budget(fixture.scope(), root, budget)
+                .unwrap();
+        for record in &fixture.records {
+            assert_eq!(
+                reader
+                    .next_record(&mut |page| fetch(&pages, page))
+                    .unwrap()
+                    .as_ref(),
+                Some(record)
+            );
+        }
+        assert!(
+            reader
+                .next_record(&mut |page| fetch(&pages, page))
+                .unwrap()
+                .is_none()
+        );
+        let mut short = budget;
+        short.records -= 1;
+        let mut reader =
+            CatalogCheckpointAuthorityReader::new_with_budget(fixture.scope(), root, short)
+                .unwrap();
+        for expected in &fixture.records[..4] {
+            assert_eq!(
+                reader
+                    .next_record(&mut |page| fetch(&pages, page))
+                    .unwrap()
+                    .as_ref(),
+                Some(expected)
+            );
+        }
+        // The later binding/attestation frames already own their credits.
+        assert!(matches!(
+            reader.next_record(&mut |page| fetch(&pages, page)),
+            Err(CatalogStreamError::Catalog(CatalogError::Bounds))
+        ));
+        let unlimited = CatalogCodingTraversalBudget {
+            bytes: u64::MAX,
+            page_occurrences: u64::MAX,
+            records: u64::MAX,
+        };
+        for case in 0..7 {
+            let mut changed = root;
+            match case {
+                0 => changed.summary.source_bytes = CATALOG_MAX_STREAM_BYTES + 1,
+                1 => changed.summary.source_pages = CATALOG_MAX_PAGE_OCCURRENCES + 1,
+                2 => changed.summary.legacy_pages = CATALOG_MAX_PAGE_OCCURRENCES + 1,
+                3 => changed.summary.revisions = u64::MAX,
+                4 => changed.records.page.byte_len = CATALOG_MAX_STREAM_BYTES + 1,
+                5 => changed.format_version = 3,
+                _ => changed.summary.legacy_revisions = u64::MAX,
+            }
+            assert!(
+                changed.validate_with_budget(unlimited).is_err(),
+                "case {case}"
+            );
+        }
+        for end in 0..expected.len() {
+            assert!(
+                CatalogCheckpointAuthorityRoot::decode_with_budget(&expected[..end], budget)
+                    .is_err()
+            );
+        }
+        expected.push(0);
+        assert!(CatalogCheckpointAuthorityRoot::decode_with_budget(&expected, budget).is_err());
+        assert!(
+            CatalogCheckpointAuthorityBuilder::new_with_budget(
+                fixture.scope(),
+                3,
+                2,
+                CatalogCodingTraversalBudget::default()
+            )
+            .is_err()
+        );
+        let mut builder =
+            CatalogCheckpointAuthorityBuilder::new_with_budget(fixture.scope(), 3, 2, budget)
+                .unwrap();
+        for record in &fixture.records {
+            builder.push(record, &mut |_, _| Ok::<_, &str>(())).unwrap();
+        }
+        assert!(
+            builder
+                .finish(&mut |_, _| Err::<(), _>("sink failed"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -272,9 +272,10 @@ impl ControlStore {
                 transaction.commit()?;
                 Ok(())
             };
-            let mut authority = CatalogCheckpointAuthorityReader::new(
+            let mut authority = CatalogCheckpointAuthorityReader::new_with_budget(
                 retention.scope(),
                 retention.checkpoint.authority_root,
+                retention.budget,
             )?;
             let mut fetch_authority =
                 |page| self.catalog_page(retention.scope(), CatalogSection::Checkpoint, page);

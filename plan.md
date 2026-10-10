@@ -1421,6 +1421,21 @@ quota increment; normal consumers and the enclosing admission, history,
 generation-floor, installed-artifact/platform/topology and retained 1 TiB
 gates remain open.
 
+Retained public authority now has an explicitly budgeted format two, selected
+by draft paged checkpoint format nine. Each original tree stays bounded, while
+the enclosing proof pays for every retained source/body occurrence and admits
+source-frame debt before exposing nested references. Original formats, signed
+bytes and root identities remain unchanged. Complete public joins and the
+guarded paged owner carry that same budget through original-history proof,
+quorum binding, reopen and bounded cancellation. Frozen local qualification
+passes 524 distinct core/store/paged Node/native cases, formatting, strict
+workspace/all-targets Clippy, all-target compilation and four debug builds.
+Source, seven binaries and 21 embedded protocol/helper inputs match; native
+cleanup is verified. Evidence is in
+`/tmp/mb-m6-history-admission-validation-zjwq8pri`.
+Full private/payload/SQL headroom, dataset/guild admission, normal
+producers and the deferred real retained-capacity gate remain open.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

@@ -27,9 +27,9 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `PackedCatalog` | `id`, `format_version`, `revision`, `parent`, `profile`, `sectors`; each sector descriptor is ordered as `id`, `sector_index`, `flat_root`, `commitment`, `slots` | embedded in checkpoint version 7; the catalog ID and each sector ID are domain-separated BLAKE3 hashes of their canonical bodies |
 | `GuildCheckpoint` | versions 3–4: `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `writer_fences`, `revision_tombstones`, `revisions`, `coding_groups`; versions 5–6 append `authority`; version 7 appends `authority`, `packing_catalog` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes; version 6 introduces root-scoped revision/tombstone records and version 7 maps every retained signed sector through authenticated stable slots to packed coding sectors |
 | `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures; versions 3–4 require every listed member, while versions 5–7 require their epoch-bound guild quorum |
-| `PagedGuildCheckpoint` (draft public header, format 8) | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `event_sequence`, `event_head`, `authority`, `authority_root`, `authority_records`, `packed_sectors`, `packed_sources`, `coding` | `mutualbackup/paged-guild-checkpoint/v1`; hash derive-key context `mutualbackup paged guild checkpoint body v1`; body/transition and production activation remain separate gates |
+| `PagedGuildCheckpoint` (draft public header, formats 8/9) | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `event_sequence`, `event_head`, `authority`, `authority_root`, `authority_records`, `packed_sectors`, `packed_sources`, `coding` | `mutualbackup/paged-guild-checkpoint/v1`; hash derive-key context `mutualbackup paged guild checkpoint body v1`; body/transition and production activation remain separate gates |
 | `QuorumPagedCheckpoint` | `checkpoint`, `signatures` | bounded certificate of paged header signatures under independently trusted current membership/quorum; no member roster is learned from the proposal |
-| `CatalogCheckpointAuthorityRoot` (staging codec, format 1) | `format_version`, `generation`, `membership_epoch`, `records`, `summary` | authenticated by the paged header; no standalone signature or activation |
+| `CatalogCheckpointAuthorityRoot` (staging codec, formats 1/2) | `format_version`, `generation`, `membership_epoch`, `records`, `summary` | authenticated by the paged header; no standalone signature or activation |
 | `CatalogLegacyRevisionRef` (format 1) | `format_version`, `guild_id`, `owner`, `protected_root_id`, `revision_id`, `sequence`, `parent`, `writer_epoch`, `writer_public_key`, `revision_hash`, `body` | `body` authenticates the original signed legacy envelope through guild-scoped Checkpoint pages; original owner/writer domains and revision body hash remain unchanged |
 | `MemberSignature` | `signer`, `signature` | signature domain belongs to containing certificate |
 | `StorageAcknowledgement` | `format_version`, `operation_id`, `guild_id`, `group_id`, `shard_index`, `row`, `root`, `holder` | `mutualbackup/storage-acknowledgement/v1` |
@@ -72,10 +72,26 @@ are bounded to 64 bytes before allocation. The summary fields are ordered as
 `members`, `writer_fences`, `tombstones`, `revisions`, `legacy_revisions`,
 `legacy_bytes`, `legacy_pages`, `source_bytes`, `source_pages`, `bindings`,
 `attestations`. The record stream, fixed root, referenced legacy envelopes and
-paged source roots share the existing 16 GiB represented-metadata and one-million
+paged source roots in format one share the existing 16 GiB represented-metadata and one-million
 page-occurrence budget. Repeated references count toward traversal work.
 `checkpoint-authority-v1.postcard.hex` freezes a deterministic 55-byte root
 binding mixed revisions and both legacy evidence variants.
+
+Authority format two keeps these ordered fields and record/page layouts, but
+requires a trusted cumulative byte/page/record budget at construction, decoding
+and traversal. Every referenced revision tree keeps its original individual
+bounds. All retained occurrences count, including repeated unchanged sources;
+no budget resets at a revision boundary. The root reserves its fixed 1 KiB
+envelope, and readers admit each paged source-frame count before exposing the
+revision reference. Full legacy source entries are admitted by the store join.
+The original unbudgeted entry points accept only format one. Draft checkpoint
+format 9 requires authority format two; format 8 requires authority format one.
+Their field order and signing/hash domains stay unchanged, and the version is
+part of the signed body. Existing format-one retention journals remain bounded
+to the old format; the guarded enclosing paged owner carries the trusted budget
+and supports format two. This removes an aggregate retained-history ceiling;
+complete dataset/guild/private/payload/SQL quotas and normal production paths
+remain separate implementation gates.
 
 Each legacy envelope keeps its original 32 MiB cap and signed bytes; readers
 authenticate all referenced pages before decoding and matching the exact

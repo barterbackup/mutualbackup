@@ -2447,6 +2447,25 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Add explicitly budgeted retained authority format two, keeping each
+      original revision tree bounded while charging cumulative history bytes,
+      page occurrences and source-frame work. Preserve original format-one
+      limits and signed layouts; draft checkpoint format nine selects the new
+      authority. Connect complete public joins and the guarded enclosing owner,
+      with original event/certificate/current-head checks and bounded release.
+      Qualification passes 178 core, 309 ordinary store and 35 paged Node
+      cases, the ordinary certified-writer migration entry point and provisioned
+      native capture/recovery (524 distinct tests). Six new fixtures cover
+      cumulative declared history, dimensional exhaustion, pre-exposure source
+      debt, canonical/version bounds, complete source joins and guarded Store/
+      Node ownership through reopen/cancellation. Formatting, strict locked
+      workspace/all-targets Clippy, all-target test compilation and four debug
+      builds pass. Frozen source, seven binaries and 21 embedded protocol/helper
+      inputs match; native cleanup is verified. Evidence is retained under
+      `/tmp/mb-m6-history-admission-validation-zjwq8pri`.
+      Full private/payload/SQL headroom, dataset/guild policy, normal producers
+      and real retained-capacity gates remain
+      open; the declared-geometry fixture does not store or recover dense data.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

@@ -2,9 +2,9 @@
 //! APIs deliberately provide no production publication/retirement capability.
 
 use mb_core::{
-    KeyMaterial, Member, MemberSignature, PAGED_GUILD_CHECKPOINT_BYTES,
-    PAGED_GUILD_CHECKPOINT_DOMAIN, PAGED_GUILD_CHECKPOINT_VERSION, PagedCheckpointTrust,
-    PagedGuildCheckpoint, QuorumPagedCheckpoint, canonical_bytes_bounded,
+    KeyMaterial, Member, MemberSignature, PAGED_GUILD_CHECKPOINT_BUDGETED_VERSION,
+    PAGED_GUILD_CHECKPOINT_BYTES, PAGED_GUILD_CHECKPOINT_DOMAIN, PAGED_GUILD_CHECKPOINT_VERSION,
+    PagedCheckpointTrust, PagedGuildCheckpoint, QuorumPagedCheckpoint, canonical_bytes_bounded,
 };
 
 use super::checkpoint_validation::{MEMBER_BYTES, MEMBER_RECORDS};
@@ -45,7 +45,11 @@ impl CatalogCheckpointCodingDirectoryIndex {
             }
         }
         let checkpoint = PagedGuildCheckpoint {
-            format_version: PAGED_GUILD_CHECKPOINT_VERSION,
+            format_version: match authority.root.format_version {
+                1 => PAGED_GUILD_CHECKPOINT_VERSION,
+                2 => PAGED_GUILD_CHECKPOINT_BUDGETED_VERSION,
+                _ => return Err(DatabaseError::Integrity.into()),
+            },
             guild_id: trust.guild_id,
             genesis_hash: trust.genesis_hash,
             generation: context.generation,

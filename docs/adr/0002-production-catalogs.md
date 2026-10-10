@@ -4343,3 +4343,76 @@ rerun. Normal producers, enclosing metadata/work
 geometry, sparse/file/Git logical size policy, physical payload/headroom, guild
 quotas, complete history ownership, installed-artifact/platform/topology and
 real retained 1 TiB gates remain open.
+
+## Budgeted retained checkpoint authority (2026-10-10)
+
+Retained source sharing cannot remove traversal debt. A checkpoint referring
+to unchanged revisions still has to authenticate each signed source-tree
+occurrence. The original authority root applied its 16 GiB/one-million-page
+aggregate cap across that history, independently of the supplied enclosing
+proof budget. That ceiling blocked multiple dense 1 TiB revisions even when
+their physical data and immutable pages were shared.
+
+Authority format two preserves the original ordered fields, authority records,
+page format, signed revision bytes and individual tree limits. Explicitly
+budgeted construction, decoding and traversal admit the cumulative referenced
+body/source bytes, pages and record work. The control stream remains bounded
+by its original tree/record ceilings. Each referenced legacy envelope retains
+its original 32 MiB limit; each paged source tree retains its 16 GiB and
+one-million-page limit. Summary bounds also enforce these per-reference maxima
+with checked arithmetic, even when the independently supplied budget is large.
+The original unbudgeted APIs and format-one root retain their previous limits.
+
+The new root reserves a fixed 1 KiB envelope. Construction checks future dense
+control/index work before writing each frame. Decoding checks the complete
+declared byte/page debt before any fetch; traversal reserves all outer records
+and legacy-envelope records before admitting a paged source-frame count and
+exposing its revision. Trailing bindings/attestations cannot lend their record
+credits to a referenced source closure. Understated summaries reject before
+exposing the offending reference, and errors permanently fence that reader or
+builder. The full store join still authenticates all body/source EOFs and
+charges flat legacy source entries against the same budget.
+
+The local authority-proof descriptor selects format two for these roots. Draft
+paged checkpoint format nine requires authority format two, while format eight
+continues to require format one. Field orders and signing/hash domains remain
+unchanged; each version is part of its signed body. The public join, certified
+history transition, exact quorum binding and guarded enclosing owner carry the
+same trusted budget. Original event authority, current predecessor checks,
+local typed EOF, replay, cancellation and bounded root release remain required.
+The standalone format-one authority-retention journal stays at its old limits;
+the guarded paged owner retains the new format. Normal producers remain off.
+
+Six new fixtures cover cumulative declared source geometry for 32 retained
+1 TiB revisions, exact and exhausted dimensions, pre-exposure debt for trailing
+authority phases, corrupt/unsupported summaries and canonical decoding,
+original root layout, version-bound header/quorum checks, complete actual
+mixed-source joins, original-history ownership and Node reopen/cancellation.
+The large-geometry fixture signs and streams real small authority records but
+does not materialize or recover its claimed dense source trees. It is admission
+arithmetic and codec coverage, not retained-capacity qualification.
+
+Qualification passes all 178 core and 309 ordinary store tests, 35 paged Node
+cases, the ordinary certified-writer retained-migration entry point and the
+provisioned Btrfs retained native capture/recovery fixture (524 distinct tests).
+The ordinary suites exclude 26 store cases and one selected native case,
+provisioned separately. The paged-module selection already includes the
+legacy-information activation/custody/evacuation case; the distinct inventory
+counts it once. Formatting, strict locked workspace/all-targets Clippy,
+all-target test compilation and all four debug program builds pass under
+Cargo/rustc 1.99.0. Frozen Rust/Cargo source, seven binaries and 21 unchanged
+embedded protocol/helper inputs match in the independent audit. Native mount,
+loop and image cleanup is verified. The first harness stopped before creating
+its fixture because Btrfs tools were absent from the turn's PATH; qualification
+resumed with the installed Nix tools against the same frozen binaries. Both
+the initial harness evidence and resume driver are retained. Logs, manifests,
+the complete distinct passing-case inventory and audits are in
+`/tmp/mb-m6-history-admission-validation-zjwq8pri`. This is focused debug-source
+qualification; other ordinary/native suites and installed artifacts were not
+rerun.
+
+Full private/bootstrap/payload
+and SQL/WAL headroom, dataset/history/guild policy, exact incremental sharing,
+normal capture/packing/coding/checkpoint/retention/seed-only recovery, native
+platforms, topology diagnosis and installed-artifact gates remain open. The
+user-deferred real dense 1 TiB run remains a separate acceptance gate.

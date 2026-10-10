@@ -155,6 +155,19 @@ fn checkpoint_owner_proof_at(
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
+    checkpoint_owner_proof_at_with_budgeted_authority(node, keys, private, expires, false)
+}
+
+fn checkpoint_owner_proof_at_with_budgeted_authority(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+    expires: u64,
+    budgeted: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
     use mb_core::{
         CatalogBuilder, CatalogCheckpointAuthorityBuilder, CatalogCheckpointAuthorityRecord as R,
         CatalogCodingDirectoryBuilder, CatalogLegacyRevisionRef, CatalogPackedSectorBuilder,
@@ -358,8 +371,17 @@ fn checkpoint_owner_proof_at(
         .unwrap();
     let legacy = legacy.finish(&mut sink).unwrap();
     let reference = CatalogLegacyRevisionRef::from_signed(guild, &revision, legacy).unwrap();
-    let mut authority =
-        CatalogCheckpointAuthorityBuilder::new(scope, 1, trust.authority.membership_epoch).unwrap();
+    let mut authority = if budgeted {
+        CatalogCheckpointAuthorityBuilder::new_with_budget(
+            scope,
+            1,
+            trust.authority.membership_epoch,
+            work,
+        )
+    } else {
+        CatalogCheckpointAuthorityBuilder::new(scope, 1, trust.authority.membership_epoch)
+    }
+    .unwrap();
     for member in &trust.members {
         authority
             .push(&R::Member(member.clone()), &mut sink)
@@ -1323,8 +1345,27 @@ fn legacy_information_activation_upgrade_authenticates_history_and_evacuates_sha
 
 #[test]
 fn paged_checkpoint_metadata_node_owner_uses_original_index_and_survives_capture_retirement() {
+    exercise_checkpoint_metadata_owner(false);
+}
+
+#[test]
+fn paged_checkpoint_budgeted_metadata_node_owner_preserves_original_authority_through_reopen() {
+    exercise_checkpoint_metadata_owner(true);
+}
+
+fn exercise_checkpoint_metadata_owner(budgeted: bool) {
     let (temp, seed, mut node, keys) = fixture();
-    let (proof, intents) = checkpoint_owner_proof(&mut node, &keys);
+    let (proof, intents) = checkpoint_owner_proof_at_with_budgeted_authority(
+        &mut node,
+        &keys,
+        false,
+        unix_seconds() + 600,
+        budgeted,
+    );
+    assert_eq!(
+        proof.certificate().checkpoint.format_version,
+        if budgeted { 9 } else { 8 }
+    );
     let flat = node
         .control
         .get_record("guild-dynamic-state", KEY)

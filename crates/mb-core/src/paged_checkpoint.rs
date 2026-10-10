@@ -15,6 +15,8 @@ use crate::{
 };
 
 pub const PAGED_GUILD_CHECKPOINT_VERSION: u16 = 8;
+/// Budgeted retained authority across independently bounded revision trees.
+pub const PAGED_GUILD_CHECKPOINT_BUDGETED_VERSION: u16 = 9;
 pub const PAGED_GUILD_CHECKPOINT_BYTES: usize = 4096;
 pub const PAGED_QUORUM_CHECKPOINT_BYTES: usize = 32768;
 pub const PAGED_GUILD_CHECKPOINT_DOMAIN: &[u8] = b"mutualbackup/paged-guild-checkpoint/v1";
@@ -136,11 +138,13 @@ impl PagedGuildCheckpoint {
             guild_id: self.guild_id,
         }
         .validate(CatalogSection::Checkpoint)?;
-        self.authority_root.validate()?;
+        self.authority_root.validate_with_budget(budget)?;
         self.packed_sectors.validate()?;
         self.packed_sources.validate()?;
-        if self.format_version != PAGED_GUILD_CHECKPOINT_VERSION
-            || self.genesis_hash == [0; 32]
+        if !matches!(
+            (self.format_version, self.authority_root.format_version),
+            (PAGED_GUILD_CHECKPOINT_VERSION, 1) | (PAGED_GUILD_CHECKPOINT_BUDGETED_VERSION, 2)
+        ) || self.genesis_hash == [0; 32]
             || self.event_head == [0; 32]
             || self.event_sequence > i64::MAX as u64
             || self.generation != self.authority_root.generation
@@ -478,6 +482,59 @@ mod tests {
             checkpoint,
             signatures,
         }
+    }
+
+    #[test]
+    fn budgeted_checkpoint_headers_admit_history_only_under_the_supplied_full_budget() {
+        let (old, trust, keys) = fixture();
+        let mut checkpoint = old;
+        checkpoint.format_version = PAGED_GUILD_CHECKPOINT_BUDGETED_VERSION;
+        checkpoint.authority_root.format_version = 2;
+        // Header admission only; the complete store proof must authenticate
+        // these claimed referenced roots/EOFs before signing or retention.
+        checkpoint.authority_root.summary.revisions = 33;
+        checkpoint.authority_root.summary.source_bytes = 32 * (2 << 30);
+        checkpoint.authority_root.summary.source_pages = 32 * 36_000;
+        checkpoint.authority_root.records.records += 31;
+        checkpoint.authority_records += 31;
+        let root = &mut checkpoint.authority_root.records.page;
+        root.byte_len += 31 * 512;
+        let budget = checkpoint.represented_work().unwrap();
+        let quorum = certificate(checkpoint, &keys);
+        quorum.verify_header(&trust, budget).unwrap();
+        assert_eq!(
+            QuorumPagedCheckpoint::decode_header(
+                &canonical_bytes(&quorum).unwrap(),
+                &trust,
+                budget
+            )
+            .unwrap(),
+            quorum
+        );
+        for dimension in 0..3 {
+            let mut short = budget;
+            match dimension {
+                0 => short.bytes -= 1,
+                1 => short.page_occurrences -= 1,
+                _ => short.records -= 1,
+            }
+            assert!(quorum.verify_header(&trust, short).is_err());
+        }
+        for (version, authority_version) in [(8, 2), (9, 1), (10, 2)] {
+            let mut changed = checkpoint;
+            changed.format_version = version;
+            changed.authority_root.format_version = authority_version;
+            assert!(changed.validate_header(unlimited()).is_err());
+        }
+        let mut changed = old;
+        changed.format_version = 9;
+        changed.authority_root.format_version = 2;
+        assert_ne!(changed.hash().unwrap(), old.hash().unwrap());
+        assert!(
+            certificate(old, &keys)
+                .verify_header(&trust, old.represented_work().unwrap())
+                .is_ok()
+        );
     }
 
     #[test]
