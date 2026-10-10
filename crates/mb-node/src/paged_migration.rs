@@ -205,6 +205,18 @@ impl RetainedLegacyMigration {
             return Ok(revision);
         }
         let authority = PagedLegacyDataAuthority::new(keys, guild_id, legacy)?;
+        let data_capacity = mb_store::CatalogRetainedSourceReservation {
+            logical_bytes: legacy
+                .value
+                .data_sectors
+                .iter()
+                .try_fold(0_u64, |bytes, source| {
+                    bytes
+                        .checked_add(u64::from(source.logical_len))
+                        .context("migration data-source bytes overflow")
+                })?,
+            sources: legacy.value.data_sectors.len() as u64,
+        };
         let roles = self.roles();
         let private = PagedPrivateMetadata::convert_legacy_revision_with_admission(
             keys,
@@ -213,6 +225,11 @@ impl RetainedLegacyMigration {
             load,
             &mut |preview, capacities| {
                 let write_journal = || -> Result<()> {
+                    control.reserve_catalog_retained_sources_in_transaction(
+                        self.0.id,
+                        self.0.scope,
+                        data_capacity,
+                    )?;
                     control.put_record_if_absent(JOURNAL, self.0.id.as_bytes(), &journal)?;
                     self.require_active(control)
                 };
@@ -383,6 +400,7 @@ impl RetainedLegacyMigration {
             // Cancellation also fences roles not reached before interruption.
             control.fence_catalog(intent)?;
         }
+        control.cancel_catalog_retained_source_reservation(self.0.id, self.0.scope)?;
         self.drain_sources(control)
     }
 

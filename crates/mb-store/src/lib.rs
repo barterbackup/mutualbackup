@@ -66,6 +66,7 @@ pub use database::{
     CatalogPackingSector, CatalogPackingValidation, CatalogPageReservation,
     CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,
     CatalogPayloadRetirementView, CatalogPublicationView, CatalogQuorumPagedCheckpointIndex,
+    CatalogRetainedSourceQuota, CatalogRetainedSourceReservation, CatalogRetainedSourceUsage,
     CatalogSectorSource, CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage,
     CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink, CheckpointRow, ControlStore,
     DatabaseError, DatabaseShellResult, KindedProtocolRecordMetadata, KindedProtocolRecordRow,

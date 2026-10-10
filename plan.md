@@ -1398,6 +1398,29 @@ This connects the encoded-page limit to retained migration; enclosing logical
 data/payload headroom, SQL/WAL, traversal, dataset/history/guild policy, normal
 producers and verified generation-floor retirement remain open.
 
+Retained-source quotas now account for unique retained authenticated data
+sources independently in each dataset. Migration reserves a conservative
+original-source bound in the same writer as its page roles and journal;
+publication converts only newly retained identities and returns unused credits.
+Shared sources remain charged until their last retained binding is cleaned up,
+including cancelled owners, while source-location repair leaves accounting
+unchanged. This counts non-hole source logical bytes and source cardinality;
+sparse lengths, aliases, private/bootstrap metadata, physical payload/parity and
+guild limits still need enclosing policy. Exact incremental sharing admission
+also needs durable dependency ownership across the admission/publication
+interval. Initial enablement over existing paged bindings requires bounded
+adoption and currently rejects before mutation. Frozen qualification passes
+518 distinct core/store/Node/native cases, including legacy formats 1/3/4/5,
+joint data/page/journal rollback, interrupted publication, final shared-owner
+cleanup and quota-enabled Btrfs capture/recovery with repeated source IDs and
+checked repair. Formatting, strict locked workspace/all-targets Clippy,
+all-target compilation, four debug program builds, source/seven-binary hashes
+and native cleanup pass. Evidence is retained under
+`/tmp/mb-m6-retained-source-validation-za4kq3hy`. These tests qualify this local
+quota increment; normal consumers and the enclosing admission, history,
+generation-floor, installed-artifact/platform/topology and retained 1 TiB
+gates remain open.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

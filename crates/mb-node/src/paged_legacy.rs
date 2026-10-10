@@ -758,6 +758,21 @@ mod tests {
             open_reservations: 5,
         };
         let initial = store.configure_catalog_storage_quota(quota).unwrap();
+        let data_bytes = legacy
+            .value
+            .data_sectors
+            .iter()
+            .map(|source| u64::from(source.logical_len))
+            .sum::<u64>();
+        let data_quota = mb_store::CatalogRetainedSourceQuota {
+            logical_bytes: data_bytes - 1,
+            sources: legacy.value.data_sectors.len() as u64,
+            open_reservations: 1,
+        };
+        store
+            .configure_catalog_retained_source_quota(data_quota)
+            .unwrap();
+        let empty_data_usage = store.catalog_retained_source_usage(scope()).unwrap();
         assert!(
             migration
                 .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
@@ -776,6 +791,32 @@ mod tests {
             .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
                 open_reservations: 6,
                 ..quota
+            })
+            .unwrap();
+        // Source admission fails after every page role was valid, rolling
+        // those reservations back together with the immutable journal.
+        assert!(
+            migration
+                .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
+                    sources[id].clone()
+                ))
+                .is_err()
+        );
+        assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        assert_eq!(
+            store.catalog_retained_source_usage(scope()).unwrap(),
+            empty_data_usage
+        );
+        assert!(
+            crate::RetainedLegacyMigration::load(&store, &keys(), id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.records("catalog-intent-v1").unwrap().is_empty());
+        store
+            .configure_catalog_retained_source_quota(mb_store::CatalogRetainedSourceQuota {
+                logical_bytes: data_bytes,
+                ..data_quota
             })
             .unwrap();
         store.database_shell_statement("CREATE TEMP TRIGGER ignore_quota_journal BEFORE INSERT ON protocol_records WHEN NEW.kind = 'paged-legacy-migration-v1' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
@@ -808,6 +849,13 @@ mod tests {
         assert_eq!(admitted.open_reservations, 6);
         assert!(admitted.reserved_page_bytes > 0);
         assert_eq!(admitted.stored_pages, 0);
+        let admitted_data = store
+            .catalog_retained_source_usage(scope())
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted_data.reserved_logical_bytes, data_bytes);
+        assert_eq!(admitted_data.open_reservations, 1);
+        assert_eq!(admitted_data.stored_sources, 0);
         drop(store);
         let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
         let pending = crate::RetainedLegacyMigration::load(&store, &keys(), id)
@@ -816,6 +864,10 @@ mod tests {
         pending.cancel(&store).unwrap();
         while pending.cleanup_step(&store).unwrap() {}
         assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
+        assert_eq!(
+            store.catalog_retained_source_usage(scope()).unwrap(),
+            empty_data_usage
+        );
         assert!(
             !store
                 .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
@@ -848,6 +900,10 @@ mod tests {
         while store.collect_catalog_page().unwrap() {}
         assert_eq!(store.catalog_storage_usage().unwrap(), Some(initial));
         assert_eq!(
+            store.catalog_retained_source_usage(scope()).unwrap(),
+            empty_data_usage
+        );
+        assert_eq!(
             store
                 .get_record("user-revision", legacy.value.revision_id.as_bytes())
                 .unwrap()
@@ -871,6 +927,23 @@ mod tests {
                     pages: 64,
                     open_reservations: 8,
                 })
+                .unwrap();
+            let data_bytes = legacy
+                .value
+                .data_sectors
+                .iter()
+                .map(|source| u64::from(source.logical_len))
+                .sum::<u64>();
+            store
+                .configure_catalog_retained_source_quota(mb_store::CatalogRetainedSourceQuota {
+                    logical_bytes: data_bytes * 2,
+                    sources: legacy.value.data_sectors.len() as u64 * 2,
+                    open_reservations: 2,
+                })
+                .unwrap();
+            let empty_data_usage = store
+                .catalog_retained_source_usage(scope())
+                .unwrap()
                 .unwrap();
             let original = canonical_bytes(&legacy).unwrap();
             store
@@ -908,6 +981,18 @@ mod tests {
             assert_eq!(published_usage.reserved_page_bytes, 0);
             assert_eq!(published_usage.reserved_pages, 0);
             assert!(published_usage.stored_pages >= if version >= 4 { 6 } else { 3 });
+            let published_data_usage = store
+                .catalog_retained_source_usage(scope())
+                .unwrap()
+                .unwrap();
+            assert_eq!(published_data_usage.stored_logical_bytes, data_bytes);
+            assert_eq!(
+                published_data_usage.stored_sources,
+                legacy.value.data_sectors.len() as u64
+            );
+            assert_eq!(published_data_usage.open_reservations, 0);
+            assert_eq!(published_data_usage.reserved_logical_bytes, 0);
+            assert_eq!(published_data_usage.reserved_sources, 0);
             assert_eq!(migrated.value.parent, Some(legacy.value.hash().unwrap()));
             assert_eq!(migrated.value.sequence, legacy.value.sequence + 1);
             assert!(
@@ -943,6 +1028,10 @@ mod tests {
                 store.catalog_storage_usage().unwrap(),
                 Some(published_usage)
             );
+            assert_eq!(
+                store.catalog_retained_source_usage(scope()).unwrap(),
+                Some(published_data_usage)
+            );
             drop(store);
             let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
             let migration = crate::RetainedLegacyMigration::load(&store, &keys(), id)
@@ -971,6 +1060,10 @@ mod tests {
                 sources[&legacy.value.data_sectors[0].id]
             );
             migration.cancel(&store).unwrap();
+            assert_eq!(
+                store.catalog_retained_source_usage(scope()).unwrap(),
+                Some(published_data_usage)
+            );
             while migration.cleanup_step(&store).unwrap() {}
             while store.collect_catalog_page().unwrap() {}
             assert_eq!(
@@ -1003,6 +1096,10 @@ mod tests {
             );
             shared.cancel(&store).unwrap();
             while shared.cleanup_step(&store).unwrap() {}
+            assert_eq!(
+                store.catalog_retained_source_usage(scope()).unwrap(),
+                Some(empty_data_usage)
+            );
             assert!(
                 !store
                     .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
@@ -1176,6 +1273,19 @@ mod tests {
         let path = temp.path().join("control.db");
         let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
         let (legacy, sources, _) = fixture(5, 3, PAYLOAD);
+        store
+            .configure_catalog_retained_source_quota(mb_store::CatalogRetainedSourceQuota {
+                logical_bytes: legacy
+                    .value
+                    .data_sectors
+                    .iter()
+                    .map(|source| u64::from(source.logical_len))
+                    .sum(),
+                sources: legacy.value.data_sectors.len() as u64,
+                open_reservations: 1,
+            })
+            .unwrap();
+        let empty_data_usage = store.catalog_retained_source_usage(scope()).unwrap();
         let original = canonical_bytes(&legacy).unwrap();
         store
             .put_record(
@@ -1241,6 +1351,10 @@ mod tests {
             .unwrap()
             .unwrap();
         while cancelled.cleanup_step(&store).unwrap() {}
+        assert_eq!(
+            store.catalog_retained_source_usage(scope()).unwrap(),
+            empty_data_usage
+        );
         assert!(
             migration
                 .retain(&store, &keys(), &legacy, &writer, &mut |id| Ok(
@@ -1265,6 +1379,16 @@ mod tests {
                 .is_err()
         );
         assert!(store.paged_revision_catalog(id).unwrap().is_none());
+        let pending_data = store
+            .catalog_retained_source_usage(scope())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_data.stored_sources, 0);
+        assert_eq!(pending_data.open_reservations, 1);
+        assert_eq!(
+            pending_data.reserved_sources,
+            legacy.value.data_sectors.len() as u64
+        );
         assert!(
             !store
                 .paged_data_anchor_is_pinned(anchor.locator.anchor_id)
@@ -1342,6 +1466,10 @@ mod tests {
             .unwrap();
         migration.cancel(&store).unwrap();
         while migration.cleanup_step(&store).unwrap() {}
+        assert_eq!(
+            store.catalog_retained_source_usage(scope()).unwrap(),
+            empty_data_usage
+        );
         assert!(
             !store
                 .paged_data_anchor_is_pinned(anchor.locator.anchor_id)

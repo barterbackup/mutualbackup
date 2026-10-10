@@ -379,6 +379,7 @@ impl ControlStore {
             bundle,
         })?;
         bundle::publish_bundle(&transaction, bundle)?;
+        retained_source_quota::close(&transaction, bundle.id, bundle.scope, false)?;
         native_validation::link_publication(&transaction, bundle.id)?;
         insert_exact(
             &transaction,
@@ -581,6 +582,7 @@ impl ControlStore {
         let signed = revision(&current.bundle)?;
         native_validation::cancel_linked_publication(&transaction, id)?;
         bundle::cancel_bundle(&transaction, id)?;
+        retained_source_quota::close(&transaction, id, current.bundle.scope, true)?;
         for kind in [
             REVISION.to_owned(),
             bootstrap_pins(signed.value.metadata.sector.id),

@@ -148,6 +148,7 @@ pub(super) fn bind(
         {
             return Err(DatabaseError::Conflict.into());
         }
+        retained_source_quota::require_binding(connection, bundle.id, bundle.scope, source)?;
         return Ok(());
     }
     let previous = anchor_count(connection, anchor)?;
@@ -155,7 +156,13 @@ pub(super) fn bind(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(DatabaseError::CapacityExceeded)?;
+    retained_source_quota::bind(connection, bundle.id, bundle.scope, source)?;
     insert_exact(connection, &kind, &source.sector.id, &encoded)?;
+    if bounded_record(connection, &kind, &source.sector.id, RECORD_LIMIT)?.as_deref()
+        != Some(encoded.as_slice())
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
     change_anchor_count(connection, anchor, previous, next)
 }
 
@@ -179,6 +186,13 @@ pub(super) fn read_source(
     {
         return Err(DatabaseError::Integrity.into());
     }
+    retained_source_quota::require_charge(
+        connection,
+        id,
+        catalog.bundle.scope,
+        &record.source,
+        false,
+    )?;
     Ok(Some(PagedCatalogDataSource {
         catalog,
         source: record.source,
@@ -347,11 +361,8 @@ impl ControlStore {
     /// writer transaction. Shared revisions and other sectors retain their pins.
     pub fn release_paged_revision_data_source(&self, id: Uuid) -> Result<bool, CatalogStoreError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        if paged_revision::snapshot(&tx, id)?
-            .ok_or(DatabaseError::NotReady)?
-            .state
-            != CatalogBundleState::Cancelled
-        {
+        let catalog = paged_revision::snapshot(&tx, id)?.ok_or(DatabaseError::NotReady)?;
+        if catalog.state != CatalogBundleState::Cancelled {
             return Err(DatabaseError::Conflict.into());
         }
         let kind = sources(id);
@@ -377,9 +388,11 @@ impl ControlStore {
                 "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
                 params![kind, key],
             )? != 1
+                || bounded_record(&tx, &kind, &key, RECORD_LIMIT)?.is_some()
             {
                 return Err(DatabaseError::Conflict.into());
             }
+            retained_source_quota::release(&tx, id, catalog.bundle.scope, &record.source)?;
             change_anchor_count(&tx, record.anchor, Some(count), count - 1)?;
             true
         } else {

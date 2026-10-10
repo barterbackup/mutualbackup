@@ -33,6 +33,7 @@ mod paged_checkpoint_revision;
 mod paged_data;
 mod paged_revision;
 mod paged_sector;
+mod retained_source_quota;
 mod retention_journal;
 mod source;
 mod storage_quota;
@@ -87,6 +88,9 @@ pub use paged_checkpoint_retention::{
 pub use paged_data::{PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource};
 pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCatalogSnapshot};
 pub use paged_sector::PagedCatalogSectorSource;
+pub use retained_source_quota::{
+    CatalogRetainedSourceQuota, CatalogRetainedSourceReservation, CatalogRetainedSourceUsage,
+};
 pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSectorSource, CatalogSourceSweep};
 pub use storage_quota::{CatalogPageReservation, CatalogStorageQuota, CatalogStorageUsage};
 
@@ -98,6 +102,10 @@ const RECORD_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum CatalogStoreError {
+    #[error(
+        "retained data-source quota is exhausted; finish cancelled-source cleanup or increase the dataset limit"
+    )]
+    RetainedSourceQuotaExceeded,
     #[error("too many retired paged sector owners; finish source cleanup before retrying")]
     PagedSourceLookupLimit,
     #[error(transparent)]

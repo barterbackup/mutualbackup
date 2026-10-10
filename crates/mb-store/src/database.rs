@@ -53,6 +53,7 @@ pub use catalog::{
     CatalogPackingSector, CatalogPackingValidation, CatalogPageReservation,
     CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,
     CatalogPayloadRetirementView, CatalogPublicationView, CatalogQuorumPagedCheckpointIndex,
+    CatalogRetainedSourceQuota, CatalogRetainedSourceReservation, CatalogRetainedSourceUsage,
     CatalogSectorSource, CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage,
     CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES,
     PagedCatalogDataSource, PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,

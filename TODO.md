@@ -2505,6 +2505,34 @@ and native-platform gates remain open.
       `/tmp/mb-m6-page-admission-validation-lqep397s`.
       Complete enclosing admission, logical retained data and payload headroom,
       normal producers, generation floors and retained 1 TiB gates remain open.
+    - [x] Reserve unique retained authenticated data-source bytes/counts per
+      dataset with immutable replay and independent open-job limits. Explicit
+      retained migration must reserve data, all page roles and its journal in
+      one writer, then convert credits with authenticated data/anchor binding
+      in publication. Charge shared sources once across retained revisions,
+      keep cancelled owners billed until bounded final-owner cleanup, and keep
+      repair/source replacement neutral. Reject initial enablement over existing
+      paged bindings until bounded adoption is implemented; grow-only policy
+      changes preserve outstanding dataset reservations. Qualification passes
+      175 core, 307 ordinary store, 34 paged Node and the ordinary certified-
+      writer migration case, plus quota-enabled native capture/recovery (518
+      distinct cases). Four new store fixtures cover concurrent/dimensional
+      exhaustion, replay, sharing and last-owner cleanup, independent datasets,
+      read-only/reopen behavior, SQL faults, corrupt/missing accounting and
+      initial adoption rejection. Existing migration cases cover data/page/
+      journal rollback, interrupted publication, cancellation and legacy formats
+      1/3/4/5. The real Btrfs fixture verifies repeated source IDs are charged
+      once, shared migrations, source loss and checked repair. Formatting,
+      strict locked workspace/all-targets Clippy, all-target test compilation
+      and four debug builds pass; frozen source/seven-binary hashes and native
+      cleanup are verified. Evidence is retained under
+      `/tmp/mb-m6-retained-source-validation-za4kq3hy`.
+      This counts unique non-hole data-source logical bytes, excluding sparse
+      length, aliases, private/bootstrap metadata and physical parity/payload
+      allocation; complete dataset/history/guild admission remains required.
+      Conservative migration reservations can need temporary sharing headroom.
+      Bounded existing-paged adoption, exact incremental dependency admission,
+      normal consumers and verified generation floors remain open.
   - [x] Join full/compact packing descriptors and source streams through a
     disposable encrypted index. Require a source-authority callback; reject
     duplicate/missing mappings, incomplete coverage, false virtual zeros and

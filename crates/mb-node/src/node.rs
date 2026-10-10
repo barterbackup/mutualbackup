@@ -18041,6 +18041,13 @@ pub(crate) mod tests {
         std::fs::write(source.join("nested/dense"), b"changed working bytes").unwrap();
         let operation = Uuid::new_v4();
         node.control
+            .configure_catalog_retained_source_quota(mb_store::CatalogRetainedSourceQuota {
+                logical_bytes: 1_u64 << 40,
+                sources: mb_core::CATALOG_MAX_RECORDS,
+                open_reservations: 8,
+            })
+            .unwrap();
+        node.control
             .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
                 page_bytes: 1024 * 1024,
                 pages: 64,
@@ -18052,12 +18059,43 @@ pub(crate) mod tests {
         let page_usage = node.control.catalog_storage_usage().unwrap().unwrap();
         assert_eq!(page_usage.open_reservations, 0);
         assert_eq!(page_usage.reserved_page_bytes, 0);
+        let retained_scope = crate::paged_data::legacy_revision_scope(&node.keys, guild, &legacy)
+            .unwrap()
+            .0;
+        let data_usage = node
+            .control
+            .catalog_retained_source_usage(retained_scope)
+            .unwrap()
+            .unwrap();
+        let unique_data = legacy
+            .value
+            .data_sectors
+            .iter()
+            .map(|source| (source.id, source.logical_len))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            data_usage.stored_logical_bytes,
+            unique_data
+                .values()
+                .map(|length| u64::from(*length))
+                .sum::<u64>()
+        );
+        assert_eq!(data_usage.stored_sources, unique_data.len() as u64);
+        assert_eq!(data_usage.open_reservations, 0);
+        assert_eq!(data_usage.reserved_logical_bytes, 0);
+        assert_eq!(data_usage.reserved_sources, 0);
         let shared_operation = Uuid::new_v4();
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, shared_operation)
             .unwrap();
         assert_eq!(
             node.control.catalog_storage_usage().unwrap(),
             Some(page_usage)
+        );
+        assert_eq!(
+            node.control
+                .catalog_retained_source_usage(retained_scope)
+                .unwrap(),
+            Some(data_usage)
         );
         drop(node);
         let mut node = Node::open(&state, seed).unwrap();

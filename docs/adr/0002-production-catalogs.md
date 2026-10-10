@@ -4272,3 +4272,74 @@ debug-source qualification, not complete ordinary/native or installed-artifact
 qualification. The user deferred real dense 1 TiB and native Windows/macOS
 qualification on 2026-10-10 until implementation/other items are ready and
 external resources are available; those acceptance gates remain open.
+
+## Retained data-source reservations (2026-10-10)
+
+The local page ledger now composes with a separate dataset-wide source quota.
+Its version-one policy applies independently to each dataset scope. Logical
+source bytes count each exact authenticated data sector once across all retained
+paged revisions in that dataset. Hard-link/native/Git reuse and unchanged
+history can share a source charge; other protected roots are independently
+billed. This metric excludes sparse file holes and alias lengths, private pages,
+bootstrap metadata, encoded catalog storage and physical coding/parity payloads.
+Those remain separate enclosing policy dimensions.
+
+Explicit legacy migration reserves its complete original data-source upper
+bound in the same writer as all page roles and its immutable journal, after
+authenticated preflight. A late data-quota failure rolls back the page prefix.
+Source publication converts only newly retained identities from reserved to
+stored credits in the same transaction as the source recipe, native anchor pin,
+root bundle and publication marker. Shared sources consume no new credits.
+Migration's conservative original-source reservation can require temporary
+headroom even when publication will share existing sources. Exact incremental
+admission must also retain every shared dependency across its admission/publication
+interval; skipping credits after an unpinned lookup would race retirement.
+Publication returns every unused credit; cancellation closes open reservations
+and permanently fences the ID. Already published data remains charged until
+bounded source-binding cleanup releases its last retained owner. Repair and
+checked source-location replacement keep the same identity/charge.
+
+Reads verify the policy marker, bounded canonical ledger/reservation/charge,
+scope, original capacity, exact source commitment and owner count. Ignored or
+reverted writes fail closed under their enclosing writer. A dedicated error
+names source-quota exhaustion and its cleanup/increase remedy. Policy limits
+can grow without scanning every dataset; reductions reject. Initial enablement
+rejects any existing paged data binding or stale accounting record before
+mutation. Existing flat sources acquire charges through authenticated explicit
+migration; bounded adoption of existing paged bindings and full retained flat
+history accounting remain required. Closed IDs await verified generation floors.
+
+The ordinary legacy-format and provisioned native recovery fixtures use both
+quotas. Qualification passes 175 core, 307 ordinary store and 34 paged Node
+cases, the ordinary certified-writer migration entry point, and the provisioned
+native capture/recovery fixture (518 distinct cases). Four new store fixtures
+cover simultaneous connections, exact replay, independent dimensions/datasets,
+sharing and final-owner cleanup, cancellation fences, read-only/reopen behavior,
+1 TiB reservation arithmetic, SQL faults, initial adoption rejection and
+missing/corrupt accounting, including loss of both policy records. The arithmetic
+fixture reserves counters only; it does not store or recover a dense 1 TiB.
+Legacy formats 1/3/4/5 exercise configured sharing and final cleanup; existing
+interruption cases cover joint data/page/journal admission and rollback of
+source binding and credits with an ignored publication marker.
+
+Native qualification passes in 36.49 seconds on disposable Btrfs. It checks
+deduplicated bytes/counts against unique original source IDs, both shared
+migrations, exact native restore, original source loss and retained checked
+repair. The earlier native run failed a new assertion that summed repeated
+signed references instead of unique identities; correcting that oracle leaves
+production accounting unchanged. Its cleanup also completed. An earlier compile
+run was deliberately stopped to harden loss of both quota-policy records; neither
+earlier run counts toward qualification. The ordinary suites exclude 26 store
+cases and one selected native case, which is provisioned separately.
+
+Formatting, strict locked workspace/all-targets Clippy, all-target test
+compilation and four debug program builds pass. Frozen Rust/Cargo source and
+seven program/test-driver hashes remain unchanged; native mount/image/loop
+cleanup is verified. Logs, both drivers, manifests, complete passing-case
+inventory and independent audits are retained under
+`/tmp/mb-m6-retained-source-validation-za4kq3hy`. This is focused debug-source
+qualification; other ordinary/native suites and installed artifacts were not
+rerun. Normal producers, enclosing metadata/work
+geometry, sparse/file/Git logical size policy, physical payload/headroom, guild
+quotas, complete history ownership, installed-artifact/platform/topology and
+real retained 1 TiB gates remain open.
