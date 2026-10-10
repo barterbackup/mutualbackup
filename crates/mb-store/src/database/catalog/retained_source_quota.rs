@@ -6,6 +6,8 @@ use mb_core::{CatalogSectorRecord, V1_SECTOR_SIZE};
 
 use super::*;
 
+pub(super) mod admission;
+
 const POLICY: &str = "catalog-retained-source-quota-v1";
 const ENABLED: &str = "catalog-retained-source-quota-enabled-v1";
 const LEDGER: &str = "catalog-retained-source-usage-v1";
@@ -153,8 +155,9 @@ fn policy(
     match (enabled.as_deref(), bytes) {
         (None, None) => {
             let existing: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1, ?2, ?3, ?4))",
-                params![LEDGER, DATASET, RESERVATION, SOURCE],
+                "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1, ?2, ?3, ?4, ?5, ?6)
+                 OR kind GLOB 'catalog-retained-source-hold-owner-v1/*')",
+                params![LEDGER, DATASET, RESERVATION, SOURCE, admission::PLAN, admission::HOLD],
                 |row| row.get(0),
             )?;
             if existing {
@@ -432,8 +435,22 @@ pub(super) fn release(
         return Ok(());
     };
     require_charge(connection, id, scope, source, true)?;
+    release_owner(connection, scope, source, quota)
+}
+
+fn release_owner(
+    connection: &Connection,
+    scope: CatalogScope,
+    source: &CatalogSectorRecord,
+    quota: CatalogRetainedSourceQuota,
+) -> Result<(), CatalogStoreError> {
     let mut usage = usage(connection, scope, quota)?;
     let mut charge = charge(connection, scope, source)?.ok_or(DatabaseError::Integrity)?;
+    if usage.stored_sources == 0
+        || usage.stored_logical_bytes < u64::from(source.sector.logical_len)
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
     let key = source_key(scope, source.sector.id)?;
     if charge.owners > 1 {
         charge.owners -= 1;
@@ -464,6 +481,9 @@ pub(super) fn close(
     scope: CatalogScope,
     cancelled: bool,
 ) -> Result<(), CatalogStoreError> {
+    if !cancelled {
+        admission::require_no_holds(connection, id)?;
+    }
     let Some(quota) = policy(connection)? else {
         return Ok(());
     };
@@ -533,8 +553,17 @@ impl ControlStore {
         } else {
             let existing: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE
-                kind GLOB 'catalog-paged-data-source-v1/*' OR kind IN (?1, ?2, ?3, ?4))",
-                params![LEDGER, RESERVATION, SOURCE, DATASET],
+                kind GLOB 'catalog-paged-data-source-v1/*'
+                OR kind GLOB 'catalog-retained-source-hold-owner-v1/*'
+                OR kind IN (?1, ?2, ?3, ?4, ?5, ?6))",
+                params![
+                    LEDGER,
+                    RESERVATION,
+                    SOURCE,
+                    DATASET,
+                    admission::PLAN,
+                    admission::HOLD
+                ],
                 |row| row.get(0),
             )?;
             if existing {

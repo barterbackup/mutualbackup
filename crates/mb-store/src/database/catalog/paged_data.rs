@@ -39,7 +39,10 @@ pub struct PagedCatalogDataSource {
     pub generation: u64,
 }
 
-fn anchor_count(connection: &Connection, id: Uuid) -> Result<Option<u64>, CatalogStoreError> {
+pub(super) fn anchor_count(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<Option<u64>, CatalogStoreError> {
     bounded_record(connection, ANCHOR, id.as_bytes(), 10)?
         .map(|bytes| {
             let count: u64 = decode_canonical(&bytes)?;
@@ -51,7 +54,7 @@ fn anchor_count(connection: &Connection, id: Uuid) -> Result<Option<u64>, Catalo
         .transpose()
 }
 
-fn change_anchor_count(
+pub(super) fn change_anchor_count(
     connection: &Connection,
     id: Uuid,
     previous: Option<u64>,
@@ -73,6 +76,69 @@ fn change_anchor_count(
             }
             Ok(())
         }
+    }?;
+    if anchor_count(connection, id)? != (next != 0).then_some(next) {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(())
+}
+
+/// Find a retained physical binding without opening a nested read transaction.
+/// Cancelled bindings remain usable for a dependency hold until their cleanup.
+pub(super) fn retained_anchor(
+    connection: &Connection,
+    scope: CatalogScope,
+    source: &CatalogSectorRecord,
+) -> Result<Option<Uuid>, CatalogStoreError> {
+    let prefix = "catalog-paged-data-source-v1/";
+    let mut cursor = String::new();
+    loop {
+        let kind: Option<Option<String>> = connection
+            .query_row(
+                "SELECT CASE WHEN length(kind) <= ?3 THEN kind END
+             FROM protocol_records INDEXED BY protocol_records_paged_sector_sources
+             WHERE record_id = ?1 AND kind > ?2 AND kind GLOB 'catalog-paged-data-source-v1/*'
+             ORDER BY kind LIMIT 1",
+                params![source.sector.id, cursor, prefix.len() + 32],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(kind) = kind else { return Ok(None) };
+        let kind = kind.ok_or(DatabaseError::Integrity)?;
+        let suffix = kind.strip_prefix(prefix).ok_or(DatabaseError::Integrity)?;
+        let id = Uuid::parse_str(suffix).map_err(|_| DatabaseError::Integrity)?;
+        if id.is_nil() || id.simple().to_string() != suffix {
+            return Err(DatabaseError::Integrity.into());
+        }
+        let (bundle, state) =
+            bundle::bundle_snapshot(connection, id)?.ok_or(DatabaseError::Integrity)?;
+        if bundle.scope == scope {
+            let bytes = bounded_record(connection, &kind, &source.sector.id, RECORD_LIMIT)?
+                .ok_or(DatabaseError::Integrity)?;
+            let record = decode_record(&bytes, source.sector.id)?;
+            if record.source != *source
+                || native_validation::retained_source_record(
+                    connection,
+                    id,
+                    source.sector.id,
+                    state == CatalogBundleState::Cancelled,
+                )?
+                .as_ref()
+                    != Some(source)
+                || anchor_count(connection, record.anchor)?.is_none()
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+            retained_source_quota::require_charge(
+                connection,
+                id,
+                scope,
+                source,
+                state == CatalogBundleState::Cancelled,
+            )?;
+            return Ok(Some(record.anchor));
+        }
+        cursor = kind;
     }
 }
 
@@ -163,7 +229,8 @@ pub(super) fn bind(
     {
         return Err(DatabaseError::Integrity.into());
     }
-    change_anchor_count(connection, anchor, previous, next)
+    change_anchor_count(connection, anchor, previous, next)?;
+    retained_source_quota::admission::consume(connection, bundle.id, bundle.scope, source)
 }
 
 pub(super) fn read_source(

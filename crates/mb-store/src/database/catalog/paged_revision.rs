@@ -640,7 +640,7 @@ pub(super) mod tests {
         }
     }
 
-    fn fixture(
+    pub(crate) fn fixture(
         store: &ControlStore,
         sequence: u64,
         parent: Option<[u8; 32]>,

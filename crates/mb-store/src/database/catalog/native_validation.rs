@@ -202,6 +202,33 @@ pub(super) fn source_record(
     sector: SectorId,
 ) -> Result<Option<CatalogSectorRecord>, CatalogStoreError> {
     require_verified(connection, id)?;
+    read_source_record(connection, id, sector)
+}
+
+/// Cancelled bindings retain their authenticated facts until bounded cleanup.
+/// This accessor is for transferring retained ownership, never serving a
+/// cancelled revision. The caller's bundle fence selects the expected state.
+pub(super) fn retained_source_record(
+    connection: &Connection,
+    id: Uuid,
+    sector: SectorId,
+    cancelled: bool,
+) -> Result<Option<CatalogSectorRecord>, CatalogStoreError> {
+    if !cancelled {
+        return source_record(connection, id, sector);
+    }
+    let record = read_validation(connection, id)?.ok_or(DatabaseError::NotReady)?;
+    if record.state != CatalogNativeValidationState::Cancelled {
+        return Err(DatabaseError::Conflict.into());
+    }
+    read_source_record(connection, id, sector)
+}
+
+fn read_source_record(
+    connection: &Connection,
+    id: Uuid,
+    sector: SectorId,
+) -> Result<Option<CatalogSectorRecord>, CatalogStoreError> {
     let record = bounded_record(
         connection,
         &sources(id),

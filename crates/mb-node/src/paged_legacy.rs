@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, ensure};
 use mb_core::{
-    CatalogError, CatalogPageRef, KeyMaterial, MerkleCommitment, PAGED_USER_REVISION_VERSION,
-    SectorId, SectorRef, SignedRecord, UserRevision, V1_SECTOR_SIZE, crypt_sector, merkle_commit,
-    sector_root,
+    CatalogError, CatalogPageRef, CatalogSectorRecord, KeyMaterial, MerkleCommitment,
+    PAGED_USER_REVISION_VERSION, SectorId, SectorRef, SignedRecord, UserRevision, V1_SECTOR_SIZE,
+    crypt_sector, merkle_commit, sector_root,
 };
 use mb_git::GitCatalogStream;
 use mb_store::CatalogPageReservation;
@@ -104,7 +104,7 @@ impl PagedPrivateMetadata {
             guild_id,
             revision,
             load,
-            &mut |_, _| Ok(()),
+            &mut |_, _, _| Ok(()),
             sink,
         )
     }
@@ -119,7 +119,7 @@ impl PagedPrivateMetadata {
         guild_id: [u8; 32],
         revision: &SignedRecord<UserRevision>,
         load: &mut impl FnMut(&SectorId) -> Result<Vec<u8>>,
-        admit: &mut impl FnMut(&Self, [CatalogPageReservation; 6]) -> Result<()>,
+        admit: &mut impl FnMut(&Self, [CatalogPageReservation; 6], &[CatalogSectorRecord]) -> Result<()>,
         sink: &mut impl FnMut(PagedPrivateStream, CatalogPageRef, Vec<u8>) -> Result<()>,
     ) -> Result<Self> {
         let (scope, length) = crate::paged_data::legacy_revision_scope(keys, guild_id, revision)?;
@@ -206,9 +206,17 @@ impl PagedPrivateMetadata {
             }
         }
         // Validate all signed data, including any unused retained references.
-        for (reference, commitment) in data.values() {
-            ciphertext(reference, *commitment, load)?;
-        }
+        let authenticated_data = data
+            .values()
+            .map(|(reference, commitment)| {
+                let bytes = ciphertext(reference, *commitment, load)?;
+                Ok(CatalogSectorRecord {
+                    format_version: 1,
+                    sector: (*reference).clone(),
+                    commitment: merkle_commit(&bytes)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut checked_load = |id: &SectorId| -> Result<Vec<u8>> {
             let (reference, commitment) = data
                 .get(id)
@@ -262,7 +270,7 @@ impl PagedPrivateMetadata {
                     .ok_or(CatalogError::Bounds)
             })?;
         reservations[2] = source_page_reservation(sources)?;
-        admit(&preview, reservations)?;
+        admit(&preview, reservations, &authenticated_data)?;
         let native = native.write_paged_native_entries(scope, &mut |stream, page, bytes| {
             sink(PagedPrivateStream::Native(stream), page, bytes)
         })?;
@@ -936,8 +944,8 @@ mod tests {
                 .sum::<u64>();
             store
                 .configure_catalog_retained_source_quota(mb_store::CatalogRetainedSourceQuota {
-                    logical_bytes: data_bytes * 2,
-                    sources: legacy.value.data_sectors.len() as u64 * 2,
+                    logical_bytes: data_bytes,
+                    sources: legacy.value.data_sectors.len() as u64,
                     open_reservations: 2,
                 })
                 .unwrap();

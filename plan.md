@@ -1399,16 +1399,16 @@ data/payload headroom, SQL/WAL, traversal, dataset/history/guild policy, normal
 producers and verified generation-floor retirement remain open.
 
 Retained-source quotas now account for unique retained authenticated data
-sources independently in each dataset. Migration reserves a conservative
-original-source bound in the same writer as its page roles and journal;
+sources independently in each dataset. Original migration admission reserved a
+conservative original-source bound in the same writer as its page roles and journal;
 publication converts only newly retained identities and returns unused credits.
 Shared sources remain charged until their last retained binding is cleaned up,
 including cancelled owners, while source-location repair leaves accounting
 unchanged. This counts non-hole source logical bytes and source cardinality;
 sparse lengths, aliases, private/bootstrap metadata, physical payload/parity and
-guild limits still need enclosing policy. Exact incremental sharing admission
-also needs durable dependency ownership across the admission/publication
-interval. Initial enablement over existing paged bindings requires bounded
+guild limits still need enclosing policy. The follow-up below adds durable
+dependency ownership across the admission/publication interval.
+Initial enablement over existing paged bindings requires bounded
 adoption and currently rejects before mutation. Frozen qualification passes
 518 distinct core/store/Node/native cases, including legacy formats 1/3/4/5,
 joint data/page/journal rollback, interrupted publication, final shared-owner
@@ -1420,6 +1420,33 @@ and native cleanup pass. Evidence is retained under
 quota increment; normal consumers and the enclosing admission, history,
 generation-floor, installed-artifact/platform/topology and retained 1 TiB
 gates remain open.
+
+Incremental retained migration now authenticates and deduplicates original data
+before admission, reserves only new identities, and durably holds shared source
+charges and physical native anchors in the same transaction as page roles and
+the migration journal. Shared sources therefore need no temporary duplicate
+data capacity, and original-owner cleanup cannot invalidate admission. A
+repeatable sorted iterator keeps the store API bounded per record; immutable
+input digests fence changed retries. Publication transfers holds to authenticated
+data bindings atomically. Cancellation releases one hold per cleanup step,
+including admitted operations that never published. Existing conservative
+reservations retain their original capacities and acquire the same shared
+dependency holds during authenticated resume. A retained-fact accessor requires
+the bundle-selected Verified/Cancelled state without enabling serving of a
+cancelled revision. Six store fixtures cover the ownership/cleanup races,
+reopening, competing connections, immutable replay, old reservations and SQL
+rollback; the cancelled-binding case fails before the correction. Legacy
+formats 1/3/4/5 and native capture/recovery now repeat migration at the exact
+unique data-byte/source limit. Frozen qualification passes 530 distinct
+core/store/paged Node/native cases, formatting, strict locked workspace/all-
+targets Clippy, all-target compilation and four debug builds. Source, seven
+binaries and 21 embedded protocol/helper inputs match; native cleanup is
+verified. Evidence is in
+`/tmp/mb-m6-source-dependencies-validation-kw33d3cx`.
+This closes incremental source admission for explicit retained
+migration. Full enclosing metadata/payload/SQL/WAL policy, normal producers,
+bounded adoption, generation floors and the deferred capacity/platform gates
+remain open.
 
 Retained public authority now has an explicitly budgeted format two, selected
 by draft paged checkpoint format nine. Each original tree stays bounded, while

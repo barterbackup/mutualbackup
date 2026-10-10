@@ -4416,3 +4416,82 @@ and SQL/WAL headroom, dataset/history/guild policy, exact incremental sharing,
 normal capture/packing/coding/checkpoint/retention/seed-only recovery, native
 platforms, topology diagnosis and installed-artifact gates remain open. The
 user-deferred real dense 1 TiB run remains a separate acceptance gate.
+
+
+## Incremental retained-source dependency admission (2026-10-10)
+
+A conservative full-source loan prevented an unchanged second revision from
+being admitted at the dataset limit, although publication charged its shared
+identities once. Merely subtracting already charged sources would leave a race:
+the original owner's final cleanup could remove both the charge and physical
+native anchor before the new revision published.
+
+Explicit retained migration now passes its complete authenticated, deduplicated
+data records from the existing dry run into source admission. The store accepts
+a repeatable iterator of strictly increasing unique identities, validates each
+bounded record, and hashes the complete input. The existing immediate writer
+reserves only new logical bytes/source counts and creates dependency holds for
+shared identities, together with all page reservations and the immutable
+migration journal. No external byte reads occur in that writer. Open-operation
+limits are checked before the input walk. Any input, quota, journal or SQL fault
+rolls back the complete admission.
+
+Each bounded hold has a dataset/source/operation key and an operation backlink.
+It increments the existing source owner count and the native anchor pin count.
+A hold can borrow a surviving hold after the original revision's final binding
+has been cleaned. It preserves local ownership, without creating a published
+data recipe or new source authorization. Existing source and reservation record
+layouts, original signed legacy bytes, source addresses and page roots remain
+unchanged. An immutable admission plan fences changed input retries. Existing
+conservative Building reservations keep their original loans on resume and
+acquire the same dependency holds for their newly authenticated shared inputs.
+
+Authenticated publication creates the new data binding and physical pin, then
+consumes its matching hold in the same writer. Unconsumed holds reject closure
+before a publication marker can commit. The new binding can use a verified
+replacement anchor, while the old hold protects the old anchor until transfer.
+Cancellation fences the reservation and releases unused loans; each subsequent
+cleanup step releases at most one hold, including operations without a bundle.
+Sources stay charged until their final binding or hold is actually removed.
+Readback checks reject ignored or reverted hold, charge and anchor-pin writes.
+A separate retained-fact accessor requires the bundle-selected Verified or
+Cancelled validation state. Ordinary source serving still requires Verified
+state. The cancelled-binding regression reproduced the active-validation lookup
+failure before this correction and passes afterward.
+
+Six new store fixtures cover exact-capacity sharing, original final-owner
+cleanup, cancelled bindings awaiting cleanup, reopening, hold-to-hold borrowing,
+competing connections publishing
+and cancelling, changed/nonrepeatable inputs, conservative replay, owner-journal
+rollback, SQL faults, and failed publication/cancellation pin transfers. Legacy
+formats 1/3/4/5 now repeat real migration at exactly one dataset's byte/source
+capacity. The provisioned native capture/recovery fixture uses its unique data
+bytes and source count as the exact limit, including repeated signed source IDs.
+Frozen qualification passes all 178 core and 315 ordinary store tests, 35
+paged Node cases, the ordinary certified-writer migration entry point and the
+provisioned Btrfs retained native capture/recovery fixture (530 distinct cases).
+The ordinary suites exclude 26 store cases and the selected native case,
+provisioned separately. The passing inventory counts the paged-module legacy
+information activation/custody case once. Formatting, strict locked workspace/
+all-targets Clippy, all-target test compilation and all four debug program
+builds pass under Cargo/rustc 1.99.0. Source and seven binary hashes remain
+unchanged; 21 embedded protocol/helper inputs match in the independent audit.
+Native mount, image and loop cleanup is verified. Logs, manifests, the complete
+distinct inventory, the negative cancellation reproduction and final audits
+are in `/tmp/mb-m6-source-dependencies-validation-kw33d3cx`. This is focused
+debug-source qualification; other ordinary/native suites and installed artifacts
+were not rerun.
+
+After qualification, removing only rebuildable incremental caches reclaims
+11 GiB and leaves about 50 GiB in `target`; the seven qualified binary hashes
+remain unchanged. The cleanup record and before/after sizes are retained with
+the final audit.
+
+This closes incremental source admission for explicit retained migration. It
+counts unique non-hole data-source logical bytes; sparse file length, aliases,
+private/bootstrap metadata, physical padding/parity/payload and SQL/WAL remain
+separate policy work. Full dataset/history/guild metadata admission, bounded
+existing-paged adoption, generation floors, normal paged producers and seed-only
+recovery, topology diagnosis and installed/platform gates remain open. The
+user-deferred dense 1 TiB and native platform runs remain separate acceptance
+gates.

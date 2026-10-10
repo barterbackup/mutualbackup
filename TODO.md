@@ -2549,9 +2549,41 @@ and native-platform gates remain open.
       This counts unique non-hole data-source logical bytes, excluding sparse
       length, aliases, private/bootstrap metadata and physical parity/payload
       allocation; complete dataset/history/guild admission remains required.
-      Conservative migration reservations can need temporary sharing headroom.
-      Bounded existing-paged adoption, exact incremental dependency admission,
+      The original reservation API remains conservative; exact incremental
+      dependency admission is recorded below. Bounded existing-paged adoption,
       normal consumers and verified generation floors remain open.
+    - [x] Admit retained migration at the dataset limit by reserving only new
+      authenticated identities and durably holding shared sources and physical
+      native anchors in the same page/source/journal writer. Publication must
+      consume those holds atomically with new data bindings; cancellation must
+      release at most one hold per cleanup step even without a published bundle.
+      Replay binds the complete sorted unique input digest and preserves old
+      conservative reservations without changing their immutable loans. Older jobs
+      acquire shared dependency holds during authenticated resume. Holds
+      remain charged until actual final binding/hold cleanup and can be borrowed
+      after the original binding is gone. A retained-fact accessor requires the
+      bundle-selected Verified/Cancelled state; serving stays unavailable for
+      cancelled revisions. The cancellation regression fails before the fix.
+      Six new store fixtures cover exact capacity, original and cancelled
+      binding cleanup, reopen, hold-to-hold borrowing, competing connections,
+      immutable/changed input and conservative replay, owner-journal rollback,
+      SQL faults and publication/cancellation pin-transfer failures. Legacy
+      formats 1/3/4/5 and the native fixture repeat migration at exactly the
+      unique data-byte/source limits. Frozen qualification passes 178 core,
+      315 ordinary store, 35 paged Node, the certified-writer migration entry
+      point and provisioned Btrfs capture/recovery (530 distinct cases).
+      Formatting, strict locked workspace/all-targets Clippy, all-target test
+      compilation and four debug builds pass under Cargo/rustc 1.99.0. Source,
+      seven binaries and 21 embedded protocol/helper inputs match; native
+      mount/loop/image cleanup is verified. Evidence is retained in
+      `/tmp/mb-m6-source-dependencies-validation-kw33d3cx`.
+      Removing rebuildable incremental caches after qualification reclaims
+      11 GiB, leaving about 50 GiB of build artifacts; all qualified binary
+      hashes remain unchanged.
+      This closes explicit retained migration's incremental source admission;
+      complete metadata/payload/SQL/WAL policy, normal producers, bounded
+      existing-paged adoption, generation floors and deferred capacity/platform
+      qualification remain open.
   - [x] Join full/compact packing descriptors and source streams through a
     disposable encrypted index. Require a source-authority callback; reject
     duplicate/missing mappings, incomplete coverage, false virtual zeros and

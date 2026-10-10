@@ -18040,10 +18040,16 @@ pub(crate) mod tests {
             .unwrap();
         std::fs::write(source.join("nested/dense"), b"changed working bytes").unwrap();
         let operation = Uuid::new_v4();
+        let unique_data = legacy
+            .value
+            .data_sectors
+            .iter()
+            .map(|source| (source.id, source.logical_len))
+            .collect::<std::collections::BTreeMap<_, _>>();
         node.control
             .configure_catalog_retained_source_quota(mb_store::CatalogRetainedSourceQuota {
-                logical_bytes: 1_u64 << 40,
-                sources: mb_core::CATALOG_MAX_RECORDS,
+                logical_bytes: unique_data.values().map(|length| u64::from(*length)).sum(),
+                sources: unique_data.len() as u64,
                 open_reservations: 8,
             })
             .unwrap();
@@ -18067,12 +18073,6 @@ pub(crate) mod tests {
             .catalog_retained_source_usage(retained_scope)
             .unwrap()
             .unwrap();
-        let unique_data = legacy
-            .value
-            .data_sectors
-            .iter()
-            .map(|source| (source.id, source.logical_len))
-            .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(
             data_usage.stored_logical_bytes,
             unique_data
