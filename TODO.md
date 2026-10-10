@@ -34,6 +34,20 @@ upgrade and real-source evacuation now close the reopened R4 item. R1/R2/R3/R5/R
 and remaining native platform, full activation/quota and retained 1 TiB gates
 remain active.
 
+Source review on 2026-10-10 of `6c10666..e36afa7` confirms both recovery-inventory
+findings from the preceding review are corrected: supported long Git refs no
+longer exceed the catch-all key limit, and validated discovery journals/fences
+no longer block recovery placement as unclassified ownership. Unknown ownership
+still blocks placement. The reader ownership-lifetime fix is now committed;
+atomic path/directory handoff remains open. No new severe regression was found
+in the reviewed inventory, ownership and P2P shutdown changes. This pass ran no
+builds, tests or runtime probes; the recorded debug-source qualification below
+is separate evidence and does not close R7. Prioritize the remaining R1 recovery
+contract and shared R2/R3 admission/quota policy, including
+R3-SINGLE-OWNER-METADATA, then complete normal paged production and retained
+1 TiB recovery qualification. R4 and R6 are complete; R5 diagnosis and R7 release
+and native-platform gates remain open.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -2317,18 +2331,16 @@ remain active.
     writers, scheduling and other platforms remain separate production gates.
   - [x] **R3-MIGRATION-RECOVERY / P2 — Preserve ordinary legacy recovery after
     explicit retained migration.** Source review through `5f8c789` found that
-    migration retains the original flat head and data-sector IDs, but adds paged
-    ownership that intercepts ordinary snapshot repair. If the source anchor is
-    lost while the control catalog survives, network restore can reconstruct
-    authenticated ciphertext and still fail: the Data branch in
-    `crates/mb-node/src/snapshot.rs::install_recovered_sector_recipe` calls
+    migration retained the original flat head and data-sector IDs, but added
+    paged ownership that intercepted ordinary snapshot repair. After source
+    anchor loss with the control catalog preserved, network restore could
+    reconstruct authenticated ciphertext and still fail: the Data branch in
+    `crates/mb-node/src/snapshot.rs::install_recovered_sector_recipe` called
     `render_data_source` against the missing original anchor. The separate
-    `replace_local_data_source` API has no production recovery caller. This
-    requires the explicit Node/library migration API; unmigrated backups are
-    unaffected. Integrate verified stable-anchor replacement and atomic retained
-    ownership transfer, or preserve ordinary flat recovery until that integration
-    exists, without weakening authentication, generation fences or pin ownership.
-    Resolve this coexistence blocker before exposing migration.
+    `replace_local_data_source` API then had no production recovery caller.
+    This affected explicit Node/library migration; unmigrated backups were
+    unaffected. The correction below resolves this coexistence blocker while
+    preserving authentication, generation fences and pin ownership.
     Implemented: historical data alone may use a flat recovery recipe whose
     reference, scope and ciphertext commitments match its live retained owner.
     Scoped paged-only data still requires explicit stable replacement. Ordinary
@@ -2448,6 +2460,27 @@ remain active.
     codecs and incremental seek/edit operations. Retire intent tombstones only
     behind a verified generation floor. Qualify interruption/reopen,
     cancellation and small changes to large catalogs.
+    - [x] Reserve encoded immutable page bytes/counts and open intent slots in
+      the durable store ledger before staging. Immediate writer transactions
+      enforce one limit across connections and exact reservation replay;
+      publication/cancellation return unused credits in the same transaction.
+      Existing shared pages remain charged until actual final-owner GC removes
+      them. Initial adoption counts existing page rows before enabling limits;
+      corrupt/missing quota records and ignored/reverted SQL writes fail closed.
+      Qualification: 175 core, 301 ordinary store and 32 paged Node tests pass,
+      plus provisioned native retained capture/recovery (509 distinct cases).
+      Seven new store fixtures cover concurrency, replay/reopen, independent
+      byte/page exhaustion, shared closure GC, adoption, atomic bundle state,
+      corrupt records and SQL faults. Formatting, strict locked workspace/
+      all-targets Clippy, all-target test compilation and four debug program
+      builds pass. Frozen source/binary hashes and Btrfs mount/image/loop
+      cleanup are verified; evidence is in
+      `/tmp/mb-m6-storage-quota-validation-o6anvf3v`. The native regression uses
+      existing unconfigured migration; configured quota lifecycle is covered
+      by the store fixtures. This covers encoded page blobs; SQL/WAL,
+      payload, traversal, dataset/history and guild quotas remain enclosing
+      policy work. Normal producers and verified generation-floor retirement
+      remain open.
   - [x] Join full/compact packing descriptors and source streams through a
     disposable encrypted index. Require a source-authority callback; reject
     duplicate/missing mappings, incomplete coverage, false virtual zeros and
@@ -2926,7 +2959,7 @@ remain active.
     inode and directory-change fences pass. A 576 KiB cursor cap and 32-job quota
     bound local work/state; attempt/generation CAS rejects stale publishers.
     Filesystem work stays outside the SQL writer. Directory-frame changes restart
-    safely; candidate disappearance remains open under R3-DISCOVERY-RESTART.
+    safely; candidate disappearance is corrected under R3-DISCOVERY-RESTART below.
     New mount roots are queued before absence. Verified hint publication
     and cursor retirement share a fenced transaction. Read-only calls retain
     their nonmutating behavior; other filesystems retain process-local fallback.

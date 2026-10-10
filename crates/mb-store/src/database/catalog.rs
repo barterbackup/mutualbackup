@@ -35,6 +35,7 @@ mod paged_revision;
 mod paged_sector;
 mod retention_journal;
 mod source;
+mod storage_quota;
 pub use bundle::{
     CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CatalogBundle, CatalogBundleRoot,
     CatalogBundleState,
@@ -87,6 +88,7 @@ pub use paged_data::{PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource};
 pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCatalogSnapshot};
 pub use paged_sector::PagedCatalogSectorSource;
 pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSectorSource, CatalogSourceSweep};
+pub use storage_quota::{CatalogPageReservation, CatalogStorageQuota, CatalogStorageUsage};
 
 const INTENT: &str = "catalog-intent-v1";
 const PAGE: &str = "catalog-page-v1";
@@ -211,18 +213,58 @@ fn read_intent(
 }
 
 fn write_intent(connection: &Connection, record: &IntentRecord) -> Result<(), CatalogStoreError> {
+    let bytes = canonical_bytes(record)?;
     let written = connection.execute(
         "UPDATE protocol_records SET bytes = ?3 WHERE kind = ?1 AND record_id = ?2",
-        params![
+        params![INTENT, record.intent.id.as_bytes(), &bytes],
+    )?;
+    if written != 1
+        || bounded_record(
+            connection,
             INTENT,
             record.intent.id.as_bytes(),
-            canonical_bytes(record)?
-        ],
-    )?;
-    if written != 1 {
+            RECORD_BYTES,
+        )?
+        .as_deref()
+            != Some(bytes.as_slice())
+    {
         return Err(DatabaseError::Conflict.into());
     }
+    if record.state != CatalogIntentState::Building {
+        storage_quota::close(connection, record.intent)?;
+    }
     Ok(())
+}
+
+fn begin_intent(
+    connection: &Connection,
+    intent: CatalogIntent,
+) -> Result<CatalogIntentState, CatalogStoreError> {
+    intent.scope.validate(intent.section)?;
+    if intent.id.is_nil() {
+        return Err(DatabaseError::Conflict.into());
+    }
+    if bounded_record(connection, INTENT, intent.id.as_bytes(), RECORD_BYTES)?.is_some() {
+        let record = read_intent(connection, intent)?;
+        if record.state == CatalogIntentState::Cancelled {
+            return Err(DatabaseError::Conflict.into());
+        }
+        return Ok(record.state);
+    }
+    let record = canonical_bytes(&IntentRecord {
+        format_version: 1,
+        intent,
+        state: CatalogIntentState::Building,
+        owned_pages: 0,
+        owned_bytes: 0,
+    })?;
+    insert_exact(connection, INTENT, intent.id.as_bytes(), &record)?;
+    if bounded_record(connection, INTENT, intent.id.as_bytes(), RECORD_BYTES)?.as_deref()
+        != Some(record.as_slice())
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(CatalogIntentState::Building)
 }
 
 fn publish_root(
@@ -344,33 +386,12 @@ impl ControlStore {
         &self,
         intent: CatalogIntent,
     ) -> Result<CatalogIntentState, CatalogStoreError> {
-        intent.scope.validate(intent.section)?;
-        if intent.id.is_nil() {
-            return Err(DatabaseError::Conflict.into());
-        }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        if bounded_record(&transaction, INTENT, intent.id.as_bytes(), RECORD_BYTES)?.is_some() {
-            let record = read_intent(&transaction, intent)?;
-            if record.state == CatalogIntentState::Cancelled {
-                return Err(DatabaseError::Conflict.into());
-            }
-            return Ok(record.state);
-        }
-        insert_exact(
-            &transaction,
-            INTENT,
-            intent.id.as_bytes(),
-            &canonical_bytes(&IntentRecord {
-                format_version: 1,
-                intent,
-                state: CatalogIntentState::Building,
-                owned_pages: 0,
-                owned_bytes: 0,
-            })?,
-        )?;
+        let state = begin_intent(&transaction, intent)?;
+        storage_quota::require_reservation(&transaction, intent, state)?;
         transaction.commit()?;
-        Ok(CatalogIntentState::Building)
+        Ok(state)
     }
 
     pub fn catalog_intent_state(
@@ -412,6 +433,7 @@ impl ControlStore {
                 )?;
             }
         }
+        storage_quota::stage(&transaction, intent, reference, bytes)?;
         insert_exact(&transaction, PAGE, &reference.hash, bytes)?;
         insert_exact(
             &transaction,
@@ -419,6 +441,7 @@ impl ControlStore {
             &reference.hash,
             &canonical_bytes(&page)?,
         )?;
+        read_page(&transaction, page)?;
         let owner_kind = owners(intent);
         if bounded_record(&transaction, &owner_kind, &reference.hash, 0)?.is_none() {
             if record.owned_pages == CATALOG_MAX_PAGE_OCCURRENCES {
@@ -608,10 +631,14 @@ impl ControlStore {
                     queue_unreferenced(&transaction, child.hash)?;
                 }
             }
+            storage_quota::collect(&transaction, bytes.len() as u64)?;
             transaction.execute(
                 "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
                 params![PAGE, hash],
             )?;
+            if bounded_record(&transaction, PAGE, &hash, CATALOG_PAGE_BYTES)?.is_some() {
+                return Err(DatabaseError::Integrity.into());
+            }
             transaction.execute(
                 "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
                 params![META, hash],

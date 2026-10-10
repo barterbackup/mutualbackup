@@ -4154,3 +4154,58 @@ after the marker commit succeeds even without the local attempt witness.
 Formatting and strict workspace/all-targets Clippy pass. M6 remains open for
 R1/R2/R3/R5/R7; these local regressions do not replace installed-artifact,
 native/platform/topology or retained 1 TiB qualification.
+
+## Durable encoded-page storage reservations (2026-10-10)
+
+The immutable page store now supports an explicitly configured durable quota
+for encoded page bytes, distinct stored pages and open reservations. Initial
+adoption counts existing physical page rows using SQL lengths, without loading
+their blobs or granting source, signature or ownership authority. Resizing must
+fit all stored pages and outstanding credits. A separate enabled marker makes
+missing or malformed ledger state an error.
+
+`begin_catalog_with_page_reservation` binds fixed byte/page credits to the exact
+immutable intent. An immediate writer transaction reserves capacity and creates
+the intent together. Concurrent connections cannot overbook that ledger. Exact
+replay preserves the original reservation; changed scope, section or capacity,
+cancelled IDs and overflowing/exhausted dimensions are rejected. Configured
+Building intents require a reservation before staging, including intents that
+predate initial quota adoption. Existing published catalogs keep their read and
+retirement paths.
+
+New encoded pages convert reserved credits into stored usage in the same
+transaction as page bytes, metadata and construction ownership. Reused physical
+pages consume no new credits. Root or bundle publication and cancellation close
+unused credits atomically with their existing state changes. Construction-pin
+release does not reduce stored usage: shared roots and parent closures retain
+their charge until the final owner retires and ordinary GC actually deletes each
+page. There is no per-forest budget reset. Bounded canonical records, exact
+write/readback checks and transaction rollback detect ignored or reverted SQL
+updates, missing insertions and ignored page collection.
+
+These counters cover encoded page blobs. SQL/WAL overhead, source/parity
+payloads, traversal work, logical retained data and dataset/history/guild limits
+still need the complete enclosing policy. Explicit configuration preserves the
+existing foundation behavior before that policy is installed. Normal paged
+producers remain disabled. Original intent/page/bundle and signed wire layouts
+are unchanged. Closed reservation rows and cancelled intent tombstones remain
+until verified generation-floor retirement is implemented.
+
+Qualification passes 509 distinct cases: all 175 core and 301 ordinary store
+tests, 32 paged Node tests and the provisioned native retained sparse-tree
+capture/migration/recovery regression. Ordinary store and selected Node runs
+retain 26 and one ignored cases respectively; the named native case is run and
+counted separately. It passes in 32.21 seconds with independent mount, image and
+loop cleanup verified. This native regression uses the existing unconfigured
+migration path. Seven new configured store fixtures exercise simultaneous and
+competing connections, exact replay/reopen, independent byte/page exhaustion,
+existing-page adoption, shared parent/root closures, atomic bundle publication
+and cancellation, corrupt/missing records and ignored/reverted SQL faults.
+Formatting, strict locked workspace/all-targets Clippy, all-target test
+compilation and all four debug program builds pass. The frozen Rust/Cargo source
+and seven program/test-driver hashes remain unchanged. Logs, manifests, passed
+case inventory and cleanup evidence are retained in
+`/tmp/mb-m6-storage-quota-validation-o6anvf3v`. These checks qualify this page
+storage increment; normal producer activation, complete R2/R3 capacity and
+quotas, generation floors, installed-artifact/platform/topology and real retained
+1 TiB gates remain open.

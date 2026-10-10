@@ -50,11 +50,12 @@ pub use catalog::{
     CatalogPackingCodingDirectoryIndex, CatalogPackingCodingDirectoryValidation,
     CatalogPackingCodingIndex, CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
     CatalogPackingCodingValidation, CatalogPackingIndex, CatalogPackingPlacement,
-    CatalogPackingSector, CatalogPackingValidation, CatalogPagedCheckpointRetention,
-    CatalogPagedCheckpointRetentionState, CatalogPayloadRetirementView, CatalogPublicationView,
-    CatalogQuorumPagedCheckpointIndex, CatalogSectorSource, CatalogSourceSweep, CatalogStoreError,
-    CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES, PagedCatalogDataSource,
-    PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
+    CatalogPackingSector, CatalogPackingValidation, CatalogPageReservation,
+    CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,
+    CatalogPayloadRetirementView, CatalogPublicationView, CatalogQuorumPagedCheckpointIndex,
+    CatalogSectorSource, CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage,
+    CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES,
+    PagedCatalogDataSource, PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 #[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;

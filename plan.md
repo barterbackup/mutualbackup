@@ -1315,7 +1315,7 @@ uses that same live node rather than a parallel replacement. Pause for a focused
 source, runtime, security, and usability review at every gate before committing
 the next milestone's detailed scope.
 
-**Current position (2026-10-08):** Milestones 0 through 5 have recorded passing
+**Current position (2026-10-10):** Milestones 0 through 5 have recorded passing
 gates; Milestone 6 remains open. The accepted direction removes FUSE-backed
 guarded capture and Git integration. Prior milestone passes do not close the
 new non-FUSE production findings below. Continue native Git, source-backend,
@@ -1325,6 +1325,16 @@ storage evidence. Complete graph recovery and physical pruning alongside those
 requirements. The recorded implementation and runtime results that follow the
 current correction queue are historical, including any superseded statements
 that guarded completion is required.
+
+Source review of `6c10666..e36afa7` on 2026-10-10 confirms the preceding review's
+two recovery-inventory findings are corrected: supported long Git refs and
+validated discovery assistance now pass inventory and safe placement, while
+unknown ownership still blocks placement. The reader ownership-lifetime fix is
+committed, with atomic path/directory handoff still open. No new severe
+regression was found in the reviewed inventory, ownership and P2P shutdown
+changes. This pass ran no builds, tests or runtime probes. Recorded debug-source
+qualification remains separate evidence; it does not establish installed
+release-artifact qualification or close Milestone 6.
 
 ### Production corrections from the 2026-10-05 source review
 
@@ -1342,13 +1352,30 @@ checks while adding the specific missing behavior.
 | R6 — ordinary Git runtime dependency (completed) | Default Nix programs now include pinned stock Git through runtime wrappers; the optional alias uses that runtime. Standalone binaries declare their Git PATH requirement and discovery reports a missing dependency clearly. | Installed runtime/alias passed packed import and both bridge directions with exact bytes/IDs in isolated environments, with and without the alias. Raw standalone missing-Git failure left visible refs/history and working bytes unchanged. A dedicated CI job repeats the gate. Broader artifact qualification remains R7. |
 | R7 — release validation | Preserve existing CI jobs for formatting, Clippy, locked tests, reflink/topology, port mapping, and private Tor. Add the complete provisioned `git-linux-acceptance.sh` gate and qualification of the actual packaged binaries and runtime dependencies. The packaged job selects all four installed programs and freezes process drivers through `packaged-process-acceptance.py`, recording source/wrapper/payload/driver hashes, positive test counts and topology cleanup; caller cleanup separately verifies mount/loop/image removal. | Installed musl runtime/alias on `83590ac` and signature-diagnostics candidate `92f9103` pass three Git packaging scenarios, 19 ordinary process cases, raw paths, the stock-Git bridge and five-daemon topology/seed recovery (793.81 and 802.64 seconds). Five live daemon observations identify each installed payload. Source, candidate and driver hashes match in independent final audits; all eight daemon logs survive verified filesystem/network cleanup, including the new request/connection/routing-authority diagnostics on `92f9103`. These runs qualify the listed Linux slice. Required checks still include the full native/upgrade/multi-volume/platform matrix, R5 causal diagnosis and repeated fault/retry evidence, and retained-capacity qualification. Nix build-only checks cannot stand in for these tests; unsupported privileged environments cannot silently count as passes. |
 
-Start with R1 and the R2 acceptance mismatch. R3 capacity design and R4
-migration can proceed independently; R5 diagnosis and repeated topology
-validation should continue alongside them. R6 packaging is independently
-fixable and feeds R7 artifact validation. Complete all applicable corrections
+Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
+admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
+single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and
+ownership joins, normal paged capture/packing/checkpoint/retention and seed-only
+recovery under that policy before claiming retained-capacity completion. R5
+topology/signature diagnosis and repeated validation should continue alongside
+them. R4 evacuation and R6 packaging are complete; preserve their regressions
+under R7 exact release-artifact validation. Complete all applicable corrections
 before Milestone 7 compatibility freeze. Native Windows/macOS work remains in
 the roadmap; a narrower production platform scope requires an explicit product
 decision rather than treating missing platform support as complete.
+
+The page store now has an explicit encoded-page quota and immutable per-intent
+reservations shared across writer connections. Page staging, root/bundle
+publication, cancellation and actual GC update the ledger in their existing
+transactions. Shared pages stay charged until physically collected. The frozen
+qualification passes 509 distinct core/store/paged Node/native cases, formatting,
+strict locked workspace/all-targets Clippy, all-target test compilation and four
+debug program builds, with source/binary hashes and native cleanup verified.
+Configured quota lifecycle is covered in store fixtures; the native migration
+regression retains its existing unconfigured behavior. The enclosing policy
+still needs SQL/WAL and payload headroom,
+traversal work, dataset/history and guild quotas before normal paged producers
+can be admitted; generation-floor retirement also remains open.
 
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
