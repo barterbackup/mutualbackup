@@ -2613,6 +2613,36 @@ and native-platform gates remain open.
       metadata/payload roles with durable selection/retirement. Full metadata/
       physical policy, normal producers/recovery and deferred real dense
       capacity/platform gates remain open.
+    - [x] Carry the original-history/quorum directory proof through guarded
+      transitive public ownership, existing private/bootstrap/native custody
+      and actual local READY information/parity dependencies. Share original
+      pin/publication/retirement algorithms and one cumulative budget; retain
+      every nested source/descriptor/forest root before I/O, every local EOF,
+      exact certificate readback, original event/current-head checks, immutable
+      interrupted replay and bounded release. Preserve original journal bytes;
+      the directory owner uses separate kinds/pin prefix six. Fence UUID reuse
+      across layouts so private/payload backlinks cannot alias. Node adapters
+      authenticate original authority, private metadata and full READY bytes.
+      Nine new Store and three Node cases qualify reopen/capture retirement,
+      interrupted replay, changed retries, shared successors/current retirement,
+      missing EOFs, SQL/trust/certificate faults, cross-layout IDs, private/native
+      anchor and information/parity custody, shared budget acquisition orders
+      and real Node private/information/parity forget/rollback/reopen.
+      Frozen qualification passes 191 Core, 369 ordinary Store and 38 paged Node
+      cases, certified-writer migration and provisioned Btrfs capture/recovery: 600
+      distinct cases. Original legacy information upgrade passes in the Node suite
+      and an independent repeat. Twelve new cases cover directory ownership and
+      local custody. Formatting, strict locked workspace/
+      all-targets Clippy, all-target test compilation and four debug program builds
+      pass. Frozen Rust/Cargo source, seven binaries and 22 embedded protocol/helper
+      inputs match; native mount/loop/image cleanup is verified. Evidence is retained
+      in `/tmp/mb-m6-directory-custody-validation-i67_41gh`; the post-commit audit
+      binds the inputs to the commit.
+      Cache cleanup reclaims 10.07 GiB, leaving about 51.5 GiB in
+      `target`, with qualified binaries unchanged.
+      Full distributed readiness/atomic activation, metadata/physical policy,
+      normal producers/recovery and deferred dense capacity/platform gates
+      remain open.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

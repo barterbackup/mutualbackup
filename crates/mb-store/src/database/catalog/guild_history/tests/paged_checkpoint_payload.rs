@@ -10,7 +10,7 @@ struct PayloadFixture {
     attempt: [u8; 16],
 }
 
-fn objects(
+pub(super) fn objects(
     fixture: &super::super::super::checkpoint_validation::tests::Fixture,
     history: &History,
 ) -> Vec<VariableParityObject> {
@@ -44,7 +44,7 @@ fn objects(
         .collect()
 }
 
-fn stage(volume: &mut ParityStore, objects: &[VariableParityObject], history: &History) {
+pub(super) fn stage(volume: &mut ParityStore, objects: &[VariableParityObject], history: &History) {
     let attempt = history.entry.transcript.value.plan.value.attempt_id;
     let hash = *blake3::hash(&canonical_bytes(&history.entry.transcript).unwrap()).as_bytes();
     for object in objects {

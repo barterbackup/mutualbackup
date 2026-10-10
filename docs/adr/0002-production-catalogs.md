@@ -4950,3 +4950,70 @@ original-history transition and quorum binding. Full metadata/physical policy,
 guarded public/private checkpoint ownership, payload custody, normal paged
 capture/retention/seed recovery and deferred dense capacity/native platform
 qualification remain open. R3-SINGLE-OWNER-METADATA and Milestone 6 remain open.
+
+## Guarded directory checkpoint custody (2026-10-10)
+
+The format-ten quorum proof now enters the original guarded custody operations.
+The retention descriptor keeps its exact directory header, certificate hash,
+independent event-trust hash and cumulative transition work. Default generic
+headers preserve original descriptor bytes and APIs. The directory owner uses
+separate version-one journal/certificate/dependency namespaces and pin prefix
+six; original namespaces and prefixes remain unchanged. UUIDs cannot be reused
+across the two checkpoint layouts, including cancelled owners, because original
+private/payload backlinks share owner IDs.
+
+Acquisition requires the completed original-history transition, exact bound
+quorum, independent event trust and actual current predecessor. It pins all
+three public roots in one short writer, then each nested original legacy/signed
+source root, source/descriptor part and coding forest before evidence I/O.
+Every local typed stream must reach EOF before publication. All pin/publication
+writers recheck trust and the current head; traversal holds no production writer.
+Interrupted building owners replay only the exact descriptor and proof.
+Published owners recheck their complete original closure. Cancellation fences
+IDs permanently, and each release transfers at most one payload, private
+revision dependency or public root. Current checkpoints cannot be cancelled or
+released. Certificate readback/deletion remains exact and atomic with the final
+public root.
+
+Private revision and actual READY information/parity custody share the same
+checked code for both layouts. The common budget includes transition/replay,
+public traversal, private bootstrap/pages and each physical role's original
+coding-witness replay. Acquisition orders cannot reset debt. Readback and volume
+retirement locate the actual UUID-unique checkpoint layout under the same control
+snapshot/writer. Node adapters independently read original event authority,
+authenticate local encrypted private metadata, enforce local ownership and
+verify the full READY bytes against the original coding commitment.
+
+New Store cases qualify transitive ownership through capture retirement,
+shared owners and reopen; exact interrupted replay and changed retry; current
+successor fencing; external-only authority refusal and missing part EOF;
+ignored initial/nested pin and certificate writes; changed final trust;
+corrupt/oversized certificates and ignored final retirement; cross-layout UUID
+exclusion; shared private/bootstrap/native anchors and physical information/
+parity custody; and shared budget exhaustion in both acquisition orders. New
+Node cases qualify authenticated private custody with poisoned flat-state
+cache, plus real information and parity forget/rollback/reopen and destructive
+volume guards through the original runtime scenarios.
+
+Frozen qualification passes 191 Core, 369 ordinary Store and 38 paged Node
+cases, certified-writer migration and provisioned Btrfs capture/recovery: 600
+distinct cases. Original legacy information upgrade passes in the Node suite
+and an independent repeat. Twelve new cases cover directory ownership and
+local custody. Formatting, strict locked workspace/
+all-targets Clippy, all-target test compilation and four debug program builds
+pass. Frozen Rust/Cargo source, seven binaries and 22 embedded protocol/helper
+inputs match; native mount/loop/image cleanup is verified. Evidence is retained
+in `/tmp/mb-m6-directory-custody-validation-i67_41gh`; the post-commit audit
+binds the inputs to the commit.
+Cache cleanup reclaims 10.07 GiB, leaving about 51.5 GiB in
+`target`, with qualified binaries unchanged.
+The ordinary suites leave 26 Store and one paged Node case ignored. The native
+case runs separately on disposable Btrfs using a logical sparse 1 TiB file,
+without qualifying dense retained capacity. Other ordinary/native suites and
+installed artifacts were not rerun.
+
+This stages custody and individual local roles. Complete distributed readiness,
+atomic checkpoint activation, enclosing metadata/physical policy including SQL/
+WAL/scratch headroom, normal paged producers/retention/seed recovery and deferred
+dense capacity/native platform gates remain required. R3-SINGLE-OWNER-METADATA
+and Milestone 6 remain open.

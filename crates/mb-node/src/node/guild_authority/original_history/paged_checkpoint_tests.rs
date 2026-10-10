@@ -2,6 +2,277 @@ use super::*;
 use crate::node::guild_authority::tests::{event, fixture, relabel};
 use crate::node::tests::test_coding_transcript;
 
+fn directory_owner_proof(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    directory_owner_proof_at(node, keys, private, unix_seconds() + 600)
+}
+
+fn directory_owner_proof_at(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+    expires: u64,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    use mb_core::{
+        CatalogPackedSourceReader, CatalogPackedSourceRecord as R, CatalogPackingDirectoryBuilder,
+        CatalogPackingDirectoryRecord as Part, CatalogScope, CatalogSection,
+    };
+    let (original, mut intents) =
+        checkpoint_owner_proof_at_with_budgeted_authority(node, keys, private, expires, true);
+    let header = original.certificate().checkpoint;
+    let trust = original.trust().clone();
+    let scope = CatalogScope::Guild {
+        guild_id: header.guild_id,
+    };
+    let work = original.transition().budget();
+    let mut sources = CatalogPackedSourceReader::new(scope, header.packed_sources).unwrap();
+    let mut bounds = Vec::new();
+    while let Some(record) = sources
+        .next_record(&mut |page| {
+            node.control
+                .catalog_page(scope, CatalogSection::Packing, page)
+        })
+        .unwrap()
+    {
+        if let R::Source { id, .. } = record {
+            bounds.push(id);
+        }
+    }
+    let mut builder = CatalogPackingDirectoryBuilder::new(
+        scope,
+        header.packed_sources.format_version,
+        header.packed_sources.profile,
+        work,
+    )
+    .unwrap();
+    let mut pages = BTreeMap::new();
+    let mut sink = |page: mb_core::CatalogPageRef, bytes| {
+        pages.insert(page.hash, (page, bytes));
+        Ok::<_, ()>(())
+    };
+    builder
+        .push(
+            Part::Sources(mb_core::CatalogPackedSourcePart {
+                format_version: 1,
+                first: bounds[0],
+                last: *bounds.last().unwrap(),
+                root: header.packed_sources,
+            }),
+            &mut sink,
+        )
+        .unwrap();
+    builder
+        .push(
+            Part::Sectors(mb_core::CatalogPackedSectorPart {
+                format_version: 1,
+                first_sector: 0,
+                root: header.packed_sectors,
+            }),
+            &mut sink,
+        )
+        .unwrap();
+    let directory = builder.finish(&mut sink).unwrap();
+    for (page, bytes) in pages.values() {
+        let intent = mb_store::CatalogIntent {
+            id: Uuid::new_v4(),
+            scope,
+            section: CatalogSection::Packing,
+        };
+        node.control.begin_catalog(intent).unwrap();
+        node.control
+            .stage_catalog_page(intent, *page, bytes)
+            .unwrap();
+        intents.push(intent);
+    }
+    let installed = node.installed_guild().unwrap().unwrap();
+    let history = mb_store::CatalogGuildHistoryIndex::build(
+        mb_store::RecordScratchStore::new(2 << 20).unwrap(),
+        &installed.certificate,
+        work,
+        Work::default(),
+        || Ok(trust.clone()),
+        &mut &node.control,
+    )
+    .unwrap();
+    let view = history.view(|| Ok(trust.clone())).unwrap();
+    let authority = original.index().authority();
+    let body = mb_store::CatalogCheckpointAuthorityIndex::build(
+        authority.context,
+        authority.root,
+        &trust.members,
+        work,
+        mb_store::RecordScratchStore::new(2 << 20).unwrap(),
+        |scope, section, page| node.control.catalog_page(scope, section, page),
+        |candidate, _| {
+            if view.current_writer(candidate.owner, &trust)?.as_ref() == Some(candidate) {
+                Ok(())
+            } else {
+                Err(mb_store::DatabaseError::Conflict.into())
+            }
+        },
+    )
+    .unwrap()
+    .validate_packing_directory(
+        mb_store::CatalogPackingDirectoryValidation {
+            format_version: 1,
+            scope,
+            directory,
+        },
+        |page| {
+            node.control
+                .catalog_page(scope, CatalogSection::Packing, page)
+        },
+    )
+    .unwrap()
+    .validate_coding_directory(
+        header.coding,
+        mb_store::CatalogCodingCoveragePolicy::Current,
+        |page| {
+            node.control
+                .catalog_page(scope, CatalogSection::Coding, page)
+        },
+        |_| Ok(mb_store::CatalogCodingAuthorization::CurrentPlacement),
+    )
+    .unwrap();
+    let transition = body
+        .validate_certified_history_coding_state(&history, work, || Ok(trust.clone()))
+        .unwrap()
+        .validate_certified_history_authority_transition(None, &history, work, || Ok(trust.clone()))
+        .unwrap();
+    let mut checkpoint = None;
+    let mut signatures = Vec::new();
+    for key in keys {
+        let (header, signature) = transition
+            .sign_paged_checkpoint_header(key, || Ok(trust.clone()))
+            .unwrap();
+        checkpoint = Some(header);
+        signatures.push(signature);
+    }
+    signatures.sort_by_key(|signature| signature.signer);
+    let proof = transition
+        .bind_paged_checkpoint_header(
+            mb_core::QuorumPagedCheckpointDirectory {
+                checkpoint: checkpoint.unwrap(),
+                signatures,
+            },
+            || Ok(trust.clone()),
+        )
+        .unwrap();
+    (proof, intents)
+}
+
+#[test]
+fn paged_checkpoint_directory_node_owner_authenticates_private_custody_and_reopens_without_advancing_heads()
+ {
+    let (temp, seed, mut node, mut keys) = fixture();
+    let owner = keys
+        .iter()
+        .position(|key| key.node_id() == node.keys.node_id())
+        .unwrap();
+    keys.swap(0, owner);
+    let (proof, captures) = directory_owner_proof(&mut node, &keys, true);
+    assert_eq!(proof.certificate().checkpoint.format_version, 10);
+    let first = proof.index().next_revision(None).unwrap().unwrap();
+    let record = proof
+        .index()
+        .next_revision(first.revision_key())
+        .unwrap()
+        .unwrap();
+    let mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed) = record else {
+        panic!("private successor expected")
+    };
+    let key = mb_core::CatalogCheckpointRevisionKey::from(&signed.value);
+    let flat = node
+        .control
+        .get_record("guild-dynamic-state", KEY)
+        .unwrap()
+        .unwrap();
+    node.control
+        .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+        .unwrap();
+    let id = Uuid::from_u128(1);
+    let retained = node
+        .retain_paged_checkpoint_directory_metadata(id, &proof)
+        .unwrap();
+    node.retain_paged_checkpoint_directory_local_revision(id, &proof, key)
+        .unwrap();
+    let mut wrong = key;
+    wrong.owner = keys[1].node_id();
+    assert!(
+        node.retain_paged_checkpoint_directory_local_revision(id, &proof, wrong)
+            .is_err()
+    );
+    for intent in captures {
+        node.control.cancel_catalog(intent).unwrap();
+        while node.control.release_catalog_pin(intent).unwrap() {}
+    }
+    while node.control.collect_catalog_page().unwrap() {}
+    assert!(
+        node.control
+            .cancel_paged_revision_catalog(signed.value.revision_id)
+            .is_err()
+    );
+    assert!(
+        node.control
+            .checkpoint_head_identity(&proof.trust().guild_id)
+            .unwrap()
+            .is_none()
+    );
+    node.control
+        .put_record("guild-dynamic-state", KEY, &flat)
+        .unwrap();
+    drop(node);
+    let node = Node::open(temp.path(), seed).unwrap();
+    assert_eq!(
+        node.control
+            .catalog_paged_checkpoint_directory_retention(id)
+            .unwrap(),
+        Some((
+            retained,
+            mb_store::CatalogPagedCheckpointRetentionState::Published
+        ))
+    );
+    assert_eq!(
+        node.control
+            .catalog_paged_checkpoint_directory_certificate(id)
+            .unwrap()
+            .as_ref(),
+        Some(proof.certificate())
+    );
+    let local = crate::PagedPrivateMetadata::load_local_catalog(
+        &node.control,
+        &node.keys,
+        signed.value.revision_id,
+        signed.value.scope(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(local.private.is_some());
+    node.control
+        .cancel_catalog_paged_checkpoint_directory_retention(id)
+        .unwrap();
+    while node
+        .control
+        .release_catalog_paged_checkpoint_directory_root(id)
+        .unwrap()
+    {}
+    assert!(
+        node.control
+            .catalog_paged_checkpoint_revision(id, signed.value.revision_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn local_private_checkpoint_revision(
     node: &Node,
     writer: &ed25519_dalek::SigningKey,
@@ -680,652 +951,646 @@ fn paged_checkpoint_node_private_dependency_authenticates_roots_and_preserves_cu
     );
 }
 
-fn exercise_checkpoint_payload_custody(information: bool, legacy: bool) {
-    let (temp, seed, mut node, mut keys) = fixture();
-    let local = keys
-        .iter()
-        .position(|key| key.node_id() == node.keys.node_id())
-        .unwrap();
-    keys.swap(if information { 0 } else { 1 }, local);
-    if legacy {
-        let source = temp.path().join("legacy-source-volume");
-        std::fs::create_dir(&source).unwrap();
-        node.configure_storage_volumes(&[source], 64 << 20, 0)
-            .unwrap();
-    }
-    let (proof, intents) = if legacy {
-        checkpoint_owner_proof_at(&mut node, &keys, false, 1)
-    } else {
-        checkpoint_owner_proof(&mut node, &keys)
-    };
-    let group = proof
-        .index()
-        .index()
-        .next_group(None)
-        .unwrap()
-        .unwrap()
-        .group
-        .range
-        .group_id;
-    let entry = proof
-        .index()
-        .index()
-        .read_group(group, |page| {
-            node.control.catalog_page(
-                mb_core::CatalogScope::Guild {
-                    guild_id: proof.trust().guild_id,
-                },
-                mb_core::CatalogSection::Coding,
-                page,
-            )
-        })
-        .unwrap()
-        .unwrap();
-    let plan = &entry.transcript.value.plan;
-    let guild = proof.trust().guild_id;
-    let original = vec![91; mb_core::V1_SECTOR_SIZE];
-    let profile = mb_core::PackingProfile {
-        format_version: 1,
-        sector_size: mb_core::V1_SECTOR_SIZE as u32,
-        slot_size: mb_core::V1_SECTOR_SIZE as u32 / 4,
-    };
-    let packed = mb_core::pack_incremental(
-        profile,
-        None,
-        vec![mb_core::PackingInput {
-            owner: keys[0].node_id(),
-            protected_root: mb_core::packing_protected_root(Uuid::from_u128(194)),
-            object_id: [193; 32],
-            source_commitment: Some(merkle_commit(&original).unwrap()),
-            bytes: original,
-        }],
-    )
-    .unwrap();
-    let information_id = plan.value.geometry.information[0].sector.id;
-    let bytes = packed
-        .catalog
-        .sectors
-        .iter()
-        .zip(&packed.sectors)
-        .find_map(|(descriptor, sector)| {
-            let mut descriptor = descriptor.clone();
-            descriptor.flat_root = sector_root(&sector.bytes);
-            descriptor.id = descriptor.calculate_id(profile).unwrap();
-            (descriptor.id == information_id).then(|| sector.bytes.clone())
-        })
-        .unwrap();
-    let shards = mb_core::encode(entry.retained.group.profile, vec![bytes]).unwrap();
-    let shard = if information { 0 } else { 1 };
-    let storage = if information { information_id } else { group };
-    let ids = [Uuid::from_u128(1), Uuid::from_u128(2)];
-    for id in ids {
-        node.retain_paged_checkpoint_metadata(id, &proof).unwrap();
-    }
-    assert!(
-        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
-            .is_err()
-    );
-    if legacy {
-        // Reproduce the prior normal upload/activation state without inventing
-        // a receipt or changing its original expired plan and signed witness.
-        node.volumes
-            .reserve_attempt(
-                &node.control,
-                &plan.value.attempt_id,
-                guild,
-                0,
-                shards[0].len() as u32,
-            )
-            .unwrap();
-        node.volumes
-            .write_attempt_range(&node.control, &plan.value.attempt_id, 0, 0, &shards[0])
-            .unwrap();
-        node.volumes
-            .finish_attempt_upload(
-                &node.control,
-                &plan.value.attempt_id,
-                storage,
-                0,
-                &plan.value.geometry.information[0].sector.commitment,
-            )
-            .unwrap();
-    } else if information {
-        node.reserve_coding_information(plan, 0).unwrap();
-        node.write_coding_information_range(plan, 0, 0, &shards[0])
-            .unwrap();
-        node.finish_coding_information_upload(plan, 0).unwrap();
-    } else {
-        let commitment = merkle_commit(&shards[1]).unwrap();
-        node.stage_coding_parity(
-            plan,
-            &entry.transcript.value.manifest,
-            &mb_store::VariableParityObject {
-                format_version: 2,
-                guild_id: guild,
-                group_id: group,
-                shard_index: 1,
-                commitment,
-                bytes: shards[1].clone(),
-            },
-        )
-        .unwrap();
-    }
-    // STAGED bytes are insufficient even when they already match the witness.
-    assert!(
-        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
-            .is_err()
-    );
-    if legacy {
-        let commitment = merkle_commit(&shards[0]).unwrap();
-        let hash = *blake3::hash(&canonical_bytes(&entry.transcript).unwrap()).as_bytes();
-        node.volumes
-            .activate_attempt_object(
-                &node.control,
-                &plan.value.attempt_id,
-                &storage,
-                0,
-                &commitment,
-                &hash,
-            )
-            .unwrap();
-        node.persist_coding_group_transcript(&entry.transcript)
-            .unwrap();
-    } else {
-        node.activate_coding_attempt(&entry.transcript).unwrap();
-    }
-    // A damaged locator must fail before a custody pin can be published. Its
-    // SQL read is bounded independently of the original authenticated proof.
-    let mut locator_key = storage.to_vec();
-    locator_key.push(shard as u8);
-    let locator = node
-        .control
-        .get_record("volume-receipt", &locator_key)
-        .unwrap()
-        .unwrap();
-    node.control
-        .put_record("volume-receipt", &locator_key, &vec![0; 513])
-        .unwrap();
-    assert!(
-        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
-            .is_err()
-    );
-    assert_eq!(
-        node.control
-            .catalog_paged_checkpoint_payload(ids[0], group, shard)
-            .unwrap(),
-        None
-    );
-    node.control
-        .put_record("volume-receipt", &locator_key, &locator)
-        .unwrap();
-    let flat = node
-        .control
-        .get_record("guild-dynamic-state", KEY)
-        .unwrap()
-        .unwrap();
-    node.control
-        .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
-        .unwrap();
-    let payload = node
-        .retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
-        .unwrap();
-    node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, shard)
-        .unwrap();
-    node.retain_paged_checkpoint_local_payload(ids[1], &proof, group, shard)
-        .unwrap();
-    assert!(
-        node.retain_paged_checkpoint_local_payload(ids[0], &proof, group, 1 - shard)
-            .is_err()
-    );
-    for intent in intents {
-        node.control.cancel_catalog(intent).unwrap();
-        while node.control.release_catalog_pin(intent).unwrap() {}
-    }
-    while node.control.collect_catalog_page().unwrap() {}
-    node.control
-        .put_record("guild-dynamic-state", KEY, &flat)
-        .unwrap();
-    let state = node.dynamic_guild_state().unwrap().unwrap();
-    let retire = event(
-        &node,
-        &keys,
-        mb_core::GuildEventKind::RetireCodingGroup {
-            group_id: group,
-            retain_through_event: state.event_sequence + 1,
-        },
-    );
-    node.install_guild_event(retire).unwrap();
-    let forget = event(
-        &node,
-        &keys,
-        mb_core::GuildEventKind::ForgetCodingGroup { group_id: group },
-    );
-    node.install_guild_event(forget).unwrap();
-    if legacy {
-        let remove = event(
-            &node,
-            &keys,
-            mb_core::GuildEventKind::RemoveMember {
-                node_id: keys[4].node_id(),
-            },
-        );
-        node.install_guild_event(remove).unwrap();
-        assert_ne!(
-            node.dynamic_guild_state()
+macro_rules! payload_custody_cases {
+    ($exercise:ident, $constructor:ident, $metadata:ident, $payload:ident, $cancel:ident, $release:ident) => {
+        fn $exercise(information: bool, legacy: bool) {
+            let (temp, seed, mut node, mut keys) = fixture();
+            let local = keys
+                .iter()
+                .position(|key| key.node_id() == node.keys.node_id())
+                .unwrap();
+            keys.swap(if information { 0 } else { 1 }, local);
+            if legacy {
+                let source = temp.path().join("legacy-source-volume");
+                std::fs::create_dir(&source).unwrap();
+                node.configure_storage_volumes(&[source], 64 << 20, 0)
+                    .unwrap();
+            }
+            let (proof, intents) = if legacy {
+                $constructor(&mut node, &keys, false, 1)
+            } else {
+                $constructor(&mut node, &keys, false, unix_seconds() + 600)
+            };
+            let group = proof
+                .index()
+                .index()
+                .next_group(None)
                 .unwrap()
                 .unwrap()
-                .membership_epoch,
-            plan.value.membership_epoch
-        );
-    }
-    node.discard_coding_attempt(&plan.value.attempt_id).unwrap();
-    assert_eq!(
-        node.volumes
-            .load_ready_variable(&node.control, &storage, shard)
-            .unwrap()
-            .bytes,
-        shards[usize::from(shard)]
-    );
-    assert!(
-        !node
-            .volumes
-            .remove_unreachable(
-                &node.control,
-                &storage,
-                shard as u8,
-                &payload.commitment.root
-            )
-            .unwrap()
-    );
-    drop(node);
-    let mut node = Node::open(temp.path(), seed.clone()).unwrap();
-    assert_eq!(
-        node.volumes
-            .load_ready_variable(&node.control, &storage, shard)
-            .unwrap()
-            .bytes,
-        shards[usize::from(shard)]
-    );
-    assert_eq!(
-        node.control
-            .catalog_paged_checkpoint_payload(ids[0], group, shard)
-            .unwrap(),
-        Some(payload.clone())
-    );
-    // Custody follows a verified physical move. Interrupt after the destination
-    // is READY, then retry rollback while both copies and the migration exist.
-    let source: crate::volume::VolumeReceipt = decode_canonical(&locator).unwrap();
-    let source_path = node
-        .volumes
-        .statuses()
-        .unwrap()
-        .into_iter()
-        .find(|status| status.volume_id == source.volume_id)
-        .unwrap()
-        .path;
-    let destination = tempfile::tempdir().unwrap();
-    node.configure_storage_volumes(
-        &[source_path.clone(), destination.path().to_path_buf()],
-        64 << 20,
-        0,
-    )
-    .unwrap();
-    node.drain_storage_volume(source.volume_id).unwrap();
-    if legacy {
-        let witness = node
-            .control
-            .get_record("coding-transcript", &plan.value.attempt_id)
-            .unwrap()
-            .unwrap();
-        let flat = node
-            .control
-            .get_record("guild-dynamic-state", KEY)
-            .unwrap()
-            .unwrap();
-        node.control
-            .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
-            .unwrap();
-        node.control
-            .delete_record("coding-transcript", &plan.value.attempt_id)
-            .unwrap();
-        assert!(
-            node.migrate_draining_volumes()
-                .unwrap_err()
-                .to_string()
-                .contains("activation witness is unavailable")
-        );
-        node.control
-            .put_record(
-                "coding-transcript",
-                &plan.value.attempt_id,
-                &vec![0; mb_core::CATALOG_CODING_TRANSCRIPT_BYTES + 1],
+                .group
+                .range
+                .group_id;
+            let entry = proof
+                .index()
+                .index()
+                .read_group(group, |page| {
+                    node.control.catalog_page(
+                        mb_core::CatalogScope::Guild {
+                            guild_id: proof.trust().guild_id,
+                        },
+                        mb_core::CatalogSection::Coding,
+                        page,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            let plan = &entry.transcript.value.plan;
+            let guild = proof.trust().guild_id;
+            let original = vec![91; mb_core::V1_SECTOR_SIZE];
+            let profile = mb_core::PackingProfile {
+                format_version: 1,
+                sector_size: mb_core::V1_SECTOR_SIZE as u32,
+                slot_size: mb_core::V1_SECTOR_SIZE as u32 / 4,
+            };
+            let packed = mb_core::pack_incremental(
+                profile,
+                None,
+                vec![mb_core::PackingInput {
+                    owner: keys[0].node_id(),
+                    protected_root: mb_core::packing_protected_root(Uuid::from_u128(194)),
+                    object_id: [193; 32],
+                    source_commitment: Some(merkle_commit(&original).unwrap()),
+                    bytes: original,
+                }],
             )
             .unwrap();
-        assert!(node.migrate_draining_volumes().is_err());
-        node.control
-            .put_record("coding-transcript", &plan.value.attempt_id, &witness)
-            .unwrap();
-        let other = proof
-            .index()
-            .index()
-            .next_group(Some(group))
-            .unwrap()
-            .unwrap()
-            .group
-            .range
-            .group_id;
-        let other = proof
-            .index()
-            .index()
-            .read_group(other, |page| {
-                node.control.catalog_page(
-                    mb_core::CatalogScope::Guild { guild_id: guild },
-                    mb_core::CatalogSection::Coding,
-                    page,
+            let information_id = plan.value.geometry.information[0].sector.id;
+            let bytes = packed
+                .catalog
+                .sectors
+                .iter()
+                .zip(&packed.sectors)
+                .find_map(|(descriptor, sector)| {
+                    let mut descriptor = descriptor.clone();
+                    descriptor.flat_root = sector_root(&sector.bytes);
+                    descriptor.id = descriptor.calculate_id(profile).unwrap();
+                    (descriptor.id == information_id).then(|| sector.bytes.clone())
+                })
+                .unwrap();
+            let shards = mb_core::encode(entry.retained.group.profile, vec![bytes]).unwrap();
+            let shard = if information { 0 } else { 1 };
+            let storage = if information { information_id } else { group };
+            let ids = [Uuid::from_u128(1), Uuid::from_u128(2)];
+            for id in ids {
+                node.$metadata(id, &proof).unwrap();
+            }
+            assert!(node.$payload(ids[0], &proof, group, shard).is_err());
+            if legacy {
+                // Reproduce the prior normal upload/activation state without inventing
+                // a receipt or changing its original expired plan and signed witness.
+                node.volumes
+                    .reserve_attempt(
+                        &node.control,
+                        &plan.value.attempt_id,
+                        guild,
+                        0,
+                        shards[0].len() as u32,
+                    )
+                    .unwrap();
+                node.volumes
+                    .write_attempt_range(&node.control, &plan.value.attempt_id, 0, 0, &shards[0])
+                    .unwrap();
+                node.volumes
+                    .finish_attempt_upload(
+                        &node.control,
+                        &plan.value.attempt_id,
+                        storage,
+                        0,
+                        &plan.value.geometry.information[0].sector.commitment,
+                    )
+                    .unwrap();
+            } else if information {
+                node.reserve_coding_information(plan, 0).unwrap();
+                node.write_coding_information_range(plan, 0, 0, &shards[0])
+                    .unwrap();
+                node.finish_coding_information_upload(plan, 0).unwrap();
+            } else {
+                let commitment = merkle_commit(&shards[1]).unwrap();
+                node.stage_coding_parity(
+                    plan,
+                    &entry.transcript.value.manifest,
+                    &mb_store::VariableParityObject {
+                        format_version: 2,
+                        guild_id: guild,
+                        group_id: group,
+                        shard_index: 1,
+                        commitment,
+                        bytes: shards[1].clone(),
+                    },
                 )
-            })
-            .unwrap()
-            .unwrap();
-        node.control
-            .put_record(
-                "coding-transcript",
-                &plan.value.attempt_id,
-                &canonical_bytes(&other.transcript).unwrap(),
-            )
-            .unwrap();
-        assert!(node.migrate_draining_volumes().is_err());
-        node.control
-            .put_record("coding-transcript", &plan.value.attempt_id, &witness)
-            .unwrap();
-        let indexed = node
-            .control
-            .get_record("guild-original-tip-v1", KEY)
-            .unwrap()
-            .unwrap();
-        node.control
-            .delete_record("guild-original-tip-v1", KEY)
-            .unwrap();
-        assert!(
-            node.migrate_draining_volumes()
-                .unwrap_err()
-                .to_string()
-                .contains("complete original-history indexing")
-        );
-        node.control
-            .put_record("guild-original-tip-v1", KEY, &indexed)
-            .unwrap();
-        let member_key = plan.value.membership_epoch.to_be_bytes();
-        let members = node
-            .control
-            .get_record("guild-original-members", &member_key)
-            .unwrap()
-            .unwrap();
-        let mut damaged = members.clone();
-        *damaged.last_mut().unwrap() ^= 1;
-        node.control
-            .put_record("guild-original-members", &member_key, &damaged)
-            .unwrap();
-        assert!(node.migrate_draining_volumes().is_err());
-        node.control
-            .put_record("guild-original-members", &member_key, &members)
-            .unwrap();
-        assert_eq!(
-            node.volumes
-                .database_shell_statement(
-                    source.volume_id,
-                    "SELECT length(acknowledgement) FROM parity_objects",
-                    false
-                )
-                .unwrap()
-                .rows,
-            vec![vec!["0".to_owned()]]
-        );
-        assert_eq!(
-            node.control
+                .unwrap();
+            }
+            // STAGED bytes are insufficient even when they already match the witness.
+            assert!(node.$payload(ids[0], &proof, group, shard).is_err());
+            if legacy {
+                let commitment = merkle_commit(&shards[0]).unwrap();
+                let hash = *blake3::hash(&canonical_bytes(&entry.transcript).unwrap()).as_bytes();
+                node.volumes
+                    .activate_attempt_object(
+                        &node.control,
+                        &plan.value.attempt_id,
+                        &storage,
+                        0,
+                        &commitment,
+                        &hash,
+                    )
+                    .unwrap();
+                node.persist_coding_group_transcript(&entry.transcript)
+                    .unwrap();
+            } else {
+                node.activate_coding_attempt(&entry.transcript).unwrap();
+            }
+            // A damaged locator must fail before a custody pin can be published. Its
+            // SQL read is bounded independently of the original authenticated proof.
+            let mut locator_key = storage.to_vec();
+            locator_key.push(shard as u8);
+            let locator = node
+                .control
                 .get_record("volume-receipt", &locator_key)
-                .unwrap(),
-            Some(locator.clone())
-        );
-        crate::volume::interrupt_next_volume_transition(
-            crate::volume::VolumeInterruption::VariableInformationEvidenceStored,
-        );
-        let injected = node.migrate_draining_volumes().unwrap_err();
-        assert!(
-            injected
-                .to_string()
-                .contains("VariableInformationEvidenceStored"),
-            "{injected:#}"
-        );
-        assert_eq!(
-            node.volumes
-                .database_shell_statement(
-                    source.volume_id,
-                    "SELECT lower(hex(acknowledgement)) FROM parity_objects",
-                    false
-                )
                 .unwrap()
-                .rows,
-            vec![vec![hex::encode(payload.transcript_hash)]]
-        );
-        node.control
-            .put_record("guild-dynamic-state", KEY, &flat)
+                .unwrap();
+            node.control
+                .put_record("volume-receipt", &locator_key, &vec![0; 513])
+                .unwrap();
+            assert!(node.$payload(ids[0], &proof, group, shard).is_err());
+            assert_eq!(
+                node.control
+                    .catalog_paged_checkpoint_payload(ids[0], group, shard)
+                    .unwrap(),
+                None
+            );
+            node.control
+                .put_record("volume-receipt", &locator_key, &locator)
+                .unwrap();
+            let flat = node
+                .control
+                .get_record("guild-dynamic-state", KEY)
+                .unwrap()
+                .unwrap();
+            node.control
+                .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+                .unwrap();
+            let payload = node.$payload(ids[0], &proof, group, shard).unwrap();
+            node.$payload(ids[0], &proof, group, shard).unwrap();
+            node.$payload(ids[1], &proof, group, shard).unwrap();
+            assert!(node.$payload(ids[0], &proof, group, 1 - shard).is_err());
+            for intent in intents {
+                node.control.cancel_catalog(intent).unwrap();
+                while node.control.release_catalog_pin(intent).unwrap() {}
+            }
+            while node.control.collect_catalog_page().unwrap() {}
+            node.control
+                .put_record("guild-dynamic-state", KEY, &flat)
+                .unwrap();
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            let retire = event(
+                &node,
+                &keys,
+                mb_core::GuildEventKind::RetireCodingGroup {
+                    group_id: group,
+                    retain_through_event: state.event_sequence + 1,
+                },
+            );
+            node.install_guild_event(retire).unwrap();
+            let forget = event(
+                &node,
+                &keys,
+                mb_core::GuildEventKind::ForgetCodingGroup { group_id: group },
+            );
+            node.install_guild_event(forget).unwrap();
+            if legacy {
+                let remove = event(
+                    &node,
+                    &keys,
+                    mb_core::GuildEventKind::RemoveMember {
+                        node_id: keys[4].node_id(),
+                    },
+                );
+                node.install_guild_event(remove).unwrap();
+                assert_ne!(
+                    node.dynamic_guild_state()
+                        .unwrap()
+                        .unwrap()
+                        .membership_epoch,
+                    plan.value.membership_epoch
+                );
+            }
+            node.discard_coding_attempt(&plan.value.attempt_id).unwrap();
+            assert_eq!(
+                node.volumes
+                    .load_ready_variable(&node.control, &storage, shard)
+                    .unwrap()
+                    .bytes,
+                shards[usize::from(shard)]
+            );
+            assert!(
+                !node
+                    .volumes
+                    .remove_unreachable(
+                        &node.control,
+                        &storage,
+                        shard as u8,
+                        &payload.commitment.root
+                    )
+                    .unwrap()
+            );
+            drop(node);
+            let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+            assert_eq!(
+                node.volumes
+                    .load_ready_variable(&node.control, &storage, shard)
+                    .unwrap()
+                    .bytes,
+                shards[usize::from(shard)]
+            );
+            assert_eq!(
+                node.control
+                    .catalog_paged_checkpoint_payload(ids[0], group, shard)
+                    .unwrap(),
+                Some(payload.clone())
+            );
+            // Custody follows a verified physical move. Interrupt after the destination
+            // is READY, then retry rollback while both copies and the migration exist.
+            let source: crate::volume::VolumeReceipt = decode_canonical(&locator).unwrap();
+            let source_path = node
+                .volumes
+                .statuses()
+                .unwrap()
+                .into_iter()
+                .find(|status| status.volume_id == source.volume_id)
+                .unwrap()
+                .path;
+            let destination = tempfile::tempdir().unwrap();
+            node.configure_storage_volumes(
+                &[source_path.clone(), destination.path().to_path_buf()],
+                64 << 20,
+                0,
+            )
             .unwrap();
-        node.control
-            .delete_record("coding-transcript", &plan.value.attempt_id)
+            node.drain_storage_volume(source.volume_id).unwrap();
+            if legacy {
+                let witness = node
+                    .control
+                    .get_record("coding-transcript", &plan.value.attempt_id)
+                    .unwrap()
+                    .unwrap();
+                let flat = node
+                    .control
+                    .get_record("guild-dynamic-state", KEY)
+                    .unwrap()
+                    .unwrap();
+                node.control
+                    .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+                    .unwrap();
+                node.control
+                    .delete_record("coding-transcript", &plan.value.attempt_id)
+                    .unwrap();
+                assert!(
+                    node.migrate_draining_volumes()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("activation witness is unavailable")
+                );
+                node.control
+                    .put_record(
+                        "coding-transcript",
+                        &plan.value.attempt_id,
+                        &vec![0; mb_core::CATALOG_CODING_TRANSCRIPT_BYTES + 1],
+                    )
+                    .unwrap();
+                assert!(node.migrate_draining_volumes().is_err());
+                node.control
+                    .put_record("coding-transcript", &plan.value.attempt_id, &witness)
+                    .unwrap();
+                let other = proof
+                    .index()
+                    .index()
+                    .next_group(Some(group))
+                    .unwrap()
+                    .unwrap()
+                    .group
+                    .range
+                    .group_id;
+                let other = proof
+                    .index()
+                    .index()
+                    .read_group(other, |page| {
+                        node.control.catalog_page(
+                            mb_core::CatalogScope::Guild { guild_id: guild },
+                            mb_core::CatalogSection::Coding,
+                            page,
+                        )
+                    })
+                    .unwrap()
+                    .unwrap();
+                node.control
+                    .put_record(
+                        "coding-transcript",
+                        &plan.value.attempt_id,
+                        &canonical_bytes(&other.transcript).unwrap(),
+                    )
+                    .unwrap();
+                assert!(node.migrate_draining_volumes().is_err());
+                node.control
+                    .put_record("coding-transcript", &plan.value.attempt_id, &witness)
+                    .unwrap();
+                let indexed = node
+                    .control
+                    .get_record("guild-original-tip-v1", KEY)
+                    .unwrap()
+                    .unwrap();
+                node.control
+                    .delete_record("guild-original-tip-v1", KEY)
+                    .unwrap();
+                assert!(
+                    node.migrate_draining_volumes()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("complete original-history indexing")
+                );
+                node.control
+                    .put_record("guild-original-tip-v1", KEY, &indexed)
+                    .unwrap();
+                let member_key = plan.value.membership_epoch.to_be_bytes();
+                let members = node
+                    .control
+                    .get_record("guild-original-members", &member_key)
+                    .unwrap()
+                    .unwrap();
+                let mut damaged = members.clone();
+                *damaged.last_mut().unwrap() ^= 1;
+                node.control
+                    .put_record("guild-original-members", &member_key, &damaged)
+                    .unwrap();
+                assert!(node.migrate_draining_volumes().is_err());
+                node.control
+                    .put_record("guild-original-members", &member_key, &members)
+                    .unwrap();
+                assert_eq!(
+                    node.volumes
+                        .database_shell_statement(
+                            source.volume_id,
+                            "SELECT length(acknowledgement) FROM parity_objects",
+                            false
+                        )
+                        .unwrap()
+                        .rows,
+                    vec![vec!["0".to_owned()]]
+                );
+                assert_eq!(
+                    node.control
+                        .get_record("volume-receipt", &locator_key)
+                        .unwrap(),
+                    Some(locator.clone())
+                );
+                crate::volume::interrupt_next_volume_transition(
+                    crate::volume::VolumeInterruption::VariableInformationEvidenceStored,
+                );
+                let injected = node.migrate_draining_volumes().unwrap_err();
+                assert!(
+                    injected
+                        .to_string()
+                        .contains("VariableInformationEvidenceStored"),
+                    "{injected:#}"
+                );
+                assert_eq!(
+                    node.volumes
+                        .database_shell_statement(
+                            source.volume_id,
+                            "SELECT lower(hex(acknowledgement)) FROM parity_objects",
+                            false
+                        )
+                        .unwrap()
+                        .rows,
+                    vec![vec![hex::encode(payload.transcript_hash)]]
+                );
+                node.control
+                    .put_record("guild-dynamic-state", KEY, &flat)
+                    .unwrap();
+                node.control
+                    .delete_record("coding-transcript", &plan.value.attempt_id)
+                    .unwrap();
+                drop(node);
+                node = Node::open(temp.path(), seed.clone()).unwrap();
+            } else if !information {
+                // Empty parity evidence is damage, even with the exact valid witness.
+                let original = node
+                    .volumes
+                    .database_shell_statement(
+                        source.volume_id,
+                        "SELECT hex(acknowledgement) FROM parity_objects",
+                        false,
+                    )
+                    .unwrap()
+                    .rows[0][0]
+                    .clone();
+                node.volumes
+                    .database_shell_statement(
+                        source.volume_id,
+                        "UPDATE parity_objects SET acknowledgement=X''",
+                        false,
+                    )
+                    .unwrap();
+                assert!(
+                    node.migrate_draining_volumes()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("not an information upload")
+                );
+                node.volumes
+                    .database_shell_statement(
+                        source.volume_id,
+                        &format!("UPDATE parity_objects SET acknowledgement=X'{original}'"),
+                        false,
+                    )
+                    .unwrap();
+            }
+            crate::volume::interrupt_next_volume_transition(
+                crate::volume::VolumeInterruption::VariableMigrationDestinationReady,
+            );
+            let interruption = node.migrate_draining_volumes().unwrap_err();
+            assert!(
+                interruption
+                    .to_string()
+                    .contains("VariableMigrationDestinationReady")
+            );
+            node.discard_coding_attempt(&plan.value.attempt_id).unwrap();
+            drop(node);
+            let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+            node.migrate_draining_volumes().unwrap();
+            if legacy {
+                assert!(source_path.starts_with(temp.path()));
+                assert_ne!(source_path, temp.path());
+                std::fs::remove_dir_all(&source_path).unwrap();
+            }
+            let moved: crate::volume::VolumeReceipt = decode_canonical(
+                &node
+                    .control
+                    .get_record("volume-receipt", &locator_key)
+                    .unwrap()
+                    .unwrap(),
+            )
             .unwrap();
-        drop(node);
-        node = Node::open(temp.path(), seed.clone()).unwrap();
-    } else if !information {
-        // Empty parity evidence is damage, even with the exact valid witness.
-        let original = node
-            .volumes
-            .database_shell_statement(
-                source.volume_id,
-                "SELECT hex(acknowledgement) FROM parity_objects",
-                false,
-            )
-            .unwrap()
-            .rows[0][0]
-            .clone();
-        node.volumes
-            .database_shell_statement(
-                source.volume_id,
-                "UPDATE parity_objects SET acknowledgement=X''",
-                false,
+            assert_ne!(moved.volume_id, source.volume_id);
+            assert_eq!(
+                node.volumes
+                    .load_ready_variable(&node.control, &storage, shard)
+                    .unwrap()
+                    .bytes,
+                shards[usize::from(shard)]
+            );
+            assert_eq!(
+                node.control
+                    .catalog_paged_checkpoint_payload(ids[0], group, shard)
+                    .unwrap(),
+                Some(payload.clone())
+            );
+            // Repair an unavailable copy without dropping its custodied locator before
+            // the replacement becomes READY. Restore the old disk and collect both
+            // copies only after the last owner retires.
+            let object = node
+                .volumes
+                .load_ready_variable(&node.control, &storage, shard)
+                .unwrap();
+            drop(node);
+            let offline = temp.path().join("offline-custody-volume");
+            std::fs::rename(destination.path(), &offline).unwrap();
+            let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+            let replacement = tempfile::tempdir().unwrap();
+            node.configure_storage_volumes(&[replacement.path().to_path_buf()], 64 << 20, 0)
+                .unwrap();
+            let before = node
+                .control
+                .get_record("volume-receipt", &locator_key)
+                .unwrap();
+            assert!(
+                !node
+                    .volumes
+                    .prepare_variable_repair(&node.control, &object)
+                    .unwrap()
+            );
+            assert_eq!(
+                node.control
+                    .get_record("volume-receipt", &locator_key)
+                    .unwrap(),
+                before
+            );
+            let repair = [225; 16];
+            node.volumes
+                .reserve_attempt(
+                    &node.control,
+                    &repair,
+                    guild,
+                    shard,
+                    object.commitment.byte_len,
+                )
+                .unwrap();
+            node.volumes
+                .write_attempt_range(&node.control, &repair, shard, 0, &object.bytes)
+                .unwrap();
+            node.volumes
+                .finish_attempt_upload(&node.control, &repair, storage, shard, &object.commitment)
+                .unwrap();
+            node.volumes
+                .attach_attempt_receipt(
+                    &node.control,
+                    &repair,
+                    &storage,
+                    shard,
+                    &payload.transcript_hash,
+                )
+                .unwrap();
+            node.volumes
+                .activate_attempt_object(
+                    &node.control,
+                    &repair,
+                    &storage,
+                    shard,
+                    &object.commitment,
+                    &payload.transcript_hash,
+                )
+                .unwrap();
+            node.volumes
+                .finalize_attempt(&node.control, &repair)
+                .unwrap();
+            drop(node);
+            std::fs::rename(&offline, destination.path()).unwrap();
+            let mut node = Node::open(temp.path(), seed).unwrap();
+            node.configure_storage_volumes(
+                &[
+                    destination.path().to_path_buf(),
+                    replacement.path().to_path_buf(),
+                ],
+                64 << 20,
+                0,
             )
             .unwrap();
-        assert!(
-            node.migrate_draining_volumes()
-                .unwrap_err()
-                .to_string()
-                .contains("not an information upload")
-        );
-        node.volumes
-            .database_shell_statement(
-                source.volume_id,
-                &format!("UPDATE parity_objects SET acknowledgement=X'{original}'"),
-                false,
-            )
-            .unwrap();
-    }
-    crate::volume::interrupt_next_volume_transition(
-        crate::volume::VolumeInterruption::VariableMigrationDestinationReady,
-    );
-    let interruption = node.migrate_draining_volumes().unwrap_err();
-    assert!(
-        interruption
-            .to_string()
-            .contains("VariableMigrationDestinationReady")
-    );
-    node.discard_coding_attempt(&plan.value.attempt_id).unwrap();
-    drop(node);
-    let mut node = Node::open(temp.path(), seed.clone()).unwrap();
-    node.migrate_draining_volumes().unwrap();
-    if legacy {
-        assert!(source_path.starts_with(temp.path()));
-        assert_ne!(source_path, temp.path());
-        std::fs::remove_dir_all(&source_path).unwrap();
-    }
-    let moved: crate::volume::VolumeReceipt = decode_canonical(
-        &node
-            .control
-            .get_record("volume-receipt", &locator_key)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_ne!(moved.volume_id, source.volume_id);
-    assert_eq!(
-        node.volumes
-            .load_ready_variable(&node.control, &storage, shard)
-            .unwrap()
-            .bytes,
-        shards[usize::from(shard)]
-    );
-    assert_eq!(
-        node.control
-            .catalog_paged_checkpoint_payload(ids[0], group, shard)
-            .unwrap(),
-        Some(payload.clone())
-    );
-    // Repair an unavailable copy without dropping its custodied locator before
-    // the replacement becomes READY. Restore the old disk and collect both
-    // copies only after the last owner retires.
-    let object = node
-        .volumes
-        .load_ready_variable(&node.control, &storage, shard)
-        .unwrap();
-    drop(node);
-    let offline = temp.path().join("offline-custody-volume");
-    std::fs::rename(destination.path(), &offline).unwrap();
-    let mut node = Node::open(temp.path(), seed.clone()).unwrap();
-    let replacement = tempfile::tempdir().unwrap();
-    node.configure_storage_volumes(&[replacement.path().to_path_buf()], 64 << 20, 0)
-        .unwrap();
-    let before = node
-        .control
-        .get_record("volume-receipt", &locator_key)
-        .unwrap();
-    assert!(
-        !node
-            .volumes
-            .prepare_variable_repair(&node.control, &object)
-            .unwrap()
-    );
-    assert_eq!(
-        node.control
-            .get_record("volume-receipt", &locator_key)
-            .unwrap(),
-        before
-    );
-    let repair = [225; 16];
-    node.volumes
-        .reserve_attempt(
-            &node.control,
-            &repair,
-            guild,
-            shard,
-            object.commitment.byte_len,
-        )
-        .unwrap();
-    node.volumes
-        .write_attempt_range(&node.control, &repair, shard, 0, &object.bytes)
-        .unwrap();
-    node.volumes
-        .finish_attempt_upload(&node.control, &repair, storage, shard, &object.commitment)
-        .unwrap();
-    node.volumes
-        .attach_attempt_receipt(
-            &node.control,
-            &repair,
-            &storage,
-            shard,
-            &payload.transcript_hash,
-        )
-        .unwrap();
-    node.volumes
-        .activate_attempt_object(
-            &node.control,
-            &repair,
-            &storage,
-            shard,
-            &object.commitment,
-            &payload.transcript_hash,
-        )
-        .unwrap();
-    node.volumes
-        .finalize_attempt(&node.control, &repair)
-        .unwrap();
-    drop(node);
-    std::fs::rename(&offline, destination.path()).unwrap();
-    let mut node = Node::open(temp.path(), seed).unwrap();
-    node.configure_storage_volumes(
-        &[
-            destination.path().to_path_buf(),
-            replacement.path().to_path_buf(),
-        ],
-        64 << 20,
-        0,
-    )
-    .unwrap();
-    assert_eq!(
-        node.volumes
-            .load_ready_variable(&node.control, &storage, shard)
-            .unwrap(),
-        object
-    );
-    node.control
-        .cancel_catalog_paged_checkpoint_retention(ids[0])
-        .unwrap();
-    assert!(
-        node.control
-            .release_catalog_paged_checkpoint_root(ids[0])
-            .unwrap()
-    );
-    assert!(
-        !node
-            .volumes
-            .remove_unreachable(
-                &node.control,
-                &storage,
-                shard as u8,
-                &payload.commitment.root
-            )
-            .unwrap()
-    );
-    while node
-        .control
-        .release_catalog_paged_checkpoint_root(ids[0])
-        .unwrap()
-    {}
-    node.control
-        .cancel_catalog_paged_checkpoint_retention(ids[1])
-        .unwrap();
-    assert!(
-        node.control
-            .release_catalog_paged_checkpoint_root(ids[1])
-            .unwrap()
-    );
-    assert!(
-        node.volumes
-            .remove_unreachable(
-                &node.control,
-                &storage,
-                shard as u8,
-                &payload.commitment.root
-            )
-            .unwrap()
-    );
-    assert!(
-        node.volumes
-            .load_ready_variable(&node.control, &storage, shard)
-            .is_err()
-    );
-    while node
-        .control
-        .release_catalog_paged_checkpoint_root(ids[1])
-        .unwrap()
-    {}
+            assert_eq!(
+                node.volumes
+                    .load_ready_variable(&node.control, &storage, shard)
+                    .unwrap(),
+                object
+            );
+            node.control.$cancel(ids[0]).unwrap();
+            assert!(node.control.$release(ids[0]).unwrap());
+            assert!(
+                !node
+                    .volumes
+                    .remove_unreachable(
+                        &node.control,
+                        &storage,
+                        shard as u8,
+                        &payload.commitment.root
+                    )
+                    .unwrap()
+            );
+            while node.control.$release(ids[0]).unwrap() {}
+            node.control.$cancel(ids[1]).unwrap();
+            assert!(node.control.$release(ids[1]).unwrap());
+            assert!(
+                node.volumes
+                    .remove_unreachable(
+                        &node.control,
+                        &storage,
+                        shard as u8,
+                        &payload.commitment.root
+                    )
+                    .unwrap()
+            );
+            assert!(
+                node.volumes
+                    .load_ready_variable(&node.control, &storage, shard)
+                    .is_err()
+            );
+            while node.control.$release(ids[1]).unwrap() {}
+        }
+    };
+}
+payload_custody_cases!(
+    exercise_checkpoint_payload_custody,
+    checkpoint_owner_proof_at,
+    retain_paged_checkpoint_metadata,
+    retain_paged_checkpoint_local_payload,
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root
+);
+payload_custody_cases!(
+    exercise_directory_checkpoint_payload_custody,
+    directory_owner_proof_at,
+    retain_paged_checkpoint_directory_metadata,
+    retain_paged_checkpoint_directory_local_payload,
+    cancel_catalog_paged_checkpoint_directory_retention,
+    release_catalog_paged_checkpoint_directory_root
+);
+
+#[test]
+fn paged_checkpoint_directory_information_custody_survives_real_forget_rollback_and_reopen() {
+    exercise_directory_checkpoint_payload_custody(true, false);
+}
+
+#[test]
+fn paged_checkpoint_directory_parity_custody_survives_real_forget_rollback_and_reopen() {
+    exercise_directory_checkpoint_payload_custody(false, false);
 }
 
 #[test]

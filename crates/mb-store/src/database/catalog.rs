@@ -104,7 +104,8 @@ pub use paged_checkpoint::{
 };
 pub use paged_checkpoint_payload::{CatalogCheckpointPayload, CatalogPayloadRetirementView};
 pub use paged_checkpoint_retention::{
-    CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,
+    CatalogPagedCheckpointDirectoryRetention, CatalogPagedCheckpointRetention,
+    CatalogPagedCheckpointRetentionState,
 };
 pub use paged_data::{
     PAGED_DATA_RECIPE_BYTES, PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource,

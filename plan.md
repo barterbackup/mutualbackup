@@ -1620,6 +1620,32 @@ Cache cleanup reclaims 8.01 GiB with binary hashes preserved. Full metadata/
 physical policy, durable activation/retirement and normal producers/recovery,
 plus deferred dense capacity/platform gates, remain open. See ADR 0002.
 
+The original-history/quorum directory proof now enters guarded public, private
+and local READY payload custody through the original shared operations. Three
+public roots and all nested source/descriptor/forest parts are pinned before
+local I/O, with exact certificate readback, independent event/current-head
+checks, immutable interrupted replay and bounded cancellation/release. A new
+journal and pin prefix six preserve existing layouts; UUIDs cannot alias the
+original private/payload backlinks across checkpoint layouts. Private and
+physical custody spend the same cumulative budget in either acquisition order.
+Node authenticates original authority, private metadata and complete READY
+bytes, with real information/parity forget/rollback/reopen qualification.
+Frozen qualification passes 191 Core, 369 ordinary Store and 38 paged Node
+cases, certified-writer migration and provisioned Btrfs capture/recovery: 600
+distinct cases. Original legacy information upgrade passes in the Node suite
+and an independent repeat. Twelve new cases cover directory ownership and
+local custody. Formatting, strict locked workspace/
+all-targets Clippy, all-target test compilation and four debug program builds
+pass. Frozen Rust/Cargo source, seven binaries and 22 embedded protocol/helper
+inputs match; native mount/loop/image cleanup is verified. Evidence is retained
+in `/tmp/mb-m6-directory-custody-validation-i67_41gh`; the post-commit audit
+binds the inputs to the commit.
+Cache cleanup reclaims 10.07 GiB, leaving about 51.5 GiB in
+`target`, with qualified binaries unchanged.
+Complete distributed readiness and atomic activation, full metadata/physical
+policy, normal producers/recovery and deferred dense capacity/platform gates
+remain open. See ADR 0002.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

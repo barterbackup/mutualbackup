@@ -7,7 +7,7 @@ use mb_core::{
     CatalogCodingTraversalBudget as Work, PagedCheckpointTrust,
 };
 
-use super::paged_checkpoint_retention::owned_certificate;
+use super::paged_checkpoint_retention::{Layout, Proof, owned_certificate, validate_owner};
 use super::retention_journal as journal;
 use super::*;
 
@@ -63,9 +63,9 @@ fn dependency(catalog: &PagedCatalogSnapshot) -> Result<Dependency, CatalogStore
     })
 }
 
-pub(super) fn owned_work(
+pub(super) fn owned_work<H: Layout>(
     connection: &Connection,
-    retention: CatalogPagedCheckpointRetention,
+    retention: CatalogPagedCheckpointRetention<H>,
 ) -> Result<Option<Work>, CatalogStoreError> {
     let stored = bounded_record(connection, TOTALS, retention.id.as_bytes(), ROW_BYTES)?;
     let work: Option<Work> = stored
@@ -75,7 +75,7 @@ pub(super) fn owned_work(
     if let Some(work) = work
         && (canonical_bytes(&work)? != *stored.as_ref().ok_or(DatabaseError::Integrity)?
             || work.records % 3 != 0
-            || work.records / 3 > retention.checkpoint.authority_root.summary.revisions
+            || work.records / 3 > retention.checkpoint.authority_root().summary.revisions
             || (work.records == 0) != (work.bytes == 0)
             || (work.records == 0) != (work.page_occurrences == 0))
     {
@@ -87,24 +87,24 @@ pub(super) fn owned_work(
     Ok(work)
 }
 
-pub(super) fn admitted_work(
+pub(super) fn admitted_work<H: Layout>(
     connection: &Connection,
-    retention: CatalogPagedCheckpointRetention,
+    retention: CatalogPagedCheckpointRetention<H>,
 ) -> Result<Option<Work>, CatalogStoreError> {
     let work = owned_work(connection, retention)?;
     check_work(connection, retention, work.unwrap_or_default())?;
     Ok(work)
 }
 
-fn check_work(
+fn check_work<H: Layout>(
     connection: &Connection,
-    retention: CatalogPagedCheckpointRetention,
+    retention: CatalogPagedCheckpointRetention<H>,
     work: Work,
 ) -> Result<(), CatalogStoreError> {
     retention.budget.remaining_after(
         retention
             .proof_work
-            .checked_add(retention.checkpoint.represented_work()?)?
+            .checked_add(retention.checkpoint.work()?)?
             .checked_add(work)?
             .checked_add(
                 paged_checkpoint_payload::owned_work(connection, retention)?.unwrap_or_default(),
@@ -122,9 +122,9 @@ pub(super) fn require_unowned(connection: &Connection, id: Uuid) -> Result<(), C
     Ok(())
 }
 
-fn change_work(
+fn change_work<H: Layout>(
     connection: &Connection,
-    retention: CatalogPagedCheckpointRetention,
+    retention: CatalogPagedCheckpointRetention<H>,
     previous: Option<Work>,
     next: Work,
 ) -> Result<(), CatalogStoreError> {
@@ -203,9 +203,9 @@ pub(super) fn has_dependencies(
 
 // The enclosing caller supplies an Immediate writer and checks the actual
 // current checkpoint before and after this one bounded dependency transfer.
-pub(super) fn release(
+pub(super) fn release<H: Layout>(
     connection: &Connection,
-    retention: CatalogPagedCheckpointRetention,
+    retention: CatalogPagedCheckpointRetention<H>,
 ) -> Result<bool, CatalogStoreError> {
     if journal::require(connection, retention)?.state
         != CatalogPagedCheckpointRetentionState::Cancelled
@@ -259,39 +259,57 @@ pub(super) fn release(
     Ok(true)
 }
 
+macro_rules! revision_api {
+    ($proof:ty, $retain:ident) => {
+        impl ControlStore {
+            /// Authenticate and retain one exact published private revision,
+            /// including its bootstrap and native/source custody, under the
+            /// completed original-history checkpoint owner.
+            pub fn $retain<E: From<CatalogStoreError>>(
+                &self,
+                id: Uuid,
+                proof: &$proof,
+                key: CatalogCheckpointRevisionKey,
+                read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+                check: impl FnOnce(&PagedCatalogSnapshot) -> Result<(), E>,
+            ) -> Result<PagedCatalogSnapshot, E> {
+                self.retain_checkpoint_revision_checked(id, proof, key, read_trust, check)
+            }
+        }
+    };
+}
+revision_api!(
+    CatalogQuorumPagedCheckpointIndex,
+    retain_catalog_paged_checkpoint_revision_checked
+);
+revision_api!(
+    CatalogQuorumPagedCheckpointDirectoryIndex,
+    retain_catalog_paged_checkpoint_directory_revision_checked
+);
+
 impl ControlStore {
     /// Retain one existing private revision bundle, its bootstrap and native/
     /// source pins for an exact revision in the completed original-history
     /// proof. Authenticate the encrypted private descriptor in `check` using
     /// this writer's snapshot. This dependency is not full payload readiness.
-    pub fn retain_catalog_paged_checkpoint_revision_checked<E: From<CatalogStoreError>>(
+    fn retain_checkpoint_revision_checked<P: Proof, E: From<CatalogStoreError>>(
         &self,
         id: Uuid,
-        proof: &CatalogQuorumPagedCheckpointIndex,
+        proof: &P,
         key: CatalogCheckpointRevisionKey,
         mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
         check: impl FnOnce(&PagedCatalogSnapshot) -> Result<(), E>,
     ) -> Result<PagedCatalogSnapshot, E> {
         let mut acquire = || -> Result<_, CatalogStoreError> {
-            if id.is_nil() || !proof.transition().has_certified_history_transition() {
+            if id.is_nil() {
                 return Err(DatabaseError::Conflict.into());
             }
-            proof.recheck_header(&mut read_trust)?;
+            let retention = proof.retention(id)?;
+            proof.recheck(&mut read_trust)?;
             let Some(CatalogCheckpointAuthorityRecord::PagedRevision(signed)) =
-                proof.index().revision(key)?
+                proof.revision(key)?
             else {
                 return Err(DatabaseError::Conflict.into());
-            };
-            let retention = CatalogPagedCheckpointRetention {
-                id,
-                checkpoint: proof.certificate().checkpoint,
-                certificate_hash: mb_core::canonical_hash_bounded(
-                    proof.certificate(),
-                    mb_core::PAGED_QUORUM_CHECKPOINT_BYTES,
-                )?,
-                trust_hash: super::checkpoint_transition::snapshot_hash(proof.trust())?,
-                proof_work: proof.transition().represented_work(),
-                budget: proof.transition().budget(),
             };
             Ok((retention, signed))
         };
@@ -356,13 +374,7 @@ impl ControlStore {
         let tx = self.read_snapshot()?;
         let catalog = read(&tx, id, revision)?;
         if catalog.is_some() {
-            let record = journal::read::<CatalogPagedCheckpointRetention>(&tx, id)?
-                .ok_or(DatabaseError::Integrity)?;
-            if record.state == CatalogPagedCheckpointRetentionState::Building || record.roots == 0 {
-                return Err(DatabaseError::Integrity.into());
-            }
-            owned_certificate(&tx, record.retention)?;
-            admitted_work(&tx, record.retention)?;
+            validate_owner(&tx, id)?;
         }
         tx.commit()?;
         Ok(catalog)

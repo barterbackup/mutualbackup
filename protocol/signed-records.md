@@ -441,3 +441,18 @@ and cannot proceed from a candidate/header alone. The full history-transition
 flag, private/metadata/payload ownership and guarded durable publication remain
 mandatory before activation. Original signed bytes, domains, header/certificate
 layouts and existing disposable marker schemas are unchanged.
+
+Format-ten proofs also enter guarded transitive public ownership and checked
+private/bootstrap/native and local READY information/parity custody. The
+retention journal holds the exact original certificate/trust/work; every nested
+source, packing part and coding forest is pinned before local traversal and
+publication requires all EOFs. Acquisition/retirement reuse original current-
+head/event checks, immutable replay, exact readback and bounded release.
+Directory custody uses new journal/certificate/dependency kinds and pin prefix
+six. Owner UUIDs are permanently exclusive across checkpoint layouts because
+original private/payload backlinks share IDs. Their readbacks and physical
+retirement guards dispatch to the exact owner's layout. The cumulative budget
+includes public/history, private and actual payload/witness debt in either
+acquisition order. These owners stage metadata and local roles; full distributed
+readiness, atomic activation and normal producers remain separate requirements.
+Original signed and journal layouts and existing pin prefixes are unchanged.

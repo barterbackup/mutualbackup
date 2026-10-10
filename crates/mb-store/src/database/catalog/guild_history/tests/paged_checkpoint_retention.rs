@@ -108,6 +108,15 @@ pub(super) fn stage_paged_owner(
         .unwrap()
         .is_some()
     {}
+    stage_owner_roots(control, &fixture.pages, &roots, offset)
+}
+
+pub(super) fn stage_owner_roots(
+    control: &ControlStore,
+    pages: &BTreeMap<[u8; 32], Vec<u8>>,
+    roots: &[OwnerRoot],
+    offset: u128,
+) -> (Vec<CatalogIntent>, Vec<OwnerRoot>) {
     fn tree(
         control: &ControlStore,
         intent: CatalogIntent,
@@ -135,14 +144,14 @@ pub(super) fn stage_paged_owner(
                 section: *section,
             };
             control.begin_catalog(intent).unwrap();
-            tree(control, intent, *root, &fixture.pages);
+            tree(control, intent, *root, pages);
             intent
         })
         .collect();
-    (intents, roots)
+    (intents, roots.to_vec())
 }
 
-fn retire_owner_captures(control: &ControlStore, intents: &[CatalogIntent]) {
+pub(super) fn retire_owner_captures(control: &ControlStore, intents: &[CatalogIntent]) {
     for intent in intents {
         control.cancel_catalog(*intent).unwrap();
         while control.release_catalog_pin(*intent).unwrap() {}

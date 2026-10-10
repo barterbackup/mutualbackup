@@ -57,6 +57,7 @@ use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open
 
 type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
+mod checkpoint_custody;
 mod guild_authority;
 
 type LegacyPackingAttestationEntries =
@@ -4276,112 +4277,6 @@ impl Node {
             authority.writer_key_for_retained_revision(owner, epoch)
         })?
         .context("writer-key registration requires dynamic guild state")
-    }
-
-    /// Stage the complete public metadata owner against independently checked
-    /// original events and the actual current predecessor. This does not
-    /// publish/activate a protected checkpoint or replace private/payload owners.
-    pub fn retain_paged_checkpoint_metadata(
-        &self,
-        id: Uuid,
-        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
-    ) -> Result<mb_store::CatalogPagedCheckpointRetention> {
-        guild_authority::with_history(&self.control, |authority| {
-            Ok(self
-                .control
-                .retain_catalog_paged_checkpoint(id, proof, || {
-                    authority.paged_checkpoint_trust().map_err(|_| {
-                        mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
-                    })
-                })?)
-        })?
-        .context("paged checkpoint requires original guild authority")
-    }
-
-    /// Keep this node's authenticated private bundle and its existing payload
-    /// pins live for a revision in the exact public checkpoint proof. Complete
-    /// information/parity custody is still required before activation.
-    pub fn retain_paged_checkpoint_local_revision(
-        &self,
-        id: Uuid,
-        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
-        key: mb_core::CatalogCheckpointRevisionKey,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            key.owner == self.keys.node_id(),
-            "private checkpoint revision belongs to another owner"
-        );
-        guild_authority::with_history(&self.control, |authority| {
-            self.control
-                .retain_catalog_paged_checkpoint_revision_checked(
-                    id,
-                    proof,
-                    key,
-                    || {
-                        authority.paged_checkpoint_trust().map_err(|_| {
-                            mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
-                        })
-                    },
-                    |snapshot| -> Result<()> {
-                        let opened = crate::PagedPrivateMetadata::open_local_snapshot(
-                            &self.keys,
-                            snapshot,
-                            snapshot.bundle.scope,
-                        )?;
-                        anyhow::ensure!(
-                            opened.private.is_some(),
-                            "checkpoint private revision is retired"
-                        );
-                        Ok(())
-                    },
-                )?;
-            Ok(())
-        })?
-        .context("paged checkpoint requires original guild authority")
-    }
-
-    /// Retain one actual local READY role from the original quorum-bound
-    /// checkpoint. Full bytes are checked while the control writer excludes GC.
-    pub fn retain_paged_checkpoint_local_payload(
-        &self,
-        id: Uuid,
-        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
-        group: [u8; 32],
-        shard: u16,
-    ) -> Result<mb_store::CatalogCheckpointPayload> {
-        guild_authority::with_history(&self.control, |authority| {
-            self.control
-                .retain_catalog_paged_checkpoint_payload_checked(
-                    id,
-                    proof,
-                    group,
-                    shard,
-                    || {
-                        authority.paged_checkpoint_trust().map_err(|_| {
-                            mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
-                        })
-                    },
-                    |payload| -> Result<()> {
-                        anyhow::ensure!(
-                            payload.holder == self.keys.node_id(),
-                            "checkpoint payload belongs to another holder"
-                        );
-                        let ready = self.volumes.load_ready_variable(
-                            &self.control,
-                            &payload.storage_id,
-                            payload.shard_index,
-                        )?;
-                        anyhow::ensure!(
-                            ready.guild_id == payload.guild_id
-                                && ready.commitment == payload.commitment
-                                && merkle_commit(&ready.bytes)? == payload.commitment,
-                            "checkpoint READY payload differs from its original coding witness"
-                        );
-                        Ok(())
-                    },
-                )
-        })?
-        .context("paged checkpoint requires original guild authority")
     }
 
     pub(crate) fn needs_recovery_key_registration(&self) -> Result<bool> {

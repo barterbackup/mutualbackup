@@ -12,7 +12,18 @@ fn body(
     trust: &PagedCheckpointTrust,
     concrete: bool,
 ) -> CatalogCheckpointDirectoriesCodingStateIndex {
-    fixture.authority_budget = Some(budget());
+    body_with_budget(fixture, history, reader, trust, concrete, budget())
+}
+
+pub(super) fn body_with_budget(
+    fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
+    history: &History,
+    reader: &CatalogGuildHistoryIndex,
+    trust: &PagedCheckpointTrust,
+    concrete: bool,
+    limit: Work,
+) -> CatalogCheckpointDirectoriesCodingStateIndex {
+    fixture.authority_budget = Some(limit);
     fixture.context.generation = trust.next_generation().unwrap();
     fixture.context.event_sequence = trust.event_sequence;
     fixture.context.event_head = trust.event_head;
@@ -23,14 +34,36 @@ fn body(
     fixture
         .records
         .extend(trust.members.iter().cloned().map(R::Member));
-    let mut original = history.entry.clone();
-    original.retained = history
+    let originals = history
         .state
         .coding_groups
         .iter()
-        .find(|group| group.group.id == original.retained.group.id)
-        .unwrap()
-        .clone();
+        .map(|retained| {
+            let transcript = if retained.group.id == history.entry.retained.group.id {
+                history.entry.transcript.clone()
+            } else {
+                history
+                    .source
+                    .objects
+                    .iter()
+                    .filter_map(|(key, bytes)| {
+                        if !matches!(key, CatalogGuildHistoryObject::Transcript(_)) {
+                            return None;
+                        }
+                        let signed: mb_core::SignedRecord<mb_core::CodingVerificationTranscript> =
+                            decode_canonical(bytes).unwrap();
+                        (signed.value.manifest.value.group.id == retained.group.id)
+                            .then_some(signed)
+                    })
+                    .next()
+                    .unwrap()
+            };
+            mb_core::CatalogCodingEntry {
+                retained: retained.clone(),
+                transcript,
+            }
+        })
+        .collect::<Vec<_>>();
     let (packing, pages, _) = fixture.packing_inputs_with_byte_roots();
     let parts = shard(packing, pages.into_iter().collect());
     let mut pages = parts.pages;
@@ -39,12 +72,13 @@ fn body(
         Ok::<_, ()>(())
     };
     let mut builder =
-        CatalogCodingDirectoryBuilder::new(fixture.scope(), trust.event_sequence, budget())
-            .unwrap();
-    builder.push_group(&original, &mut sink).unwrap();
+        CatalogCodingDirectoryBuilder::new(fixture.scope(), trust.event_sequence, limit).unwrap();
+    for original in &originals {
+        builder.push_group(original, &mut sink).unwrap();
+    }
     let coding = builder.finish(&mut sink).unwrap();
     let index = fixture
-        .build_with_members(budget(), &trust.members)
+        .build_with_members(limit, &trust.members)
         .unwrap()
         .validate_packing_directory(parts.manifest, |page| Ok(pages[&page.hash].clone()))
         .unwrap()
@@ -55,15 +89,16 @@ fn body(
             |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
         )
         .unwrap();
+    fixture.pages.extend(pages);
     if concrete {
         index
-            .validate_certified_history_coding_state(reader, budget(), || Ok(trust.clone()))
+            .validate_certified_history_coding_state(reader, limit, || Ok(trust.clone()))
             .unwrap()
     } else {
         let view = reader.view(|| Ok(trust.clone())).unwrap();
         index
             .validate_certified_coding_state(
-                budget(),
+                limit,
                 || Ok(view.coding_trust()),
                 |id, trust| view.coding_group(id, trust),
             )
@@ -71,7 +106,7 @@ fn body(
     }
 }
 
-fn certificate(
+pub(super) fn certificate(
     transition: CatalogCheckpointDirectoriesTransitionIndex,
     history: &History,
 ) -> CatalogQuorumPagedCheckpointDirectoryIndex {
@@ -103,7 +138,7 @@ fn certificate(
         .unwrap()
 }
 
-fn initial(
+pub(super) fn initial(
     fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
     history: &History,
 ) -> CatalogQuorumPagedCheckpointDirectoryIndex {
