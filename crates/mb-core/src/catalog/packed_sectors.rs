@@ -179,6 +179,14 @@ impl CatalogPackedSectorRoot {
     }
 
     pub fn validate(self) -> Result<(), CatalogError> {
+        self.validate_geometry(false)
+    }
+
+    pub(super) fn validate_part(self) -> Result<(), CatalogError> {
+        self.validate_geometry(true)
+    }
+
+    fn validate_geometry(self, part: bool) -> Result<(), CatalogError> {
         self.records.validate()?;
         let width = self
             .profile
@@ -192,7 +200,7 @@ impl CatalogPackedSectorRoot {
             || self.sectors.checked_mul(1 + fragments) != Some(self.records.records)
             || self.sectors.checked_mul(u64::from(width)) != Some(self.slots)
             || self.source_chunks > self.slots
-            || (self.sectors == 0) != (self.source_chunks == 0)
+            || !part && (self.sectors == 0) != (self.source_chunks == 0)
             || self.source_bytes < self.source_chunks
             || self
                 .source_chunks
@@ -243,6 +251,7 @@ struct ActiveSector {
 }
 
 struct SectorState {
+    first_sector: u32,
     packing_version: u16,
     profile: PackingProfile,
     active: Option<ActiveSector>,
@@ -260,6 +269,7 @@ impl SectorState {
             return Err(CatalogError::InvalidPage);
         }
         Ok(Self {
+            first_sector: 0,
             packing_version,
             profile,
             active: None,
@@ -283,7 +293,7 @@ impl SectorState {
             } => {
                 if *format_version != 1
                     || self.active.is_some()
-                    || u64::from(*sector_index) != self.sectors
+                    || u64::from(*sector_index) != u64::from(self.first_sector) + self.sectors
                     || *flat_root == [0; 32]
                     || commitment.byte_len != self.profile.sector_size
                     || commitment.validate().is_err()
@@ -357,7 +367,11 @@ impl SectorState {
     }
 
     fn finish(&self) -> Result<(), CatalogError> {
-        if self.active.is_some() || self.sectors != 0 && !self.last_has_source {
+        self.finish_part(false)
+    }
+
+    fn finish_part(&self, part: bool) -> Result<(), CatalogError> {
+        if self.active.is_some() || !part && self.sectors != 0 && !self.last_has_source {
             return Err(CatalogError::InvalidPage);
         }
         Ok(())
@@ -400,6 +414,20 @@ impl CatalogPackedSectorBuilder {
         }
         let mut builder = Self::new(scope, packing_version, profile)?;
         builder.format_version = 2;
+        Ok(builder)
+    }
+
+    /// Build one nonempty directory part at its original global sector index.
+    /// The range envelope must be authenticated with the root; never renumber
+    /// descriptors or rewrite their original sector identities at a boundary.
+    pub fn new_part(
+        scope: CatalogScope,
+        packing_version: u16,
+        profile: PackingProfile,
+        first_sector: u32,
+    ) -> Result<Self, CatalogError> {
+        let mut builder = Self::new_compact(scope, packing_version, profile)?;
+        builder.state.first_sector = first_sector;
         Ok(builder)
     }
 
@@ -477,7 +505,41 @@ impl CatalogPackedSectorBuilder {
         if self.failed {
             return Err(CatalogError::Failed.into());
         }
-        self.state.finish()?;
+        if self.state.first_sector != 0 {
+            return Err(CatalogError::InvalidPage.into());
+        }
+        self.finish_root(sink, false)
+    }
+
+    pub fn finish_part<E>(
+        self,
+        sink: &mut impl FnMut(CatalogPageRef, Vec<u8>) -> Result<(), E>,
+    ) -> Result<super::CatalogPackedSectorPart, CatalogStreamError<E>> {
+        if self.failed {
+            return Err(CatalogError::Failed.into());
+        }
+        if self.state.sectors == 0 {
+            return Err(CatalogError::Bounds.into());
+        }
+        let first_sector = self.state.first_sector;
+        let part = super::CatalogPackedSectorPart {
+            format_version: 1,
+            first_sector,
+            root: self.finish_root(sink, true)?,
+        };
+        part.validate()?;
+        Ok(part)
+    }
+
+    fn finish_root<E>(
+        self,
+        sink: &mut impl FnMut(CatalogPageRef, Vec<u8>) -> Result<(), E>,
+        part: bool,
+    ) -> Result<CatalogPackedSectorRoot, CatalogStreamError<E>> {
+        if self.failed {
+            return Err(CatalogError::Failed.into());
+        }
+        self.state.finish_part(part)?;
         let root = CatalogPackedSectorRoot {
             format_version: self.format_version,
             packing_version: self.state.packing_version,
@@ -488,7 +550,7 @@ impl CatalogPackedSectorBuilder {
             source_chunks: self.state.source_chunks,
             source_bytes: self.state.source_bytes,
         };
-        root.validate()?;
+        root.validate_geometry(part)?;
         Ok(root)
     }
 }
@@ -502,6 +564,7 @@ pub struct CatalogPackedSectorReader {
     state: SectorState,
     consumed: u64,
     failed: bool,
+    part: bool,
 }
 
 impl CatalogPackedSectorReader {
@@ -513,6 +576,25 @@ impl CatalogPackedSectorReader {
             state: SectorState::new(root.packing_version, root.profile)?,
             consumed: 0,
             failed: false,
+            part: false,
+        })
+    }
+
+    pub fn for_part(
+        scope: CatalogScope,
+        part: super::CatalogPackedSectorPart,
+    ) -> Result<Self, CatalogError> {
+        part.validate()?;
+        Ok(Self {
+            records: CatalogRecordReader::new(scope, CatalogSection::Packing, part.root.records)?,
+            root: part.root,
+            state: SectorState {
+                first_sector: part.first_sector,
+                ..SectorState::new(part.root.packing_version, part.root.profile)?
+            },
+            consumed: 0,
+            failed: false,
+            part: true,
         })
     }
 
@@ -592,7 +674,11 @@ impl CatalogPackedSectorReader {
     }
 
     fn verify_totals(&self) -> Result<(), CatalogError> {
-        self.state.finish()?;
+        if self.part {
+            self.state.finish_part(true)?;
+        } else {
+            self.state.finish()?;
+        }
         if self.state.sectors != self.root.sectors
             || self.state.slots != self.root.slots
             || self.state.source_chunks != self.root.source_chunks
@@ -601,6 +687,10 @@ impl CatalogPackedSectorReader {
             return Err(CatalogError::InvalidPage);
         }
         Ok(())
+    }
+
+    pub(super) fn last_sector_has_source(&self) -> bool {
+        self.state.last_has_source
     }
 }
 

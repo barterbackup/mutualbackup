@@ -2515,6 +2515,29 @@ and native-platform gates remain open.
       Full section/dataset/guild policy, private/payload/
       SQL headroom, normal producers and deferred real capacity/platform gates
       remain open; declared upper-bound roots do not qualify dense storage.
+    - [x] Shard original packing source/descriptor streams through a bounded
+      explicitly budgeted directory. Verify ordered source bounds, contiguous
+      global sector ranges and all nested/directory EOFs without collecting the
+      whole directory. Preserve original IDs and signed layouts; carry source
+      authority, uniqueness, coverage and Merkle joins through every boundary
+      in one disposable scratch transaction. Allow interior padding-only parts
+      while retaining the complete stream's last-source requirement. Eleven
+      new core/Store cases cover ranges, EOFs, dimensional exhaustion before
+      I/O, cross-part duplication, false zero/Merkle substitution, SQL rollback
+      and scratch exhaustion/rebuild. The declared four-root fixture represents
+      48,777,248 sources and 65,036,331 sectors, exceeding both single-stream
+      record limits; it does not store those nested streams or qualify capacity.
+      Frozen qualification passes 185 core, 333 ordinary Store, 35 paged Node,
+      the certified-writer migration case and provisioned Btrfs native recovery
+      (555 distinct cases). Formatting, strict locked workspace/all-targets
+      Clippy, all-target test compilation and four debug builds pass. Source,
+      seven binaries and 21 embedded inputs match; native cleanup is verified.
+      Evidence is retained under
+      `/tmp/mb-m6-packing-shards-validation-newgl31k`. Cache cleanup reclaims
+      8.61 GiB, leaving about 51.3 GiB in `target`, with qualified
+      binary hashes preserved. Transitive part ownership, certified authority/
+      coding/checkpoint integration, full metadata/physical policy, normal
+      producers/recovery and deferred real capacity/platform gates remain open.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

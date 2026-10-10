@@ -4709,3 +4709,61 @@ from activating a guild limit over existing dataset accounting. Complete section
 dataset/guild metadata and physical policy, normal paged producers/recovery,
 generation-floor retirement and deferred real capacity/platform qualification
 remain required before production admission is enabled.
+
+## Sharded original packing streams (2026-10-10)
+
+A single retained owner can exceed both original packing stream record limits.
+The declared geometry fixture includes 16,777,216 dense data sources and 32
+maximum private catalogs, each with one million page sources plus a bootstrap
+source: 48,777,248 sources total. Preserving the allocator's reserved cross-owner
+slot requires 65,036,331 packed sectors. At two frames per source/descriptor,
+both streams exceed their existing 67,108,864-record cap. The fixture materializes
+four bounded root records, representing two source and two descriptor parts.
+It verifies declared directory admission, without storing those nested streams
+or payload and without qualifying real dense capacity.
+
+`CatalogPackingDirectoryRoot` adds bounded source ranges followed by contiguous
+global descriptor ranges. Each original stream keeps its byte/page/record caps;
+the enclosing trusted budget charges all referenced occurrences and directory
+framing before page I/O. One active nested reader verifies actual first/last
+source headers, part totals and every nested and directory EOF. Global sector
+indices remain in the original identity calculation across boundaries.
+Interior padding-only parts are allowed, while the complete stream must still
+end with a sector containing a source. Original whole-stream formats retain
+their existing meaning, and signed layouts remain unchanged.
+
+`CatalogPackingDirectoryIndex` shares the original packing join engine inside
+one admitted private scratch transaction. Source authorization, uniqueness,
+missing-chunk accounting, virtual-zero checks and Merkle composition continue
+across every part boundary. Bounded point lookups require the exact completed
+directory marker. A failed source, part, authority, SQL write or physical scratch
+admission rolls back the whole index prefix. The reader does not collect a
+whole directory or reset budgets between parts. Eleven new core/Store cases
+cover declared geometry, original IDs/global indices, both source encodings,
+interior padding, range/EOF/canonical bounds, pre-I/O dimensional exhaustion,
+cross-part duplication, false zero/Merkle substitution, ignored writes and
+scratch exhaustion/rebuild. The fixture with 2,048 sources exercises directory
+index pages and spills beyond its one MiB cache.
+
+Frozen qualification passes 185 core, 333 ordinary Store and 35 paged
+Node cases, the certified-writer migration entry point and provisioned Btrfs
+native capture/recovery: 555 distinct cases. The ordinary suites leave 26 Store
+cases and one Node case ignored; that native case runs separately on disposable
+Btrfs with a logical sparse 1 TiB file. Formatting, strict locked workspace/
+all-targets Clippy, all-target test compilation and four debug builds pass under
+Cargo/rustc 1.99.0. Frozen source, seven binaries and 21 embedded protocol/helper
+inputs match; native mount/loop/image cleanup is verified. Evidence is retained
+under `/tmp/mb-m6-packing-shards-validation-newgl31k`. The post-commit audit
+binds source and embedded inputs to the commit. Removing only rebuildable
+incremental caches reclaims 8.61 GiB and leaves about 51.3 GiB in `target`, preserving
+all seven qualified binary hashes. Other ordinary/native suites and installed
+artifacts were not rerun.
+
+This stages the sharded join. Transitive durable ownership of referenced parts,
+certified authority/coding/public joins and checkpoint activation still need
+integration. The index intentionally offers no directory-only local bundle,
+which would leave nested parts without ownership. Full section/dataset/guild
+policy must fund private/bootstrap metadata, sources, payload, SQL/WAL and
+physical traversal/scratch headroom before enabling normal producers. The
+normal paged capture/retention/seed-recovery path and deferred dense-capacity/
+native-platform qualification gates remain open under R3-SINGLE-OWNER-METADATA.

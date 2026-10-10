@@ -221,6 +221,7 @@ struct ActiveSource {
 struct SourceState {
     profile: crate::PackingProfile,
     previous: Option<CatalogPackedSourceId>,
+    first: Option<CatalogPackedSourceId>,
     active: Option<ActiveSource>,
     sources: u64,
     chunks: u64,
@@ -232,6 +233,7 @@ impl SourceState {
         Ok(Self {
             profile,
             previous: None,
+            first: None,
             active: None,
             sources: 0,
             chunks: 0,
@@ -256,6 +258,7 @@ impl SourceState {
                     return Err(CatalogError::InvalidPage);
                 }
                 self.previous = Some(*id);
+                self.first.get_or_insert(*id);
                 self.active = Some(ActiveSource {
                     commitment: commitment.clone(),
                     consumed: 0,
@@ -400,6 +403,25 @@ impl CatalogPackedSourceBuilder {
         })();
         self.failed = result.is_err();
         result
+    }
+
+    pub fn finish_part<E>(
+        self,
+        sink: &mut impl FnMut(CatalogPageRef, Vec<u8>) -> Result<(), E>,
+    ) -> Result<super::CatalogPackedSourcePart, CatalogStreamError<E>> {
+        if self.failed {
+            return Err(CatalogError::Failed.into());
+        }
+        let first = self.state.first.ok_or(CatalogError::Bounds)?;
+        let last = self.state.previous.ok_or(CatalogError::Bounds)?;
+        let part = super::CatalogPackedSourcePart {
+            format_version: 1,
+            first,
+            last,
+            root: self.finish(sink)?,
+        };
+        part.validate()?;
+        Ok(part)
     }
 
     pub fn finish<E>(

@@ -16,6 +16,7 @@ mod files;
 mod native_files;
 mod packed_sectors;
 mod packed_sources;
+mod packing_directory;
 mod privacy;
 mod range;
 mod records;
@@ -64,6 +65,12 @@ pub use packed_sources::{
     CATALOG_PACKED_SOURCE_ROOT_BYTES, CatalogPackedSourceBuilder, CatalogPackedSourceId,
     CatalogPackedSourceProof, CatalogPackedSourceReader, CatalogPackedSourceRecord,
     CatalogPackedSourceRoot,
+};
+pub use packing_directory::{
+    CATALOG_PACKING_DIRECTORY_RECORD_BYTES, CATALOG_PACKING_DIRECTORY_ROOT_BYTES,
+    CatalogPackedSectorPart, CatalogPackedSourcePart, CatalogPackingDirectoryBuilder,
+    CatalogPackingDirectoryReader, CatalogPackingDirectoryRecord, CatalogPackingDirectoryRoot,
+    CatalogPackingDirectorySummary,
 };
 pub use range::CatalogRangeReader;
 pub use records::{

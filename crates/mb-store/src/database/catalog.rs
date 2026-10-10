@@ -25,6 +25,7 @@ mod guild_history;
 mod native_validation;
 mod packing_authority;
 mod packing_coding_retention;
+mod packing_directory_validation;
 mod packing_validation;
 mod paged_checkpoint;
 mod paged_checkpoint_payload;
@@ -76,6 +77,9 @@ pub use packing_authority::{
 };
 pub use packing_coding_retention::{
     CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
+};
+pub use packing_directory_validation::{
+    CatalogPackingDirectoryIndex, CatalogPackingDirectoryValidation,
 };
 pub use packing_validation::{
     CatalogPackingIndex, CatalogPackingPlacement, CatalogPackingSector, CatalogPackingValidation,

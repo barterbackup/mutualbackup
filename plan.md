@@ -1541,6 +1541,26 @@ admission bottleneck;
 the complete section/dataset/guild policy, private/payload/SQL headroom, normal
 producers and deferred capacity/platform acceptance gates remain open.
 
+Original packing streams now have an explicitly budgeted sharded directory.
+Bounded ordered source ranges and contiguous global descriptor ranges preserve
+original sector IDs and indices. One active reader completes all nested and
+directory EOFs; one disposable scratch transaction carries authority,
+uniqueness, coverage and Merkle joins across boundaries. Interior padding-only
+parts are valid, but the global last sector must contain a source. Eleven new
+core/Store regressions pass. The declared retained geometry represents
+48,777,248 sources and 65,036,331 sectors with four bounded root records; it
+neither materializes those streams nor qualifies dense storage/recovery.
+Frozen qualification passes 555 distinct cases: 185 core, 333 ordinary Store,
+35 paged Node, the certified-writer migration case and provisioned Btrfs native
+recovery. Formatting, strict locked workspace/all-targets Clippy, all-target
+test compilation and four debug builds pass. Source, seven binaries and 21
+embedded inputs match, and native cleanup is verified. Evidence is retained in
+`/tmp/mb-m6-packing-shards-validation-newgl31k`. Cache cleanup reclaims
+8.61 GiB with qualified binary hashes preserved. Transitive part ownership,
+certified authority/coding/checkpoint integration, complete enclosing metadata
+and physical policy, normal producers/recovery and deferred capacity/platform
+gates remain open; see ADR 0002.
+
 Current Git mutation admission also shares capture's 39,488 data-position bound,
 reserving 512 metadata positions from the 40,000-position flat format. It rounds
 each reachable blob independently and conservatively assumes distinct sector

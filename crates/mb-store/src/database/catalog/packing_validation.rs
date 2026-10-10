@@ -14,7 +14,7 @@ use mb_core::{
 use super::*;
 use crate::RecordScratchStore;
 
-const ROOT_BYTES: usize = 2048;
+pub(super) const ROOT_BYTES: usize = 2048;
 const ROW_BYTES: usize = 256;
 const KEY_BYTES: usize = 104;
 const HEADERS: &str = "packing-source";
@@ -336,24 +336,12 @@ impl CatalogPackingIndex {
         source: SourceChunkId,
     ) -> Result<Option<CatalogPackingPlacement>, CatalogStoreError> {
         self.require_complete()?;
-        let key = canonical_bytes_bounded(&source, KEY_BYTES)?;
-        let Some((chunk, _)) = row::<Chunk>(&self.store, CHUNKS, &key)? else {
-            return Ok(None);
-        };
-        let placement = chunk.placement.ok_or(DatabaseError::Integrity)?;
-        if chunk.subtree_root == [0; 32]
-            || u64::from(placement.sector_index) >= self.manifest.descriptors.sectors
-            || placement.slot_index
-                >= self
-                    .manifest
-                    .descriptors
-                    .profile
-                    .slots_per_sector()
-                    .map_err(|_| CatalogError::InvalidPage)?
-        {
-            return Err(DatabaseError::Integrity.into());
-        }
-        Ok(Some(placement))
+        read_placement(
+            &self.store,
+            self.manifest.descriptors.profile,
+            self.manifest.descriptors.sectors,
+            source,
+        )
     }
 
     pub fn sector(&self, id: [u8; 32]) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
@@ -367,22 +355,105 @@ impl CatalogPackingIndex {
         &self,
         id: [u8; 32],
     ) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
-        let Some((sector, _)) = row::<CatalogPackingSector>(&self.store, SECTORS, &id)? else {
-            return Ok(None);
-        };
-        if sector.id != id
-            || sector.id == [0; 32]
-            || u64::from(sector.index) >= self.manifest.descriptors.sectors
-            || sector.flat_root == [0; 32]
-            || sector.commitment.byte_len != self.manifest.descriptors.profile.sector_size
-            || sector.commitment.validate().is_err()
-            || self.manifest.descriptors.packing_version >= 3
-                && sector.flat_root != sector.commitment.root
-        {
-            return Err(DatabaseError::Integrity.into());
-        }
-        Ok(Some(sector))
+        read_sector(
+            &self.store,
+            self.manifest.descriptors.profile,
+            self.manifest.descriptors.packing_version,
+            self.manifest.descriptors.sectors,
+            id,
+        )
     }
+}
+
+pub(super) fn read_placement(
+    store: &RecordScratchStore,
+    profile: mb_core::PackingProfile,
+    sectors: u64,
+    source: SourceChunkId,
+) -> Result<Option<CatalogPackingPlacement>, CatalogStoreError> {
+    let key = canonical_bytes_bounded(&source, KEY_BYTES)?;
+    let Some((chunk, _)) = row::<Chunk>(store, CHUNKS, &key)? else {
+        return Ok(None);
+    };
+    let placement = chunk.placement.ok_or(DatabaseError::Integrity)?;
+    if chunk.subtree_root == [0; 32]
+        || u64::from(placement.sector_index) >= sectors
+        || placement.slot_index
+            >= profile
+                .slots_per_sector()
+                .map_err(|_| CatalogError::InvalidPage)?
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(Some(placement))
+}
+
+pub(super) fn read_sector(
+    store: &RecordScratchStore,
+    profile: mb_core::PackingProfile,
+    version: u16,
+    sectors: u64,
+    id: [u8; 32],
+) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
+    let Some((sector, _)) = row::<CatalogPackingSector>(store, SECTORS, &id)? else {
+        return Ok(None);
+    };
+    if sector.id != id
+        || sector.id == [0; 32]
+        || u64::from(sector.index) >= sectors
+        || sector.flat_root == [0; 32]
+        || sector.commitment.byte_len != profile.sector_size
+        || sector.commitment.validate().is_err()
+        || version >= 3 && sector.flat_root != sector.commitment.root
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(Some(sector))
+}
+pub(super) trait PackingStreams {
+    fn next_source(
+        &mut self,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<CatalogPackedSourceRecord>, CatalogStoreError>;
+
+    fn next_sector(
+        &mut self,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+        resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, CatalogStoreError>,
+    ) -> Result<Option<CatalogPackedSectorRecord>, CatalogStoreError>;
+
+    fn verify_complete(&self) -> Result<(), CatalogStoreError> {
+        Ok(())
+    }
+}
+
+struct SinglePackingStreams {
+    sources: CatalogPackedSourceReader,
+    descriptors: CatalogPackedSectorReader,
+}
+
+impl PackingStreams for SinglePackingStreams {
+    fn next_source(
+        &mut self,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<CatalogPackedSourceRecord>, CatalogStoreError> {
+        unwrap_stream(self.sources.next_record(fetch))
+    }
+
+    fn next_sector(
+        &mut self,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+        resolve: &mut impl FnMut([u8; 32]) -> Result<CatalogPackedSourceId, CatalogStoreError>,
+    ) -> Result<Option<CatalogPackedSectorRecord>, CatalogStoreError> {
+        unwrap_stream(self.descriptors.next_record_with_sources(fetch, resolve))
+    }
+}
+
+pub(super) struct PackingStreamManifest<'a> {
+    pub profile: mb_core::PackingProfile,
+    pub chunks: u64,
+    pub complete_kind: &'static str,
+    pub completion: &'a [u8],
 }
 
 pub(super) fn build_index(
@@ -394,7 +465,42 @@ pub(super) fn build_index(
         &MerkleCommitment,
     ) -> Result<(), CatalogStoreError>,
 ) -> Result<(), CatalogStoreError> {
-    for kind in [HEADERS, CHUNKS, SECTORS, COMPLETE] {
+    let mut streams = SinglePackingStreams {
+        sources: CatalogPackedSourceReader::new(manifest.scope, manifest.sources)?,
+        descriptors: CatalogPackedSectorReader::new(manifest.scope, manifest.descriptors)?,
+    };
+    let completion = canonical_bytes_bounded(&manifest, ROOT_BYTES)?;
+    build_streams(
+        &mut streams,
+        PackingStreamManifest {
+            profile: manifest.descriptors.profile,
+            chunks: manifest.sources.chunks,
+            complete_kind: COMPLETE,
+            completion: &completion,
+        },
+        store,
+        fetch,
+        authorize,
+    )
+}
+
+pub(super) fn build_streams(
+    streams: &mut impl PackingStreams,
+    manifest: PackingStreamManifest<'_>,
+    store: &RecordScratchStore,
+    fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    authorize: &mut impl FnMut(
+        CatalogPackedSourceId,
+        &MerkleCommitment,
+    ) -> Result<(), CatalogStoreError>,
+) -> Result<(), CatalogStoreError> {
+    for kind in [
+        HEADERS,
+        CHUNKS,
+        SECTORS,
+        COMPLETE,
+        super::packing_directory_validation::COMPLETE,
+    ] {
         if store
             .next_record_bounded(kind, None, KEY_BYTES, ROOT_BYTES)?
             .is_some()
@@ -402,10 +508,9 @@ pub(super) fn build_index(
             return Err(DatabaseError::Conflict.into());
         }
     }
-    let mut sources = CatalogPackedSourceReader::new(manifest.scope, manifest.sources)?;
     let mut current = None;
     let mut pending = 0_u64;
-    while let Some(record) = unwrap_stream(sources.next_record(fetch))? {
+    while let Some(record) = streams.next_source(fetch)? {
         match record {
             CatalogPackedSourceRecord::Source { id, commitment, .. } => {
                 authorize(id, &commitment)?;
@@ -456,20 +561,19 @@ pub(super) fn build_index(
             }
         }
     }
-    if pending != manifest.sources.chunks {
+    if pending != manifest.chunks {
         return Err(DatabaseError::Integrity.into());
     }
-    let profile = manifest.descriptors.profile;
+    let profile = manifest.profile;
     let width = profile
         .slots_per_sector()
         .map_err(|_| CatalogError::InvalidPage)?;
     let zero_root =
         merkle_zero_subtree_root(profile.slot_size).map_err(|_| CatalogError::InvalidPage)?;
     let zero_hash = zero_content_hash(profile.slot_size);
-    let mut reader = CatalogPackedSectorReader::new(manifest.scope, manifest.descriptors)?;
     let mut resolve = |key| resolve_source(store, profile, key);
     let mut active: Option<ActiveSector> = None;
-    while let Some(record) = unwrap_stream(reader.next_record_with_sources(fetch, &mut resolve))? {
+    while let Some(record) = streams.next_sector(fetch, &mut resolve)? {
         match record {
             CatalogPackedSectorRecord::Header {
                 id,
@@ -571,12 +675,8 @@ pub(super) fn build_index(
     if active.is_some() || pending != 0 {
         return Err(CatalogError::InvalidPage.into());
     }
-    put(
-        store,
-        COMPLETE,
-        b"root",
-        &canonical_bytes_bounded(&manifest, ROOT_BYTES)?,
-    )?;
+    streams.verify_complete()?;
+    put(store, manifest.complete_kind, b"root", manifest.completion)?;
     Ok(())
 }
 
