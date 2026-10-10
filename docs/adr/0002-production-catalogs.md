@@ -4618,3 +4618,38 @@ required single-owner retained geometry, private metadata, data bindings,
 validation facts, capture manifests, physical pages, scratch and SQL/WAL/payload
 headroom. Normal paged producers/retention/seed recovery and deferred dense
 capacity/native-platform qualification remain required.
+
+## Current installed Linux artifact qualification (2026-10-10)
+
+Committed source `c4efb51` builds successfully as the actual Nix musl runtime
+and optional Git alias. Two fresh disposable Btrfs fixtures qualify the same
+installed candidate and frozen process drivers. Both runs pass all three
+isolated-PATH Git packaging scenarios: ordinary import/fetch/push, alias-first
+operation and standalone missing-Git rejection before refs/history change.
+Each process run passes 23 ordinary cases, raw Unix CLI/daemon/Git paths, the
+stock-Git bridge and five-daemon topology/seed recovery. There are 26 distinct
+process cases and 52 executions across the two runs. The topology gates pass
+in 679.73 and 597.27 seconds, with source/storage loss, direct and punched paths,
+relay-only replacement and final verified backup.
+
+Live `/proc/PID/exe` observations bind all five topology daemon roles to the
+installed static payload in each run. Separate final audits verify tracked
+source, eight runtime wrappers/payloads, the alias and both compiled drivers;
+source/candidate/driver hashes are identical across runs. Each run preserves
+eight named daemon logs with private directory/file modes. Disposable mounts,
+images, loop associations, namespaces and fixture firewall rules are retired,
+and forwarding returns to its initial value. Provisioning manifests and
+independent audits report success under
+`/tmp/mb-m6-installed-c4efb51-1_ha0nbo` and
+`/tmp/mb-m6-installed-repeat-c4efb51-m3pnuksl`. Build inputs and Nix store roots
+are recorded; earlier qualified installed candidates remain rooted separately.
+
+Retained daemon logs contain 46 and 44 per-daemon event groups with incomplete
+signature sets followed by complete sets. Their longest observed intervals are
+116.76 and 103.39 seconds. These are bounded observations of available logs;
+they do not prove unlogged phases, diagnose the original 5,400-second outlier,
+or qualify the required partition/coordinator-crash/interrupted-retry matrix.
+R5 stays open. This is the listed installed Linux slice, not the full R7 native,
+upgrade, multi-volume, private-Tor, supported-platform or retained-capacity
+matrix. The enclosing metadata policy and normal paged producer/recovery path
+also remain required before production admission is enabled.

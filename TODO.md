@@ -3426,6 +3426,26 @@ and native-platform gates remain open.
     or close the remaining native, upgrade, multi-volume, private-Tor, platform
     and retained-capacity release matrix.
 
+  - [x] Requalify the installed Linux runtime and Git alias on `c4efb51` with
+    two fresh-state runs. The actual Nix musl build succeeds. Each run passes
+    all three isolated-PATH Git packaging scenarios, 23 ordinary process cases,
+    raw Unix paths, the stock-Git bridge and five-daemon topology/seed recovery
+    (26 distinct process cases, 52 executions across the two runs). The topology
+    gates pass in 679.73 and 597.27 seconds, including source/storage loss,
+    direct and punched paths, relay-only replacement and final verified backup.
+    Five live topology daemon payloads match the installed static executable
+    in each run. Independent audits verify identical tracked source, eight
+    wrappers/payloads and both frozen drivers across the runs, with eight named
+    private peer logs retained per run and mount/image/loop/network/forwarding
+    cleanup verified. Evidence is retained under
+    `/tmp/mb-m6-installed-c4efb51-1_ha0nbo` and
+    `/tmp/mb-m6-installed-repeat-c4efb51-m3pnuksl`.
+    Observed incomplete signature groups in the retained logs complete in both
+    runs; the longest logged intervals are 116.76 and 103.39 seconds. These log
+    observations do not explain the historical stall or qualify interrupted
+    retries/partitions. R5 and the remaining R7 native/upgrade/multi-volume,
+    private-Tor, platform and dense retained-capacity matrix remain open.
+
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
   source-loss matrix on the release source. Record repeated topology evidence
