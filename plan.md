@@ -1336,6 +1336,15 @@ changes. This pass ran no builds, tests or runtime probes. Recorded debug-source
 qualification remains separate evidence; it does not establish installed
 release-artifact qualification or close Milestone 6.
 
+Linux reader directory binding is now qualified separately from the earlier
+source review. Saved control and parity readers retain their original directories
+through rename/replacement, and SQLCipher WAL/SHM operations retain the same
+capability. The concrete before-fix regression and the complete ordinary run are
+recorded in R1 of `TODO.md` and the production catalog ADR. This increment passes
+1,326 distinct cases, including the provisioned sparse Btrfs case, with frozen
+source and binary hashes. Complete admission/leaf/version handoff and all other
+open Milestone 6 gates remain required.
+
 ### Production corrections from the 2026-10-05 source review
 
 These are the correction requirements; completed increments are recorded below.

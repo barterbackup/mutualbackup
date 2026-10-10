@@ -158,6 +158,8 @@ impl RecordScratchStore {
             records: ControlStore {
                 connection,
                 path: Default::default(),
+                #[cfg(target_os = "linux")]
+                directory: None,
             },
             #[cfg(target_os = "linux")]
             _vfs: vfs,

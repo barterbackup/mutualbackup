@@ -392,6 +392,8 @@ pub(super) fn open_control(
         Ok(ControlStore {
             connection,
             path: path.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            directory: None,
         })
     })
 }

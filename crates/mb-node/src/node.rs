@@ -33,8 +33,8 @@ use mb_git::{
     GitRemoteBranchInfo, GitRepository, GitStatus, GitTagInfo, GitWorktreeInfo,
 };
 use mb_store::{
-    ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
-    SourceBackendBinding, SourceBackendKind, VariableParityObject, filesystem_identity,
+    ControlStore, DatabaseError, NativeFileId, ParityObject, PinnedDirectory, SourceBackendBinding,
+    SourceBackendKind, VariableParityObject, filesystem_identity,
 };
 use rand::RngCore;
 use uuid::Uuid;
@@ -53,7 +53,7 @@ use crate::snapshot::{
     resume_restore_publication, retire_revision_anchor_with_recipe_pins, revision_git_backup,
     revision_head_id,
 };
-use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
+use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig};
 
 type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
@@ -862,8 +862,11 @@ struct MembershipHistoryCache {
 #[derive(Clone)]
 pub(crate) struct NodeReaderConfig {
     keys: Arc<KeyMaterial>,
+    #[cfg(not(target_os = "linux"))]
     control_path: PathBuf,
     control_database_key: [u8; 32],
+    #[cfg(target_os = "linux")]
+    control_directory: Option<mb_store::DatabaseDirectory>,
     volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
     // Keep the claim while this handle can open or use a writable catalog.
     _data_dir_lease: DataDirLease,
@@ -879,9 +882,31 @@ pub(crate) struct NodeReader {
 
 impl NodeReaderConfig {
     pub(crate) fn open(&self) -> Result<NodeReader> {
+        #[cfg(target_os = "linux")]
+        let control = {
+            let current =
+                open_data_dir_lock_file_at(&self._data_dir_lease.directory, false)?.metadata()?;
+            let owned = self._data_dir_lease._lock.metadata()?;
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                (current.dev(), current.ino()) == (owned.dev(), owned.ino())
+                    && owned.nlink() == 1
+                    && owned.len() == 0,
+                "node data lock changed before opening a reader"
+            );
+            ControlStore::open_existing_in_directory_with_key(
+                self.control_directory
+                    .as_ref()
+                    .context("node control directory is not held")?,
+                std::ffi::OsStr::new("control.db"),
+                &self.control_database_key,
+            )?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let control = ControlStore::open_with_key(&self.control_path, &self.control_database_key)?;
         Ok(NodeReader {
             keys: self.keys.clone(),
-            control: ControlStore::open_with_key(&self.control_path, &self.control_database_key)?,
+            control,
             volume_readers: self.volume_readers.clone(),
             _data_dir_lease: self._data_dir_lease.clone(),
         })
@@ -1070,11 +1095,7 @@ impl NodeReader {
         let mut first_error = None;
         let mut object = None;
         for volume in volumes.iter() {
-            let store = match ParityStore::open_existing_with_key(
-                &volume.path,
-                volume.volume_id.as_bytes(),
-                &volume.database_key,
-            ) {
+            let store = match volume.open() {
                 Ok(store) => store,
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -1198,11 +1219,7 @@ impl NodeReader {
             .map_err(|_| anyhow::anyhow!("volume reader configuration lock was poisoned"))?;
         let mut first_error = None;
         for volume in volumes.iter() {
-            let store = match ParityStore::open_existing_with_key(
-                &volume.path,
-                volume.volume_id.as_bytes(),
-                &volume.database_key,
-            ) {
+            let store = match volume.open() {
                 Ok(store) => store,
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -1372,7 +1389,14 @@ impl Node {
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
         crate::source_policy::require_native_source_state_from_catalog(&data_dir, &keys)?;
         locked.make_private()?;
-        let (mut control, control_database_key) = open_control_store(&data_dir, &keys)?;
+        #[cfg(target_os = "linux")]
+        let (mut control, control_database_key) = crate::volume::open_control_store_in_directory(
+            &mb_store::DatabaseDirectory::from_file(locked.lease.directory.clone())?,
+            &keys,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let (mut control, control_database_key) =
+            crate::volume::open_control_store(&data_dir, &keys)?;
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
@@ -3258,8 +3282,11 @@ impl Node {
     pub(crate) fn reader_config(&self) -> NodeReaderConfig {
         NodeReaderConfig {
             keys: self.keys.clone(),
+            #[cfg(not(target_os = "linux"))]
             control_path: self.control.path().to_path_buf(),
             control_database_key: self.control_database_key,
+            #[cfg(target_os = "linux")]
+            control_directory: self.control.directory().cloned(),
             volume_readers: self.volume_readers.clone(),
             _data_dir_lease: self._data_dir_lock.lease.clone(),
         }
@@ -18872,6 +18899,106 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn data_lock_reader_reopens_the_owned_directory_after_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let visible = temp.path().join("data");
+        let moved = temp.path().join("moved");
+        let seed = Seed::from_bytes([213; 32]);
+        let node = Node::open(&visible, seed.clone()).unwrap();
+        node.control
+            .put_record("ownership-directory-fixture", b"id", b"original")
+            .unwrap();
+        let bytes = vec![21; mb_core::V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [22; 32],
+            group_id: [23; 32],
+            shard_index: 3,
+            root: mb_core::sector_root(&bytes),
+            bytes,
+        };
+        node.volumes.reader_configs()[0]
+            .open()
+            .unwrap()
+            .stage_and_publish(&object)
+            .unwrap();
+        let configuration = node.reader_config();
+        drop(node);
+        fs::rename(&visible, &moved).unwrap();
+        fs::create_dir(&visible).unwrap();
+        for entry in fs::read_dir(&moved).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != ".node.lock" {
+                fs::copy(entry.path(), visible.join(entry.file_name())).unwrap();
+            }
+        }
+        let replacement = Node::open(&visible, seed.clone()).unwrap();
+        replacement
+            .control
+            .put_record("ownership-directory-fixture", b"id", b"replacement")
+            .unwrap();
+        let mut replacement_store = replacement.volumes.reader_configs()[0].open().unwrap();
+        assert!(
+            replacement_store
+                .remove_ready(&object.group_id, object.shard_index, &object.root)
+                .unwrap()
+        );
+        let bytes = vec![24; mb_core::V1_SECTOR_SIZE];
+        let replacement_object = ParityObject {
+            bytes: bytes.clone(),
+            root: mb_core::sector_root(&bytes),
+            ..object.clone()
+        };
+        replacement_store
+            .stage_and_publish(&replacement_object)
+            .unwrap();
+        let reader = configuration.open().unwrap();
+        assert_eq!(
+            reader
+                .control
+                .get_record("ownership-directory-fixture", b"id")
+                .unwrap(),
+            Some(b"original".to_vec()),
+            "the reader must reopen its held directory, not a new owner at the old path"
+        );
+        assert_eq!(
+            reader
+                .parity_for_guild(&object.guild_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            object.bytes
+        );
+        assert_eq!(
+            replacement_store
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            replacement_object
+        );
+        reader
+            .control
+            .put_record("ownership-directory-fixture", b"id", b"reader update")
+            .unwrap();
+        assert_eq!(
+            replacement
+                .control
+                .get_record("ownership-directory-fixture", b"id")
+                .unwrap(),
+            Some(b"replacement".to_vec())
+        );
+        assert!(Node::open(&moved, seed.clone()).is_err());
+        drop(reader);
+        drop(configuration);
+        let original = Node::open(&moved, seed).unwrap();
+        assert_eq!(
+            original
+                .control
+                .get_record("ownership-directory-fixture", b"id")
+                .unwrap(),
+            Some(b"reader update".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn data_lock_rejects_linked_nonregular_and_nonempty_inputs_without_permission_changes() {
         use std::os::unix::{
             ffi::OsStrExt,
@@ -26722,14 +26849,11 @@ pub(crate) mod tests {
             .unwrap();
         let source = configs.remove(source_index);
         let destination = configs.pop().unwrap();
-        ParityStore::open_existing_with_key(
-            &destination.path,
-            destination.volume_id.as_bytes(),
-            &destination.database_key,
-        )
-        .unwrap()
-        .stage_and_publish(&object)
-        .unwrap();
+        destination
+            .open()
+            .unwrap()
+            .stage_and_publish(&object)
+            .unwrap();
         node.database_shell_statement(
             Some(source.volume_id),
             "UPDATE parity_objects SET bytes = zeroblob(65536)",

@@ -234,11 +234,15 @@ implementation admitted a second Node while a saved writable-reader
 configuration still existed; its expected failure and unchanged source/driver
 hashes are retained. The new regression covers cloned configurations, opening
 after Node destruction, reader-only ownership, final release and exact
-stored-record reopen. This binds ownership lifetime, not atomic path/source
-admission: saved reader paths and later control/volume writers still need
-complete pinned-directory and leaf handoff. Full history/payload joins,
-enclosing budgets, installed artifacts and other-platform qualification remain
-open. The native Git source-loss fixture now shuts down and releases the
+stored-record reopen. Linux control and parity readers now also retain their
+opened directories. A saved configuration reopens its original database after
+rename/replacement, and SQLCipher main/WAL/SHM operations preserve that binding.
+Independent connections share the live directory descriptor through final close.
+The before-fix replacement regression and five Store cases are recorded in R1
+of `TODO.md`. Complete atomic source-admission/leaf/version handoff, initial
+volume setup, external-owner reconciliation, history/payload joins, enclosing
+budgets, installed artifacts and other-platform qualification remain open.
+The native Git source-loss fixture now shuts down and releases the
 original owner and its workers before normal startup acquires a new claim. It
 retains the same advertised QUIC endpoint, with a 30-second retry limited to
 address-in-use while the old transport drains. Normal P2P event-loop shutdown

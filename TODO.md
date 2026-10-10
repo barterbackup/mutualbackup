@@ -729,9 +729,9 @@ and native-platform gates remain open.
     unchanged source/driver hashes are retained. The new regression covers
     cloned configurations, opening after Node destruction, reader-only
     ownership, final release and exact stored-record reopen. This binds
-    ownership lifetime, not atomic path/source admission: saved reader paths
-    and later control/volume writers still need complete pinned-directory and
-    leaf handoff. Full history/payload joins, enclosing budgets, installed
+    ownership lifetime. The Linux directory-binding increment below addresses
+    saved-reader path redirection; complete atomic source-admission and leaf
+    handoff remain required. Full history/payload joins, enclosing budgets, installed
     artifacts and other-platform qualification remain open. The native Git
     source-loss fixture now shuts down and releases the original owner and its
     workers before normal startup acquires a new claim. It retains the same
@@ -769,6 +769,57 @@ and native-platform gates remain open.
     debug-source qualification; other ignored cases, installed artifacts, the
     enclosing metadata budget, normal paged backup/retention/seed-recovery
     integration and other platforms remain open.
+  - [x] Bind Linux writable reader reopens to their owned control and parity directories.
+    Linux control and parity stores now retain an opened, owned directory
+    that rejects group/other write access.
+    A separate SQLCipher Unix VFS keeps the held procfs directory path through
+    main database, WAL, SHM and journal operations instead of resolving it back to
+    a replaceable pathname. Live connections to the same directory share a retained
+    descriptor so the first connection's SHM pathname remains valid after it closes.
+    Node control-key publication, existing-volume manifest/key opens, saved reader
+    configurations and scratch allocation-domain accounting use that directory.
+    Existing-reader opens never create a missing catalog; public volume records keep
+    their original ordinary paths and signed/schema encodings remain unchanged.
+
+    The before-fix test under `/tmp/mb-m6-directory-handoff-negative-ptr1d9yd`
+    reproduces a saved reader selecting a replacement control database after its
+    original directory is renamed. The completed Node regression authenticates
+    original control and READY parity bytes while an independently opened replacement
+    owner holds different bytes at the old path; reader writes affect only the original,
+    and the original lock stays exclusive until final reader/configuration release.
+    Five Store regressions cover reparented WAL readers/writers and first-connection
+    release, replacement symlinks, invalid/missing database leaves, raw Unix names,
+    bound scratch accounting and parity publication/reopen.
+
+    Frozen debug-source qualification passes 1,325 ordinary workspace/all-targets
+    cases reported by 19 test drivers and one provisioned Btrfs retained-capture/
+    recovery case: 1,326 distinct passing cases. The ordinary total includes 63 vendored
+    library/protocol cases. Ordinary drivers report 121 ignored cases; one runs
+    separately on Btrfs, leaving 120 unexecuted. Formatting, strict locked
+    workspace/all-targets Clippy, all-target test compilation and all four debug program
+    builds pass with the established 8,192-descriptor test limit. All 250 Rust/Cargo
+    source files, 23 binaries and 22 embedded inputs remain unchanged.
+    Evidence is retained in `/tmp/mb-m6-directory-binding-validation-guihu189`;
+    the post-commit audit binds those inputs to the commit.
+    Native mount/loop/image cleanup is verified. The Btrfs case uses a sparse logical
+    1 TiB file; dense retained capacity and installed-artifact qualification remain open.
+    The initial harness assertion on an all-ignored target is retained; continuation
+    checks its exact zero-pass/ignored inventory and requires positive exact counts for
+    every ordinary target against the same frozen inputs, without repeating passed builds
+    or native coverage.
+
+    Generated-artifact cleanup removes 5 obsolete hashed
+    workspace executables and incremental cache, reclaiming 16.42 GiB and leaving
+    31.5 GiB in `target`. Current build outputs, prior qualified paths and all
+    23 current binary hashes are preserved.
+
+    This closes saved-reader directory redirection on Linux. Atomic source-admission
+    to writer/leaf/version handoff, initial volume setup, external-owner reconciliation,
+    complete retained history/payload joins, enclosing metadata/physical quotas and
+    SQL/WAL/scratch budgets, normal paged producers/retention/seed recovery, the topology/
+    signature stall and current installed-artifact qualification remain open. Dense
+    1 TiB and native Windows/macOS qualification remain explicitly deferred by the user;
+    R1, R2/R3 and Milestone 6 remain open.
   - [x] Admit normal Git discovery assistance and supported long refs during recovery inventory.
     Preserved external catalogs validate discovery journals, saved cursor
     structure, area identities, canonical encodings, supported bounds and

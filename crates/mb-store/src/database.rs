@@ -18,6 +18,8 @@ use crate::SCHEMA_VERSION;
 mod anchor_discovery;
 mod catalog;
 #[cfg(target_os = "linux")]
+mod directory;
+#[cfg(target_os = "linux")]
 mod preserved_read;
 mod read_snapshot;
 mod scratch;
@@ -67,6 +69,8 @@ pub use catalog::{
     PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 #[cfg(target_os = "linux")]
+pub use directory::DatabaseDirectory;
+#[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
 #[cfg(target_os = "linux")]
@@ -114,6 +118,8 @@ pub enum DatabaseError {
 pub struct ControlStore {
     connection: Connection,
     path: PathBuf,
+    #[cfg(target_os = "linux")]
+    directory: Option<DatabaseDirectory>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +146,8 @@ impl ControlStore {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            directory: None,
         })
     }
 
@@ -159,6 +167,8 @@ impl ControlStore {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            directory: None,
         })
     }
 
@@ -189,6 +199,8 @@ impl ControlStore {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            directory: None,
         })
     }
 
@@ -2172,6 +2184,8 @@ pub struct ObjectAttemptState {
 pub struct ParityStore {
     connection: Connection,
     path: PathBuf,
+    #[cfg(target_os = "linux")]
+    directory: Option<DatabaseDirectory>,
 }
 
 impl ParityStore {
@@ -2194,6 +2208,8 @@ impl ParityStore {
             Ok(Self {
                 connection,
                 path: path.to_path_buf(),
+                #[cfg(target_os = "linux")]
+                directory: None,
             })
         })
     }
@@ -2220,6 +2236,8 @@ impl ParityStore {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            directory: None,
         })
     }
 
@@ -2241,6 +2259,8 @@ impl ParityStore {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            directory: None,
         })
     }
 
@@ -2269,6 +2289,8 @@ impl ParityStore {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            directory: None,
         })
     }
 

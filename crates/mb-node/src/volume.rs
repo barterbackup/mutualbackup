@@ -412,6 +412,29 @@ pub(crate) struct VolumeReaderConfig {
     pub volume_id: Uuid,
     pub path: PathBuf,
     pub database_key: [u8; 32],
+    #[cfg(target_os = "linux")]
+    directory: Option<mb_store::DatabaseDirectory>,
+}
+
+impl VolumeReaderConfig {
+    pub(crate) fn open(&self) -> std::result::Result<ParityStore, mb_store::DatabaseError> {
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &self.directory {
+            return ParityStore::open_existing_in_directory_with_key(
+                directory,
+                self.path
+                    .file_name()
+                    .ok_or(mb_store::DatabaseError::Conflict)?,
+                self.volume_id.as_bytes(),
+                &self.database_key,
+            );
+        }
+        ParityStore::open_existing_with_key(
+            &self.path,
+            self.volume_id.as_bytes(),
+            &self.database_key,
+        )
+    }
 }
 
 struct StorageVolume {
@@ -786,6 +809,8 @@ impl StorageVolumes {
                         volume_id: volume.record.volume_id,
                         path: store.path().to_path_buf(),
                         database_key: volume.database_key,
+                        #[cfg(target_os = "linux")]
+                        directory: store.directory().cloned(),
                     })
             })
             .collect()
@@ -2861,11 +2886,7 @@ pub(crate) fn reader_coding_capacity(
         if record.state != StorageVolumeState::Online {
             continue;
         }
-        let store = match ParityStore::open_existing_with_key(
-            &reader.path,
-            reader.volume_id.as_bytes(),
-            &reader.database_key,
-        ) {
+        let store = match reader.open() {
             Ok(store) => store,
             Err(_) => continue,
         };
@@ -2957,29 +2978,59 @@ pub(crate) fn validate_preserved_control_key(data_dir: &Path, keys: &KeyMaterial
     Ok(())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn open_control_store(
     data_dir: &Path,
     keys: &KeyMaterial,
 ) -> Result<(ControlStore, [u8; 32])> {
+    open_control_store_impl(
+        data_dir,
+        keys,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn open_control_store_in_directory(
+    directory: &mb_store::DatabaseDirectory,
+    keys: &KeyMaterial,
+) -> Result<(ControlStore, [u8; 32])> {
+    open_control_store_impl(&directory.path(), keys, Some(directory))
+}
+
+fn open_control_store_impl(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+    #[cfg(target_os = "linux")] directory: Option<&mb_store::DatabaseDirectory>,
+) -> Result<(ControlStore, [u8; 32])> {
     let database_path = data_dir.join("control.db");
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
     let database_id = b"control.db/v2";
+    let open = |key: &[u8; 32]| {
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = directory {
+            return ControlStore::open_in_directory_with_key(
+                directory,
+                std::ffi::OsStr::new("control.db"),
+                key,
+            );
+        }
+        ControlStore::open_with_key(&database_path, key)
+    };
     if let Some(envelope) = read_private_record_optional::<WrappedDatabaseKey>(&envelope_path)? {
         let database_key = keys
             .unwrap_database_key(database_id, &envelope)
             .context("cannot unwrap control database key")?;
-        match ControlStore::open_with_key(&database_path, &database_key) {
+        match open(&database_key) {
             Ok(store) => return Ok((store, database_key)),
             Err(new_key_error) => {
                 let legacy_key = keys.database_key(b"control.db");
-                let store = ControlStore::open_with_key(&database_path, &legacy_key).with_context(
-                    || format!("control database rejected wrapped key: {new_key_error}"),
-                )?;
+                let store = open(&legacy_key).with_context(|| {
+                    format!("control database rejected wrapped key: {new_key_error}")
+                })?;
                 store.rekey(&database_key)?;
-                return Ok((
-                    ControlStore::open_with_key(&database_path, &database_key)?,
-                    database_key,
-                ));
+                return Ok((open(&database_key)?, database_key));
             }
         }
     }
@@ -2987,20 +3038,26 @@ pub(crate) fn open_control_store(
     let mut database_key = [0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut database_key);
     let envelope = keys.wrap_database_key(database_id, &database_key)?;
+    #[cfg(target_os = "linux")]
+    if let Some(directory) = directory {
+        let bytes = canonical_bytes_bounded(&envelope, MAX_LOCAL_MANIFEST_BYTES)?;
+        write_new_private_record_at(
+            directory.file(),
+            &std::ffi::CString::new(CONTROL_KEY_FILE)?,
+            &bytes,
+        )?;
+    } else {
+        write_new_private_record(&envelope_path, &envelope)?;
+    }
+    #[cfg(not(target_os = "linux"))]
     write_new_private_record(&envelope_path, &envelope)?;
     if database_path.exists() {
         let legacy_key = keys.database_key(b"control.db");
-        let store = ControlStore::open_with_key(&database_path, &legacy_key)?;
+        let store = open(&legacy_key)?;
         store.rekey(&database_key)?;
-        Ok((
-            ControlStore::open_with_key(&database_path, &database_key)?,
-            database_key,
-        ))
+        Ok((open(&database_key)?, database_key))
     } else {
-        Ok((
-            ControlStore::open_with_key(&database_path, &database_key)?,
-            database_key,
-        ))
+        Ok((open(&database_key)?, database_key))
     }
 }
 
@@ -3107,6 +3164,11 @@ fn open_volume_store(
     database_key: &[u8; 32],
     keys: &KeyMaterial,
 ) -> Result<ParityStore> {
+    #[cfg(target_os = "linux")]
+    let directory = mb_store::DatabaseDirectory::open(&record.path)?;
+    #[cfg(target_os = "linux")]
+    let manifest_path = directory.leaf(VOLUME_MANIFEST_FILE)?;
+    #[cfg(not(target_os = "linux"))]
     let manifest_path = record.path.join(VOLUME_MANIFEST_FILE);
     let signed: SignedRecord<VolumeManifest> = read_private_record(&manifest_path)?;
     signed.verify(VOLUME_MANIFEST_DOMAIN)?;
@@ -3120,27 +3182,32 @@ fn open_volume_store(
     {
         bail!("parity volume manifest conflicts with the control registry");
     }
+    #[cfg(not(target_os = "linux"))]
     let database_path = record.path.join(&record.database_file);
-    match ParityStore::open_existing_with_key(
-        &database_path,
-        record.volume_id.as_bytes(),
-        database_key,
-    ) {
+    let open = |key: &[u8; 32]| {
+        #[cfg(target_os = "linux")]
+        {
+            ParityStore::open_existing_in_directory_with_key(
+                &directory,
+                std::ffi::OsStr::new(&record.database_file),
+                record.volume_id.as_bytes(),
+                key,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ParityStore::open_existing_with_key(&database_path, record.volume_id.as_bytes(), key)
+        }
+    };
+    match open(database_key) {
         Ok(store) => Ok(store),
         Err(new_key_error) => {
             let legacy_key = keys.database_key(&legacy_volume_database_id(record.volume_id));
-            let store = ParityStore::open_existing_with_key(
-                &database_path,
-                record.volume_id.as_bytes(),
-                &legacy_key,
-            )
-            .with_context(|| format!("parity database rejected wrapped key: {new_key_error}"))?;
+            let store = open(&legacy_key).with_context(|| {
+                format!("parity database rejected wrapped key: {new_key_error}")
+            })?;
             store.rekey(database_key)?;
-            Ok(ParityStore::open_existing_with_key(
-                &database_path,
-                record.volume_id.as_bytes(),
-                database_key,
-            )?)
+            Ok(open(database_key)?)
         }
     }
 }

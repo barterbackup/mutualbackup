@@ -24,12 +24,7 @@ const BTRFS_TYPE: u32 = libc::BTRFS_SUPER_MAGIC as u32;
 /// their filesystem UUID; ordinary filesystems use their current device ID.
 /// This is not a durable source identity or evidence of free physical capacity.
 pub fn physical_allocation_domain(path: impl AsRef<Path>) -> Result<[u8; 32], DatabaseError> {
-    domain_for_file(
-        &OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?,
-    )
+    domain_for_file(&super::directory::open_directory_file(path.as_ref())?)
 }
 
 fn domain_for_file(file: &File) -> Result<[u8; 32], DatabaseError> {
@@ -114,10 +109,7 @@ impl ScratchVfs {
     ) -> Result<Self, DatabaseError> {
         // Initialize through rusqlite before finding SQLite's default VFS.
         drop(rusqlite::Connection::open_in_memory()?);
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(directory)?;
+        let directory = super::directory::open_directory_file(directory)?;
         if checkpoint_paths.len() > 1024 || max_physical_bytes < CHUNK {
             return Err(DatabaseError::ScratchUnavailable);
         }
@@ -129,10 +121,7 @@ impl ScratchVfs {
                 .parent()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
-            let directory = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(parent)?;
+            let directory = super::directory::open_directory_file(parent)?;
             if domain_for_file(&directory)? != device {
                 return Err(DatabaseError::ScratchUnavailable);
             }
