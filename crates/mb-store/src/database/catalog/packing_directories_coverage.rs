@@ -281,6 +281,16 @@ impl CatalogPackingCodingDirectoriesIndex {
         self.require_complete()?;
         self.rows()?.read_group_with_work(id, fetch)
     }
+
+    pub(super) fn read_group_with_work_budget(
+        &self,
+        id: [u8; 32],
+        budget: CatalogCodingTraversalBudget,
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<(CatalogCodingEntry, CatalogCodingTraversalBudget)>, CatalogStoreError> {
+        self.require_complete()?;
+        self.rows()?.read_group_with_work_budget(id, budget, fetch)
+    }
 }
 
 #[cfg(test)]

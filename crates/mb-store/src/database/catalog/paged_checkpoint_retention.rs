@@ -136,8 +136,9 @@ impl<H: Layout> Retention for CatalogPagedCheckpointRetention<H> {
 }
 
 impl ControlStore {
-    // Call only inside the short writer transaction. The independent reader
-    // fences original event authority; the actual SQL head fences the base.
+    // Publication requires the short writer transaction. A read snapshot may
+    // use the same guard for preliminary admission, followed by a writer
+    // recheck. Independent event authority and the actual SQL head fence the base.
     pub(super) fn guard_paged_candidate<H: Layout>(
         &self,
         retention: CatalogPagedCheckpointRetention<H>,

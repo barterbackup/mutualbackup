@@ -6,6 +6,7 @@ use mb_core::{
     ShardRoleV2,
 };
 
+use super::checkpoint_body::Header;
 use super::paged_checkpoint_retention::{Layout, Proof, owned_certificate, validate_owner};
 use super::retention_journal as journal;
 use super::*;
@@ -428,13 +429,55 @@ impl ControlStore {
         mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
         check: impl FnOnce(&CatalogCheckpointPayload) -> Result<(), E>,
     ) -> Result<CatalogCheckpointPayload, E> {
-        let acquire = || -> Result<_, CatalogStoreError> {
+        proof.recheck(&mut read_trust)?;
+        let mut acquire = || -> Result<_, CatalogStoreError> {
             if id.is_nil() {
                 return Err(DatabaseError::Conflict.into());
             }
             let retention = proof.retention(id)?;
+            // Bound point replay against this owner's complete custody debt.
+            // Release the read snapshot before fetching witness pages; the
+            // writer below rechecks admission against any intervening changes.
+            let tx = self.read_snapshot()?;
+            self.guard_paged_candidate(retention, &mut read_trust)?;
+            if journal::require(&tx, retention)?.state
+                != CatalogPagedCheckpointRetentionState::Published
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            owned_certificate(&tx, retention)?;
+            let work = admitted_work(&tx, retention)?.unwrap_or_default();
+            let existing = read(&tx, id, group, shard)?;
+            // A retry authenticates its original witness without charging the
+            // same role twice. All other roles and private dependencies remain
+            // debited, along with this role's rows and known physical bytes.
+            let other_payload_work = work.remaining_after(
+                existing
+                    .as_ref()
+                    .map(|payload| payload.work())
+                    .transpose()?
+                    .unwrap_or_default(),
+            )?;
+            let replay_budget = retention.budget.remaining_after(
+                retention
+                    .proof_work
+                    .checked_add(retention.checkpoint.work()?)?
+                    .checked_add(other_payload_work)?
+                    .checked_add(
+                        paged_checkpoint_revision::owned_work(&tx, retention)?.unwrap_or_default(),
+                    )?
+                    .checked_add(Work {
+                        bytes: 3 * ROW_BYTES as u64
+                            + existing
+                                .as_ref()
+                                .map_or(0, |payload| u64::from(payload.commitment.byte_len)),
+                        page_occurrences: 0,
+                        records: 3,
+                    })?,
+            )?;
+            tx.commit()?;
             let (entry, replay_work) = proof
-                .read_group(group, |page| {
+                .read_group(group, replay_budget, |page| {
                     self.catalog_page(
                         CatalogScope::Guild {
                             guild_id: retention.checkpoint.guild_id(),
@@ -470,7 +513,6 @@ impl ControlStore {
             payload.validate()?;
             Ok((retention, payload))
         };
-        proof.recheck(&mut read_trust)?;
         let (retention, payload) = acquire()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(CatalogStoreError::from)?;
@@ -483,13 +525,13 @@ impl ControlStore {
         owned_certificate(&tx, retention)?;
         let previous = raw_totals(&tx, retention)?;
         admitted_work(&tx, retention)?;
-        check(&payload)?;
         let row = key(group, shard);
         let reverse = owner_key(id, group, shard);
-        if let Some(existing) = read(&tx, id, group, shard)? {
+        let next = if let Some(existing) = read(&tx, id, group, shard)? {
             if existing != payload {
                 return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
             }
+            None
         } else {
             if bounded_record(&tx, &owners(payload.storage_id, shard), &reverse, ROW_BYTES)?
                 .is_some()
@@ -502,6 +544,10 @@ impl ControlStore {
                 .checked_add(payload.work()?)
                 .map_err(CatalogStoreError::from)?;
             check_work(&tx, retention, next)?;
+            Some(next)
+        };
+        check(&payload)?;
+        if let Some(next) = next {
             let bytes = canonical_bytes(&payload).map_err(CatalogStoreError::from)?;
             insert_exact(&tx, &dependencies(id), &row, &bytes)?;
             insert_exact(&tx, &owners(payload.storage_id, shard), &reverse, &bytes)?;

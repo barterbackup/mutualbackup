@@ -2643,6 +2643,35 @@ and native-platform gates remain open.
       Full distributed readiness/atomic activation, metadata/physical policy,
       normal producers/recovery and deferred dense capacity/platform gates
       remain open.
+    - [x] Admit checkpoint custody before witness and byte validation.
+      Checkpoint custody now admits prospective private and physical dependency
+      work before authenticating their complete bytes. A read snapshot subtracts
+      original proof/public, private and other payload debt before original-witness
+      point replay. Each authenticated page is admitted before fetching and each
+      framed record before decoding. The publication writer rechecks all current debt
+      before byte validation and pin/counter publication. Exact same-role retries
+      reuse their existing charge; they still authenticate the witness and bytes.
+      Both original and directory layouts use these checks without changing signed
+      or journal encodings. Tests reject exhausted byte/page/record dimensions,
+      stop before an over-budget page fetch, reject damaged witness pages through
+      admission first, reject byte-validation callbacks in both acquisition orders,
+      and preserve exact-budget private/payload retries and counters.
+      Frozen qualification passes 192 Core, 369 ordinary Store and 38 paged Node
+      cases, certified-writer migration and provisioned Btrfs capture/recovery: 601
+      distinct cases. Formatting, strict locked workspace/all-targets Clippy, all-target
+      test compilation and four debug program builds pass. Source, seven binaries and
+      22 embedded inputs match; native mount/loop/image cleanup is verified. Evidence
+      is retained in `/tmp/mb-m6-custody-admission-validation-6my7zoqc`; a post-commit
+      audit binds the qualified inputs to the commit.
+      Removing 68 obsolete hashed workspace executables and incremental
+      cache reclaims 28.43 GiB, leaving 31.5 GiB in `target`. Current build outputs,
+      prior qualified paths and all seven qualified binary hashes are preserved.
+      The ordinary run leaves 26 Store and one paged Node case ignored. The native
+      case uses a sparse logical 1 TiB file on disposable Btrfs, without qualifying
+      dense retained capacity. Other ordinary/native suites and installed artifacts
+      were not rerun. Full distributed readiness/atomic activation, enclosing metadata/
+      physical policy including SQL/WAL/scratch headroom, normal paged producers and
+      seed recovery, and the deferred dense capacity/platform gates remain open.
   - [x] Add compact packing descriptors and complete-source subtree streams.
     Stable 32-byte source keys replace repeated owner/root/object identities;
     resolved slots reproduce original sector IDs, without dense ordinals that

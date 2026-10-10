@@ -305,6 +305,16 @@ impl CatalogPackingCodingDirectoryIndex {
         self.require_complete()?;
         self.rows()?.read_group_with_work(id, fetch)
     }
+
+    pub(super) fn read_group_with_work_budget(
+        &self,
+        id: [u8; 32],
+        budget: CatalogCodingTraversalBudget,
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<(CatalogCodingEntry, CatalogCodingTraversalBudget)>, CatalogStoreError> {
+        self.require_complete()?;
+        self.rows()?.read_group_with_work_budget(id, budget, fetch)
+    }
 }
 
 pub(super) struct DirectoryCoverageRows<'a> {
@@ -392,15 +402,33 @@ impl DirectoryCoverageRows<'_> {
     pub(super) fn read_group_with_work(
         &self,
         id: [u8; 32],
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
+    ) -> Result<Option<(CatalogCodingEntry, CatalogCodingTraversalBudget)>, CatalogStoreError> {
+        self.read_group_with_work_budget(
+            id,
+            CatalogCodingTraversalBudget {
+                bytes: u64::MAX,
+                page_occurrences: u64::MAX,
+                records: u64::MAX,
+            },
+            fetch,
+        )
+    }
+
+    pub(super) fn read_group_with_work_budget(
+        &self,
+        id: [u8; 32],
+        budget: CatalogCodingTraversalBudget,
         mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
     ) -> Result<Option<(CatalogCodingEntry, CatalogCodingTraversalBudget)>, CatalogStoreError> {
         let Some(group) = self.group(id)? else {
             return Ok(None);
         };
-        let (entry, work) = unwrap_stream(self.root.read_group_with_work(
+        let (entry, work) = unwrap_stream(self.root.read_group_with_work_budget(
             self.scope,
             self.budget,
             group.location(),
+            budget,
             &mut fetch,
         ))?;
         if entry.retained.group.profile != group.group.profile

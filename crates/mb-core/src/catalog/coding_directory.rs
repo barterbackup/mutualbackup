@@ -56,7 +56,7 @@ impl CatalogCodingTraversalBudget {
         })
     }
 
-    fn check(self, work: Self) -> Result<(), CatalogError> {
+    pub(super) fn check(self, work: Self) -> Result<(), CatalogError> {
         self.remaining_after(work).map(|_| ())
     }
 }
@@ -212,6 +212,21 @@ impl CatalogCodingDirectoryRoot {
     ) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
         self.validate(budget)?;
         location.read_group_with_work(scope, self.guild_event_sequence, fetch)
+    }
+
+    /// Replay one indexed original witness within the owner's remaining work
+    /// budget. Admit each authenticated page before fetching it and each framed
+    /// record before decoding it. Directory admission remains independent.
+    pub fn read_group_with_work_budget<E>(
+        self,
+        scope: CatalogScope,
+        directory_budget: CatalogCodingTraversalBudget,
+        location: CatalogCodingGroupLocation,
+        replay_budget: CatalogCodingTraversalBudget,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+    ) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
+        self.validate(directory_budget)?;
+        location.read_group_with_work_budget(scope, self.guild_event_sequence, replay_budget, fetch)
     }
 }
 
@@ -1077,6 +1092,86 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn coding_point_replay_admits_pages_and_records_with_exact_remaining_work() {
+        let expected = entry(3, 9, 65536, 12);
+        let (root, pages) = build(std::slice::from_ref(&expected), CATALOG_MAX_STREAM_BYTES);
+        let mut reader = CatalogCodingDirectoryReader::new(scope(), root, budget()).unwrap();
+        reader
+            .next_group(&mut |page| Ok::<_, ()>(pages[&page.hash].clone()))
+            .unwrap();
+        let location = reader.last_group_location().unwrap();
+        let (_, exact) = root
+            .read_group_with_work(scope(), budget(), location, &mut |page| {
+                Ok::<_, ()>(pages[&page.hash].clone())
+            })
+            .unwrap();
+        assert!(exact.page_occurrences > 1 && exact.records > 2);
+        assert_eq!(
+            root.read_group_with_work_budget(scope(), budget(), location, exact, &mut |page| Ok::<
+                _,
+                (),
+            >(
+                pages[&page.hash].clone()
+            ))
+            .unwrap(),
+            (expected, exact)
+        );
+        for exhausted in [
+            CatalogCodingTraversalBudget { bytes: 0, ..exact },
+            CatalogCodingTraversalBudget {
+                page_occurrences: 0,
+                ..exact
+            },
+            CatalogCodingTraversalBudget {
+                records: 1,
+                ..exact
+            },
+        ] {
+            assert!(matches!(
+                root.read_group_with_work_budget(
+                    scope(),
+                    budget(),
+                    location,
+                    exhausted,
+                    &mut |_| -> Result<Vec<u8>, ()> {
+                        panic!("exhausted point replay fetched a page")
+                    }
+                ),
+                Err(CatalogStreamError::Catalog(CatalogError::Bounds))
+            ));
+        }
+        for short in [
+            CatalogCodingTraversalBudget {
+                bytes: exact.bytes - 1,
+                ..exact
+            },
+            CatalogCodingTraversalBudget {
+                page_occurrences: exact.page_occurrences - 1,
+                ..exact
+            },
+            CatalogCodingTraversalBudget {
+                records: exact.records - 1,
+                ..exact
+            },
+        ] {
+            let mut fetched = CatalogCodingTraversalBudget::default();
+            assert!(matches!(
+                root.read_group_with_work_budget(scope(), budget(), location, short, &mut |page| {
+                    fetched.bytes += u64::from(page.encoded_len);
+                    fetched.page_occurrences += 1;
+                    assert!(fetched.bytes <= short.bytes);
+                    assert!(fetched.page_occurrences <= short.page_occurrences);
+                    Ok::<_, ()>(pages[&page.hash].clone())
+                }),
+                Err(CatalogStreamError::Catalog(CatalogError::Bounds))
+            ));
+            if short.records == exact.records {
+                assert!(fetched.page_occurrences < exact.page_occurrences);
+            }
+        }
     }
 
     #[test]

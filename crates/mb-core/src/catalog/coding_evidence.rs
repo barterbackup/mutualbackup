@@ -259,7 +259,26 @@ impl CatalogCodingGroupLocation {
     ) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
         // Exact whole-directory membership and counters belong to the trusted
         // completed traversal; the part/range decoder authenticates this group.
-        read_group_at(scope, sequence, self.page, self.range, fetch)
+        self.read_group_with_work_budget(
+            scope,
+            sequence,
+            CatalogCodingTraversalBudget {
+                bytes: u64::MAX,
+                page_occurrences: u64::MAX,
+                records: u64::MAX,
+            },
+            fetch,
+        )
+    }
+
+    pub(super) fn read_group_with_work_budget<E>(
+        self,
+        scope: CatalogScope,
+        sequence: u64,
+        budget: CatalogCodingTraversalBudget,
+        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+    ) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
+        read_group_at(scope, sequence, self.page, self.range, budget, fetch)
     }
 }
 
@@ -343,8 +362,12 @@ impl CatalogCodingRoot {
             .parts
             .get(usize::from(range.part))
             .ok_or(CatalogError::Bounds)?;
-        read_group_at(scope, self.guild_event_sequence, part.page, range, fetch)
-            .map(|(entry, _)| entry)
+        CatalogCodingGroupLocation {
+            page: part.page,
+            range,
+        }
+        .read_group_with_work(scope, self.guild_event_sequence, fetch)
+        .map(|(entry, _)| entry)
     }
 }
 
@@ -353,6 +376,7 @@ fn read_group_at<E>(
     sequence: u64,
     page: CatalogPageRef,
     range: CatalogCodingGroupRange,
+    budget: CatalogCodingTraversalBudget,
     fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
 ) -> Result<(CatalogCodingEntry, CatalogCodingTraversalBudget), CatalogStreamError<E>> {
     let guild_id = guild(scope)?;
@@ -374,17 +398,26 @@ fn read_group_at<E>(
     {
         return Err(CatalogError::Bounds.into());
     }
+    // Every group contains a header and at least one witness fragment. Reject
+    // exhausted dimensions before allocating the range or invoking storage.
+    budget.check(CatalogCodingTraversalBudget {
+        bytes: u64::from(range.len),
+        page_occurrences: 1,
+        records: 2,
+    })?;
     let mut reader =
         CatalogRangeReader::new(scope, CatalogSection::Coding, page, range.offset..end)?;
     let mut bytes = Vec::with_capacity(range.len as usize);
     let mut work = CatalogCodingTraversalBudget::default();
-    let mut measured_fetch = |page| -> Result<Vec<u8>, CatalogStreamError<E>> {
-        let bytes = fetch(page).map_err(CatalogStreamError::Storage)?;
-        work = work.checked_add(CatalogCodingTraversalBudget {
-            bytes: bytes.len() as u64,
+    let mut measured_fetch = |page: CatalogPageRef| -> Result<Vec<u8>, CatalogStreamError<E>> {
+        let next = work.checked_add(CatalogCodingTraversalBudget {
+            bytes: u64::from(page.encoded_len),
             page_occurrences: 1,
             records: 0,
         })?;
+        budget.check(next)?;
+        let bytes = fetch(page).map_err(CatalogStreamError::Storage)?;
+        work = next;
         Ok(bytes)
     };
     while let Some(chunk) = reader
@@ -410,12 +443,17 @@ fn read_group_at<E>(
             return Err(CatalogError::Bounds.into());
         }
         let end = length_end.checked_add(length).ok_or(CatalogError::Bounds)?;
+        let next_work = work.checked_add(CatalogCodingTraversalBudget {
+            records: 1,
+            ..Default::default()
+        })?;
+        budget.check(next_work)?;
         let record = bytes
             .get(length_end..end)
             .ok_or(CatalogError::InvalidPage)?
             .to_vec();
         position = end;
-        work.records = work.records.checked_add(1).ok_or(CatalogError::Bounds)?;
+        work = next_work;
         Ok(Some(record))
     };
     let header = CatalogCodingRecord::decode(&next()?.ok_or(CatalogError::InvalidPage)?)?;

@@ -649,7 +649,19 @@ fn checkpoint_private_dependency_debits_the_enclosing_proof_budget() {
         .retain_catalog_paged_checkpoint(id, &limited, || Ok(limited.trust().clone()))
         .unwrap();
     let key = CatalogCheckpointRevisionKey::from(&fixture.paged().value);
-    assert!(retain(&control, id, &limited, key).is_err());
+    assert!(
+        control
+            .retain_catalog_paged_checkpoint_revision_checked(
+                id,
+                &limited,
+                key,
+                || Ok(limited.trust().clone()),
+                |_| -> Result<(), CatalogStoreError> {
+                    panic!("unadmitted private bytes were read")
+                }
+            )
+            .is_err()
+    );
     assert!(
         control
             .catalog_paged_checkpoint_revision(id, bundle.id)

@@ -192,6 +192,7 @@ pub(in crate::database::catalog) trait Proof {
     fn read_group(
         &self,
         group: [u8; 32],
+        budget: Work,
         fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
     ) -> Result<Option<(mb_core::CatalogCodingEntry, Work)>, CatalogStoreError>;
 }
@@ -243,9 +244,12 @@ macro_rules! proof {
             fn read_group(
                 &self,
                 group: [u8; 32],
+                budget: Work,
                 fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>, CatalogStoreError>,
             ) -> Result<Option<(mb_core::CatalogCodingEntry, Work)>, CatalogStoreError> {
-                self.index().index().read_group_with_work(group, fetch)
+                self.index()
+                    .index()
+                    .read_group_with_work_budget(group, budget, fetch)
             }
         }
     };

@@ -332,16 +332,21 @@ impl ControlStore {
         {
             return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
         }
-        check(&catalog)?;
         let previous_work = admitted_work(&tx, retention)?;
         let bytes = canonical_bytes(&expected).map_err(CatalogStoreError::from)?;
         // Reject one-sided damage rather than silently repairing a lost pin.
-        if read(&tx, id, catalog.bundle.id)?.is_none() {
+        let next = if read(&tx, id, catalog.bundle.id)?.is_none() {
             let next = previous_work
                 .unwrap_or_default()
                 .checked_add(expected.work)
                 .map_err(CatalogStoreError::from)?;
             check_work(&tx, retention, next)?;
+            Some(next)
+        } else {
+            None
+        };
+        check(&catalog)?;
+        if let Some(next) = next {
             insert_exact(&tx, &revisions(id), catalog.bundle.id.as_bytes(), &bytes)?;
             insert_exact(&tx, &owners(catalog.bundle.id), id.as_bytes(), &bytes)?;
             change_work(&tx, retention, previous_work, next)?;

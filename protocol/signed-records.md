@@ -456,3 +456,8 @@ includes public/history, private and actual payload/witness debt in either
 acquisition order. These owners stage metadata and local roles; full distributed
 readiness, atomic activation and normal producers remain separate requirements.
 Original signed and journal layouts and existing pin prefixes are unchanged.
+Custody acquisition debits all other existing private/payload work before
+original-witness point replay, admitting each authenticated page before fetch
+and framed record before decode. The writer admits prospective dependency work
+before complete private/payload byte validation. Exact same-role retries reuse
+their existing charge while reauthenticating original evidence and bytes.

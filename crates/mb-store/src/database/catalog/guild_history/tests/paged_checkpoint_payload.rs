@@ -558,7 +558,20 @@ fn checkpoint_payload_custody_shares_one_budget_with_private_revision_dependenci
                     |_| Ok::<_, CatalogStoreError>(()),
                 )
                 .unwrap();
-            assert!(retain(&control, &volume, &limited, id, group, 0).is_err());
+            assert!(
+                control
+                    .retain_catalog_paged_checkpoint_payload_checked(
+                        id,
+                        &limited,
+                        group,
+                        0,
+                        || Ok(limited.trust().clone()),
+                        |_| -> Result<(), CatalogStoreError> {
+                            panic!("unadmitted payload bytes were read")
+                        }
+                    )
+                    .is_err()
+            );
             assert!(
                 control
                     .catalog_paged_checkpoint_payload(id, group, 0)
@@ -574,7 +587,9 @@ fn checkpoint_payload_custody_shares_one_budget_with_private_revision_dependenci
                         &limited,
                         key,
                         || Ok(limited.trust().clone()),
-                        |_| Ok::<_, CatalogStoreError>(())
+                        |_| -> Result<(), CatalogStoreError> {
+                            panic!("unadmitted private bytes were read")
+                        }
                     )
                     .is_err()
             );
@@ -585,5 +600,102 @@ fn checkpoint_payload_custody_shares_one_budget_with_private_revision_dependenci
                     .is_none()
             );
         }
+    }
+
+    let replay_limited = private::private_proof_with_budget(
+        &mut authority,
+        &history,
+        public
+            .checked_add(private_work)
+            .unwrap()
+            .checked_add(Work {
+                bytes: 3 * 512,
+                records: 3,
+                page_occurrences: 0,
+            })
+            .unwrap(),
+    );
+    let id = Uuid::from_u128(4);
+    control
+        .retain_catalog_paged_checkpoint(id, &replay_limited, || Ok(replay_limited.trust().clone()))
+        .unwrap();
+    control
+        .retain_catalog_paged_checkpoint_revision_checked(
+            id,
+            &replay_limited,
+            key,
+            || Ok(replay_limited.trust().clone()),
+            |_| Ok::<_, CatalogStoreError>(()),
+        )
+        .unwrap();
+    let page = proof
+        .index()
+        .index()
+        .next_group(None)
+        .unwrap()
+        .unwrap()
+        .page;
+    let saved = control
+        .get_record("catalog-page-v1", &page.hash)
+        .unwrap()
+        .unwrap();
+    control
+        .put_record("catalog-page-v1", &page.hash, &[0])
+        .unwrap();
+    assert!(matches!(
+        control.retain_catalog_paged_checkpoint_payload_checked(
+            id,
+            &replay_limited,
+            group,
+            0,
+            || Ok(replay_limited.trust().clone()),
+            |_| -> Result<(), CatalogStoreError> {
+                panic!("unadmitted witness reached payload validation")
+            }
+        ),
+        Err(CatalogStoreError::Page(mb_core::CatalogError::Bounds))
+    ));
+    control
+        .put_record("catalog-page-v1", &page.hash, &saved)
+        .unwrap();
+
+    let exact = private::private_proof_with_budget(
+        &mut authority,
+        &history,
+        public
+            .checked_add(private_work)
+            .unwrap()
+            .checked_add(payload_work)
+            .unwrap(),
+    );
+    for (id, private_first) in [(Uuid::from_u128(5), true), (Uuid::from_u128(6), false)] {
+        let owner = control
+            .retain_catalog_paged_checkpoint(id, &exact, || Ok(exact.trust().clone()))
+            .unwrap();
+        for _ in 0..2 {
+            if !private_first {
+                retain(&control, &volume, &exact, id, group, 0).unwrap();
+            }
+            control
+                .retain_catalog_paged_checkpoint_revision_checked(
+                    id,
+                    &exact,
+                    key,
+                    || Ok(exact.trust().clone()),
+                    |_| Ok::<_, CatalogStoreError>(()),
+                )
+                .unwrap();
+            retain(&control, &volume, &exact, id, group, 0).unwrap();
+        }
+        assert_eq!(
+            super::super::super::paged_checkpoint_revision::owned_work(&control.connection, owner)
+                .unwrap(),
+            Some(private_work)
+        );
+        assert_eq!(
+            super::super::super::paged_checkpoint_payload::owned_work(&control.connection, owner)
+                .unwrap(),
+            Some(payload_work)
+        );
     }
 }

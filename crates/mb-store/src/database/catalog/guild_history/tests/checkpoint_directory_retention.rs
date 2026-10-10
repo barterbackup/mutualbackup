@@ -835,7 +835,20 @@ fn directory_private_and_payload_dependencies_share_the_complete_budget_in_both_
         retain(&control, id, &limited);
         if private_first {
             retain_private(&control, id, &limited, &fixture).unwrap();
-            assert!(retain_payload(&control, &volume, id, &limited, group, 0).is_err());
+            assert!(
+                control
+                    .retain_catalog_paged_checkpoint_directory_payload_checked(
+                        id,
+                        &limited,
+                        group,
+                        0,
+                        || Ok(limited.trust().clone()),
+                        |_| -> Result<(), CatalogStoreError> {
+                            panic!("unadmitted directory payload bytes were read")
+                        }
+                    )
+                    .is_err()
+            );
             assert!(
                 control
                     .catalog_paged_checkpoint_payload(id, group, 0)
@@ -844,7 +857,19 @@ fn directory_private_and_payload_dependencies_share_the_complete_budget_in_both_
             );
         } else {
             retain_payload(&control, &volume, id, &limited, group, 0).unwrap();
-            assert!(retain_private(&control, id, &limited, &fixture).is_err());
+            assert!(
+                control
+                    .retain_catalog_paged_checkpoint_directory_revision_checked(
+                        id,
+                        &limited,
+                        mb_core::CatalogCheckpointRevisionKey::from(&fixture.paged().value),
+                        || Ok(limited.trust().clone()),
+                        |_| -> Result<(), CatalogStoreError> {
+                            panic!("unadmitted directory private bytes were read")
+                        }
+                    )
+                    .is_err()
+            );
             assert!(
                 control
                     .catalog_paged_checkpoint_revision(id, bundle.id)
@@ -852,5 +877,76 @@ fn directory_private_and_payload_dependencies_share_the_complete_budget_in_both_
                     .is_none()
             );
         }
+    }
+
+    let replay_limited = proof(
+        &mut fixture,
+        &history,
+        public
+            .checked_add(private_work)
+            .unwrap()
+            .checked_add(Work {
+                bytes: 3 * 512,
+                records: 3,
+                page_occurrences: 0,
+            })
+            .unwrap(),
+    );
+    let id = Uuid::from_u128(4);
+    retain(&control, id, &replay_limited);
+    retain_private(&control, id, &replay_limited, &fixture).unwrap();
+    let page = full.index().index().next_group(None).unwrap().unwrap().page;
+    let saved = control
+        .get_record("catalog-page-v1", &page.hash)
+        .unwrap()
+        .unwrap();
+    control
+        .put_record("catalog-page-v1", &page.hash, &[0])
+        .unwrap();
+    assert!(matches!(
+        control.retain_catalog_paged_checkpoint_directory_payload_checked(
+            id,
+            &replay_limited,
+            group,
+            0,
+            || Ok(replay_limited.trust().clone()),
+            |_| -> Result<(), CatalogStoreError> {
+                panic!("unadmitted directory witness reached payload validation")
+            }
+        ),
+        Err(CatalogStoreError::Page(mb_core::CatalogError::Bounds))
+    ));
+    control
+        .put_record("catalog-page-v1", &page.hash, &saved)
+        .unwrap();
+
+    let exact = proof(
+        &mut fixture,
+        &history,
+        public
+            .checked_add(private_work)
+            .unwrap()
+            .checked_add(payload_work)
+            .unwrap(),
+    );
+    for (id, private_first) in [(Uuid::from_u128(5), true), (Uuid::from_u128(6), false)] {
+        let owner = retain(&control, id, &exact);
+        for _ in 0..2 {
+            if !private_first {
+                retain_payload(&control, &volume, id, &exact, group, 0).unwrap();
+            }
+            retain_private(&control, id, &exact, &fixture).unwrap();
+            retain_payload(&control, &volume, id, &exact, group, 0).unwrap();
+        }
+        assert_eq!(
+            super::super::super::paged_checkpoint_revision::owned_work(&control.connection, owner)
+                .unwrap(),
+            Some(private_work)
+        );
+        assert_eq!(
+            super::super::super::paged_checkpoint_payload::owned_work(&control.connection, owner)
+                .unwrap(),
+            Some(payload_work)
+        );
     }
 }
