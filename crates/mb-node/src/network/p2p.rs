@@ -21479,6 +21479,15 @@ mod tests {
         }
 
         fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + use<> {
+            // Keep a second dispatcher registered without making it default.
+            // Otherwise tracing's single-subscriber fast path can cache
+            // `never` when another test thread first registers a callsite
+            // without our scoped subscriber, losing the receive/worker logs.
+            static REGISTRATION_GUARD: std::sync::OnceLock<tracing::Dispatch> =
+                std::sync::OnceLock::new();
+            REGISTRATION_GUARD.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
             let log = self.clone();
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
@@ -21803,6 +21812,47 @@ mod tests {
         }
         assert!(admission.contains("locked_event_hash=None"), "{admission}");
         assert!(completed.contains("error=Some("), "{completed}");
+    }
+
+    #[test]
+    fn scoped_signature_trace_registration_survives_an_unsubscribed_thread() {
+        const CHILD: &str = "MB_SIGNATURE_TRACE_REGISTRATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A fresh process makes the single-subscriber registration race
+            // deterministic, independent of parallel tests' subscribers.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "network::p2p::tests::scoped_signature_trace_registration_survives_an_unsubscribed_thread",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+        fn emit() {
+            tracing::info!("scoped signature registration probe");
+        }
+        let log = SignatureTraceLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        // First encounter the same callsite on a thread without a subscriber;
+        // it must not disable the subsequent scoped subscriber's event.
+        std::thread::spawn(emit).join().unwrap();
+        emit();
+        assert_eq!(
+            log.text()
+                .matches("scoped signature registration probe")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

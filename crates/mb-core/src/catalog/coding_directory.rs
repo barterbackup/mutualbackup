@@ -9,6 +9,9 @@ use crate::{canonical_bytes_bounded, canonical_size_bounded};
 
 pub const CATALOG_CODING_DIRECTORY_ROOT_BYTES: usize = 512;
 
+mod capacity;
+pub use capacity::CatalogCodingDirectoryCapacity;
+
 /// Local limits from the enclosing authenticated admission policy, never from
 /// an untrusted directory's own claims. The eventual checkpoint must debit its
 /// other sections before supplying the remaining budget here.
@@ -256,6 +259,7 @@ pub struct CatalogCodingDirectoryBuilder {
     summary: CatalogCodingDirectorySummary,
     previous: Option<[u8; 32]>,
     forest_limit: u64,
+    group_limit: Option<u64>,
     failed: bool,
 }
 
@@ -286,8 +290,25 @@ impl CatalogCodingDirectoryBuilder {
             // A dense single-tree forest remains below the original forest's
             // page ceiling. Additional forests share the enclosing budget.
             forest_limit: CATALOG_MAX_STREAM_BYTES,
+            group_limit: None,
             failed: false,
         })
+    }
+
+    /// Reserve the full supported original-witness upper bound before staging.
+    /// The enclosing trusted budget must cover it, after debiting every other
+    /// checkpoint section. Refuse extra groups even if their encodings are
+    /// smaller. This does not admit SQL, payload, scratch or physical storage.
+    pub fn for_group_capacity(
+        scope: CatalogScope,
+        sequence: u64,
+        groups: u64,
+        budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
+        budget.check(CatalogCodingDirectoryCapacity::for_groups(groups)?.work)?;
+        let mut builder = Self::new(scope, sequence, budget)?;
+        builder.group_limit = Some(groups);
+        Ok(builder)
     }
 
     pub fn push_group<E>(
@@ -308,6 +329,19 @@ impl CatalogCodingDirectoryBuilder {
         entry: &CatalogCodingEntry,
         sink: &mut impl FnMut(CatalogPageRef, Vec<u8>) -> Result<(), E>,
     ) -> Result<(), CatalogStreamError<E>> {
+        let accepted = self
+            .summary
+            .coding
+            .groups
+            .checked_add(
+                self.active
+                    .as_ref()
+                    .map_or(0, |active| active.summary().groups),
+            )
+            .ok_or(CatalogError::Bounds)?;
+        if self.group_limit.is_some_and(|limit| accepted >= limit) {
+            return Err(CatalogError::Bounds.into());
+        }
         if self
             .previous
             .is_some_and(|id| id >= entry.retained.group.id)
@@ -635,6 +669,106 @@ mod tests {
         }
         assert!(reader.last_group_location().is_none());
         Ok(entries)
+    }
+
+    #[test]
+    fn declared_group_capacity_fences_extra_groups_before_staging_and_failure_is_sticky() {
+        let entries = entries(3);
+        let capacity = CatalogCodingDirectoryCapacity::for_groups(2).unwrap();
+        let mut builder = CatalogCodingDirectoryBuilder::for_group_capacity(
+            scope(),
+            i64::MAX as u64,
+            2,
+            capacity.work,
+        )
+        .unwrap();
+        let mut pages = Pages::new();
+        let calls = std::cell::Cell::new(0);
+        let mut sink = |page: CatalogPageRef, bytes| {
+            calls.set(calls.get() + 1);
+            pages.insert(page.hash, bytes);
+            Ok::<_, ()>(())
+        };
+        for entry in &entries[..2] {
+            builder.push_group(entry, &mut sink).unwrap();
+        }
+        let staged = calls.get();
+        assert!(matches!(
+            builder.push_group(&entries[2], &mut sink),
+            Err(CatalogStreamError::Catalog(CatalogError::Bounds))
+        ));
+        assert_eq!(calls.get(), staged);
+        assert!(matches!(
+            builder.push_group(&entries[2], &mut sink),
+            Err(CatalogStreamError::Catalog(CatalogError::Failed))
+        ));
+        assert!(builder.finish(&mut sink).is_err());
+        assert_eq!(calls.get(), staged);
+        for dimension in 0..3 {
+            let mut insufficient = capacity.work;
+            match dimension {
+                0 => insufficient.bytes -= 1,
+                1 => insufficient.page_occurrences -= 1,
+                _ => insufficient.records -= 1,
+            }
+            assert!(
+                CatalogCodingDirectoryBuilder::for_group_capacity(
+                    scope(),
+                    i64::MAX as u64,
+                    2,
+                    insufficient,
+                )
+                .is_err()
+            );
+        }
+        let empty = CatalogCodingDirectoryCapacity::for_groups(0).unwrap();
+        let root = CatalogCodingDirectoryBuilder::for_group_capacity(scope(), 1, 0, empty.work)
+            .unwrap()
+            .finish(&mut |_: CatalogPageRef, _: Vec<u8>| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(root.work().unwrap(), empty.work);
+    }
+
+    #[test]
+    fn full_original_witnesses_shard_within_the_declared_construction_capacity() {
+        let mut entries = (1..=12)
+            .map(|id| entry(3, id, 65536, 256))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.retained.group.id);
+        let forest_limit = 1024 * 1024;
+        let capacity =
+            CatalogCodingDirectoryCapacity::with_forest_limit(entries.len() as u64, forest_limit)
+                .unwrap();
+        let mut builder = CatalogCodingDirectoryBuilder::for_group_capacity(
+            scope(),
+            i64::MAX as u64,
+            entries.len() as u64,
+            capacity.work,
+        )
+        .unwrap();
+        // Exercise the same shard algorithm at a smaller forest boundary. The
+        // budget still reserves full 600 KiB originals, rather than this fixture.
+        builder.forest_limit = forest_limit;
+        let mut pages = Pages::new();
+        let mut sink = |page: CatalogPageRef, bytes| {
+            pages.insert(page.hash, bytes);
+            Ok::<_, ()>(())
+        };
+        for entry in &entries {
+            assert!(canonical_bytes(&entry.transcript).unwrap().len() > 192 * 1024);
+            builder.push_group(entry, &mut sink).unwrap();
+        }
+        let root = builder.finish(&mut sink).unwrap();
+        assert!(root.summary.forests > 1 && root.summary.forests <= capacity.forests);
+        assert!(root.summary.evidence_bytes <= capacity.evidence_bytes);
+        assert!(root.records.page.byte_len <= capacity.directory_bytes);
+        assert!(root.summary.coding.transcript_bytes <= capacity.transcript_bytes);
+        capacity.work.check(root.work().unwrap()).unwrap();
+        assert!(
+            pages.values().map(|bytes| bytes.len() as u64).sum::<u64>()
+                <= capacity.encoded_page_bytes
+        );
+        assert_eq!(read(root, &pages).unwrap(), entries);
     }
 
     #[test]

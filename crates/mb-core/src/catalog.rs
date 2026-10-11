@@ -32,8 +32,8 @@ pub use checkpoint_authority::{
 };
 pub use coding_directory::{
     CATALOG_CODING_DIRECTORY_ROOT_BYTES, CatalogCodingDirectoryBuilder,
-    CatalogCodingDirectoryReader, CatalogCodingDirectoryRoot, CatalogCodingDirectorySummary,
-    CatalogCodingTraversalBudget,
+    CatalogCodingDirectoryCapacity, CatalogCodingDirectoryReader, CatalogCodingDirectoryRoot,
+    CatalogCodingDirectorySummary, CatalogCodingTraversalBudget,
 };
 pub use coding_evidence::{
     CATALOG_CODING_FRAGMENT_BYTES, CATALOG_CODING_GROUP_BYTES, CATALOG_CODING_MAX_BYTES,

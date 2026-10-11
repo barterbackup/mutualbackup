@@ -1826,6 +1826,12 @@ pub(super) mod tests {
         assert!(sources * 2 <= CATALOG_MAX_RECORDS);
         let combined_bytes_lower = descriptor_bytes_lower + source_bytes + coding_bytes_lower;
         assert!(combined_bytes_lower > 64 * 1024 * 1024 * 1024);
+        let capacity = CatalogCodingDirectoryCapacity::for_groups(groups).unwrap();
+        assert!(capacity.work.bytes > coding_bytes_lower);
+        assert!(capacity.work.records > groups * root.parts[0].records);
+        assert!(capacity.work.page_occurrences > coding_leaves_lower);
+        assert!(capacity.transcript_bytes > 4 * (1_u64 << 40));
+        eprintln!("single-owner 1 TiB full-witness coding upper bound: {capacity:?}");
         eprintln!(
             "single-owner 1 TiB lower bound: {sources} data sources, {packed_sectors} packed sectors, {groups} groups, {per_group_lower} coding bytes/group, {coding_bytes_lower} coding bytes, {coding_leaves_lower} coding leaves, {descriptor_bytes_lower} descriptor bytes, {source_bytes} source-proof bytes, {combined_bytes_lower} combined bytes before signed source trees/private metadata/history"
         );

@@ -86,6 +86,61 @@ database work; it must preserve shared pages and pending intents. Seed-only
 recovery obtains authenticated roots first, then fetches and verifies pages
 incrementally. Missing or corrupt pages block the affected operation.
 
+## Full original-witness coding construction credits
+
+`CatalogCodingDirectoryCapacity::for_groups` derives an upper bound for the
+current directory builder's automatic single-tree forests. Its input counts
+all candidate/live/retired groups to be emitted. It reserves the supported paged
+codec's full 600 KiB original transcript envelope per group, plus the existing
+4 KiB group framing allowance. It does not substitute compact-only samples,
+short failure domains or one byte per raw compatibility-witness byte.
+
+With `B = 600 KiB + 4 KiB`, each nonfinal forest admits at least
+`floor((16 GiB - 8 - 512) / B) = 27,776` groups. Eight bytes reserve its record
+stream header and 512 bytes reserve its descriptor. The number of forests is
+therefore at most `ceil(groups / 27,776)`. Reserve a framed 512-byte descriptor
+per forest, the directory stream's 8-byte header, and its 512-byte envelope.
+Each group reserves 39 records: one header plus at most 38 transcript fragments.
+
+Page rounding is separate for every tree. For `n` trees, the sum of rounded
+counts at a level is at most `ceil(sum / fanout) + n - 1`; apply this at leaves
+and all three possible index levels. Counting unused upper levels over-reserves
+shorter trees. Multiplying the resulting page occurrences by 64 KiB gives a
+separate upper bound on encoded immutable page payloads, without assuming page
+sharing. This is not SQL or physical allocation accounting.
+
+The required actual single-owner allocator geometry has 7,456,541 default 3+2
+groups. Its derived coding construction credits are:
+
+| Resource | Upper reservation |
+| --- | ---: |
+| Forests | 269 |
+| Original transcript bytes | 4,581,298,790,400 |
+| Framed evidence stream bytes | 4,611,840,784,488 |
+| Directory stream bytes | 138,812 |
+| Combined stream/envelope bytes | 4,611,840,923,812 |
+| Page occurrences | 75,654,639 |
+| Record occurrences | 290,805,368 |
+| Encoded immutable page bytes | 4,958,102,421,504 |
+
+`CatalogCodingDirectoryBuilder::for_group_capacity` requires the independently
+trusted remaining work budget to cover these credits before staging. It also
+rejects extra groups before invoking the sink and retains the existing sticky
+failure fence. Existing measured-budget constructors and wire formats remain
+unchanged. Full-byte witnesses with 256-byte domains shard and replay with their
+original signed bytes under the derived credits.
+
+These are construction credits for this builder, not a universal recovery
+budget. Existing authenticated layouts can have different parts/page density;
+admit their exact authenticated work under the complete enclosing policy.
+Source/private/native/Git trees, retained revision occurrences, certified
+history, root owners/pins, original-record copies, journals/caches, SQL schema
+and indexes/pages, WAL/checkpoint copies, scratch, physical allocation and
+repeated traversal still need their own combined credits and enforcement.
+The 62,746,792,515-byte compact coding lower bound remains necessary evidence,
+but is not this full original-witness upper bound. No normal producer is enabled
+and the R3 enclosing-policy requirement remains open.
+
 ## Implementation and qualification order
 
 1. Add the bounded tree codec, streaming builder and authenticated traversal.
@@ -5727,3 +5782,7 @@ and physical policy, distributed readiness/current ownership, complete legacy
 joins, normal paged producers/retention/seed recovery, R5 and fresh installed
 R7 qualification remain open. Normal paged producers remain disabled. The real
 dense 1 TiB and native Windows/macOS gates remain user-deferred.
+
+Full-witness construction qualification passes 1,397 distinct tests in 1,397 executions: 198 Core, 409 ordinary Store, 117 Git, 548 Node, both provisioned Btrfs recovery fixtures, the explicit >512 MiB atomic writer, and all remaining workspace targets. Formatting, strict locked workspace/all-targets Clippy, all four debug builds and compilation pass. The 331 frozen inputs (328 code/dependency inputs) and 23 exact executables are audited; 121 other ignored cases remain unexecuted. Exact superseded-inode retirement reclaims 9.94 GiB; target uses 47.42 GiB. Current binaries/aliases, 7 unchanged shared inodes, 29 older archived paths, 14 auxiliary WIP files and 10 installed roots remain intact. Evidence: `/tmp/mb-m6-full-witness-capacity-final-k91to5f7`. This qualifies construction arithmetic and the listed regressions, not complete metadata admission or a dense 1 TiB recovery. The full enclosing policy and normal paged pipeline remain open; dense 1 TiB and native Windows/macOS tests remain user-deferred.
+
+An isolated subprocess regression proves the scoped-tracing callsite race found during qualification: first registration on an unsubscribed test thread suppressed later scoped events. The trace-test helper now retains a disabled dispatcher without installing it as the default, preserving dynamic callsite filtering and isolated logs. The probe passes after reproducing zero captured events before the fix; all three real signature trace cases also pass. Production logging/admission, the two-worker runtime and the 10-second inbound deadline remain unchanged. The first full attempt remains failed evidence under `/tmp/mb-m6-full-witness-capacity-xna0f2z7`; its inputs and logs are preserved. This fixes diagnostic-test capture, not R5's historical topology/signature stall or its remaining fault matrix.

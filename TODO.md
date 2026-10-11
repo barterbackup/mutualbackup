@@ -2553,6 +2553,28 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Derive/enforce full original-witness coding construction credits.
+      Count the supported 600 KiB witness envelope, framed groups, forest
+      descriptors, separately rounded leaves/indexes, record occurrences and
+      encoded immutable page bytes. The actual single-owner geometry reserves
+      269 forests, 4,611,840,923,812 combined stream/envelope bytes, 75,654,639
+      pages and 4,958,102,421,504 encoded page bytes. An explicit builder
+      constructor checks the trusted remaining budget before staging and fences
+      extra groups before sink calls. Four new cases cover full-byte witnesses
+      with 256-byte domains, original-byte replay, forest rounding, overflow,
+      budget refusal and sticky failure; the actual allocator audit also checks
+      the derived upper bound. Frozen qualification passes 1,397 distinct tests
+      (198 Core, 409 ordinary Store, 117 Git, 548 Node, both native recovery
+      fixtures, the explicit bulk writer and remaining targets), format, strict
+      locked Clippy, all four debug builds and compilation. All 331 inputs,
+      328 code/dependency inputs and 23 exact executables are audited; 121 other
+      ignored cases remain unexecuted. Retirement reclaims 9.94 GiB;
+      target uses 47.42 GiB, preserving current/shared binaries, older
+      archives, auxiliary WIP and installed roots. These are construction
+      credits, not admission for arbitrary recovered layouts or the complete
+      checkpoint/SQL/WAL/scratch/physical/traversal policy. That policy, retained
+      history limits and normal producers/recovery remain open. See ADR 0002.
+      Evidence: `/tmp/mb-m6-full-witness-capacity-final-k91to5f7`.
     - [x] Add explicit logical quotas over all seven Control and all three
       Parity tables, including original protocol records, journals, cached
       payloads, operations, checkpoint/recovery rows, parity acknowledgements
@@ -4129,6 +4151,19 @@ and native-platform gates remain open.
   either commit verified protection or expose an actionable blocked state with
   durable retry. Keep the historical evidence below; later successes do not
   explain the original 5,400-second outlier.
+
+  - [x] Make scoped signature-trace callsite registration deterministic under
+    parallel tests. A fresh-process probe reproduces suppressed scoped events
+    when another thread first registers the callsite without a subscriber.
+    Retain a disabled dispatcher without installing it as default, preserving
+    per-subscriber filtering and isolated captures. The probe and all three
+    real trace cases pass; admission assertions, two Tokio workers and the
+    10-second deadline are unchanged. Production logging/admission is unchanged.
+    Frozen qualification passes 1,397 distinct cases, including all 548 Node
+    cases and the existing process/native regressions. Preserve the first failed
+    attempt's inputs/logs and red-probe evidence. This fixes test capture only;
+    the historical R5 cause and complete fault matrix remain open. Evidence:
+    `/tmp/mb-m6-full-witness-capacity-final-k91to5f7`.
 
   - [x] Reject an invalid peer signature before entering durable quorum
     collection. Previously the client checked the response's signer ID only;
