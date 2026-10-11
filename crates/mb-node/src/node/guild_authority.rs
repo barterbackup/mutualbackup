@@ -255,11 +255,49 @@ pub(super) fn publish(
     records: &[ControlRecord],
     deletions: &[(String, Vec<u8>)],
 ) -> Result<()> {
-    let initial = GuildAuthoritySnapshot::from_genesis(&installed.certificate)?;
-    let next = make(
-        initial.event_head,
+    publish_authority(
+        control,
+        installed,
         GuildAuthoritySnapshot::from_state(state)?,
-    )?;
+        before,
+        records,
+        deletions,
+        None,
+    )
+}
+
+pub(super) fn publish_indexed_event(
+    control: &ControlStore,
+    installed: &InstalledGuild,
+    history: &mb_store::CatalogDurableGuildHistory,
+    event: &QuorumGuildEvent,
+    records: &[ControlRecord],
+    deletions: &[(String, Vec<u8>)],
+) -> Result<()> {
+    let mutation = original_history::prepare_event(control, history, event, records)?;
+    let next = mutation.authority().clone();
+    publish_authority(
+        control,
+        installed,
+        next,
+        Some(history.authority()),
+        records,
+        deletions,
+        Some(mutation),
+    )
+}
+
+fn publish_authority(
+    control: &ControlStore,
+    installed: &InstalledGuild,
+    authority: GuildAuthoritySnapshot,
+    before: Option<&GuildAuthoritySnapshot>,
+    records: &[ControlRecord],
+    deletions: &[(String, Vec<u8>)],
+    prepared_history: Option<mb_store::CatalogGuildHistoryMutation>,
+) -> Result<()> {
+    let initial = GuildAuthoritySnapshot::from_genesis(&installed.certificate)?;
+    let next = make(initial.event_head, authority)?;
     if next.authority.guild_id != initial.guild_id
         || next.authority.event_sequence == 0 && next.authority != initial
     {
@@ -286,8 +324,10 @@ pub(super) fn publish(
         before.as_ref(),
         records,
     )?;
-    let original_history =
-        original_history::prepare(control, installed, &next, before.as_ref(), records)?;
+    let original_history = match prepared_history {
+        Some(mutation) => mutation,
+        None => original_history::prepare(control, installed, &next, before.as_ref(), records)?,
+    };
     control.with_record_transaction(|| -> Result<()> {
         if control.get_record_bounded(KIND, KEY, BYTES)? != expected {
             anyhow::bail!("compact guild authority changed before publication");
@@ -542,7 +582,17 @@ mod tests {
             .unwrap()
             .authorize_historical_member(&initial.guild_id, node.keys.node_id())
             .unwrap();
-        assert!(node.dynamic_guild_state().is_err());
+        assert!(
+            decode_canonical::<DynamicGuildState>(
+                &node
+                    .control
+                    .get_record("guild-dynamic-state", KEY)
+                    .unwrap()
+                    .unwrap()
+            )
+            .map(|state| state.validate().is_err())
+            .unwrap_or(true)
+        );
         assert_eq!(
             node.guild_summary().unwrap().unwrap().event_sequence,
             Some(0)
@@ -615,7 +665,7 @@ mod tests {
             let trigger = match fault {
                 0 => format!("CREATE TEMP TRIGGER compact_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='{KIND}' BEGIN SELECT RAISE(IGNORE); END"),
                 1 => "CREATE TEMP TRIGGER compact_fault BEFORE INSERT ON protocol_records WHEN NEW.kind='guild-event' BEGIN SELECT RAISE(IGNORE); END".to_owned(),
-                2 => "CREATE TEMP TRIGGER compact_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='guild-dynamic-state' BEGIN SELECT RAISE(IGNORE); END".to_owned(),
+                2 => "CREATE TEMP TRIGGER compact_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN SELECT RAISE(IGNORE); END".to_owned(),
                 3 => format!("CREATE TEMP TRIGGER compact_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='{KIND}' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind=NEW.kind AND record_id=NEW.record_id; END"),
                 4 => "CREATE TEMP TRIGGER compact_fault AFTER INSERT ON protocol_records WHEN NEW.kind='guild-event' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind=NEW.kind AND record_id=NEW.record_id; END".to_owned(),
                 _ => "CREATE TEMP TRIGGER compact_fault BEFORE DELETE ON protocol_records WHEN OLD.kind='guild-event-partial-signatures' BEGIN SELECT RAISE(IGNORE); END".to_owned(),
@@ -723,9 +773,10 @@ mod tests {
         let certified = relabel(&node, &keys);
         node.install_guild_event(certified.clone()).unwrap();
         let current = node.control.get_record(KIND, KEY).unwrap().unwrap();
+        let rejected = relabel(&node, &keys);
         node.control.put_record(KIND, KEY, &initial).unwrap();
         assert!(read(&node.control).is_err());
-        assert!(node.install_guild_event(relabel(&node, &keys)).is_err());
+        assert!(node.install_guild_event(rejected).is_err());
         node.control.put_record(KIND, KEY, &current).unwrap();
         let event_key = certified.event.sequence.to_be_bytes();
         node.control

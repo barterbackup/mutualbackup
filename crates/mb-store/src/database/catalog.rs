@@ -73,9 +73,9 @@ pub use coding_directory_coverage::{
 pub use coding_retention::{CatalogCodingRetention, CatalogCodingRetentionState};
 pub use coding_validation::{CatalogCodingValidation, CatalogValidatedCoding};
 pub use guild_history::{
-    CatalogDurableGuildHistory, CatalogDurableGuildHistoryView, CatalogGuildHistoryIndex,
-    CatalogGuildHistoryMutation, CatalogGuildHistoryObject, CatalogGuildHistorySnapshot,
-    CatalogGuildHistorySource, CatalogGuildHistoryView,
+    CatalogDurableGuildHistory, CatalogDurableGuildHistoryView, CatalogGuildEventProposalGuard,
+    CatalogGuildHistoryIndex, CatalogGuildHistoryMutation, CatalogGuildHistoryObject,
+    CatalogGuildHistorySnapshot, CatalogGuildHistorySource, CatalogGuildHistoryView,
 };
 pub use native_validation::{
     CatalogNativeValidation, CatalogNativeValidationState, CatalogValidatedLink,

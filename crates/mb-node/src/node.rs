@@ -4288,15 +4288,7 @@ impl Node {
     }
 
     pub fn dynamic_guild_state(&self) -> Result<Option<DynamicGuildState>> {
-        let state = self
-            .control
-            .get_record("guild-dynamic-state", b"primary")?
-            .map(|bytes| decode_canonical::<DynamicGuildState>(&bytes))
-            .transpose()?;
-        if let Some(state) = &state {
-            state.validate()?;
-        }
-        Ok(state)
+        guild_authority::original_history::legacy_state(&self.control)
     }
 
     pub(crate) fn advance_guild_history_index(&self) -> Result<bool> {
@@ -4341,7 +4333,7 @@ impl Node {
         if event.kind.coding_group_add().is_some() {
             anyhow::bail!("coding-group events require replayable verifier evidence");
         }
-        self.sign_guild_event_proposal_inner(event)
+        self.sign_guild_event_proposal_inner(event, None)
     }
 
     pub(crate) fn locked_guild_event_proposal(&self, sequence: u64) -> Result<Option<GuildEvent>> {
@@ -4378,16 +4370,21 @@ impl Node {
             anyhow::bail!("new coding Add proposals must bind verifier evidence");
         }
         self.validate_coding_group_event_evidence(event, transcript)?;
-        self.sign_guild_event_proposal_inner(event)
+        self.sign_guild_event_proposal_inner(event, Some(transcript))
     }
 
-    fn sign_guild_event_proposal_inner(&self, event: &GuildEvent) -> Result<MemberSignature> {
+    fn sign_guild_event_proposal_inner(
+        &self,
+        event: &GuildEvent,
+        transcript: Option<&SignedRecord<CodingVerificationTranscript>>,
+    ) -> Result<MemberSignature> {
         let event_hash = event.hash()?;
         let record_id = event.sequence.to_be_bytes();
-        if let Some(bytes) = self
-            .control
-            .get_record("guild-event-signature-lock", &record_id)?
-        {
+        if let Some(bytes) = self.control.get_record_bounded(
+            "guild-event-signature-lock",
+            &record_id,
+            mb_core::GUILD_EVENT_BYTES + 256,
+        )? {
             let lock: GuildEventSignatureLock = decode_canonical(&bytes)?;
             if lock.format_version != 1 || lock.event_hash != event_hash || lock.event != *event {
                 tracing::warn!(
@@ -4410,10 +4407,37 @@ impl Node {
             );
             return Ok(lock.signature);
         }
-        let state = self
-            .dynamic_guild_state()?
-            .context("node has no dynamic guild state")?;
-        state.validate_event_proposal(event)?;
+        let mut proposal_guard = None;
+        let state = if let Some(history) =
+            guild_authority::original_history::complete_index(&self.control)?
+        {
+            let records = transcript
+                .map(|transcript| -> Result<_> {
+                    Ok(vec![(
+                        "coding-event-transcript".to_owned(),
+                        event_hash.to_vec(),
+                        mb_core::canonical_bytes_bounded(
+                            transcript,
+                            mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                        )?,
+                    )])
+                })
+                .transpose()?
+                .unwrap_or_default();
+            proposal_guard = Some(guild_authority::original_history::validate_proposal(
+                &self.control,
+                &history,
+                event,
+                &records,
+            )?);
+            history.authority().clone()
+        } else {
+            let state = self
+                .dynamic_guild_state()?
+                .context("node has no dynamic guild state")?;
+            state.validate_event_proposal(event)?;
+            mb_core::GuildAuthoritySnapshot::from_state(&state)?
+        };
         if !state
             .active_members()
             .any(|member| member.node_id == self.keys.node_id())
@@ -4427,13 +4451,38 @@ impl Node {
             event: event.clone(),
             signature: signature.clone(),
         };
-        if !self.control.put_record_if_absent(
-            "guild-event-signature-lock",
-            &record_id,
-            &canonical_bytes(&lock)?,
-        )? {
-            anyhow::bail!("local seed has already signed a guild event at this sequence");
-        }
+        let encoded = mb_core::canonical_bytes_bounded(&lock, mb_core::GUILD_EVENT_BYTES + 256)?;
+        guild_authority::with_history(&self.control, |authority| {
+            if authority.snapshot() != &state {
+                anyhow::bail!("guild authority changed before signing");
+            }
+            self.control.with_record_transaction(|| -> Result<()> {
+                authority.check()?;
+                if let Some(guard) = &proposal_guard {
+                    guard.check_unchanged(&self.control)?;
+                }
+                if !self.control.put_record_if_absent(
+                    "guild-event-signature-lock",
+                    &record_id,
+                    &encoded,
+                )? {
+                    anyhow::bail!("local seed has already signed a guild event at this sequence");
+                }
+                if self
+                    .control
+                    .get_record_bounded("guild-event-signature-lock", &record_id, encoded.len())?
+                    .as_deref()
+                    != Some(encoded.as_slice())
+                {
+                    anyhow::bail!("guild signature lock did not preserve exact bytes");
+                }
+                if let Some(guard) = &proposal_guard {
+                    guard.check_unchanged(&self.control)?;
+                }
+                authority.check()
+            })
+        })?
+        .context("guild authority disappeared before signing")?;
         tracing::debug!(
             signer = %self.keys.node_id(),
             guild_id = %hex::encode(event.guild_id),
@@ -4451,17 +4500,27 @@ impl Node {
         event: &GuildEvent,
         candidate: MemberSignature,
     ) -> Result<Vec<MemberSignature>> {
-        let state = self
-            .dynamic_guild_state()?
+        let state = guild_authority::read_or_legacy(&self.control)?
             .context("node has no dynamic guild state")?;
-        state.validate_event_proposal(event)?;
         if self.locked_guild_event_proposal(event.sequence)?.as_ref() != Some(event) {
             anyhow::bail!("local guild proposal lock does not match the event");
+        }
+        // The exact lock was created only after complete effect validation.
+        // It can authorize collecting signatures only at its original scope.
+        if event.guild_id != state.guild_id
+            || Some(event.sequence) != state.event_sequence.checked_add(1)
+            || event.parent != state.event_head
+        {
+            anyhow::bail!("locked guild proposal no longer follows current authority");
         }
         let id = pending_guild_event_signatures_id(event);
         let mut pending = self
             .control
-            .get_record("guild-event-partial-signatures", &id)?
+            .get_record_bounded(
+                "guild-event-partial-signatures",
+                &id,
+                mb_core::GUILD_EVENT_BYTES + mb_core::GUILD_AUTHORITY_SNAPSHOT_BYTES,
+            )?
             .map(|bytes| decode_canonical::<PendingGuildEventSignatures>(&bytes))
             .transpose()?
             .unwrap_or(PendingGuildEventSignatures {
@@ -4500,11 +4559,30 @@ impl Node {
             Ok(_) => return Ok(pending.signatures),
             Err(index) => pending.signatures.insert(index, candidate),
         }
-        self.control.put_record(
-            "guild-event-partial-signatures",
-            &id,
-            &canonical_bytes(&pending)?,
+        let encoded = mb_core::canonical_bytes_bounded(
+            &pending,
+            mb_core::GUILD_EVENT_BYTES + mb_core::GUILD_AUTHORITY_SNAPSHOT_BYTES,
         )?;
+        guild_authority::with_history(&self.control, |authority| {
+            if authority.snapshot() != &state {
+                anyhow::bail!("guild authority changed during signature collection");
+            }
+            self.control.with_record_transaction(|| -> Result<()> {
+                authority.check()?;
+                self.control
+                    .put_record("guild-event-partial-signatures", &id, &encoded)?;
+                if self
+                    .control
+                    .get_record_bounded("guild-event-partial-signatures", &id, encoded.len())?
+                    .as_deref()
+                    != Some(encoded.as_slice())
+                {
+                    anyhow::bail!("partial guild signatures did not preserve exact bytes");
+                }
+                authority.check()
+            })
+        })?
+        .context("guild authority disappeared during signature collection")?;
         tracing::debug!(
             guild_id = %hex::encode(event.guild_id),
             sequence = event.sequence,
@@ -4685,16 +4763,26 @@ impl Node {
         transcript: Option<SignedRecord<CodingVerificationTranscript>>,
         binding: Option<QuorumLegacyCodingAddBinding>,
     ) -> Result<()> {
-        let mut state = self
-            .dynamic_guild_state()?
-            .context("node has no dynamic guild state")?;
+        let indexed = guild_authority::original_history::complete_index(&self.control)?;
+        let mut state = if indexed.is_some() {
+            None
+        } else {
+            Some(
+                self.dynamic_guild_state()?
+                    .context("node has no dynamic guild state")?,
+            )
+        };
+        let authority_before = match &indexed {
+            Some(history) => history.authority().clone(),
+            None => mb_core::GuildAuthoritySnapshot::from_state(state.as_ref().unwrap())?,
+        };
         let sequence = certified.event.sequence;
         let record_id = sequence.to_be_bytes();
-        let encoded = canonical_bytes(&certified)?;
-        if sequence <= state.event_sequence {
+        let encoded = mb_core::canonical_bytes_bounded(&certified, mb_core::GUILD_EVENT_BYTES)?;
+        if sequence <= authority_before.event_sequence {
             let existing = self
                 .control
-                .get_record("guild-event", &record_id)?
+                .get_record_bounded("guild-event", &record_id, mb_core::GUILD_EVENT_BYTES)?
                 .context("dynamic guild state omits a historical event")?;
             if existing != encoded {
                 anyhow::bail!("guild event conflicts with installed history");
@@ -4704,7 +4792,11 @@ impl Node {
                 let bytes = canonical_bytes(binding)?;
                 if self
                     .control
-                    .get_record("coding-legacy-add-binding", &event_hash)?
+                    .get_record_bounded(
+                        "coding-legacy-add-binding",
+                        &event_hash,
+                        mb_core::LEGACY_CODING_ADD_BINDING_BYTES,
+                    )?
                     .is_some_and(|existing| existing != bytes)
                 {
                     anyhow::bail!("historical Add conflicts with its quorum binding");
@@ -4717,14 +4809,20 @@ impl Node {
                 let attempt_id = transcript.value.plan.value.attempt_id;
                 let group = &transcript.value.manifest.value.group;
                 let event_hash = certified.event.hash()?;
-                if let Some(existing) = self
-                    .control
-                    .get_record("coding-event-transcript", &event_hash)?
-                    && existing != canonical_bytes(&transcript)?
+                if let Some(existing) = self.control.get_record_bounded(
+                    "coding-event-transcript",
+                    &event_hash,
+                    mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                )? && existing != canonical_bytes(&transcript)?
                 {
                     anyhow::bail!("historical Add conflicts with its bound verifier evidence");
                 }
-                let current_add = state.coding_groups.iter().any(|retained| {
+                let current_add = guild_authority::retained_group_if_available(
+                    &self.control,
+                    authority_before.guild_id,
+                    group.id,
+                )?
+                .is_some_and(|retained| {
                     retained.group == *group && retained.added_at_event == sequence
                 });
                 if current_add {
@@ -4736,7 +4834,11 @@ impl Node {
                     )?;
                 } else if self
                     .control
-                    .get_record("coding-event-transcript", &event_hash)?
+                    .get_record_bounded(
+                        "coding-event-transcript",
+                        &event_hash,
+                        mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                    )?
                     .is_none()
                 {
                     anyhow::bail!("historical Add has no event-bound verifier evidence");
@@ -4761,8 +4863,11 @@ impl Node {
             )?;
             return Ok(());
         }
-        if let Some(existing) = self.control.get_record("guild-event", &record_id)?
-            && existing != encoded
+        if let Some(existing) = self.control.get_record_bounded(
+            "guild-event",
+            &record_id,
+            mb_core::GUILD_EVENT_BYTES,
+        )? && existing != encoded
         {
             anyhow::bail!("guild event conflicts with durable history");
         }
@@ -4774,19 +4879,23 @@ impl Node {
         let forgotten_group = if let mb_core::GuildEventKind::ForgetCodingGroup { group_id } =
             &certified.event.kind
         {
-            let retained = state
-                .coding_groups
-                .iter()
-                .find(|retained| retained.group.id == *group_id)
-                .context("forgotten coding group is absent from guild history")?;
+            let retained = guild_authority::retained_group(
+                &self.control,
+                authority_before.guild_id,
+                *group_id,
+            )?;
             let add_event: QuorumGuildEvent = decode_canonical(
                 &self
                     .control
-                    .get_record("guild-event", &retained.added_at_event.to_be_bytes())?
+                    .get_record_bounded(
+                        "guild-event",
+                        &retained.added_at_event.to_be_bytes(),
+                        mb_core::GUILD_EVENT_BYTES,
+                    )?
                     .context("forgotten coding group has no historical Add event")?,
             )?;
             let transcript = self.coding_transcript_for_event(
-                state.guild_id,
+                authority_before.guild_id,
                 *group_id,
                 retained.added_at_event,
                 add_event.event.hash()?,
@@ -4799,31 +4908,30 @@ impl Node {
             None
         };
         let is_forget = forgotten_group.is_some();
-        let authority_before = mb_core::GuildAuthoritySnapshot::from_state(&state)?;
         let installed = self
             .installed_guild()?
             .context("guild event has no installed genesis")?;
-        state.apply_event(&certified)?;
-        if invalidates_placement_audit {
-            // Invalidate before committing the valid event so an interruption
-            // cannot leave a pre-change Healthy report attached to the
-            // unchanged checkpoint hash.
-            self.control.delete_record("node-state", b"guild-audit")?;
+        if let Some(state) = &mut state {
+            state.apply_event(&certified)?;
         }
-        let mut records = vec![
-            ("guild-event".to_owned(), record_id.to_vec(), encoded),
-            (
+        let mut records = vec![("guild-event".to_owned(), record_id.to_vec(), encoded)];
+        if let Some(state) = &state {
+            records.push((
                 "guild-dynamic-state".to_owned(),
                 b"primary".to_vec(),
-                canonical_bytes(&state)?,
-            ),
-        ];
+                canonical_bytes(state)?,
+            ));
+        }
         if let Some(binding) = binding {
             let event_hash = certified.event.hash()?;
             let bytes = canonical_bytes(&binding)?;
             if self
                 .control
-                .get_record("coding-legacy-add-binding", &event_hash)?
+                .get_record_bounded(
+                    "coding-legacy-add-binding",
+                    &event_hash,
+                    mb_core::LEGACY_CODING_ADD_BINDING_BYTES,
+                )?
                 .is_some_and(|existing| existing != bytes)
             {
                 anyhow::bail!("coding Add conflicts with its quorum binding");
@@ -4838,7 +4946,11 @@ impl Node {
             let bytes = canonical_bytes(&transcript)?;
             if self
                 .control
-                .get_record("coding-event-transcript", &add_hash)?
+                .get_record_bounded(
+                    "coding-event-transcript",
+                    &add_hash,
+                    mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                )?
                 .is_some_and(|existing| existing != bytes)
             {
                 anyhow::bail!("forgotten coding Add conflicts with its verifier evidence");
@@ -4901,7 +5013,11 @@ impl Node {
             let event_hash = certified.event.hash()?;
             if self
                 .control
-                .get_record("coding-event-transcript", &event_hash)?
+                .get_record_bounded(
+                    "coding-event-transcript",
+                    &event_hash,
+                    mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                )?
                 .is_some_and(|existing| existing != bytes)
             {
                 anyhow::bail!("coding Add conflicts with its bound verifier evidence");
@@ -4925,18 +5041,33 @@ impl Node {
         let mut deletions = attempt_id
             .map(|attempt_id| vec![("coding-pending-activation".to_owned(), attempt_id.to_vec())])
             .unwrap_or_default();
+        if invalidates_placement_audit {
+            // Audit invalidation and the accepted event share the writer.
+            deletions.push(("node-state".to_owned(), b"guild-audit".to_vec()));
+        }
         deletions.push((
             "guild-event-partial-signatures".to_owned(),
             pending_guild_event_signatures_id(&certified.event).to_vec(),
         ));
-        guild_authority::publish(
-            &self.control,
-            &installed,
-            &state,
-            Some(&authority_before),
-            &records,
-            &deletions,
-        )?;
+        if let Some(history) = &indexed {
+            guild_authority::publish_indexed_event(
+                &self.control,
+                &installed,
+                history,
+                &certified,
+                &records,
+                &deletions,
+            )?;
+        } else {
+            guild_authority::publish(
+                &self.control,
+                &installed,
+                state.as_ref().unwrap(),
+                Some(&authority_before),
+                &records,
+                &deletions,
+            )?;
+        }
         if let Some(attempt_id) = attempt_id {
             self.volumes.finalize_attempt(&self.control, &attempt_id)?;
         }
@@ -14612,12 +14743,8 @@ fn guild_event_tail_from_store(
             .get_record("guild-installed", b"primary")?
             .context("node has no installed guild")?,
     )?;
-    let durable: DynamicGuildState = decode_canonical(
-        &control
-            .get_record("guild-dynamic-state", b"primary")?
-            .context("node has no dynamic guild state")?,
-    )?;
-    durable.validate()?;
+    let durable = guild_authority::original_history::legacy_state(control)?
+        .context("node has no dynamic guild state")?;
     if base_sequence > durable.event_sequence {
         anyhow::bail!("guild event-tail base is ahead of local state");
     }
@@ -16919,7 +17046,7 @@ pub(crate) mod tests {
             node.dynamic_guild_state_for_membership_epoch(1).unwrap(),
             initial
         );
-        let mut conflicting = updated;
+        let mut conflicting = updated.clone();
         conflicting.event_head = [77; 32];
         node.control
             .put_record(
@@ -16927,6 +17054,23 @@ pub(crate) mod tests {
                 b"primary",
                 &canonical_bytes(&conflicting).unwrap(),
             )
+            .unwrap();
+        assert_eq!(
+            node.dynamic_guild_state_for_membership_epoch(2).unwrap(),
+            updated
+        );
+        let id = 1_u64.to_be_bytes();
+        let mut original: QuorumGuildEvent = decode_canonical(
+            &node
+                .control
+                .get_record("guild-event", &id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        original.event.parent = [77; 32];
+        node.control
+            .put_record("guild-event", &id, &canonical_bytes(&original).unwrap())
             .unwrap();
         assert!(node.dynamic_guild_state_for_membership_epoch(2).is_err());
     }

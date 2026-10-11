@@ -5596,3 +5596,34 @@ The post-commit audit binds the qualified code and executable inventory to the
 committed tree. Complete enclosing activation, fixed legacy migration, full
 metadata/WAL/index/scratch/traversal and physical quotas, normal producers and
 seed-only recovery, remaining bulk consumers and the R5/R7 gates remain open.
+
+### 2026-10-11 — Bounded original-history normal event admission
+
+Normal proposal signing, signature collection and event installation use the complete durable original-history index. Unsigned proposal validation runs the same non-membership rules and original verifier evidence in a disposable bounded overlay; its opaque point-row guard has no installation capability. Original quorum verification remains mandatory for publication. Signing guards the exact indexed rows and original current authority before and after its serialized write; signature collection fences its exact previously validated lock/current scope and reads bounded journals. Original events, event-bound transcripts, membership projections, cleanup obligations, partial-signature deletion and audit invalidation publish atomically.
+
+Indexed installs no longer rewrite or materialize the complete DynamicGuildState. The explicit compatibility API reconstructs the full value from every bounded original event under genesis, tip, full-tail and original-history fences, using a coherent read snapshot on independent readers. Older absent/incomplete indexes retain their validated legacy path and explicit one-event catch-up; malformed or conflicting indexes fail closed. Full-value compatibility consumers and event-tail replay still allocate growing history and remain integration work. This does not derive the final metadata budget, enable normal paged producers or complete enclosing checkpoint availability/current activation.
+
+Three new Node tests exercise real normal admission with an unusable 2 MiB cache: writer/recovery key rotation and revocation, removed-member refusal, partial signatures, unchanged original bytes, idempotent replay/reopen, original coding Add witness binding, refused unsigned installs, Retire/Forget deadlines, and actual authority/selected indexed-row changes during signature writes. Existing legacy-store fixtures explicitly save a complete old-format state before removing the index; fault targets follow the original rows now written. Preliminary old-cache expectations and the raw decoder-versus-state-validation mismatch remain in separate diagnostic logs. No production authorization, bounds or runtime test deadlines were weakened.
+
+An earlier workspace attempt was stopped before Node after identifying an obsolete full-value cache assertion outside the authority preflight. Its source/binary/native cleanup checks pass, but its incomplete inventory is excluded. The final compatibility test checks reconstruction from original events and refusal after an original event is changed.
+
+Frozen formatting, strict locked workspace/all-target Clippy, all-target
+compilation, four debug programs, the complete ordinary workspace and both
+provisioned Btrfs recovery cases pass: 1,379 distinct tests
+in 1,383 executions, including 194 Core, 400 Store, 117 Git and
+544 Node. Evidence: `/tmp/mb-m6-indexed-event-admission-final-8hn_aomd`. Targets run sequentially with four test threads and
+unchanged deadlines. The per-event envelope/point-row/evidence admission is not
+a 25 ms fairness qualification or the final retained metadata/SQL/WAL policy.
+121 other ignored cases and fresh installed-artifact qualification remain open;
+dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+Independent source/binary/exact-inventory, native-cleanup and preservation audits
+pass. Exact retirement of the superseded `2c3e86e` debug archive and preliminary
+Node-only executable reclaims 10.43 GiB and leaves 47.41 GiB in
+`target`. All current qualified executables, 29 older archived paths, 14 auxiliary
+WIP files and 10 installed roots are preserved. The post-commit audit binds the
+qualification to the committed tree. Full-value compatibility/event-tail replay
+and remaining bulk consumers, complete metadata and physical admission, enclosing
+availability/current activation, fixed legacy migration, normal producers and
+seed-only recovery, historical topology/signature cause/full matrix and remaining
+R7 software/release gates remain open.

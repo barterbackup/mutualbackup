@@ -157,6 +157,17 @@ pub struct CatalogGuildHistoryMutation {
     step_work: Work,
 }
 
+/// A checked unsigned proposal has no publication capability. Its bounded
+/// point-row guards fence signing without exposing the disposable mutation.
+pub struct CatalogGuildEventProposalGuard {
+    checked: CatalogGuildHistoryMutation,
+}
+impl CatalogGuildEventProposalGuard {
+    pub fn check_unchanged(&self, control: &ControlStore) -> Result<(), CatalogStoreError> {
+        self.checked.check_expected(control)
+    }
+}
+
 fn seed(
     control: &ControlStore,
     scratch: &RecordScratchStore,
@@ -345,6 +356,41 @@ impl CatalogDurableGuildHistory {
         budget: Work,
         source: &mut impl CatalogGuildHistorySource,
     ) -> Result<CatalogGuildHistoryMutation, CatalogStoreError> {
+        self.prepare_event(control, event, budget, source, true)
+    }
+
+    /// Validate a proposal in a disposable bounded overlay. No mutation or
+    /// unsigned authority can escape this method or be installed by its caller.
+    pub fn validate_event_proposal(
+        &self,
+        control: &ControlStore,
+        event: &mb_core::GuildEvent,
+        budget: Work,
+        source: &mut impl CatalogGuildHistorySource,
+    ) -> Result<CatalogGuildEventProposalGuard, CatalogStoreError> {
+        let checked = self.prepare_event(
+            control,
+            &QuorumGuildEvent {
+                event: event.clone(),
+                signatures: Vec::new(),
+            },
+            budget,
+            source,
+            false,
+        )?;
+        let guard = CatalogGuildEventProposalGuard { checked };
+        guard.check_unchanged(control)?;
+        Ok(guard)
+    }
+
+    fn prepare_event(
+        &self,
+        control: &ControlStore,
+        event: &QuorumGuildEvent,
+        budget: Work,
+        source: &mut impl CatalogGuildHistorySource,
+        certified: bool,
+    ) -> Result<CatalogGuildHistoryMutation, CatalogStoreError> {
         let mut meter = Meter {
             budget,
             used: Work::default(),
@@ -375,104 +421,105 @@ impl CatalogDurableGuildHistory {
             transcript: None,
         };
         scratch.with_record_transaction(|| -> Result<(), CatalogStoreError> {
-            authority.advance_indexed(
-                event,
-                |before, original| -> Result<(), CatalogStoreError> {
-                    let mut locations = Vec::with_capacity(3);
-                    match &original.kind {
-                        GuildEventKind::RotateWriterKey { owner, epoch, .. } => {
-                            locations.push((LATEST_WRITER, owner.0.to_vec()));
-                            locations.push((WRITERS, epoch_key(*owner, *epoch).to_vec()));
-                        }
-                        GuildEventKind::RevokeWriterKey { owner, epoch } => {
-                            locations.push((WRITERS, epoch_key(*owner, *epoch).to_vec()))
-                        }
-                        GuildEventKind::RotateRecoveryKey { envelope } => {
-                            locations.push((LATEST_RECOVERY, envelope.subject.0.to_vec()));
-                            locations.push((
-                                RECOVERY,
-                                epoch_key(envelope.subject, envelope.epoch).to_vec(),
-                            ));
-                        }
-                        GuildEventKind::RevokeRecoveryKey { subject, epoch } => {
-                            locations.push((RECOVERY, epoch_key(*subject, *epoch).to_vec()))
-                        }
-                        GuildEventKind::AddCodingGroup { group }
-                        | GuildEventKind::AddCodingGroupBound { group, .. } => {
-                            locations.push((GROUPS, group.id.to_vec()));
-                            locations.push((
-                                ARCHIVE,
-                                historical::incarnation_key(group.id, original.sequence).to_vec(),
-                            ));
-                            let object = CatalogGuildHistoryObject::Transcript(original.hash()?);
-                            let bytes = fetch(
-                                &mut source,
-                                &mut meter,
-                                object,
-                                None,
-                                CATALOG_CODING_TRANSCRIPT_BYTES,
-                            )?;
-                            let transcript = decode_coding_transcript_bounded(&bytes)?;
-                            locations.push((
-                                MEMBERS,
-                                transcript
-                                    .value
-                                    .plan
-                                    .value
-                                    .membership_epoch
-                                    .to_be_bytes()
-                                    .to_vec(),
-                            ));
-                            source.transcript = Some((object, bytes));
-                        }
-                        GuildEventKind::RetireCodingGroup { group_id, .. }
-                        | GuildEventKind::ForgetCodingGroup { group_id } => {
-                            seed(
-                                control,
-                                &scratch,
-                                &mut meter,
-                                &mut guards,
-                                genesis,
-                                GROUPS,
-                                group_id,
-                            )?;
-                            let (group, _) =
-                                get::<Group>(&scratch, &mut meter, GROUPS, group_id, GROUP_BYTES)?
-                                    .ok_or(DatabaseError::Conflict)?;
-                            validate_group(&group, group_id, before.event_sequence)?;
-                            locations.push((
-                                ARCHIVE,
-                                historical::incarnation_key(
-                                    *group_id,
-                                    group.retained.added_at_event,
-                                )
-                                .to_vec(),
-                            ));
-                        }
-                        _ => return Err(DatabaseError::Integrity.into()),
+            let apply = |before: &GuildAuthoritySnapshot,
+                         original: &mb_core::GuildEvent|
+             -> Result<(), CatalogStoreError> {
+                let mut locations = Vec::with_capacity(3);
+                match &original.kind {
+                    GuildEventKind::RotateWriterKey { owner, epoch, .. } => {
+                        locations.push((LATEST_WRITER, owner.0.to_vec()));
+                        locations.push((WRITERS, epoch_key(*owner, *epoch).to_vec()));
                     }
-                    for (name, key) in locations {
+                    GuildEventKind::RevokeWriterKey { owner, epoch } => {
+                        locations.push((WRITERS, epoch_key(*owner, *epoch).to_vec()))
+                    }
+                    GuildEventKind::RotateRecoveryKey { envelope } => {
+                        locations.push((LATEST_RECOVERY, envelope.subject.0.to_vec()));
+                        locations.push((
+                            RECOVERY,
+                            epoch_key(envelope.subject, envelope.epoch).to_vec(),
+                        ));
+                    }
+                    GuildEventKind::RevokeRecoveryKey { subject, epoch } => {
+                        locations.push((RECOVERY, epoch_key(*subject, *epoch).to_vec()))
+                    }
+                    GuildEventKind::AddCodingGroup { group }
+                    | GuildEventKind::AddCodingGroupBound { group, .. } => {
+                        locations.push((GROUPS, group.id.to_vec()));
+                        locations.push((
+                            ARCHIVE,
+                            historical::incarnation_key(group.id, original.sequence).to_vec(),
+                        ));
+                        let object = CatalogGuildHistoryObject::Transcript(original.hash()?);
+                        let bytes = fetch(
+                            &mut source,
+                            &mut meter,
+                            object,
+                            None,
+                            CATALOG_CODING_TRANSCRIPT_BYTES,
+                        )?;
+                        let transcript = decode_coding_transcript_bounded(&bytes)?;
+                        locations.push((
+                            MEMBERS,
+                            transcript
+                                .value
+                                .plan
+                                .value
+                                .membership_epoch
+                                .to_be_bytes()
+                                .to_vec(),
+                        ));
+                        source.transcript = Some((object, bytes));
+                    }
+                    GuildEventKind::RetireCodingGroup { group_id, .. }
+                    | GuildEventKind::ForgetCodingGroup { group_id } => {
                         seed(
                             control,
                             &scratch,
                             &mut meter,
                             &mut guards,
                             genesis,
-                            name,
-                            &key,
+                            GROUPS,
+                            group_id,
                         )?;
+                        let (group, _) =
+                            get::<Group>(&scratch, &mut meter, GROUPS, group_id, GROUP_BYTES)?
+                                .ok_or(DatabaseError::Conflict)?;
+                        validate_group(&group, group_id, before.event_sequence)?;
+                        locations.push((
+                            ARCHIVE,
+                            historical::incarnation_key(*group_id, group.retained.added_at_event)
+                                .to_vec(),
+                        ));
                     }
-                    apply_effect(
+                    _ => return Err(DatabaseError::Integrity.into()),
+                }
+                for (name, key) in locations {
+                    seed(
+                        control,
                         &scratch,
                         &mut meter,
-                        &mut source,
-                        before,
-                        event,
-                        &mut retained,
-                        &mut retired,
-                    )
-                },
-            )?;
+                        &mut guards,
+                        genesis,
+                        name,
+                        &key,
+                    )?;
+                }
+                apply_effect(
+                    &scratch,
+                    &mut meter,
+                    &mut source,
+                    before,
+                    event,
+                    &mut retained,
+                    &mut retired,
+                )
+            };
+            if certified {
+                authority.advance_indexed(event, apply)?;
+            } else {
+                authority.advance_proposal_indexed(&event.event, apply)?;
+            }
             if authority.membership_epoch != self.manifest.authority.membership_epoch {
                 let key = authority.membership_epoch.to_be_bytes();
                 seed(
@@ -597,6 +644,11 @@ impl CatalogGuildHistoryMutation {
         if control.connection.is_autocommit() {
             return Err(DatabaseError::Conflict.into());
         }
+        self.check_expected(control)?;
+        self.apply_checked(control)
+    }
+
+    fn check_expected(&self, control: &ControlStore) -> Result<(), CatalogStoreError> {
         if control.get_record_bounded(TIP, KEY, TIP_BYTES)? != self.expected {
             return Err(DatabaseError::Conflict.into());
         }
@@ -620,6 +672,10 @@ impl CatalogGuildHistoryMutation {
                 return Err(DatabaseError::Conflict.into());
             }
         }
+        Ok(())
+    }
+
+    fn apply_checked(&self, control: &ControlStore) -> Result<(), CatalogStoreError> {
         for patch in &self.patches {
             if patch.expected == patch.next {
                 continue;

@@ -3556,6 +3556,35 @@ and native-platform gates remain open.
     retention/seed recovery remain open. Producers stay disabled; 121 other
     ignored cases and fresh installed qualification remain open. Dense 1 TiB
     and native Windows/macOS qualification remain user-deferred.
+  - [x] Use bounded original-history authority for normal event proposal
+    signing, partial-signature collection and installation. Validate full indexed
+    effects and original coding evidence in a disposable proposal overlay; its
+    opaque point-row guard cannot publish an unsigned event. Fence signing and
+    partial signatures with the original current scope through serialized
+    writes. Publish original events/transcripts, membership/history projections,
+    cleanup obligations, partial deletion and audit invalidation atomically.
+    Indexed installs no longer materialize or rewrite the full dynamic catalog.
+    The explicit legacy-value API reconstructs it from all original events under
+    genesis/tip/history/EOF fences; independent readers use one coherent snapshot.
+    Absent/incomplete indexes retain legacy validation and bounded catch-up;
+    malformed indexes fail closed. Three Node cases cover unusable flat cache,
+    key rotation/revocation, membership, original witness binding, refused
+    unsigned installs, coding Retire/Forget, exact replay/reopen and authority/
+    selected-row write rollback. Full frozen qualification passes
+    1,379 distinct tests in 1,383 executions,
+    including 194 Core, 400 Store, 117 Git, 544 Node and both provisioned Btrfs
+    cases. Formatting, strict locked workspace/all-target Clippy, compilation and
+    all four debug builds pass. Evidence: `/tmp/mb-m6-indexed-event-admission-final-8hn_aomd`.
+    Exact retirement of superseded debug executables and the preliminary Node
+    binary reclaims 10.43 GiB; `target` uses 47.41 GiB.
+    All current executables, 29 older archived paths, 14 auxiliary WIP files and
+    10 installed roots are preserved. Full-value/event-tail and remaining bulk
+    consumers, complete metadata/SQL/WAL/index/scratch/traversal/physical policy,
+    enclosing distributed availability/current activation, fixed legacy coding,
+    normal paged production/retention/seed recovery and R5/R7 remain open.
+    Producers stay disabled; 121 other ignored cases and fresh installed
+    qualification remain open. Dense 1 TiB and native Windows/macOS qualification
+    remain user-deferred.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

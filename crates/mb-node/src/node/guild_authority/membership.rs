@@ -509,7 +509,17 @@ mod tests {
         node.control
             .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
             .unwrap();
-        assert!(node.dynamic_guild_state().is_err());
+        assert!(
+            decode_canonical::<DynamicGuildState>(
+                &node
+                    .control
+                    .get_record("guild-dynamic-state", KEY)
+                    .unwrap()
+                    .unwrap()
+            )
+            .map(|state| state.validate().is_err())
+            .unwrap_or(true)
+        );
         node.validate_coding_attempt_plan(&fresh).unwrap();
         for expected in [&initial, &relabeled, &majority, &added, &removed] {
             assert_eq!(
@@ -566,7 +576,7 @@ mod tests {
                     "CREATE TEMP TRIGGER membership_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='{MARKER}' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-event'; END"
                 ),
                 7 => format!(
-                    "CREATE TEMP TRIGGER membership_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='{MARKER}' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-dynamic-state'; END"
+                    "CREATE TEMP TRIGGER membership_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='{MARKER}' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-original-tip-v1'; END"
                 ),
                 _ => format!(
                     "CREATE TEMP TRIGGER membership_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='{MARKER}' BEGIN INSERT INTO protocol_records(kind,record_id,bytes) VALUES ('guild-event-partial-signatures', X'{}', X'00'); END",
@@ -771,7 +781,7 @@ mod tests {
             .put_record("guild-dynamic-state", KEY, b"unreadable legacy state")
             .unwrap();
         assert_eq!(node.membership_authority_for_epoch(2).unwrap(), current);
-        assert!(node.membership_authority_for_epoch(1).is_err());
+        assert_eq!(node.membership_authority_for_epoch(1).unwrap(), initial);
         node.control
             .delete_record(EPOCHS, &2_u64.to_be_bytes())
             .unwrap();

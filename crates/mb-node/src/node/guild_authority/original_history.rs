@@ -73,6 +73,106 @@ pub(super) fn owns_kind(kind: &str) -> bool {
     History::owns_record_kind(kind)
 }
 
+pub(crate) fn complete_index(control: &ControlStore) -> Result<Option<History>> {
+    let Some(current) = read_record(control)? else {
+        return Ok(None);
+    };
+    let Some(history) = History::read(control)? else {
+        return Ok(None);
+    };
+    if history.genesis_hash() != current.genesis_hash
+        || history.authority().guild_id != current.authority.guild_id
+        || history.authority().event_sequence > current.authority.event_sequence
+    {
+        anyhow::bail!("indexed event authority conflicts with original history");
+    }
+    if history.authority().event_sequence < current.authority.event_sequence {
+        check_original_tip(
+            control,
+            &make(current.genesis_hash, history.authority().clone())?,
+        )?;
+        return Ok(None);
+    }
+    history.view(control, current.genesis_hash, &current.authority)?;
+    Ok(Some(history))
+}
+
+pub(crate) fn validate_proposal(
+    control: &ControlStore,
+    history: &History,
+    event: &GuildEvent,
+    records: &[ControlRecord],
+) -> Result<mb_store::CatalogGuildEventProposalGuard> {
+    let guard = history.validate_event_proposal(
+        control,
+        event,
+        budget(),
+        &mut Source { control, records },
+    )?;
+    history.view(control, history.genesis_hash(), history.authority())?;
+    let current = read_record(control)?.context("indexed event authority disappeared")?;
+    if current.authority != *history.authority() || current.genesis_hash != history.genesis_hash() {
+        anyhow::bail!("indexed event authority changed during proposal validation");
+    }
+    Ok(guard)
+}
+
+pub(super) fn prepare_event(
+    control: &ControlStore,
+    history: &History,
+    event: &QuorumGuildEvent,
+    records: &[ControlRecord],
+) -> Result<Mutation> {
+    Ok(history.prepare_advance(control, event, budget(), &mut Source { control, records })?)
+}
+
+/// Explicit compatibility API: consumers asking for the old complete value
+/// still allocate it. Normal event admission/publication never calls this.
+pub(crate) fn legacy_state(control: &ControlStore) -> Result<Option<DynamicGuildState>> {
+    with_read_snapshot(control, || legacy_state_in_snapshot(control))
+}
+
+fn legacy_state_in_snapshot(control: &ControlStore) -> Result<Option<DynamicGuildState>> {
+    let Some(history) = complete_index(control)? else {
+        let state = read_legacy(control)?.map(|(state, _)| state);
+        if let Some(state) = &state {
+            let authority = GuildAuthoritySnapshot::from_state(state)?;
+            if let Some(current) = read_record(control)?
+                && current.authority != authority
+            {
+                anyhow::bail!("legacy cache differs from current original authority");
+            }
+            if let Some(history) = History::read(control)?
+                && (history.authority().event_sequence > authority.event_sequence
+                    || history.authority().event_sequence == authority.event_sequence
+                        && history.authority() != &authority)
+            {
+                anyhow::bail!("legacy cache is behind indexed original authority");
+            }
+        }
+        return Ok(state);
+    };
+    let reader = AuthorityReader::open_complete(control)?;
+    let original = reader
+        .original
+        .as_deref()
+        .context("original genesis disappeared")?;
+    let installed = decode_installed_guild(original)?;
+    let mut state = initial_dynamic_guild_state(&installed)?;
+    for sequence in 1..=history.authority().event_sequence {
+        let key = sequence.to_be_bytes();
+        let bytes = control
+            .get_record_bounded("guild-event", &key, GUILD_EVENT_BYTES)?
+            .context("legacy state reconstruction lacks an original event")?;
+        state.apply_event(&QuorumGuildEvent::decode_bounded(&bytes)?)?;
+    }
+    if GuildAuthoritySnapshot::from_state(&state)? != *history.authority() {
+        anyhow::bail!("legacy state reconstruction has another original tip");
+    }
+    reader.check()?;
+    Ok(Some(state))
+}
+
 pub(super) fn prepare(
     control: &ControlStore,
     installed: &InstalledGuild,
@@ -564,6 +664,9 @@ pub(super) fn retained_group_if_available(
 mod paged_checkpoint_tests;
 
 #[cfg(test)]
+mod normal_events;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::node::guild_authority::tests::{event, fixture, relabel};
@@ -731,6 +834,10 @@ mod tests {
             );
             node.control.put_record(kind, KEY, &before).unwrap();
         }
+        let legacy = canonical_bytes(&node.dynamic_guild_state().unwrap().unwrap()).unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &legacy)
+            .unwrap();
         node.control
             .database_shell_statement(
                 "DELETE FROM protocol_records WHERE kind LIKE 'guild-original-%'",
@@ -811,7 +918,7 @@ mod tests {
         assert!(node.needs_recovery_key_registration().is_err());
     }
 
-    fn group(
+    pub(super) fn group(
         node: &Node,
         keys: &[KeyMaterial],
     ) -> (
@@ -928,7 +1035,17 @@ mod tests {
             node.variable_shard_for_guild(&descriptor.guild_id, &descriptor.id, 0)
                 .is_err()
         );
-        assert!(node.dynamic_guild_state().is_err());
+        assert!(
+            decode_canonical::<DynamicGuildState>(
+                &node
+                    .control
+                    .get_record("guild-dynamic-state", KEY)
+                    .unwrap()
+                    .unwrap()
+            )
+            .map(|state| state.validate().is_err())
+            .unwrap_or(true)
+        );
     }
 
     #[test]
@@ -970,7 +1087,17 @@ mod tests {
             node.control
                 .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
                 .unwrap();
-            assert!(node.dynamic_guild_state().is_err());
+            assert!(
+                decode_canonical::<DynamicGuildState>(
+                    &node
+                        .control
+                        .get_record("guild-dynamic-state", KEY)
+                        .unwrap()
+                        .unwrap()
+                )
+                .map(|state| state.validate().is_err())
+                .unwrap_or(true)
+            );
             assert_eq!(
                 node.recovery_coding_transcript_for_group(
                     checkpoint,
@@ -1299,11 +1426,7 @@ mod tests {
         let descriptor = transcript.value.manifest.value.group.clone();
         node.install_coding_group_event(add, transcript.clone())
             .unwrap();
-        let flat = node
-            .control
-            .get_record("guild-dynamic-state", KEY)
-            .unwrap()
-            .unwrap();
+        let flat = canonical_bytes(&node.dynamic_guild_state().unwrap().unwrap()).unwrap();
         let event_witness = node
             .control
             .get_record("coding-event-transcript", &event_hash)
@@ -1420,6 +1543,10 @@ mod tests {
         let relabel = relabel(&node, &keys);
         node.install_guild_event(relabel).unwrap();
         // Model a store predating this index; preserve all original records.
+        let legacy = canonical_bytes(&node.dynamic_guild_state().unwrap().unwrap()).unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &legacy)
+            .unwrap();
         node.control
             .database_shell_statement(
                 "DELETE FROM protocol_records WHERE kind LIKE 'guild-original-%'",
@@ -1552,7 +1679,7 @@ mod tests {
                     "CREATE TEMP TRIGGER original_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='guild-original-tip-v1' BEGIN SELECT RAISE(IGNORE); END"
                 }
                 2 => {
-                    "CREATE TEMP TRIGGER original_fault AFTER INSERT ON protocol_records WHEN NEW.kind='guild-original-event' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-dynamic-state'; END"
+                    "CREATE TEMP TRIGGER original_fault AFTER INSERT ON protocol_records WHEN NEW.kind='guild-original-event' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-original-event'; END"
                 }
                 3 => {
                     "CREATE TEMP TRIGGER original_fault AFTER UPDATE ON protocol_records WHEN NEW.kind='guild-authority-tip-v1' BEGIN UPDATE protocol_records SET bytes=X'00' WHERE kind='guild-original-tip-v1'; END"
@@ -1653,7 +1780,17 @@ mod tests {
         node.control
             .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
             .unwrap();
-        assert!(node.dynamic_guild_state().is_err());
+        assert!(
+            decode_canonical::<DynamicGuildState>(
+                &node
+                    .control
+                    .get_record("guild-dynamic-state", KEY)
+                    .unwrap()
+                    .unwrap()
+            )
+            .map(|state| state.validate().is_err())
+            .unwrap_or(true)
+        );
         assert!(
             node.uncovered_packed_sectors(std::slice::from_ref(&descriptor))
                 .unwrap()

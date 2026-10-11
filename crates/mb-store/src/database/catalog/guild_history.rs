@@ -18,7 +18,8 @@ mod historical;
 pub use historical::CatalogGuildHistorySnapshot;
 mod durable;
 pub use durable::{
-    CatalogDurableGuildHistory, CatalogDurableGuildHistoryView, CatalogGuildHistoryMutation,
+    CatalogDurableGuildHistory, CatalogDurableGuildHistoryView, CatalogGuildEventProposalGuard,
+    CatalogGuildHistoryMutation,
 };
 
 const MEMBERS: &str = "guild-history-membership";

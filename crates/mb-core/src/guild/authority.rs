@@ -152,6 +152,48 @@ impl GuildAuthoritySnapshot {
         F: FnOnce(&Self, &GuildEvent) -> Result<(), E>,
     {
         self.verify_event(certified)?;
+        self.advance_verified_indexed(certified, validate_non_membership)
+    }
+
+    /// Check an unsigned next proposal using the same complete indexed effects.
+    /// This updates only a disposable local projection and confers no quorum
+    /// authority. The caller must discard every effect of this validation.
+    pub fn advance_proposal_indexed<E, F>(
+        &mut self,
+        event: &GuildEvent,
+        validate_non_membership: F,
+    ) -> Result<(), E>
+    where
+        E: From<GuildStateError>,
+        F: FnOnce(&Self, &GuildEvent) -> Result<(), E>,
+    {
+        crate::canonical_size_bounded(event, GUILD_EVENT_BYTES).map_err(GuildStateError::from)?;
+        self.validate()?;
+        if !valid_event_format(event)
+            || event.guild_id != self.guild_id
+            || Some(event.sequence) != self.event_sequence.checked_add(1)
+            || event.parent != self.event_head
+        {
+            return Err(GuildStateError::InvalidEvent.into());
+        }
+        self.advance_verified_indexed(
+            &QuorumGuildEvent {
+                event: event.clone(),
+                signatures: Vec::new(),
+            },
+            validate_non_membership,
+        )
+    }
+
+    fn advance_verified_indexed<E, F>(
+        &mut self,
+        certified: &QuorumGuildEvent,
+        validate_non_membership: F,
+    ) -> Result<(), E>
+    where
+        E: From<GuildStateError>,
+        F: FnOnce(&Self, &GuildEvent) -> Result<(), E>,
+    {
         let mut next = self.state()?;
         match &certified.event.kind {
             GuildEventKind::AddMember { .. }
