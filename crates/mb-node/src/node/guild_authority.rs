@@ -28,6 +28,14 @@ pub(super) fn retained_group(
     original_history::retained_group(control, guild, group)
 }
 
+pub(super) fn retained_group_if_available(
+    control: &ControlStore,
+    guild: [u8; 32],
+    group: [u8; 32],
+) -> Result<Option<mb_core::RetainedCodingGroup>> {
+    original_history::retained_group_if_available(control, guild, group)
+}
+
 /// Freeze one independently checked current scope around a batch of bounded
 /// key/group lookups. A successful result always includes the final fences.
 pub(super) fn with_history<T>(

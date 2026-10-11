@@ -403,7 +403,10 @@ impl<'a> AuthorityReader<'a> {
         }
     }
 
-    fn retained_group(&self, id: [u8; 32]) -> Result<Option<mb_core::RetainedCodingGroup>> {
+    pub(crate) fn retained_group(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<mb_core::RetainedCodingGroup>> {
         match &self.history {
             Some(history) => Ok(history
                 .view(self.control, history.genesis_hash(), &self.current)?
@@ -417,6 +420,30 @@ impl<'a> AuthorityReader<'a> {
                 .find(|group| group.group.id == id)
                 .cloned()),
         }
+    }
+
+    pub(crate) fn validate_retained_coding_transcript(
+        &self,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        self.check()?;
+        match &self.history {
+            Some(history) => history
+                .view(self.control, history.genesis_hash(), &self.current)?
+                .validate_retained_coding_transcript(transcript)?,
+            None => {
+                let descriptor = &transcript.value.manifest.value.group;
+                if self.current.guild_id != descriptor.guild_id
+                    || self
+                        .retained_group(descriptor.id)?
+                        .is_none_or(|group| group.group != *descriptor)
+                    || replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
+                {
+                    anyhow::bail!("recovery transcript is absent from certified guild state");
+                }
+            }
+        }
+        self.check()
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -479,15 +506,21 @@ pub(super) fn retained_group(
     guild: [u8; 32],
     id: [u8; 32],
 ) -> Result<mb_core::RetainedCodingGroup> {
-    with_history(control, |authority| {
+    retained_group_if_available(control, guild, id)?.context("variable coding group is unavailable")
+}
+
+pub(super) fn retained_group_if_available(
+    control: &ControlStore,
+    guild: [u8; 32],
+    id: [u8; 32],
+) -> Result<Option<mb_core::RetainedCodingGroup>> {
+    Ok(with_history(control, |authority| {
         if authority.snapshot().guild_id != guild {
             anyhow::bail!("variable coding group belongs to another guild");
         }
-        authority
-            .retained_group(id)?
-            .context("variable coding group is unavailable")
+        authority.retained_group(id)
     })?
-    .context("node has no dynamic guild state")
+    .flatten())
 }
 
 #[cfg(test)]
@@ -859,6 +892,485 @@ mod tests {
                 .is_err()
         );
         assert!(node.dynamic_guild_state().is_err());
+    }
+
+    #[test]
+    fn indexed_recovery_stages_and_activates_live_and_retired_shards_without_flat_state() {
+        for retired in [false, true] {
+            let (temp, seed, mut node, keys) = fixture();
+            let (add, transcript, shards) = group(&node, &keys);
+            let descriptor = transcript.value.manifest.value.group.clone();
+            node.install_coding_group_event(add, transcript.clone())
+                .unwrap();
+            if retired {
+                let sequence = node.dynamic_guild_state().unwrap().unwrap().event_sequence + 1;
+                let retire = event(
+                    &node,
+                    &keys,
+                    mb_core::GuildEventKind::RetireCodingGroup {
+                        group_id: descriptor.id,
+                        retain_through_event: sequence,
+                    },
+                );
+                node.install_guild_event(retire).unwrap();
+            }
+            let checkpoint = transcript.value.plan.value.checkpoint_hash;
+            node.control
+                .put_record(
+                    "recovery-attempt",
+                    b"active",
+                    &canonical_bytes(&RecoveryAttempt {
+                        format_version: 1,
+                        guild_id: descriptor.guild_id,
+                        checkpoint_hash: checkpoint,
+                        generation: 1,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            drop(node);
+            let mut node = Node::open(temp.path(), seed).unwrap();
+            node.control
+                .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+                .unwrap();
+            assert!(node.dynamic_guild_state().is_err());
+            assert_eq!(
+                node.recovery_coding_transcript_for_group(
+                    checkpoint,
+                    descriptor.guild_id,
+                    descriptor.id
+                )
+                .unwrap(),
+                transcript
+            );
+            assert!(
+                node.recovery_coding_transcript_for_group(
+                    [99; 32],
+                    descriptor.guild_id,
+                    descriptor.id
+                )
+                .is_err()
+            );
+            assert!(
+                node.recovery_coding_transcript_for_group(checkpoint, [99; 32], descriptor.id)
+                    .is_err()
+            );
+            node.stage_recovered_variable_shard(&checkpoint, &transcript, 1, &shards[1])
+                .unwrap();
+            node.activate_recovered_coding_attempt(checkpoint, &transcript)
+                .unwrap();
+            assert_eq!(
+                node.variable_shard_for_guild(&descriptor.guild_id, &descriptor.id, 1)
+                    .unwrap(),
+                shards[1]
+            );
+            let reader = node.reader_config().open().unwrap();
+            assert_eq!(
+                reader
+                    .coding_transcript_for_group(descriptor.guild_id, descriptor.id)
+                    .unwrap(),
+                transcript
+            );
+            assert_eq!(
+                reader
+                    .variable_shard_for_guild(&descriptor.guild_id, &descriptor.id, 1)
+                    .unwrap(),
+                shards[1]
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_recovery_rejects_substituted_aliases_and_damaged_original_rows_before_staging() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let (add, transcript, shards) = group(&node, &keys);
+        node.install_coding_group_event(add, transcript.clone())
+            .unwrap();
+        let descriptor = &transcript.value.manifest.value.group;
+        let checkpoint = transcript.value.plan.value.checkpoint_hash;
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        let mut changed = transcript.value.clone();
+        changed.verified_at_unix_seconds += 1;
+        let signer = keys
+            .iter()
+            .find(|key| key.node_id() == transcript.signer)
+            .unwrap();
+        let substituted =
+            SignedRecord::sign(mb_core::CODING_TRANSCRIPT_DOMAIN, changed, signer).unwrap();
+        assert_eq!(
+            replay_coding_transcript(&substituted).unwrap(),
+            CodingReplayFinding::Verified
+        );
+        assert_eq!(substituted.value.manifest.value.group, *descriptor);
+        let original = canonical_bytes(&transcript).unwrap();
+        for (kind, key) in [
+            (
+                "coding-transcript",
+                transcript.value.plan.value.attempt_id.as_slice(),
+            ),
+            ("coding-group-transcript", descriptor.id.as_slice()),
+        ] {
+            node.control
+                .put_record(kind, key, &canonical_bytes(&substituted).unwrap())
+                .unwrap();
+        }
+        assert!(
+            node.recovery_coding_transcript_for_group(
+                checkpoint,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .is_err()
+        );
+        assert!(
+            node.stage_recovered_variable_shard(&checkpoint, &substituted, 1, &shards[1])
+                .is_err()
+        );
+        assert!(node.activate_coding_attempt(&substituted).is_err());
+        assert!(
+            !node
+                .volumes
+                .has_staged_attempt_object(
+                    &node.control,
+                    &transcript.value.plan.value.attempt_id,
+                    &descriptor.id,
+                    1
+                )
+                .unwrap()
+        );
+        for (kind, key) in [
+            (
+                "coding-transcript",
+                transcript.value.plan.value.attempt_id.as_slice(),
+            ),
+            ("coding-group-transcript", descriptor.id.as_slice()),
+        ] {
+            node.control.put_record(kind, key, &original).unwrap();
+        }
+        for (kind, key, cap) in [
+            (
+                "guild-original-group",
+                descriptor.id.as_slice(),
+                mb_core::GUILD_EVENT_BYTES + 64,
+            ),
+            (
+                "guild-original-tip-v1",
+                KEY,
+                GUILD_AUTHORITY_SNAPSHOT_BYTES + 256,
+            ),
+            (
+                "coding-transcript",
+                transcript.value.plan.value.attempt_id.as_slice(),
+                mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+            ),
+            (
+                "coding-group-transcript",
+                descriptor.id.as_slice(),
+                mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+            ),
+        ] {
+            let before = node.control.get_record(kind, key).unwrap().unwrap();
+            for bad in [None, Some(vec![0]), Some(vec![0; cap + 1])] {
+                match bad {
+                    Some(bytes) => node.control.put_record(kind, key, &bytes).unwrap(),
+                    None => {
+                        node.control.delete_record(kind, key).unwrap();
+                    }
+                }
+                assert!(
+                    node.recovery_coding_transcript_for_group(
+                        checkpoint,
+                        descriptor.guild_id,
+                        descriptor.id
+                    )
+                    .is_err(),
+                    "damaged {kind}"
+                );
+                assert!(
+                    node.stage_recovered_variable_shard(&checkpoint, &transcript, 1, &shards[1])
+                        .is_err(),
+                    "damaged {kind}"
+                );
+                assert!(
+                    !node
+                        .volumes
+                        .has_staged_attempt_object(
+                            &node.control,
+                            &transcript.value.plan.value.attempt_id,
+                            &descriptor.id,
+                            1
+                        )
+                        .unwrap()
+                );
+            }
+            node.control.put_record(kind, key, &before).unwrap();
+        }
+        for kind in ["guild-installed", KIND, "guild-original-tip-v1"] {
+            let before = node.control.get_record(kind, KEY).unwrap().unwrap();
+            assert!(
+                with_history(&node.control, |authority| {
+                    authority.validate_retained_coding_transcript(&transcript)?;
+                    node.control.put_record(kind, KEY, &[0])?;
+                    Ok(())
+                })
+                .is_err(),
+                "changed transcript batch fence {kind}"
+            );
+            node.control.put_record(kind, KEY, &before).unwrap();
+        }
+        assert_eq!(
+            node.recovery_coding_transcript_for_group(
+                checkpoint,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn indexed_recovery_follows_retire_forget_and_new_add_without_changing_group_identity() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let (add, transcript, shards) = group(&node, &keys);
+        let original_event_hash = add.event.hash().unwrap();
+        let original_sequence = add.event.sequence;
+        node.install_coding_group_event(add, transcript.clone())
+            .unwrap();
+        let descriptor = transcript.value.manifest.value.group.clone();
+        let checkpoint = transcript.value.plan.value.checkpoint_hash;
+        let retire = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RetireCodingGroup {
+                group_id: descriptor.id,
+                retain_through_event: original_sequence + 1,
+            },
+        );
+        node.install_guild_event(retire).unwrap();
+        assert_eq!(
+            node.recovery_coding_transcript_for_group(
+                checkpoint,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .unwrap(),
+            transcript
+        );
+        let forget = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::ForgetCodingGroup {
+                group_id: descriptor.id,
+            },
+        );
+        node.install_guild_event(forget).unwrap();
+        assert!(
+            node.recovery_coding_transcript_for_group(
+                checkpoint,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .is_err()
+        );
+        // Historical evidence remains accessible; it does not permit staging.
+        assert_eq!(
+            node.coding_transcript_for_group(descriptor.guild_id, descriptor.id)
+                .unwrap(),
+            transcript
+        );
+        assert_eq!(
+            node.coding_transcript_for_event(
+                descriptor.guild_id,
+                descriptor.id,
+                original_sequence,
+                original_event_hash
+            )
+            .unwrap(),
+            transcript
+        );
+
+        let mut plan = transcript.value.plan.value.clone();
+        plan.attempt_id[0] += 1;
+        let delegator = keys
+            .iter()
+            .find(|key| key.node_id() == plan.delegator)
+            .unwrap();
+        let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, delegator).unwrap();
+        let successor = test_coding_transcript(plan, &shards, &keys);
+        assert_eq!(successor.value.manifest.value.group, descriptor);
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let add = GuildEvent {
+            format_version: 2,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::AddCodingGroupBound {
+                group: descriptor.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(&successor).unwrap()).as_bytes(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|key| sign_guild_event(&add, key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_coding_group_event(
+            QuorumGuildEvent {
+                event: add,
+                signatures,
+            },
+            successor.clone(),
+        )
+        .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert_eq!(
+            node.recovery_coding_transcript_for_group(
+                checkpoint,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .unwrap(),
+            successor
+        );
+        assert!(
+            node.stage_recovered_variable_shard(&checkpoint, &transcript, 1, &shards[1])
+                .is_err()
+        );
+        assert_eq!(
+            node.coding_transcript_for_event(
+                descriptor.guild_id,
+                descriptor.id,
+                original_sequence,
+                original_event_hash
+            )
+            .unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn coding_event_fallback_uses_original_index_and_preserves_legacy_recovery_access() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let (add, transcript, _) = group(&node, &keys);
+        let event_sequence = add.event.sequence;
+        let event_hash = add.event.hash().unwrap();
+        let descriptor = transcript.value.manifest.value.group.clone();
+        node.install_coding_group_event(add, transcript.clone())
+            .unwrap();
+        let flat = node
+            .control
+            .get_record("guild-dynamic-state", KEY)
+            .unwrap()
+            .unwrap();
+        let event_witness = node
+            .control
+            .get_record("coding-event-transcript", &event_hash)
+            .unwrap()
+            .unwrap();
+        node.control
+            .delete_record("coding-event-transcript", &event_hash)
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert_eq!(
+            node.coding_transcript_for_event(
+                descriptor.guild_id,
+                descriptor.id,
+                event_sequence,
+                event_hash
+            )
+            .unwrap(),
+            transcript
+        );
+        let reader = node.reader_config().open().unwrap();
+        assert_eq!(
+            reader
+                .coding_transcript_for_event(
+                    descriptor.guild_id,
+                    descriptor.id,
+                    event_sequence,
+                    event_hash
+                )
+                .unwrap(),
+            transcript
+        );
+        node.control
+            .put_record(
+                "coding-event-transcript",
+                &event_hash,
+                &vec![0; mb_core::CATALOG_CODING_TRANSCRIPT_BYTES + 1],
+            )
+            .unwrap();
+        assert!(
+            node.coding_transcript_for_event(
+                descriptor.guild_id,
+                descriptor.id,
+                event_sequence,
+                event_hash
+            )
+            .is_err()
+        );
+        assert!(
+            reader
+                .coding_transcript_for_event(
+                    descriptor.guild_id,
+                    descriptor.id,
+                    event_sequence,
+                    event_hash
+                )
+                .is_err()
+        );
+        drop(reader);
+        node.control
+            .put_record("coding-event-transcript", &event_hash, &event_witness)
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &flat)
+            .unwrap();
+        node.control
+            .database_shell_statement(
+                "DELETE FROM protocol_records WHERE kind LIKE 'guild-original-%'",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            node.recovery_coding_transcript_for_group(
+                transcript.value.plan.value.checkpoint_hash,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .unwrap(),
+            transcript
+        );
+        assert!(node.advance_guild_history_index().unwrap());
+        assert_eq!(
+            node.recovery_coding_transcript_for_group(
+                transcript.value.plan.value.checkpoint_hash,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .unwrap(),
+            transcript
+        );
+        assert!(node.advance_guild_history_index().unwrap());
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert_eq!(
+            node.recovery_coding_transcript_for_group(
+                transcript.value.plan.value.checkpoint_hash,
+                descriptor.guild_id,
+                descriptor.id
+            )
+            .unwrap(),
+            transcript
+        );
     }
 
     #[test]

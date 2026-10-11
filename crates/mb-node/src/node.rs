@@ -998,19 +998,7 @@ impl NodeReader {
         guild_id: [u8; 32],
         group_id: [u8; 32],
     ) -> Result<SignedRecord<CodingVerificationTranscript>> {
-        let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(
-            &self
-                .control
-                .get_record("coding-group-transcript", &group_id)?
-                .context("coding-group verifier transcript is unavailable")?,
-        )?;
-        if transcript.value.manifest.value.group.guild_id != guild_id
-            || transcript.value.manifest.value.group.id != group_id
-            || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified
-        {
-            anyhow::bail!("stored coding-group verifier transcript is invalid");
-        }
-        Ok(transcript)
+        coding_transcript_for_group_from_store(&self.control, guild_id, group_id)
     }
 
     pub(crate) fn coding_transcript_for_event(
@@ -4980,10 +4968,15 @@ impl Node {
         &self,
         transcript: &SignedRecord<CodingVerificationTranscript>,
     ) -> Result<()> {
-        let bytes = canonical_bytes(transcript)?;
+        let bytes =
+            mb_core::canonical_bytes_bounded(transcript, mb_core::CATALOG_CODING_TRANSCRIPT_BYTES)?;
         if self
             .control
-            .get_record("coding-transcript", &transcript.value.plan.value.attempt_id)?
+            .get_record_bounded(
+                "coding-transcript",
+                &transcript.value.plan.value.attempt_id,
+                mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+            )?
             .is_some_and(|existing| existing != bytes)
         {
             anyhow::bail!("coding attempt already has conflicting verifier evidence");
@@ -4991,14 +4984,18 @@ impl Node {
         let group_id = transcript.value.manifest.value.group.id;
         if self
             .control
-            .get_record("coding-group-transcript", &group_id)?
+            .get_record_bounded(
+                "coding-group-transcript",
+                &group_id,
+                mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+            )?
             .is_some_and(|existing| existing != bytes)
-            && self.dynamic_guild_state()?.is_some_and(|state| {
-                state
-                    .coding_groups
-                    .iter()
-                    .any(|retained| retained.group.id == group_id)
-            })
+            && guild_authority::retained_group_if_available(
+                &self.control,
+                transcript.value.manifest.value.group.guild_id,
+                group_id,
+            )?
+            .is_some()
         {
             anyhow::bail!("retained coding group already has conflicting verifier evidence");
         }
@@ -5039,19 +5036,7 @@ impl Node {
         guild_id: [u8; 32],
         group_id: [u8; 32],
     ) -> Result<SignedRecord<CodingVerificationTranscript>> {
-        let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(
-            &self
-                .control
-                .get_record("coding-group-transcript", &group_id)?
-                .context("coding-group verifier transcript is unavailable")?,
-        )?;
-        if transcript.value.manifest.value.group.guild_id != guild_id
-            || transcript.value.manifest.value.group.id != group_id
-            || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified
-        {
-            anyhow::bail!("stored coding-group verifier transcript is invalid");
-        }
-        Ok(transcript)
+        coding_transcript_for_group_from_store(&self.control, guild_id, group_id)
     }
 
     pub(crate) fn coding_transcript_for_event(
@@ -5092,11 +5077,13 @@ impl Node {
                 .signatures
                 .iter()
                 .any(|signature| signature.signer == self.keys.node_id())
-            || !self.dynamic_guild_state()?.is_some_and(|state| {
-                state
+            || !guild_authority::with_history(&self.control, |authority| {
+                Ok(authority
+                    .snapshot()
                     .active_members()
-                    .any(|member| member.node_id == self.keys.node_id())
-            })
+                    .any(|member| member.node_id == self.keys.node_id()))
+            })?
+            .unwrap_or(false)
         {
             anyhow::bail!("local node is not an authorized historical Add witness");
         }
@@ -5141,17 +5128,7 @@ impl Node {
         guild_id: [u8; 32],
         group_id: [u8; 32],
     ) -> Result<SignedRecord<CodingVerificationTranscript>> {
-        let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(
-            &self
-                .control
-                .get_record("coding-group-transcript", &group_id)?
-                .context("coding-group verifier transcript is unavailable")?,
-        )?;
-        if transcript.value.manifest.value.group.guild_id != guild_id
-            || transcript.value.manifest.value.group.id != group_id
-        {
-            anyhow::bail!("stored coding-group verifier transcript has the wrong group");
-        }
+        let transcript = coding_transcript_for_group_from_store(&self.control, guild_id, group_id)?;
         self.validate_certified_recovery_transcript(checkpoint_hash, &transcript)?;
         Ok(transcript)
     }
@@ -5164,24 +5141,28 @@ impl Node {
         let plan = &transcript.value.plan.value;
         let group = &transcript.value.manifest.value.group;
         self.require_active_recovery_attempt(group.guild_id, checkpoint_hash)?;
-        if !self
-            .dynamic_guild_state()?
-            .context("node has no dynamic guild state")?
-            .coding_groups
-            .iter()
-            .any(|retained| retained.group == *group)
-        {
-            anyhow::bail!("recovery transcript is absent from certified guild state");
-        }
-        let bytes = canonical_bytes(transcript)?;
-        for (kind, record_id) in [
-            ("coding-transcript", plan.attempt_id.as_slice()),
-            ("coding-group-transcript", group.id.as_slice()),
-        ] {
-            if self.control.get_record(kind, record_id)?.as_deref() != Some(bytes.as_slice()) {
-                anyhow::bail!("recovery transcript differs from certified durable evidence");
+        guild_authority::with_history(&self.control, |authority| {
+            authority.validate_retained_coding_transcript(transcript)?;
+            let bytes = mb_core::canonical_bytes_bounded(
+                transcript,
+                mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+            )?;
+            for (kind, record_id) in [
+                ("coding-transcript", plan.attempt_id.as_slice()),
+                ("coding-group-transcript", group.id.as_slice()),
+            ] {
+                if self
+                    .control
+                    .get_record_bounded(kind, record_id, mb_core::CATALOG_CODING_TRANSCRIPT_BYTES)?
+                    .as_deref()
+                    != Some(bytes.as_slice())
+                {
+                    anyhow::bail!("recovery transcript differs from certified durable evidence");
+                }
             }
-        }
+            Ok(())
+        })?
+        .context("node has no original guild authority")?;
         Ok(())
     }
 
@@ -9302,12 +9283,20 @@ impl Node {
     ) -> Result<()> {
         let plan = &transcript.value.plan.value;
         let group = &transcript.value.manifest.value.group;
-        let group_committed = self.dynamic_guild_state()?.is_some_and(|state| {
-            state
-                .coding_groups
-                .iter()
-                .any(|retained| retained.group == *group)
-        });
+        let group_committed = guild_authority::with_history(&self.control, |authority| {
+            if authority.snapshot().guild_id != group.guild_id {
+                anyhow::bail!("variable coding group belongs to another guild");
+            }
+            if authority
+                .retained_group(group.id)?
+                .is_none_or(|retained| retained.group != *group)
+            {
+                return Ok(false);
+            }
+            authority.validate_retained_coding_transcript(transcript)?;
+            Ok(true)
+        })?
+        .unwrap_or(false);
         let local_id = self.keys.node_id();
         let assigned = group.roles.iter().any(|role| match role {
             ShardRoleV2::Information(information) => information.owner == local_id,
@@ -10366,16 +10355,21 @@ impl Node {
         let checkpoint = self
             .current_checkpoint_from_hash(checkpoint_hash)?
             .context("variable repair checkpoint is unavailable")?;
-        let group = guild_authority::retained_group(
-            &self.control,
-            checkpoint.checkpoint.guild_id,
-            group_id,
-        )?
-        .group;
-        if !variable_group_protects_checkpoint(&checkpoint.checkpoint, &group) {
-            anyhow::bail!("variable repair group protects no live checkpoint sector");
-        }
-        let transcript = self.coding_transcript_for_group(group.guild_id, group.id)?;
+        let (group, transcript) = guild_authority::with_history(&self.control, |authority| {
+            let group = authority
+                .retained_group(group_id)?
+                .context("variable coding group is unavailable")?
+                .group;
+            if group.guild_id != checkpoint.checkpoint.guild_id
+                || !variable_group_protects_checkpoint(&checkpoint.checkpoint, &group)
+            {
+                anyhow::bail!("variable repair group protects no live checkpoint sector");
+            }
+            let transcript = self.coding_transcript_for_group(group.guild_id, group.id)?;
+            authority.validate_retained_coding_transcript(&transcript)?;
+            Ok((group, transcript))
+        })?
+        .context("node has no original guild authority")?;
         Ok((checkpoint, group, transcript))
     }
 
@@ -14597,6 +14591,30 @@ fn legacy_coding_add_binding_from_store(
         .transpose()
 }
 
+// Activation evidence can be served before Add or after Forget. Custody,
+// repair and recovery additionally require the retained original-history row.
+fn coding_transcript_for_group_from_store(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    group_id: [u8; 32],
+) -> Result<SignedRecord<CodingVerificationTranscript>> {
+    let bytes = control
+        .get_record_bounded(
+            "coding-group-transcript",
+            &group_id,
+            mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+        )?
+        .context("coding-group verifier transcript is unavailable")?;
+    let transcript = mb_core::decode_coding_transcript_bounded(&bytes)?;
+    if transcript.value.manifest.value.group.guild_id != guild_id
+        || transcript.value.manifest.value.group.id != group_id
+        || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified
+    {
+        anyhow::bail!("stored coding-group verifier transcript is invalid");
+    }
+    Ok(transcript)
+}
+
 fn coding_transcript_for_event_from_store(
     control: &ControlStore,
     guild_id: [u8; 32],
@@ -14604,9 +14622,13 @@ fn coding_transcript_for_event_from_store(
     event_sequence: u64,
     event_hash: [u8; 32],
 ) -> Result<SignedRecord<CodingVerificationTranscript>> {
-    let certified: QuorumGuildEvent = decode_canonical(
+    let certified = QuorumGuildEvent::decode_bounded(
         &control
-            .get_record("guild-event", &event_sequence.to_be_bytes())?
+            .get_record_bounded(
+                "guild-event",
+                &event_sequence.to_be_bytes(),
+                mb_core::GUILD_EVENT_BYTES,
+            )?
             .context("coding Add event is unavailable")?,
     )?;
     if certified.event.guild_id != guild_id
@@ -14621,26 +14643,37 @@ fn coding_transcript_for_event_from_store(
     if group.id != group_id {
         anyhow::bail!("requested coding transcript has the wrong group");
     }
-    let bytes = if let Some(bytes) = control.get_record("coding-event-transcript", &event_hash)? {
+    let bytes = if let Some(bytes) = control.get_record_bounded(
+        "coding-event-transcript",
+        &event_hash,
+        mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+    )? {
         bytes
     } else {
         // Pre-binding stores can safely supply the current retained Add:
         // another transcript cannot overwrite its group key while retained.
-        let retained: DynamicGuildState = decode_canonical(
-            &control
-                .get_record("guild-dynamic-state", b"primary")?
-                .context("node has no dynamic guild state")?,
-        )?;
-        if !retained.coding_groups.iter().any(|retained| {
-            retained.group.id == group_id && retained.added_at_event == event_sequence
-        }) {
-            anyhow::bail!("historical coding Add has no event-bound verifier evidence");
-        }
-        control
-            .get_record("coding-group-transcript", &group_id)?
-            .context("retained coding-group verifier transcript is unavailable")?
+        guild_authority::with_history(control, |authority| {
+            let retained = authority
+                .retained_group(group_id)?
+                .context("variable coding group is unavailable")?;
+            if retained.group != *group || retained.added_at_event != event_sequence {
+                anyhow::bail!("historical coding Add has no event-bound verifier evidence");
+            }
+            let bytes = control
+                .get_record_bounded(
+                    "coding-group-transcript",
+                    &group_id,
+                    mb_core::CATALOG_CODING_TRANSCRIPT_BYTES,
+                )?
+                .context("retained coding-group verifier transcript is unavailable")?;
+            authority.validate_retained_coding_transcript(
+                &mb_core::decode_coding_transcript_bounded(&bytes)?,
+            )?;
+            Ok(bytes)
+        })?
+        .context("node has no original guild authority")?
     };
-    let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+    let transcript = mb_core::decode_coding_transcript_bounded(&bytes)?;
     if transcript.value.manifest.value.group != *group
         || transcript_hash.is_some_and(|expected| *blake3::hash(&bytes).as_bytes() != expected)
         || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified

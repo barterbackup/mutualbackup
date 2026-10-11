@@ -1526,6 +1526,47 @@ SQL/WAL/index/record/payload/scratch/traversal policy, normal paged production/
 retention/seed recovery and generation-floor retirement remain required;
 dense 1 TiB and native Windows/macOS qualification remain user-deferred.
 
+Normal variable repair, retained recovery staging and activation now use the
+completed durable original-history index instead of materializing legacy
+coding vectors. Lookups match the original signed transcript hash, descriptor
+and historical membership under genesis/current-tip/history fences. Retired
+groups remain available until Forget; a new Add keeps the group identity and
+binds its new witness. Group/event evidence readers bound transcript SQL
+allocation and decoding to 600 KiB and original Add events to 128 KiB.
+Event-witness fallback and local historical Add attestation consume the same
+authority; evidence serving remains available before Add and after Forget.
+Absent/incomplete indexes preserve the independently fenced legacy
+compatibility path; damaged completed group/evidence rows reject.
+
+Four new Node fixtures cover real recovery staging/activation after reopen
+with unusable flat state, live/retired custody, Forget/re-add, substituted
+valid aliases, missing/corrupt/oversized records, final batch fences and
+legacy catch-up. Frozen qualification passes the complete ordinary
+workspace/all-target inventory and both provisioned Btrfs recovery cases:
+1,363 distinct tests in 1,367 positive executions, including 194 Core, 394
+Store, 117 Git and 534 Node. Formatting, strict locked workspace/all-targets
+Clippy, all-target compilation and four debug program builds pass. An initial
+extra parallel-target run and an overlapping diagnostic hit the offline-spare
+fixture's unchanged 90-second deadline. The previous/current binaries pass the
+isolated case in 52.13/48.76s; the complete Node target then passes with its
+four threads and no other target executing. All failed logs are retained, with
+no source or timeout change. All 322 source files and 23 executable paths stay
+unchanged during qualification; documentation updates follow the run. Native
+cleanup, installed roots and all 14 auxiliary uncommitted files are verified.
+The current candidate supersedes the ce06a7b debug archive. Retiring only that
+archive reclaims 9.85 GiB and leaves 47.24 GiB in target. Current qualified
+executables, earlier binaries supporting installed qualification, original
+records and hash inventories remain available. Evidence is retained under
+`/tmp/mb-m6-bounded-coding-lookup-kcyguyl7`.
+
+Other 121 ignored cases remain unexecuted; installed artifacts were not
+rebuilt for this change. Btrfs uses sparse logical 1 TiB, without dense
+qualification. This completes these coding point consumers, not bulk lifecycle
+indexing, complete paged checkpoint authority/custody/activation, enclosing
+admission or normal paged capture/packing/retention/seed production. Fixed
+legacy-group migration and the remaining R1/R2/R3/R5/R7 gates stay open. Dense
+1 TiB and native Windows/macOS qualification remain user-deferred.
+
 Retained legacy migration now connects to configured page quotas. Its
 authenticated dry run counts native and optional Git pages and bounds source
 tree geometry before atomically reserving all three or six roles and writing

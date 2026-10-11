@@ -752,6 +752,35 @@ impl CatalogDurableGuildHistoryView<'_> {
         }
         Ok(Some(group.retained))
     }
+
+    /// Match the original signed witness of the currently retained incarnation.
+    /// A retired group still owns its witness until Forget. Group-key aliases
+    /// alone cannot authorize another transcript with the same descriptor.
+    pub fn validate_retained_coding_transcript(
+        &self,
+        transcript: &mb_core::SignedRecord<mb_core::CodingVerificationTranscript>,
+    ) -> Result<(), CatalogStoreError> {
+        let bytes = canonical_bytes_bounded(transcript, CATALOG_CODING_TRANSCRIPT_BYTES)?;
+        let descriptor = &transcript.value.manifest.value.group;
+        let group = self
+            .point::<Group>(GROUPS, &descriptor.id)?
+            .ok_or(DatabaseError::NotReady)?;
+        validate_group(
+            &group,
+            &descriptor.id,
+            self.history.authority().event_sequence,
+        )?;
+        if group.retained.group != *descriptor
+            || descriptor.guild_id != self.history.authority().guild_id
+            || group.transcript_hash != *blake3::hash(&bytes).as_bytes()
+            || replay_coding_transcript(transcript).map_err(|_| DatabaseError::Integrity)?
+                != CodingReplayFinding::Verified
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        self.validate_historical_coding_plan(&transcript.value.plan)
+    }
+
     pub fn writer_key(
         &self,
         owner: NodeId,

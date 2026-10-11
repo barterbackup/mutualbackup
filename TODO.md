@@ -3460,6 +3460,22 @@ and native-platform gates remain open.
     private/distributed payload availability, activation/retirement, normal
     capture/retention/seed recovery, the remaining installed-artifact matrix and
     the deferred dense 1 TiB/native Windows/macOS qualification remain open.
+  - [x] Integrate bounded original coding witness lookup into normal variable
+    repair, retained recovery staging/activation and historical Add evidence.
+    Preserve retired custody until Forget and bind each re-add to its original
+    signed witness under genesis/tip/history fences. Bound transcript/event
+    reads to 600/128 KiB; preserve pre-Add/post-Forget evidence serving and
+    fenced legacy access while indexing is absent/incomplete. Four new Node
+    fixtures and full frozen workspace plus both Btrfs recovery cases pass:
+    1,363 distinct tests in 1,367 positive executions. Formatting, strict
+    workspace Clippy, all-target compilation and four debug builds pass.
+    Source/binary identities, native cleanup, installed roots and auxiliary
+    work are verified; retiring superseded debug artifacts reclaims 9.85 GiB.
+    Evidence: `/tmp/mb-m6-bounded-coding-lookup-kcyguyl7`.
+    121 other ignored cases, fresh installed qualification, bulk lifecycle
+    integration, complete enclosing paged authority/custody/activation and
+    full admission/production/retention/seed recovery remain open. Dense
+    1 TiB and native Windows/macOS qualification remain user-deferred.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
