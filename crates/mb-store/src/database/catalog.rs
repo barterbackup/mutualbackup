@@ -681,7 +681,7 @@ impl ControlStore {
                     queue_unreferenced(&transaction, child.hash)?;
                 }
             }
-            storage_quota::collect(&transaction, bytes.len() as u64)?;
+            storage_quota::collect(&transaction, page, bytes.len() as u64)?;
             transaction.execute(
                 "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
                 params![PAGE, hash],
@@ -689,10 +689,14 @@ impl ControlStore {
             if bounded_record(&transaction, PAGE, &hash, CATALOG_PAGE_BYTES)?.is_some() {
                 return Err(DatabaseError::Integrity.into());
             }
-            transaction.execute(
+            if transaction.execute(
                 "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
                 params![META, hash],
-            )?;
+            )? != 1
+                || bounded_record(&transaction, META, &hash, RECORD_BYTES)?.is_some()
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
         }
         transaction.execute(
             "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",

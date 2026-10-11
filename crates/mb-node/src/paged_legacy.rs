@@ -766,6 +766,9 @@ mod tests {
             open_reservations: 5,
         };
         let initial = store.configure_catalog_storage_quota(quota).unwrap();
+        store
+            .configure_catalog_scoped_storage_quotas(quota, quota)
+            .unwrap();
         let data_bytes = legacy
             .value
             .data_sectors
@@ -800,6 +803,9 @@ mod tests {
                 open_reservations: 6,
                 ..quota
             })
+            .unwrap();
+        store
+            .configure_catalog_scoped_storage_quotas(initial.quota, initial.quota)
             .unwrap();
         // Source admission fails after every page role was valid, rolling
         // those reservations back together with the immutable journal.
@@ -935,6 +941,9 @@ mod tests {
                     pages: 64,
                     open_reservations: 8,
                 })
+                .unwrap();
+            store
+                .configure_catalog_scoped_storage_quotas(empty_usage.quota, empty_usage.quota)
                 .unwrap();
             let data_bytes = legacy
                 .value

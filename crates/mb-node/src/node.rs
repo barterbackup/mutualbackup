@@ -18055,16 +18055,25 @@ pub(crate) mod tests {
                 .configure_catalog_retained_source_guild_quota(data_quota)
                 .unwrap();
         }
+        let page_quota = mb_store::CatalogStorageQuota {
+            page_bytes: 1024 * 1024,
+            pages: 64,
+            open_reservations: 8,
+        };
         node.control
-            .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
-                page_bytes: 1024 * 1024,
-                pages: 64,
-                open_reservations: 8,
-            })
+            .configure_catalog_storage_quota(page_quota)
             .unwrap();
+        if quotas_before_migration {
+            node.control
+                .configure_catalog_scoped_storage_quotas(page_quota, page_quota)
+                .unwrap();
+        }
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, operation)
             .unwrap();
         if !quotas_before_migration {
+            node.control
+                .configure_catalog_scoped_storage_quotas(page_quota, page_quota)
+                .unwrap();
             let original = unique_data
                 .keys()
                 .map(|sector| {
@@ -18095,6 +18104,16 @@ pub(crate) mod tests {
         let retained_scope = crate::paged_data::legacy_revision_scope(&node.keys, guild, &legacy)
             .unwrap()
             .0;
+        assert_eq!(
+            node.control
+                .catalog_dataset_storage_usage(retained_scope)
+                .unwrap(),
+            Some(page_usage)
+        );
+        assert_eq!(
+            node.control.catalog_guild_storage_usage(guild).unwrap(),
+            Some(page_usage)
+        );
         let data_usage = node
             .control
             .catalog_retained_source_usage(retained_scope)

@@ -1503,6 +1503,29 @@ still needs SQL/WAL and payload headroom,
 traversal work, dataset/history and guild quotas before normal paged producers
 can be admitted; generation-floor retirement also remains open.
 
+The encoded-page writer now also enforces one limit per dataset and one
+aggregate limit per guild, including private/source dataset pages and public
+guild pages. Original reservation identities and all three ledgers change
+atomically through staging, publication, cancellation and actual final-owner GC.
+Shared/cancelled/unpublished pages remain charged until collection. Initial
+enablement validates bounded original pages and loans and reconciles exact store
+totals without rewriting original rows; corrupt/orphan records and suppressed
+SQL writes reject atomically. Policy resizing is grow-only and scan-free.
+Eight new Store fixtures and both configured/adopted Btrfs native recovery
+variants pass. Fresh frozen qualification runs the complete ordinary workspace
+and both native cases: 1,359 distinct tests in 1,367 positive executions,
+formatting, strict locked workspace/all-targets Clippy, all-target compilation
+and four debug programs. All 322 source files and 23 executable paths stay
+unchanged during the run; the documentation update follows. Native cleanup,
+archived qualification artifacts, auxiliary work and installed roots are
+verified. Cache cleanup reclaims 8.94 GiB, with qualified binaries unchanged.
+Evidence is in `/tmp/mb-m6-scoped-page-quota-validation-on4iksql`.
+Other 121 ignored cases and fresh installed artifacts were not run for this
+change. Sparse logical 1 TiB is distinct from dense qualification. Enclosing
+SQL/WAL/index/record/payload/scratch/traversal policy, normal paged production/
+retention/seed recovery and generation-floor retirement remain required;
+dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+
 Retained legacy migration now connects to configured page quotas. Its
 authenticated dry run counts native and optional Git pages and bounds source
 tree geometry before atomically reserving all three or six roles and writing

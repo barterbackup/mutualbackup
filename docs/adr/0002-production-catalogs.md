@@ -5366,3 +5366,47 @@ candidate. R5's historical stall and full fault matrix, R7's remaining native/
 upgrade/multi-volume/private-Tor/platform matrix, enclosing admission and normal
 paged recovery remain open. Dense 1 TiB and native Windows/macOS qualification
 remain user-deferred.
+
+## Dataset and guild encoded-page quotas (2026-10-11)
+
+The existing store writer now reserves retained encoded-page bytes, page counts
+and open intent slots per dataset and in aggregate across each guild. Guild
+charges include every dataset's private/source pages and public guild pages.
+Exact reservation replay, staging, publication, cancellation and actual
+final-owner GC update all three ledgers atomically. Shared pages are charged
+once; cancelled and unpublished pages stay charged until physical collection.
+
+Initial enablement validates one bounded original page/metadata or reservation
+row at a time, rejects orphan/inconsistent records and reconciles the exact
+original store totals. Existing protocol rows remain unchanged. Persistent scope
+and membership markers reject missing accounting; loan identities bind the
+original capacity. Later policy resizing is grow-only and scan-free.
+Ignored/aborted SQL writes and suppressed metadata deletion reject and roll back
+accounting and ownership together.
+
+Eight new Store fixtures cover independent/concurrent scopes, private/public
+sharing, adoption, immutable credits, corrupt records and SQL faults. Existing
+legacy migration formats 1/3/4/5 now enforce these page limits. Both provisioned
+Btrfs native variants pass with limits enabled before migration or adopted
+afterward, including shared migration, source loss, interrupted repair and
+restore (32.36s and 30.90s). Fresh frozen qualification passes the complete
+ordinary workspace/all-target inventory and both native cases: 1,359 distinct
+tests in 1,367 positive executions, including 194 Core, 394 Store, 117 Git,
+530 Node and all ordinary command/process/vendored targets. Formatting, strict
+locked workspace/all-targets Clippy, all-target compilation and four debug
+programs pass. All 322 source files and 23 executable paths stay unchanged during
+qualification; the documentation-only update follows the run. Native mount/
+loop/image cleanup, 29 archived qualification paths with their original inodes,
+14 auxiliary uncommitted files and all installed roots are verified. Cache
+cleanup reclaims 8.94 GiB, leaving 46.75 GiB in `target`, with qualified artifacts
+unchanged. Evidence and exact case inventories are under
+`/tmp/mb-m6-scoped-page-quota-validation-on4iksql`.
+
+Other 121 ignored cases remain unexecuted; installed artifacts were not rebuilt
+for this change. The native cases use sparse logical 1 TiB, without dense
+qualification. These limits account for encoded page blobs; SQL/WAL,
+index/record overhead, physical payload, scratch and traversal budgets still
+require the enclosing policy. Normal paged capture/checkpoint/retention/seed
+production, verified generation-floor retirement and remaining R1/R2/R3/R5/R7
+gates stay open. Dense 1 TiB and native Windows/macOS qualification remain
+deferred at the user's request.

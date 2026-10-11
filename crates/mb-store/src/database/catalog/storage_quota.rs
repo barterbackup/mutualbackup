@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod scoped;
+
 const QUOTA: &str = "catalog-storage-quota-v1";
 const ENABLED: &str = "catalog-storage-quota-enabled-v1";
 const RESERVATION: &str = "catalog-page-reservation-v1";
@@ -104,6 +106,7 @@ fn decode<T: serde::de::DeserializeOwned + Serialize>(
 fn ledger(connection: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
     let enabled = bounded_record(connection, ENABLED, KEY, 1)?;
     let bytes = bounded_record(connection, QUOTA, KEY, RECORD_BYTES)?;
+    scoped::require_global_policy(connection, enabled.is_some() || bytes.is_some())?;
     match (enabled.as_deref(), bytes) {
         (None, None) => Ok(None),
         (Some([1]), Some(bytes)) => {
@@ -169,6 +172,7 @@ pub(super) fn require_reservation(
     intent: CatalogIntent,
     state: CatalogIntentState,
 ) -> Result<(), CatalogStoreError> {
+    scoped::require_reservation(connection, intent)?;
     let record = reservation(connection, intent)?;
     match (ledger(connection)?, record, state) {
         (None, None, _) => Ok(()),
@@ -207,6 +211,7 @@ pub(super) fn stage(
     {
         return Err(DatabaseError::Conflict.into());
     }
+    scoped::stage(connection, *record, reference, bytes.len() as u64)?;
     if bounded_record(connection, PAGE, &reference.hash, CATALOG_PAGE_BYTES)?.is_some() {
         return Ok(());
     }
@@ -249,6 +254,7 @@ pub(super) fn close(
     connection: &Connection,
     intent: CatalogIntent,
 ) -> Result<(), CatalogStoreError> {
+    scoped::close(connection, intent)?;
     let Some(mut record) = reservation(connection, intent)? else {
         return Ok(());
     };
@@ -277,7 +283,12 @@ pub(super) fn close(
     write_ledger(connection, ledger)
 }
 
-pub(super) fn collect(connection: &Connection, page_bytes: u64) -> Result<(), CatalogStoreError> {
+pub(super) fn collect(
+    connection: &Connection,
+    page: PageMetadata,
+    page_bytes: u64,
+) -> Result<(), CatalogStoreError> {
+    scoped::collect(connection, page, page_bytes)?;
     let Some(mut record) = ledger(connection)? else {
         return Ok(());
     };
@@ -345,6 +356,7 @@ fn reserve_intent(
             return Err(DatabaseError::Integrity.into());
         }
         write_ledger(connection, ledger)?;
+        scoped::reserve(connection, record)?;
     }
     require_reservation(connection, intent, state)?;
     Ok(state)

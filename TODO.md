@@ -2954,6 +2954,45 @@ and native-platform gates remain open.
       Complete enclosing metadata/physical/SQL/WAL/scratch policy, normal paged
       producers/retention/seed recovery, generation floors and the user-deferred
       dense capacity/native Windows/macOS gates remain open.
+    - [x] Reserve retained encoded-page bytes/counts and open intent slots per
+      dataset and in aggregate across each guild, inside the existing store
+      writer. Guild totals include every dataset's private/source pages and
+      public guild packing/coding/checkpoint pages. Reservation replay binds
+      the original capacity; staging, publication, cancellation and final-owner
+      GC update all three ledgers atomically. Shared pages are charged once;
+      cancelled and unpublished pages stay charged until actual collection.
+      Initial enablement validates one bounded page/metadata or reservation
+      row at a time, rejects orphan/inconsistent records and reconciles the
+      exact original store totals without rewriting existing protocol rows.
+      Scope/membership markers reject missing accounting; later resizing is
+      grow-only and scan-free. Ignored/aborted writes and suppressed metadata
+      deletion reject and roll back ownership and accounting together.
+      Eight new Store fixtures cover independent/concurrent scopes, private/
+      public sharing, adoption, immutable credits, corrupted records and SQL
+      faults. Existing migration formats 1/3/4/5 now enforce these page limits.
+      Both provisioned Btrfs native variants pass with limits enabled before
+      migration or adopted afterward, including shared migration, source loss,
+      interrupted repair and restore (32.36s and 30.90s).
+      Frozen qualification passes the complete ordinary workspace/all-target
+      inventory: 194 Core, 394 Store, 117 Git, 530 Node and all ordinary command,
+      process and vendored targets, plus both native cases: 1,359 distinct
+      tests in 1,367 positive executions. Formatting, strict locked workspace/
+      all-targets Clippy, all-target compilation and four debug programs pass.
+      All 322 source files and 23 program/test-driver paths stay unchanged
+      during qualification; the documentation-only update follows the run.
+      Native mount/loop/image cleanup, 29 archived qualification paths, all
+      installed roots and 14 auxiliary uncommitted files are verified.
+      Incremental-cache cleanup reclaims 8.94 GiB, leaving 46.75 GiB in
+      `target`, with qualified artifacts unchanged. Evidence and exact case
+      inventories are in `/tmp/mb-m6-scoped-page-quota-validation-on4iksql`.
+      Other 121 ignored cases remain unexecuted; installed artifacts were not
+      rebuilt for this change. The native cases use sparse logical 1 TiB,
+      without dense qualification. Encoded page limits exclude SQL/WAL,
+      index/record overhead, physical payload, scratch and traversal budgets.
+      Complete enclosing policy, normal paged capture/checkpoint/retention/
+      seed production and verified generation-floor retirement remain open.
+      Dense 1 TiB and native Windows/macOS qualification remain user-deferred;
+      this does not close R1/R2/R3/R5/R7 or Milestone 6.
   - [x] Join full/compact packing descriptors and source streams through a
     disposable encrypted index. Require a source-authority callback; reject
     duplicate/missing mappings, incomplete coverage, false virtual zeros and
