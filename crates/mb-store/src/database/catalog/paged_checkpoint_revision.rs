@@ -106,6 +106,10 @@ fn check_work<H: Layout>(
             .proof_work
             .checked_add(retention.checkpoint.work()?)?
             .checked_add(work)?
+            .checked_add(
+                paged_checkpoint_legacy_revision::owned_work(connection, retention)?
+                    .unwrap_or_default(),
+            )?
             .checked_add(paged_checkpoint_custody::owned_work(connection, retention)?)?
             .checked_add(
                 paged_checkpoint_payload::owned_work(connection, retention)?.unwrap_or_default(),
@@ -115,6 +119,7 @@ fn check_work<H: Layout>(
 }
 
 pub(super) fn require_unowned(connection: &Connection, id: Uuid) -> Result<(), CatalogStoreError> {
+    paged_checkpoint_legacy_revision::require_unowned(connection, id)?;
     if has_dependencies(connection, id)?
         || bounded_record(connection, TOTALS, id.as_bytes(), ROW_BYTES)?.is_some()
     {
@@ -185,6 +190,7 @@ pub(super) fn require_unretained(
         params![owners(revision)],
         |row| row.get(0),
     )?;
+    paged_checkpoint_legacy_revision::require_unretained(connection, revision)?;
     if retained {
         return Err(DatabaseError::Conflict.into());
     }

@@ -67,7 +67,7 @@ fn read<H: Layout>(
         || progress.revisions > authority.revisions
         || progress.legacy_revisions > authority.legacy_revisions
         || progress.legacy_revisions > progress.revisions
-        || progress.local_revisions > progress.revisions - progress.legacy_revisions
+        || progress.local_revisions > progress.revisions
         || progress.local_payloads
             > observed
                 .information_roles
@@ -102,10 +102,12 @@ fn read<H: Layout>(
         && (paged_checkpoint_revision::owned_work(connection, retention)?
             .unwrap_or_default()
             .records
-            != progress
-                .local_revisions
-                .checked_mul(3)
-                .ok_or(CatalogError::Bounds)?
+            / 3
+            + paged_checkpoint_legacy_revision::owned_work(connection, retention)?
+                .unwrap_or_default()
+                .records
+                / 4
+            != progress.local_revisions
             || paged_checkpoint_payload::owned_count(connection, retention)?
                 != progress.local_payloads)
     {
@@ -240,10 +242,16 @@ impl ControlStore {
                     if previous.revision_cursor.is_some_and(|cursor| key <= cursor) {
                         return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
                     }
-                    // Fixed/flat local private custody needs its original legacy
-                    // owner bridge. Do not silently declare it complete or migrate IDs.
                     if matches!(revision, R::LegacyRevision(_)) && key.owner == holder {
-                        return Err(CatalogStoreError::from(DatabaseError::NotReady).into());
+                        self.retain_checkpoint_legacy_revision_checked(
+                            id,
+                            proof,
+                            key,
+                            None,
+                            &mut read_trust,
+                            |snapshot, _| check_revision(snapshot),
+                        )?;
+                        add(&mut next.local_revisions, 1)?;
                     }
                     if matches!(revision, R::PagedRevision(_)) && key.owner == holder {
                         self.retain_checkpoint_revision_checked(
@@ -290,6 +298,13 @@ impl ControlStore {
                                 .proof_work
                                 .checked_add(retention.checkpoint.work()?)?
                                 .checked_add(owned_work(&self.connection, retention)?)?
+                                .checked_add(
+                                    paged_checkpoint_legacy_revision::owned_work(
+                                        &self.connection,
+                                        retention,
+                                    )?
+                                    .unwrap_or_default(),
+                                )?
                                 .checked_add(
                                     paged_checkpoint_revision::owned_work(
                                         &self.connection,

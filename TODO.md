@@ -3529,6 +3529,33 @@ and native-platform gates remain open.
     capture/packing/checkpoint/retention/seed recovery remain open. Normal paged
     producers stay disabled. 121 other ignored cases and fresh installed
     qualification remain open; dense 1 TiB/native Windows/macOS remain deferred.
+  - [x] Bind an existing authenticated legacy private conversion to its original
+    checkpoint revision in both paged layouts. Keep the original signed body
+    and revision ID; borrow the separate conversion's private/bootstrap/native
+    and source custody. Paired bounded dependencies bind the original reference,
+    converted bundle and active migration journal fingerprint. A separate pin
+    count makes a damaged last backlink block cancellation. Acquisition,
+    journal fencing and retirement use serialized writers; actual-current guards
+    protect pin transfer. Legacy body reads and all borrowed dependencies share
+    the enclosing proof/cursor/private/payload budget. Local custody resumes
+    through a bound legacy revision and counts both dependency types at EOF.
+    Two new Node cases use real authenticated legacy metadata, provision every
+    original local information role, reopen with unusable flat state, preserve
+    original signed bytes and cover shared owners, damaged pairs/last pins,
+    oversized journals, actor binding, budget refusal and current-head rollback.
+    Full frozen qualification passes 1,376 distinct tests
+    in 1,378 executions, including 400 Store, 541 Node and
+    both provisioned Btrfs cases; formatting, strict locked workspace/all-target
+    Clippy, compilation and all four debug builds pass. Evidence:
+    `/tmp/mb-m6-legacy-private-custody-p0cko6en`. Exact retirement of the superseded debug archive
+    and preliminary Node-only binary reclaims 10.42 GiB, leaving
+    47.40 GiB in `target`; current qualified executables, 29 older archived
+    paths, 14 auxiliary WIP files and all 10 installed roots remain intact.
+    Fixed legacy coding, complete migration authority integration, distributed
+    availability/current activation, full quotas and normal paged production/
+    retention/seed recovery remain open. Producers stay disabled; 121 other
+    ignored cases and fresh installed qualification remain open. Dense 1 TiB
+    and native Windows/macOS qualification remain user-deferred.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

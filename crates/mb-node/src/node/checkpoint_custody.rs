@@ -59,8 +59,64 @@ custody_reads!(NodeReader);
 macro_rules! custody {
     ($proof:ty, $retention:ty, $metadata:ident, $revision:ident, $payload:ident,
      $retain:ident, $retain_revision:ident, $retain_payload:ident,
-     $step:ident, $retain_step:ident) => {
+     $step:ident, $retain_step:ident, $legacy:ident, $retain_legacy:ident) => {
         impl Node {
+            /// Retain this node's existing authenticated conversion for an
+            /// original legacy revision. The checkpoint keeps the old signed
+            /// identity; the conversion stays a separate local private owner.
+            pub fn $legacy(
+                &self,
+                id: Uuid,
+                proof: &$proof,
+                key: mb_core::CatalogCheckpointRevisionKey,
+                migration: Uuid,
+            ) -> Result<()> {
+                anyhow::ensure!(
+                    key.owner == self.keys.node_id(),
+                    "private checkpoint revision belongs to another owner"
+                );
+                guild_authority::with_history(&self.control, |authority| {
+                    self.control.$retain_legacy(
+                        id,
+                        proof,
+                        key,
+                        migration,
+                        || {
+                            authority.paged_checkpoint_trust().map_err(|_| {
+                                mb_store::CatalogStoreError::Database(
+                                    mb_store::DatabaseError::Conflict,
+                                )
+                            })
+                        },
+                        |snapshot, legacy| -> Result<()> {
+                            crate::RetainedLegacyMigration::load(
+                                &self.control,
+                                &self.keys,
+                                migration,
+                            )?
+                            .context("checkpoint requires the original retained migration")?
+                            .check_checkpoint_custody(
+                                &self.control,
+                                &self.keys,
+                                legacy,
+                                snapshot,
+                            )?;
+                            let opened = crate::PagedPrivateMetadata::open_local_snapshot(
+                                &self.keys,
+                                snapshot,
+                                snapshot.bundle.scope,
+                            )?;
+                            anyhow::ensure!(
+                                opened.private.is_some(),
+                                "checkpoint private revision is retired"
+                            );
+                            Ok(())
+                        },
+                    )?;
+                    Ok(())
+                })?
+                .context("paged checkpoint requires original guild authority")
+            }
             /// Acquire one local private revision or one bounded group's local
             /// READY assignments under this exact metadata owner. Durable progress
             /// resumes after reopen. Complete is local custody, not distributed
@@ -231,7 +287,9 @@ custody!(
     retain_catalog_paged_checkpoint_revision_checked,
     retain_catalog_paged_checkpoint_payload_checked,
     retain_paged_checkpoint_local_custody_step,
-    retain_catalog_paged_checkpoint_local_custody_step_checked
+    retain_catalog_paged_checkpoint_local_custody_step_checked,
+    retain_paged_checkpoint_local_legacy_revision,
+    retain_catalog_paged_checkpoint_legacy_revision_checked
 );
 custody!(
     mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
@@ -243,5 +301,7 @@ custody!(
     retain_catalog_paged_checkpoint_directory_revision_checked,
     retain_catalog_paged_checkpoint_directory_payload_checked,
     retain_paged_checkpoint_directory_local_custody_step,
-    retain_catalog_paged_checkpoint_directory_local_custody_step_checked
+    retain_catalog_paged_checkpoint_directory_local_custody_step_checked,
+    retain_paged_checkpoint_directory_local_legacy_revision,
+    retain_catalog_paged_checkpoint_directory_legacy_revision_checked
 );

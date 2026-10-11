@@ -32,6 +32,7 @@ mod packing_directory_validation;
 mod packing_validation;
 mod paged_checkpoint;
 mod paged_checkpoint_custody;
+mod paged_checkpoint_legacy_revision;
 mod paged_checkpoint_payload;
 mod paged_checkpoint_retention;
 mod paged_checkpoint_revision;

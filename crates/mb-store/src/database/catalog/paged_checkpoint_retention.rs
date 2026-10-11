@@ -490,7 +490,9 @@ impl ControlStore {
             {
                 return Err(DatabaseError::Integrity.into());
             }
-            if paged_checkpoint_revision::has_dependencies(&self.connection, id)? {
+            if paged_checkpoint_revision::has_dependencies(&self.connection, id)?
+                || paged_checkpoint_legacy_revision::has_dependencies(&self.connection, id)?
+            {
                 return Err(DatabaseError::Integrity.into());
             }
             if self.record_length(H::CERTIFICATE, id.as_bytes())?.is_some() {
@@ -520,7 +522,9 @@ impl ControlStore {
             {
                 return Err(DatabaseError::Integrity.into());
             }
-            if paged_checkpoint_revision::has_dependencies(&self.connection, id)? {
+            if paged_checkpoint_revision::has_dependencies(&self.connection, id)?
+                || paged_checkpoint_legacy_revision::has_dependencies(&self.connection, id)?
+            {
                 return Err(DatabaseError::Integrity.into());
             }
             if self.record_length(H::CERTIFICATE, id.as_bytes())?.is_some() {
@@ -580,6 +584,11 @@ impl ControlStore {
             transaction.commit()?;
             return Ok(true);
         }
+        if paged_checkpoint_legacy_revision::release(&transaction, record.retention)? {
+            self.guard_paged_retirement(record.retention)?;
+            transaction.commit()?;
+            return Ok(true);
+        }
         if paged_checkpoint_revision::release(&transaction, record.retention)? {
             self.guard_paged_retirement(record.retention)?;
             transaction.commit()?;
@@ -594,6 +603,8 @@ impl ControlStore {
         {
             if paged_checkpoint_revision::admitted_work(&transaction, record.retention)?
                 .is_some_and(|work| work.records != 0)
+                || paged_checkpoint_legacy_revision::owned_work(&transaction, record.retention)?
+                    .is_some_and(|work| work.records != 0)
                 || paged_checkpoint_payload::admitted_work(&transaction, record.retention)?
                     .is_some_and(|work| work.records != 0)
             {

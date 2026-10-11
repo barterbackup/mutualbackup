@@ -156,6 +156,31 @@ impl RetainedLegacyMigration {
         Ok(())
     }
 
+    /// Authenticate a separately retained conversion against its original
+    /// signed ancestor before a checkpoint borrows its private/source owner.
+    pub(crate) fn check_checkpoint_custody(
+        &self,
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        legacy: &SignedRecord<UserRevision>,
+        snapshot: &mb_store::PagedCatalogSnapshot,
+    ) -> Result<()> {
+        let CatalogScope::Dataset { guild_id, .. } = self.0.scope else {
+            anyhow::bail!("migration requires dataset scope");
+        };
+        ensure!(
+            Self::new(keys, guild_id, legacy, self.0.writer.clone(), self.0.id)?.0 == self.0
+                && snapshot.bundle.id == self.0.id
+                && snapshot.bundle.scope == self.0.scope
+                && snapshot.state == CatalogBundleState::Published,
+            "checkpoint conversion differs from its original migration"
+        );
+        self.check_publication(
+            &PagedUserRevision::decode_signed(&snapshot.bundle.descriptor)?.value,
+        )?;
+        self.require_active(control)
+    }
+
     /// Verify the complete legacy schema/bytes, stage typed streams and publish
     /// all roots and stable sources together. No original head, recipe, signed
     /// record or protection claim is replaced. The caller supplies certified
@@ -368,14 +393,21 @@ impl RetainedLegacyMigration {
         cancelled.cancelled = true;
         let old = canonical_bytes_bounded(&self.0, JOURNAL_BYTES)?;
         let new = canonical_bytes_bounded(&cancelled, JOURNAL_BYTES)?;
-        let bytes = control.get_record_bounded(JOURNAL, self.0.id.as_bytes(), JOURNAL_BYTES)?;
-        if bytes.as_ref() != Some(&new) {
-            ensure!(
-                bytes == Some(old.clone()),
-                "migration cancellation identity differs"
-            );
-            control.replace_record_if_value(JOURNAL, self.0.id.as_bytes(), &old, &new)?;
-        }
+        control.with_unretained_paged_revision_record_transaction(
+            self.0.id,
+            || -> Result<()> {
+                let bytes =
+                    control.get_record_bounded(JOURNAL, self.0.id.as_bytes(), JOURNAL_BYTES)?;
+                if bytes.as_ref() != Some(&new) {
+                    ensure!(
+                        bytes == Some(old.clone()),
+                        "migration cancellation identity differs"
+                    );
+                    control.replace_record_if_value(JOURNAL, self.0.id.as_bytes(), &old, &new)?;
+                }
+                Ok(())
+            },
+        )?;
         if let Some(snapshot) = control.paged_revision_catalog(self.0.id)? {
             self.check_publication(
                 &PagedUserRevision::decode_signed(&snapshot.bundle.descriptor)?.value,

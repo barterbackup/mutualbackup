@@ -4,6 +4,328 @@ use crate::node::tests::test_coding_transcript;
 
 mod transport;
 
+macro_rules! legacy_custody_cases {
+    ($test:ident, $constructor:ident, $metadata:ident, $retain:ident, $step:ident, $cancel:ident, $release:ident) => {
+        #[test]
+        fn $test() {
+            let (temp, seed, mut node, mut keys) = fixture();
+            let local = keys
+                .iter()
+                .position(|key| key.node_id() == node.keys.node_id())
+                .unwrap();
+            keys.swap(0, local);
+            let (proof, _) = $constructor(&mut node, &keys);
+            let guild = proof.trust().guild_id;
+            let mb_core::CatalogCheckpointAuthorityRecord::LegacyRevision(reference) =
+                proof.index().next_revision(None).unwrap().unwrap()
+            else {
+                panic!("original legacy revision")
+            };
+            let key = mb_core::CatalogCheckpointRevisionKey {
+                owner: reference.owner,
+                protected_root_id: reference.protected_root_id,
+                sequence: reference.sequence,
+                revision_id: reference.revision_id,
+            };
+            let original = reference
+                .read_signed(&mut |page| {
+                    node.control.catalog_page(
+                        mb_core::CatalogScope::Guild { guild_id: guild },
+                        mb_core::CatalogSection::Checkpoint,
+                        page,
+                    )
+                })
+                .unwrap();
+            let original_bytes = canonical_bytes(&original).unwrap();
+            node.control.put_record("user-revision", original.value.revision_id.as_bytes(), &original_bytes).unwrap();
+            let writer = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+            let migration_id = Uuid::from_u128(88);
+            let migration = crate::RetainedLegacyMigration::new(
+                &node.keys,
+                guild,
+                &original,
+                mb_core::WriterFence {
+                    owner: node.keys.node_id(),
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                },
+                migration_id,
+            )
+            .unwrap();
+            let (_, ciphertext) = mb_core::encrypted_sector(
+                &node.keys.guild_data_key(&guild),
+                [193; 32],
+                &legacy_private_plaintext(),
+            )
+            .unwrap();
+            let converted = migration
+                .retain(&node.control, &node.keys, &original, &writer, &mut |id| {
+                    anyhow::ensure!(*id == [193; 32]);
+                    Ok(ciphertext.clone())
+                })
+                .unwrap();
+            assert_eq!(converted.value.parent, Some(original.value.hash().unwrap()));
+            assert_ne!(converted.value.revision_id, original.value.revision_id);
+            let ids = [Uuid::from_u128(90), Uuid::from_u128(91)];
+            for id in ids {
+                node.$metadata(id, &proof).unwrap();
+            }
+            // No implicit conversion, reference reinterpretation or cursor skip.
+            assert!(node.$step(ids[0], &proof).is_err());
+            assert_eq!(
+                node.control
+                    .catalog_paged_checkpoint_legacy_revision(ids[0], key.revision_id)
+                    .unwrap(),
+                None
+            );
+            let journal = node
+                .control
+                .get_record("paged-legacy-migration-v1", migration_id.as_bytes())
+                .unwrap()
+                .unwrap();
+            node.control
+                .put_record(
+                    "paged-legacy-migration-v1",
+                    migration_id.as_bytes(),
+                    &vec![0; 513],
+                )
+                .unwrap();
+            assert!(node.$retain(ids[0], &proof, key, migration_id).is_err());
+            node.control
+                .put_record(
+                    "paged-legacy-migration-v1",
+                    migration_id.as_bytes(),
+                    &journal,
+                )
+                .unwrap();
+            let forward = format!("catalog-checkpoint-legacy-private-v1/{}", ids[0].simple());
+            let activate = format!("INSERT INTO checkpoint_heads(guild_id, generation, checkpoint_hash, checkpoint_bytes) VALUES (X'{}', 1, X'{}', X'01');", hex::encode(guild), hex::encode(proof.certificate().checkpoint.hash().unwrap()));
+            node.control.database_shell_statement(&format!("CREATE TEMP TRIGGER bridge_head AFTER INSERT ON protocol_records WHEN NEW.kind = '{forward}' BEGIN {activate} END"), false).unwrap();
+            assert!(node.$retain(ids[0], &proof, key, migration_id).is_err());
+            assert!(node.control.get_record(&forward, key.revision_id.as_bytes()).unwrap().is_none());
+            assert!(node.control.checkpoint_head_identity(&guild).unwrap().is_none());
+            node.control.database_shell_statement("DROP TRIGGER bridge_head", false).unwrap();
+            for id in ids {
+                node.$retain(id, &proof, key, migration_id).unwrap();
+            }
+            node.$retain(ids[0], &proof, key, migration_id).unwrap();
+            let mut other = key;
+            other.owner = keys[1].node_id();
+            assert!(node.$retain(ids[0], &proof, other, migration_id).is_err());
+            let totals_kind = "catalog-checkpoint-legacy-private-work-v1";
+            let totals = node.control.get_record(totals_kind, ids[0].as_bytes()).unwrap().unwrap();
+            let mut exceeded: Work = decode_canonical(&totals).unwrap();
+            exceeded.bytes = proof.transition().budget().bytes;
+            node.control.put_record(totals_kind, ids[0].as_bytes(), &canonical_bytes(&exceeded).unwrap()).unwrap();
+            assert!(node.$retain(ids[0], &proof, key, migration_id).is_err());
+            node.control.put_record(totals_kind, ids[0].as_bytes(), &totals).unwrap();
+            assert!(migration.cancel(&node.control).is_err());
+            assert_eq!(
+                node.control
+                    .get_record("paged-legacy-migration-v1", migration_id.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+                journal
+            );
+            assert!(
+                node.control
+                    .cancel_paged_revision_catalog(migration_id)
+                    .is_err()
+            );
+            // Paired dependency damage fails without repairing away a lost pin.
+            let reverse = format!(
+                "catalog-legacy-private-checkpoint-v1/{}",
+                migration_id.simple()
+            );
+            let pin = node
+                .control
+                .get_record(&reverse, ids[0].as_bytes())
+                .unwrap()
+                .unwrap();
+            node.control
+                .delete_record_if_value(&reverse, ids[0].as_bytes(), &pin)
+                .unwrap();
+            assert!(node.$step(ids[0], &proof).is_err());
+            assert!(node.$retain(ids[0], &proof, key, migration_id).is_err());
+            assert!(
+                node.control
+                    .catalog_paged_checkpoint_legacy_revision(ids[0], key.revision_id)
+                    .is_err()
+            );
+            node.control
+                .put_record_if_absent(&reverse, ids[0].as_bytes(), &pin)
+                .unwrap();
+            node.control
+                .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+                .unwrap();
+            drop(node);
+            let mut node = Node::open(temp.path(), seed).unwrap();
+            let progress = node.$step(ids[0], &proof).unwrap();
+            assert_eq!(
+                (
+                    progress.revisions,
+                    progress.legacy_revisions,
+                    progress.local_revisions
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                node.$step(ids[0], &proof).unwrap().phase,
+                mb_store::CatalogCheckpointLocalCustodyPhase::Coding
+            );
+            assert!(node.$step(ids[0], &proof).is_err());
+            let profile = mb_core::PackingProfile {
+                format_version: 1,
+                sector_size: mb_core::V1_SECTOR_SIZE as u32,
+                slot_size: mb_core::V1_SECTOR_SIZE as u32 / 4,
+            };
+            let packed = mb_core::pack_incremental(
+                profile,
+                None,
+                vec![mb_core::PackingInput {
+                    owner: key.owner,
+                    protected_root: mb_core::packing_protected_root(key.protected_root_id),
+                    object_id: [193; 32],
+                    source_commitment: Some(merkle_commit(&ciphertext).unwrap()),
+                    bytes: ciphertext,
+                }],
+            )
+            .unwrap();
+            let mut cursor = None;
+            while let Some(row) = proof.index().index().next_group(cursor).unwrap() {
+                let group = row.group.range.group_id;
+                let entry = proof
+                    .index()
+                    .index()
+                    .read_group(group, |page| {
+                        node.control.catalog_page(
+                            mb_core::CatalogScope::Guild { guild_id: guild },
+                            mb_core::CatalogSection::Coding,
+                            page,
+                        )
+                    })
+                    .unwrap()
+                    .unwrap();
+                let plan = &entry.transcript.value.plan;
+                let information = &plan.value.geometry.information[0].sector;
+                let bytes = packed
+                    .catalog
+                    .sectors
+                    .iter()
+                    .zip(&packed.sectors)
+                    .find_map(|(descriptor, sector)| {
+                        let mut descriptor = descriptor.clone();
+                        descriptor.flat_root = sector_root(&sector.bytes);
+                        descriptor.id = descriptor.calculate_id(profile).unwrap();
+                        (descriptor.id == information.id).then(|| sector.bytes.clone())
+                    })
+                    .unwrap();
+                node.reserve_coding_information(plan, 0).unwrap();
+                node.write_coding_information_range(plan, 0, 0, &bytes)
+                    .unwrap();
+                node.finish_coding_information_upload(plan, 0).unwrap();
+                node.activate_coding_attempt(&entry.transcript).unwrap();
+                cursor = Some(group);
+            }
+            for id in ids {
+                let mut complete = None;
+                for _ in 0..6 {
+                    let progress = node.$step(id, &proof).unwrap();
+                    if progress.phase == mb_store::CatalogCheckpointLocalCustodyPhase::Complete {
+                        complete = Some(progress);
+                        break;
+                    }
+                }
+                let complete = complete.expect("complete original legacy inventory");
+                assert_eq!(
+                    (
+                        complete.revisions,
+                        complete.legacy_revisions,
+                        complete.local_revisions
+                    ),
+                    (1, 1, 1)
+                );
+                assert_eq!(
+                    complete.coding,
+                    proof.certificate().checkpoint.coding.summary.coding
+                );
+                assert_eq!(complete.local_payloads, complete.coding.information_roles);
+            }
+            assert_eq!(
+                canonical_bytes(
+                    &reference
+                        .read_signed(&mut |page| node.control.catalog_page(
+                            mb_core::CatalogScope::Guild { guild_id: guild },
+                            mb_core::CatalogSection::Checkpoint,
+                            page
+                        ))
+                        .unwrap()
+                )
+                .unwrap(),
+                original_bytes
+            );
+            assert!(
+                node.control
+                    .checkpoint_head_identity(&guild)
+                    .unwrap()
+                    .is_none()
+            );
+            node.control.$cancel(ids[0]).unwrap();
+            while node.control.$release(ids[0]).unwrap() {}
+            assert!(migration.cancel(&node.control).is_err());
+            let last_pin = node.control.get_record(&reverse, ids[1].as_bytes()).unwrap().unwrap();
+            node.control.delete_record_if_value(&reverse, ids[1].as_bytes(), &last_pin).unwrap();
+            assert!(migration.cancel(&node.control).is_err());
+            assert_eq!(node.control.get_record("paged-legacy-migration-v1", migration_id.as_bytes()).unwrap().unwrap(), journal);
+            node.control.put_record_if_absent(&reverse, ids[1].as_bytes(), &last_pin).unwrap();
+            assert_eq!(
+                node.$step(ids[1], &proof).unwrap().phase,
+                mb_store::CatalogCheckpointLocalCustodyPhase::Complete
+            );
+            node.control.$cancel(ids[1]).unwrap();
+            node.control.database_shell_statement(&format!("CREATE TEMP TRIGGER bridge_retire_head AFTER DELETE ON protocol_records WHEN OLD.kind = 'catalog-checkpoint-legacy-private-v1/{}' BEGIN {activate} END", ids[1].simple()), false).unwrap();
+            // Payload dependencies retire first; the bridge's guarded DELETE must
+            // roll back both its pin transfer and an unexpected actual head.
+            let mut refused = false;
+            for _ in 0..8 {
+                match node.control.$release(ids[1]) {
+                    Ok(true) => {},
+                    Err(_) => { refused = true; break; },
+                    Ok(false) => panic!("legacy bridge retired despite head trigger"),
+                }
+            }
+            assert!(refused);
+            assert!(node.control.checkpoint_head_identity(&guild).unwrap().is_none());
+            assert!(migration.cancel(&node.control).is_err());
+            node.control.database_shell_statement("DROP TRIGGER bridge_retire_head", false).unwrap();
+            while node.control.$release(ids[1]).unwrap() {}
+            assert_eq!(
+                node.control
+                    .catalog_paged_checkpoint_legacy_revision(ids[1], key.revision_id)
+                    .unwrap(),
+                None
+            );
+            migration.cancel(&node.control).unwrap();
+            while migration.cleanup_step(&node.control).unwrap() {}
+            assert_eq!(node.control.get_record("user-revision", key.revision_id.as_bytes()).unwrap().unwrap(), original_bytes);
+        }
+    };
+}
+legacy_custody_cases!(
+    paged_checkpoint_legacy_private_custody_preserves_identity_reopens_and_blocks_migration_cancel,
+    legacy_private_checkpoint,
+    retain_paged_checkpoint_metadata,
+    retain_paged_checkpoint_local_legacy_revision,
+    retain_paged_checkpoint_local_custody_step,
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root
+);
+legacy_custody_cases!(
+    directory_checkpoint_legacy_private_custody_preserves_identity_reopens_and_blocks_migration_cancel,
+    legacy_private_directory, retain_paged_checkpoint_directory_metadata, retain_paged_checkpoint_directory_local_legacy_revision,
+    retain_paged_checkpoint_directory_local_custody_step, cancel_catalog_paged_checkpoint_directory_retention, release_catalog_paged_checkpoint_directory_root
+);
+
 macro_rules! local_custody_cases {
     ($test:ident, $constructor:ident, $metadata:ident, $step:ident, $cancel:ident, $release:ident) => {
         #[test]
@@ -189,11 +511,7 @@ fn directory_owner_proof_at_with_rooted_sources(
     mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
-    use mb_core::{
-        CatalogPackedSourceReader, CatalogPackedSourceRecord as R, CatalogPackingDirectoryBuilder,
-        CatalogPackingDirectoryRecord as Part, CatalogScope, CatalogSection,
-    };
-    let (original, mut intents) = checkpoint_owner_proof_at_with_rooted_sources(
+    let (original, intents) = checkpoint_owner_proof_at_with_rooted_sources(
         node,
         keys,
         private,
@@ -201,6 +519,22 @@ fn directory_owner_proof_at_with_rooted_sources(
         true,
         rooted_sources,
     );
+    directory_from_original(node, keys, original, intents)
+}
+
+fn directory_from_original(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    original: mb_store::CatalogQuorumPagedCheckpointIndex,
+    mut intents: Vec<mb_store::CatalogIntent>,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    use mb_core::{
+        CatalogPackedSourceReader, CatalogPackedSourceRecord as R, CatalogPackingDirectoryBuilder,
+        CatalogPackingDirectoryRecord as Part, CatalogScope, CatalogSection,
+    };
     let header = original.certificate().checkpoint;
     let trust = original.trust().clone();
     let scope = CatalogScope::Guild {
@@ -632,6 +966,69 @@ fn checkpoint_owner_proof_at_with_rooted_sources(
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
+    checkpoint_owner_proof_at_with_legacy_private(
+        node,
+        keys,
+        private,
+        expires,
+        budgeted,
+        rooted_sources,
+        false,
+    )
+}
+
+fn legacy_private_checkpoint(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    checkpoint_owner_proof_at_with_legacy_private(
+        node,
+        keys,
+        false,
+        unix_seconds() + 600,
+        true,
+        false,
+        true,
+    )
+}
+
+fn legacy_private_directory(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    let (proof, intents) = legacy_private_checkpoint(node, keys);
+    directory_from_original(node, keys, proof, intents)
+}
+
+fn legacy_private_plaintext() -> Vec<u8> {
+    canonical_bytes(&crate::PrivateMetadata {
+        format_version: 3,
+        root_mode: 0o700,
+        root_modified_secs: 123,
+        root_modified_nanos: 456,
+        entries: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn checkpoint_owner_proof_at_with_legacy_private(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+    expires: u64,
+    budgeted: bool,
+    rooted_sources: bool,
+    legacy_private: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
     use mb_core::{
         CatalogBuilder, CatalogCheckpointAuthorityBuilder, CatalogCheckpointAuthorityRecord as R,
         CatalogCodingDirectoryBuilder, CatalogLegacyRevisionRef, CatalogPackedSectorBuilder,
@@ -671,13 +1068,25 @@ fn checkpoint_owner_proof_at_with_rooted_sources(
         },
     );
     node.install_guild_event(rotate).unwrap();
-    let bytes = vec![91; mb_core::V1_SECTOR_SIZE];
-    let commitment = mb_core::merkle_commit(&bytes).unwrap();
-    let target = SectorRef {
-        id: [193; 32],
-        root: sector_root(&bytes),
-        logical_len: mb_core::V1_SECTOR_SIZE as u32,
+    let (target, bytes) = if legacy_private {
+        mb_core::encrypted_sector(
+            &keys[0].guild_data_key(&guild),
+            [193; 32],
+            &legacy_private_plaintext(),
+        )
+        .unwrap()
+    } else {
+        let bytes = vec![91; mb_core::V1_SECTOR_SIZE];
+        (
+            SectorRef {
+                id: [193; 32],
+                root: sector_root(&bytes),
+                logical_len: mb_core::V1_SECTOR_SIZE as u32,
+            },
+            bytes,
+        )
     };
+    let commitment = mb_core::merkle_commit(&bytes).unwrap();
     let root_id = Uuid::from_u128(194);
     let mut revision = UserRevision {
         format_version: 4,

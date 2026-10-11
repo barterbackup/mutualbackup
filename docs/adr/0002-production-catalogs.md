@@ -5568,3 +5568,31 @@ audits pass. Retiring exactly the superseded `515d1af` debug archive reclaims
 qualified executables, 29 older archived paths, 14 auxiliary uncommitted files
 and all 10 installed roots are preserved. The post-commit Git-tree/code/binary
 and preservation audit binds the qualification to the committed source.
+
+### 2026-10-11 — Original legacy private custody under paged checkpoints
+
+Bind existing retained legacy private conversions to their original checkpoint identities in both public layouts. Keep the original signed legacy body and revision ID; borrow the separately published conversion, bootstrap and native/source pins. Paired 1,024-byte dependencies bind the complete original reference, converted bundle and active migration journal fingerprint. An independently updated 32-byte pin count prevents a damaged last backlink from permitting cancellation. Checkpoint and journal cancellation remain serialized with acquisition and bounded retirement. Shared admission includes legacy body reads, journal/private/bootstrap custody and all dependency/counter rows; complete local custody counts paged and legacy dependencies separately.
+
+Two new Node fixtures use real authenticated legacy metadata and provision every original local information assignment. They cover original body preservation, complete EOF, replay/reopen with unusable flat state, shared owners, missing paired and last reverse pins, oversized journals, actor binding, budget refusal and actual-current changes during acquisition and retirement. Existing migration data/Git and native cases remain part of full qualification. The bridge is local acquisition; fixed legacy groups, full legacy migration authority integration, distributed availability/current activation, full quotas/admission, normal production and seed-only recovery remain open. Normal paged producers remain disabled. Hardware qualification remains user-deferred.
+
+Preliminary logs are separate: a mutable test binding was corrected at compile time; the first runtime fixture lacked the mandatory format-three Merkle migration authority and correctly failed before bridge acquisition. Final fixtures use the existing signed-Merkle format. No production authority, bounds or test deadlines were weakened.
+
+Frozen formatting, strict locked workspace/all-target Clippy, all-target
+compilation, four debug programs, the complete ordinary workspace and both
+provisioned Btrfs recovery cases pass: 1,376 distinct tests
+in 1,378 executions, including 400 Store and 541 Node.
+Evidence: `/tmp/mb-m6-legacy-private-custody-p0cko6en`. Targets run sequentially with four test threads
+and unchanged deadlines. The original 32 MiB per-legacy-envelope bound remains
+in force; this bridge does not claim paged fairness for legacy envelopes.
+121 other ignored cases and fresh installed-artifact qualification remain open;
+dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+Independent source/binary/exact-inventory, native-cleanup and preservation audits
+pass. Exact retirement of the superseded `7dcc284` debug archive and the
+preliminary Node-only executable reclaims 10.42 GiB and leaves
+47.40 GiB allocated in `target`. Current qualified executables, 29 older
+archived paths, 14 auxiliary WIP files and all 10 installed roots are preserved.
+The post-commit audit binds the qualified code and executable inventory to the
+committed tree. Complete enclosing activation, fixed legacy migration, full
+metadata/WAL/index/scratch/traversal and physical quotas, normal producers and
+seed-only recovery, remaining bulk consumers and the R5/R7 gates remain open.
