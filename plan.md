@@ -1371,7 +1371,7 @@ restart; a valid-history regression reproduces the former skip and preserves
 the original proposal/signatures and full-signature requirement. The cleanup
 check also preserves that exact unfinished Add instead of treating its absent
 group as forgotten; explicit replan markers remain enforced. The original
-stall diagnosis, complete fault matrix and current installed artifact gates
+stall diagnosis, complete fault matrix and remaining installed artifact gates
 remain open; see R5 in `TODO.md`.
 
 Existing paged data can now enter retained-source quota policy through a bounded
@@ -1390,8 +1390,23 @@ original certificate and requested page. Frozen qualification passes all ordinar
 workspace targets and both provisioned Btrfs cases (1351 distinct tests), with
 23 unchanged qualified binaries. This enables retained candidate transport;
 normal producers, complete admission/distributed readiness, atomic activation,
-current installed artifacts and deferred dense/platform gates remain open.
+the remaining installed-artifact matrix and deferred dense/platform gates remain
+open.
 See the retained public transport item in `TODO.md` and ADR 0002.
+
+The installed Linux runtime and Git alias on `7d0edb3` now pass packaging,
+ordinary process/raw-path/stock-Git checks, five-daemon seed recovery, and two
+fresh real relay-signer partition/coordinator-crash runs: 27 distinct process
+cases in 28 executions plus three Git packaging scenarios. Both fault runs
+cryptographically verify the original stopped-catalog signatures and transcript,
+then require the same event with all five original signers before commit.
+All 320 source files match the immutable Nix build input; wrappers, static
+payloads, alias and frozen drivers remain unchanged, and native/network cleanup
+is verified. The earlier 1,351-case workspace result retains identical code
+inputs and all 23 binary hashes. See R7 in `TODO.md` and ADR 0002 for the exact
+scope and `/tmp/mb-m6-installed-7d0edb3-c4pmnqci` evidence.
+The historical stall diagnosis, mandatory CI integration of the fault case,
+remaining release matrix and user-deferred dense/platform gates remain open.
 
 ### Production corrections from the 2026-10-05 source review
 

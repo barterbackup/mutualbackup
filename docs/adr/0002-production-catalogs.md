@@ -5257,6 +5257,49 @@ source/binary manifests and exact passing/ignored inventories are retained in
 
 This closes retained public transport. Full enclosing resource/metadata/physical
 admission, private and distributed payload availability, normal capture/packing/
-checkpoint/retention/seed recovery, atomic activation and current installed
-artifact qualification remain required. Dense 1 TiB and native Windows/macOS
+checkpoint/retention/seed recovery, atomic activation and the remaining installed
+artifact matrix remain required. Dense 1 TiB and native Windows/macOS
 qualification remain deferred at the user's request.
+
+## Installed recovery and signature-retry qualification (2026-10-11)
+
+The pinned Nix musl release runtime and optional Git alias built from `7d0edb3`
+pass the current installed Linux process slice. All 320 tracked source files
+match the immutable Nix source copied for this build. The runtime and alias have
+separate retained GC roots; older qualified roots remain preserved.
+
+All three isolated-PATH Git packaging scenarios, 23 ordinary process tests,
+raw Unix paths, the stock-Git bridge and five-daemon topology/seed recovery pass.
+The baseline completes in 812.01 seconds. Two further fresh complete
+topology runs partition the relay-only signer after coding-signature dispatch
+and abruptly crash the coordinator after four durable signatures. An independent
+complete stopped DB/WAL copy verifies all four original signatures, the proposal
+lock and bounded original coding transcript. Original catalog/WAL/SHM/key bytes
+remain unchanged. Restart resumes the same event and attempt, and the exact
+event must install with all five original authentic signers before backup commit.
+The runs have different correlated request IDs. No daemon interruption hook is
+used. This qualifies one controlled fault scenario twice, not the full fault
+matrix or the cause of the historical `3155689` outlier.
+
+There are 27 distinct Rust process cases in 28 positive executions, with the three
+packaging scenarios recorded separately. Live daemon identities match the exact
+installed static payload. Independent final audits verify all 320 source hashes,
+eight wrappers/payloads, the Git alias and two frozen driver hashes, and restored
+network/forwarding plus mount/loop/image cleanup. The earlier 1,351-case workspace
+result is retained only after verifying identical code inputs and all 23 qualified
+binary hashes; those suites were not rerun for this installed slice. Cargo's
+package-only driver build temporarily rebound four shared debug launchers. Their
+exact original qualified artifacts remained intact in the dependency directory
+and were restored before reusing the result; all 19 original test drivers stayed
+unchanged. The binding audit records both original and rebuilt artifacts.
+Auxiliary uncommitted work and older installed roots remain preserved. Evidence,
+exact case inventory, private peer logs and build/qualification/audit drivers are under
+`/tmp/mb-m6-installed-7d0edb3-c4pmnqci`. A documentation-only successor records
+this evidence; the source and candidate qualified here remain exactly `7d0edb3`.
+
+R5's historical stall diagnosis and complete fault matrix remain open. The two
+fault runs still need mandatory packaged CI integration. R7's remaining native,
+upgrade, multi-volume, private-Tor and platform matrix, full enclosing metadata/
+resource/physical admission, normal paged producers and seed recovery, and atomic
+activation remain required. Dense 1 TiB and native Windows/macOS qualification
+remain deferred at the user's request.

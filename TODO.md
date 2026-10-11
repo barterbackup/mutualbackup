@@ -3419,8 +3419,8 @@ and native-platform gates remain open.
     This completes retained public transport, not normal producer activation or
     current/protected advertisement. Complete enclosing admission/quotas,
     private/distributed payload availability, activation/retirement, normal
-    capture/retention/seed recovery, current installed artifacts and the deferred
-    dense 1 TiB/native Windows/macOS qualification remain open.
+    capture/retention/seed recovery, the remaining installed-artifact matrix and
+    the deferred dense 1 TiB/native Windows/macOS qualification remain open.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
@@ -3797,6 +3797,34 @@ and native-platform gates remain open.
     retries/partitions. R5 and the remaining R7 native/upgrade/multi-volume,
     private-Tor, platform and dense retained-capacity matrix remain open.
 
+  - [x] Qualify the installed Linux runtime and Git alias on `7d0edb3`, including
+    two fresh relay-signer partition and coordinator-crash runs. The pinned Nix
+    musl release build succeeds; all 320 tracked source files match its immutable
+    Nix source. All three isolated-PATH Git packaging scenarios, 23 ordinary
+    process cases, raw Unix paths, the stock-Git bridge and five-daemon topology/
+    seed recovery pass. The baseline passes in 812.01 seconds.
+    Both interruption runs verify the four original signatures, proposal lock
+    and coding transcript from a separate complete stopped DB/WAL copy, then
+    require the same event/attempt installed with all five original signatures
+    before backup commits. Original stopped inputs remain unchanged. Different
+    request IDs establish two fresh attempts. This is 27 distinct process cases
+    in 28 positive executions, plus the three Git packaging scenarios.
+    Independently observed live daemons match the installed static payload;
+    source, eight wrappers/payloads, the Git alias and both frozen test drivers
+    remain unchanged. Network/forwarding, mount, loop and image cleanup is
+    verified. The earlier 1,351-test ordinary-workspace/native qualification is
+    retained after rechecking identical code inputs and all 23 qualified binary
+    hashes; it was not rerun for this artifact slice. Cargo driver compilation
+    temporarily rebound four shared debug launchers; their exact qualified
+    dependency artifacts remained intact and were restored before evidence
+    reuse. All 19 original workspace test drivers remained unchanged. Evidence,
+    exact case inventory, private peer logs and independent audits are retained under
+    `/tmp/mb-m6-installed-7d0edb3-c4pmnqci`. The historical
+    `3155689` stall diagnosis, complete fault matrix and remaining R7 native/
+    upgrade/multi-volume/private-Tor/platform gates remain open. These fault
+    runs still need inclusion in the mandatory packaged CI runner. Dense 1 TiB
+    and native Windows/macOS qualification remain deferred at the user's request.
+
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
   source-loss matrix on the release source. Record repeated topology evidence
@@ -3992,10 +4020,10 @@ and native-platform gates remain open.
     post-commit audit binds the inputs to the commit.
 
     This qualifies one repeated controlled fault scenario on debug source. The
-    original 3155689 stall diagnosis, complete R5 fault matrix and current
-    installed-artifact qualification remain open. It does not enable normal paged
-    producers or close R1/R2/R3/R5/R7 or Milestone 6; dense 1 TiB and native
-    Windows/macOS qualification remain deferred.
+    original 3155689 stall diagnosis and complete R5 fault matrix remain open.
+    The installed Linux slice is separately qualified under R7. It does not enable
+    normal paged producers or close R1/R2/R3/R5/R7 or Milestone 6; dense 1 TiB
+    and native Windows/macOS qualification remain deferred.
 
   Existing investigation and validation record:
 
