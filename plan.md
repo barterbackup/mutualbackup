@@ -5425,3 +5425,60 @@ qualification remain open. Complete R3 policy, distributed availability/current
 activation, fixed legacy coding and remaining bulk consumers, normal paged
 production/retention/seed recovery and R1/R5/R7 software requirements remain open.
 Dense 1 TiB and native Windows/macOS gates remain user-deferred.
+
+### All-table logical database admission (2026-10-11)
+
+An explicitly declared DatabaseRecordQuota covers all seven Control tables and
+all three Parity tables: metadata, every protocol kind, operations, checkpoint
+locks/heads/pages, recovery shards, staged/ready parity, acknowledgements and
+preallocated coding reservations. Accounted bytes charge stored text/BLOB byte
+lengths, eight bytes per integer and primary-index locator, duplicated
+primary-key bytes, a possible partial-index key reserved for every protocol
+row, a 32-byte row charge, and a 1 KiB counter/guard reservation. This
+definition does not bound SQL schema text, database/index page allocation, WAL,
+journals, scratch, filesystem allocation or traversal work.
+
+Persistent AFTER triggers account only actual writes, including existing open
+connections. INSERT, UPDATE, DELETE and REPLACE participate in the enclosing
+SQL transaction; quota failure rolls back a streamed batch. Guarded exact
+readback rejects ignored/reverted counters, changed limits and tampered guard
+values. Incremental BLOB writes use previously charged fixed-length
+reservations.
+
+New stores and legacy stores remain unconfigured until local policy explicitly
+requests adoption. An IMMEDIATE transaction installs the canonical tables,
+triggers and cursor. Adoption freezes ordinary writes and advances at most 128
+row-length headers per transaction across every table using native byte-length
+queries that do not materialize large text/BLOB cells, including negative
+rowids. It resumes across reopen, charges original data without rewriting it,
+and reaches ACTIVE only at every table's EOF. Incomplete adoption can be
+aborted; an active quota can be resized within current usage. Read-only and
+writable openers reject incomplete/malformed trigger schemas or missing
+accounting.
+
+Node exposes explicit control and per-volume policy entry points, resumes an
+interrupted adoption before startup reconciliation, and aborts a newly refused
+adoption without leaving normal writes frozen. Existing scopes for page and
+retained-source quotas continue to apply. Both provisioned native migration and
+source-loss recovery fixtures exercise declared all-table quotas. The existing
+8,193 x 64 KiB atomic-writer regression now runs under a declared 1 GiB logical
+quota, preserving supported writes whose committed WAL exceeds 512 MiB.
+
+Frozen qualification passes 1,392 distinct tests: 194 Core, 409 ordinary Store,
+117 Git, 547 Node, the explicit bulk case and both provisioned Btrfs recovery
+cases, plus the remaining workspace targets. Format, strict locked
+workspace/all-targets Clippy, compilation and all four debug builds pass. The
+large batch uses 531.41 MiB committed WAL and 26.68 MiB peak process RSS under
+its declared quota. All 330 frozen inputs, 327 code/dependency inputs and 23
+exact executables are audited. 121 other ignored cases remain unexecuted. Exact
+superseded-inode retirement reclaims 9.95 GiB; target uses 47.42 GiB. Current
+binaries/aliases, 8 unchanged shared inodes, 29 older archived paths, 14
+auxiliary WIP files and 10 installed roots are preserved. Evidence:
+`/tmp/mb-m6-all-record-quota-final-0r1ucce3`.
+
+This component is logical data/index-key admission, not the complete R3 single-
+owner upper bound. The full enclosing metadata, SQL/index/WAL/scratch/traversal
+and physical policy, distributed readiness/current ownership, complete legacy
+joins, normal paged producers/retention/seed recovery, R5 and fresh installed
+R7 qualification remain open. Normal paged producers remain disabled. The real
+dense 1 TiB and native Windows/macOS gates remain user-deferred.

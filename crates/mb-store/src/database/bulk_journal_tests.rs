@@ -17,6 +17,15 @@ fn streamed_atomic_batch_above_512_mib_preserves_rollback_reopen_and_reader_snap
     writer
         .put_record("bulk", &first, b"previously committed")
         .unwrap();
+    writer
+        .begin_record_quota_adoption(DatabaseRecordQuota {
+            max_rows: RECORDS + 1024,
+            max_accounted_bytes: 1024 * 1024 * 1024,
+        })
+        .unwrap();
+    while writer.resume_record_quota_adoption().unwrap().state != DatabaseRecordQuotaState::Active {
+    }
+    let quota_before = writer.record_quota_usage().unwrap().unwrap();
     let reader = ControlStore::open_existing_read_only_with_key(&path, &key).unwrap();
     reader.connection.execute_batch("BEGIN").unwrap();
     assert_eq!(
@@ -48,6 +57,7 @@ fn streamed_atomic_batch_above_512_mib_preserves_rollback_reopen_and_reader_snap
         "SQL admission cut off a supported batch before its producer completed"
     );
     assert!(writer.connection.is_autocommit());
+    assert_eq!(writer.record_quota_usage().unwrap(), Some(quota_before));
     assert_eq!(
         writer.get_record("bulk", &first).unwrap().unwrap(),
         b"previously committed"

@@ -1405,6 +1405,15 @@ impl Node {
         #[cfg(not(target_os = "linux"))]
         let (mut control, control_database_key) =
             crate::volume::open_control_store(&data_dir, &keys)?;
+        // Incomplete quota adoption freezes ordinary writes. Resume the durable
+        // rowid cursor before startup reconciliation; each step is bounded and
+        // committed independently, so interruption does not restart a scan.
+        while control
+            .record_quota_usage()?
+            .is_some_and(|usage| usage.state == mb_store::DatabaseRecordQuotaState::Adopting)
+        {
+            control.resume_record_quota_adoption()?;
+        }
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
@@ -1428,6 +1437,40 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Declare a logical quota over all control tables and their index keys.
+    /// This is not a filesystem, WAL or scratch allocation budget. Existing
+    /// records are adopted in bounded, independently committed steps; restart
+    /// completes an interrupted adoption before ordinary startup writes.
+    pub fn configure_control_record_quota(
+        &mut self,
+        quota: mb_store::DatabaseRecordQuota,
+    ) -> Result<mb_store::DatabaseRecordQuotaUsage> {
+        let was_unconfigured = self.control.record_quota_usage()?.is_none();
+        let result = (|| {
+            let mut usage = self.control.begin_record_quota_adoption(quota)?;
+            while usage.state == mb_store::DatabaseRecordQuotaState::Adopting {
+                usage = self.control.resume_record_quota_adoption()?;
+            }
+            Ok(usage)
+        })();
+        if result.is_err() && was_unconfigured && self.control.record_quota_usage()?.is_some() {
+            self.control
+                .abort_record_quota_adoption()
+                .context("failed to abort incomplete control record quota adoption")?;
+        }
+        result
+    }
+
+    /// Apply an independently declared logical record quota to a local parity
+    /// volume. Payload reservations and cached acknowledgements are included.
+    pub fn configure_volume_record_quota(
+        &mut self,
+        volume_id: Uuid,
+        quota: mb_store::DatabaseRecordQuota,
+    ) -> Result<mb_store::DatabaseRecordQuotaUsage> {
+        self.volumes.configure_record_quota(volume_id, quota)
     }
 
     pub fn keys(&self) -> &KeyMaterial {
@@ -15254,6 +15297,157 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
 
+    fn record_quota_test_endpoints(node: &Node) -> Vec<String> {
+        vec![format!(
+            "/ip4/127.0.0.1/udp/39001/quic-v1/p2p/{}",
+            node.keys.node_id().libp2p_peer_id().unwrap()
+        )]
+    }
+
+    #[test]
+    fn normal_node_writes_consume_declared_control_record_quota_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state");
+        let seed = Seed::from_bytes([181; 32]);
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        node.configure_failure_domain("quota-test").unwrap();
+        let generous = mb_store::DatabaseRecordQuota {
+            max_rows: 100_000,
+            max_accounted_bytes: 1024 * 1024 * 1024,
+        };
+        let baseline = node.configure_control_record_quota(generous).unwrap();
+        let full = node
+            .configure_control_record_quota(mb_store::DatabaseRecordQuota {
+                max_rows: baseline.rows,
+                max_accounted_bytes: baseline.accounted_bytes,
+            })
+            .unwrap();
+        let endpoints = record_quota_test_endpoints(&node);
+        let error = node.create_guild(endpoints.clone()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("database record quota exhausted"),
+            "{error:#}"
+        );
+        assert_eq!(node.control.record_quota_usage().unwrap(), Some(full));
+        assert!(node.guild_summary().unwrap().is_none());
+        node.configure_control_record_quota(generous).unwrap();
+        let guild = node.create_guild(endpoints).unwrap();
+        let after = node.control.record_quota_usage().unwrap().unwrap();
+        assert!(after.rows > baseline.rows);
+        assert!(after.accounted_bytes > baseline.accounted_bytes);
+        drop(node);
+        let node = Node::open(&path, seed).unwrap();
+        assert_eq!(
+            node.guild_summary().unwrap().unwrap().guild_id,
+            guild.guild_id
+        );
+        assert_eq!(
+            node.control.record_quota_usage().unwrap().unwrap().state,
+            mb_store::DatabaseRecordQuotaState::Active
+        );
+    }
+
+    #[test]
+    fn node_startup_resumes_interrupted_record_quota_before_normal_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state");
+        let seed = Seed::from_bytes([182; 32]);
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        node.configure_failure_domain("quota-test").unwrap();
+        let volume_config = node.volumes.reader_configs().into_iter().next().unwrap();
+        let mut parity = volume_config.open().unwrap();
+        parity
+            .reserve_coding_attempt(&[1; 16], &[2; 32], 0, 65536, u64::MAX)
+            .unwrap();
+        parity
+            .begin_record_quota_adoption(mb_store::DatabaseRecordQuota {
+                max_rows: 100_000,
+                max_accounted_bytes: 1024 * 1024 * 1024,
+            })
+            .unwrap();
+        parity.resume_record_quota_adoption().unwrap();
+        drop(parity);
+        drop(volume_config);
+        for index in 0..300_u64 {
+            node.control
+                .put_record("retained-original", &index.to_be_bytes(), &[7; 1024])
+                .unwrap();
+        }
+        node.control
+            .begin_record_quota_adoption(mb_store::DatabaseRecordQuota {
+                max_rows: 100_000,
+                max_accounted_bytes: 1024 * 1024 * 1024,
+            })
+            .unwrap();
+        node.control.resume_record_quota_adoption().unwrap();
+        let partial = node.control.resume_record_quota_adoption().unwrap();
+        assert_eq!(partial.state, mb_store::DatabaseRecordQuotaState::Adopting);
+        drop(node);
+        let mut node = Node::open(&path, seed).unwrap();
+        let complete = node.control.record_quota_usage().unwrap().unwrap();
+        assert_eq!(complete.state, mb_store::DatabaseRecordQuotaState::Active);
+        assert!(complete.rows > partial.rows);
+        for index in [0_u64, 127, 299] {
+            assert_eq!(
+                node.control
+                    .get_record("retained-original", &index.to_be_bytes())
+                    .unwrap()
+                    .unwrap(),
+                vec![7; 1024]
+            );
+        }
+        node.create_guild(record_quota_test_endpoints(&node))
+            .unwrap();
+        let config = node.volumes.reader_configs().into_iter().next().unwrap();
+        let parity = config.open().unwrap();
+        let parity_usage = parity.record_quota_usage().unwrap().unwrap();
+        assert_eq!(
+            parity_usage.state,
+            mb_store::DatabaseRecordQuotaState::Active
+        );
+        assert_eq!(parity.used_bytes().unwrap(), 65536);
+        drop(parity);
+        let resized = node
+            .configure_volume_record_quota(
+                config.volume_id,
+                mb_store::DatabaseRecordQuota {
+                    max_rows: parity_usage.rows,
+                    max_accounted_bytes: parity_usage.accounted_bytes,
+                },
+            )
+            .unwrap();
+        assert_eq!(resized.rows, parity_usage.rows);
+    }
+
+    #[test]
+    fn refused_new_control_record_quota_does_not_leave_normal_node_writes_frozen() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path().join("state"), Seed::from_bytes([183; 32])).unwrap();
+        node.configure_failure_domain("quota-test").unwrap();
+        node.control
+            .put_record("retained-original", b"id", &[4; 65536])
+            .unwrap();
+        assert!(
+            node.configure_control_record_quota(mb_store::DatabaseRecordQuota {
+                max_rows: 1000,
+                max_accounted_bytes: 4096,
+            })
+            .is_err()
+        );
+        assert_eq!(node.control.record_quota_usage().unwrap(), None);
+        assert_eq!(
+            node.control
+                .get_record("retained-original", b"id")
+                .unwrap()
+                .unwrap(),
+            vec![4; 65536]
+        );
+        node.create_guild(record_quota_test_endpoints(&node))
+            .unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn discovery_maintenance_selects_catalog_without_replaying_git_or_rebinding_mount() {
@@ -18083,6 +18277,25 @@ pub(crate) mod tests {
         let seed = Seed::from_bytes([227; 32]);
         let state = temp.path().join("node");
         let mut node = Node::open(&state, seed.clone()).unwrap();
+        // Exercise actual capture, migration, retained custody and source-loss
+        // recovery under the database-wide policy, alongside scoped page and
+        // source quotas. This small sparse fixture does not establish a dense
+        // 1 TiB capacity bound.
+        let record_quota = mb_store::DatabaseRecordQuota {
+            max_rows: 1_000_000,
+            max_accounted_bytes: 4 * 1024 * 1024 * 1024,
+        };
+        node.configure_control_record_quota(record_quota).unwrap();
+        let volume_ids = node
+            .volumes
+            .reader_configs()
+            .iter()
+            .map(|config| config.volume_id)
+            .collect::<Vec<_>>();
+        for volume_id in volume_ids {
+            node.configure_volume_record_quota(volume_id, record_quota)
+                .unwrap();
+        }
         let certified = install_public_restore_fixture(&mut node, &seed);
         let guild = certified.value.guild_id;
         let signing = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);

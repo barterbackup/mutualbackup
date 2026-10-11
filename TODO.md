@@ -2553,6 +2553,39 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Add explicit logical quotas over all seven Control and all three
+      Parity tables, including original protocol records, journals, cached
+      payloads, operations, checkpoint/recovery rows, parity acknowledgements
+      and coding reservations. Charge stored text/BLOB bytes, integer cells,
+      row framing, primary keys/locators and a possible partial-index key
+      reservation for every protocol row, plus fixed counter/guard bookkeeping.
+      Persistent transactional AFTER triggers cover existing and newly opened
+      writers; exact readback rejects ignored/reverted counters, changed limits
+      and tampered guards. Late exhaustion rolls back a whole streamed batch.
+      Freeze writes during resumable adoption and scan at most 128 row-length
+      headers per transaction with native byte-length queries; test negative
+      rowids, reopen, abort, large-cell statement memory and existing UTF-16
+      databases. Node exposes explicit control/volume policy, resumes interrupted
+      adoption before startup reconciliation, and aborts newly refused adoption
+      without leaving normal writes frozen. Existing unconfigured stores retain
+      legacy behavior. Nine Store and three Node regressions pass; both native
+      retained/source-loss fixtures and the >512 MiB atomic writer run under
+      declared all-table quotas. This definition excludes SQL schema/page/index
+      allocation, WAL/journals, scratch, physical allocation and traversal work.
+      Complete enclosing budgets, the formal single-owner upper bound and
+      normal paged producers/recovery remain open; no producer is enabled.
+      Frozen qualification passes 1,392 distinct tests: 194 Core, 409 ordinary
+      Store, 117 Git, 547 Node, the explicit bulk case and both provisioned
+      Btrfs recovery cases, plus the remaining workspace targets. Format,
+      strict locked workspace/all-targets Clippy, compilation and all four
+      debug builds pass. The large batch uses 531.41 MiB committed WAL and
+      26.68 MiB peak process RSS under its declared quota. All 330 frozen
+      inputs, 327 code/dependency inputs and 23 exact executables are audited.
+      121 other ignored cases remain unexecuted. Exact superseded-inode
+      retirement reclaims 9.95 GiB; target uses 47.42 GiB. Current
+      binaries/aliases, 8 unchanged shared inodes, 29 older archived paths, 14
+      auxiliary WIP files and 10 installed roots are preserved. Evidence:
+      `/tmp/mb-m6-all-record-quota-final-0r1ucce3`.
     - [x] Qualify the existing streamed atomic SQL writer above a 512 MiB WAL
       before introducing database admission. One explicit Linux Store fixture
       streams 8,193 64 KiB values, rejects a late producer after the full batch,

@@ -24,6 +24,7 @@ mod directory;
 #[cfg(target_os = "linux")]
 mod preserved_read;
 mod read_snapshot;
+mod record_quota;
 mod scratch;
 #[cfg(target_os = "linux")]
 mod scratch_space;
@@ -75,6 +76,7 @@ pub use catalog::{
 pub use directory::{DatabaseDirectory, DatabaseOpenGuard};
 #[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;
+pub use record_quota::{DatabaseRecordQuota, DatabaseRecordQuotaState, DatabaseRecordQuotaUsage};
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
 #[cfg(target_os = "linux")]
 pub use scratch_space::physical_allocation_domain;
@@ -112,6 +114,8 @@ pub enum DatabaseError {
     NotReady,
     #[error("parity storage budget is exhausted")]
     CapacityExceeded,
+    #[error("database record quota is exhausted")]
+    RecordCapacityExceeded,
     #[error("immutable database state conflicts with the requested write")]
     Conflict,
     #[error("database kind or schema version is incompatible")]
@@ -4397,6 +4401,16 @@ fn require_exact_tables(
     connection: &Connection,
     expected: &[(&str, &str)],
 ) -> Result<(), DatabaseError> {
+    let quota_objects = record_quota::schema(connection)?;
+    let expected = expected
+        .iter()
+        .copied()
+        .chain(
+            quota_objects
+                .iter()
+                .map(|(name, sql)| (name.as_str(), sql.as_str())),
+        )
+        .collect::<Vec<_>>();
     let mut statement = connection.prepare(
         "SELECT type, name, coalesce(sql, '') FROM sqlite_schema
          WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
@@ -4412,12 +4426,14 @@ fn require_exact_tables(
     if actual.len() != expected.len() {
         return Err(DatabaseError::IncompatibleSchema);
     }
-    for (name, sql) in expected {
+    for (name, sql) in &expected {
         let Some((object_type, actual_sql)) = actual.get(*name) else {
             return Err(DatabaseError::IncompatibleSchema);
         };
         let expected_type = if sql.starts_with("CREATE INDEX") {
             "index"
+        } else if sql.starts_with("CREATE TRIGGER") {
+            "trigger"
         } else {
             "table"
         };
@@ -4427,7 +4443,7 @@ fn require_exact_tables(
             return Err(DatabaseError::IncompatibleSchema);
         }
     }
-    Ok(())
+    record_quota::validate(connection)
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
@@ -4586,6 +4602,7 @@ fn configure_encrypted_connection(
          PRAGMA cipher_memory_security = ON;
          PRAGMA trusted_schema = OFF;
          PRAGMA foreign_keys = ON;
+         PRAGMA recursive_triggers = ON;
          PRAGMA temp_store = MEMORY;
          PRAGMA secure_delete = ON;",
     )?;

@@ -450,6 +450,35 @@ pub(crate) struct StorageVolumes {
 }
 
 impl StorageVolumes {
+    pub(crate) fn configure_record_quota(
+        &mut self,
+        volume_id: Uuid,
+        quota: mb_store::DatabaseRecordQuota,
+    ) -> Result<mb_store::DatabaseRecordQuotaUsage> {
+        let volume = self
+            .volumes
+            .get_mut(&volume_id)
+            .context("unknown parity volume")?;
+        let store = volume
+            .store
+            .as_mut()
+            .context("parity volume is unavailable")?;
+        let was_unconfigured = store.record_quota_usage()?.is_none();
+        let result = (|| {
+            let mut usage = store.begin_record_quota_adoption(quota)?;
+            while usage.state == mb_store::DatabaseRecordQuotaState::Adopting {
+                usage = store.resume_record_quota_adoption()?;
+            }
+            Ok(usage)
+        })();
+        if result.is_err() && was_unconfigured && store.record_quota_usage()?.is_some() {
+            store
+                .abort_record_quota_adoption()
+                .context("failed to abort incomplete parity record quota adoption")?;
+        }
+        result
+    }
+
     pub(crate) fn open(
         data_dir: &Path,
         keys: Arc<KeyMaterial>,
@@ -3280,17 +3309,24 @@ fn open_volume_store(
             ParityStore::open_existing_with_key(&database_path, record.volume_id.as_bytes(), key)
         }
     };
-    match open(database_key) {
-        Ok(store) => Ok(store),
+    let mut store = match open(database_key) {
+        Ok(store) => store,
         Err(new_key_error) => {
             let legacy_key = keys.database_key(&legacy_volume_database_id(record.volume_id));
             let store = open(&legacy_key).with_context(|| {
                 format!("parity database rejected wrapped key: {new_key_error}")
             })?;
             store.rekey(database_key)?;
-            Ok(open(database_key)?)
+            open(database_key)?
         }
+    };
+    while store
+        .record_quota_usage()?
+        .is_some_and(|usage| usage.state == mb_store::DatabaseRecordQuotaState::Adopting)
+    {
+        store.resume_record_quota_adoption()?;
     }
+    Ok(store)
 }
 
 fn validate_manifest(manifest: &VolumeManifest, owner: NodeId) -> Result<()> {
