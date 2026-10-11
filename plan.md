@@ -1315,7 +1315,7 @@ uses that same live node rather than a parallel replacement. Pause for a focused
 source, runtime, security, and usability review at every gate before committing
 the next milestone's detailed scope.
 
-**Current position (2026-10-10):** Milestones 0 through 5 have recorded passing
+**Current position (2026-10-11):** Milestones 0 through 5 have recorded passing
 gates; Milestone 6 remains open. The accepted direction removes FUSE-backed
 guarded capture and Git integration. Prior milestone passes do not close the
 new non-FUSE production findings below. Continue native Git, source-backend,
@@ -1373,6 +1373,15 @@ check also preserves that exact unfinished Add instead of treating its absent
 group as forgotten; explicit replan markers remain enforced. The original
 stall diagnosis, complete fault matrix and current installed artifact gates
 remain open; see R5 in `TODO.md`.
+
+Existing paged data can now enter retained-source quota policy through a bounded
+initial ownership scan. Signed publication, original verified source facts,
+recipes and physical pins must reconcile; shared and cancelled owners are charged
+before the policy commits. Frozen source qualification passes 735 distinct cases,
+including both preconfigured and post-migration quota Btrfs recovery variants.
+See the quota adoption item in `TODO.md` and ADR 0002. Complete enclosing metadata/
+physical admission, normal paged producers and seed recovery, current installed
+artifacts and the user-deferred dense/platform gates remain open.
 
 ### Production corrections from the 2026-10-05 source review
 

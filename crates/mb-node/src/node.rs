@@ -17967,6 +17967,18 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn native_capture_migrates_and_restores_retained_paged_sparse_tree() {
+        native_retained_paged_sparse_tree_with_quota(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn native_existing_paged_sources_adopt_quotas_and_restore_after_source_loss() {
+        native_retained_paged_sparse_tree_with_quota(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_retained_paged_sparse_tree_with_quota(quotas_before_migration: bool) {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let root =
@@ -18030,20 +18042,19 @@ pub(crate) mod tests {
             .iter()
             .map(|source| (source.id, source.logical_len))
             .collect::<std::collections::BTreeMap<_, _>>();
-        node.control
-            .configure_catalog_retained_source_quota(mb_store::CatalogRetainedSourceQuota {
-                logical_bytes: unique_data.values().map(|length| u64::from(*length)).sum(),
-                sources: unique_data.len() as u64,
-                open_reservations: 8,
-            })
-            .unwrap();
-        node.control
-            .configure_catalog_retained_source_guild_quota(mb_store::CatalogRetainedSourceQuota {
-                logical_bytes: unique_data.values().map(|length| u64::from(*length)).sum(),
-                sources: unique_data.len() as u64,
-                open_reservations: 8,
-            })
-            .unwrap();
+        let data_quota = mb_store::CatalogRetainedSourceQuota {
+            logical_bytes: unique_data.values().map(|length| u64::from(*length)).sum(),
+            sources: unique_data.len() as u64,
+            open_reservations: 8,
+        };
+        if quotas_before_migration {
+            node.control
+                .configure_catalog_retained_source_quota(data_quota)
+                .unwrap();
+            node.control
+                .configure_catalog_retained_source_guild_quota(data_quota)
+                .unwrap();
+        }
         node.control
             .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
                 page_bytes: 1024 * 1024,
@@ -18053,6 +18064,31 @@ pub(crate) mod tests {
             .unwrap();
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, operation)
             .unwrap();
+        if !quotas_before_migration {
+            let original = unique_data
+                .keys()
+                .map(|sector| {
+                    node.control
+                        .paged_revision_data_source(operation, *sector)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            node.control
+                .configure_catalog_retained_source_quota(data_quota)
+                .unwrap();
+            node.control
+                .configure_catalog_retained_source_guild_quota(data_quota)
+                .unwrap();
+            for binding in original {
+                assert_eq!(
+                    node.control
+                        .paged_revision_data_source(operation, binding.source.sector.id)
+                        .unwrap(),
+                    Some(binding)
+                );
+            }
+        }
         let page_usage = node.control.catalog_storage_usage().unwrap().unwrap();
         assert_eq!(page_usage.open_reservations, 0);
         assert_eq!(page_usage.reserved_page_bytes, 0);

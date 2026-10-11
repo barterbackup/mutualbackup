@@ -7,6 +7,7 @@ use mb_core::{CatalogSectorRecord, V1_SECTOR_SIZE};
 use super::*;
 
 pub(super) mod admission;
+mod adoption;
 mod guild;
 
 const POLICY: &str = "catalog-retained-source-quota-v1";
@@ -544,11 +545,12 @@ pub(super) fn close(
 }
 
 impl ControlStore {
-    /// Enable only before any paged data binding exists. Existing flat data is
-    /// charged by explicit authenticated migration, not this configuration.
+    /// Enable after validating and charging existing paged data bindings,
+    /// including cancelled owners that still await cleanup. Existing flat data
+    /// is charged by explicit authenticated migration, not configuration.
     /// Grow-only resizing preserves every dataset's outstanding reservations
-    /// without a catalog/history scan. Rebuilding existing paged usage remains
-    /// a separate bounded adoption gate.
+    /// without a catalog/history scan. Initial adoption visits one bounded row
+    /// at a time in the policy writer; failure rolls back all accounting.
     pub fn configure_catalog_retained_source_quota(
         &self,
         quota: CatalogRetainedSourceQuota,
@@ -564,29 +566,12 @@ impl ControlStore {
             }
             replace(&tx, POLICY, KEY, &(1_u16, quota))?;
         } else {
-            let existing: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE
-                kind GLOB 'catalog-paged-data-source-v1/*'
-                OR kind GLOB 'catalog-retained-source-hold-owner-v1/*'
-                OR kind IN (?1, ?2, ?3, ?4, ?5, ?6))",
-                params![
-                    LEDGER,
-                    RESERVATION,
-                    SOURCE,
-                    DATASET,
-                    admission::PLAN,
-                    admission::HOLD
-                ],
-                |row| row.get(0),
-            )?;
-            if existing {
-                return Err(DatabaseError::NotReady.into());
-            }
             insert_exact(&tx, POLICY, KEY, &canonical_bytes(&(1_u16, quota))?)?;
             insert_exact(&tx, ENABLED, KEY, &[1])?;
             if policy(&tx)? != Some(quota) {
                 return Err(DatabaseError::Integrity.into());
             }
+            adoption::adopt(&tx, quota)?;
         }
         tx.commit()?;
         Ok(())

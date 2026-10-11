@@ -346,6 +346,91 @@ pub(super) fn read_source(
     }))
 }
 
+/// Validate pre-quota bindings using their original signed publication and
+/// retained validation facts. Quota checks are deliberately left to the caller
+/// rebuilding the ledger. The primary-key cursor owns only one bounded row.
+pub(super) fn for_each_retained_source(
+    connection: &Connection,
+    mut visit: impl FnMut(
+        Uuid,
+        CatalogScope,
+        CatalogBundleState,
+        &CatalogSectorRecord,
+    ) -> Result<(), CatalogStoreError>,
+) -> Result<(), CatalogStoreError> {
+    let prefix = "catalog-paged-data-source-v1/";
+    let mut after = None::<(String, Vec<u8>)>;
+    loop {
+        let cursor = if after.is_some() {
+            "AND (kind, record_id) > (?3, ?4)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT CASE WHEN length(CAST(kind AS BLOB)) = ?1 THEN kind END,
+                    CASE WHEN length(record_id) = 32 THEN record_id END,
+                    CASE WHEN length(bytes) <= ?2 THEN bytes END
+             FROM protocol_records WHERE kind GLOB 'catalog-paged-data-source-v1/*'
+             {cursor} ORDER BY kind, record_id LIMIT 1"
+        );
+        let read = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        };
+        let row = if let Some((kind, key)) = &after {
+            connection.query_row(
+                &sql,
+                params![prefix.len() + 32, RECORD_LIMIT, kind, key],
+                read,
+            )
+        } else {
+            // An absent cursor must also visit empty or malformed first keys.
+            connection.query_row(&sql, params![prefix.len() + 32, RECORD_LIMIT], read)
+        }
+        .optional()?;
+        let Some((kind, key, bytes)) = row else {
+            return Ok(());
+        };
+        let kind = kind.ok_or(DatabaseError::Integrity)?;
+        let key = key.ok_or(DatabaseError::Integrity)?;
+        let bytes = bytes.ok_or(DatabaseError::Integrity)?;
+        let suffix = kind.strip_prefix(prefix).ok_or(DatabaseError::Integrity)?;
+        let id = Uuid::parse_str(suffix).map_err(|_| DatabaseError::Integrity)?;
+        if id.is_nil() || id.simple().to_string() != suffix {
+            return Err(DatabaseError::Integrity.into());
+        }
+        let sector = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| DatabaseError::Integrity)?;
+        let catalog = paged_revision::snapshot(connection, id)?.ok_or(DatabaseError::Integrity)?;
+        let record = decode_record(connection, id, catalog.bundle.scope, &bytes, sector)?;
+        if native_validation::retained_source_record(
+            connection,
+            id,
+            sector,
+            catalog.state == CatalogBundleState::Cancelled,
+        )?
+        .as_ref()
+            != Some(&record.source)
+            || anchor_count(connection, record.anchor)?.is_none()
+            || PagedUserRevision::decode_signed(&catalog.bundle.descriptor)?
+                .value
+                .metadata
+                .sector
+                .id
+                == sector
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        visit(id, catalog.bundle.scope, catalog.state, &record.source)?;
+        after = Some((kind, key));
+    }
+}
+
 impl ControlStore {
     /// Visit one indexed owner of a data sector, including cancelled owners
     /// whose pins await cleanup. The cursor advances over tombstones without

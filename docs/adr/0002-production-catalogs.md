@@ -5159,3 +5159,58 @@ physical quotas and SQL/WAL/scratch budgets, normal paged capture/retention/seed
 recovery, topology/signature diagnosis and current installed-artifact gates remain
 open. Dense 1 TiB and native Windows/macOS qualification remain explicitly deferred;
 R1, R2/R3 and Milestone 6 remain open.
+
+
+## Initial retained-source quota adoption (2026-10-11)
+
+`configure_catalog_retained_source_quota` now accounts for paged data that was
+published before source limits were configured. Its initial immediate writer
+visits one bounded source binding at a time using the protocol-record primary
+key. SQL checks namespace, 32-byte key and record lengths before allocating
+row values; an absent initial cursor includes malformed empty first keys.
+Every owner must reconcile with the original signed paged descriptor,
+publication/root and Verified/Cancelled validation fences, exact original
+source facts, recipe/backlink and nonzero physical anchor pin. Existing local
+verified facts supply the source join; adoption does not reread payloads or
+create new checkpoint authority.
+
+The writer creates one source charge per exact dataset/source identity, with
+an owner count spanning published and cancelled bindings. A cancelled owner
+remains billed until actual binding cleanup. Each adopted bundle receives a
+closed zero-credit Published/Cancelled reservation, supporting the existing
+read, cancellation and final-owner cleanup routes without reserving retroactive
+credits. New migration can borrow adopted sources at the exact dataset/guild
+limit through the existing dependency holds. Original binding formats 1/2/3,
+generations, signed roots, recipes, anchor counts and original journals remain
+unchanged. Initial policy and all counters commit together; a late invalid row,
+exhausted byte/source limit or ignored/aborted accounting write rolls back every
+valid prefix. Existing enabled policies still resize only upward without a
+history scan, and missing accounting cannot become new zero usage.
+
+Five new Store regressions cover shared and cancelled custody, exact limits,
+original binding layouts/generations, read-only/reopen behavior, concurrent
+initial activation, independent datasets/guilds, authenticated substitution,
+malformed/empty/oversized rows, late orphan owners and SQL faults. The existing
+native recovery fixture retains its quota-before-migration case. A second case
+enables dataset/guild quotas after real native migration, checks unchanged
+bindings, then exercises shared admission, source loss, interrupted replacement,
+reopen and exact restoration. Both provisioned Btrfs cases pass in 29.85 and
+28.37 seconds, with mount/loop/image cleanup verified.
+
+Frozen debug-source qualification passes 192 Core, 385 ordinary Store, 117
+ordinary Git, 38 paged Node, the certified-writer migration entry point and the
+two native cases: 735 distinct tests. Formatting, strict locked workspace/
+all-targets Clippy, all-target test compilation and four debug builds pass.
+Source and eight qualified program/test-driver hashes remain unchanged. The
+logs, source/binary manifests, driver and complete passing-case inventory are
+retained in `/tmp/mb-m6-source-adoption-validation-7onfqby1`; the post-commit audit
+binds the code to the commit. Full Node/CLI suites and installed artifacts were
+not rerun; 26 Store and 64 Git cases remain ignored.
+
+Initial adoption performs a complete ownership scan under one writer; its total
+SQL/WAL work and headroom still require enclosing policy qualification. It counts
+unique non-hole logical data bytes, excluding private/bootstrap metadata,
+physical payload/coding, sparse lengths and aliases. Complete enclosing budgets,
+normal paged capture/packing/checkpoint/retention/seed consumers and generation
+floors remain open. The native fixture uses sparse logical 1 TiB; the user-deferred
+dense capacity and native Windows/macOS gates remain separate acceptance work.

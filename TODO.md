@@ -2922,6 +2922,38 @@ and native-platform gates remain open.
       private/bootstrap metadata, physical payload/coding, SQL/WAL, traversal,
       the complete enclosing policy, adoption of previously unaccounted paged
       data, normal producers and deferred capacity/platform gates remain open.
+    - [x] Adopt previously unaccounted paged data before enabling retained-source
+      quotas. Visit one SQL-bounded binding at a time under the immediate policy
+      writer, checking its original signed publication, verified source facts,
+      recipe/backlink and physical anchor pin. Charge each exact source once per
+      dataset and preserve every retained owner, including cancelled bindings
+      awaiting cleanup. Closed zero-credit reservations allow normal reads,
+      cancellation and final-owner release without opening retroactive loans.
+      Preserve original signed roots, binding bytes, generations and pin counts;
+      any over-limit, corrupt/orphan row or rejected SQL write rolls back the
+      entire activation. Missing old accounting still cannot reset an enabled
+      policy. Grow-only resizing keeps its existing scan-free behavior.
+      Five new Store regressions cover shared/cancelled ownership, exact byte/
+      source limits, original binding formats 1/2/3, preserved generations,
+      read-only/reopen behavior, concurrent enablement, separate datasets/guilds,
+      authenticated record substitution, empty/oversized/malformed keys and
+      rows, late invalid owners, and ignored/aborted accounting writes.
+      A second provisioned Btrfs case enables dataset/guild quotas after migration
+      and checks shared admission, source loss, interrupted repair, reopen and
+      exact native restoration. Both native variants pass (29.85s and 28.37s).
+      Frozen qualification passes 192 Core, 385 ordinary Store, 117 ordinary Git,
+      38 paged Node, the certified-writer migration case and both native cases:
+      735 distinct passes. Formatting, strict locked workspace/all-targets
+      Clippy, all-target test compilation and four debug program builds pass.
+      Source and eight qualified binary hashes match; native mount/loop/image
+      cleanup is verified. Evidence is retained under
+      `/tmp/mb-m6-source-adoption-validation-7onfqby1`.
+      This qualifies explicit quota adoption. Full Node/CLI suites and current
+      installed artifacts were not rerun; 26 Store and 64 Git cases remain ignored.
+      The native fixture uses sparse logical 1 TiB, without dense qualification.
+      Complete enclosing metadata/physical/SQL/WAL/scratch policy, normal paged
+      producers/retention/seed recovery, generation floors and the user-deferred
+      dense capacity/native Windows/macOS gates remain open.
   - [x] Join full/compact packing descriptors and source streams through a
     disposable encrypted index. Require a source-authority callback; reject
     duplicate/missing mappings, incomplete coverage, false virtual zeros and
