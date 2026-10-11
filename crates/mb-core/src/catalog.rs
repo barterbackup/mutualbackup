@@ -17,6 +17,7 @@ mod native_files;
 mod packed_sectors;
 mod packed_sources;
 mod packing_directory;
+mod path;
 mod privacy;
 mod range;
 mod records;
@@ -72,6 +73,7 @@ pub use packing_directory::{
     CatalogPackingDirectoryReader, CatalogPackingDirectoryRecord, CatalogPackingDirectoryRoot,
     CatalogPackingDirectorySummary,
 };
+pub use path::CatalogPagePath;
 pub use range::CatalogRangeReader;
 pub use records::{
     CATALOG_MAX_RECORDS, CATALOG_RECORD_BYTES, CatalogRecordBuilder, CatalogRecordReader,
@@ -505,6 +507,7 @@ pub struct CatalogReader {
     section: CatalogSection,
     root: CatalogPageRef,
     pending: Vec<CatalogPageRef>,
+    path: Vec<CatalogPageRef>,
     visited: u64,
     byte_len: u64,
     failed: bool,
@@ -523,6 +526,7 @@ impl CatalogReader {
             section,
             root,
             pending: vec![root],
+            path: Vec::with_capacity(usize::from(root.height) + 1),
             visited: 0,
             byte_len: 0,
             failed: false,
@@ -532,6 +536,15 @@ impl CatalogReader {
     pub fn next_leaf<E>(
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+    ) -> Result<Option<Vec<u8>>, CatalogStreamError<E>> {
+        self.next_leaf_with_path(&mut |path| fetch(*path.last().expect("nonempty catalog path")))
+    }
+
+    /// Fetch each page with its bounded authenticated root-to-page path. This
+    /// preserves the same traversal, EOF accounting and sticky failure fence.
+    pub fn next_leaf_with_path<E>(
+        &mut self,
+        fetch: &mut impl FnMut(&[CatalogPageRef]) -> Result<Vec<u8>, E>,
     ) -> Result<Option<Vec<u8>>, CatalogStreamError<E>> {
         if self.failed {
             return Err(CatalogError::Failed.into());
@@ -543,14 +556,24 @@ impl CatalogReader {
 
     fn next_inner<E>(
         &mut self,
-        fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,
+        fetch: &mut impl FnMut(&[CatalogPageRef]) -> Result<Vec<u8>, E>,
     ) -> Result<Option<Vec<u8>>, CatalogStreamError<E>> {
         while let Some(reference) = self.pending.pop() {
             self.visited += 1;
             if self.visited > self.root.page_occurrences {
                 return Err(CatalogError::Bounds.into());
             }
-            let bytes = fetch(reference).map_err(CatalogStreamError::Storage)?;
+            let depth = self
+                .root
+                .height
+                .checked_sub(reference.height)
+                .ok_or(CatalogError::InvalidPage)?;
+            self.path.truncate(usize::from(depth));
+            if self.path.len() != usize::from(depth) {
+                return Err(CatalogError::InvalidPage.into());
+            }
+            self.path.push(reference);
+            let bytes = fetch(&self.path).map_err(CatalogStreamError::Storage)?;
             let page = verify_page(reference, self.scope, self.section, &bytes)?;
             match page.body {
                 PageBody::Index(children) => self.pending.extend(children.into_iter().rev()),
@@ -614,6 +637,147 @@ mod tests {
         }
         let root = builder.finish(&mut sink).unwrap();
         (root, pages)
+    }
+
+    #[test]
+    fn catalog_paths_stream_across_branches_and_preserve_eof_and_failure_fences() {
+        let bytes = (0..CATALOG_LEAF_BYTES * (CATALOG_FANOUT + 2) + 1)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let (root, pages) = build(&bytes, 8191);
+        assert_eq!(root.height, 2);
+        let mut reader = CatalogReader::new(scope(), CatalogSection::GitGraph, root).unwrap();
+        let mut received = 0;
+        let mut calls = 0;
+        let mut fetch = |refs: &[CatalogPageRef]| {
+            calls += 1;
+            assert_eq!(refs[0], root);
+            assert!(refs.len() <= usize::from(root.height) + 1);
+            CatalogPagePath {
+                scope: scope(),
+                section: CatalogSection::GitGraph,
+                pages: refs.to_vec(),
+            }
+            .read(&mut |page| Ok::<_, &'static str>(pages[&page.hash].clone()))
+        };
+        while let Some(leaf) = reader.next_leaf_with_path(&mut fetch).unwrap() {
+            assert_eq!(leaf, bytes[received..received + leaf.len()]);
+            received += leaf.len();
+        }
+        assert_eq!(received, bytes.len());
+        assert!(reader.next_leaf_with_path(&mut fetch).unwrap().is_none());
+        assert_eq!(calls, root.page_occurrences);
+        let mut failed = CatalogReader::new(scope(), CatalogSection::GitGraph, root).unwrap();
+        assert!(matches!(
+            failed.next_leaf_with_path(&mut |_| Err("offline")),
+            Err(CatalogStreamError::Storage("offline"))
+        ));
+        assert!(matches!(
+            failed.next_leaf_with_path(&mut |_| -> Result<Vec<u8>, &str> {
+                panic!("failed traversal fetched again")
+            }),
+            Err(CatalogStreamError::Catalog(CatalogError::Failed))
+        ));
+    }
+
+    #[test]
+    fn catalog_paths_reject_unlinked_children_before_fetch_and_bound_decoding() {
+        let (root, mut pages) = build(&vec![7; CATALOG_LEAF_BYTES + 1], 4096);
+        let CatalogPageContents::Index(children) = root
+            .verify_page(scope(), CatalogSection::GitGraph, &pages[&root.hash])
+            .unwrap()
+        else {
+            panic!("index")
+        };
+        let (foreign, foreign_pages) = build(&[9], 1);
+        pages.extend(foreign_pages);
+        for next in [
+            foreign,
+            CatalogPageRef {
+                byte_len: children[0].byte_len - 1,
+                ..children[0]
+            },
+            CatalogPageRef {
+                encoded_len: children[0].encoded_len - 1,
+                ..children[0]
+            },
+        ] {
+            let path = CatalogPagePath {
+                scope: scope(),
+                section: CatalogSection::GitGraph,
+                pages: vec![root, next],
+            };
+            let mut calls = Vec::new();
+            assert!(
+                path.read(&mut |page| {
+                    calls.push(page);
+                    Ok::<_, ()>(pages[&page.hash].clone())
+                })
+                .is_err()
+            );
+            assert_eq!(calls, vec![root]);
+        }
+        let mut reference = children[1];
+        let mut refs = vec![reference];
+        for height in 1..=CATALOG_MAX_HEIGHT {
+            let (parent, bytes) = Page {
+                format_version: 1,
+                scope: scope(),
+                section: CatalogSection::GitGraph,
+                height,
+                body: PageBody::Index(vec![reference]),
+            }
+            .encode()
+            .unwrap();
+            pages.insert(parent.hash, bytes);
+            refs.insert(0, parent);
+            reference = parent;
+        }
+        let mut path = CatalogPagePath {
+            scope: scope(),
+            section: CatalogSection::GitGraph,
+            pages: refs,
+        };
+        let encoded = canonical_bytes(&path).unwrap();
+        let decoded: CatalogPagePath = decode_canonical(&encoded).unwrap();
+        assert_eq!(decoded, path);
+        assert_eq!(
+            path.read(&mut |page| Ok::<_, ()>(pages[&page.hash].clone()))
+                .unwrap(),
+            pages[&children[1].hash]
+        );
+        path.pages.push(children[0]);
+        assert!(decode_canonical::<CatalogPagePath>(&canonical_bytes(&path).unwrap()).is_err());
+        assert!(
+            path.read(&mut |_| -> Result<Vec<u8>, ()> { panic!("oversized path fetched") })
+                .is_err()
+        );
+        path.pages.clear();
+        assert!(
+            path.read(&mut |_| -> Result<Vec<u8>, ()> { panic!("empty path fetched") })
+                .is_err()
+        );
+        path.pages = vec![root, children[0]];
+        let mut corrupt = pages[&root.hash].clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut calls = 0;
+        assert!(
+            path.read(&mut |_| {
+                calls += 1;
+                Ok::<_, ()>(corrupt.clone())
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        path.scope = CatalogScope::Dataset {
+            guild_id: [1; 32],
+            owner: NodeId([2; 32]),
+            protected_root_id: Uuid::from_u128(88),
+        };
+        assert!(
+            path.read(&mut |page| Ok::<_, ()>(pages[&page.hash].clone()))
+                .is_err()
+        );
     }
 
     #[test]

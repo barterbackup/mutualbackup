@@ -2543,6 +2543,139 @@ impl P2pClient {
         Ok((total_pages, page_hash, bytes))
     }
 
+    async fn retained_paged_checkpoint_certificate_bytes(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        layout: mb_core::PagedCheckpointLayout,
+        owner_id: Uuid,
+        checkpoint_hash: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            !owner_id.is_nil() && checkpoint_hash != [0; 32],
+            "invalid paged checkpoint locator"
+        );
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetRetainedPagedCheckpointCertificate {
+                    guild_id,
+                    layout,
+                    owner_id,
+                    checkpoint_hash,
+                },
+            )
+            .await?;
+        let PeerResponse::RetainedPagedCheckpointCertificate { bytes } = response else {
+            bail!("peer returned the wrong retained paged checkpoint certificate response");
+        };
+        Ok(bytes)
+    }
+
+    /// Fetch the original candidate certificate and verify its exact identity
+    /// and quorum against independently supplied historical authority. This
+    /// does not prove body EOF, distributed custody or current activation.
+    pub async fn retained_paged_checkpoint_certificate(
+        &self,
+        peer: NodeId,
+        owner_id: Uuid,
+        checkpoint_hash: [u8; 32],
+        trust: &mb_core::PagedCheckpointTrust,
+        budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<mb_core::QuorumPagedCheckpoint> {
+        let bytes = self
+            .retained_paged_checkpoint_certificate_bytes(
+                peer,
+                trust.guild_id,
+                mb_core::PagedCheckpointLayout::Individual,
+                owner_id,
+                checkpoint_hash,
+            )
+            .await?;
+        let certificate = mb_core::QuorumPagedCheckpoint::decode_header(&bytes, trust, budget)?;
+        anyhow::ensure!(
+            certificate.hash()? == checkpoint_hash,
+            "paged checkpoint certificate identity changed"
+        );
+        Ok(certificate)
+    }
+
+    /// Directory counterpart with the same independent trust and identity checks.
+    pub async fn retained_paged_checkpoint_directory_certificate(
+        &self,
+        peer: NodeId,
+        owner_id: Uuid,
+        checkpoint_hash: [u8; 32],
+        trust: &mb_core::PagedCheckpointTrust,
+        budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<mb_core::QuorumPagedCheckpointDirectory> {
+        let bytes = self
+            .retained_paged_checkpoint_certificate_bytes(
+                peer,
+                trust.guild_id,
+                mb_core::PagedCheckpointLayout::Directory,
+                owner_id,
+                checkpoint_hash,
+            )
+            .await?;
+        let certificate =
+            mb_core::QuorumPagedCheckpointDirectory::decode_header(&bytes, trust, budget)?;
+        anyhow::ensure!(
+            certificate.hash()? == checkpoint_hash,
+            "paged checkpoint certificate identity changed"
+        );
+        Ok(certificate)
+    }
+
+    /// Read one public page using an authenticated path from a root in the
+    /// caller's independently verified checkpoint. The server checks durable
+    /// ownership and every edge; the client checks the exact requested page.
+    pub async fn retained_paged_checkpoint_public_page(
+        &self,
+        peer: NodeId,
+        layout: mb_core::PagedCheckpointLayout,
+        owner_id: Uuid,
+        checkpoint_hash: [u8; 32],
+        path: mb_core::CatalogPagePath,
+    ) -> Result<Vec<u8>> {
+        path.validate()?;
+        anyhow::ensure!(
+            !path.section.is_private(),
+            "private catalog pages cannot use public checkpoint transport"
+        );
+        anyhow::ensure!(
+            !owner_id.is_nil() && checkpoint_hash != [0; 32],
+            "invalid paged checkpoint locator"
+        );
+        let guild_id = match path.scope {
+            mb_core::CatalogScope::Guild { guild_id }
+            | mb_core::CatalogScope::Dataset { guild_id, .. } => guild_id,
+        };
+        let target = *path
+            .pages
+            .last()
+            .context("paged checkpoint path is empty")?;
+        let scope = path.scope;
+        let section = path.section;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetRetainedPagedCheckpointPage {
+                    guild_id,
+                    layout,
+                    owner_id,
+                    checkpoint_hash,
+                    path,
+                },
+            )
+            .await?;
+        let PeerResponse::RetainedPagedCheckpointPage { bytes } = response else {
+            bail!("peer returned the wrong retained paged checkpoint page response");
+        };
+        target.verify_page(scope, section, &bytes)?;
+        Ok(bytes)
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn ensure_filler(
         &self,

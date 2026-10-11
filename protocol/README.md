@@ -27,6 +27,17 @@ recipient and guild scope, request hash, freshness, authorization, frame and
 queue limits, and object-specific semantic bounds. Errors are capped at 4096
 UTF-8 bytes and carry a stable code plus a retryable flag.
 
+`GetRetainedPagedCheckpointCertificate` and `GetRetainedPagedCheckpointPage`
+read an exact published local metadata owner, selected by UUID, layout and
+original checkpoint hash. They use the historical-member recovery policy and
+read-only workers. The page path contains at most four authenticated references
+from an exact owned public root; every parent edge is verified in one local
+snapshot before the child is read. Responses are bounded to 32 KiB for the
+original certificate and 64 KiB for one encoded page. The client independently
+checks historical quorum and checkpoint identity, and authenticates each page
+against the requested reference. A retained candidate is not advertised as a
+current/protected checkpoint. Private file and Git plaintext are excluded.
+
 `RetireCodingAttempt` is a mutation addressed to the signed plan's delegator
 by its assigned coding coordinator. The delegator checks historical plan
 authority and arbitrates against accepted verifier evidence under its writer

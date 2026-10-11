@@ -1,6 +1,61 @@
 //! Shared original-authority and local private/READY custody for both public layouts.
 use super::*;
 
+macro_rules! custody_reads {
+    ($node:ty) => {
+        impl $node {
+            /// Original retained certificate; the caller must independently
+            /// verify its historical quorum, identity and complete body.
+            pub fn retained_paged_checkpoint_certificate(
+                &self,
+                guild_id: [u8; 32],
+                layout: mb_core::PagedCheckpointLayout,
+                id: Uuid,
+                checkpoint_hash: [u8; 32],
+            ) -> Result<Vec<u8>> {
+                self.control
+                    .catalog_retained_paged_checkpoint_certificate(
+                        layout,
+                        guild_id,
+                        id,
+                        checkpoint_hash,
+                    )?
+                    .context("paged checkpoint metadata owner is not published")
+            }
+
+            /// Fetch only public metadata reachable from this owner's exact
+            /// root. No private file or Git plaintext is served by this path.
+            pub fn retained_paged_checkpoint_public_page(
+                &self,
+                guild_id: [u8; 32],
+                layout: mb_core::PagedCheckpointLayout,
+                id: Uuid,
+                checkpoint_hash: [u8; 32],
+                path: &mb_core::CatalogPagePath,
+            ) -> Result<Vec<u8>> {
+                let path_guild = match path.scope {
+                    mb_core::CatalogScope::Guild { guild_id }
+                    | mb_core::CatalogScope::Dataset { guild_id, .. } => guild_id,
+                };
+                anyhow::ensure!(
+                    path_guild == guild_id,
+                    "paged checkpoint path belongs to another guild"
+                );
+                self.control
+                    .catalog_retained_paged_checkpoint_public_page(
+                        layout,
+                        id,
+                        checkpoint_hash,
+                        path,
+                    )?
+                    .context("paged checkpoint metadata owner is not published")
+            }
+        }
+    };
+}
+custody_reads!(Node);
+custody_reads!(NodeReader);
+
 macro_rules! custody {
     ($proof:ty, $retention:ty, $metadata:ident, $revision:ident, $payload:ident,
      $retain:ident, $retain_revision:ident, $retain_payload:ident) => {

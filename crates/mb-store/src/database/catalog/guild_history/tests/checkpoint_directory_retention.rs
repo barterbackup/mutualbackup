@@ -1,5 +1,7 @@
 use super::checkpoint_directories::{body_with_budget, certificate};
-use super::paged_checkpoint_retention::{retire_owner_captures, stage_owner_roots};
+use super::paged_checkpoint_retention::{
+    assert_owned_public_reads, retire_owner_captures, stage_owner_roots,
+};
 use super::*;
 use crate::database::catalog::paged_checkpoint_retention::Proof;
 use crate::database::catalog::retention_journal::{self as journal, Dependency};
@@ -177,7 +179,56 @@ fn directory_owner_reopens_and_preserves_every_nested_root_after_staging_and_sha
     for (scope, section, root) in &roots {
         control.catalog_page(*scope, *section, *root).unwrap();
     }
+    let layout = mb_core::PagedCheckpointLayout::Directory;
+    let hash = proof.certificate().hash().unwrap();
+    let certificate = canonical_bytes(proof.certificate()).unwrap();
+    let reader = ControlStore::open_existing_read_only_with_key(
+        &path,
+        &history.keys[0].database_key(crate::database::CONTROL_DATABASE_ID),
+    )
+    .unwrap();
+    reader
+        .with_read_only_snapshot(|| {
+            assert_owned_public_reads(
+                &reader,
+                layout,
+                second.id,
+                (history.state.guild_id, hash),
+                &certificate,
+                &roots,
+            );
+            Ok(())
+        })
+        .unwrap();
+    drop(reader);
     retire(&control, second.id);
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(
+                layout,
+                history.state.guild_id,
+                second.id,
+                hash
+            )
+            .unwrap()
+            .is_none()
+    );
+    let (scope, section, root) = roots[0];
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_public_page(
+                layout,
+                second.id,
+                hash,
+                &mb_core::CatalogPagePath {
+                    scope,
+                    section,
+                    pages: vec![root]
+                }
+            )
+            .unwrap()
+            .is_none()
+    );
     for (scope, section, root) in roots {
         assert!(control.catalog_page(scope, section, root).is_err());
     }

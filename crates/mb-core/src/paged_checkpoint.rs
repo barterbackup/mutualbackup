@@ -23,6 +23,14 @@ pub const PAGED_GUILD_CHECKPOINT_DOMAIN: &[u8] = b"mutualbackup/paged-guild-chec
 const HASH_DOMAIN: &str = "mutualbackup paged guild checkpoint body v1";
 const MEMBERS: usize = 256;
 
+/// Select the original individual packing roots or their directory envelope.
+/// This is a transport discriminator, not checkpoint or membership authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PagedCheckpointLayout {
+    Individual,
+    Directory,
+}
+
 mod directory;
 pub use directory::{
     PAGED_GUILD_CHECKPOINT_DIRECTORY_VERSION, PagedGuildCheckpointDirectory,

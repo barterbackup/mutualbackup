@@ -2,6 +2,8 @@ use super::*;
 use crate::node::guild_authority::tests::{event, fixture, relabel};
 use crate::node::tests::test_coding_transcript;
 
+mod transport;
+
 fn directory_owner_proof(
     node: &mut Node,
     keys: &[KeyMaterial],
@@ -22,12 +24,31 @@ fn directory_owner_proof_at(
     mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
+    directory_owner_proof_at_with_rooted_sources(node, keys, private, expires, false)
+}
+
+fn directory_owner_proof_at_with_rooted_sources(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+    expires: u64,
+    rooted_sources: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
     use mb_core::{
         CatalogPackedSourceReader, CatalogPackedSourceRecord as R, CatalogPackingDirectoryBuilder,
         CatalogPackingDirectoryRecord as Part, CatalogScope, CatalogSection,
     };
-    let (original, mut intents) =
-        checkpoint_owner_proof_at_with_budgeted_authority(node, keys, private, expires, true);
+    let (original, mut intents) = checkpoint_owner_proof_at_with_rooted_sources(
+        node,
+        keys,
+        private,
+        expires,
+        true,
+        rooted_sources,
+    );
     let header = original.certificate().checkpoint;
     let trust = original.trust().clone();
     let scope = CatalogScope::Guild {
@@ -279,6 +300,7 @@ fn local_private_checkpoint_revision(
     guild: [u8; 32],
     root: Uuid,
     parent: [u8; 32],
+    rooted_sources: bool,
 ) -> (
     SignedRecord<mb_core::PagedUserRevision>,
     Vec<(mb_core::CatalogSectorRecord, Vec<u8>)>,
@@ -359,6 +381,11 @@ fn local_private_checkpoint_revision(
         sources.push(record, &mut sink).unwrap();
     }
     let sources = sources.finish(&mut sink).unwrap();
+    let sources = if rooted_sources {
+        transport::wrap_sources(node, intents[2], sources)
+    } else {
+        sources
+    };
     let signed = mb_core::PagedUserRevision {
         format_version: mb_core::PAGED_USER_REVISION_VERSION,
         guild_id: guild,
@@ -435,6 +462,20 @@ fn checkpoint_owner_proof_at_with_budgeted_authority(
     private: bool,
     expires: u64,
     budgeted: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    checkpoint_owner_proof_at_with_rooted_sources(node, keys, private, expires, budgeted, false)
+}
+
+fn checkpoint_owner_proof_at_with_rooted_sources(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+    expires: u64,
+    budgeted: bool,
+    rooted_sources: bool,
 ) -> (
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
@@ -522,6 +563,7 @@ fn checkpoint_owner_proof_at_with_budgeted_authority(
             guild,
             root_id,
             revision.value.hash().unwrap(),
+            rooted_sources,
         );
         for (record, bytes) in sources {
             inputs.insert(record.sector.id, (record, bytes));

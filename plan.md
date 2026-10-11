@@ -1383,6 +1383,16 @@ See the quota adoption item in `TODO.md` and ADR 0002. Complete enclosing metada
 physical admission, normal paged producers and seed recovery, current installed
 artifacts and the user-deferred dense/platform gates remain open.
 
+Retained paged checkpoint certificates and public pages now have a bounded,
+authorized peer-read path. Exact local ownership and authenticated root-to-page
+edges are checked in a query-only snapshot; clients independently verify the
+original certificate and requested page. Frozen qualification passes all ordinary
+workspace targets and both provisioned Btrfs cases (1351 distinct tests), with
+23 unchanged qualified binaries. This enables retained candidate transport;
+normal producers, complete admission/distributed readiness, atomic activation,
+current installed artifacts and deferred dense/platform gates remain open.
+See the retained public transport item in `TODO.md` and ADR 0002.
+
 ### Production corrections from the 2026-10-05 source review
 
 These are the correction requirements; completed increments are recorded below.

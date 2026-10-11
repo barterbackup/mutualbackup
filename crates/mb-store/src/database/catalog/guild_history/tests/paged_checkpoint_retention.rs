@@ -25,6 +25,119 @@ pub(super) fn paged_owner_proof(
 
 type OwnerRoot = (CatalogScope, CatalogSection, CatalogPageRef);
 
+pub(super) fn assert_owned_public_reads(
+    control: &ControlStore,
+    layout: mb_core::PagedCheckpointLayout,
+    id: Uuid,
+    identity: ([u8; 32], [u8; 32]),
+    certificate: &[u8],
+    roots: &[OwnerRoot],
+) {
+    let (guild, hash) = identity;
+    let changes = control.connection.total_changes();
+    assert_eq!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(layout, guild, id, hash)
+            .unwrap()
+            .as_deref(),
+        Some(certificate)
+    );
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(layout, [231; 32], id, hash)
+            .is_err()
+    );
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(layout, guild, id, [232; 32])
+            .is_err()
+    );
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(
+                layout,
+                guild,
+                Uuid::from_u128(999_999),
+                hash
+            )
+            .unwrap()
+            .is_none()
+    );
+    let other = match layout {
+        mb_core::PagedCheckpointLayout::Individual => mb_core::PagedCheckpointLayout::Directory,
+        mb_core::PagedCheckpointLayout::Directory => mb_core::PagedCheckpointLayout::Individual,
+    };
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(other, guild, id, hash)
+            .unwrap()
+            .is_none()
+    );
+    for &(scope, section, root) in roots {
+        let path = mb_core::CatalogPagePath {
+            scope,
+            section,
+            pages: vec![root],
+        };
+        assert_eq!(
+            control
+                .catalog_retained_paged_checkpoint_public_page(layout, id, hash, &path)
+                .unwrap()
+                .unwrap(),
+            control.catalog_page(scope, section, root).unwrap()
+        );
+        assert!(
+            control
+                .catalog_retained_paged_checkpoint_public_page(layout, id, [232; 32], &path)
+                .is_err()
+        );
+        let mut reader = mb_core::CatalogReader::new(scope, section, root).unwrap();
+        let mut bytes = 0;
+        while let Some(leaf) = reader
+            .next_leaf_with_path(&mut |refs| {
+                control
+                    .catalog_retained_paged_checkpoint_public_page(
+                        layout,
+                        id,
+                        hash,
+                        &mb_core::CatalogPagePath {
+                            scope,
+                            section,
+                            pages: refs.to_vec(),
+                        },
+                    )?
+                    .ok_or_else(|| CatalogStoreError::from(DatabaseError::NotReady))
+            })
+            .unwrap()
+        {
+            bytes += leaf.len() as u64;
+        }
+        assert_eq!(bytes, root.byte_len);
+        let mut foreign = path.clone();
+        foreign.scope = CatalogScope::Guild {
+            guild_id: [231; 32],
+        };
+        assert!(
+            control
+                .catalog_retained_paged_checkpoint_public_page(layout, id, hash, &foreign)
+                .is_err()
+        );
+        foreign = path;
+        foreign.scope = CatalogScope::Dataset {
+            guild_id: guild,
+            owner: mb_core::NodeId([230; 32]),
+            protected_root_id: Uuid::from_u128(44),
+        };
+        foreign.section = CatalogSection::FileMetadata;
+        assert!(
+            control
+                .catalog_retained_paged_checkpoint_public_page(layout, id, hash, &foreign)
+                .is_err()
+        );
+    }
+    assert_eq!(control.connection.total_changes(), changes);
+}
+
 fn paged_owner_descriptor(
     id: Uuid,
     proof: &CatalogQuorumPagedCheckpointIndex,
@@ -165,6 +278,133 @@ fn guarded_checkpoint_owner_keeps_all_public_roots_after_capture_retirement_and_
 }
 
 #[test]
+fn retained_public_reads_reject_unowned_pages_and_damaged_original_ownership() {
+    use crate::database::catalog::paged_checkpoint_retention::Layout;
+    use crate::database::catalog::retention_journal::{self as journal, Retention};
+    let (mut fixture, history) = real_checkpoint();
+    let proof = paged_owner_proof(&mut fixture, &history, None);
+    let temp = tempfile::tempdir().unwrap();
+    let control = ControlStore::open(temp.path().join("owner.db"), &history.keys[0]).unwrap();
+    let (_, roots) = stage_paged_owner(&control, &fixture, &proof, 1000);
+    let id = Uuid::from_u128(1);
+    control
+        .retain_catalog_paged_checkpoint(id, &proof, || Ok(proof.trust().clone()))
+        .unwrap();
+    let layout = mb_core::PagedCheckpointLayout::Individual;
+    let hash = proof.certificate().hash().unwrap();
+    let (scope, section, root) = roots[0];
+    let path = mb_core::CatalogPagePath {
+        scope,
+        section,
+        pages: vec![root],
+    };
+    let read = || control.catalog_retained_paged_checkpoint_public_page(layout, id, hash, &path);
+    let bytes = read().unwrap().unwrap();
+    let mut foreign_pages = BTreeMap::new();
+    let mut builder = mb_core::CatalogBuilder::new(scope, section).unwrap();
+    let mut sink = |page: CatalogPageRef, bytes| {
+        foreign_pages.insert(page.hash, bytes);
+        Ok::<_, ()>(())
+    };
+    builder
+        .push(b"staged public data belonging to another owner", &mut sink)
+        .unwrap();
+    let foreign = builder.finish(&mut sink).unwrap();
+    stage_owner_roots(&control, &foreign_pages, &[(scope, section, foreign)], 2000);
+    assert!(control.catalog_page(scope, section, foreign).is_ok());
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_public_page(
+                layout,
+                id,
+                hash,
+                &mb_core::CatalogPagePath {
+                    scope,
+                    section,
+                    pages: vec![foreign]
+                }
+            )
+            .is_err()
+    );
+    let pin_kind = crate::database::catalog::pins(root.hash);
+    let pin = journal::pin_id::<CatalogPagedCheckpointRetention>(id);
+    assert_eq!(
+        control
+            .connection
+            .execute(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                params![pin_kind, pin]
+            )
+            .unwrap(),
+        1
+    );
+    assert!(read().is_err());
+    control.put_record(&pin_kind, &pin, &[]).unwrap();
+    assert_eq!(read().unwrap().unwrap(), bytes);
+    let dependency_kind = journal::dependencies::<CatalogPagedCheckpointRetention>(id);
+    let dependency = control
+        .get_record(&dependency_kind, &root.hash)
+        .unwrap()
+        .unwrap();
+    control
+        .put_record(&dependency_kind, &root.hash, &[0])
+        .unwrap();
+    assert!(read().is_err());
+    control
+        .put_record(&dependency_kind, &root.hash, &dependency)
+        .unwrap();
+    let cert_kind = <mb_core::PagedGuildCheckpoint as Layout>::CERTIFICATE;
+    let certificate = control
+        .get_record(cert_kind, id.as_bytes())
+        .unwrap()
+        .unwrap();
+    let mut changed = proof.certificate().clone();
+    changed.signatures[0].signature[0] ^= 1;
+    control
+        .put_record(
+            cert_kind,
+            id.as_bytes(),
+            &canonical_bytes(&changed).unwrap(),
+        )
+        .unwrap();
+    assert!(read().is_err());
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(layout, history.state.guild_id, id, hash)
+            .is_err()
+    );
+    control
+        .put_record(cert_kind, id.as_bytes(), &certificate)
+        .unwrap();
+    assert_eq!(read().unwrap().unwrap(), bytes);
+    let before = journal::read::<CatalogPagedCheckpointRetention>(&control.connection, id)
+        .unwrap()
+        .unwrap();
+    let mut building = before;
+    building.state = CatalogPagedCheckpointRetentionState::Building;
+    journal::write(&control.connection, before, building).unwrap();
+    assert!(read().unwrap().is_none());
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(layout, history.state.guild_id, id, hash)
+            .unwrap()
+            .is_none()
+    );
+    journal::write(&control.connection, building, before).unwrap();
+    assert_eq!(read().unwrap().unwrap(), bytes);
+    assert_eq!(
+        control
+            .get_record(
+                <CatalogPagedCheckpointRetention as Retention>::JOURNAL,
+                id.as_bytes()
+            )
+            .unwrap()
+            .unwrap(),
+        canonical_bytes(&before).unwrap()
+    );
+}
+
+#[test]
 fn budgeted_checkpoint_owner_keeps_original_history_proof_and_all_roots_through_reopen() {
     public_owner_lifecycle(true);
 }
@@ -221,9 +461,53 @@ fn public_owner_lifecycle(budgeted: bool) {
     for (scope, section, root) in &roots {
         control.catalog_page(*scope, *section, *root).unwrap();
     }
+    let layout = mb_core::PagedCheckpointLayout::Individual;
+    let hash = proof.certificate().hash().unwrap();
+    let certificate = canonical_bytes(proof.certificate()).unwrap();
+    let reader = ControlStore::open_existing_read_only_with_key(
+        &path,
+        &history.keys[0].database_key(crate::database::CONTROL_DATABASE_ID),
+    )
+    .unwrap();
+    reader
+        .with_read_only_snapshot(|| {
+            assert_owned_public_reads(
+                &reader,
+                layout,
+                id,
+                (history.state.guild_id, hash),
+                &certificate,
+                &roots,
+            );
+            Ok(())
+        })
+        .unwrap();
+    drop(reader);
     control
         .cancel_catalog_paged_checkpoint_retention(id)
         .unwrap();
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_certificate(layout, history.state.guild_id, id, hash)
+            .unwrap()
+            .is_none()
+    );
+    let (scope, section, root) = roots[0];
+    assert!(
+        control
+            .catalog_retained_paged_checkpoint_public_page(
+                layout,
+                id,
+                hash,
+                &mb_core::CatalogPagePath {
+                    scope,
+                    section,
+                    pages: vec![root]
+                }
+            )
+            .unwrap()
+            .is_none()
+    );
     while control.release_catalog_paged_checkpoint_root(id).unwrap() {}
     while control.collect_catalog_page().unwrap() {}
     assert!(

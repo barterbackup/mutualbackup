@@ -5214,3 +5214,49 @@ physical payload/coding, sparse lengths and aliases. Complete enclosing budgets,
 normal paged capture/packing/checkpoint/retention/seed consumers and generation
 floors remain open. The native fixture uses sparse logical 1 TiB; the user-deferred
 dense capacity and native Windows/macOS gates remain separate acceptance work.
+
+## Authenticated retained public checkpoint transport (2026-10-11)
+
+Retained individual and directory candidates can serve their exact original
+certificate and one authenticated public page over the existing signed peer
+channel. Requests bind layout, owner UUID and original checkpoint hash. The
+owner must be Published, and a page must descend from one of its exact retained
+public roots with the original dependency and root pin. A short query-only
+snapshot checks certificate identity, root ownership and each authenticated
+parent edge before fetching the child. A path is bounded to four references;
+certificate and page decoders bound allocation to 32 and 64 KiB. File/Git private
+plaintext is excluded. Historical-member authorization preserves recovery after
+member removal, while unrelated peers cannot read these owners.
+
+The client checks the original certificate against independently supplied
+historical trust and the requested checkpoint hash, then authenticates each page
+against its exact requested reference. Catalog traversal exposes its bounded
+path while preserving leaf order, aggregate EOF accounting and failure fencing.
+The new peer variants are appended; existing signed models, persisted owner
+records and older wire encodings remain unchanged. The owner UUID is a locator,
+not authority to advertise a current/protected checkpoint.
+
+Core fixtures cover branching traversal, maximum depth, bounds and forged/corrupt
+paths. Store fixtures use real original-history proofs, shared retained roots,
+staging retirement and query-only reopen, rejecting damaged ownership and
+certificate records. Real QUIC cases stream all public roots for both layouts,
+including a valid signed source tree at maximum depth, after staging retirement,
+node reopen and requester removal. They reject outsiders, wrong trust, forged
+child paths, private scope, corruption and cancelled owners. The current SQL
+head stays absent throughout candidate access.
+
+Frozen qualification passes 194 Core, 386 Store, 117 Git, 530 Node, all remaining ordinary workspace targets and both provisioned Btrfs recovery cases: 1351 distinct passes in 1354 executions. Three transport cases run both in the
+preflight and full Node suite. Formatting, strict locked workspace/all-targets
+Clippy, all-target test compilation and four debug builds pass. Source and all
+23 program/test-driver hashes match. Both native cases use sparse logical
+1 TiB and verify resource cleanup; they do not qualify dense capacity. A harness
+accounting error on an ignored-only target was corrected and the remaining
+suites resumed on the same unchanged source and binaries. Logs, both drivers,
+source/binary manifests and exact passing/ignored inventories are retained in
+`/tmp/mb-m6-page-transport-validation-5k2dmc0s`. 121 other ignored cases remain unexecuted.
+
+This closes retained public transport. Full enclosing resource/metadata/physical
+admission, private and distributed payload availability, normal capture/packing/
+checkpoint/retention/seed recovery, atomic activation and current installed
+artifact qualification remain required. Dense 1 TiB and native Windows/macOS
+qualification remain deferred at the user's request.

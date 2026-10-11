@@ -696,6 +696,8 @@ fn process_peer_request(
                             | PeerRequest::GetCodingTranscript { .. }
                             | PeerRequest::GetCodingTranscriptForEvent { .. }
                             | PeerRequest::GetLegacyCodingAddBinding { .. }
+                            | PeerRequest::GetRetainedPagedCheckpointCertificate { .. }
+                            | PeerRequest::GetRetainedPagedCheckpointPage { .. }
                     ) {
                         reader.authorize_historical_member(&guild_id, caller)?;
                     } else {
@@ -1006,6 +1008,34 @@ fn execute_read_request(
     request: PeerRequest,
 ) -> Result<PeerResponse> {
     match request {
+        PeerRequest::GetRetainedPagedCheckpointCertificate {
+            guild_id,
+            layout,
+            owner_id,
+            checkpoint_hash,
+        } => Ok(PeerResponse::RetainedPagedCheckpointCertificate {
+            bytes: node.retained_paged_checkpoint_certificate(
+                guild_id,
+                layout,
+                owner_id,
+                checkpoint_hash,
+            )?,
+        }),
+        PeerRequest::GetRetainedPagedCheckpointPage {
+            guild_id,
+            layout,
+            owner_id,
+            checkpoint_hash,
+            path,
+        } => Ok(PeerResponse::RetainedPagedCheckpointPage {
+            bytes: node.retained_paged_checkpoint_public_page(
+                guild_id,
+                layout,
+                owner_id,
+                checkpoint_hash,
+                &path,
+            )?,
+        }),
         PeerRequest::Profile => Ok(PeerResponse::Profile(PeerProfile {
             member: node.advertised_member(&config.failure_domain)?,
             endpoint: config.public_endpoint.clone(),
@@ -1574,6 +1604,10 @@ fn execute_peer_request(
         }
         PeerRequest::GetLegacyCodingAddBinding { .. } => {
             bail!("legacy coding Add binding read was sent to a mutation worker")
+        }
+        PeerRequest::GetRetainedPagedCheckpointCertificate { .. }
+        | PeerRequest::GetRetainedPagedCheckpointPage { .. } => {
+            bail!("retained paged checkpoint read was sent to a mutation worker")
         }
         PeerRequest::ExchangeEndpoints { .. } => {
             bail!("endpoint exchange was sent to a mutation worker")

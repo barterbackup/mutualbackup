@@ -136,6 +136,129 @@ impl<H: Layout> Retention for CatalogPagedCheckpointRetention<H> {
 }
 
 impl ControlStore {
+    fn retained_paged_checkpoint_certificate<H: Layout>(
+        &self,
+        guild_id: [u8; 32],
+        id: Uuid,
+        checkpoint_hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, CatalogStoreError> {
+        let snapshot = self.read_snapshot()?;
+        let Some(record) = journal::read::<CatalogPagedCheckpointRetention<H>>(&snapshot, id)?
+        else {
+            snapshot.commit()?;
+            return Ok(None);
+        };
+        if record.state != CatalogPagedCheckpointRetentionState::Published {
+            snapshot.commit()?;
+            return Ok(None);
+        }
+        if record.retention.checkpoint.guild_id() != guild_id
+            || record.retention.checkpoint.hash()? != checkpoint_hash
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let certificate = owned_certificate(&snapshot, record.retention)?;
+        let bytes =
+            mb_core::canonical_bytes_bounded(&certificate, mb_core::PAGED_QUORUM_CHECKPOINT_BYTES)?;
+        snapshot.commit()?;
+        Ok(Some(bytes))
+    }
+
+    /// Read the original certificate from a published local metadata owner.
+    /// The owner UUID is a locator; it grants no current-checkpoint authority.
+    pub fn catalog_retained_paged_checkpoint_certificate(
+        &self,
+        layout: mb_core::PagedCheckpointLayout,
+        guild_id: [u8; 32],
+        id: Uuid,
+        checkpoint_hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, CatalogStoreError> {
+        match layout {
+            mb_core::PagedCheckpointLayout::Individual => self
+                .retained_paged_checkpoint_certificate::<PagedGuildCheckpoint>(
+                    guild_id,
+                    id,
+                    checkpoint_hash,
+                ),
+            mb_core::PagedCheckpointLayout::Directory => self
+                .retained_paged_checkpoint_certificate::<mb_core::PagedGuildCheckpointDirectory>(
+                    guild_id,
+                    id,
+                    checkpoint_hash,
+                ),
+        }
+    }
+
+    fn retained_paged_checkpoint_page<H: Layout>(
+        &self,
+        id: Uuid,
+        checkpoint_hash: [u8; 32],
+        path: &mb_core::CatalogPagePath,
+    ) -> Result<Option<Vec<u8>>, CatalogStoreError> {
+        path.validate()?;
+        if path.section.is_private() {
+            return Err(DatabaseError::Conflict.into());
+        }
+        let snapshot = self.read_snapshot()?;
+        let Some(record) = journal::read::<CatalogPagedCheckpointRetention<H>>(&snapshot, id)?
+        else {
+            snapshot.commit()?;
+            return Ok(None);
+        };
+        if record.state != CatalogPagedCheckpointRetentionState::Published {
+            snapshot.commit()?;
+            return Ok(None);
+        }
+        if record.retention.checkpoint.hash()? != checkpoint_hash {
+            return Err(DatabaseError::Conflict.into());
+        }
+        owned_certificate(&snapshot, record.retention)?;
+        check_owned_root(
+            &snapshot,
+            record.retention,
+            Dependency {
+                scope: path.scope,
+                section: path.section,
+                root: path.pages[0],
+            },
+        )?;
+        let bytes = unwrap_stream(path.read(&mut |reference| {
+            read_page(
+                &snapshot,
+                PageMetadata {
+                    format_version: 1,
+                    scope: path.scope,
+                    section: path.section,
+                    reference,
+                },
+            )
+        }))?;
+        snapshot.commit()?;
+        Ok(Some(bytes))
+    }
+
+    /// Read one authenticated public page from a published candidate's exact
+    /// retained root. Building/cancelled owners expose no page. This is metadata
+    /// custody access, not an assertion of current or distributed protection.
+    pub fn catalog_retained_paged_checkpoint_public_page(
+        &self,
+        layout: mb_core::PagedCheckpointLayout,
+        id: Uuid,
+        checkpoint_hash: [u8; 32],
+        path: &mb_core::CatalogPagePath,
+    ) -> Result<Option<Vec<u8>>, CatalogStoreError> {
+        match layout {
+            mb_core::PagedCheckpointLayout::Individual => self
+                .retained_paged_checkpoint_page::<PagedGuildCheckpoint>(id, checkpoint_hash, path),
+            mb_core::PagedCheckpointLayout::Directory => self
+                .retained_paged_checkpoint_page::<mb_core::PagedGuildCheckpointDirectory>(
+                    id,
+                    checkpoint_hash,
+                    path,
+                ),
+        }
+    }
+
     // Publication requires the short writer transaction. A read snapshot may
     // use the same guard for preliminary admission, followed by a writer
     // recheck. Independent event authority and the actual SQL head fence the base.

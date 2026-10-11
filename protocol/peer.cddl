@@ -202,6 +202,15 @@ peer-request =
         targets: [1*256 bytes32-array]
       } }
   / { "CodingCapacity": { guild_id: bytes32-array, shard_size: uint } }
+  / { "GetRetainedPagedCheckpointCertificate": {
+        guild_id: bytes32-array, layout: paged-checkpoint-layout,
+        owner_id: uuid-bytes, checkpoint_hash: bytes32-array
+      } }
+  / { "GetRetainedPagedCheckpointPage": {
+        guild_id: bytes32-array, layout: paged-checkpoint-layout,
+        owner_id: uuid-bytes, checkpoint_hash: bytes32-array,
+        path: catalog-public-page-path
+      } }
 
 peer-response =
     { "Profile": peer-profile }
@@ -231,7 +240,25 @@ peer-response =
   / { "CodingAttemptRetired": { retired: bool } }
   / { "LegacyCodingAddAttestation": member-signature }
   / { "LegacyCodingAddBinding": null / legacy-coding-add-binding }
+  / { "RetainedPagedCheckpointCertificate": { bytes: [1*32768 uint8] } }
+  / { "RetainedPagedCheckpointPage": { bytes: [1*65536 uint8] } }
   / "Ack"
+
+paged-checkpoint-layout = "Individual" / "Directory"
+catalog-public-page-path = {
+  scope: { "Guild": { guild_id: bytes32-array } } /
+         { "Dataset": { guild_id: bytes32-array, owner: bytes32-array,
+                        protected_root_id: uuid-bytes } },
+  section: "SectorReferences" / "Packing" / "Coding" / "Checkpoint",
+  pages: [1*4 catalog-page-ref]
+}
+catalog-page-ref = {
+  hash: bytes32-array,
+  encoded_len: 1..65536,
+  height: 0..3,
+  byte_len: 0..17179869184,
+  page_occurrences: 1..1000000
+}
 
 peer-profile = { member: member, endpoint: tstr }
 guild-peer = { member: member, endpoints: [* tstr] }

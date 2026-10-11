@@ -3391,6 +3391,36 @@ and native-platform gates remain open.
     local custody of an individual role; complete distributed availability,
     history ownership, activation, quota and retained-capacity/release gates
     remain open, and normal paged checkpoint producers remain disabled.
+  - [x] Serve original retained paged checkpoint certificates and authenticated
+    public pages through signed peer requests for individual and directory
+    layouts. Bind the exact published owner UUID, original checkpoint hash,
+    scope/section, root dependency and root pin. Verify every parent edge before
+    reading its child in one query-only snapshot; paths contain at most four
+    references. Stream catalog leaves with those paths without collecting a
+    complete tree. Historical-member recovery authorization applies; private
+    file/Git plaintext, unowned roots and Building/Cancelled owners are denied.
+    Bound certificate/page decoding to 32/64 KiB. Clients independently verify
+    the historical quorum, checkpoint identity and exact requested page.
+    Existing signed layouts and peer variants retain their encodings.
+    Core fixtures cover branching, exact EOF, failed traversal, forged edges,
+    corrupt parents and decode bounds. Store fixtures use original-history-proven
+    owners after staging retirement and read-only reopen, including damaged
+    pins/dependencies/certificates and unpublished/cancelled state. Real QUIC
+    fixtures stream every retained public root, including a signed four-level
+    source tree, through removed-member recovery; reject outsiders, forged paths,
+    wrong trust, private scope, corrupt bytes and cancellation without advancing
+    a current checkpoint. Frozen qualification passes 194 Core, 386 Store, 117 Git, 530 Node, all remaining ordinary workspace targets and both provisioned Btrfs recovery cases: 1351 distinct passes in 1354 executions.
+    Formatting, strict locked workspace/all-targets Clippy, all-target test
+    compilation and four debug builds pass. Source and all 23 qualified binary
+    hashes match; native mount/loop/image cleanup is verified. The harness
+    resumes the same frozen inputs after correcting zero-test ignored-suite
+    accounting. Evidence, drivers and exact passing/ignored inventories are in
+    `/tmp/mb-m6-page-transport-validation-5k2dmc0s`. 121 other ignored cases remain unexecuted.
+    This completes retained public transport, not normal producer activation or
+    current/protected advertisement. Complete enclosing admission/quotas,
+    private/distributed payload availability, activation/retirement, normal
+    capture/retention/seed recovery, current installed artifacts and the deferred
+    dense 1 TiB/native Windows/macOS qualification remain open.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

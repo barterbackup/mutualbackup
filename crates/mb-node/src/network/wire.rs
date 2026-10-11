@@ -338,6 +338,19 @@ pub(super) enum PeerRequest {
         event_sequence: u64,
         event_hash: [u8; 32],
     },
+    GetRetainedPagedCheckpointCertificate {
+        guild_id: [u8; 32],
+        layout: mb_core::PagedCheckpointLayout,
+        owner_id: Uuid,
+        checkpoint_hash: [u8; 32],
+    },
+    GetRetainedPagedCheckpointPage {
+        guild_id: [u8; 32],
+        layout: mb_core::PagedCheckpointLayout,
+        owner_id: Uuid,
+        checkpoint_hash: [u8; 32],
+        path: mb_core::CatalogPagePath,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -382,6 +395,8 @@ impl PeerRequest {
                 | Self::GetCodingTranscript { .. }
                 | Self::GetCodingTranscriptForEvent { .. }
                 | Self::GetLegacyCodingAddBinding { .. }
+                | Self::GetRetainedPagedCheckpointCertificate { .. }
+                | Self::GetRetainedPagedCheckpointPage { .. }
                 | Self::ExchangeEndpoints { .. }
                 | Self::CodingCapacity { .. }
         )
@@ -407,6 +422,8 @@ impl PeerRequest {
             | Self::GetCodingTranscript { .. }
             | Self::GetCodingTranscriptForEvent { .. }
             | Self::GetLegacyCodingAddBinding { .. }
+            | Self::GetRetainedPagedCheckpointCertificate { .. }
+            | Self::GetRetainedPagedCheckpointPage { .. }
             | Self::ExchangeEndpoints { .. }
             | Self::CodingCapacity { .. } => None,
             #[cfg(test)]
@@ -485,6 +502,8 @@ impl PeerRequest {
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::GetCheckpointHead { guild_id }
             | Self::GetCheckpointAtGeneration { guild_id, .. }
+            | Self::GetRetainedPagedCheckpointCertificate { guild_id, .. }
+            | Self::GetRetainedPagedCheckpointPage { guild_id, .. }
             | Self::SignLegacyPackingBinding { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
             Self::AttestLegacyPackingSource { attestation, .. } => Some(attestation.guild_id),
@@ -613,6 +632,57 @@ pub(super) enum PeerResponse {
     },
     LegacyCodingAddAttestation(MemberSignature),
     LegacyCodingAddBinding(Option<QuorumLegacyCodingAddBinding>),
+    RetainedPagedCheckpointCertificate {
+        #[serde(deserialize_with = "certificate_bytes")]
+        bytes: Vec<u8>,
+    },
+    RetainedPagedCheckpointPage {
+        #[serde(deserialize_with = "page_bytes")]
+        bytes: Vec<u8>,
+    },
+}
+
+fn certificate_bytes<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
+    bounded_bytes::<D, { mb_core::PAGED_QUORUM_CHECKPOINT_BYTES }>(decoder)
+}
+
+fn page_bytes<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
+    bounded_bytes::<D, { mb_core::CATALOG_PAGE_BYTES }>(decoder)
+}
+
+fn bounded_bytes<'de, D: serde::Deserializer<'de>, const LIMIT: usize>(
+    decoder: D,
+) -> Result<Vec<u8>, D::Error> {
+    use serde::de::{Error, SeqAccess, Visitor};
+    struct Bytes<const LIMIT: usize>;
+    impl<'de, const LIMIT: usize> Visitor<'de> for Bytes<LIMIT> {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "at most {LIMIT} bytes")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            if seq.size_hint().is_some_and(|size| size > LIMIT) {
+                return Err(A::Error::custom("oversized paged checkpoint response"));
+            }
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64));
+            while bytes.len() < LIMIT {
+                match seq.next_element()? {
+                    Some(byte) => bytes.push(byte),
+                    None => return Ok(bytes),
+                }
+            }
+            struct Extra;
+            impl<'de> serde::de::DeserializeSeed<'de> for Extra {
+                type Value = ();
+                fn deserialize<E: serde::Deserializer<'de>>(self, _: E) -> Result<(), E::Error> {
+                    Err(E::Error::custom("oversized paged checkpoint response"))
+                }
+            }
+            seq.next_element_seed(Extra)?;
+            Ok(bytes)
+        }
+    }
+    decoder.deserialize_seq(Bytes::<LIMIT>)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -949,6 +1019,135 @@ mod tests {
         include_str!("../../../../protocol/vectors/storage-acknowledgement.postcard.hex");
     const RECOVERY_LOCATOR: &str =
         include_str!("../../../../protocol/vectors/recovery-locator.postcard.hex");
+
+    #[test]
+    fn retained_paged_checkpoint_frames_bound_paths_and_payloads_on_both_transports() {
+        let mut path = mb_core::CatalogPagePath {
+            scope: mb_core::CatalogScope::Guild {
+                guild_id: [255; 32],
+            },
+            section: mb_core::CatalogSection::Checkpoint,
+            pages: (0..=mb_core::CATALOG_MAX_HEIGHT)
+                .rev()
+                .map(|height| mb_core::CatalogPageRef {
+                    hash: [255; 32],
+                    encoded_len: mb_core::CATALOG_PAGE_BYTES as u32,
+                    height,
+                    byte_len: if height == 0 {
+                        mb_core::CATALOG_LEAF_BYTES as u64
+                    } else {
+                        mb_core::CATALOG_MAX_STREAM_BYTES
+                    },
+                    page_occurrences: if height == 0 {
+                        1
+                    } else {
+                        mb_core::CATALOG_MAX_PAGE_OCCURRENCES
+                    },
+                })
+                .collect(),
+        };
+        path.validate().unwrap();
+        for layout in [
+            mb_core::PagedCheckpointLayout::Individual,
+            mb_core::PagedCheckpointLayout::Directory,
+        ] {
+            let mut dataset_path = path.clone();
+            dataset_path.scope = mb_core::CatalogScope::Dataset {
+                guild_id: [255; 32],
+                owner: NodeId([255; 32]),
+                protected_root_id: Uuid::from_bytes([255; 16]),
+            };
+            dataset_path.section = mb_core::CatalogSection::SectorReferences;
+            for request in [
+                PeerRequest::GetRetainedPagedCheckpointCertificate {
+                    guild_id: [255; 32],
+                    layout,
+                    owner_id: Uuid::from_bytes([255; 16]),
+                    checkpoint_hash: [255; 32],
+                },
+                PeerRequest::GetRetainedPagedCheckpointPage {
+                    guild_id: [255; 32],
+                    layout,
+                    owner_id: Uuid::from_bytes([255; 16]),
+                    checkpoint_hash: [255; 32],
+                    path: path.clone(),
+                },
+                PeerRequest::GetRetainedPagedCheckpointPage {
+                    guild_id: [255; 32],
+                    layout,
+                    owner_id: Uuid::from_bytes([255; 16]),
+                    checkpoint_hash: [255; 32],
+                    path: dataset_path,
+                },
+            ] {
+                assert!(request.is_read_only());
+                assert!(!request.is_writer_read());
+                assert!(request.mutation_kind().is_none());
+                assert_eq!(request.guild_scope(), Some([255; 32]));
+                let signed = budget_request(request);
+                let cbor = cbor4ii::serde::to_vec(Vec::new(), &signed).unwrap();
+                cddl_cat::validate_cbor_bytes("signed-peer-request", SCHEMA, &cbor).unwrap();
+                cbor4ii::serde::from_slice::<SignedRecord<PeerRequestEnvelope>>(&cbor).unwrap();
+                mb_core::decode_canonical::<SignedRecord<PeerRequestEnvelope>>(
+                    &canonical_bytes(&signed).unwrap(),
+                )
+                .unwrap();
+                let (tcp, cbor) = frame_sizes(&signed).unwrap();
+                assert!(tcp.max(cbor) <= super::super::MAX_PEER_FRAME_BYTES);
+            }
+        }
+        path.pages.push(path.pages[3]);
+        let signed = budget_request(PeerRequest::GetRetainedPagedCheckpointPage {
+            guild_id: [255; 32],
+            layout: mb_core::PagedCheckpointLayout::Individual,
+            owner_id: Uuid::from_bytes([255; 16]),
+            checkpoint_hash: [255; 32],
+            path,
+        });
+        assert!(
+            mb_core::decode_canonical::<SignedRecord<PeerRequestEnvelope>>(
+                &canonical_bytes(&signed).unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            cbor4ii::serde::from_slice::<SignedRecord<PeerRequestEnvelope>>(
+                &cbor4ii::serde::to_vec(Vec::new(), &signed).unwrap()
+            )
+            .is_err()
+        );
+        for (limit, certificate) in [
+            (mb_core::PAGED_QUORUM_CHECKPOINT_BYTES, true),
+            (mb_core::CATALOG_PAGE_BYTES, false),
+        ] {
+            for length in [limit, limit + 1] {
+                let response = if certificate {
+                    PeerResponse::RetainedPagedCheckpointCertificate {
+                        bytes: vec![255; length],
+                    }
+                } else {
+                    PeerResponse::RetainedPagedCheckpointPage {
+                        bytes: vec![255; length],
+                    }
+                };
+                let signed = budget_response(response);
+                let tcp = canonical_bytes(&signed).unwrap();
+                let cbor = cbor4ii::serde::to_vec(Vec::new(), &signed).unwrap();
+                assert_eq!(
+                    mb_core::decode_canonical::<SignedRecord<PeerResponseEnvelope>>(&tcp).is_ok(),
+                    length == limit
+                );
+                assert_eq!(
+                    cbor4ii::serde::from_slice::<SignedRecord<PeerResponseEnvelope>>(&cbor).is_ok(),
+                    length == limit
+                );
+                if length == limit {
+                    cddl_cat::validate_cbor_bytes("signed-peer-response", SCHEMA, &cbor).unwrap();
+                    assert!(tcp.len().max(cbor.len()) <= super::super::MAX_PEER_FRAME_BYTES);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn versioned_coding_plan_tuples_preserve_both_transports_and_reject_extra_fields() {

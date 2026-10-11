@@ -59,12 +59,13 @@ pub use catalog::{
     CatalogPackedSourcePart, CatalogPackedSourceProof, CatalogPackedSourceReader,
     CatalogPackedSourceRecord, CatalogPackedSourceRoot, CatalogPackingDirectoryBuilder,
     CatalogPackingDirectoryReader, CatalogPackingDirectoryRecord, CatalogPackingDirectoryRoot,
-    CatalogPackingDirectorySummary, CatalogPageContents, CatalogPageRef, CatalogRangeReader,
-    CatalogReader, CatalogRecordBuilder, CatalogRecordReader, CatalogRecordRoot, CatalogScope,
-    CatalogSection, CatalogSectorBuilder, CatalogSectorReader, CatalogSectorRecord,
-    CatalogSectorRoot, CatalogStreamError, PAGED_PRIVATE_METADATA_BYTES, PAGED_USER_REVISION_BYTES,
-    PAGED_USER_REVISION_DOMAIN, PAGED_USER_REVISION_VERSION, PagedRevisionSourceReader,
-    PagedUserRevision, catalog_file_path_order, decode_coding_transcript_bounded,
+    CatalogPackingDirectorySummary, CatalogPageContents, CatalogPagePath, CatalogPageRef,
+    CatalogRangeReader, CatalogReader, CatalogRecordBuilder, CatalogRecordReader,
+    CatalogRecordRoot, CatalogScope, CatalogSection, CatalogSectorBuilder, CatalogSectorReader,
+    CatalogSectorRecord, CatalogSectorRoot, CatalogStreamError, PAGED_PRIVATE_METADATA_BYTES,
+    PAGED_USER_REVISION_BYTES, PAGED_USER_REVISION_DOMAIN, PAGED_USER_REVISION_VERSION,
+    PagedRevisionSourceReader, PagedUserRevision, catalog_file_path_order,
+    decode_coding_transcript_bounded,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
@@ -109,9 +110,9 @@ pub use packing::{
 pub use paged_checkpoint::{
     PAGED_GUILD_CHECKPOINT_BUDGETED_VERSION, PAGED_GUILD_CHECKPOINT_BYTES,
     PAGED_GUILD_CHECKPOINT_DIRECTORY_VERSION, PAGED_GUILD_CHECKPOINT_DOMAIN,
-    PAGED_GUILD_CHECKPOINT_VERSION, PAGED_QUORUM_CHECKPOINT_BYTES, PagedCheckpointParent,
-    PagedCheckpointTrust, PagedGuildCheckpoint, PagedGuildCheckpointDirectory,
-    QuorumPagedCheckpoint, QuorumPagedCheckpointDirectory,
+    PAGED_GUILD_CHECKPOINT_VERSION, PAGED_QUORUM_CHECKPOINT_BYTES, PagedCheckpointLayout,
+    PagedCheckpointParent, PagedCheckpointTrust, PagedGuildCheckpoint,
+    PagedGuildCheckpointDirectory, QuorumPagedCheckpoint, QuorumPagedCheckpointDirectory,
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
