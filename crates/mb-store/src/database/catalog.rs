@@ -31,6 +31,7 @@ mod packing_directories_retention;
 mod packing_directory_validation;
 mod packing_validation;
 mod paged_checkpoint;
+mod paged_checkpoint_custody;
 mod paged_checkpoint_payload;
 mod paged_checkpoint_retention;
 mod paged_checkpoint_revision;
@@ -101,6 +102,9 @@ pub use packing_validation::{
 };
 pub use paged_checkpoint::{
     CatalogQuorumPagedCheckpointDirectoryIndex, CatalogQuorumPagedCheckpointIndex,
+};
+pub use paged_checkpoint_custody::{
+    CatalogCheckpointLocalCustody, CatalogCheckpointLocalCustodyPhase,
 };
 pub use paged_checkpoint_payload::{CatalogCheckpointPayload, CatalogPayloadRetirementView};
 pub use paged_checkpoint_retention::{

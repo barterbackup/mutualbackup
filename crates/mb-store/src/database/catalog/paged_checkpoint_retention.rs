@@ -313,6 +313,7 @@ impl ControlStore {
             if !existed {
                 paged_checkpoint_revision::require_unowned(&transaction, id)?;
                 paged_checkpoint_payload::require_unowned(&transaction, id)?;
+                paged_checkpoint_custody::require_unowned(&transaction, id)?;
             }
             let state = journal::begin(&transaction, retention)?;
             paged_checkpoint_revision::admitted_work(&transaction, retention)?;
@@ -556,6 +557,7 @@ impl ControlStore {
         let record = journal::read::<CatalogPagedCheckpointRetention<H>>(&transaction, id)?
             .ok_or(DatabaseError::NotReady)?;
         self.guard_paged_retirement(record.retention)?;
+        paged_checkpoint_custody::cancel(&transaction, record.retention)?;
         journal::cancel::<CatalogPagedCheckpointRetention<H>>(&transaction, id)?;
         self.guard_paged_retirement(record.retention)?;
         transaction.commit()?;

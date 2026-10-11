@@ -106,6 +106,7 @@ fn check_work<H: Layout>(
             .proof_work
             .checked_add(retention.checkpoint.work()?)?
             .checked_add(work)?
+            .checked_add(paged_checkpoint_custody::owned_work(connection, retention)?)?
             .checked_add(
                 paged_checkpoint_payload::owned_work(connection, retention)?.unwrap_or_default(),
             )?,
@@ -292,7 +293,7 @@ impl ControlStore {
     /// source pins for an exact revision in the completed original-history
     /// proof. Authenticate the encrypted private descriptor in `check` using
     /// this writer's snapshot. This dependency is not full payload readiness.
-    fn retain_checkpoint_revision_checked<P: Proof, E: From<CatalogStoreError>>(
+    pub(super) fn retain_checkpoint_revision_checked<P: Proof, E: From<CatalogStoreError>>(
         &self,
         id: Uuid,
         proof: &P,

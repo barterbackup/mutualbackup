@@ -187,6 +187,15 @@ pub(in crate::database::catalog) trait Proof {
         &self,
         key: mb_core::CatalogCheckpointRevisionKey,
     ) -> Result<Option<R>, CatalogStoreError>;
+    fn next_revision(
+        &self,
+        after: Option<mb_core::CatalogCheckpointRevisionKey>,
+    ) -> Result<Option<R>, CatalogStoreError>;
+    fn next_group(
+        &self,
+        after: Option<[u8; 32]>,
+    ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError>;
+    fn has_member(&self, holder: mb_core::NodeId) -> bool;
     fn source_id(&self, key: [u8; 32])
     -> Result<mb_core::CatalogPackedSourceId, CatalogStoreError>;
     fn read_group(
@@ -234,6 +243,24 @@ macro_rules! proof {
                 key: mb_core::CatalogCheckpointRevisionKey,
             ) -> Result<Option<R>, CatalogStoreError> {
                 self.index().revision(key)
+            }
+            fn next_revision(
+                &self,
+                after: Option<mb_core::CatalogCheckpointRevisionKey>,
+            ) -> Result<Option<R>, CatalogStoreError> {
+                self.index().next_revision(after)
+            }
+            fn next_group(
+                &self,
+                after: Option<[u8; 32]>,
+            ) -> Result<Option<CatalogIndexedDirectoryCodingGroup>, CatalogStoreError> {
+                self.index().index().next_group_row(after)
+            }
+            fn has_member(&self, holder: mb_core::NodeId) -> bool {
+                self.trust()
+                    .members
+                    .binary_search_by_key(&holder, |member| member.node_id)
+                    .is_ok()
             }
             fn source_id(
                 &self,

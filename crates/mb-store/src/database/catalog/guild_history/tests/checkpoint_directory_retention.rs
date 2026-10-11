@@ -41,7 +41,7 @@ fn successor(
     certificate(transition, history)
 }
 
-fn stage(
+pub(super) fn stage(
     control: &ControlStore,
     fixture: &Fixture,
     proof: &CatalogQuorumPagedCheckpointDirectoryIndex,

@@ -157,6 +157,13 @@ pub(super) fn owned_work<H: Layout>(
     Ok(raw_totals(connection, retention)?.map(|totals| totals.work))
 }
 
+pub(super) fn owned_count<H: Layout>(
+    connection: &Connection,
+    retention: CatalogPagedCheckpointRetention<H>,
+) -> Result<u64, CatalogStoreError> {
+    Ok(raw_totals(connection, retention)?.map_or(0, |totals| totals.count))
+}
+
 pub(super) fn admitted_work<H: Layout>(
     connection: &Connection,
     retention: CatalogPagedCheckpointRetention<H>,
@@ -176,6 +183,7 @@ fn check_work<H: Layout>(
             .proof_work
             .checked_add(retention.checkpoint.work()?)?
             .checked_add(work)?
+            .checked_add(paged_checkpoint_custody::owned_work(connection, retention)?)?
             .checked_add(
                 paged_checkpoint_revision::owned_work(connection, retention)?.unwrap_or_default(),
             )?,
@@ -420,7 +428,7 @@ impl ControlStore {
     /// Verify actual READY custody and publish one physical role dependency in
     /// the control writer. The callback must authenticate full payload bytes.
     /// This is one local role, not complete distributed checkpoint readiness.
-    fn retain_checkpoint_payload_checked<P: Proof, E: From<CatalogStoreError>>(
+    pub(super) fn retain_checkpoint_payload_checked<P: Proof, E: From<CatalogStoreError>>(
         &self,
         id: Uuid,
         proof: &P,
@@ -463,6 +471,7 @@ impl ControlStore {
                     .proof_work
                     .checked_add(retention.checkpoint.work()?)?
                     .checked_add(other_payload_work)?
+                    .checked_add(paged_checkpoint_custody::owned_work(&tx, retention)?)?
                     .checked_add(
                         paged_checkpoint_revision::owned_work(&tx, retention)?.unwrap_or_default(),
                     )?

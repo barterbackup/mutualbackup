@@ -4,6 +4,158 @@ use crate::node::tests::test_coding_transcript;
 
 mod transport;
 
+macro_rules! local_custody_cases {
+    ($test:ident, $constructor:ident, $metadata:ident, $step:ident, $cancel:ident, $release:ident) => {
+        #[test]
+        fn $test() {
+            let (temp, seed, mut node, mut keys) = fixture();
+            let local = keys
+                .iter()
+                .position(|key| key.node_id() == node.keys.node_id())
+                .unwrap();
+            keys.swap(1, local);
+            let (proof, _) = $constructor(&mut node, &keys, false, unix_seconds() + 600);
+            let guild = proof.trust().guild_id;
+            let id = Uuid::from_u128(90);
+            node.$metadata(id, &proof).unwrap();
+            let first = node.$step(id, &proof).unwrap();
+            assert_eq!(first.revisions, 1);
+            assert_eq!(first.local_revisions, 0);
+            assert_eq!(
+                first.phase,
+                mb_store::CatalogCheckpointLocalCustodyPhase::Revisions
+            );
+            let coding = node.$step(id, &proof).unwrap();
+            assert_eq!(
+                coding.phase,
+                mb_store::CatalogCheckpointLocalCustodyPhase::Coding
+            );
+            assert!(node.$step(id, &proof).is_err());
+            let saved = node
+                .control
+                .get_record("catalog-checkpoint-local-custody-v1", id.as_bytes())
+                .unwrap();
+            let progress: mb_store::CatalogCheckpointLocalCustody =
+                decode_canonical(saved.as_ref().unwrap()).unwrap();
+            assert_eq!(progress, coding);
+            let original = vec![91; mb_core::V1_SECTOR_SIZE];
+            let profile = mb_core::PackingProfile {
+                format_version: 1,
+                sector_size: mb_core::V1_SECTOR_SIZE as u32,
+                slot_size: mb_core::V1_SECTOR_SIZE as u32 / 4,
+            };
+            let packed = mb_core::pack_incremental(
+                profile,
+                None,
+                vec![mb_core::PackingInput {
+                    owner: keys[0].node_id(),
+                    protected_root: mb_core::packing_protected_root(Uuid::from_u128(194)),
+                    object_id: [193; 32],
+                    source_commitment: Some(merkle_commit(&original).unwrap()),
+                    bytes: original,
+                }],
+            )
+            .unwrap();
+            let mut cursor = None;
+            while let Some(row) = proof.index().index().next_group(cursor).unwrap() {
+                let group = row.group.range.group_id;
+                let entry = proof
+                    .index()
+                    .index()
+                    .read_group(group, |page| {
+                        node.control.catalog_page(
+                            mb_core::CatalogScope::Guild { guild_id: guild },
+                            mb_core::CatalogSection::Coding,
+                            page,
+                        )
+                    })
+                    .unwrap()
+                    .unwrap();
+                let plan = &entry.transcript.value.plan;
+                let information_id = plan.value.geometry.information[0].sector.id;
+                let bytes = packed
+                    .catalog
+                    .sectors
+                    .iter()
+                    .zip(&packed.sectors)
+                    .find_map(|(descriptor, sector)| {
+                        let mut descriptor = descriptor.clone();
+                        descriptor.flat_root = sector_root(&sector.bytes);
+                        descriptor.id = descriptor.calculate_id(profile).unwrap();
+                        (descriptor.id == information_id).then(|| sector.bytes.clone())
+                    })
+                    .unwrap();
+                let shards = mb_core::encode(entry.retained.group.profile, vec![bytes]).unwrap();
+                let commitment = merkle_commit(&shards[1]).unwrap();
+                node.stage_coding_parity(
+                    plan,
+                    &entry.transcript.value.manifest,
+                    &mb_store::VariableParityObject {
+                        format_version: 2,
+                        guild_id: guild,
+                        group_id: group,
+                        shard_index: 1,
+                        commitment,
+                        bytes: shards[1].clone(),
+                    },
+                )
+                .unwrap();
+                node.activate_coding_attempt(&entry.transcript).unwrap();
+                cursor = Some(group);
+            }
+            node.control
+                .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+                .unwrap();
+            drop(node);
+            let node = Node::open(temp.path(), seed).unwrap();
+            let mut completed = None;
+            for _ in 0..4 {
+                let progress = node.$step(id, &proof).unwrap();
+                if progress.phase == mb_store::CatalogCheckpointLocalCustodyPhase::Complete {
+                    completed = Some(progress);
+                    break;
+                }
+            }
+            let completed = completed.expect("local custody did not reach complete inventory EOF");
+            let expected = proof.certificate().checkpoint.coding.summary.coding;
+            assert_eq!(completed.coding, expected);
+            assert_eq!(completed.local_payloads, expected.parity_roles);
+            assert_eq!(node.$step(id, &proof).unwrap(), completed);
+            assert!(
+                node.control
+                    .checkpoint_head_identity(&guild)
+                    .unwrap()
+                    .is_none()
+            );
+            node.control.$cancel(id).unwrap();
+            assert!(
+                node.control
+                    .get_record("catalog-checkpoint-local-custody-v1", id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(node.$step(id, &proof).is_err());
+            while node.control.$release(id).unwrap() {}
+        }
+    };
+}
+local_custody_cases!(
+    paged_checkpoint_complete_local_custody_requires_all_ready_assignments_and_resumes_original_history,
+    checkpoint_owner_proof_at,
+    retain_paged_checkpoint_metadata,
+    retain_paged_checkpoint_local_custody_step,
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root
+);
+local_custody_cases!(
+    paged_checkpoint_directory_complete_local_custody_requires_all_ready_assignments_and_resumes_original_history,
+    directory_owner_proof_at,
+    retain_paged_checkpoint_directory_metadata,
+    retain_paged_checkpoint_directory_local_custody_step,
+    cancel_catalog_paged_checkpoint_directory_retention,
+    release_catalog_paged_checkpoint_directory_root
+);
+
 fn directory_owner_proof(
     node: &mut Node,
     keys: &[KeyMaterial],

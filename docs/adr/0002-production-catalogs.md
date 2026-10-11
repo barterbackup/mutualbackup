@@ -5518,3 +5518,53 @@ This reclaims 11.44 GiB physically and leaves 47.28 GiB allocated in `target`.
 The current 23 executables, 29 older archived paths, 14 auxiliary uncommitted
 files and all 10 installed roots remain unchanged. Retirement and post-commit
 Git-tree/code/binary/preservation audits bind these facts to the committed tree.
+
+Both public paged checkpoint layouts now acquire local private/bootstrap/source
+and READY custody through a resumable walk under their original enclosing
+metadata owner. One 1,024-byte journal binds the original certificate/header,
+independent trust, holder and indexed cursors. Each call visits one revision or
+one bounded coding group, checks the actual assigned holder and full local
+bytes, and publishes progress only after event/predecessor and exact owner
+checks inside a CAS writer. Cursor/scan work shares the existing cumulative
+private/payload/proof budget. Failure preserves acquired pins and the cursor;
+replay reauthenticates dependencies, and cancellation invalidates completion
+atomically before the existing one-dependency retirement steps.
+
+Completion verifies every declared revision and coding EOF and exact owned
+private/payload counts, including holders with no local assignments. Logical
+revision ownership and physical shard placement are independent. Local legacy
+private revisions require their original ownership bridge; group/revision IDs
+and existing migration guards remain intact. Complete local acquisition does
+not publish a current or distributed protected checkpoint. Fixed legacy
+bridges, distributed readiness/activation, all metadata/WAL/index/scratch and
+physical quotas, normal production/retention/seed recovery, historical flat
+validation and remaining bulk lifecycle integration remain open. Normal paged
+producers stay disabled.
+
+Four new Store and two new Node fixtures cover original owners, missing READY
+roles, exact EOF after lost rows, restart, sharing, admission, damaged records,
+actor substitution and actual-current changes at insertion, advancement and
+cancellation. Node supplies all assigned original groups and completes after
+reopen with unusable flat state. Frozen format, strict locked workspace/all-
+target Clippy, all-target compilation, four debug programs, complete ordinary
+workspace and both provisioned Btrfs recovery cases pass: 1,374 distinct tests
+in 1,380 executions, including 400 Store and 539 Node. Evidence: `/tmp/mb-m6-local-checkpoint-custody-rh5db6gq`.
+Targets run sequentially with four test threads and unchanged deadlines.
+121 other ignored cases and fresh installed-artifact qualification remain open;
+dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+Initial Store assertions incorrectly expected the private logical owner to
+hold READY shards; the fixture places those shards on other holders. An initial
+Node extension staged only one of the fixture's two assigned groups, and the
+new full-custody walk correctly rejected its missing READY role. Dedicated
+final fixtures provision all assignments; existing migration tests retain their
+original behavior. These initial logs and a corrected Clippy style finding
+remain separate from the accepted frozen passing inventory. No production
+bounds, authorization checks or test deadlines were weakened.
+
+Independent frozen source/binary/exact inventory, native-cleanup and preservation
+audits pass. Retiring exactly the superseded `515d1af` debug archive reclaims
+9.35 GiB and leaves 47.39 GiB allocated in `target`. Current
+qualified executables, 29 older archived paths, 14 auxiliary uncommitted files
+and all 10 installed roots are preserved. The post-commit Git-tree/code/binary
+and preservation audit binds the qualification to the committed source.

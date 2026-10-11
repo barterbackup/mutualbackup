@@ -58,8 +58,65 @@ custody_reads!(NodeReader);
 
 macro_rules! custody {
     ($proof:ty, $retention:ty, $metadata:ident, $revision:ident, $payload:ident,
-     $retain:ident, $retain_revision:ident, $retain_payload:ident) => {
+     $retain:ident, $retain_revision:ident, $retain_payload:ident,
+     $step:ident, $retain_step:ident) => {
         impl Node {
+            /// Acquire one local private revision or one bounded group's local
+            /// READY assignments under this exact metadata owner. Durable progress
+            /// resumes after reopen. Complete is local custody, not distributed
+            /// protection or permission to activate a checkpoint.
+            pub fn $step(
+                &self,
+                id: Uuid,
+                proof: &$proof,
+            ) -> Result<mb_store::CatalogCheckpointLocalCustody> {
+                guild_authority::with_history(&self.control, |authority| {
+                    self.control.$retain_step(
+                        id,
+                        proof,
+                        self.keys.node_id(),
+                        || {
+                            authority.paged_checkpoint_trust().map_err(|_| {
+                                mb_store::CatalogStoreError::Database(
+                                    mb_store::DatabaseError::Conflict,
+                                )
+                            })
+                        },
+                        |snapshot| -> Result<()> {
+                            let opened = crate::PagedPrivateMetadata::open_local_snapshot(
+                                &self.keys,
+                                snapshot,
+                                snapshot.bundle.scope,
+                            )?;
+                            anyhow::ensure!(
+                                opened.private.is_some(),
+                                "checkpoint private revision is retired"
+                            );
+                            Ok(())
+                        },
+                        |payload| -> Result<()> {
+                            anyhow::ensure!(
+                                payload.holder == self.keys.node_id(),
+                                "checkpoint payload belongs to another holder"
+                            );
+                            let ready = self.volumes.load_ready_variable(
+                                &self.control,
+                                &payload.storage_id,
+                                payload.shard_index,
+                            )?;
+                            anyhow::ensure!(
+                                ready.guild_id == payload.guild_id
+                                    && ready.commitment == payload.commitment
+                                    && merkle_commit(&ready.bytes)? == payload.commitment,
+                                "checkpoint READY payload differs from its original coding witness"
+                            );
+                            Ok(())
+                        },
+                    )
+                })?
+                .context("paged checkpoint requires original guild authority")
+            }
+
             /// Stage the complete public metadata owner against independently checked
             /// original events and the actual current predecessor. This does not
             /// publish/activate a protected checkpoint or replace private/payload owners.
@@ -172,7 +229,9 @@ custody!(
     retain_paged_checkpoint_local_payload,
     retain_catalog_paged_checkpoint,
     retain_catalog_paged_checkpoint_revision_checked,
-    retain_catalog_paged_checkpoint_payload_checked
+    retain_catalog_paged_checkpoint_payload_checked,
+    retain_paged_checkpoint_local_custody_step,
+    retain_catalog_paged_checkpoint_local_custody_step_checked
 );
 custody!(
     mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
@@ -182,5 +241,7 @@ custody!(
     retain_paged_checkpoint_directory_local_payload,
     retain_catalog_paged_checkpoint_directory,
     retain_catalog_paged_checkpoint_directory_revision_checked,
-    retain_catalog_paged_checkpoint_directory_payload_checked
+    retain_catalog_paged_checkpoint_directory_payload_checked,
+    retain_paged_checkpoint_directory_local_custody_step,
+    retain_catalog_paged_checkpoint_directory_local_custody_step_checked
 );

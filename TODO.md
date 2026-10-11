@@ -3499,6 +3499,36 @@ and native-platform gates remain open.
     activation and normal production/retention/seed recovery remain open.
     121 other ignored cases and fresh installed qualification remain open;
     dense 1 TiB/native Windows/macOS qualification remain user-deferred.
+  - [x] Finish resumable local private/READY custody under the original enclosing
+    public checkpoint owner for both paged layouts. A bounded 1,024-byte cursor
+    binds the holder, original certificate/header/trust and complete revision/
+    coding EOF counters. Each call visits one revision or one bounded group;
+    local private/bootstrap/source and actual full-Merkle READY dependencies
+    use the existing owner pins and cumulative work budget. Cursor publication
+    rechecks original event trust and the actual predecessor inside its CAS
+    writer. Failed steps keep acquired dependencies and replay the same cursor;
+    cancellation invalidates completion atomically before bounded retirement.
+    Complete counts include all declared revisions/groups even for holders
+    with no local assignments; one-sided/oversized rows, missing inventory,
+    stale current heads and another holder cannot complete. Local legacy
+    private revisions require their original ownership bridge and fail closed.
+    Four new Store and two new Node cases cover missing READY data, reopen,
+    independent logical/private and physical holders, successor sharing,
+    cursor/scan admission, exact EOF, damaged records and insertion/advancement/
+    cancellation rollback. Node provisions every assigned original group and
+    completes after reopen with unusable flat state. Full frozen qualification
+    passes 1,374 distinct tests in 1,380 executions, including 400 Store,
+    539 Node and both provisioned Btrfs recovery cases. Format, strict locked
+    workspace/all-target Clippy, compilation and four debug builds pass.
+    Evidence: `/tmp/mb-m6-local-checkpoint-custody-rh5db6gq`. Source/binary/inventory/preservation audits pass. Exact
+    retirement of the superseded debug archive reclaims 9.35 GiB,
+    leaving 47.39 GiB in `target`; current qualified executables,
+    29 older archived paths, 14 auxiliary WIP files and all 10 installed roots
+    remain intact. Distributed availability/activation, complete global
+    metadata/WAL/scratch/physical quotas, fixed legacy bridges and normal paged
+    capture/packing/checkpoint/retention/seed recovery remain open. Normal paged
+    producers stay disabled. 121 other ignored cases and fresh installed
+    qualification remain open; dense 1 TiB/native Windows/macOS remain deferred.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals
