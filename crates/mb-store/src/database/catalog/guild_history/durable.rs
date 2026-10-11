@@ -753,6 +753,57 @@ impl CatalogDurableGuildHistoryView<'_> {
         Ok(Some(group.retained))
     }
 
+    /// Visit the complete retained set in key order, allocating one bounded
+    /// original group at a time. Successful EOF checks both lifecycle counts
+    /// against the certified-history tip, including an empty set.
+    pub fn for_each_retained_group<E>(
+        &self,
+        mut visit: impl FnMut(RetainedCodingGroup) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<CatalogStoreError>,
+    {
+        self.history.check(self.control)?;
+        let mut after: Option<Vec<u8>> = None;
+        let mut retained = 0_u64;
+        let mut retired = 0_u64;
+        while let Some((key, length)) = self
+            .control
+            .next_record_metadata_bounded(kind(GROUPS), after.as_deref(), 32)
+            .map_err(CatalogStoreError::from)?
+        {
+            if key.len() != 32
+                || after.as_ref().is_some_and(|previous| previous >= &key)
+                || length <= HEADER
+                || length > HEADER + GROUP_BYTES
+            {
+                return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+            }
+            let id = key
+                .as_slice()
+                .try_into()
+                .map_err(|_| CatalogStoreError::from(DatabaseError::Integrity))?;
+            let group = self
+                .retained_group(id)?
+                .ok_or_else(|| CatalogStoreError::from(DatabaseError::Integrity))?;
+            retained = retained
+                .checked_add(1)
+                .ok_or_else(|| CatalogStoreError::from(DatabaseError::Integrity))?;
+            retired += u64::from(group.retired_at_event.is_some());
+            if retained > self.history.manifest.retained || retired > self.history.manifest.retired
+            {
+                return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+            }
+            visit(group)?;
+            after = Some(key);
+        }
+        if retained != self.history.manifest.retained || retired != self.history.manifest.retired {
+            return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+        }
+        self.history.check(self.control)?;
+        Ok(())
+    }
+
     /// Match the original signed witness of the currently retained incarnation.
     /// A retired group still owns its witness until Forget. Group-key aliases
     /// alone cannot authorize another transcript with the same descriptor.
@@ -797,6 +848,27 @@ impl CatalogDurableGuildHistoryView<'_> {
             return Err(DatabaseError::Integrity.into());
         }
         Ok(value)
+    }
+
+    /// The latest registered writer epoch remains superseded when revoked;
+    /// an older unrevoked key must never become current again.
+    pub fn current_writer_key(
+        &self,
+        owner: NodeId,
+    ) -> Result<Option<WriterKeyEpoch>, CatalogStoreError> {
+        let Some(epoch) = self.point::<u64>(LATEST_WRITER, &owner.0)? else {
+            if self.writer_key(owner, 1)?.is_some() {
+                return Err(DatabaseError::Integrity.into());
+            }
+            return Ok(None);
+        };
+        if epoch == 0 || epoch > self.history.authority().event_sequence {
+            return Err(DatabaseError::Integrity.into());
+        }
+        let key = self
+            .writer_key(owner, epoch)?
+            .ok_or(DatabaseError::Integrity)?;
+        Ok(key.revoked_at_event.is_none().then_some(key))
     }
     pub fn recovery_key(
         &self,

@@ -5453,3 +5453,68 @@ indexing, complete paged checkpoint authority/custody/activation, enclosing
 admission or normal paged capture/packing/retention/seed production. Fixed
 legacy-group migration and the remaining R1/R2/R3/R5/R7 gates stay open. Dense
 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+
+## Streaming original retained groups in normal coverage (2026-10-11)
+
+Normal current variable checkpoint coverage, uncovered variable/packed-sector
+planning and expired-input replacement planning now consume the completed
+durable original-history index through a single frozen authority batch. The
+Store visitor reads key metadata before allocating each bounded group, checks
+strict key order and exact retained/retired counts at EOF, and rechecks its tip.
+Node reads relevant evidence at the existing 600 KiB SQL/decoder cap and matches
+the original Add hash and descriptor. A missing witness establishes no coverage;
+present malformed, oversized or substituted evidence rejects. A missing group
+cannot silently establish EOF even when no sector is requested. Current writer
+checks retain historical key access but never revive an older registered epoch
+after rotation or revocation. Checkpoint-head joins are fenced independently.
+
+Existing root/commitment and placement distinctions remain: current protection
+requires full root binding and current placement; exact-head legacy sectors
+retain historical placement compatibility, while packed coverage stays current.
+Retired groups do not establish new coverage. Replacement planning excludes a
+group with any expired physical input from its planning view without retiring
+its actual custody. Absent/incomplete indexing retains independently fenced
+legacy access; historical flat checkpoint validation keeps its compatibility
+validator. No signed identities, encodings or peer variants change.
+
+Five new fixtures cover complete live/retired/forgotten EOF, malformed/oversized/
+missing rows, post-visit tip fences, damaged latest-writer rows and revocation,
+reopen with unusable flat state, valid substituted/oversized witness aliases,
+expired-input planning and current full-root/writer binding. Initial preliminary
+fixtures incorrectly used the version-one event helper for two transcript-bound
+Adds; their protocol rejections were retained, then the fixtures were
+corrected to version two. The final frozen source passes 1,368 distinct tests
+in 1,372 positive executions, including 396 Store, 537 Node and both provisioned
+Btrfs recovery cases. Formatting, strict locked workspace/all-target Clippy,
+all-target compilation and four debug builds pass; targets run sequentially,
+with no timeout changes. Source/executable identities and native cleanup are
+recorded in `/tmp/mb-m6-streamed-coverage-final-fhxnz87b`. Two attempted full
+Node runs on the preceding frozen candidate missed the inbound receive trace; isolated, 15 concurrent trace stress runs and a full
+146-case P2P diagnostic passed. The fixture formerly accepted any request error.
+It now requires the actual membership rejection, includes captured traces on
+failure and binds both event-loop futures to the subscriber on a two-worker
+executor. Final qualification includes this stronger cross-thread trace case.
+Earlier failed and diagnostic evidence remains under
+`/tmp/mb-m6-streamed-coverage-aox5yu2g`. Deadlines are unchanged; this fixture
+correction does not close the historical R5 topology/signature investigation.
+
+This completes streaming coverage/planning consumers, not the complete scan's
+work budget, enclosing request vector, historical flat validation, event
+publication/bulk lifecycle, complete quotas, enclosing paged ownership and
+activation, normal paged capture/retention/seed recovery or installed/native
+qualification. 121 other ignored cases and fresh installed qualification remain
+open; dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+
+Independent audit verifies all 323 frozen source paths (320 code/dependency
+inputs unchanged after the documentation update), 23 qualified executables,
+19 ordinary target inventories, exact passing/ignored names and native cleanup.
+It corrects empty-selection bookkeeping without rerunning tests or changing
+source/binaries; the initial audit error remains recorded. After that audit,
+exact-path retirement removes the superseded `4c938d8` debug archive and the
+preliminary/failed Node drivers, preserving their hashes and diagnostic logs.
+This reclaims 11.44 GiB physically and leaves 47.28 GiB allocated in `target`.
+The current 23 executables, 29 older archived paths, 14 auxiliary uncommitted
+files and all 10 installed roots remain unchanged. Retirement and post-commit
+Git-tree/code/binary/preservation audits bind these facts to the committed tree.

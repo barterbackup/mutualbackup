@@ -422,6 +422,43 @@ impl<'a> AuthorityReader<'a> {
         }
     }
 
+    pub(crate) fn for_each_retained_group(
+        &self,
+        mut visit: impl FnMut(mb_core::RetainedCodingGroup) -> Result<()>,
+    ) -> Result<()> {
+        self.check()?;
+        match &self.history {
+            Some(history) => history
+                .view(self.control, history.genesis_hash(), &self.current)?
+                .for_each_retained_group(&mut visit)?,
+            None => {
+                for group in &self
+                    .legacy
+                    .as_ref()
+                    .context("legacy authority is unavailable")?
+                    .coding_groups
+                {
+                    visit(group.clone())?;
+                }
+            }
+        }
+        self.check()
+    }
+
+    pub(crate) fn writer_epoch_is_current(&self, owner: NodeId, epoch: u64) -> Result<bool> {
+        match &self.history {
+            Some(history) => Ok(history
+                .view(self.control, history.genesis_hash(), &self.current)?
+                .current_writer_key(owner)?
+                .is_some_and(|key| key.epoch == epoch)),
+            None => Ok(self
+                .legacy
+                .as_ref()
+                .context("legacy authority is unavailable")?
+                .writer_epoch_is_current(owner, epoch)),
+        }
+    }
+
     pub(crate) fn validate_retained_coding_transcript(
         &self,
         transcript: &SignedRecord<CodingVerificationTranscript>,
@@ -1563,5 +1600,379 @@ mod tests {
                 1
             );
         }
+    }
+    fn bound_add(
+        node: &Node,
+        keys: &[KeyMaterial],
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> QuorumGuildEvent {
+        let mut certified = event(
+            node,
+            keys,
+            mb_core::GuildEventKind::AddCodingGroupBound {
+                group: transcript.value.manifest.value.group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(transcript).unwrap()).as_bytes(),
+            },
+        );
+        certified.event.format_version = 2;
+        for signature in &mut certified.signatures {
+            let signer = keys
+                .iter()
+                .find(|key| key.node_id() == signature.signer)
+                .unwrap();
+            *signature = sign_guild_event(&certified.event, signer).unwrap();
+        }
+        certified
+    }
+
+    #[test]
+    fn indexed_coverage_planning_survives_reopen_and_rejects_substituted_witnesses() {
+        let (temp, seed, mut node, keys) = fixture();
+        let (add, transcript, _) = group(&node, &keys);
+        let group_id = transcript.value.manifest.value.group.id;
+        let ShardRoleV2::Information(information) = &transcript.value.manifest.value.group.roles[0]
+        else {
+            unreachable!()
+        };
+        let descriptor = PackedSectorDescriptor {
+            id: information.sector.id,
+            sector_index: 0,
+            flat_root: transcript.value.plan.value.information_root(0).unwrap(),
+            commitment: information.sector.commitment.clone(),
+            slots: Vec::new(),
+        };
+        node.install_coding_group_event(add, transcript.clone())
+            .unwrap();
+        let flat = node
+            .control
+            .get_record("guild-dynamic-state", KEY)
+            .unwrap()
+            .unwrap();
+        drop(node);
+        let mut node = Node::open(temp.path(), seed).unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &vec![0; 2 << 20])
+            .unwrap();
+        assert!(node.dynamic_guild_state().is_err());
+        assert!(
+            node.uncovered_packed_sectors(std::slice::from_ref(&descriptor))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            node.packed_sectors_for_group_replacement(std::slice::from_ref(&descriptor))
+                .unwrap()
+                .is_empty()
+        );
+        let mut different = descriptor.clone();
+        different.flat_root = [66; 32];
+        assert_eq!(
+            node.uncovered_packed_sectors(std::slice::from_ref(&different))
+                .unwrap(),
+            vec![different]
+        );
+        let indexed = node
+            .control
+            .get_record("guild-original-group", &group_id)
+            .unwrap()
+            .unwrap();
+        node.control
+            .delete_record("guild-original-group", &group_id)
+            .unwrap();
+        assert!(
+            node.uncovered_packed_sectors(&[]).is_err(),
+            "EOF must be checked even with no requested sectors"
+        );
+        node.control
+            .put_record("guild-original-group", &group_id, &indexed)
+            .unwrap();
+        let mut value = transcript.value.plan.value.clone();
+        value.attempt_id = [88; 16];
+        let delegator = keys
+            .iter()
+            .find(|key| key.node_id() == value.delegator)
+            .unwrap();
+        let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, value, delegator).unwrap();
+        let shards = mb_core::encode(plan.value.geometry.profile, vec![vec![91; 64]]).unwrap();
+        let alternate = test_coding_transcript(plan, &shards, &keys);
+        assert_eq!(
+            alternate.value.manifest.value.group,
+            transcript.value.manifest.value.group
+        );
+        node.control
+            .put_record(
+                "coding-group-transcript",
+                &group_id,
+                &canonical_bytes(&alternate).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            node.uncovered_packed_sectors(std::slice::from_ref(&descriptor))
+                .is_err()
+        );
+        node.control
+            .put_record(
+                "coding-group-transcript",
+                &group_id,
+                &vec![0; mb_core::CATALOG_CODING_TRANSCRIPT_BYTES + 1],
+            )
+            .unwrap();
+        assert!(
+            node.uncovered_packed_sectors(std::slice::from_ref(&descriptor))
+                .is_err()
+        );
+        node.control
+            .put_record(
+                "coding-group-transcript",
+                &group_id,
+                &canonical_bytes(&transcript).unwrap(),
+            )
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &flat)
+            .unwrap();
+        let sequence = node.dynamic_guild_state().unwrap().unwrap().event_sequence + 1;
+        let retire = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RetireCodingGroup {
+                group_id,
+                retain_through_event: sequence,
+            },
+        );
+        node.install_guild_event(retire).unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert_eq!(
+            node.uncovered_packed_sectors(std::slice::from_ref(&descriptor))
+                .unwrap(),
+            vec![descriptor]
+        );
+    }
+
+    #[test]
+    fn indexed_replacement_keeps_groups_with_expired_inputs_out_of_the_planning_view() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let (_, first, _) = group(&node, &keys);
+        let mut value = first.value.plan.value.clone();
+        value.geometry.profile = mb_core::CodingProfile::new(2, 1, 64);
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let other = state
+            .active_members()
+            .find(|member| member.node_id == value.delegator)
+            .unwrap();
+        let shards =
+            mb_core::encode(value.geometry.profile, vec![vec![91; 64], vec![92; 64]]).unwrap();
+        value.geometry.information.push(mb_core::InformationRoleV2 {
+            owner: other.node_id,
+            failure_domain: other.failure_domain.clone(),
+            sector: mb_core::RangeSectorRef {
+                id: [194; 32],
+                commitment: merkle_commit(&shards[1]).unwrap(),
+                logical_len: 64,
+                virtual_zero: false,
+            },
+        });
+        value.information_roots =
+            Some(shards[..2].iter().map(|shard| sector_root(shard)).collect());
+        let signer = keys
+            .iter()
+            .find(|key| key.node_id() == value.delegator)
+            .unwrap();
+        let transcript = test_coding_transcript(
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, value, signer).unwrap(),
+            &shards,
+            &keys,
+        );
+        let certified = bound_add(&node, &keys, &transcript);
+        node.install_coding_group_event(certified, transcript.clone())
+            .unwrap();
+        let descriptors = transcript
+            .value
+            .plan
+            .value
+            .geometry
+            .information
+            .iter()
+            .enumerate()
+            .map(|(index, role)| PackedSectorDescriptor {
+                id: role.sector.id,
+                sector_index: index as u32,
+                flat_root: transcript.value.plan.value.information_root(index).unwrap(),
+                commitment: role.sector.commitment.clone(),
+                slots: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert!(
+            node.uncovered_packed_sectors(&descriptors[..1])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            node.packed_sectors_for_group_replacement(&descriptors[..1])
+                .unwrap(),
+            descriptors[..1]
+        );
+        assert!(
+            node.packed_sectors_for_group_replacement(&descriptors)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            node.coding_transcript_for_group(
+                state.guild_id,
+                transcript.value.manifest.value.group.id
+            )
+            .is_ok(),
+            "planning cannot retire actual custody"
+        );
+    }
+    #[test]
+    fn indexed_current_checkpoint_coverage_uses_original_writer_and_full_root_binding() {
+        let (_temp, _seed, mut node, keys) = fixture();
+        let (_, initial, _) = group(&node, &keys);
+        let mut value = initial.value.plan.value.clone();
+        let owner = value.geometry.information[0].owner;
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[224; 32]);
+        let register = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        );
+        node.install_guild_event(register).unwrap();
+        value.geometry.profile = mb_core::CodingProfile::new(1, 1, V1_SECTOR_SIZE as u32);
+        let shards =
+            mb_core::encode(value.geometry.profile, vec![vec![91; V1_SECTOR_SIZE]]).unwrap();
+        value.geometry.information[0].sector.commitment = merkle_commit(&shards[0]).unwrap();
+        value.information_roots = Some(vec![sector_root(&shards[0])]);
+        let signer = keys
+            .iter()
+            .find(|key| key.node_id() == value.delegator)
+            .unwrap();
+        let transcript = test_coding_transcript(
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, value, signer).unwrap(),
+            &shards,
+            &keys,
+        );
+        let add = bound_add(&node, &keys, &transcript);
+        node.install_coding_group_event(add, transcript.clone())
+            .unwrap();
+        let mut revision = UserRevision {
+            format_version: 4,
+            guild_id: transcript.value.plan.value.geometry.guild_id,
+            protected_root_id: Uuid::from_bytes([225; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([226; 16]),
+            owner,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![SectorRef {
+                id: [193; 32],
+                root: sector_root(&shards[0]),
+                logical_len: 64,
+            }],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![merkle_commit(&shards[0]).unwrap()]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let owner_key = keys.iter().find(|key| key.node_id() == owner).unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let checkpoint = GuildCheckpoint {
+            format_version: 6,
+            guild_id: state.guild_id,
+            genesis_hash: node
+                .installed_guild()
+                .unwrap()
+                .unwrap()
+                .certificate
+                .hash()
+                .unwrap(),
+            generation: 1,
+            parent: None,
+            members: state.active_members().cloned().collect(),
+            writer_fences: vec![mb_core::WriterFence {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            }],
+            revision_tombstones: Vec::new(),
+            revisions: vec![SignedRecord::sign(USER_REVISION_DOMAIN, revision, owner_key).unwrap()],
+            coding_groups: Vec::new(),
+            authority: Some(mb_core::CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: state.membership_epoch,
+                quorum: state.quorum,
+            }),
+            packing_catalog: None,
+        };
+        checkpoint.validate().unwrap();
+        let flat = node
+            .control
+            .get_record("guild-dynamic-state", KEY)
+            .unwrap()
+            .unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        node.validate_variable_checkpoint_coverage(&checkpoint, false)
+            .unwrap();
+        let mut wrong = checkpoint.clone();
+        wrong.revisions[0].value.metadata_sectors[0].root = [99; 32];
+        assert!(
+            node.validate_variable_checkpoint_coverage(&wrong, false)
+                .is_err()
+        );
+        let mut wrong = checkpoint.clone();
+        wrong.revisions[0]
+            .value
+            .sector_commitments
+            .as_mut()
+            .unwrap()[0] = merkle_commit(&vec![92; V1_SECTOR_SIZE]).unwrap();
+        assert!(
+            node.validate_variable_checkpoint_coverage(&wrong, false)
+                .is_err()
+        );
+        node.control
+            .put_record("guild-dynamic-state", KEY, &flat)
+            .unwrap();
+        let rotate = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 2,
+                public_key: keys[1].node_id().0,
+            },
+        );
+        node.install_guild_event(rotate).unwrap();
+        let revoke = event(
+            &node,
+            &keys,
+            mb_core::GuildEventKind::RevokeWriterKey { owner, epoch: 2 },
+        );
+        node.install_guild_event(revoke).unwrap();
+        node.control
+            .put_record("guild-dynamic-state", KEY, &[0])
+            .unwrap();
+        assert_eq!(
+            node.retained_writer_public_key(owner, 1).unwrap(),
+            Some(writer.verifying_key().to_bytes())
+        );
+        assert!(
+            node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                .is_err(),
+            "an old retained writer cannot sign a new uncommitted head"
+        );
     }
 }

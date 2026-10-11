@@ -3476,6 +3476,29 @@ and native-platform gates remain open.
     integration, complete enclosing paged authority/custody/activation and
     full admission/production/retention/seed recovery remain open. Dense
     1 TiB and native Windows/macOS qualification remain user-deferred.
+  - [x] Stream retained original groups into normal current checkpoint coverage
+    and variable/packed replacement planning. Completed indexes allocate one
+    bounded group/witness at a time, verify original Add hashes and exact
+    retained/retired EOF counts, and freeze genesis/tip/history and checkpoint
+    head joins. Current writer lookup never revives an older epoch after
+    rotation/revocation; exact-head sector placement and retired custody retain
+    their existing rules. Absent/incomplete indexes keep fenced legacy access.
+    Five new Store/Node fixtures and complete frozen workspace plus both Btrfs
+    cases pass: 1,368 distinct tests in 1,372 executions, including 396 Store
+    and 537 Node. Format, strict locked all-target Clippy, all-target compilation
+    and four debug builds pass. Evidence:
+    `/tmp/mb-m6-streamed-coverage-final-fhxnz87b`.
+    Independent source/binary/inventory and preservation audits pass; retiring
+    the superseded debug archive and preliminary/failed drivers reclaims
+    11.44 GiB, leaving 47.28 GiB in `target`. Current qualified executables,
+    29 older archived paths, 14 auxiliary WIP files and all 10 installed roots
+    remain intact.
+    This bounds retained-history allocation, not the complete scan's work or
+    the enclosing request vector. Historical flat checkpoint validation,
+    event ingestion/bulk lifecycle, shared quotas, complete paged ownership/
+    activation and normal production/retention/seed recovery remain open.
+    121 other ignored cases and fresh installed qualification remain open;
+    dense 1 TiB/native Windows/macOS qualification remain user-deferred.
   - [ ] Bind the completed directory coverage proof, both packing roots and
     every logical forest reference into the enclosing durable checkpoint owner.
     Retaining a directory root alone, or combining independent local journals

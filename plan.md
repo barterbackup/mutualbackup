@@ -5241,3 +5241,35 @@ writes, preserving configured parity headroom and current checkpoint-copy space
 under shared process admission. Physical-limit failure/reopen/retry and Btrfs
 rewrite tests pass. Dataset/history quotas, other filesystem writers, scheduling
 and cross-platform VFS qualification remain release gates.
+
+Normal current variable checkpoint coverage and variable/packed replacement
+planning now stream the completed original-history retained set. Each group
+and relevant 600 KiB-bounded witness is read independently; exact live/retired
+EOF counts and genesis/current-tip/history fences reject missing, malformed or
+extra index rows. Relevant evidence must match the original Add transcript,
+not merely a valid group alias. Current writer checks use the indexed latest
+epoch and reject rotation/revocation without reviving a historical key.
+Checkpoint-head joins are fenced; exact-head legacy sector compatibility and
+replacement custody remain intact. Absent/incomplete indexes preserve legacy
+access. Historical flat coverage remains on its compatibility validator.
+
+Five new Store/Node fixtures cover complete EOF and lifecycle, damaged/missing/
+oversized rows, final tip changes, revoked/latest writer damage, reopen with
+unusable flat state, substituted witnesses, expired-input planning and full
+root binding. Frozen qualification passes 1,368 distinct tests in 1,372 positive
+executions: complete ordinary workspace/all-target drivers plus both provisioned
+Btrfs recovery cases, including 396 Store and 537 Node. Format, strict locked
+workspace/all-target Clippy, all-target compilation and four debug builds pass.
+Evidence: `/tmp/mb-m6-streamed-coverage-final-fhxnz87b`. Tests run sequentially by
+target with unchanged deadlines. The completed scan's work and request vector
+still need paged admission; event ingestion/bulk lifecycle and the complete
+shared quota/ownership/activation/production/retention/seed path remain open.
+121 other ignored cases and fresh installed qualification remain open. Dense
+1 TiB and native Windows/macOS qualification remain user-deferred.
+
+Independent source/binary/test-inventory and native/preservation audits pass.
+Retiring only the superseded debug archive and preliminary/failed Node drivers
+reclaims 11.44 GiB, leaving 47.28 GiB in `target`; current qualified executables,
+29 older archived paths, 14 auxiliary WIP files and all 10 installed roots stay
+intact. Original diagnostic evidence remains available. The post-commit audit
+checks exact Git-tree bytes against qualified code and verifies preservation.

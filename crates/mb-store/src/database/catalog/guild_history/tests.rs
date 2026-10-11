@@ -2317,3 +2317,135 @@ fn real_history_migrates_an_empty_legacy_prefix_and_rejects_omitted_variable_his
         }
     }
 }
+
+#[test]
+fn durable_retained_group_stream_checks_complete_lifecycle_and_eof() {
+    let mut history = History::new(false, 4);
+    let id = history.entry.retained.group.id;
+    history.push(GuildEventKind::RetireCodingGroup {
+        group_id: id,
+        retain_through_event: 7,
+    });
+    history.push(GuildEventKind::ForgetCodingGroup { group_id: id });
+    let directory = tempfile::tempdir().unwrap();
+    let control = ControlStore::open(directory.path().join("stream.db"), &history.keys[0]).unwrap();
+    CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    for sequence in 0..=8 {
+        if sequence > 0 {
+            advance_durable(&control, &history);
+        }
+        let current = durable(&control);
+        let view = current
+            .view(&control, current.genesis_hash(), current.authority())
+            .unwrap();
+        let mut found = Vec::new();
+        view.for_each_retained_group::<CatalogStoreError>(|group| {
+            found.push(group);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(found.len(), usize::from((6..=7).contains(&sequence)));
+        if sequence == 7 {
+            assert_eq!(found[0].retired_at_event, Some(7));
+        }
+        if sequence == 6 {
+            let row = control
+                .get_record("guild-original-group", &id)
+                .unwrap()
+                .unwrap();
+            for damage in [None, Some(vec![0]), Some(vec![0; GROUP_BYTES + 65])] {
+                match damage {
+                    Some(bytes) => control
+                        .put_record("guild-original-group", &id, &bytes)
+                        .unwrap(),
+                    None => {
+                        control.delete_record("guild-original-group", &id).unwrap();
+                    }
+                }
+                assert!(
+                    view.for_each_retained_group::<CatalogStoreError>(|_| Ok(()))
+                        .is_err()
+                );
+                control
+                    .put_record("guild-original-group", &id, &row)
+                    .unwrap();
+            }
+            let tip = control
+                .get_record("guild-original-tip-v1", b"primary")
+                .unwrap()
+                .unwrap();
+            assert!(
+                view.for_each_retained_group::<CatalogStoreError>(|_| {
+                    control.put_record("guild-original-tip-v1", b"primary", &[0])?;
+                    Ok(())
+                })
+                .is_err()
+            );
+            control
+                .put_record("guild-original-tip-v1", b"primary", &tip)
+                .unwrap();
+        }
+        // Even a caller needing no group must reject rows beyond certified EOF.
+        control
+            .put_record("guild-original-group", &[255; 33], &[1; 65])
+            .unwrap();
+        assert!(
+            view.for_each_retained_group::<CatalogStoreError>(|_| Ok(()))
+                .is_err()
+        );
+        control
+            .delete_record("guild-original-group", &[255; 33])
+            .unwrap();
+    }
+}
+
+#[test]
+fn durable_current_writer_never_revives_a_superseded_or_revoked_epoch() {
+    let mut history = History::new(false, 4);
+    let owner = history.keys[0].node_id();
+    history.push(GuildEventKind::RotateWriterKey {
+        owner,
+        epoch: 2,
+        public_key: history.keys[1].node_id().0,
+    });
+    history.push(GuildEventKind::RevokeWriterKey { owner, epoch: 2 });
+    let directory = tempfile::tempdir().unwrap();
+    let control = ControlStore::open(directory.path().join("writer.db"), &history.keys[0]).unwrap();
+    CatalogDurableGuildHistory::prepare_genesis(&control, &history.genesis, budget())
+        .unwrap()
+        .commit(&control)
+        .unwrap();
+    for _ in 0..history.state.event_sequence {
+        advance_durable(&control, &history);
+    }
+    let current = durable(&control);
+    let view = current
+        .view(&control, current.genesis_hash(), current.authority())
+        .unwrap();
+    assert!(view.current_writer_key(owner).unwrap().is_none());
+    assert!(
+        view.writer_key(owner, 1)
+            .unwrap()
+            .unwrap()
+            .revoked_at_event
+            .is_none()
+    );
+    let latest = control
+        .get_record("guild-original-latest-writer", &owner.0)
+        .unwrap()
+        .unwrap();
+    control
+        .delete_record("guild-original-latest-writer", &owner.0)
+        .unwrap();
+    assert!(view.current_writer_key(owner).is_err());
+    control
+        .put_record("guild-original-latest-writer", &owner.0, &latest)
+        .unwrap();
+    control
+        .delete_record("guild-original-writer", &epoch_key(owner, 2))
+        .unwrap();
+    assert!(view.current_writer_key(owner).is_err());
+}

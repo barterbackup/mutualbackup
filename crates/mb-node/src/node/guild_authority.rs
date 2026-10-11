@@ -15,7 +15,7 @@ thread_local! {
 }
 
 mod membership;
-mod original_history;
+pub(super) mod original_history;
 
 pub(super) fn advance_original_history(control: &ControlStore) -> Result<bool> {
     original_history::advance(control)

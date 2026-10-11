@@ -59,6 +59,7 @@ type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
 mod checkpoint_custody;
 mod guild_authority;
+mod variable_coverage;
 
 type LegacyPackingAttestationEntries =
     BTreeMap<(NodeId, [u8; 32], SectorId), Vec<SignedRecord<mb_core::LegacyPackingAttestation>>>;
@@ -10562,13 +10563,10 @@ impl Node {
             }
             anyhow::bail!("checkpoint contents are invalid in their historical guild epoch");
         }
-        let state = self
-            .dynamic_guild_state()?
-            .context("dynamic checkpoint requires dynamic guild state")?;
-        if state.guild_id != checkpoint.guild_id {
-            anyhow::bail!("checkpoint and dynamic guild state differ");
-        }
-        self.validate_variable_checkpoint_coverage_in_state(checkpoint, &state, false)?;
+        guild_authority::with_history(&self.control, |authority| {
+            self.validate_current_variable_checkpoint_coverage(checkpoint, authority)
+        })?
+        .context("dynamic checkpoint requires dynamic guild state")?;
         Ok(())
     }
 
@@ -10722,85 +10720,6 @@ impl Node {
             }
         }
         Ok(false)
-    }
-
-    pub(crate) fn uncovered_variable_sectors(
-        &self,
-        owner: NodeId,
-        sectors: &[SectorRef],
-        commitments: Option<&[mb_core::MerkleCommitment]>,
-    ) -> Result<Vec<SectorRef>> {
-        if commitments.is_some_and(|commitments| commitments.len() != sectors.len()) {
-            anyhow::bail!("revision sector commitments do not align with its sectors");
-        }
-        let state = self
-            .dynamic_guild_state()?
-            .context("variable coverage requires dynamic guild state")?;
-        let mut uncovered = Vec::new();
-        for (index, sector) in sectors.iter().enumerate() {
-            let expected_commitment = commitments.and_then(|commitments| commitments.get(index));
-            if !self.verified_variable_sector_coverage(
-                &state,
-                owner,
-                sector,
-                expected_commitment,
-                false,
-                true,
-            )? {
-                uncovered.push(sector.clone());
-            }
-        }
-        Ok(uncovered)
-    }
-
-    pub(crate) fn uncovered_packed_sectors(
-        &self,
-        descriptors: &[PackedSectorDescriptor],
-    ) -> Result<Vec<PackedSectorDescriptor>> {
-        let state = self
-            .dynamic_guild_state()?
-            .context("packed coverage requires dynamic guild state")?;
-        self.uncovered_packed_sectors_in_state(&state, descriptors)
-    }
-
-    pub(crate) fn packed_sectors_for_group_replacement(
-        &self,
-        descriptors: &[PackedSectorDescriptor],
-    ) -> Result<Vec<PackedSectorDescriptor>> {
-        let mut state = self
-            .dynamic_guild_state()?
-            .context("packed replacement requires dynamic guild state")?;
-        let live = descriptors
-            .iter()
-            .map(|sector| sector.id)
-            .collect::<BTreeSet<_>>();
-        // This is only a planning view. Keep the actual groups and their READY
-        // shards until a verified replacement is activated and Retire/Forget
-        // is committed. Padding roles do not contain expired user data.
-        state.coding_groups.retain(|retained| {
-            retained.group.roles.iter().all(|role| {
-                !matches!(role, ShardRoleV2::Information(information)
-                    if !information.sector.virtual_zero && !live.contains(&information.sector.id))
-            })
-        });
-        self.uncovered_packed_sectors_in_state(&state, descriptors)
-    }
-
-    fn uncovered_packed_sectors_in_state(
-        &self,
-        state: &DynamicGuildState,
-        descriptors: &[PackedSectorDescriptor],
-    ) -> Result<Vec<PackedSectorDescriptor>> {
-        descriptors
-            .iter()
-            .filter_map(|descriptor| {
-                match self.verified_packed_sector_coverage(state, descriptor, false) {
-                    Ok(true) => None,
-                    Ok(false) => Some(Ok(descriptor.clone())),
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .collect()
     }
 
     fn verified_variable_sector_coverage(

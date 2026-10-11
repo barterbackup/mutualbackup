@@ -21721,8 +21721,9 @@ mod tests {
         assert!(received.contains("session_sequence=Some(2)"), "{received}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn signature_request_trace_reaches_the_real_inbound_admission_worker() {
+        use tracing::instrument::WithSubscriber;
         let log = SignatureTraceLog::default();
         let _subscriber = tracing::subscriber::set_default(log.subscriber());
         let temp = tempfile::tempdir().unwrap();
@@ -21734,8 +21735,10 @@ mod tests {
             build_p2p(Arc::new(Mutex::new(first)), config(first_id)).unwrap();
         let (second_client, second_loop) =
             build_p2p(Arc::new(Mutex::new(second)), config(second_id)).unwrap();
-        let first_task = tokio::spawn(first_loop.run());
-        let second_task = tokio::spawn(second_loop.run());
+        // Event-loop tasks can be polled off the test thread. Carry the
+        // subscriber through every poll and into the real blocking worker.
+        let first_task = tokio::spawn(first_loop.run().with_current_subscriber());
+        let second_task = tokio::spawn(second_loop.run().with_current_subscriber());
         let address = listening_address(&second_client).await;
         first_client
             .add_peer_address(second_id, address)
@@ -21759,8 +21762,16 @@ mod tests {
         second_client.shutdown().await.unwrap();
         first_task.await.unwrap().unwrap();
         second_task.await.unwrap().unwrap();
-        assert!(result.unwrap().is_err());
         let text = log.text();
+        let error = result
+            .expect("signature request must finish before its deadline")
+            .expect_err("unaffiliated caller must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("caller is not an authorized guild member for this transition"),
+            "{error:#}\n{text}"
+        );
         let sent = text
             .lines()
             .find(|line| line.contains("stage=\"dispatched\""))
@@ -21777,7 +21788,7 @@ mod tests {
         let received = text
             .lines()
             .find(|line| line.contains("received guild signature request"))
-            .unwrap();
+            .unwrap_or_else(|| panic!("missing receive trace: {error:#}\n{text}"));
         let admission = text
             .lines()
             .find(|line| line.contains("guild transition caller failed local membership admission"))
