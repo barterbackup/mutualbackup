@@ -3845,10 +3845,33 @@ and native-platform gates remain open.
     syntax and diff checks pass. All 23 earlier
     workspace binary hashes, installed wrappers/payloads/alias and frozen drivers
     remain unchanged; auxiliary uncommitted work is preserved. Evidence is under
-    `/tmp/mb-m6-packaged-retry-gate-validation-226p4tp4`. This is runner-boundary
-    qualification; a fresh exact-source Nix build and complete provisioned run
-    of the committed runner remain pending. The historical stall, full fault
-    matrix and remaining R7/Milestone 6 gates stay open.
+    `/tmp/mb-m6-packaged-retry-gate-validation-226p4tp4`.
+    Fresh exact-source qualification on `d80c108` passes the pinned Nix musl
+    build, all three isolated-PATH Git packaging scenarios and the complete mandatory
+    installed runner: 23 ordinary process cases, raw Unix paths, the stock-Git bridge,
+    five-daemon topology/seed recovery and two fresh relay signer partition and
+    coordinator crash runs: 27 distinct process cases in 28 positive executions. The
+    baseline passes in 774.93 seconds; the two interruption runs pass in
+    711.91 and 742.50 seconds. The runner validates both original-signature
+    proofs with distinct request IDs and checks network/forwarding cleanup after
+    each run. Each proof authenticates the original four signatures and transcript
+    from a separate complete stopped DB/WAL copy, preserves original stopped inputs,
+    and requires the same event/attempt with all five original signers before backup
+    commits. Both fresh interruptions occur before activation completes; they do not
+    add installed coverage of the completed-activation retry branch. All 320 tracked
+    source files match the immutable Nix source; installed wrappers/payloads/alias
+    and both frozen test drivers stay unchanged. Independent
+    live daemon observations identify the installed static payload on all five peers.
+    The final independent audit verifies source/candidate/driver identities and
+    network, forwarding, mount, loop and image cleanup. Workspace/all-target driver
+    compilation preserves all 23 previously qualified workspace binary hashes;
+    identical Rust/dependency inputs retain the earlier 1,351-case qualification
+    without rerunning it. Auxiliary uncommitted work and all installed roots are
+    preserved. Evidence, exact case inventory, private peer logs and independent
+    audits are retained under `/tmp/mb-m6-installed-d80c108-4hjjpv1t`.
+    The historical stall, full fault matrix and remaining R7/Milestone 6 gates
+    stay open. Dense 1 TiB and native Windows/macOS qualification remain deferred
+    at the user's request.
 
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
