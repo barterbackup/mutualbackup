@@ -2,7 +2,7 @@
 """Run process/recovery fixtures against one installed release candidate.
 
 The caller provisions and removes the disposable Btrfs filesystem. Cargo builds
-only the test drivers; every application process uses MUTUALBACKUP_TEST_BIN_DIR.
+the workspace test configuration; application processes use MUTUALBACKUP_TEST_BIN_DIR.
 The manifest records source, wrappers, underlying payloads and driver hashes,
 checks they stay unchanged, and never reports an omitted scenario as passing.
 """
@@ -20,6 +20,20 @@ import time
 
 PROGRAMS = ("mutualbackup", "mutualbackupd", "mutualgit", "git-remote-mutualbackup")
 WORKSPACE = Path(__file__).resolve().parent.parent
+SIGNATURE_RETRY_CASE = (
+    "five_daemons_resume_relay_signature_after_partition_and_coordinator_crash"
+)
+SIGNATURE_RETRY_CHECKS = (
+    "four_original_signatures_verified_from_stopped_catalog",
+    "coordinator_crashed",
+    "same_event_resumed",
+    "committed",
+    "stopped_inputs_unchanged",
+    "proof_uses_separate_complete_db_wal_copy",
+    "original_transcript_verified",
+    "exact_event_installed_with_all_five_original_signers",
+    "network_routes_restored",
+)
 
 
 def executable(path):
@@ -200,6 +214,121 @@ def require_test_counts(log, expected):
     return counts
 
 
+def require_signature_retry(log, previous_requests):
+    """Require the real fixture's original-signature proof for a fresh attempt."""
+    require_test_counts(log, (1, 0, 0))
+
+    def unique_object(pairs):
+        record = {}
+        for key, value in pairs:
+            if key in record:
+                raise RuntimeError(f"duplicate signature-retry proof field in {log}")
+            record[key] = value
+        return record
+
+    rows = []
+    with log.open() as output:
+        while line := output.readline(64 * 1024 + 1):
+            if len(line) > 64 * 1024:
+                raise RuntimeError(f"oversized signature-retry diagnostic in {log}")
+            if line.startswith("SIGNATURE_RETRY_EVIDENCE "):
+                try:
+                    rows.append(
+                        json.loads(
+                            line.removeprefix("SIGNATURE_RETRY_EVIDENCE "),
+                            object_pairs_hook=unique_object,
+                        )
+                    )
+                except (ValueError, RecursionError) as error:
+                    raise RuntimeError(
+                        f"invalid signature-retry proof in {log}"
+                    ) from error
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        raise RuntimeError(f"expected one signature-retry proof in {log}")
+    proof = rows[0]
+    if any(proof.get(check) is not True for check in SIGNATURE_RETRY_CHECKS):
+        raise RuntimeError(f"incomplete signature-retry proof in {log}")
+    if type(proof.get("activation_was_completed_before_crash")) is not bool:
+        raise RuntimeError(f"missing stopped activation status in {log}")
+    for key, length in {
+        "request_id": 32,
+        "guild_id": 64,
+        "event_hash": 64,
+        "group_id": 64,
+        "attempt_id": 32,
+        "missing_signer": 64,
+    }.items():
+        value = proof.get(key)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(f"[0-9a-f]{{{length}}}", value) is None
+        ):
+            raise RuntimeError(f"invalid signature-retry {key} in {log}")
+    sequence = proof.get("sequence")
+    if type(sequence) is not int or not 0 < sequence < 2**64:
+        raise RuntimeError(f"invalid signature-retry sequence in {log}")
+    if proof["request_id"] in previous_requests:
+        raise RuntimeError(f"repeated signature-retry request in {log}")
+    dispatch = proof.get("dispatch")
+    partial = proof.get("durable_partial")
+    if not isinstance(dispatch, str) or not isinstance(partial, str):
+        raise RuntimeError(f"missing correlated signature-retry traces in {log}")
+
+    def field(trace, name, value):
+        pattern = r"\b" + name + "=" + re.escape(value) + r"(?=$|[ ,}])"
+        if re.search(pattern, trace) is None:
+            raise RuntimeError(f"uncorrelated signature-retry {name} in {log}")
+
+    field(dispatch, "request_id", proof["request_id"])
+    field(dispatch, "guild_id", proof["guild_id"])
+    field(dispatch, "sequence", str(sequence))
+    for key in ("event_hash", "group_id", "attempt_id"):
+        field(dispatch, key, "Some(" + json.dumps(proof[key]) + ")")
+    field(dispatch, "signer", "Some(" + json.dumps(proof["missing_signer"]) + ")")
+    field(dispatch, "kind", '"coding-add"')
+    field(dispatch, "stage", '"dispatched"')
+    field(dispatch, "path", "Some(RelayFallback)")
+    field(partial, "guild_id", proof["guild_id"])
+    field(partial, "sequence", str(sequence))
+    field(partial, "event_hash", proof["event_hash"])
+    field(partial, "signatures", "4")
+    missing = re.search(r"\bmissing_signers=\[NodeId\(\[([0-9, ]+)\]\)\]", partial)
+    expected = list(bytes.fromhex(proof["missing_signer"]))
+    try:
+        actual = [] if missing is None else [int(value.strip()) for value in missing[1].split(",")]
+    except ValueError as error:
+        raise RuntimeError(f"invalid missing signature in {log}") from error
+    if actual != expected:
+        raise RuntimeError(f"uncorrelated missing signature in {log}")
+    return proof
+
+
+def qualify_signature_retries(step, output_dir, reflink_root, before_resources, save):
+    proofs = {}
+    for number in (1, 2):
+        name = f"relay-signature-retry-{number}"
+        record = step(
+            name,
+            [
+                "bash",
+                WORKSPACE / "scripts/network-smoke.sh",
+                reflink_root,
+                SIGNATURE_RETRY_CASE,
+            ],
+            3000,
+            (1, 0, 0),
+        )
+        record["signature_retry"] = require_signature_retry(
+            output_dir / f"{name}.log", {proof["request_id"] for proof in proofs.values()}
+        )
+        record["topology_cleanup_verified"] = topology_resources() == before_resources
+        save()
+        if not record["topology_cleanup_verified"]:
+            raise RuntimeError(f"{name} did not restore network resources")
+        proofs[name] = record["signature_retry"]
+    return proofs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", required=True, type=Path)
@@ -242,6 +371,7 @@ def main():
             "raw-unix-paths",
             "stock-git-bridge",
             "five-daemon-topology-seed-recovery",
+            "repeated-relay-signer-partition-coordinator-crash",
         ],
         "filesystem_cleanup": "verified separately by the provisioning caller",
         "debug_only_failpoints": "not exercised by installed programs; source debug fixtures qualify them separately",
@@ -278,6 +408,7 @@ def main():
             raise RuntimeError(
                 f"{name} failed; see {args.output_dir / (name + '.log')}"
             )
+        return record
 
     save()
     try:
@@ -287,12 +418,8 @@ def main():
                 "cargo",
                 "test",
                 "--locked",
-                "-p",
-                "mutualbackup",
-                "--test",
-                "prototype_acceptance",
-                "--test",
-                "git_remote_helper",
+                "--workspace",
+                "--all-targets",
                 "--no-run",
                 "--message-format=json",
             ],
@@ -306,6 +433,7 @@ def main():
         required_process = {
             "raw_unix_paths_survive_cli_daemon_and_git_checkout",
             "five_daemons_recover_latest_snapshot_from_seed_and_dht",
+            SIGNATURE_RETRY_CASE,
         }
         bridge = "stock_git_fetches_and_pushes_through_native_anchors"
         if (
@@ -358,6 +486,9 @@ def main():
             5400,
             (1, 0, 0),
         )
+        evidence["signature_retry_proofs"] = qualify_signature_retries(
+            step, args.output_dir, args.reflink_root, before_resources, save
+        )
         evidence["qualified"] = True
     finally:
         verifications = {
@@ -393,7 +524,7 @@ def main():
                 f"qualification identity or topology cleanup failed; see {manifest}"
             )
     print(
-        f"Installed process, raw-path, stock-Git and topology/seed-recovery qualification passed: {manifest}"
+        f"Installed process, raw-path, stock-Git, topology/seed-recovery and repeated signature-retry qualification passed: {manifest}"
     )
 
 

@@ -5297,9 +5297,49 @@ exact case inventory, private peer logs and build/qualification/audit drivers ar
 `/tmp/mb-m6-installed-7d0edb3-c4pmnqci`. A documentation-only successor records
 this evidence; the source and candidate qualified here remain exactly `7d0edb3`.
 
-R5's historical stall diagnosis and complete fault matrix remain open. The two
-fault runs still need mandatory packaged CI integration. R7's remaining native,
+R5's historical stall diagnosis and complete fault matrix remain open. Mandatory
+packaged CI integration is recorded next. R7's remaining native,
 upgrade, multi-volume, private-Tor and platform matrix, full enclosing metadata/
 resource/physical admission, normal paged producers and seed recovery, and atomic
 activation remain required. Dense 1 TiB and native Windows/macOS qualification
 remain deferred at the user's request.
+
+## Mandatory installed relay-signature retry gate (2026-10-11)
+
+The packaged process runner now requires the provisioned fault case in its
+compiled inventory, then runs it twice after ordinary process, raw-path,
+stock-Git and baseline topology/seed recovery. Each fresh run has a 3,000-second
+process-group bound and requires exactly one positive test plus one bounded
+original-signature proof. The gate checks all stopped-catalog, transcript,
+original-input, exact installed-event/five-signer, route restoration and commit
+facts. It correlates request/guild/event/group/attempt/sequence/signer identities
+to the original coding-add dispatch over RelayFallback and the exact durable
+four-signature trace. Malformed, duplicate, missing or incomplete proofs,
+non-boolean status fields, invalid identities and repeated request IDs reject.
+Network/forwarding resources must match the baseline after each run before the
+next starts. Both proofs enter the qualification manifest, and the existing
+final source, installed wrapper/payload and driver identity checks remain.
+
+Cargo compiles the workspace/all-target test configuration once, keeping the
+previously qualified debug configuration rather than rebinding its launchers
+through a separate package-only feature configuration. Every application process
+continues to use the complete installed candidate. The existing mandatory
+packaged CI job invokes this runner; its build, packaging and diagnostic/cleanup
+steps are preserved.
+
+All 11 boundary checks pass, including omitted/false proof facts, malformed and
+duplicate records, field/trace substitution, duplicate fresh-attempt evidence,
+and a first run leaving network resources. Both actual retained installed fault
+records also pass the complete new gate with different request IDs. Formatting,
+locked workspace/all-target test compilation, network-script syntax and diff
+checks pass; all 23 prior workspace binary hashes,
+installed wrappers/payloads/alias and frozen drivers stay unchanged, and auxiliary
+uncommitted work is preserved. Evidence and the driver are under
+`/tmp/mb-m6-packaged-retry-gate-validation-226p4tp4`.
+
+This qualifies the runner boundary and reuses actual retained fixture evidence;
+it does not claim a fresh provisioned execution of the new runner. The committed
+exact-source Nix build and complete provisioned run remain pending. R5's
+historical stall and full fault matrix, R7's remaining native/upgrade/multi-volume/
+private-Tor/platform matrix, enclosing admission and normal paged recovery remain
+open. Dense 1 TiB and native Windows/macOS qualification remain user-deferred.

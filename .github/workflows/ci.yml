@@ -57,7 +57,7 @@ jobs:
             --alias-dir "$PWD/result-git/bin" \
             --stock-git "$(command -v git)" \
             --reflink-root /mnt/mutualbackup-package-ci'
-      - name: Qualify the installed candidate through process and seed recovery
+      - name: Qualify installed process, seed recovery and repeated relay-signature restart
         run: |
           nix develop -c python3 scripts/packaged-process-acceptance.py \
             --bin-dir "$PWD/result-runtime/bin" \

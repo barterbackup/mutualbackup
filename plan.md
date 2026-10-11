@@ -1405,8 +1405,17 @@ payloads, alias and frozen drivers remain unchanged, and native/network cleanup
 is verified. The earlier 1,351-case workspace result retains identical code
 inputs and all 23 binary hashes. See R7 in `TODO.md` and ADR 0002 for the exact
 scope and `/tmp/mb-m6-installed-7d0edb3-c4pmnqci` evidence.
-The historical stall diagnosis, mandatory CI integration of the fault case,
-remaining release matrix and user-deferred dense/platform gates remain open.
+The mandatory packaged runner now invokes the controlled fault scenario twice,
+requires bounded original-signature proofs correlated to the actual relay
+dispatch and missing signer, rejects reused request IDs, and checks network
+cleanup after each run. Eleven boundary checks and both retained real installed
+proofs pass the gate. Workspace/all-target driver compilation preserves the
+qualified debug configuration: actual locked all-target compilation leaves all
+23 previously qualified binary hashes unchanged. Application processes use the
+installed candidate.
+Fresh exact-source Nix/provisioned qualification of this committed runner is
+pending. The historical stall diagnosis, remaining release matrix and
+user-deferred dense/platform gates remain open.
 
 ### Production corrections from the 2026-10-05 source review
 

@@ -3821,9 +3821,34 @@ and native-platform gates remain open.
     exact case inventory, private peer logs and independent audits are retained under
     `/tmp/mb-m6-installed-7d0edb3-c4pmnqci`. The historical
     `3155689` stall diagnosis, complete fault matrix and remaining R7 native/
-    upgrade/multi-volume/private-Tor/platform gates remain open. These fault
-    runs still need inclusion in the mandatory packaged CI runner. Dense 1 TiB
+    upgrade/multi-volume/private-Tor/platform gates remain open. Mandatory CI
+    integration is recorded next. Dense 1 TiB
     and native Windows/macOS qualification remain deferred at the user's request.
+
+  - [x] Require two fresh relay-signer partition/coordinator-crash runs in the
+    mandatory installed-candidate CI runner. The compiled provisioned fault case
+    must exist before ordinary execution. Each run requires exactly one positive
+    test and one bounded original-signature proof, including stopped-catalog/
+    transcript verification, unchanged original inputs, the same installed event
+    with all five original signers, restored routes and committed backup. Match
+    request/guild/event/group/attempt/sequence/missing-signer identities to the
+    original relay dispatch and four-signature trace; reject malformed/duplicate/
+    incomplete records, integer substitutes for booleans and reused request IDs.
+    Check network/forwarding cleanup after each run, before starting the next.
+    Record both proofs and preserve the existing final source/candidate/driver
+    identity checks. Compile the workspace/all-target test configuration once;
+    application processes still select the complete installed candidate. This
+    also avoids the earlier package-only build's debug-launcher rebinding.
+    Implementation qualification passes all 11 boundary checks and replays both
+    real retained installed fault records through the new complete proof gate.
+    Formatting, locked workspace/all-target test compilation, network-script
+    syntax and diff checks pass. All 23 earlier
+    workspace binary hashes, installed wrappers/payloads/alias and frozen drivers
+    remain unchanged; auxiliary uncommitted work is preserved. Evidence is under
+    `/tmp/mb-m6-packaged-retry-gate-validation-226p4tp4`. This is runner-boundary
+    qualification; a fresh exact-source Nix build and complete provisioned run
+    of the committed runner remain pending. The historical stall, full fault
+    matrix and remaining R7/Milestone 6 gates stay open.
 
   Acceptance: a failing or omitted required job blocks release; every supported
   backend passes its native capture/edit/restore, crash, retention/prune, and
