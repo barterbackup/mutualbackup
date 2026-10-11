@@ -5382,3 +5382,46 @@ and remaining bulk consumers, complete metadata and physical admission, enclosin
 availability/current activation, fixed legacy migration, normal producers and
 seed-only recovery, historical topology/signature cause/full matrix and remaining
 R7 software/release gates remain open.
+
+### 2026-10-11 — Preserve supported bulk SQL admission
+
+The existing single-owner allocator maps three dense 64 KiB sources to four
+64 KiB packed sectors. A supported 384 MiB source batch therefore already has
+512 MiB of packed payload before serialized records, keys, indexes and journal
+framing. Normal legacy packed-cache publication uses one `put_records_iter`
+writer across the complete batch. A buffer/RSS budget is not a bound on that
+transaction or on inherited WAL retained by an independent reader. An attempted
+unconditional 512 MiB journal cap was withdrawn before commit; it would narrow
+existing supported operations. Its source/logs remain separate diagnostic
+material under `/tmp/mb-m6-sql-journal-limits-xz2xgzgj`; the incomplete attempt is
+not accepted qualification.
+
+The new explicit Linux Store regression streams 8,193 64 KiB values without
+materializing the batch, rolls back a producer failure after all values, keeps
+the reader's original snapshot, then commits, reopens and verifies complete EOF
+from the inherited WAL before checkpoint/reopen. Frozen execution uses
+531.40 MiB WAL and 18.64 MiB peak process RSS. This is the existing generic
+atomic writer contract, not a complete packing/capture/recovery, enclosing quota
+or dense 1 TiB qualification. Production behavior and admission limits are
+unchanged. The enclosing policy still must derive all original/private/source/
+bootstrap/history/owner records, control/parity tables and indexes, unreclaimed
+main pages, WAL/SHM/rollback journals, encrypted scratch and checkpoint copies,
+and source/packing/information/parity allocation across shared physical domains.
+Declared retained-history/job/count limits and bounded publication must preserve
+supported geometry and original identities before producers can be enabled.
+
+Frozen qualification passes 1,380 distinct tests in
+1,380 executions across all 19 ordinary workspace drivers,
+the explicit bulk case and both provisioned Btrfs recovery cases: 194 Core,
+400 ordinary Store, 117 Git and 544 Node. Formatting, strict locked workspace/
+all-targets Clippy, test compilation and four debug program builds pass. Evidence:
+`/tmp/mb-m6-bulk-journal-admission-thz39kz6`. Independent source/binary/exact-inventory, memory,
+native cleanup and preservation audits pass. Exact retirement reclaims
+8.89 GiB and leaves 47.41 GiB in `target`; current executables,
+eight unchanged shared inodes, 29 older archived paths, 14 auxiliary WIP files
+and all 10 installed roots remain intact. The post-commit audit binds the
+qualification to the committed tree. 121 other ignored cases and fresh installed
+qualification remain open. Complete R3 policy, distributed availability/current
+activation, fixed legacy coding and remaining bulk consumers, normal paged
+production/retention/seed recovery and R1/R5/R7 software requirements remain open.
+Dense 1 TiB and native Windows/macOS gates remain user-deferred.

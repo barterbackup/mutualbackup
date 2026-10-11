@@ -16,6 +16,8 @@ use crate::SCHEMA_VERSION;
 
 #[cfg(target_os = "linux")]
 mod anchor_discovery;
+#[cfg(all(test, target_os = "linux"))]
+mod bulk_journal_tests;
 mod catalog;
 #[cfg(target_os = "linux")]
 mod directory;

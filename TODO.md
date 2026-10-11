@@ -2553,6 +2553,30 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Qualify the existing streamed atomic SQL writer above a 512 MiB WAL
+      before introducing database admission. One explicit Linux Store fixture
+      streams 8,193 64 KiB values, rejects a late producer after the full batch,
+      preserves original records and a held reader's snapshot, then commits,
+      reopens the inherited WAL, verifies every record and checkpoints safely.
+      Its frozen run uses 531.40 MiB WAL and 18.64 MiB peak process RSS.
+      This preserves the generic writer contract; it does not qualify a normal
+      backup, full packing, enclosing quotas or dense 1 TiB capacity. A global
+      512 MiB journal ceiling was withdrawn before commit: the existing allocator
+      already maps 384 MiB of dense single-owner sources to 512 MiB packed
+      payload, before record/key/index/framing overhead. A memory/buffer ceiling
+      cannot silently become a transaction or retained-journal ceiling.
+      Full frozen qualification passes 1,380 distinct tests,
+      including 194 Core, 400 ordinary Store, 117 Git, 544 Node, this explicit
+      bulk fixture and both provisioned Btrfs recovery cases. Formatting, strict
+      locked workspace/all-targets Clippy, compilation and four debug builds pass.
+      Evidence: `/tmp/mb-m6-bulk-journal-admission-thz39kz6`. Exact obsolete-inode retirement reclaims 8.89 GiB;
+      `target` uses 47.41 GiB. Current executables, eight unchanged shared
+      inodes, 29 older archived paths, 14 auxiliary WIP files and 10 installed
+      roots are preserved. Complete metadata/SQL/index/WAL/scratch/traversal and
+      physical policy, enclosing readiness/current activation, full legacy joins,
+      normal paged producers/retention/seed recovery and R5/R7 remain open.
+      Producers stay disabled. Dense 1 TiB and native Windows/macOS qualification
+      remain user-deferred.
     - [x] Add explicitly budgeted retained authority format two, keeping each
       original revision tree bounded while charging cumulative history bytes,
       page occurrences and source-frame work. Preserve original format-one
