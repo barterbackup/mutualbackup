@@ -1466,6 +1466,18 @@ superseded-inode retirement reclaims 9.94 GiB; target uses 47.42
 GiB. These construction credits do not close the complete enclosing resource
 policy or normal paged recovery gates. See ADR 0002 and `/tmp/mb-m6-full-witness-capacity-final-k91to5f7`.
 
+Automatic packing construction now shards complete sources and sectors while
+preserving original identities and global indices. One declared reservation
+combines complete compact packing with full original-witness coding before
+staging; the required geometry has an upper reservation of 4,631,391,975,828
+stream/envelope bytes and 4,979,121,455,104 encoded page bytes. Frozen workspace,
+bulk-writer and native recovery qualification passes 1,404 distinct tests on
+335 inputs and 23 exact executables. Retirement reclaims 9.67 GiB;
+target uses 47.43 GiB. This constructs both directories and passes their
+existing joins; complete enclosing policy, bounded incremental updates and
+normal producers/retention/seed recovery remain open. See ADR 0002 and
+`/tmp/mb-m6-packing-coding-production-a6kytmjm`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

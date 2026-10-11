@@ -2553,6 +2553,30 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Combine full packing/coding construction credits and automatic parts.
+      Stream bounded complete source proofs and original sector descriptors,
+      rolling only between whole sources/sectors under byte and record caps.
+      Preserve source keys/order, global indices and original IDs; validate full
+      proofs before compacting. Reserve packing plus full original-witness
+      coding work before staging, partition credits, and fence extra counts
+      before sink callbacks. The required dense data geometry reserves
+      4,631,391,975,828 stream/envelope bytes, 75,975,364 pages, 369,099,046
+      records and 4,979,121,455,104 encoded page bytes. Six Core regressions and
+      one Store regression cover bounds, EOF, original replay, part rollover,
+      failures and complete authority/placement/coding joins. Existing retained
+      directory fixtures use the automatic packing producer. Frozen qualification
+      passes 1,404 distinct tests, format, strict locked Clippy, four debug
+      builds and compilation; 335 inputs, 332 code/dependency inputs, 19
+      inventories and 23 executables are audited. The 121 other ignored cases
+      remain unexecuted. Retirement reclaims 9.67 GiB; target uses
+      47.43 GiB, preserving current/shared executables, older archives,
+      auxiliary WIP and installed roots. These construction credits do not
+      close admission for other recovered layouts, complete checkpoint/private/
+      history/SQL/WAL/scratch/physical/traversal policy or normal producers/
+      retention/seed recovery. Whole-stream construction still visits every
+      record; bounded incremental updates remain required. The parent R3 gate
+      remains open; deferred hardware gates remain unchanged. See ADR 0002.
+      Evidence: `/tmp/mb-m6-packing-coding-production-a6kytmjm`.
     - [x] Derive/enforce full original-witness coding construction credits.
       Count the supported 600 KiB witness envelope, framed groups, forest
       descriptors, separately rounded leaves/indexes, record occurrences and

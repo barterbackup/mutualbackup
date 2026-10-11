@@ -11,6 +11,7 @@ pub const CATALOG_CODING_DIRECTORY_ROOT_BYTES: usize = 512;
 
 mod capacity;
 pub use capacity::CatalogCodingDirectoryCapacity;
+pub(super) use capacity::dense_forest_pages;
 
 /// Local limits from the enclosing authenticated admission policy, never from
 /// an untrusted directory's own claims. The eventual checkpoint must debit its

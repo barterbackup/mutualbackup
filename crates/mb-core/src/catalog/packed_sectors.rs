@@ -36,7 +36,7 @@ pub enum CatalogPackedSlotReference {
 }
 
 impl CatalogPackedSlotReference {
-    fn from_slot(slot: &PackedSlot) -> Self {
+    pub(super) fn from_slot(slot: &PackedSlot) -> Self {
         let reference = slot.source().map(|source| CatalogPackedChunkReference {
             source_key: CatalogPackedSourceId {
                 owner: source.id.owner,

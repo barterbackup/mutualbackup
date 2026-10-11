@@ -101,7 +101,10 @@ impl CatalogCodingDirectoryCapacity {
 /// ceil(sum(x_i) / d) + n - 1. Apply at leaves and each possible index level.
 /// Counting all index levels deliberately over-reserves shorter trees; no
 /// forest's credit is reused for another forest. The builder limits each tree.
-fn dense_forest_pages(bytes: u64, forests: u64) -> Result<u64, CatalogError> {
+pub(in crate::catalog) fn dense_forest_pages(
+    bytes: u64,
+    forests: u64,
+) -> Result<u64, CatalogError> {
     if forests == 0 {
         return if bytes == 0 {
             Ok(0)

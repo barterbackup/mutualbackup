@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use super::*;
 use crate::{PackingProfile, canonical_bytes_bounded, canonical_size_bounded};
 
+pub(super) mod capacity;
+mod stream;
+pub use capacity::CatalogPackingDirectoryCapacity;
+pub use stream::CatalogPackingDirectoryStreamBuilder;
+
 pub const CATALOG_PACKING_DIRECTORY_ROOT_BYTES: usize = 512;
 pub const CATALOG_PACKING_DIRECTORY_RECORD_BYTES: usize = 1024;
 

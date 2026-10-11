@@ -1,10 +1,9 @@
 use super::*;
 use crate::RecordScratchStore;
 use mb_core::{
-    CatalogPackedSectorBuilder, CatalogPackedSectorPart, CatalogPackedSectorReader,
-    CatalogPackedSectorRecord, CatalogPackedSourceBuilder, CatalogPackedSourceId,
+    CatalogPackedSectorPart, CatalogPackedSectorReader, CatalogPackedSourceId,
     CatalogPackedSourcePart, CatalogPackedSourceReader, CatalogPackedSourceRecord,
-    CatalogPackingDirectoryBuilder, CatalogPackingDirectoryRecord,
+    CatalogPackingDirectoryRecord,
 };
 use std::collections::HashMap;
 
@@ -25,82 +24,61 @@ pub(crate) fn shard(
         Ok::<_, ()>(())
     };
     let mut reader = CatalogPackedSourceReader::new(original.scope, original.sources).unwrap();
-    let mut source: Option<CatalogPackedSourceBuilder> = None;
-    let mut sources = Vec::new();
+    let budget = mb_core::CatalogPackingDirectoryCapacity::with_part_bytes(
+        original.sources.profile,
+        original.sources.sources,
+        original.descriptors.sectors,
+        600,
+    )
+    .unwrap()
+    .work;
+    let mut builder = mb_core::CatalogPackingDirectoryStreamBuilder::with_part_bytes(
+        original.scope,
+        original.descriptors.packing_version,
+        original.sources.profile,
+        original.sources.sources,
+        original.descriptors.sectors,
+        budget,
+        600,
+    )
+    .unwrap();
     let mut ids = HashMap::<[u8; 32], CatalogPackedSourceId>::new();
     let mut fetch = |page: CatalogPageRef| Ok::<_, ()>(originals[&page.hash].clone());
     while let Some(record) = reader.next_record(&mut fetch).unwrap() {
         if let CatalogPackedSourceRecord::Source { id, .. } = record {
-            if let Some(builder) = source.take() {
-                sources.push(builder.finish_part(&mut sink).unwrap());
-            }
             ids.insert(id.key(), id);
-            source = Some(
-                CatalogPackedSourceBuilder::new_compact(original.scope, original.sources.profile)
-                    .unwrap(),
-            );
         }
-        source.as_mut().unwrap().push(&record, &mut sink).unwrap();
-    }
-    if let Some(builder) = source {
-        sources.push(builder.finish_part(&mut sink).unwrap());
+        builder.push_source(&record, &mut sink).unwrap();
     }
     let mut reader = CatalogPackedSectorReader::new(original.scope, original.descriptors).unwrap();
-    let mut sector: Option<CatalogPackedSectorBuilder> = None;
-    let mut sectors = Vec::new();
     while let Some(record) = reader
         .next_record_with_sources(&mut fetch, &mut |key| Ok(ids[&key]))
         .unwrap()
     {
-        if let CatalogPackedSectorRecord::Header { sector_index, .. } = record {
-            if let Some(builder) = sector.take() {
-                sectors.push(builder.finish_part(&mut sink).unwrap());
-            }
-            sector = Some(
-                CatalogPackedSectorBuilder::new_part(
-                    original.scope,
-                    original.descriptors.packing_version,
-                    original.descriptors.profile,
-                    sector_index,
-                )
-                .unwrap(),
-            );
-        }
-        sector.as_mut().unwrap().push(&record, &mut sink).unwrap();
-    }
-    if let Some(builder) = sector {
-        sectors.push(builder.finish_part(&mut sink).unwrap());
-    }
-    let budget = CatalogCodingTraversalBudget {
-        bytes: 1 << 30,
-        page_occurrences: 1_000_000,
-        records: 1_000_000,
-    };
-    let mut directory = CatalogPackingDirectoryBuilder::new(
-        original.scope,
-        original.descriptors.packing_version,
-        original.descriptors.profile,
-        budget,
-    )
-    .unwrap();
-    for record in sources
-        .iter()
-        .copied()
-        .map(CatalogPackingDirectoryRecord::Sources)
-        .chain(
-            sectors
-                .iter()
-                .copied()
-                .map(CatalogPackingDirectoryRecord::Sectors),
-        )
-    {
-        directory.push(record, &mut sink).unwrap();
+        builder.push_sector(&record, &mut sink).unwrap();
     }
     let manifest = CatalogPackingDirectoryValidation {
         format_version: 1,
         scope: original.scope,
-        directory: directory.finish(&mut sink).unwrap(),
+        directory: builder.finish(&mut sink).unwrap(),
     };
+    let mut sources = Vec::new();
+    let mut sectors = Vec::new();
+    let mut directory = mb_core::CatalogRecordReader::new(
+        original.scope,
+        mb_core::CatalogSection::Packing,
+        manifest.directory.records,
+    )
+    .unwrap();
+    while let Some(bytes) = directory
+        .next_record(&mut |page: CatalogPageRef| Ok::<_, ()>(pages[&page.hash].clone()))
+        .unwrap()
+    {
+        match CatalogPackingDirectoryRecord::decode(&bytes).unwrap() {
+            CatalogPackingDirectoryRecord::Sources(part) => sources.push(part),
+            CatalogPackingDirectoryRecord::Sectors(part) => sectors.push(part),
+        }
+    }
     PackingParts {
         manifest,
         pages,
@@ -158,6 +136,120 @@ impl Fixture {
                 |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
             )
             .unwrap()
+    }
+}
+
+#[test]
+fn combined_construction_credits_feed_complete_source_placement_and_original_witness_joins() {
+    use mb_core::{CatalogPackingCodingBuilder, CatalogPackingCodingCapacity};
+    let fixture = Fixture::new(12);
+    let original = fixture.coding.packing.manifest;
+    let capacity = CatalogPackingCodingCapacity::with_packing_part_bytes(
+        original.sources.profile,
+        original.sources.sources,
+        original.descriptors.sectors,
+        fixture.coding.entries.len() as u64,
+        600,
+    )
+    .unwrap();
+    let mut builder = CatalogPackingCodingBuilder::new(
+        original.scope,
+        original.descriptors.packing_version,
+        fixture.coding.root.guild_event_sequence,
+        capacity,
+        capacity.work,
+    )
+    .unwrap();
+    let mut pages = HashMap::new();
+    let mut sink = |page: CatalogPageRef, bytes| {
+        pages.insert(page.hash, bytes);
+        Ok::<_, CatalogStoreError>(())
+    };
+    let mut ids = HashMap::new();
+    let mut sources = CatalogPackedSourceReader::new(original.scope, original.sources).unwrap();
+    while let Some(record) = sources
+        .next_record(&mut |page| fixture.coding.packing.fetch(page))
+        .unwrap()
+    {
+        if let CatalogPackedSourceRecord::Source { id, .. } = record {
+            ids.insert(id.key(), id);
+        }
+        builder.push_source(&record, &mut sink).unwrap();
+    }
+    let mut sectors = CatalogPackedSectorReader::new(original.scope, original.descriptors).unwrap();
+    while let Some(record) = sectors
+        .next_record_with_sources(&mut |page| fixture.coding.packing.fetch(page), &mut |key| {
+            Ok(ids[&key])
+        })
+        .unwrap()
+    {
+        builder.push_sector(&record, &mut sink).unwrap();
+    }
+    for entry in &fixture.coding.entries {
+        builder.push_group(entry, &mut sink).unwrap();
+    }
+    let roots = builder.finish(&mut sink).unwrap();
+    capacity
+        .work
+        .remaining_after(roots.work().unwrap())
+        .unwrap();
+    assert_eq!(roots.packing.summary.sources, original.sources.sources);
+    assert_eq!(roots.packing.summary.sectors, original.descriptors.sectors);
+    assert_eq!(
+        roots.coding.summary.coding.groups,
+        fixture.coding.entries.len() as u64
+    );
+    assert!(
+        pages.values().map(|bytes| bytes.len() as u64).sum::<u64>() <= capacity.encoded_page_bytes
+    );
+    let packing = CatalogPackingDirectoryValidation {
+        format_version: 1,
+        scope: original.scope,
+        directory: roots.packing,
+    };
+    let manifest = CatalogPackingCodingDirectoriesValidation {
+        format_version: 1,
+        packing,
+        coding: roots.coding,
+        policy: CatalogCodingCoveragePolicy::Current,
+        prior_work: Default::default(),
+    };
+    let fetch = |page: CatalogPageRef| {
+        pages
+            .get(&page.hash)
+            .cloned()
+            .ok_or_else(|| DatabaseError::NotReady.into())
+    };
+    let proof = CatalogPackingDirectoryIndex::build(
+        packing,
+        packing.represented_work().unwrap(),
+        RecordScratchStore::new(16 << 20).unwrap(),
+        fetch,
+        |id, commitment| fixture.coding.packing.authorize(id, commitment),
+    )
+    .unwrap()
+    .validate_coding_directory(
+        roots.coding,
+        manifest.policy,
+        manifest.represented_work().unwrap(),
+        fetch,
+        |_| Ok(CatalogCodingAuthorization::CurrentPlacement),
+    )
+    .unwrap();
+    assert_eq!(proof.manifest(), manifest);
+    for expected in &fixture.coding.entries {
+        let (actual, _) = proof
+            .read_group_with_work(expected.retained.group.id, fetch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            canonical_bytes(&actual.transcript).unwrap(),
+            canonical_bytes(&expected.transcript).unwrap()
+        );
+        assert_eq!(&actual, expected);
+    }
+    for sector in &fixture.coding.packing.sectors {
+        assert!(proof.coverage(sector.id).unwrap().is_some());
     }
 }
 

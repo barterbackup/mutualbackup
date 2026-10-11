@@ -141,6 +141,83 @@ The 62,746,792,515-byte compact coding lower bound remains necessary evidence,
 but is not this full original-witness upper bound. No normal producer is enabled
 and the R3 enclosing-policy requirement remains open.
 
+## Combined packing/coding construction and automatic parts
+
+`CatalogPackingDirectoryStreamBuilder` consumes one bounded source/proof or
+sector/slot fragment at a time. Sources precede descriptors. It compacts only
+after validating original Merkle openings or descriptor identities, and rolls
+parts only between complete sources/sectors. Global source order, source keys,
+sector indices and original sector IDs survive each boundary. Each part checks
+both the 16 GiB stream ceiling and the 64 Mi-record ceiling. Smaller part
+targets are explicit; whole-stream construction still visits every record and
+does not establish bounded incremental update work.
+
+For profile width `w`, the compact source reservation per source is
+`260 + 32*w + 20*ceil(w/64)` bytes; the descriptor reservation per sector is
+`260 + 72*w + 20*ceil(w/128)`. The 256-byte header and 16-byte fragment-field
+reservations cover maximum supported scalar widths. A compact slot reserves
+72 bytes for tags, source key, five-byte chunk index and content hash. Every
+record includes its four-byte frame. Accepted headers and compact fragments
+are checked against these field bounds before page storage; original proof
+verification remains mandatory. An empty final descriptor is rejected before
+root emission, matching the ordinary directory reader's authenticated EOF.
+
+The maximum units per part is the smaller of `(part_bytes - 8)/unit_bytes`
+and `64 Mi-records/records_per_unit`. Count the separately rounded pages of
+all parts, their eight-byte stream headers, framed directory descriptors and
+the root envelope. Counts cover all emitted live/candidate/retired occurrences;
+no credit assumes page sharing or deduplicated historical occurrences.
+
+`CatalogPackingCodingCapacity` combines these packing credits with the full
+original-witness coding credits. `CatalogPackingCodingBuilder` rederives the
+local capacity value and requires the complete trusted remaining budget before
+staging. Each section receives its own reservation; unused bytes in one
+section cannot fund excess counts in another. Extra source, sector or group
+headers fail before flushing more pages, and any validation/storage error
+permanently fences further pushes and finish.
+
+For the required dense data geometry of 16,777,216 sources, 22,369,622
+packed sectors and 7,456,541 default 3+2 groups, the construction reservation
+is shown below. Private/bootstrap catalog sectors that also enter packing
+must increase these source, sector and group counts before construction;
+this data contribution is not the full enclosing checkpoint reservation:
+
+| Resource | Packing | Coding | Combined |
+| --- | ---: | ---: | ---: |
+| Stream/envelope bytes | 19,551,052,016 | 4,611,840,923,812 | 4,631,391,975,828 |
+| Page occurrences | 320,725 | 75,654,639 | 75,975,364 |
+| Record occurrences | 78,293,678 | 290,805,368 | 369,099,046 |
+| Encoded immutable page bytes | 21,019,033,600 | 4,958,102,421,504 | 4,979,121,455,104 |
+
+Six new Core cases cover the actual reserved single-owner slot geometry,
+original proof and descriptor replay across parts, maximum field encodings,
+part rounding/overflow, combined dimensional refusal, changed credits, excess
+counts before callbacks, partial/reordered/corrupt records, storage failures,
+empty final sectors and sticky failure. One new Store case connects both
+produced directories to complete source authority, placement and coding
+coverage and compares original witness bytes. Existing certified-directory
+and retention/reopen/shared-owner/rollback fixtures now use the automatic
+packing producer.
+
+These are complete packing/coding construction credits, not the full
+checkpoint capacity policy or universal admission for recovered layouts.
+Signed source/private/native/Git/history occurrences, authority/certificates,
+root/payload ownership, journal/counter copies, SQL schema/index/pages, WAL,
+scratch, physical allocation and repeated traversal remain separately charged
+requirements. Complete production capture, incremental packing/coding,
+checkpoint/retention and seed-only recovery remain open; normal producers
+remain disabled. Dense 1 TiB and native Windows/macOS gates remain user-deferred.
+
+Frozen qualification passes 1,404 distinct tests: 204 Core, 410 ordinary
+Store, 117 Git, 548 Node, the explicit large atomic writer and both provisioned
+Btrfs recovery fixtures, plus the remaining targets. Format, strict locked
+workspace/all-targets Clippy, four debug builds and compilation pass. All 335
+inputs, 332 code/dependency inputs, 19 inventories and 23 exact executables are
+audited. The 121 other ignored cases remain unexecuted. Exact retirement
+reclaims 9.67 GiB; target uses 47.43 GiB. Current/shared executables,
+29 older archived paths, 14 auxiliary WIP files and 10 installed roots remain
+intact. Evidence: `/tmp/mb-m6-packing-coding-production-a6kytmjm`.
+
 ## Implementation and qualification order
 
 1. Add the bounded tree codec, streaming builder and authenticated traversal.
