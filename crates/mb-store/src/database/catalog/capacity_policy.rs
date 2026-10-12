@@ -177,6 +177,31 @@ pub(super) fn publication(
 }
 
 impl ControlStore {
+    /// Recheck an immutable enclosing contract in the caller's current writer,
+    /// or a fresh read snapshot when no transaction is held. This never commits
+    /// or rolls back the caller's writer and keeps backing-ledger checks intact.
+    pub fn check_catalog_capacity_policy(
+        &self,
+        expected: CatalogCapacityPolicy,
+    ) -> Result<(), CatalogStoreError> {
+        let check = |connection: &Connection| {
+            if read(connection)? != Some(expected) {
+                return Err(DatabaseError::Conflict.into());
+            }
+            revision_quota::require_capacity_backing(connection)?;
+            retained_source_quota::require_capacity_backing(connection)?;
+            Ok(())
+        };
+        if !self.connection.is_autocommit() {
+            check(&self.connection)
+        } else {
+            let tx = self.read_snapshot()?;
+            check(&tx)?;
+            tx.commit()?;
+            Ok(())
+        }
+    }
+
     pub fn catalog_capacity_policy(
         &self,
     ) -> Result<Option<CatalogCapacityPolicy>, CatalogStoreError> {

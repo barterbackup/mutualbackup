@@ -2553,6 +2553,29 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Own native paged capture candidates through atomic publication/retry.
+      Connect the Node API to a bounded immutable native plan/manifest journal,
+      original request/writer/registration/backend/ancestor guards, active SQL
+      record/page/journal and scoped page admission, 128-row source batches,
+      indexed source ordering, exact unique-data dependency reservations and
+      complete private/public/bootstrap local publication. Commit the final
+      capture identity with all owners/credits and recheck authority after every
+      final write. Preserve the exact capture across reopen and working-source
+      loss. Recognize journals in recovery inventory and pre-writer startup.
+      Cancellation respects checkpoint custody and releases one queued source,
+      dependency, owner, pin or validation row per step before physical discard.
+      Three Store and one ordinary Node regressions pass; the native Node
+      capture/share/late-authority rollback/inventory/source-loss retry/restore/
+      cancellation fixture passes, including sparse 1 TiB and hard links. The
+      forbidden writer/read nesting baseline is preserved and corrected through
+      a writer-safe policy check. No flat backup head or protection is advanced.
+      Frozen full qualification passes 1,457 tests, format, strict Clippy, four
+      builds and 350-input/23-executable audits; 121 other ignored cases remain
+      unexecuted. Retirement reclaims 11.74 GiB; target uses 47.47 GiB.
+      Full workload/physical/pending-job admission, ordinary/Git production,
+      distributed activation, normal retention/seed recovery, legacy consumers
+      and R5/R7 remain open; normal producers stay disabled and hardware gates
+      stay deferred. See ADR 0002 and `/tmp/mb-m6-native-owner-z1hqnvv_`.
     - [x] Produce private paged native roots directly from immutable anchors.
       Admit namespace/recipe geometry and conservative byte/page/framing-record
       construction work before source I/O/callbacks. Stream at most 128 sector

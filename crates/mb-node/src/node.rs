@@ -5997,6 +5997,231 @@ impl Node {
         )
     }
 
+    /// Capture and retain a native paged candidate without a flat revision.
+    /// Reuse the operation ID for retry. Current certified writer authority and
+    /// explicit database/scoped catalog admission are required. Ordinary backup
+    /// heads and distributed protection remain on their existing path.
+    #[cfg(target_os = "linux")]
+    pub fn prepare_paged_native_revision_catalog(
+        &mut self,
+        guild_id: [u8; 32],
+        protected_root_id: Uuid,
+        source_root: &Path,
+        sequence: u64,
+        operation_id: Uuid,
+    ) -> Result<SignedRecord<mb_core::PagedUserRevision>> {
+        use crate::paged_capture::{CaptureRequest, PagedNativeCapture};
+        let scope = mb_core::CatalogScope::Dataset {
+            guild_id,
+            owner: self.keys.node_id(),
+            protected_root_id,
+        };
+        let mut operation = PagedNativeCapture::load(&self.control, operation_id)?;
+        if let Some(existing) = &operation {
+            anyhow::ensure!(
+                existing.request().scope == scope
+                    && existing.request().sequence == sequence
+                    && existing.request().requested_source == source_root,
+                "native capture retry differs from the original request"
+            );
+            if let Some(completed) = existing.completed(&self.control, &self.keys)? {
+                return Ok(completed);
+            }
+        }
+        let root = self.protected_root_by_id(protected_root_id)?;
+        let captured = operation
+            .as_ref()
+            .is_some_and(|operation| operation.has_capture());
+        if !captured {
+            anyhow::ensure!(
+                source_root.canonicalize()? == root.path,
+                "source path does not match the protected root"
+            );
+        }
+        PagedNativeCapture::admit_configuration(&self.control, scope)?;
+        anyhow::ensure!(
+            self.control
+                .get_record_bounded("git-repository", protected_root_id.as_bytes(), 65536)?
+                .is_none()
+                && (captured || mb_store::git_catalog_marker(&root.path)?.is_none()),
+            "paged Git production must retain its complete graph before capture is enabled"
+        );
+        let backend = if captured {
+            None
+        } else {
+            let backend = self.verified_source_backend_for_root(&root)?;
+            backend.backend.require_supported()?;
+            Some(backend)
+        };
+        let root_bytes = self
+            .control
+            .get_record_bounded("protected-root", protected_root_id.as_bytes(), 16384)?
+            .context("protected root registration is unavailable")?;
+        let backend_bytes = self
+            .control
+            .get_record_bounded("source-backend", protected_root_id.as_bytes(), 4096)?
+            .context("native source backend registration is unavailable")?;
+        let saved_backend: mb_store::SourceBackendBinding = decode_canonical(&backend_bytes)?;
+        saved_backend.backend.require_supported()?;
+        let head_id = crate::snapshot::revision_head_id(guild_id, protected_root_id);
+        let head = self.control.get_record_bounded(
+            "user-revision-head",
+            &head_id,
+            mb_core::V1_MAX_CATALOG_BYTES,
+        )?;
+        let parent = if let Some(bytes) = &head {
+            let previous: SignedRecord<UserRevision> = decode_canonical(bytes)?;
+            previous.verify(USER_REVISION_DOMAIN)?;
+            previous.value.verify_writer()?;
+            anyhow::ensure!(
+                previous.value.owner == self.keys.node_id()
+                    && previous.value.guild_id == guild_id
+                    && previous.value.protected_root_id == protected_root_id
+                    && previous.value.sequence.checked_add(1) == Some(sequence),
+                "native capture does not extend the local revision head"
+            );
+            Some(previous.value.hash()?)
+        } else {
+            anyhow::ensure!(
+                sequence == 1,
+                "the first native capture must have sequence one"
+            );
+            None
+        };
+        let fence = self.certified_native_capture_writer(guild_id)?;
+        let writer: LocalWriterIncarnation = decode_canonical(
+            &self
+                .control
+                .get_record_bounded("writer-incarnation", &guild_id, 1024)?
+                .context("native capture requires the certified local writer")?,
+        )?;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&writer.secret_key);
+        anyhow::ensure!(
+            writer.format_version == 1
+                && writer.epoch == fence.epoch
+                && writer.public_key == fence.public_key
+                && signing.verifying_key().to_bytes() == fence.public_key,
+            "native capture local writer is not certified"
+        );
+        let request = CaptureRequest {
+            scope,
+            id: operation_id,
+            writer: fence.clone(),
+            sequence,
+            parent,
+            captured_change_sequence: self
+                .root_dirty_state(protected_root_id)?
+                .filter(|state| state.dirty)
+                .map(|state| state.change_sequence),
+            requested_source: source_root.to_path_buf(),
+            registration_hash: *blake3::hash(&root_bytes).as_bytes(),
+            backend_hash: *blake3::hash(&backend_bytes).as_bytes(),
+        };
+        if let Some(existing) = &operation {
+            anyhow::ensure!(
+                existing.request().writer == fence
+                    && existing.request().parent == parent
+                    && existing.request().registration_hash == request.registration_hash
+                    && existing.request().backend_hash == request.backend_hash,
+                "native capture writer, registration or ancestor changed"
+            );
+        } else {
+            operation = Some(PagedNativeCapture::begin(
+                &self.control,
+                request,
+                backend
+                    .context("uncaptured operation has no native backend")?
+                    .backend
+                    .plan_root(&root.path)?,
+            )?);
+        }
+        operation
+            .as_mut()
+            .expect("capture operation established")
+            .produce(&self.control, &self.keys, &signing, || {
+                anyhow::ensure!(
+                    self.certified_native_capture_writer(guild_id)? == fence
+                        && self
+                            .control
+                            .get_record_bounded(
+                                "protected-root",
+                                protected_root_id.as_bytes(),
+                                16384
+                            )?
+                            .as_ref()
+                            == Some(&root_bytes)
+                        && self
+                            .control
+                            .get_record_bounded(
+                                "source-backend",
+                                protected_root_id.as_bytes(),
+                                4096
+                            )?
+                            .as_ref()
+                            == Some(&backend_bytes)
+                        && self.control.get_record_bounded(
+                            "user-revision-head",
+                            &head_id,
+                            mb_core::V1_MAX_CATALOG_BYTES
+                        )? == head,
+                    "native capture authority, registration, backend or ancestor changed"
+                );
+                Ok(())
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn certified_native_capture_writer(&self, guild_id: [u8; 32]) -> Result<mb_core::WriterFence> {
+        let checkpoint = self
+            .current_checkpoint(guild_id)?
+            .context("native capture requires a certified checkpoint")?;
+        checkpoint.verify()?;
+        anyhow::ensure!(
+            checkpoint.checkpoint.guild_id == guild_id
+                && checkpoint
+                    .checkpoint
+                    .members
+                    .iter()
+                    .any(|member| member.node_id == self.keys.node_id()),
+            "native capture owner is not a current guild member"
+        );
+        checkpoint
+            .checkpoint
+            .writer_fences
+            .iter()
+            .filter(|fence| fence.owner == self.keys.node_id())
+            .max_by_key(|fence| fence.epoch)
+            .cloned()
+            .context("native capture has no certified writer")
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn cancel_paged_native_revision_catalog(&mut self, operation_id: Uuid) -> Result<()> {
+        let mut operation =
+            crate::paged_capture::PagedNativeCapture::load(&self.control, operation_id)?
+                .context("native capture operation is unavailable")?;
+        anyhow::ensure!(
+            matches!(operation.request().scope, mb_core::CatalogScope::Dataset { owner, .. } if owner == self.keys.node_id()),
+            "native capture belongs to another owner"
+        );
+        operation.cancel(&self.control)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn cleanup_paged_native_revision_catalog_step(
+        &mut self,
+        operation_id: Uuid,
+    ) -> Result<bool> {
+        let mut operation =
+            crate::paged_capture::PagedNativeCapture::load(&self.control, operation_id)?
+                .context("native capture operation is unavailable")?;
+        anyhow::ensure!(
+            matches!(operation.request().scope, mb_core::CatalogScope::Dataset { owner, .. } if owner == self.keys.node_id()),
+            "native capture belongs to another owner"
+        );
+        operation.cleanup_step(&self.control)
+    }
+
     /// Retain a verified paged successor alongside an existing flat revision.
     /// This migration does not advance the flat head or advertise protection.
     /// The operation ID is durable: reuse it for retry and cancellation.
@@ -15386,6 +15611,8 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(target_os = "linux")]
+    mod paged_capture;
     use super::*;
 
     fn record_quota_test_endpoints(node: &Node) -> Vec<String> {

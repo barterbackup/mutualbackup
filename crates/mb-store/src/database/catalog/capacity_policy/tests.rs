@@ -67,6 +67,58 @@ fn backing(store: &ControlStore) {
 }
 
 #[test]
+fn capacity_policy_checked_writer_read_preserves_enclosing_rollback_and_guard_faults() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ControlStore::open(temp.path().join("control.db"), &keys()).unwrap();
+    backing(&store);
+    store.configure_catalog_capacity_policy(policy()).unwrap();
+    store.check_catalog_capacity_policy(policy()).unwrap();
+    let result: Result<(), CatalogStoreError> = store.with_record_transaction(|| {
+        store.put_record("policy-writer-prefix", b"rollback", b"new")?;
+        store.check_catalog_capacity_policy(policy())?;
+        Err(DatabaseError::Conflict.into())
+    });
+    assert!(matches!(
+        result,
+        Err(CatalogStoreError::Database(DatabaseError::Conflict))
+    ));
+    assert!(
+        store
+            .get_record("policy-writer-prefix", b"rollback")
+            .unwrap()
+            .is_none()
+    );
+    let mut wrong = policy();
+    wrong.revisions_per_dataset = 2;
+    assert!(store.check_catalog_capacity_policy(wrong).is_err());
+    let result: Result<(), CatalogStoreError> = store.with_record_transaction(|| {
+        store.put_record("policy-writer-prefix", b"fault", b"new")?;
+        store.put_record(POLICY, KEY, b"broken")?;
+        store.check_catalog_capacity_policy(policy())
+    });
+    assert!(result.is_err());
+    assert!(
+        store
+            .get_record("policy-writer-prefix", b"fault")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.catalog_capacity_policy().unwrap(), Some(policy()));
+    store
+        .with_record_transaction(|| -> Result<(), CatalogStoreError> {
+            store.put_record("policy-writer-prefix", b"committed", b"new")?;
+            store.check_catalog_capacity_policy(policy())
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .get_record("policy-writer-prefix", b"committed")
+            .unwrap(),
+        Some(b"new".to_vec())
+    );
+}
+
+#[test]
 fn capacity_policy_charges_shared_revision_occurrences_and_preserves_reopen_and_cancellation() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("control.db");

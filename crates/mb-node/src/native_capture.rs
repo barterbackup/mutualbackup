@@ -27,6 +27,7 @@ use crate::{NativeCatalogStream, PagedAnchorSectorSource, PagedPrivateMetadata};
 /// charges: the enclosing source ledger must deduplicate authenticated IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeCatalogAdmission {
+    pub private_roots: [Work; 2],
     pub native_work: Work,
     pub data_occurrences: u64,
     pub data_occurrence_bytes: u64,
@@ -255,14 +256,15 @@ impl NativeCatalogAdmission {
         let page_occurrences = add(dense_pages(namespace_bytes)?, dense_pages(recipe_bytes)?)?;
         // Match publication's conservative framing-record admission, rather
         // than substituting the smaller exact typed record count.
-        let native_work = Work {
-            bytes,
-            page_occurrences,
-            records: add(
-                ((namespace_bytes - 8) / 5).min(CATALOG_MAX_RECORDS),
-                ((recipe_bytes - 8) / 5).min(CATALOG_MAX_RECORDS),
-            )?,
+        let root_work = |bytes| -> Result<Work> {
+            Ok(Work {
+                bytes,
+                page_occurrences: dense_pages(bytes)?,
+                records: ((bytes - 8) / 5).min(CATALOG_MAX_RECORDS),
+            })
         };
+        let private_roots = [root_work(namespace_bytes)?, root_work(recipe_bytes)?];
+        let native_work = private_roots[0].checked_add(private_roots[1])?;
         ensure!(
             bytes <= CATALOG_MAX_STREAM_BYTES && page_occurrences <= CATALOG_MAX_PAGE_OCCURRENCES,
             "native catalog exceeds aggregate geometry"
@@ -271,6 +273,7 @@ impl NativeCatalogAdmission {
             .private_work_per_revision
             .remaining_after(native_work)?;
         Ok(Self {
+            private_roots,
             native_work,
             data_occurrences,
             data_occurrence_bytes,

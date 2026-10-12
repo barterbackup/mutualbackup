@@ -367,6 +367,29 @@ impl ControlStore {
         bootstrap: &[u8],
         check: impl FnOnce(&CatalogPublicationView<'_>) -> Result<(), E>,
     ) -> Result<(), E> {
+        self.publish_paged_revision_catalog_with_guards(
+            bundle,
+            bootstrap,
+            check,
+            || Ok(()),
+            || Ok(()),
+        )
+    }
+
+    /// Compose an enclosing operation's final ownership writes with root,
+    /// payload, quota and bootstrap publication. Both callbacks execute in the
+    /// same IMMEDIATE writer: finalize after the publication marker, then check
+    /// authority after every operation/quota write and before commit. Callback
+    /// errors roll back all ownership and credits. Callbacks must not begin a
+    /// nested writer transaction or perform external I/O.
+    pub fn publish_paged_revision_catalog_with_guards<E: From<CatalogStoreError>>(
+        &self,
+        bundle: &CatalogBundle,
+        bootstrap: &[u8],
+        check: impl FnOnce(&CatalogPublicationView<'_>) -> Result<(), E>,
+        finalize: impl FnOnce() -> Result<(), E>,
+        guard: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
         let signed = revision(bundle)?;
         check_bootstrap(&signed, bootstrap)?;
         let transaction =
@@ -410,8 +433,10 @@ impl ControlStore {
             bundle.id.as_bytes(),
             &marker(&signed)?,
         )?;
+        finalize()?;
         quota_guard.recheck(&transaction)?;
         capacity_guard.recheck(&transaction, bundle)?;
+        guard()?;
         transaction.commit().map_err(CatalogStoreError::from)?;
         Ok(())
     }
@@ -816,58 +841,35 @@ pub(super) mod tests {
         bundle: &CatalogBundle,
         bootstrap: &[u8],
     ) -> Result<(), CatalogStoreError> {
+        publish_with_guards(store, bundle, bootstrap, || Ok(()), || Ok(()))
+    }
+
+    fn publish_with_guards(
+        store: &ControlStore,
+        bundle: &CatalogBundle,
+        bootstrap: &[u8],
+        finalize: impl FnOnce() -> Result<(), CatalogStoreError>,
+        guard: impl FnOnce() -> Result<(), CatalogStoreError>,
+    ) -> Result<(), CatalogStoreError> {
         let signed = revision(bundle)?;
         let fence = WriterFence {
             owner: signed.value.owner,
             epoch: signed.value.writer_epoch,
             public_key: signed.value.writer_public_key,
         };
-        store.publish_paged_revision_catalog_checked(bundle, bootstrap, |view| {
-            let mut reader = PagedRevisionSourceReader::new(
-                &signed,
-                signed.value.guild_id,
-                signed.value.owner,
-                &fence,
-            )?;
-            while let Some(record) = reader
-                .next_sector(&mut |page| view.catalog_page(CatalogSection::SectorReferences, page))
-                .map_err(|error| match error {
-                    mb_core::CatalogStreamError::Catalog(error) => CatalogStoreError::from(error),
-                    mb_core::CatalogStreamError::Storage(error) => error,
-                })?
-            {
-                if view.source(record.sector.id)?.as_ref() != Some(&record) {
-                    return Err(DatabaseError::Integrity.into());
-                }
-            }
-            assert!(reader.is_complete());
-            for member in bundle
-                .roots
-                .iter()
-                .filter(|member| member.intent.section.is_private())
-            {
-                let mut reader =
-                    mb_core::CatalogReader::new(bundle.scope, member.intent.section, member.root)?;
-                while reader
-                    .next_leaf(&mut |page| -> Result<Vec<u8>, CatalogStoreError> {
-                        let encoded = view.catalog_page(member.intent.section, page)?;
-                        let (sector, ciphertext) = page.seal_private_page(
-                            &keys().guild_content_id_key(&signed.value.guild_id),
-                            &keys().guild_data_key(&signed.value.guild_id),
-                            bundle.scope,
-                            member.intent.section,
-                            &encoded,
-                        )?;
-                        view.bind_private_page_source(
-                            member.intent,
-                            page,
-                            &CatalogSectorRecord {
-                                format_version: 1,
-                                sector,
-                                commitment: merkle_commit(&ciphertext).map_err(ModelError::from)?,
-                            },
-                        )?;
-                        Ok(encoded)
+        store.publish_paged_revision_catalog_with_guards(
+            bundle,
+            bootstrap,
+            |view| {
+                let mut reader = PagedRevisionSourceReader::new(
+                    &signed,
+                    signed.value.guild_id,
+                    signed.value.owner,
+                    &fence,
+                )?;
+                while let Some(record) = reader
+                    .next_sector(&mut |page| {
+                        view.catalog_page(CatalogSection::SectorReferences, page)
                     })
                     .map_err(|error| match error {
                         mb_core::CatalogStreamError::Catalog(error) => {
@@ -875,11 +877,182 @@ pub(super) mod tests {
                         }
                         mb_core::CatalogStreamError::Storage(error) => error,
                     })?
-                    .is_some()
-                {}
+                {
+                    if view.source(record.sector.id)?.as_ref() != Some(&record) {
+                        return Err(DatabaseError::Integrity.into());
+                    }
+                }
+                assert!(reader.is_complete());
+                for member in bundle
+                    .roots
+                    .iter()
+                    .filter(|member| member.intent.section.is_private())
+                {
+                    let mut reader = mb_core::CatalogReader::new(
+                        bundle.scope,
+                        member.intent.section,
+                        member.root,
+                    )?;
+                    while reader
+                        .next_leaf(&mut |page| -> Result<Vec<u8>, CatalogStoreError> {
+                            let encoded = view.catalog_page(member.intent.section, page)?;
+                            let (sector, ciphertext) = page.seal_private_page(
+                                &keys().guild_content_id_key(&signed.value.guild_id),
+                                &keys().guild_data_key(&signed.value.guild_id),
+                                bundle.scope,
+                                member.intent.section,
+                                &encoded,
+                            )?;
+                            view.bind_private_page_source(
+                                member.intent,
+                                page,
+                                &CatalogSectorRecord {
+                                    format_version: 1,
+                                    sector,
+                                    commitment: merkle_commit(&ciphertext)
+                                        .map_err(ModelError::from)?,
+                                },
+                            )?;
+                            Ok(encoded)
+                        })
+                        .map_err(|error| match error {
+                            mb_core::CatalogStreamError::Catalog(error) => {
+                                CatalogStoreError::from(error)
+                            }
+                            mb_core::CatalogStreamError::Storage(error) => error,
+                        })?
+                        .is_some()
+                    {}
+                }
+                Ok(())
+            },
+            finalize,
+            guard,
+        )
+    }
+
+    #[test]
+    fn paged_publication_final_owner_and_late_authority_guard_commit_or_roll_back_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open_with_key(&path, &[213; 32]).unwrap();
+        let (bundle, bytes) = fixture(&store, 1, None);
+        store
+            .put_record("publication-authority", b"current", b"original")
+            .unwrap();
+        store.database_shell_statement("CREATE TEMP TRIGGER late_authority AFTER INSERT ON protocol_records WHEN NEW.kind='catalog-paged-publication-v1' BEGIN UPDATE protocol_records SET bytes=X'7265766f6b6564' WHERE kind='publication-authority' AND record_id=X'63757272656e74'; END", false).unwrap();
+        let finalize = || -> Result<(), CatalogStoreError> {
+            store.put_record_if_absent("capture-final", bundle.id.as_bytes(), b"ready")?;
+            Ok(())
+        };
+        let guard = || -> Result<(), CatalogStoreError> {
+            if store.get_record_bounded("publication-authority", b"current", 32)?
+                != Some(b"original".to_vec())
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            if store.get_record_bounded("capture-final", bundle.id.as_bytes(), 32)?
+                != Some(b"ready".to_vec())
+            {
+                return Err(DatabaseError::Integrity.into());
             }
             Ok(())
-        })
+        };
+        assert!(matches!(
+            publish_with_guards(&store, &bundle, &bytes, finalize, guard),
+            Err(CatalogStoreError::Database(DatabaseError::Conflict))
+        ));
+        assert!(store.paged_revision_catalog(bundle.id).unwrap().is_none());
+        assert!(
+            store
+                .get_record("capture-final", bundle.id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_record("publication-authority", b"current")
+                .unwrap(),
+            Some(b"original".to_vec())
+        );
+        for member in &bundle.roots {
+            assert_eq!(
+                store.catalog_intent_state(member.intent).unwrap(),
+                CatalogIntentState::Building
+            );
+        }
+        store
+            .database_shell_statement("DROP TRIGGER late_authority", false)
+            .unwrap();
+        publish_with_guards(&store, &bundle, &bytes, finalize, guard).unwrap();
+        let expected = store.paged_revision_catalog(bundle.id).unwrap().unwrap();
+        drop(store);
+        let store = ControlStore::open_with_key(&path, &[213; 32]).unwrap();
+        assert_eq!(
+            store.paged_revision_catalog(bundle.id).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            store
+                .get_record("capture-final", bundle.id.as_bytes())
+                .unwrap(),
+            Some(b"ready".to_vec())
+        );
+    }
+
+    #[test]
+    fn paged_publication_ignored_final_owner_write_preserves_building_roots_and_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            ControlStore::open_with_key(temp.path().join("control.db"), &[214; 32]).unwrap();
+        let (bundle, bytes) = fixture(&store, 1, None);
+        store.database_shell_statement("CREATE TEMP TRIGGER ignore_final BEFORE INSERT ON protocol_records WHEN NEW.kind='capture-final' BEGIN SELECT RAISE(IGNORE); END", false).unwrap();
+        let result = publish_with_guards(
+            &store,
+            &bundle,
+            &bytes,
+            || {
+                store.put_record_if_absent("capture-final", bundle.id.as_bytes(), b"ready")?;
+                Ok(())
+            },
+            || {
+                if store.get_record_bounded("capture-final", bundle.id.as_bytes(), 32)?
+                    != Some(b"ready".to_vec())
+                {
+                    return Err(DatabaseError::Integrity.into());
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(store.paged_revision_catalog(bundle.id).unwrap().is_none());
+        for member in &bundle.roots {
+            assert_eq!(
+                store.catalog_intent_state(member.intent).unwrap(),
+                CatalogIntentState::Building
+            );
+        }
+        store
+            .database_shell_statement("DROP TRIGGER ignore_final", false)
+            .unwrap();
+        publish_with_guards(
+            &store,
+            &bundle,
+            &bytes,
+            || {
+                store.put_record_if_absent("capture-final", bundle.id.as_bytes(), b"ready")?;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(store.paged_revision_catalog(bundle.id).unwrap().is_some());
+        assert_eq!(
+            store
+                .get_record("capture-final", bundle.id.as_bytes())
+                .unwrap(),
+            Some(b"ready".to_vec())
+        );
     }
 
     #[test]

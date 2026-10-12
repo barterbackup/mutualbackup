@@ -169,8 +169,32 @@ impl PagedPrivateMetadata {
         signed: &SignedRecord<PagedUserRevision>,
         fence: &mb_core::WriterFence,
         intents: PagedCatalogIntents,
-        mut source_for: impl FnMut(&CatalogSectorRecord) -> Result<Option<crate::PagedDataSource>>,
+        source_for: impl FnMut(&CatalogSectorRecord) -> Result<Option<crate::PagedDataSource>>,
     ) -> Result<()> {
+        self.publish_local_catalog_with_operation(
+            control,
+            keys,
+            signed,
+            fence,
+            intents,
+            (source_for, || Ok(()), || Ok(())),
+        )
+    }
+
+    pub(crate) fn publish_local_catalog_with_operation(
+        &self,
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        signed: &SignedRecord<PagedUserRevision>,
+        fence: &mb_core::WriterFence,
+        intents: PagedCatalogIntents,
+        callbacks: (
+            impl FnMut(&CatalogSectorRecord) -> Result<Option<crate::PagedDataSource>>,
+            impl FnOnce() -> Result<()>,
+            impl FnOnce() -> Result<()>,
+        ),
+    ) -> Result<()> {
+        let (mut source_for, finalize, guard) = callbacks;
         let bundle = self.local_bundle(signed, intents)?;
         control.check_catalog_published_revision_capacity(&bundle)?;
         let (record, bootstrap) = self.seal(keys, bundle.scope)?;
@@ -202,7 +226,7 @@ impl PagedPrivateMetadata {
             sources: signed.value.sources,
         };
         control.validate_native_file_catalog(manifest)?;
-        control.publish_paged_revision_catalog_checked(
+        control.publish_paged_revision_catalog_with_guards(
             &bundle,
             &bootstrap,
             |view| -> Result<()> {
@@ -296,6 +320,8 @@ impl PagedPrivateMetadata {
                 }
                 Ok(())
             },
+            finalize,
+            guard,
         )?;
         Ok(())
     }

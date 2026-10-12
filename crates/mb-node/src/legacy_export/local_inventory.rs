@@ -1236,6 +1236,21 @@ pub(super) fn for_each_record(
         })?;
     }
     control.for_each_record_bounded(
+        crate::paged_capture::JOURNAL,
+        16,
+        crate::paged_capture::JOURNAL_BYTES,
+        |key, bytes| {
+            let capture = crate::paged_capture::PagedNativeCapture::decode(key, bytes)?;
+            let intent = capture.preserved();
+            validate_pending(&intent)?;
+            visit(PreservedLocalRecord::PendingCapture {
+                kind: crate::paged_capture::JOURNAL,
+                intent: &intent,
+            })?;
+            Ok(true)
+        },
+    )?;
+    control.for_each_record_bounded(
         "git-graph-intent-v1",
         16,
         V1_MAX_CATALOG_BYTES,

@@ -722,6 +722,16 @@ fn decode_recovery_anchor_intent(bytes: &[u8]) -> Result<(RecoveryAnchorIntent, 
 }
 
 pub(crate) fn require_native_capture_state(control: &ControlStore) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    control.for_each_record_bounded(
+        crate::paged_capture::JOURNAL,
+        16,
+        crate::paged_capture::JOURNAL_BYTES,
+        |key, bytes| {
+            crate::paged_capture::PagedNativeCapture::decode(key, bytes)?;
+            Ok(true)
+        },
+    )?;
     control.for_each_record_value("capture-intent", |bytes| {
         let (intent, _) = decode_capture_intent(bytes)?;
         if !matches!(intent.plan, SourceCapturePlan::ReflinkV1(_)) {

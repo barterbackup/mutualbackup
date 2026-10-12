@@ -1533,6 +1533,19 @@ Complete producer ownership/preflight, ordinary/Git production, enclosing
 physical/distributed activation, retention/seed recovery and R5/R7 remain open.
 See ADR 0002 and `/tmp/mb-m6-native-producer-yt6u5_c5`.
 
+The Node native paged candidate API now owns capture, bounded source ordering,
+admission and atomic local publication through retry/reopen and source loss.
+Final operation ownership and all catalog/source/quota writes commit together,
+with independent current writer/member and original registration/backend/
+ancestor guards after the last writes. Cancellation and cleanup preserve shared
+pins and retire one record per step. Recovery inventory/startup recognize the
+owner journal. Three Store and one ordinary Node regressions and the complete
+provisioned native candidate lifecycle pass; frozen full qualification passes
+1,457 tests on 350 inputs and 23 executables. Retirement reclaims 11.74 GiB
+and leaves 47.47 GiB in target. Full workload/physical/pending-job admission,
+ordinary/Git production, distributed activation, normal retention/seed recovery,
+legacy consumers and R5/R7 remain open. See ADR 0002 and `/tmp/mb-m6-native-owner-z1hqnvv_`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

@@ -15,6 +15,8 @@ mod native_catalog;
 pub use native_capture::NativeCatalogAdmission;
 mod network;
 mod node;
+#[cfg(target_os = "linux")]
+mod paged_capture;
 mod paged_data;
 #[cfg(target_os = "linux")]
 mod paged_legacy;

@@ -352,6 +352,80 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Durable native paged capture candidates
+
+`Node::prepare_paged_native_revision_catalog` now connects the native encoder
+with durable capture ownership, source ordering, admission and exact local
+publication. The operation ID is immutable across retry. A bounded 32 KiB
+version-one journal binds the request/scope, writer, sequence/ancestor, captured
+change sequence, original registration/backend hashes and explicit capacity
+policy. Native plans are validated before startup writer admission and included
+in read-only recovery inventory/placement through the existing pending-capture
+ownership representation. No guarded/FUSE plan is accepted or replayed.
+
+The operation requires active SQL record/page/journal, global/scoped immutable
+page and backing unique-data/published-revision policies. Its writer must be
+independently certified for the current owner/member. The native plan is owned
+before capture; a completed manifest receives an immutable digest before typed
+construction. Retry opens that exact capture, never recaptures changed or lost
+working data. Native and source roots reserve their own declared page credits.
+The encoder's two private-tree bounds now remain individually available for
+those reservations while retaining one aggregate private-work check.
+
+Authenticated source rows are committed in batches of at most 128 and ordered
+by the persistent key index. Each read bounds its key/payload before allocation;
+source-tree construction and repeatable quota/dependency scans retain constant
+catalog state. Duplicate source identities preserve exact commitments and one
+verified recipe; original anchor/area ownership is checked before binding.
+The signed catalog retains private pages and bootstrap as well as data sources.
+No flat private metadata, whole sector vector or flat revision is created.
+
+Publication can now compose an enclosing finalizer and final authority guard
+with all revision/root/bootstrap/source/quota writes in one IMMEDIATE writer.
+The native operation records its exact published hash after the publication
+marker, then rechecks the current member/writer, original registration/backend
+and ancestor after the final writes. Ignored ownership writes or late authority
+changes roll back the journal, published roots, source pins and credits together.
+A dedicated capacity-policy check reads inside an existing writer without
+committing it or starting a nested read transaction; backing and immutable-pair
+checks remain intact. The initial native probe reproduced the forbidden nested
+transaction on first capture before that correction; its failed log, executable
+identity and verified native cleanup are retained separately.
+
+Completed retries return the original signed identity after reopen/source loss.
+Cancellation first persists its fence under the existing checkpoint-custody
+exclusion, then cancels catalogs, validation and reservations. Cleanup removes at
+most one queued source, dependency, source owner, page pin or validation row per
+step. Physical discard waits until all retained pins release; the cancellation
+journal persists as an ID fence. Published candidates can also retire their
+provisional source rows incrementally without changing retained ownership.
+
+Three Store regressions qualify finalizer/late-authority atomicity, ignored
+ownership writes/retry and caller-writer capacity checks/rollback. One ordinary
+Node regression requires each database/scoped-page admission policy before any
+capture owner is created. The provisioned native lifecycle uses the Node API to
+capture/publish candidates, share exact data identities, reject a real late
+checkpoint-authority fault, inventory all owners read-only, reopen after working
+source loss, retry the saved capture, restore exact bytes/sparse 1 TiB geometry/
+hard links, and cancel/release all owners across repeated reopen. Queue cleanup
+is checked one record at a time. No flat revision or flat backup head is advanced;
+these are retained candidates, not distributed protection or seed-only recovery.
+
+Complete workload/pending-job/physical admission and policy adoption, normal
+backup/Git switching, distributed checkpoint availability/activation, normal
+retention/seed-only recovery, remaining legacy consumers and R5/R7 remain open.
+Normal paged producers remain disabled. Dense real 1 TiB and native Windows/
+macOS qualification remain user-deferred.
+
+Frozen full qualification passes 1,457 distinct tests, including 443 ordinary
+Store, 560 ordinary Node, the bulk writer and all four provisioned native
+fixtures. Formatting, strict locked workspace/all-targets Clippy and four debug
+builds pass. All 350 inputs, 347 code/dependency inputs, 19 inventories and 23
+executables are audited; 121 other ignored cases remain unexecuted. Retirement
+reclaims 11.74 GiB; target uses 47.47 GiB. Current executables, older
+archives, 14 auxiliary WIP files and 10 installed roots are preserved. Evidence:
+`/tmp/mb-m6-native-owner-z1hqnvv_`.
+
 ## Direct native-anchor paged construction
 
 Native captures can now produce typed private namespace/recipe roots directly
