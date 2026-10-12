@@ -267,6 +267,9 @@ fn total(
         return Err(DatabaseError::Integrity.into());
     }
     limit(policy, scope).covers(value.used)?;
+    if let Some(limit) = capacity_policy::revision_limit(connection, scope)? {
+        limit.covers(value.used)?;
+    }
     Ok(value.used)
 }
 
@@ -455,6 +458,7 @@ pub(super) fn check(
     connection: &Connection,
     bundle: &CatalogBundle,
 ) -> Result<(), CatalogStoreError> {
+    capacity_policy::publication(connection, bundle)?;
     let Some(policy) = policy(connection)? else {
         return Ok(());
     };
@@ -471,9 +475,67 @@ pub(super) fn check(
         }
     } else {
         for scope in scopes(value.scope)? {
-            limit(policy, scope).covers(total(connection, policy, scope)?.add(value.amount)?)?;
+            let next = total(connection, policy, scope)?.add(value.amount)?;
+            limit(policy, scope).covers(next)?;
+            if let Some(limit) = capacity_policy::revision_limit(connection, scope)? {
+                limit.covers(next)?;
+            }
         }
     }
+    Ok(())
+}
+
+pub(super) fn require_capacity_backing(connection: &Connection) -> Result<(), CatalogStoreError> {
+    if !policy(connection)?
+        .is_some_and(|policy| policy.state == CatalogPublishedRevisionQuotaState::Active)
+    {
+        return Err(DatabaseError::NotReady.into());
+    }
+    if let Some(required) = capacity_policy::read(connection)? {
+        require_capacity_backing_for(connection, required)?;
+    }
+    Ok(())
+}
+
+pub(super) fn require_capacity_backing_for(
+    connection: &Connection,
+    required: mb_core::CatalogCapacityPolicy,
+) -> Result<(), CatalogStoreError> {
+    let actual = policy(connection)?.ok_or(DatabaseError::NotReady)?;
+    if actual.state != CatalogPublishedRevisionQuotaState::Active {
+        return Err(DatabaseError::NotReady.into());
+    }
+    let plan = required.plan()?;
+    let count = required.revisions_per_dataset;
+    actual
+        .quotas
+        .dataset
+        .covers(CatalogPublishedRevisionQuota {
+            revisions: count,
+            work: Work {
+                bytes: plan
+                    .revision_work
+                    .bytes
+                    .checked_mul(count)
+                    .ok_or(DatabaseError::CapacityExceeded)?,
+                page_occurrences: plan
+                    .revision_work
+                    .page_occurrences
+                    .checked_mul(count)
+                    .ok_or(DatabaseError::CapacityExceeded)?,
+                records: plan
+                    .revision_work
+                    .records
+                    .checked_mul(count)
+                    .ok_or(DatabaseError::CapacityExceeded)?,
+            },
+        })?;
+    let aggregate = CatalogPublishedRevisionQuota {
+        revisions: plan.revision_occurrences,
+        work: plan.retained_revision_work,
+    };
+    actual.quotas.global.covers(aggregate)?;
+    actual.quotas.guild.covers(aggregate)?;
     Ok(())
 }
 

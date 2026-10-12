@@ -19,6 +19,10 @@ pub(in crate::database::catalog) trait Layout:
     fn authority_root(self) -> mb_core::CatalogCheckpointAuthorityRoot;
     fn coding_root(self) -> mb_core::CatalogCodingDirectoryRoot;
     fn validate(self, budget: Work) -> Result<(), CatalogStoreError>;
+    fn admit_capacity(
+        self,
+        policy: mb_core::CatalogCapacityPolicy,
+    ) -> Result<(), CatalogStoreError>;
     fn validate_trust(
         self,
         trust: &PagedCheckpointTrust,
@@ -70,6 +74,12 @@ impl Layout for PagedGuildCheckpoint {
     const DEPENDENCIES: &'static str = "catalog-paged-checkpoint-dependency-v1";
     const PIN_PREFIX: u8 = 4;
     const OTHER_JOURNAL: &'static str = "catalog-directory-checkpoint-retention-v1";
+    fn admit_capacity(
+        self,
+        policy: mb_core::CatalogCapacityPolicy,
+    ) -> Result<(), CatalogStoreError> {
+        Ok(policy.admit_individual_checkpoint(self)?)
+    }
     fn initial(self) -> Vec<Dependency> {
         dependencies(
             self.guild_id,
@@ -111,6 +121,12 @@ impl Layout for mb_core::PagedGuildCheckpointDirectory {
     const DEPENDENCIES: &'static str = "catalog-directory-checkpoint-dependency-v1";
     const PIN_PREFIX: u8 = 6;
     const OTHER_JOURNAL: &'static str = "catalog-paged-checkpoint-retention-v1";
+    fn admit_capacity(
+        self,
+        policy: mb_core::CatalogCapacityPolicy,
+    ) -> Result<(), CatalogStoreError> {
+        Ok(policy.admit_checkpoint(self)?)
+    }
     fn initial(self) -> Vec<Dependency> {
         dependencies(
             self.guild_id,

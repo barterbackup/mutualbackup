@@ -2553,6 +2553,28 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Compose retained catalog/source capacity through checkpoint custody.
+      Derive one local contract across unique retained data, private page and
+      bootstrap sources, original legacy bodies/source occurrences, repeated
+      revision/source trees, authority, packing, full original coding witnesses
+      and independent proof/history replay. Require dense source/native recipe
+      geometry; include retained placements and historical payload profiles.
+      Persist paired immutable rows with an independent enrollment marker;
+      require sufficient active backing ledgers and refuse implicit adoption.
+      Enforce data/revision scope credits and final publication/reservation
+      policy guards. Both checkpoint layouts require the exact job budget,
+      independent proof credits and original legacy/nested source bounds.
+      Node configuration/startup and packing construction use the contract.
+      Six Core, eight Store and two Node regressions pass, including a failing
+      replay-budget baseline and original custody/heads/reopen. Frozen full
+      qualification passes 1,446 distinct tests, format, strict Clippy, four
+      builds, bulk/native probes and 346-input/23-executable audits; 121 other
+      ignored cases remain unexecuted. Retirement reclaims 11.82 GiB;
+      target uses 47.44 GiB with older artifacts, auxiliary WIP and installed
+      roots preserved. Full workload/physical admission, existing-catalog
+      adoption, normal paged/Git/capture/recovery and distributed activation
+      remain open, as do R5/R7 and deferred hardware gates. See ADR 0002.
+      Evidence: `/tmp/mb-m6-dataset-policy-rcjnf3px`.
     - [x] Enforce explicit durable WAL/rollback-journal byte admission.
       Persist bounded paired local policies and apply the current ceiling to
       native main/journal file objects before writes and extension/truncation,

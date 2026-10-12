@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{ControlStore, DatabaseError};
 
 mod bundle;
+mod capacity_policy;
 mod checkpoint_body;
 mod checkpoint_coding;
 mod checkpoint_retention;

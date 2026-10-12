@@ -1512,6 +1512,16 @@ loss fixtures and the >512 MiB atomic writer pass. Frozen qualification passes
 physical reservation, aggregate/copy/scratch policy and normal paged recovery
 remain open. See ADR 0002 and `/tmp/mb-m6-journal-quota-cfu06vgl`.
 
+A guarded local catalog capacity contract now composes retained unique data,
+private/bootstrap and original legacy sources, source-tree/revision occurrences,
+authority, packing, full original coding witnesses and independent proof/history
+replay. Scoped ledgers, final publication/reservation guards, both checkpoint
+custody layouts and Node startup/configuration enforce it. Six Core, eight Store
+and two Node regressions and frozen full qualification pass 1,446 distinct tests
+on 346 inputs and 23 executables. Retirement reclaims 11.82 GiB and leaves
+47.44 GiB in target. Full workload/physical admission, existing-catalog
+adoption, normal paged recovery and R5/R7 remain open. See ADR 0002 and `/tmp/mb-m6-dataset-policy-rcjnf3px`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

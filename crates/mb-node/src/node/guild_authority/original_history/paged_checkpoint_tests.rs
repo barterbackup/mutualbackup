@@ -1038,11 +1038,16 @@ fn checkpoint_owner_proof_at_with_legacy_private(
         CatalogCheckpointAuthorityContext, CatalogCheckpointAuthorityIndex,
         CatalogGuildHistoryIndex, CatalogPackingValidation, RecordScratchStore,
     };
-    let work = Work {
-        bytes: 64 << 20,
-        records: 65536,
-        page_occurrences: 65536,
-    };
+    let work = node
+        .control
+        .catalog_capacity_policy()
+        .unwrap()
+        .map(|policy| policy.plan().unwrap().job_work)
+        .unwrap_or(Work {
+            bytes: 64 << 20,
+            records: 65536,
+            page_occurrences: 65536,
+        });
     let guild = node
         .installed_guild()
         .unwrap()
@@ -2219,6 +2224,198 @@ fn paged_checkpoint_metadata_node_owner_uses_original_index_and_survives_capture
 #[test]
 fn paged_checkpoint_budgeted_metadata_node_owner_preserves_original_authority_through_reopen() {
     exercise_checkpoint_metadata_owner(true);
+}
+
+#[test]
+fn capacity_policy_checkpoint_custody_uses_the_same_enclosing_contract_and_reopens() {
+    use mb_core::{CatalogCapacityPolicy, CodingProfile, PackingProfile};
+    for (directory, configure_before, replay_allowed) in [
+        (false, true, true),
+        (true, true, true),
+        (false, false, true),
+        (true, false, true),
+        (false, true, false),
+        (true, true, false),
+    ] {
+        let (temp, seed, mut node, keys) = fixture();
+        let quota = mb_store::CatalogPublishedRevisionQuota {
+            revisions: 100,
+            work: Work {
+                bytes: 1 << 30,
+                page_occurrences: 1_000_000,
+                records: 10_000_000,
+            },
+        };
+        node.configure_published_revision_quotas(mb_store::CatalogPublishedRevisionQuotas {
+            global: quota,
+            dataset: quota,
+            guild: quota,
+        })
+        .unwrap();
+        let data = mb_store::CatalogRetainedSourceQuota {
+            logical_bytes: 1 << 30,
+            sources: 1_000_000,
+            open_reservations: 100,
+        };
+        node.control
+            .configure_catalog_retained_source_quota(data)
+            .unwrap();
+        node.control
+            .configure_catalog_retained_source_guild_quota(data)
+            .unwrap();
+        let policy = CatalogCapacityPolicy {
+            format_version: 1,
+            datasets: 1,
+            revisions_per_dataset: 1,
+            legacy_revisions: 1,
+            legacy_source_occurrences: 1,
+            data_bytes_per_dataset: 1,
+            data_sources_per_dataset: 1,
+            private_work_per_revision: Work {
+                bytes: 16,
+                page_occurrences: 2,
+                records: 0,
+            },
+            source_pages_per_revision: 1,
+            authority_control_records: 257,
+            packing_profile: PackingProfile {
+                format_version: 1,
+                sector_size: 65536,
+                slot_size: 16384,
+            },
+            coding_profile: CodingProfile::new(3, 2, 65536),
+            packed_sectors: 7,
+            coding_groups: 3,
+            replay_work: if replay_allowed {
+                Work {
+                    bytes: 64 << 20,
+                    page_occurrences: 65536,
+                    records: 65536,
+                }
+            } else {
+                Work::default()
+            },
+        };
+        if configure_before {
+            node.configure_catalog_capacity_policy(policy).unwrap();
+        }
+        let id = Uuid::new_v4();
+        let (hash, bytes, guild) = if directory {
+            let (proof, _) = directory_owner_proof(&mut node, &keys, false);
+            if !configure_before {
+                node.configure_catalog_capacity_policy(policy).unwrap();
+                assert!(
+                    node.retain_paged_checkpoint_directory_metadata(id, &proof)
+                        .is_err()
+                );
+                assert!(
+                    node.control
+                        .catalog_paged_checkpoint_directory_retention(id)
+                        .unwrap()
+                        .is_none()
+                );
+                continue;
+            }
+            assert_eq!(proof.transition().budget(), policy.plan().unwrap().job_work);
+            if !replay_allowed {
+                assert!(proof.transition().represented_work().bytes > 0);
+                assert!(
+                    node.retain_paged_checkpoint_directory_metadata(id, &proof)
+                        .is_err()
+                );
+                assert!(
+                    node.control
+                        .catalog_paged_checkpoint_directory_retention(id)
+                        .unwrap()
+                        .is_none()
+                );
+                continue;
+            }
+            let owned = node
+                .retain_paged_checkpoint_directory_metadata(id, &proof)
+                .unwrap();
+            let certificate = node
+                .control
+                .catalog_paged_checkpoint_directory_certificate(id)
+                .unwrap()
+                .unwrap();
+            (
+                owned.checkpoint.hash().unwrap(),
+                canonical_bytes(&certificate).unwrap(),
+                proof.trust().guild_id,
+            )
+        } else {
+            let (proof, _) = checkpoint_owner_proof_at_with_budgeted_authority(
+                &mut node,
+                &keys,
+                false,
+                unix_seconds() + 600,
+                true,
+            );
+            if !configure_before {
+                node.configure_catalog_capacity_policy(policy).unwrap();
+                assert!(node.retain_paged_checkpoint_metadata(id, &proof).is_err());
+                assert!(
+                    node.control
+                        .catalog_paged_checkpoint_retention(id)
+                        .unwrap()
+                        .is_none()
+                );
+                continue;
+            }
+            assert_eq!(proof.transition().budget(), policy.plan().unwrap().job_work);
+            if !replay_allowed {
+                assert!(proof.transition().represented_work().bytes > 0);
+                assert!(node.retain_paged_checkpoint_metadata(id, &proof).is_err());
+                assert!(
+                    node.control
+                        .catalog_paged_checkpoint_retention(id)
+                        .unwrap()
+                        .is_none()
+                );
+                continue;
+            }
+            let owned = node.retain_paged_checkpoint_metadata(id, &proof).unwrap();
+            let certificate = node
+                .control
+                .catalog_paged_checkpoint_certificate(id)
+                .unwrap()
+                .unwrap();
+            (
+                owned.checkpoint.hash().unwrap(),
+                canonical_bytes(&certificate).unwrap(),
+                proof.trust().guild_id,
+            )
+        };
+        assert!(
+            node.control
+                .checkpoint_head_identity(&guild)
+                .unwrap()
+                .is_none()
+        );
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
+        let layout = if directory {
+            mb_core::PagedCheckpointLayout::Directory
+        } else {
+            mb_core::PagedCheckpointLayout::Individual
+        };
+        assert_eq!(
+            node.retained_paged_checkpoint_certificate(guild, layout, id, hash)
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            node.control.catalog_capacity_policy().unwrap(),
+            Some(policy)
+        );
+        assert!(
+            node.control
+                .checkpoint_head_identity(&guild)
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 fn exercise_checkpoint_metadata_owner(budgeted: bool) {

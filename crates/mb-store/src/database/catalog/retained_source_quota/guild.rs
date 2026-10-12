@@ -98,6 +98,9 @@ fn ledger(
         _ => return Err(DatabaseError::Integrity.into()),
     };
     result.validate_limits(quota)?;
+    if let Some(limit) = capacity_policy::data_limit(connection, result.scope)? {
+        result.validate_limits(limit)?;
+    }
     Ok(Some(result))
 }
 
@@ -230,6 +233,9 @@ pub(super) fn update_dataset_usage(
     let total = ledger(connection, id, quota)?.ok_or(DatabaseError::Integrity)?;
     let total = changed(total, before, after)?;
     total.validate_limits(quota)?;
+    if let Some(limit) = capacity_policy::data_limit(connection, total.scope)? {
+        total.validate_limits(limit)?;
+    }
     replace(connection, LEDGER, &id, &(1_u16, total))
 }
 

@@ -268,6 +268,15 @@ impl ControlStore {
         read_trust: &mut impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
     ) -> Result<(), CatalogStoreError> {
         require_layout::<H>(&self.connection, retention.id)?;
+        if let Some(policy) = capacity_policy::read(&self.connection)? {
+            retention.checkpoint.admit_capacity(policy)?;
+            policy.replay_work.remaining_after(retention.proof_work)?;
+            if retention.budget != policy.plan()?.job_work {
+                return Err(DatabaseError::CapacityExceeded.into());
+            }
+            revision_quota::require_capacity_backing(&self.connection)?;
+            retained_source_quota::require_capacity_backing(&self.connection)?;
+        }
         let trust = read_trust()?;
         if snapshot_hash(&trust)? != retention.trust_hash
             || self.checkpoint_head_identity(&retention.checkpoint.guild_id())?
@@ -296,6 +305,7 @@ impl ControlStore {
         mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
     ) -> Result<CatalogPagedCheckpointRetention<P::Header>, CatalogStoreError> {
         let retention = proof.retention(id)?;
+        let capacity_guard = capacity_policy::guard(&self.connection)?;
         proof.recheck(&mut read_trust)?;
         retention.validate()?;
         let certificate_bytes = mb_core::canonical_bytes_bounded(
@@ -355,6 +365,7 @@ impl ControlStore {
                 }
             }
             self.guard_paged_candidate(retention, &mut read_trust)?;
+            capacity_guard.recheck(&transaction)?;
             transaction.commit()?;
         }
         let result = (|| {
@@ -368,6 +379,7 @@ impl ControlStore {
                     journal::retain(&transaction, retention, dependency)?;
                 }
                 self.guard_paged_candidate(retention, &mut read_trust)?;
+                capacity_guard.recheck(&transaction)?;
                 transaction.commit()?;
                 Ok(())
             };
@@ -378,6 +390,7 @@ impl ControlStore {
             )?;
             let mut fetch_authority =
                 |page| self.catalog_page(scope(retention), CatalogSection::Checkpoint, page);
+            let mut legacy_sources = 0_u64;
             while let Some(record) = unwrap_stream(authority.next_record(&mut fetch_authority))? {
                 match record {
                     R::LegacyRevision(revision) => {
@@ -386,12 +399,32 @@ impl ControlStore {
                             section: CatalogSection::Checkpoint,
                             root: revision.body,
                         })?;
-                        revision
+                        let original = revision
                             .read_signed(&mut fetch_authority)
                             .map_err(unwrap_error)?;
+                        legacy_sources = legacy_sources
+                            .checked_add(
+                                original
+                                    .value
+                                    .metadata_sectors
+                                    .len()
+                                    .checked_add(original.value.data_sectors.len())
+                                    .ok_or(DatabaseError::CapacityExceeded)?
+                                    as u64,
+                            )
+                            .ok_or(DatabaseError::CapacityExceeded)?;
+                        if capacity_guard
+                            .policy()
+                            .is_some_and(|policy| legacy_sources > policy.legacy_source_occurrences)
+                        {
+                            return Err(DatabaseError::CapacityExceeded.into());
+                        }
                     }
                     R::PagedRevision(revision) => {
                         let body = &revision.value;
+                        if let Some(policy) = capacity_guard.policy() {
+                            policy.admit_revision(body, Work::default())?;
+                        }
                         let scope = body.scope();
                         pin(Dependency {
                             scope,
@@ -456,6 +489,7 @@ impl ControlStore {
             }
             owned_certificate(&transaction, retention)?;
             self.guard_paged_candidate(retention, &mut read_trust)?;
+            capacity_guard.recheck(&transaction)?;
             transaction.commit()?;
             Ok(retention)
         })();

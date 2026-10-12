@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use crate::{ModelError, NodeId, canonical_bytes, decode_canonical};
 
+mod capacity_policy;
 mod checkpoint_authority;
+pub use capacity_policy::{CatalogCapacityPlan, CatalogCapacityPolicy};
 mod coding_directory;
 mod coding_evidence;
 mod file_recipes;

@@ -1405,6 +1405,7 @@ impl Node {
         #[cfg(not(target_os = "linux"))]
         let (mut control, control_database_key) =
             crate::volume::open_control_store(&data_dir, &keys)?;
+        control.catalog_capacity_policy()?;
         // Incomplete quota adoption freezes ordinary writes. Resume the durable
         // rowid cursor before startup reconciliation; each step is bounded and
         // committed independently, so interruption does not restart a scan.
@@ -1450,6 +1451,16 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// One immutable local contract for retained data/revision ledgers and
+    /// enclosing checkpoint admission. Independent database/physical quotas
+    /// remain required; this does not enable normal paged producers.
+    pub fn configure_catalog_capacity_policy(
+        &self,
+        policy: mb_core::CatalogCapacityPolicy,
+    ) -> Result<()> {
+        Ok(self.control.configure_catalog_capacity_policy(policy)?)
     }
 
     /// Admit the complete durable WAL/rollback-journal byte extent separately
@@ -15532,6 +15543,84 @@ pub(crate) mod tests {
         );
         node.configure_volume_journal_quota(volume_id, quota)
             .unwrap();
+    }
+
+    #[test]
+    fn node_capacity_contract_survives_reopen_and_refused_configuration() {
+        use mb_core::{
+            CatalogCapacityPolicy, CatalogCodingTraversalBudget as Work, CodingProfile,
+            PackingProfile,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([188; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let policy = CatalogCapacityPolicy {
+            format_version: 1,
+            datasets: 1,
+            revisions_per_dataset: 1,
+            legacy_revisions: 0,
+            legacy_source_occurrences: 0,
+            data_bytes_per_dataset: 1,
+            data_sources_per_dataset: 1,
+            private_work_per_revision: Work {
+                bytes: 16,
+                page_occurrences: 2,
+                records: 0,
+            },
+            source_pages_per_revision: 1,
+            authority_control_records: 257,
+            packing_profile: PackingProfile {
+                format_version: 1,
+                sector_size: 65536,
+                slot_size: 16384,
+            },
+            coding_profile: CodingProfile::new(3, 2, 65536),
+            packed_sectors: 6,
+            coding_groups: 2,
+            replay_work: Work::default(),
+        };
+        assert!(node.configure_catalog_capacity_policy(policy).is_err());
+        assert!(node.control.catalog_capacity_policy().unwrap().is_none());
+        let quota = mb_store::CatalogPublishedRevisionQuota {
+            revisions: 100,
+            work: Work {
+                bytes: 1 << 30,
+                page_occurrences: 1_000_000,
+                records: 10_000_000,
+            },
+        };
+        node.configure_published_revision_quotas(mb_store::CatalogPublishedRevisionQuotas {
+            global: quota,
+            dataset: quota,
+            guild: quota,
+        })
+        .unwrap();
+        let data = mb_store::CatalogRetainedSourceQuota {
+            logical_bytes: 1 << 30,
+            sources: 1_000_000,
+            open_reservations: 100,
+        };
+        node.control
+            .configure_catalog_retained_source_quota(data)
+            .unwrap();
+        node.control
+            .configure_catalog_retained_source_guild_quota(data)
+            .unwrap();
+        node.configure_catalog_capacity_policy(policy).unwrap();
+        node.configure_failure_domain("capacity-contract").unwrap();
+        let guild = node
+            .create_guild(record_quota_test_endpoints(&node))
+            .unwrap();
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            node.control.catalog_capacity_policy().unwrap(),
+            Some(policy)
+        );
+        assert_eq!(
+            node.guild_summary().unwrap().unwrap().guild_id,
+            guild.guild_id
+        );
     }
 
     #[test]

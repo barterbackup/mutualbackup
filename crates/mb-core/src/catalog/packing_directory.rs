@@ -295,7 +295,7 @@ impl DirectoryState {
     }
 }
 
-fn dense_pages(bytes: u64) -> u64 {
+pub(super) fn dense_pages(bytes: u64) -> u64 {
     let mut nodes = bytes.div_ceil(CATALOG_LEAF_BYTES as u64).max(1);
     let mut pages = nodes;
     while nodes > 1 {

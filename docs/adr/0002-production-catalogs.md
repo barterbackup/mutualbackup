@@ -352,6 +352,88 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Shared retained catalog capacity contract
+
+`CatalogCapacityPolicy` is one versioned local contract for retained data and
+revision exposure, private native/Git roots, source trees and enclosing public
+checkpoint custody. It grants no authority and changes no signed/wire format.
+Independent SQL record/page/journal, scratch and filesystem quotas still apply.
+
+The policy declares dataset-unit aggregate credits, revisions per dataset,
+unique retained data bytes/sources, private byte/page/framing-record limits,
+source-tree page limits, original legacy body/source credits, authority control
+records, packing/coding geometry and retained placement/group limits. Data
+credits exclude holes, aliases, private pages and bootstrap sectors; private
+and source-tree occurrences are charged for every retained revision even when
+pages are shared. Root registrations have their own separate limits.
+
+With D dataset units, R revisions per dataset, S unique data-source credits,
+P private-page credits and L original legacy source occurrences, reserve
+`D*S + D*R*(P+1) + L` packing sources. The additional one per revision is its
+bootstrap ciphertext. Legacy references/bodies keep their original identities
+and separate credits. Their bounded original envelopes are read at EOF to
+check actual source counts. The plan includes source frames (128-byte codec
+plus four-byte framing), control records, directories, original 600 KiB coding
+witnesses, certificate/bundle/bootstrap envelopes and independently declared
+private/source page layout bounds. Source credits must cover dense construction;
+a 1 TiB contract also reserves the full native sector-reference fragments,
+headers and maximum path needed to describe the dense file.
+
+A compiled-library probe declares one retained dataset/revision, 1 TiB data,
+2 GiB private metadata and 40,000 private pages. It requires 16,817,217 sources,
+22,422,956 single-owner packed sectors and 7,474,319 default 3+2 groups.
+Represented metadata credits are 4,646,802,735,012 bytes, 78,156,507 page
+occurrences and 722,340,858 records; encoded immutable page credits are
+5,122,064,842,752 bytes. These are conservative codec/layout reservations,
+including full original witnesses, not measured metadata or physical allocation.
+Historical payload credits cover all supported 64 roles/4 MiB profiles;
+independent proof/history replay credits cannot borrow unused payload credits.
+The probe and exact library/source/executable hashes are retained with the
+qualification evidence. It is a numeric derivation, not a real dense run.
+
+Installation holds one writer, requires active backing revision/data ledgers
+with sufficient limits, and commits exact immutable policy/guard rows plus a
+bounded independent enrollment marker. Missing, oversized, mismatched or wholly
+removed protocol policy rows fail closed while the marker remains. Existing
+retained owners/reservations require explicit adoption; refusal preserves them.
+Configured ledgers enforce dataset/guild data and global/dataset/guild revision
+credits even when their independent quotas are larger. Late reservation or
+publication policy replacement rolls back credits and ownership together.
+Publication checks private and public root declarations before its callback
+and rechecks the original contract after the final marker write.
+
+Packing construction reserves the complete declared geometry before its first
+sink call. Both checkpoint layouts use the same contract, exact derived job
+budget and an independent proof/history-work check before creating custody.
+Each nested paged source root and original legacy source count is bounded.
+Every metadata pin/publication transaction rechecks the contract and existing
+independent current trust/head. Original signed records and heads stay intact;
+metadata custody does not activate protection. Node validates the policy before
+startup reconciliation and exposes explicit configuration.
+
+Six Core, eight Store and two Node regressions cover the dense data/private
+geometry, original legacy credits, retained occurrences, retired groups,
+scalar overflow, actual single-owner allocation, insufficient backing limits,
+private/source admission, scope/reservation exhaustion, late policy faults,
+corruption, original custody/refused adoption, both layouts, insufficient job
+and independent replay budgets, unchanged heads and reopen. The replay-budget
+regression fails on the preceding implementation before the independent check.
+
+Full workload/physical reservation and policy adoption into existing catalogs,
+normal Git/capture preflight and paged capture/packing/coding/checkpoint/
+retention/seed recovery, distributed availability/activation and R5/R7 remain
+open. Normal paged producers remain disabled. Dense 1 TiB and native Windows/
+macOS qualification remain user-deferred.
+
+Frozen qualification passes 1,446 distinct tests: 210 Core, 440 ordinary
+Store, 117 Git, 554 Node, the bulk writer and both provisioned native recovery
+fixtures, plus the remaining targets. Formatting, strict locked workspace/
+all-targets Clippy, compilation and four debug builds pass. All 346 inputs,
+343 code/dependency inputs, 19 inventories and 23 executables are audited;
+121 other ignored cases remain unexecuted. Verified retirement reclaims
+11.82 GiB; target uses 47.44 GiB. Current executables, older archives,
+14 auxiliary WIP files and 10 installed roots are preserved. Evidence: `/tmp/mb-m6-dataset-policy-rcjnf3px`.
+
 ## Explicit durable journal admission
 
 `DatabaseJournalQuota` explicitly limits each durable WAL/rollback-journal

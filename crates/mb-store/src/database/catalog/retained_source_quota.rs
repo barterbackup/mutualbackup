@@ -210,8 +210,55 @@ fn usage(
         _ => return Err(DatabaseError::Integrity.into()),
     };
     result.validate(quota)?;
+    if let Some(limit) = capacity_policy::data_limit(connection, scope)? {
+        result.validate_limits(limit)?;
+    }
     guild::require_dataset_usage(connection, result, enabled.is_some())?;
     Ok(result)
+}
+
+pub(super) fn require_capacity_backing(connection: &Connection) -> Result<(), CatalogStoreError> {
+    if policy(connection)?.is_none() || guild::policy(connection)?.is_none() {
+        return Err(DatabaseError::NotReady.into());
+    }
+    if let Some(required) = capacity_policy::read(connection)? {
+        require_capacity_backing_for(connection, required)?;
+    }
+    Ok(())
+}
+
+pub(super) fn require_capacity_backing_for(
+    connection: &Connection,
+    required: mb_core::CatalogCapacityPolicy,
+) -> Result<(), CatalogStoreError> {
+    let dataset = policy(connection)?.ok_or(DatabaseError::NotReady)?;
+    let guild = guild::policy(connection)?.ok_or(DatabaseError::NotReady)?;
+    let units = u64::from(required.datasets);
+    if dataset.logical_bytes < required.data_bytes_per_dataset
+        || dataset.sources < required.data_sources_per_dataset
+        || guild.logical_bytes
+            < required
+                .data_bytes_per_dataset
+                .checked_mul(units)
+                .ok_or(DatabaseError::CapacityExceeded)?
+        || guild.sources
+            < required
+                .data_sources_per_dataset
+                .checked_mul(units)
+                .ok_or(DatabaseError::CapacityExceeded)?
+    {
+        return Err(DatabaseError::CapacityExceeded.into());
+    }
+    Ok(())
+}
+
+pub(super) fn check_capacity_usage(
+    connection: &Connection,
+    scope: CatalogScope,
+) -> Result<(), CatalogStoreError> {
+    let quota = policy(connection)?.ok_or(DatabaseError::NotReady)?;
+    usage(connection, scope, quota)?;
+    Ok(())
 }
 
 fn replace<T: Serialize>(
@@ -238,6 +285,9 @@ fn write_usage(
     quota: CatalogRetainedSourceQuota,
 ) -> Result<(), CatalogStoreError> {
     usage.validate(quota)?;
+    if let Some(limit) = capacity_policy::data_limit(connection, usage.scope)? {
+        usage.validate_limits(limit)?;
+    }
     let previous = self::usage(connection, usage.scope, quota)?;
     guild::update_dataset_usage(connection, previous, usage)?;
     replace(
@@ -603,6 +653,7 @@ impl ControlStore {
         if self.connection.is_autocommit() || id.is_nil() {
             return Err(DatabaseError::Conflict.into());
         }
+        let capacity_guard = capacity_policy::guard(&self.connection)?;
         capacity.validate()?;
         let key = dataset_key(scope)?;
         let Some(quota) = policy(&self.connection)? else {
@@ -660,6 +711,7 @@ impl ControlStore {
         if reservation(&self.connection, id, scope)? != Some(record) {
             return Err(DatabaseError::Integrity.into());
         }
+        capacity_guard.recheck(&self.connection)?;
         Ok(())
     }
 

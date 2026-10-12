@@ -372,6 +372,7 @@ impl ControlStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(CatalogStoreError::from)?;
+        let capacity_guard = capacity_policy::publication(&transaction, bundle)?;
         let manifest = native_validation::verified_manifest(&transaction, bundle.id)?;
         if !matches_manifest(bundle, manifest, &signed) {
             return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
@@ -410,6 +411,7 @@ impl ControlStore {
             &marker(&signed)?,
         )?;
         quota_guard.recheck(&transaction)?;
+        capacity_guard.recheck(&transaction, bundle)?;
         transaction.commit().map_err(CatalogStoreError::from)?;
         Ok(())
     }

@@ -97,6 +97,24 @@ pub struct CatalogPackingCodingBuilder {
 }
 
 impl CatalogPackingCodingBuilder {
+    /// Reserve the complete declared retained data/private/bootstrap geometry
+    /// before the first sink call. Original witness and count fences still apply.
+    pub fn with_capacity_policy(
+        scope: CatalogScope,
+        packing_version: u16,
+        event_sequence: u64,
+        policy: CatalogCapacityPolicy,
+        remaining_budget: CatalogCodingTraversalBudget,
+    ) -> Result<Self, CatalogError> {
+        Self::new(
+            scope,
+            packing_version,
+            event_sequence,
+            policy.plan()?.packing_coding,
+            remaining_budget,
+        )
+    }
+
     pub fn new(
         scope: CatalogScope,
         packing_version: u16,
