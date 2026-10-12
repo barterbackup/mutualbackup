@@ -86,7 +86,7 @@ pub use packing_authority::{
     CatalogCertifiedCodingDirectoriesIndex, CatalogCertifiedCodingDirectoryIndex,
     CatalogCertifiedCodingIndex, CatalogCertifiedPackingDirectoryIndex,
     CatalogCertifiedPackingIndex, CatalogPackingAuthority, CatalogPackingAuthorityBase,
-    CatalogPackingAuthorizedSource,
+    CatalogPackingAuthorizedSource, CatalogProducedPackingDirectory,
 };
 pub use packing_coding_retention::{
     CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,

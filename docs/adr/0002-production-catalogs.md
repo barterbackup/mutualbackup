@@ -352,6 +352,69 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Bounded fresh source-authorized packing
+
+`CatalogPackingAuthority::produce_packing_directory` constructs fresh sharded
+packing directly from the certified original source set and signed paged
+candidates. Admission debits the complete declared packing construction and
+original authority work before callbacks. Sources are read into one fixed
+64 KiB buffer and checked against both original flat and Merkle roots. Complete
+subtree fragments hold at most 64 roots and are calculated from individual
+chunks in linear payload work. Sources retain their owner/root/object order.
+
+The existing admitted encrypted scratch store now holds point rows for owner
+cursors, sector classifications and assigned slots. Indexed selection reproduces
+the original fresh allocator's owner rounds, first eligible sector and reserved
+cross-owner slot. No catalog-wide source/chunk/slot vector or owner list is
+constructed. At most 128 assignments share a scratch transaction; every SQL
+mutation is checked, and a failed batch rolls back its whole prefix. A failed
+construction consumes the disposable job. Existing physical scratch admission
+and process-exit cleanup apply to these rows.
+
+Payload construction reauthenticates sources as needed and emits one packed
+payload/descriptor at a time, preserving virtual-zero mappings, unchanged
+content hashes, sector IDs and exact bytes. The payload sink runs before its
+descriptor metadata is emitted. Page and payload sinks retain their own durable ownership
+and cancellation responsibilities. The returned construction retains the
+original authority and candidates; full emitted-page/source/descriptor coverage
+EOF validation is required before it yields the usable certified packing index.
+Current checkpoint authority, private/payload custody and activation remain
+independent enclosing requirements.
+
+Seven regressions cover single-owner spare slots, uneven multi-owner rounds,
+virtual-zero sources, exact legacy allocator payloads/descriptors/IDs, the widest
+supported slot profile, signed paged candidate sharing, required page EOFs,
+all-dimensional pre-I/O admission, changed ciphertext, sink faults and ignored
+SQL writes with batch rollback, and malformed stored source identities/chunk
+indices rejected before payload indexing. The new point-read guard has an actual
+failing regression baseline with its original source and executable identity
+preserved before correction. The initial multi-owner fixture was rejected
+because it reused globally unique sector IDs across owners; the widest fixture
+exceeded its deliberately small 4 MiB scratch index. Corrected independent IDs
+and an explicit 32 MiB test index preserve the supported production geometry.
+The widest case uses independent payload/slot/ID checks to avoid the reference
+flat packer's quadratic full-source proof generation. No production limit was
+raised. Original failed logs remain in the qualification evidence directory.
+
+The additional widest-profile fixture passes with 25.93 MiB peak RSS; its
+original partial executable and all 353 frozen inputs are independently checked.
+This is a focused memory observation, not a retained 1 TiB qualification.
+
+Durable enclosing packing/coding operation ownership, incremental seek/edit,
+full physical/pending-job admission, paged-base authority, distributed checkpoint
+activation and normal backup/retention/seed-only switching remain open. Normal
+paged producers remain disabled; dense real 1 TiB and native Windows/macOS gates
+remain user-deferred.
+
+Frozen full qualification passes 1,464 distinct tests, including 450 ordinary
+Store, 560 ordinary Node, the bulk writer and four provisioned native fixtures.
+Formatting, strict locked workspace/all-targets Clippy and four debug builds
+pass. Audits verify 353 inputs, 350 unchanged code/dependency inputs, 23 exact
+executables and 19 drivers; 121 other ignored cases remain unexecuted. Retirement
+reclaims 9.83 GiB and leaves 47.48 GiB in target, preserving current
+executables, older archives, 14 auxiliary WIP files and 10 installed roots.
+Evidence: `/tmp/mb-m6-packing-producer-6w61ltjm`.
+
 ## Durable native paged capture candidates
 
 `Node::prepare_paged_native_revision_catalog` now connects the native encoder

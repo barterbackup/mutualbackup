@@ -1546,6 +1546,18 @@ and leaves 47.47 GiB in target. Full workload/physical/pending-job admission,
 ordinary/Git production, distributed activation, normal retention/seed recovery,
 legacy consumers and R5/R7 remain open. See ADR 0002 and `/tmp/mb-m6-native-owner-z1hqnvv_`.
 
+Source-authorized fresh packing now streams complete source proofs and original
+packed payloads/descriptors through an indexed encrypted disk allocator. Owner
+rounds, spare slots, virtual-zero mappings, exact bytes and original IDs match
+the existing allocator. Construction and source-authority credits are paid
+before callbacks; failed batches roll back, and complete emitted-page/coverage
+EOFs are required before placements or candidates can be used. Frozen full
+qualification passes 1,464 tests on 353 inputs and 23 executables. Retirement
+reclaims 9.83 GiB; target uses 47.48 GiB. Durable enclosing operation
+ownership, incremental edits, full physical/pending-job admission, paged-base
+authority, distributed activation and normal backup/retention/seed recovery
+remain open. See ADR 0002 and `/tmp/mb-m6-packing-producer-6w61ltjm`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

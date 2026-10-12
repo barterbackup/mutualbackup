@@ -19,9 +19,11 @@ use super::*;
 use crate::RecordScratchStore;
 
 mod directories;
+mod producer;
 pub use directories::{
     CatalogCertifiedCodingDirectoriesIndex, CatalogCertifiedPackingDirectoryIndex,
 };
+pub use producer::CatalogProducedPackingDirectory;
 
 pub(super) const ROW_BYTES: usize = 256;
 pub(super) const EVIDENCE_BYTES: usize = 512;

@@ -2553,6 +2553,23 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Stream source-authorized fresh packing through a disk allocator.
+      Debit original authority and the complete declared packing construction
+      before callbacks. Read/authenticate one 64 KiB source at a time; compose
+      bounded complete-source subtrees in linear work. Indexed encrypted owner,
+      classification and assignment rows preserve the existing owner rounds,
+      spare slot, virtual-zero mappings, payload bytes and descriptor identities.
+      Check every mutation in batches of at most 128 allocations and roll back
+      failed prefixes. Emit one payload/descriptor at a time and require complete
+      page/source/coverage EOFs before returning placements and original signed
+      candidates. Seven regressions and frozen full qualification pass: 1,464
+      tests, format, strict Clippy, four builds and 353-input/23-executable audits.
+      Another 121 ignored cases remain unexecuted. Retirement reclaims
+      9.83 GiB; target uses 47.48 GiB. Durable enclosing operation
+      ownership, incremental edits, full physical/pending-job admission,
+      paged-base authority, distributed activation and normal backup/retention/
+      seed recovery remain open. Normal producers stay disabled; hardware gates
+      stay deferred. See ADR 0002 and `/tmp/mb-m6-packing-producer-6w61ltjm`.
     - [x] Own native paged capture candidates through atomic publication/retry.
       Connect the Node API to a bounded immutable native plan/manifest journal,
       original request/writer/registration/backend/ancestor guards, active SQL
