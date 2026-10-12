@@ -1478,6 +1478,18 @@ existing joins; complete enclosing policy, bounded incremental updates and
 normal producers/retention/seed recovery remain open. See ADR 0002 and
 `/tmp/mb-m6-packing-coding-production-a6kytmjm`.
 
+Published paged revision metadata now has explicit version-one global,
+dataset and guild occurrence quotas. Repeated source/private roots consume
+revision/byte/page/record credits even when physical pages and data are shared.
+Bounded adoption/abort resumes at startup; publication/cancellation guard exact
+original identities and all scoped totals through the enclosing writer. Both
+native fixtures cover configuration or existing adoption, shared successors
+and source loss. Frozen qualification passes 1,413 distinct tests on 337 inputs
+and 23 executables; retirement reclaims 10.64 GiB and leaves 47.43
+GiB in target. These are published exposure limits; complete structural,
+pending capture/checkpoint/replay/SQL/WAL/scratch/physical policy and normal
+paged recovery remain open. See ADR 0002 and `/tmp/mb-m6-published-revision-quota-j49ro9os`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

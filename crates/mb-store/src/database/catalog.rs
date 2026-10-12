@@ -41,6 +41,7 @@ mod paged_revision;
 mod paged_sector;
 mod retained_source_quota;
 mod retention_journal;
+mod revision_quota;
 mod source;
 mod storage_quota;
 pub use bundle::{
@@ -119,6 +120,11 @@ pub use paged_revision::{CatalogPublicationView, PagedCatalogPageSource, PagedCa
 pub use paged_sector::PagedCatalogSectorSource;
 pub use retained_source_quota::{
     CatalogRetainedSourceQuota, CatalogRetainedSourceReservation, CatalogRetainedSourceUsage,
+};
+pub use revision_quota::{
+    CatalogPublishedRevisionQuota, CatalogPublishedRevisionQuotaScope,
+    CatalogPublishedRevisionQuotaState, CatalogPublishedRevisionQuotaUsage,
+    CatalogPublishedRevisionQuotas,
 };
 pub use source::{CATALOG_SECTOR_RECIPE_BYTES, CatalogSectorSource, CatalogSourceSweep};
 pub use storage_quota::{CatalogPageReservation, CatalogStorageQuota, CatalogStorageUsage};

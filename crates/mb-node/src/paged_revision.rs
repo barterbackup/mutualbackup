@@ -172,6 +172,7 @@ impl PagedPrivateMetadata {
         mut source_for: impl FnMut(&CatalogSectorRecord) -> Result<Option<crate::PagedDataSource>>,
     ) -> Result<()> {
         let bundle = self.local_bundle(signed, intents)?;
+        control.check_catalog_published_revision_capacity(&bundle)?;
         let (record, bootstrap) = self.seal(keys, bundle.scope)?;
         ensure!(
             record == signed.value.metadata,

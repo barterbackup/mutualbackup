@@ -2553,6 +2553,31 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Bound published revision metadata occurrences across retained history.
+      Add version-one global/dataset/guild limits over revision count and
+      represented bytes, pages and record work. Count repeated source/private
+      roots without physical sharing discounts, with bounded original bundle/
+      bootstrap framing and conservative private record counts. Node preflights
+      before graph/native validation; Store atomically guards all scoped totals
+      and exact original identity through publication/cancellation and final
+      writer readback. Adopt one existing original publication per transaction,
+      freeze publishers/cancellers until EOF, resume after reopen, grow refused
+      limits or abort one derived row per step. Node resumes adoption/abort
+      before reconciliation and cleans a newly refused configuration. Seven
+      Store and two Node cases pass, and both native fixtures exercise prior
+      configuration/existing adoption, shared successors and source loss.
+      Frozen qualification passes 1,413 distinct tests, format, strict locked
+      Clippy, compilation and four debug builds; 337 inputs, 334 code/dependency
+      inputs, 19 inventories and 23 executables are audited. The 121 other
+      ignored cases remain unexecuted. Retirement reclaims 10.64 GiB;
+      target uses 47.43 GiB, preserving current/older executables, auxiliary
+      WIP and installed roots. Cancelled cleanup keeps independent page/data/
+      all-table charges. This published exposure quota does not close pending
+      captures, legacy flat history, structural file/extent/Git/sparse limits,
+      enclosing checkpoint/replay/SQL/WAL/scratch/physical policy, normal paged
+      producers/recovery or R5/R7. The parent R3 gate and deferred hardware
+      gates remain open. See ADR 0002.
+      Evidence: `/tmp/mb-m6-published-revision-quota-j49ro9os`.
     - [x] Combine full packing/coding construction credits and automatic parts.
       Stream bounded complete source proofs and original sector descriptors,
       rolling only between whole sources/sectors under byte and record caps.

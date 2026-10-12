@@ -218,6 +218,80 @@ reclaims 9.67 GiB; target uses 47.43 GiB. Current/shared executables,
 29 older archived paths, 14 auxiliary WIP files and 10 installed roots remain
 intact. Evidence: `/tmp/mb-m6-packing-coding-production-a6kytmjm`.
 
+## Published revision metadata occurrence quotas
+
+`CatalogPublishedRevisionQuotas` is an explicitly configured, version-one local
+policy over global, dataset and guild scopes. Each scope limits published
+revision count and represented metadata bytes, page occurrences and record
+work. Reusing an unchanged source/private root in two retained revisions counts
+it twice. Separate immutable-page and authenticated-data ledgers continue to
+charge unique physical pages and data sources; sharing does not erase the
+published history's exposure/work reservation.
+
+A charge binds the exact original signed paged revision bundle and scope.
+Bytes include every public-source/private root's represented stream bytes,
+plus a conservative 2 KiB signed envelope, 8 KiB local bundle and 64 KiB
+bootstrap reservation. Pages count every root occurrence. Source records count
+exactly; each private framed stream reserves at most the smaller of 64
+Mi-records and `(byte_len - 8)/5`, since every record has a four-byte length and
+nonempty payload. This computes a conservative record bound without decrypting
+private paths or assembling payloads. A valid 3/6-root bundle therefore has a
+per-revision upper bound of 16 GiB + 74 KiB represented/envelope bytes, one
+million page occurrences and `1 + 6*64 Mi-records`. These are metadata exposure
+credits, not encoded-page, SQL or physical allocation bounds; actual charges
+use the admitted original root summaries. This definition does not yet specify
+all file/namespace/extent/Git/sparse-length structural limits.
+
+Node runs an early read-only capacity check before graph scratch/native index
+work, then Store repeats admission under the publication's IMMEDIATE writer.
+The charge and all three scoped totals publish or roll back with the original
+roots, private/bootstrap/source bindings and publication markers. Scope and
+policy markers reject missing ledgers; CAS plus exact readback detects ignored
+or reverted writes. All three old totals are captured before mutation, all new
+totals are checked afterwards, and an enclosing guard checks policy/charge/
+totals again after the last publication or cancellation write. A late fault
+cannot leave a completed prefix or reduce a different scope's accounting.
+Identical publication retries do not double-charge.
+
+Adoption freezes publication and cancellation across connections. Each
+independently committed step reads one indexed publication locator, a bounded
+original bundle and its at-most-64-KiB bootstrap; it reads no catalog page or
+data payload. The cursor survives reopen, skips cancelled exposure and becomes
+ACTIVE only at indexed EOF. Insufficient limits preserve progress and originals;
+limits can grow without a dataset-sized scan. Incomplete adoption can abort,
+removing at most one derived charge/total/marker per transaction. Node exposes
+explicit configuration, resumes adoption/abort before startup reconciliation,
+and aborts a newly refused configuration without leaving normal writes frozen.
+Existing unconfigured stores retain their legacy behavior.
+
+Cancellation withdraws the published exposure charge atomically. Remaining
+cancelled journals, private/data bindings and pins retain their independent
+all-table/page/data-source charges until bounded cleanup. This is not a limit
+on pending capture/import work, legacy flat revisions, enclosing checkpoint
+copies, replay passes, SQL schema/index/pages, WAL, scratch or filesystem
+allocation. Those complete-policy requirements, structural limits, normal
+paged production/retention/seed-only recovery and R5/R7 remain open. Normal
+paged producers remain disabled; dense 1 TiB and native Windows/macOS
+qualification stay user-deferred.
+
+Seven new Store regressions cover repeated shared roots, all four dimensions,
+scope isolation, idempotency, bounded adopt/reopen/abort, exhaustion/growth,
+original identity, missing/malformed rows and ignored/reverted/late SQL faults.
+Two Node regressions cover startup resumption and refused configuration.
+Both real native retained/source-loss fixtures now configure the policy before
+migration or adopt existing publication; a shared successor doubles metadata
+exposure while retaining unchanged unique page/data usage.
+
+Frozen qualification passes 1,413 distinct tests: 204 Core, 417 ordinary
+Store, 117 Git, 550 Node, the explicit >512 MiB atomic writer and both
+provisioned Btrfs recovery fixtures, plus the remaining targets. Formatting,
+strict locked workspace/all-targets Clippy, compilation and four debug builds
+pass. All 337 inputs, 334 code/dependency inputs, 19 inventories and 23 exact
+executables are audited. The 121 other ignored cases remain unexecuted. Exact
+obsolete-inode retirement reclaims 10.64 GiB; target uses 47.43 GiB.
+Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
+installed roots are preserved. Evidence: `/tmp/mb-m6-published-revision-quota-j49ro9os`.
+
 ## Implementation and qualification order
 
 1. Add the bounded tree codec, streaming builder and authenticated traversal.

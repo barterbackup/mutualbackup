@@ -1414,6 +1414,19 @@ impl Node {
         {
             control.resume_record_quota_adoption()?;
         }
+        while let Some(usage) = control.catalog_published_revision_quota_usage(
+            mb_store::CatalogPublishedRevisionQuotaScope::Global,
+        )? {
+            match usage.state {
+                mb_store::CatalogPublishedRevisionQuotaState::Adopting => {
+                    control.resume_catalog_published_revision_quota_adoption()?;
+                }
+                mb_store::CatalogPublishedRevisionQuotaState::Aborting => {
+                    control.abort_catalog_published_revision_quota_adoption()?;
+                }
+                mb_store::CatalogPublishedRevisionQuotaState::Active => break,
+            }
+        }
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
@@ -1471,6 +1484,39 @@ impl Node {
         quota: mb_store::DatabaseRecordQuota,
     ) -> Result<mb_store::DatabaseRecordQuotaUsage> {
         self.volumes.configure_record_quota(volume_id, quota)
+    }
+
+    /// Admit repeated published revision metadata across global, dataset and
+    /// guild scopes. Existing roots are adopted one at a time; physical pages,
+    /// payloads, pending cleanup, SQL/WAL and scratch keep independent budgets.
+    pub fn configure_published_revision_quotas(
+        &mut self,
+        quotas: mb_store::CatalogPublishedRevisionQuotas,
+    ) -> Result<mb_store::CatalogPublishedRevisionQuotaUsage> {
+        let new_policy = self
+            .control
+            .catalog_published_revision_quota_usage(
+                mb_store::CatalogPublishedRevisionQuotaScope::Global,
+            )?
+            .is_none();
+        let result = (|| {
+            let mut usage = self
+                .control
+                .begin_catalog_published_revision_quota_adoption(quotas)?;
+            while usage.state == mb_store::CatalogPublishedRevisionQuotaState::Adopting {
+                usage = self
+                    .control
+                    .resume_catalog_published_revision_quota_adoption()?;
+            }
+            Ok(usage)
+        })();
+        if result.is_err() && new_policy {
+            while self
+                .control
+                .abort_catalog_published_revision_quota_adoption()?
+            {}
+        }
+        result
     }
 
     pub fn keys(&self) -> &KeyMaterial {
@@ -15304,6 +15350,83 @@ pub(crate) mod tests {
         )]
     }
 
+    fn published_revision_test_quotas() -> mb_store::CatalogPublishedRevisionQuotas {
+        let quota = mb_store::CatalogPublishedRevisionQuota {
+            revisions: 100,
+            work: mb_core::CatalogCodingTraversalBudget {
+                bytes: 4 * 1024 * 1024 * 1024,
+                page_occurrences: 1_000_000,
+                records: 10_000_000,
+            },
+        };
+        mb_store::CatalogPublishedRevisionQuotas {
+            global: quota,
+            dataset: quota,
+            guild: quota,
+        }
+    }
+
+    #[test]
+    fn node_startup_resumes_published_revision_adoption_and_abort_before_reconciliation() {
+        for abort in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state");
+            let seed = Seed::from_bytes([184; 32]);
+            let node = Node::open(&path, seed.clone()).unwrap();
+            node.control
+                .begin_catalog_published_revision_quota_adoption(published_revision_test_quotas())
+                .unwrap();
+            if abort {
+                assert!(
+                    node.control
+                        .abort_catalog_published_revision_quota_adoption()
+                        .unwrap()
+                );
+            }
+            drop(node);
+            let mut node = Node::open(&path, seed).unwrap();
+            let usage = node
+                .control
+                .catalog_published_revision_quota_usage(
+                    mb_store::CatalogPublishedRevisionQuotaScope::Global,
+                )
+                .unwrap();
+            if abort {
+                assert!(usage.is_none());
+            } else {
+                assert_eq!(
+                    usage.unwrap().state,
+                    mb_store::CatalogPublishedRevisionQuotaState::Active
+                );
+            }
+            node.configure_failure_domain("quota-test").unwrap();
+            node.create_guild(record_quota_test_endpoints(&node))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn refused_new_published_revision_policy_leaves_normal_node_writes_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path().join("state"), Seed::from_bytes([185; 32])).unwrap();
+        let mut quotas = published_revision_test_quotas();
+        quotas.dataset.work.records = u64::MAX;
+        assert!(node.configure_published_revision_quotas(quotas).is_err());
+        assert!(
+            node.control
+                .catalog_published_revision_quota_usage(
+                    mb_store::CatalogPublishedRevisionQuotaScope::Global
+                )
+                .unwrap()
+                .is_none()
+        );
+        node.configure_published_revision_quotas(published_revision_test_quotas())
+            .unwrap();
+        node.configure_failure_domain("quota-test").unwrap();
+        node.create_guild(record_quota_test_endpoints(&node))
+            .unwrap();
+    }
+
     #[test]
     fn normal_node_writes_consume_declared_control_record_quota_and_reopen() {
         let temp = tempfile::tempdir().unwrap();
@@ -18376,10 +18499,14 @@ pub(crate) mod tests {
             node.control
                 .configure_catalog_scoped_storage_quotas(page_quota, page_quota)
                 .unwrap();
+            node.configure_published_revision_quotas(published_revision_test_quotas())
+                .unwrap();
         }
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, operation)
             .unwrap();
         if !quotas_before_migration {
+            node.configure_published_revision_quotas(published_revision_test_quotas())
+                .unwrap();
             node.control
                 .configure_catalog_scoped_storage_quotas(page_quota, page_quota)
                 .unwrap();
@@ -18452,6 +18579,27 @@ pub(crate) mod tests {
         let shared_operation = Uuid::new_v4();
         node.migrate_retained_revision_catalog(guild, legacy.value.revision_id, shared_operation)
             .unwrap();
+        let revision_usage = node
+            .control
+            .catalog_published_revision_quota_usage(
+                mb_store::CatalogPublishedRevisionQuotaScope::Global,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision_usage.used.revisions, 2);
+        for scope in [
+            mb_store::CatalogPublishedRevisionQuotaScope::Dataset(retained_scope),
+            mb_store::CatalogPublishedRevisionQuotaScope::Guild(guild),
+        ] {
+            assert_eq!(
+                node.control
+                    .catalog_published_revision_quota_usage(scope)
+                    .unwrap()
+                    .unwrap()
+                    .used,
+                revision_usage.used
+            );
+        }
         assert_eq!(
             node.control.catalog_storage_usage().unwrap(),
             Some(page_usage)

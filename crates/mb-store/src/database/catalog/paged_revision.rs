@@ -10,7 +10,7 @@ use super::*;
 
 const REVISION: &str = "paged-user-revision-v1";
 const BOOTSTRAP: &str = "paged-revision-bootstrap-v1";
-const PUBLICATION: &str = "catalog-paged-publication-v1";
+pub(super) const PUBLICATION: &str = "catalog-paged-publication-v1";
 
 fn bootstrap_pins(id: [u8; 32]) -> String {
     format!("catalog-paged-bootstrap-owner-v1/{}", hex::encode(id))
@@ -206,7 +206,9 @@ pub struct PagedCatalogSnapshot {
     pub bootstrap: Option<Vec<u8>>,
 }
 
-fn revision(bundle: &CatalogBundle) -> Result<SignedRecord<PagedUserRevision>, CatalogStoreError> {
+pub(super) fn revision(
+    bundle: &CatalogBundle,
+) -> Result<SignedRecord<PagedUserRevision>, CatalogStoreError> {
     bundle.validate()?;
     let signed = PagedUserRevision::decode_signed(&bundle.descriptor)?;
     let sections = [
@@ -345,6 +347,7 @@ pub(super) fn snapshot(
             None
         }
     };
+    revision_quota::validate_publication(connection, &bundle, state)?;
     Ok(Some(PagedCatalogSnapshot {
         bundle,
         state,
@@ -373,6 +376,7 @@ impl ControlStore {
         if !matches_manifest(bundle, manifest, &signed) {
             return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
         }
+        let quota_guard = revision_quota::publish(&transaction, bundle)?;
         check(&CatalogPublicationView {
             connection: &transaction,
             manifest,
@@ -405,6 +409,7 @@ impl ControlStore {
             bundle.id.as_bytes(),
             &marker(&signed)?,
         )?;
+        quota_guard.recheck(&transaction)?;
         transaction.commit().map_err(CatalogStoreError::from)?;
         Ok(())
     }
@@ -580,6 +585,7 @@ impl ControlStore {
             return Ok(());
         }
         let signed = revision(&current.bundle)?;
+        let quota_guard = revision_quota::cancel(&transaction, &current.bundle)?;
         native_validation::cancel_linked_publication(&transaction, id)?;
         bundle::cancel_bundle(&transaction, id)?;
         retained_source_quota::close(&transaction, id, current.bundle.scope, true)?;
@@ -610,6 +616,7 @@ impl ControlStore {
             return Err(DatabaseError::Conflict.into());
         }
         paged_checkpoint_revision::require_unretained(&transaction, id)?;
+        quota_guard.recheck(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -802,7 +809,7 @@ pub(super) mod tests {
         (bundle, bootstrap)
     }
 
-    fn publish(
+    pub(crate) fn publish(
         store: &ControlStore,
         bundle: &CatalogBundle,
         bootstrap: &[u8],
@@ -814,8 +821,12 @@ pub(super) mod tests {
             public_key: signed.value.writer_public_key,
         };
         store.publish_paged_revision_catalog_checked(bundle, bootstrap, |view| {
-            let mut reader =
-                PagedRevisionSourceReader::new(&signed, [73; 32], keys().node_id(), &fence)?;
+            let mut reader = PagedRevisionSourceReader::new(
+                &signed,
+                signed.value.guild_id,
+                signed.value.owner,
+                &fence,
+            )?;
             while let Some(record) = reader
                 .next_sector(&mut |page| view.catalog_page(CatalogSection::SectorReferences, page))
                 .map_err(|error| match error {
@@ -839,8 +850,8 @@ pub(super) mod tests {
                     .next_leaf(&mut |page| -> Result<Vec<u8>, CatalogStoreError> {
                         let encoded = view.catalog_page(member.intent.section, page)?;
                         let (sector, ciphertext) = page.seal_private_page(
-                            &keys().guild_content_id_key(&[73; 32]),
-                            &keys().guild_data_key(&[73; 32]),
+                            &keys().guild_content_id_key(&signed.value.guild_id),
+                            &keys().guild_data_key(&signed.value.guild_id),
                             bundle.scope,
                             member.intent.section,
                             &encoded,
