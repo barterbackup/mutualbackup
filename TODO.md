@@ -2553,6 +2553,24 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Produce private paged native roots directly from immutable anchors.
+      Admit namespace/recipe geometry and conservative byte/page/framing-record
+      construction work before source I/O/callbacks. Stream at most 128 sector
+      references per fragment with scoped ciphertext commitments and stable
+      source offsets; preserve sparse holes, hard links, attributes and EOF.
+      Recheck the original enrolled capacity contract after the last callback.
+      Five ordinary regressions and a provisioned capture/paged publication/
+      reopen/restore fixture pass without any flat revision/head. The fixture
+      exercises scoped page/data, revision, SQL record/page/journal and shared
+      capacity policies plus data/page sink refusal; its sparse 1 TiB file does
+      not qualify dense capacity. Frozen full qualification passes 1,452 tests,
+      format, strict Clippy, four builds and 348-input/23-executable audits;
+      121 other ignored cases remain unexecuted. Retirement reclaims
+      10.46 GiB; target uses 47.44 GiB with original preservation audited.
+      Complete producer ownership/preflight, ordinary backup switching, Git,
+      physical/distributed activation, retention/seed recovery and R5/R7 remain
+      open; normal producers stay disabled and hardware gates stay deferred.
+      See ADR 0002 and `/tmp/mb-m6-native-producer-yt6u5_c5`.
     - [x] Compose retained catalog/source capacity through checkpoint custody.
       Derive one local contract across unique retained data, private page and
       bootstrap sources, original legacy bodies/source occurrences, repeated

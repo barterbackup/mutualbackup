@@ -352,6 +352,67 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Direct native-anchor paged construction
+
+Native captures can now produce typed private namespace/recipe roots directly
+through `PagedPrivateMetadata::write_native_anchor_catalog`. No flat private
+metadata, `UserRevision` or dataset-sized sector-reference vector is required.
+The encoder consumes the current immutable native anchor manifest domain:
+8,192 namespace entries, 65,536 extents and its existing bounded encoding.
+It does not change the anchor backend's supported path/platform domain.
+
+`NativeCatalogAdmission` checks the whole namespace and recipe geometry before
+source I/O or caller callbacks. It validates ordered namespace/parent joins,
+hard-link attributes and extent identity, sparse ordering/coverage, counts,
+scalar overflow and root attributes. Maximum supported scalar and fragment
+widths reserve represented bytes, dense page layout and the same conservative
+framing-record upper counts used by final publication. The two trees share the
+configured private-work budget. A pure dense 1 TiB recipe derivation covers
+16,777,216 data occurrences without opening payloads or collecting references;
+this is construction arithmetic, not dense backup qualification.
+
+Recipe fragments contain at most 128 references. Each data occurrence yields
+its scoped content address, ciphertext commitment and exact stable anchor
+locator/offset. Holes and hard-link aliases produce no separate data callback;
+all root/file attributes and both authenticated EOFs are retained. The encoder
+uses existing control-aware durable area discovery/hints. Callback errors stop
+construction immediately. The original enrolled capacity contract must match
+at admission and remain unchanged after the last callback.
+
+Occurrence byte/source counts are independent upper bounds. Repeated content
+must be deduplicated by authenticated ID and charged through the retained-source
+ledger; these counts are not unique-data reservations. The enclosing operation
+must own/admit the immutable capture, reserve and durably stage both private
+trees and the signed source tree, seal/retain private pages and bootstrap,
+authenticate/bind stable data, and publish under current certified writer trust.
+Returning private roots alone grants no checkpoint authority or protection.
+
+Five ordinary regressions cover dense recipe arithmetic, holes/aliases/repeated
+content, malformed namespace/extent/link/scalar geometry and metadata exhaustion
+before I/O/callbacks, empty files, ordering, EOF, sink errors and late capacity
+faults. A provisioned Btrfs fixture captures a native tree, encodes it directly,
+seals/joins its private and data sources and publishes under scoped data/page,
+revision, SQL record/page/journal and shared capacity policies. Data/page sink
+failures leave no published owner. After changing working bytes and reopening,
+it restores exact dense bytes, a sparse 1 TiB file and hard-link identity from
+the retained paged catalog. No flat revision or flat head is created. The sparse
+file qualifies sparse restore behavior, not the deferred real dense run.
+
+Normal backup switching, durable complete capture/preflight ownership, Git
+production, enclosing physical admission, distributed checkpoint activation,
+retention/seed-only production recovery and R5/R7 remain open. Normal producers
+remain disabled. Dense 1 TiB and native Windows/macOS qualification remain
+user-deferred.
+
+Frozen full qualification passes 1,452 distinct tests, including 559 ordinary
+Node cases, the bulk writer and all three provisioned native fixtures.
+Formatting, strict locked workspace/all-targets Clippy and four debug builds
+pass. All 348 inputs, 345 code/dependency inputs, 19 inventories and 23
+executables are audited; 121 other ignored cases remain unexecuted. Verified
+retirement reclaims 10.46 GiB; target uses 47.44 GiB. Current executables,
+older archives, 14 auxiliary WIP files and 10 installed roots are preserved.
+Evidence: `/tmp/mb-m6-native-producer-yt6u5_c5`.
+
 ## Shared retained catalog capacity contract
 
 `CatalogCapacityPolicy` is one versioned local contract for retained data and

@@ -8,7 +8,11 @@ mod guarded_metadata;
 mod lab;
 #[cfg(target_os = "linux")]
 mod legacy_export;
+#[cfg(target_os = "linux")]
+mod native_capture;
 mod native_catalog;
+#[cfg(target_os = "linux")]
+pub use native_capture::NativeCatalogAdmission;
 mod network;
 mod node;
 mod paged_data;

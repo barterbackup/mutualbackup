@@ -1522,6 +1522,17 @@ on 346 inputs and 23 executables. Retirement reclaims 11.82 GiB and leaves
 47.44 GiB in target. Full workload/physical admission, existing-catalog
 adoption, normal paged recovery and R5/R7 remain open. See ADR 0002 and `/tmp/mb-m6-dataset-policy-rcjnf3px`.
 
+Native anchors now produce private paged namespace/recipe roots directly,
+with complete construction geometry admission before source I/O/callbacks,
+128-reference fragments, sparse/hard-link joins and original capacity guards.
+Five ordinary regressions and a provisioned native capture/paged publication/
+reopen/restore fixture preserve exact bytes and heads without a flat revision.
+Frozen full qualification passes 1,452 tests on 348 inputs and 23 executables;
+retirement reclaims 10.46 GiB and leaves 47.44 GiB in target.
+Complete producer ownership/preflight, ordinary/Git production, enclosing
+physical/distributed activation, retention/seed recovery and R5/R7 remain open.
+See ADR 0002 and `/tmp/mb-m6-native-producer-yt6u5_c5`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and
