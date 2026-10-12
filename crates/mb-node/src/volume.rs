@@ -450,6 +450,22 @@ pub(crate) struct StorageVolumes {
 }
 
 impl StorageVolumes {
+    pub(crate) fn configure_journal_quota(
+        &mut self,
+        volume_id: Uuid,
+        quota: mb_store::DatabaseJournalQuota,
+    ) -> Result<mb_store::DatabaseJournalQuotaUsage> {
+        let volume = self
+            .volumes
+            .get_mut(&volume_id)
+            .context("unknown parity volume")?;
+        let store = volume
+            .store
+            .as_mut()
+            .context("parity volume is unavailable")?;
+        Ok(store.configure_journal_quota(quota)?)
+    }
+
     pub(crate) fn configure_page_quota(
         &mut self,
         volume_id: Uuid,

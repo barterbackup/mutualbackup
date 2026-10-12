@@ -1501,6 +1501,17 @@ inputs and 23 executables; retirement reclaims 10.65 GiB and leaves
 complete enclosing policy and normal paged recovery remain open. See ADR 0002
 and `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+Control/parity stores now admit explicitly declared durable WAL/rollback-
+journal byte ceilings through native I/O, including inherited bytes and commit-
+time exhaustion. Exact policy/guard readback, cached writers, directory/native
+locks, admitted shell writes and atomic parity BLOB/progress publication are
+qualified. Nine Store and one Node regressions, both native retained/source-
+loss fixtures and the >512 MiB atomic writer pass. Frozen qualification passes
+1,430 distinct tests on 342 inputs and 23 executables; retirement reclaims
+10.65 GiB and leaves 47.44 GiB in target. Complete workload/retention/
+physical reservation, aggregate/copy/scratch policy and normal paged recovery
+remain open. See ADR 0002 and `/tmp/mb-m6-journal-quota-cfu06vgl`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

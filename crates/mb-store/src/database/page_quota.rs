@@ -163,8 +163,8 @@ unsafe extern "C" fn enforce(
     _argv: *mut *mut ffi::sqlite3_value,
 ) {
     let result = std::panic::catch_unwind(|| -> Result<(), DatabaseError> {
-        // SAFETY: the engine invokes this on its owning connection/thread with
-        // its recursive connection mutex held. The wrapper borrows the handle;
+        // SAFETY: SQLite invokes this on the connection's owning thread and
+        // supports reentrant local policy reads. The wrapper borrows the handle;
         // dropping it finalizes only our statements and never closes SQLite.
         let connection =
             unsafe { Connection::from_handle(ffi::sqlite3_context_db_handle(context))? };

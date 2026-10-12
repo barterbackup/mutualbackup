@@ -30,6 +30,11 @@ fn streamed_atomic_batch_above_512_mib_preserves_rollback_reopen_and_reader_snap
             max_pages: 256 * 1024,
         })
         .unwrap();
+    writer
+        .configure_journal_quota(DatabaseJournalQuota {
+            max_bytes: 1024 * 1024 * 1024,
+        })
+        .unwrap();
     let quota_before = writer.record_quota_usage().unwrap().unwrap();
     let reader = ControlStore::open_existing_read_only_with_key(&path, &key).unwrap();
     reader.connection.execute_batch("BEGIN").unwrap();

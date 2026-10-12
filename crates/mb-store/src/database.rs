@@ -21,6 +21,8 @@ mod bulk_journal_tests;
 mod catalog;
 #[cfg(target_os = "linux")]
 mod directory;
+mod journal_quota;
+mod journal_vfs;
 mod page_quota;
 #[cfg(target_os = "linux")]
 mod preserved_read;
@@ -78,6 +80,7 @@ pub use catalog::{
 };
 #[cfg(target_os = "linux")]
 pub use directory::{DatabaseDirectory, DatabaseOpenGuard};
+pub use journal_quota::{DatabaseJournalQuota, DatabaseJournalQuotaUsage};
 pub use page_quota::{DatabasePageQuota, DatabasePageQuotaUsage};
 #[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;
@@ -2453,6 +2456,11 @@ impl ParityStore {
         {
             return Err(DatabaseError::Integrity);
         }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        journal_quota::apply(&transaction)?;
         let row = self
             .connection
             .query_row(
@@ -2489,6 +2497,8 @@ impl ParityStore {
             if stored != bytes {
                 return Err(DatabaseError::Conflict);
             }
+            drop(blob);
+            transaction.commit()?;
             return Ok(written);
         }
         if offset != written {
@@ -2498,11 +2508,23 @@ impl ParityStore {
         blob.write_all(bytes)?;
         drop(blob);
         let next = u32::try_from(end).map_err(|_| DatabaseError::Integrity)?;
-        self.connection.execute(
+        if self.connection.execute(
             "UPDATE coding_reservations SET written_until = ?1
              WHERE attempt_id = ?2 AND shard_index = ?3 AND written_until = ?4",
             params![next, attempt_id.as_slice(), shard_index, written],
+        )? != 1
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        let actual: u32 = self.connection.query_row(
+            "SELECT written_until FROM coding_reservations WHERE attempt_id=?1 AND shard_index=?2",
+            params![attempt_id.as_slice(), shard_index],
+            |row| row.get(0),
         )?;
+        if actual != next {
+            return Err(DatabaseError::Integrity);
+        }
+        transaction.commit()?;
         Ok(next)
     }
 
@@ -4408,6 +4430,7 @@ fn require_exact_tables(
 ) -> Result<(), DatabaseError> {
     let mut quota_objects = record_quota::schema(connection)?;
     quota_objects.extend(page_quota::schema(connection)?);
+    quota_objects.extend(journal_quota::schema(connection)?);
     let expected = expected
         .iter()
         .copied()
@@ -4450,7 +4473,8 @@ fn require_exact_tables(
         }
     }
     record_quota::validate(connection)?;
-    page_quota::apply(connection)
+    page_quota::apply(connection)?;
+    journal_quota::apply(connection)
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
@@ -4575,12 +4599,12 @@ fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseErr
         fs::create_dir_all(parent)?;
         set_private_directory(parent)?;
     }
-    let connection = Connection::open(path)?;
+    let connection = journal_vfs::connect(path, OpenFlags::default())?;
     configure_encrypted(connection, key)
 }
 
 fn open_encrypted_existing(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseError> {
-    let connection = Connection::open_with_flags(
+    let connection = journal_vfs::connect(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
@@ -4629,6 +4653,8 @@ fn configure_encrypted_connection(
     connection.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
     page_quota::register(&connection)?;
     page_quota::apply(&connection)?;
+    journal_quota::register(&connection)?;
+    journal_quota::apply(&connection)?;
     if !read_only {
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -4665,19 +4691,88 @@ fn wal_checkpoint_reservation_bytes(path: &Path) -> Result<u64, DatabaseError> {
     }
 }
 
+unsafe extern "C" fn shell_control_statement(
+    data: *mut std::ffi::c_void,
+    action: i32,
+    _: *const std::ffi::c_char,
+    _: *const std::ffi::c_char,
+    _: *const std::ffi::c_char,
+    _: *const std::ffi::c_char,
+) -> i32 {
+    if matches!(
+        action,
+        rusqlite::ffi::SQLITE_TRANSACTION
+            | rusqlite::ffi::SQLITE_SAVEPOINT
+            | rusqlite::ffi::SQLITE_PRAGMA
+    ) {
+        // This synchronous detector changes no authorization decisions. Its
+        // stack value is removed before the prepared statement is stepped.
+        unsafe {
+            *data.cast::<bool>() = true;
+        }
+    }
+    rusqlite::ffi::SQLITE_OK
+}
+
 fn database_shell_statement(
     connection: &Connection,
     sql: &str,
     query_only: bool,
 ) -> Result<DatabaseShellResult, DatabaseError> {
     page_quota::apply(connection)?;
+    journal_quota::apply(connection)?;
     if query_only {
         connection.pragma_update(None, "query_only", true)?;
     }
-    let mut statement = connection.prepare(sql)?;
+    let configured = journal_quota::configured(connection)?;
+    let mut control_statement = false;
+    let mut statement = if configured {
+        // This private connection has no application authorizer. Let SQLite
+        // identify transaction/pragma statements rather than parsing SQL text.
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_set_authorizer(
+                connection.handle(),
+                Some(shell_control_statement),
+                (&mut control_statement as *mut bool).cast(),
+            )
+        };
+        if code != rusqlite::ffi::SQLITE_OK {
+            return Err(DatabaseError::Integrity);
+        }
+        let prepared = connection.prepare(sql);
+        let reset = unsafe {
+            rusqlite::ffi::sqlite3_set_authorizer(connection.handle(), None, std::ptr::null_mut())
+        };
+        if reset != rusqlite::ffi::SQLITE_OK {
+            return Err(DatabaseError::Integrity);
+        }
+        prepared?
+    } else {
+        connection.prepare(sql)?
+    };
+    let transaction = if configured
+        && !statement.readonly()
+        && !control_statement
+        && connection.is_autocommit()
+    {
+        Some(rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    } else {
+        None
+    };
+    // Existing deferred transactions obtain a policy snapshot here; a later
+    // concurrent policy commit prevents stale promotion to the SQLite writer.
+    journal_quota::apply(connection)?;
+    page_quota::apply(connection)?;
     let column_count = statement.column_count();
     if column_count == 0 {
         let affected_rows = statement.execute([])?;
+        drop(statement);
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         return Ok(DatabaseShellResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -4704,6 +4799,11 @@ fn database_shell_statement(
             values.push(value);
         }
         rows.push(values);
+    }
+    drop(query);
+    drop(statement);
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
     }
     Ok(DatabaseShellResult {
         columns,

@@ -352,6 +352,75 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Explicit durable journal admission
+
+`DatabaseJournalQuota` explicitly limits each durable WAL/rollback-journal
+file's byte extent. It includes inherited file bytes, metadata/schema/index
+frames and repeated update work; its budget is independent of live row count,
+logical main-database pages and memory. The caller must declare enough bytes
+for the intended complete transaction. Existing unconfigured stores retain
+native journal behavior. The local policy leaves signed records and IDs intact.
+
+A native VFS adapter shares the admitted limit between the main file and its
+actual journal objects through [SQLite's journal-to-database interface](https://www.sqlite.org/c3ref/database_file_object.html).
+It checks offset/length arithmetic before native writes and extension through
+truncation, returning FULL before an over-budget operation. With an active
+limit it disables native chunk rounding and ignores optional journal size
+hints, preventing preallocation from exceeding admitted writes. It delegates
+native read/sync/lock/SHM/map/file-control behavior and retains the directory
+capability and HAS_MOVED checks. Main-file, scratch and other temporary file
+allocation need their own admission. [SQLite's journal file control](https://www.sqlite.org/c3ref/c_fcntl_begin_atomic_write.html)
+reads the actual current/inherited file size without pathname reconstruction;
+an allocated but unopened/closed journal handle has no I/O table and counts
+zero. The adapter guards that state before dereferencing methods.
+
+Two version-one singleton policy/guard rows bind the exact database kind,
+4 KiB cipher geometry and byte ceiling. Bounded schema/header/row checks
+precede policy decoding. Configuration/resize holds an IMMEDIATE writer,
+refuses limits below the current journal extent, and commits exact paired
+readback. A refused or ignored/reverted change rolls back its rows and restores
+the prior native limit. Persistent BEFORE triggers apply current limits for
+existing/cached writers. Startup applies the policy before journal setup and
+reconciliation; read-only inspection preserves inherited committed bytes.
+The configured database shell admits ordinary schema/index writes under its
+writer, using SQLite's parser to preserve transaction/pragma commands.
+
+Parity upload ranges now hold one IMMEDIATE writer through the original
+reservation lookup, current journal admission, BLOB bytes and exact progress
+cursor CAS/readback. Ignored cursor writes or late journal exhaustion roll back
+the bytes and cursor together. Exact replay and original attempt/shard identity
+remain mandatory. A held reader sees the original committed snapshot; a failed
+stream or commit leaves no completed prefix or changed logical quota counter.
+
+Node exposes independent control/volume journal configuration. Nine Store
+regressions cover cached/streamed and commit-time exhaustion, inherited WAL
+refusal/reopen, policy faults/corruption, inactive handles, rejected native
+write/truncate/hint growth, renamed directory identity, shell commands and
+atomic parity BLOB/cursor rollback. A Node regression covers refused policy,
+normal guild state and configuration/reopen. Both real native retained/source-
+loss fixtures declare 4 GiB journal ceilings alongside other independent
+quotas. The 8,193 x 64 KiB atomic writer declares 1 GiB and preserves its
+>512 MiB committed inherited WAL, late-producer rollback and held snapshot.
+
+This is an explicit per-file journal ceiling. It does not derive the complete
+single-owner 1 TiB/history workload budget or reserve physical blocks before
+allocation, including filesystem rounding/metadata, CoW snapshots, aggregate
+main/checkpoint tails, simultaneous journals, VACUUM/rekey copies, scratch or
+other writers. Full section/dataset/guild/transaction/retention admission,
+distributed availability/activation, normal paged capture/retention/seed recovery
+and R5/R7 remain open. Normal paged producers remain disabled. Dense 1 TiB and
+native Windows/macOS qualification stay user-deferred.
+
+Frozen qualification passes 1,430 distinct tests: 204 Core, 432 ordinary
+Store, 117 Git, 552 Node, the explicit >512 MiB atomic writer and both
+provisioned Btrfs recovery fixtures, plus the remaining targets. Formatting,
+strict locked workspace/all-targets Clippy, compilation and four debug builds
+pass. All 342 inputs, 339 code/dependency inputs, 19 inventories and 23 exact
+executables are audited; 121 other ignored cases remain unexecuted. Exact
+obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
+Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
+installed roots are preserved. Evidence: `/tmp/mb-m6-journal-quota-cfu06vgl`.
+
 ## Implementation and qualification order
 
 1. Add the bounded tree codec, streaming builder and authenticated traversal.

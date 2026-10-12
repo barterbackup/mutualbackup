@@ -402,7 +402,10 @@ fn register() -> Result<(), DatabaseError> {
             if code != ffi::SQLITE_OK {
                 return code;
             }
-            let parent = ffi::sqlite3_vfs_find(c"unix".as_ptr());
+            let parent = match super::journal_vfs::register() {
+                Ok(parent) => parent,
+                Err(_) => return ffi::SQLITE_CANTOPEN,
+            };
             if parent.is_null() || (*parent).iVersion < 3 {
                 return ffi::SQLITE_NOTFOUND;
             }

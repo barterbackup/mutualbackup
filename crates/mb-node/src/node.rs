@@ -1452,6 +1452,23 @@ impl Node {
         &self.data_dir
     }
 
+    /// Admit the complete durable WAL/rollback-journal byte extent separately
+    /// from main database pages, memory, scratch and filesystem reservations.
+    pub fn configure_control_journal_quota(
+        &mut self,
+        quota: mb_store::DatabaseJournalQuota,
+    ) -> Result<mb_store::DatabaseJournalQuotaUsage> {
+        Ok(self.control.configure_journal_quota(quota)?)
+    }
+
+    pub fn configure_volume_journal_quota(
+        &mut self,
+        volume_id: Uuid,
+        quota: mb_store::DatabaseJournalQuota,
+    ) -> Result<mb_store::DatabaseJournalQuotaUsage> {
+        self.volumes.configure_journal_quota(volume_id, quota)
+    }
+
     /// Bound all control database pages, including schema/index and free pages.
     /// WAL, scratch and filesystem reservations need their own admission.
     pub fn configure_control_page_quota(
@@ -15483,6 +15500,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn node_journal_quotas_survive_reopen_and_refused_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([187; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert!(
+            node.configure_control_journal_quota(mb_store::DatabaseJournalQuota { max_bytes: 32 })
+                .is_err()
+        );
+        assert!(node.control.journal_quota_usage().unwrap().is_none());
+        let quota = mb_store::DatabaseJournalQuota {
+            max_bytes: 4 * 1024 * 1024,
+        };
+        node.configure_control_journal_quota(quota).unwrap();
+        let volume_id = node.volumes.reader_configs()[0].volume_id;
+        node.configure_volume_journal_quota(volume_id, quota)
+            .unwrap();
+        node.configure_failure_domain("journal-quota").unwrap();
+        let guild = node
+            .create_guild(record_quota_test_endpoints(&node))
+            .unwrap();
+        drop(node);
+        let mut node = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            node.control.journal_quota_usage().unwrap().unwrap().quota,
+            quota
+        );
+        assert_eq!(
+            node.guild_summary().unwrap().unwrap().guild_id,
+            guild.guild_id
+        );
+        node.configure_volume_journal_quota(volume_id, quota)
+            .unwrap();
+    }
+
+    #[test]
     fn normal_node_writes_consume_declared_control_record_quota_and_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state");
@@ -18468,6 +18520,10 @@ pub(crate) mod tests {
             max_pages: 1024 * 1024,
         };
         node.configure_control_page_quota(page_quota).unwrap();
+        let journal_quota = mb_store::DatabaseJournalQuota {
+            max_bytes: 4 * 1024 * 1024 * 1024,
+        };
+        node.configure_control_journal_quota(journal_quota).unwrap();
         let volume_ids = node
             .volumes
             .reader_configs()
@@ -18478,6 +18534,8 @@ pub(crate) mod tests {
             node.configure_volume_record_quota(volume_id, record_quota)
                 .unwrap();
             node.configure_volume_page_quota(volume_id, page_quota)
+                .unwrap();
+            node.configure_volume_journal_quota(volume_id, journal_quota)
                 .unwrap();
         }
         let certified = install_public_restore_fixture(&mut node, &seed);

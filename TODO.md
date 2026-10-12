@@ -2553,6 +2553,30 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Enforce explicit durable WAL/rollback-journal byte admission.
+      Persist bounded paired local policies and apply the current ceiling to
+      native main/journal file objects before writes and extension/truncation,
+      preserving native locks/SHM/directory identity and inherited committed
+      WALs. Disable rounded journal preallocation under an active limit.
+      Refused install/resize and ignored/reverted rows restore prior state.
+      Cached writers and admitted shell schema writes use the current policy;
+      explicit transaction/pragma commands keep their behavior. Publish parity
+      BLOB ranges and exact progress cursor CAS/readback atomically, including
+      late exhaustion and suppressed cursor rollback. Node exposes control/
+      volume configuration. Nine Store and one Node regressions pass; both
+      native retained/source-loss fixtures declare journal ceilings and the
+      large atomic writer preserves >512 MiB inherited WAL under a 1 GiB
+      budget. Frozen qualification passes 1,430 distinct tests, format, strict
+      locked Clippy, compilation and four debug builds; 342 inputs, 339 code/
+      dependency inputs, 19 inventories and 23 executables are audited. The
+      121 other ignored cases remain unexecuted. Retirement reclaims
+      10.65 GiB; target uses 47.44 GiB with current/older artifacts,
+      auxiliary WIP and installed roots preserved. This per-file ceiling does
+      not derive full workload/history policy or reserve physical blocks,
+      filesystem/CoW/aggregate/copy/scratch/other-writer headroom. Complete
+      single-owner policy, normal paged recovery and R5/R7 remain open, as do
+      the parent R3 and user-deferred hardware gates. See ADR 0002.
+      Evidence: `/tmp/mb-m6-journal-quota-cfu06vgl`.
     - [x] Enforce persistent logical SQL database-page ceilings.
       Declare a separate 4 KiB page-count policy for control/parity stores,
       covering schema/index, live and freelist pages. Persist paired exact
