@@ -57,6 +57,12 @@ pub(super) trait Body {
     fn authority(&self) -> CatalogCheckpointAuthorityValidation;
     fn store(&self) -> &RecordScratchStore;
     fn budget(&self) -> CatalogCodingTraversalBudget;
+    fn source_count(&self) -> u64;
+    fn authority_work(&self) -> CatalogCodingTraversalBudget;
+    fn next_revision(
+        &self,
+        after: Option<mb_core::CatalogCheckpointRevisionKey>,
+    ) -> Result<Option<mb_core::CatalogCheckpointAuthorityRecord>, CatalogStoreError>;
     fn group(
         &self,
         after: Option<[u8; 32]>,
@@ -75,6 +81,18 @@ macro_rules! rows {
         }
         fn budget(&self) -> CatalogCodingTraversalBudget {
             self.index().budget()
+        }
+        fn source_count(&self) -> u64 {
+            self.source_count()
+        }
+        fn authority_work(&self) -> CatalogCodingTraversalBudget {
+            self.index().manifest().prior_work
+        }
+        fn next_revision(
+            &self,
+            after: Option<mb_core::CatalogCheckpointRevisionKey>,
+        ) -> Result<Option<mb_core::CatalogCheckpointAuthorityRecord>, CatalogStoreError> {
+            self.next_revision(after)
         }
         fn group(
             &self,

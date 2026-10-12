@@ -1,5 +1,5 @@
-//! Source authority for a packing proposal based on an already trusted legacy
-//! certificate. This is a migration bridge, not a paged checkpoint certificate
+//! Source authority for a packing proposal based on an independently trusted
+//! legacy or paged certificate. This is not a paged checkpoint certificate
 //! or revision activation: private joins, retention policy, coding receipts and
 //! publication against the unchanged certified base and current guild-event
 //! membership/writer fences remain separate gates.
@@ -19,6 +19,7 @@ use super::*;
 use crate::RecordScratchStore;
 
 mod directories;
+mod paged_base;
 mod producer;
 pub use directories::{
     CatalogCertifiedCodingDirectoriesIndex, CatalogCertifiedPackingDirectoryIndex,
@@ -36,7 +37,8 @@ const CANDIDATES: &str = "packing-authority-candidate";
 pub(super) const BINDINGS: &str = "packing-authority-binding";
 pub(super) const ATTESTATIONS: &str = "packing-authority-attestation";
 pub(super) const TALLIES: &str = "packing-authority-tally";
-pub(super) const KINDS: [&str; 9] = [
+pub(super) const TOMBSTONES: &str = "packing-authority-tombstone";
+pub(super) const KINDS: [&str; 10] = [
     MEMBERS,
     FENCES,
     HEADS,
@@ -46,6 +48,7 @@ pub(super) const KINDS: [&str; 9] = [
     BINDINGS,
     ATTESTATIONS,
     TALLIES,
+    TOMBSTONES,
 ];
 
 /// The expected hash is supplied by the caller's established checkpoint trust
@@ -232,6 +235,9 @@ pub struct CatalogPackingAuthority {
     // One record per bounded signed envelope/evidence object, plus every
     // framed paged-source occurrence (including repeated referenced trees).
     records: u64,
+    // Paged bases may span many source trees; their independently supplied
+    // enclosing credits replace the old single-forest authority ceiling.
+    limit: Option<CatalogCodingTraversalBudget>,
 }
 
 impl CatalogPackingAuthority {
@@ -274,6 +280,7 @@ impl CatalogPackingAuthority {
             bytes: legacy_bytes,
             pages: 0,
             records: 1,
+            limit: None,
         };
         job.store
             .with_record_transaction(|| -> Result<(), CatalogStoreError> {
@@ -297,6 +304,22 @@ impl CatalogPackingAuthority {
                     } else {
                         insert(&job.store, FENCES, &fence.owner.0, fence, ROW_BYTES)?;
                     }
+                }
+                for tombstone in &checkpoint.revision_tombstones {
+                    insert(
+                        &job.store,
+                        TOMBSTONES,
+                        &chain(tombstone.owner, tombstone.protected_root_id),
+                        tombstone,
+                        ROW_BYTES,
+                    )?;
+                    insert(
+                        &job.store,
+                        IDS,
+                        tombstone.last_revision_id.as_bytes(),
+                        &true,
+                        ROW_BYTES,
+                    )?;
                 }
                 for revision in &checkpoint.revisions {
                     let body = &revision.value;
@@ -406,8 +429,27 @@ impl CatalogPackingAuthority {
     }
 
     fn check_budget(&self, extra_bytes: u64, extra_pages: u64) -> Result<(), CatalogStoreError> {
+        if self.authenticated > self.sources {
+            return Err(CatalogError::Bounds.into());
+        }
+        if let Some(limit) = self.limit {
+            limit.remaining_after(CatalogCodingTraversalBudget {
+                bytes: self
+                    .bytes
+                    .checked_add(extra_bytes)
+                    .ok_or(CatalogError::Bounds)?,
+                page_occurrences: self
+                    .pages
+                    .checked_add(extra_pages)
+                    .ok_or(CatalogError::Bounds)?,
+                records: self.records,
+            })?;
+            if self.sources > limit.records {
+                return Err(CatalogError::Bounds.into());
+            }
+            return Ok(());
+        }
         if self.sources > CATALOG_MAX_RECORDS
-            || self.authenticated > self.sources
             || self
                 .bytes
                 .checked_add(extra_bytes)
@@ -448,7 +490,13 @@ impl CatalogPackingAuthority {
                 if head.sequence.checked_add(1) == Some(body.sequence)
                     && body.parent == Some(head.hash)
                     && body.writer_epoch >= head.writer_epoch => {}
-            None if body.sequence == 1 && body.parent.is_none() => {}
+            None => match read::<mb_core::RevisionTombstone>(&self.store, TOMBSTONES, &key)? {
+                Some((tombstone, _))
+                    if tombstone.through_sequence.checked_add(1) == Some(body.sequence)
+                        && body.parent == Some(tombstone.last_revision_hash) => {}
+                None if body.sequence == 1 && body.parent.is_none() => {}
+                _ => return Err(DatabaseError::Conflict.into()),
+            },
             _ => return Err(DatabaseError::Conflict.into()),
         }
         let bytes = encoded(signed, PAGED_USER_REVISION_BYTES)?;
@@ -460,6 +508,19 @@ impl CatalogPackingAuthority {
             .and_then(|records| records.checked_add(body.sources.records.records))
             .ok_or(CatalogError::Bounds)?;
         self.check_budget(extra_bytes, extra_pages)?;
+        if let Some(limit) = self.limit {
+            limit.remaining_after(CatalogCodingTraversalBudget {
+                bytes: self
+                    .bytes
+                    .checked_add(extra_bytes)
+                    .ok_or(CatalogError::Bounds)?,
+                page_occurrences: self
+                    .pages
+                    .checked_add(extra_pages)
+                    .ok_or(CatalogError::Bounds)?,
+                records,
+            })?;
+        }
         let mut new_sources = 0;
         let mut authenticated_sources = 0;
         self.store
@@ -481,7 +542,11 @@ impl CatalogPackingAuthority {
                         add_source(&self.store, id, record.sector.root, Some(record.commitment))?;
                     new_sources += new;
                     authenticated_sources += authenticated;
-                    if self.sources + new_sources > CATALOG_MAX_RECORDS {
+                    if self.sources + new_sources
+                        > self
+                            .limit
+                            .map_or(CATALOG_MAX_RECORDS, |limit| limit.records)
+                    {
                         return Err(CatalogError::Bounds.into());
                     }
                 }
@@ -545,6 +610,9 @@ impl CatalogPackingAuthority {
         let bytes = encoded(signed, EVIDENCE_BYTES)?;
         let records = self.records.checked_add(1).ok_or(CatalogError::Bounds)?;
         self.check_budget(bytes.len() as u64, 0)?;
+        if self.limit.is_some_and(|limit| records > limit.records) {
+            return Err(CatalogError::Bounds.into());
+        }
         signed.verify(LEGACY_PACKING_BINDING_DOMAIN)?;
         let value = &signed.value;
         if value.format_version != 1 || signed.signer != value.owner {
@@ -577,6 +645,9 @@ impl CatalogPackingAuthority {
         let bytes = encoded(signed, EVIDENCE_BYTES)?;
         let records = self.records.checked_add(1).ok_or(CatalogError::Bounds)?;
         self.check_budget(bytes.len() as u64, 0)?;
+        if self.limit.is_some_and(|limit| records > limit.records) {
+            return Err(CatalogError::Bounds.into());
+        }
         signed.verify(LEGACY_PACKING_ATTESTATION_DOMAIN)?;
         let value = &signed.value;
         if value.format_version != 1
@@ -911,6 +982,7 @@ impl CatalogCertifiedCodingIndex {
 
 #[cfg(test)]
 pub(super) mod tests {
+    mod tombstones;
     use super::*;
     use ed25519_dalek::SigningKey;
     use mb_core::{

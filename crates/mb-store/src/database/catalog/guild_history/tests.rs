@@ -4,6 +4,7 @@ mod paged_checkpoint_custody;
 mod paged_checkpoint_payload;
 mod paged_checkpoint_retention;
 mod paged_checkpoint_revision;
+mod paged_packing_base;
 
 use super::*;
 use mb_core::{

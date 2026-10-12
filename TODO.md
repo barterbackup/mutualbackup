@@ -2553,6 +2553,25 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Import complete paged checkpoint authority for subsequent packing.
+      Support both public layouts from the independently trusted original state
+      hash and exact quorum/body/source EOF/certified-history proof. Debit
+      original authority and certificate work before bounded typed fact reads;
+      use one fresh admitted encrypted index without flattening a checkpoint or
+      source list. Preserve original source addresses/commitments, membership/
+      latest fences, legacy evidence, revision parents, tombstones and globally
+      reserved retired IDs. New candidate rows start empty. Carry enclosing
+      credits across source trees and candidate/evidence admission before I/O.
+      Seven regressions pass, including both layouts feeding the actual paged
+      producer, negative/fault cases, exact legacy continuation and real
+      predecessor pruning with retired-UUID rejection for both paged layouts.
+      Frozen full qualification passes 1,471 tests, format, strict Clippy, four
+      builds and 356-input/23-executable audits; 121 other ignored cases remain
+      unexecuted. Retirement reclaims 9.63 GiB; target uses 47.48 GiB.
+      Durable packing source custody, incremental edits, complete policy/quotas,
+      distributed activation, normal backup/retention/seed recovery, legacy
+      consumers and R5/R7 remain open. Producers stay disabled and hardware gates
+      stay deferred. See ADR 0002 and `/tmp/mb-m6-paged-packing-base-nht7o9z5`.
     - [x] Stream source-authorized fresh packing through a disk allocator.
       Debit original authority and the complete declared packing construction
       before callbacks. Read/authenticate one 64 KiB source at a time; compose

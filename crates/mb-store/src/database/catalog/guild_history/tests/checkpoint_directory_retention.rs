@@ -10,7 +10,7 @@ use mb_core::{CatalogCheckpointAuthorityRecord as R, CatalogPackingDirectoryReco
 type Fixture = super::super::super::checkpoint_validation::tests::Fixture;
 type Root = (CatalogScope, CatalogSection, CatalogPageRef);
 
-fn proof(
+pub(super) fn proof(
     fixture: &mut Fixture,
     history: &History,
     limit: Work,
@@ -18,7 +18,7 @@ fn proof(
     successor(fixture, history, None, limit)
 }
 
-fn successor(
+pub(super) fn successor(
     fixture: &mut Fixture,
     history: &History,
     previous: Option<&CatalogQuorumPagedCheckpointDirectoryIndex>,

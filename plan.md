@@ -1558,6 +1558,19 @@ ownership, incremental edits, full physical/pending-job admission, paged-base
 authority, distributed activation and normal backup/retention/seed recovery
 remain open. See ADR 0002 and `/tmp/mb-m6-packing-producer-6w61ltjm`.
 
+Packing authority now imports both completed paged checkpoint layouts from an
+independently trusted original state hash and full quorum/body/source/history
+proof. Typed bounded facts preserve source commitments, members/latest fences,
+revision parents, tombstones and globally reserved retired IDs; candidate rows
+start empty. Enclosing credits survive across source trees and subsequent
+candidate/evidence admission. Both layouts feed the actual paged packing
+producer; original legacy retirement and real paged predecessor pruning are
+qualified. Frozen full qualification passes 1,471 tests on 356 inputs and 23
+executables. Retirement reclaims 9.63 GiB; target uses 47.48 GiB.
+Durable packing source custody, incremental edits, complete policy/quotas,
+distributed activation, normal backup/retention/seed recovery, legacy consumers
+and R5/R7 remain open. See ADR 0002 and `/tmp/mb-m6-paged-packing-base-nht7o9z5`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

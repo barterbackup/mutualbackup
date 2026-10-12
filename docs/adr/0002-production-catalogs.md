@@ -352,6 +352,65 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Paged checkpoint source authority for subsequent packing
+
+`CatalogPackingAuthority::from_paged_checkpoint` and
+`from_paged_checkpoint_directory` now import both completed public layouts into
+one fresh admitted encrypted scratch store. The independently trusted state
+hash must match the original certificate. Exact quorum/header/body completion,
+all original source/body EOFs and the certified-history transition are required;
+a signed header alone cannot start this route. No flat checkpoint, retained
+revision vector or catalog-wide source list is reconstructed.
+
+Admission debits the original authority work and bounded certificate before
+copying any facts. Every source/evidence/fence/tombstone read bounds key and
+payload allocation, validates canonical typed bytes and checks its original
+identity/geometry. The copied namespaces retain original source addresses and
+commitments, current members/latest fences and legacy migration evidence.
+Original heads and globally reserved IDs are rebuilt from the checked revision
+cursor. Candidate rows start empty; prior packing/coding/proposal indexes stay
+inside the original disposable proof. Import mutation failures discard the
+entire fresh job. Both constructor boundaries recheck the original completed
+proof; enclosing publication still needs the actual current base/event guard.
+
+Paged imports retain independently declared enclosing credits across source
+trees instead of applying the old single-forest 16 GiB/one-million-page ceiling.
+Subsequent candidate and evidence admission debit all dimensions before source
+fetch or mutation. Each referenced tree keeps its existing codec limits, and
+physical scratch admission remains mandatory in the supplied store. This
+transfer does not complete aggregate physical/pending-job/SQL admission.
+
+Legacy source-authority imports now preserve tombstones and reserve each
+original retired revision UUID. Retired roots cannot restart at sequence one;
+the retained successor chain, exact parent and current writer remain required.
+Paged imports also preserve tombstone provenance and IDs when an original
+legacy revision is pruned behind a retained paged successor.
+
+Seven regressions cover both layouts feeding the actual paged packing producer,
+original source/commitment equality, correct successor and candidate EOF, wrong
+trusted identity, independent byte/page/record exhaustion, occupied destination,
+changed parent/writer/global ID, damaged original facts, ignored imports, exact
+legacy retirement/continuation and real predecessor pruning for both paged
+layouts with rejection of the retired UUID. The initial retired-root fixture
+was rejected because legacy checkpoints require a retained successor; the
+corrected fixture preserves that original invariant. Failed build/fixture logs
+remain in the evidence directory.
+
+Durable pending packing source/private/bootstrap/anchor custody, incremental
+packing edits, full admission and quotas, distributed checkpoint availability
+and atomic activation, normal backup/retention/seed-only recovery, remaining
+legacy consumers and R5/R7 remain open. Normal paged producers stay disabled.
+Dense real 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+Frozen full qualification passes 1,471 distinct tests, including 457 ordinary
+Store, 560 ordinary Node, the bulk writer and all four provisioned native
+fixtures. Formatting, strict locked workspace/all-targets Clippy and four debug
+builds pass. Audits verify 356 inputs, 353 unchanged code/dependency inputs, 23
+exact executables and 19 drivers; 121 other ignored cases remain unexecuted.
+Retirement reclaims 9.63 GiB and leaves 47.48 GiB in target, preserving
+current executables, older archives, 14 auxiliary WIP files and 10 installed
+roots. Evidence: `/tmp/mb-m6-paged-packing-base-nht7o9z5`.
+
 ## Bounded fresh source-authorized packing
 
 `CatalogPackingAuthority::produce_packing_directory` constructs fresh sharded

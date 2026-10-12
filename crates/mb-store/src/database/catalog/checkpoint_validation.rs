@@ -842,6 +842,11 @@ pub struct CatalogCheckpointCodingDirectoryIndex<I = CatalogPackingCodingDirecto
     source_count: u64,
     index: I,
 }
+impl<I> CatalogCheckpointCodingDirectoryIndex<I> {
+    pub(super) fn source_count(&self) -> u64 {
+        self.source_count
+    }
+}
 impl CatalogCheckpointCodingDirectoryIndex {
     /// Read one exact revision from the completed, authenticated authority join.
     /// No retained-history scan or caller-supplied membership assertion is used.
