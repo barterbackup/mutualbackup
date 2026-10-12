@@ -1490,6 +1490,17 @@ GiB in target. These are published exposure limits; complete structural,
 pending capture/checkpoint/replay/SQL/WAL/scratch/physical policy and normal
 paged recovery remain open. See ADR 0002 and `/tmp/mb-m6-published-revision-quota-j49ro9os`.
 
+Control/parity stores now support persistent logical SQL database-page limits,
+including schema/index and freelist pages. Existing/cached writers refresh the
+pager cap under their data triggers; exact policy/guard and bounded schema
+checks preserve atomic refusal/rollback. Node control/volume configuration,
+read-only/reopen, both native retained/source-loss fixtures and the large atomic
+writer are qualified. Frozen qualification passes 1,420 distinct tests on 339
+inputs and 23 executables; retirement reclaims 10.65 GiB and leaves
+47.44 GiB in target. WAL/checkpoint tails, scratch, physical reservation,
+complete enclosing policy and normal paged recovery remain open. See ADR 0002
+and `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

@@ -21,6 +21,7 @@ mod bulk_journal_tests;
 mod catalog;
 #[cfg(target_os = "linux")]
 mod directory;
+mod page_quota;
 #[cfg(target_os = "linux")]
 mod preserved_read;
 mod read_snapshot;
@@ -77,6 +78,7 @@ pub use catalog::{
 };
 #[cfg(target_os = "linux")]
 pub use directory::{DatabaseDirectory, DatabaseOpenGuard};
+pub use page_quota::{DatabasePageQuota, DatabasePageQuotaUsage};
 #[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;
 pub use record_quota::{DatabaseRecordQuota, DatabaseRecordQuotaState, DatabaseRecordQuotaUsage};
@@ -4404,7 +4406,8 @@ fn require_exact_tables(
     connection: &Connection,
     expected: &[(&str, &str)],
 ) -> Result<(), DatabaseError> {
-    let quota_objects = record_quota::schema(connection)?;
+    let mut quota_objects = record_quota::schema(connection)?;
+    quota_objects.extend(page_quota::schema(connection)?);
     let expected = expected
         .iter()
         .copied()
@@ -4446,7 +4449,8 @@ fn require_exact_tables(
             return Err(DatabaseError::IncompatibleSchema);
         }
     }
-    record_quota::validate(connection)
+    record_quota::validate(connection)?;
+    page_quota::apply(connection)
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
@@ -4611,12 +4615,6 @@ fn configure_encrypted_connection(
     )?;
     if read_only {
         connection.pragma_update(None, "query_only", true)?;
-    } else {
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             PRAGMA wal_autocheckpoint = 1;",
-        )?;
     }
     let cipher_version: Option<String> = connection
         .query_row("PRAGMA cipher_version", [], |row| row.get(0))
@@ -4629,6 +4627,15 @@ fn configure_encrypted_connection(
         return Err(DatabaseError::HmacDisabled);
     }
     connection.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+    page_quota::register(&connection)?;
+    page_quota::apply(&connection)?;
+    if !read_only {
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             PRAGMA wal_autocheckpoint = 1;",
+        )?;
+    }
     Ok(connection)
 }
 
@@ -4663,6 +4670,7 @@ fn database_shell_statement(
     sql: &str,
     query_only: bool,
 ) -> Result<DatabaseShellResult, DatabaseError> {
+    page_quota::apply(connection)?;
     if query_only {
         connection.pragma_update(None, "query_only", true)?;
     }

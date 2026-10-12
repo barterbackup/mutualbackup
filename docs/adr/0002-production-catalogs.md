@@ -292,6 +292,66 @@ obsolete-inode retirement reclaims 10.64 GiB; target uses 47.43 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-published-revision-quota-j49ro9os`.
 
+## Persistent database page admission
+
+`DatabasePageQuota` explicitly limits the current logical page count of each
+control/parity database. Its 4 KiB pages include schema, SQL indexes, live cells
+and unused freelist pages. SQLite's pager refuses allocations beyond the
+configured count. This is an additional dimension beside the all-table logical
+record quota, immutable encoded-page quota and source/history occurrence
+ledgers. The setting is local policy; signed layouts and original IDs remain
+unchanged. See [SQLite's pager limit](https://www.sqlite.org/pragma.html#pragma_max_page_count).
+
+Two version-one singleton policy/guard rows bind the exact kind, page size and
+limit. Configuration holds an IMMEDIATE writer, checks the original page count,
+publishes or resizes both rows with exact readback, checks the full recognized
+schema and commits. Refused installation/resize rolls back all rows and
+restores the previous pager setting. The admitted count includes quota/schema
+bookkeeping allocated by the installation itself. There is no payload scan or
+adoption cursor: the pager header already counts every allocated database page.
+
+Every encrypted connection registers a fixed innocuous SQL callback. Persistent
+BEFORE INSERT/UPDATE/DELETE triggers apply the current policy under the actual
+writer, including cached statements and connections opened before installation
+or resize. Policy/meta table declarations are checked before evaluating their
+columns; declaration reads, text headers and row multiplicity are bounded.
+Missing, changed or malformed policy/guard records refuse writes. Opening and
+read-only inspection apply the admitted limit before journal-mode setup and
+startup reconciliation. The database shell reapplies it before each statement,
+so schema/index allocation uses the current setting too. Atomic batch or shard
+exhaustion preserves prior records and logical quota counters.
+
+Node exposes independent control/volume configuration. Six Store regressions
+cover old/cached writers, atomic rollback, growth/shrink, freelist accounting,
+schema/index allocation, SQL ignore/reversion, missing/oversized/malformed
+policy and schema, parity blobs and read-only reopening. A Node regression
+covers refused configuration, ordinary guild state and persisted control/volume
+limits after reopen. Both real native retained/source-loss fixtures now declare
+4 GiB database-page ceilings, alongside their other independent quotas. The
+existing atomic 8,193 x 64 KiB writer runs with a 1 GiB page ceiling, preserving
+its >512 MiB committed inherited WAL and held reader snapshot.
+
+The cap counts the active logical database. Older file tails awaiting
+checkpoint/truncation, filesystem block rounding, WAL/SHM/rollback journals,
+VACUUM/rekey copies, scratch, filesystem metadata, shared-snapshot extents and
+aggregate filesystem reservations still require their own admission. Repeated
+updates can produce more journal work than the live database page count. This
+adds no memory-derived WAL ceiling. The complete single-owner metadata budget,
+trusted workload-derived transaction/retention policy, distributed availability/
+activation, normal paged producers/retention/seed recovery and R5/R7 remain
+open. Normal paged producers stay disabled; dense 1 TiB and Windows/macOS
+qualification remain user-deferred.
+
+Frozen qualification passes 1,420 distinct tests: 204 Core, 423 ordinary
+Store, 117 Git, 551 Node, the explicit >512 MiB atomic writer and both
+provisioned Btrfs recovery fixtures, plus the remaining targets. Formatting,
+strict locked workspace/all-targets Clippy, compilation and four debug builds
+pass. All 339 inputs, 336 code/dependency inputs, 19 inventories and 23 exact
+executables are audited; 121 other ignored cases remain unexecuted. Exact
+obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
+Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
+installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
+
 ## Implementation and qualification order
 
 1. Add the bounded tree codec, streaming builder and authenticated traversal.

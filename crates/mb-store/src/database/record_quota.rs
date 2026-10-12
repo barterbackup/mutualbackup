@@ -175,6 +175,10 @@ fn tables(connection: &Connection) -> Result<&'static [Table], DatabaseError> {
     }
 }
 
+pub(super) fn data_tables(connection: &Connection) -> Result<Vec<&'static str>, DatabaseError> {
+    Ok(tables(connection)?.iter().map(|table| table.name).collect())
+}
+
 impl Table {
     fn charge(self, prefix: &str) -> String {
         // Integer cells and index row locators have a fixed logical charge of

@@ -2553,6 +2553,28 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Enforce persistent logical SQL database-page ceilings.
+      Declare a separate 4 KiB page-count policy for control/parity stores,
+      covering schema/index, live and freelist pages. Persist paired exact
+      policy/guard rows and apply the current pager cap in BEFORE triggers,
+      including existing connections and cached statements. Validate bounded
+      declarations/headers before decoding; refuse missing/malformed state and
+      restore the old pager limit after refused atomic installation/resize.
+      Apply before startup/journal setup and each database-shell statement.
+      Node exposes control/volume configuration. Six Store and one Node cases
+      pass; both native retained/source-loss fixtures declare page ceilings and
+      the 8,193-record atomic writer preserves its >512 MiB inherited WAL under
+      a 1 GiB page cap. Frozen qualification passes 1,420 distinct tests,
+      formatting, strict locked Clippy, compilation and four debug builds;
+      339 inputs, 336 code/dependency inputs, 19 inventories and 23 executables
+      are audited. The 121 other ignored cases remain unexecuted. Retirement
+      reclaims 10.65 GiB; target uses 47.44 GiB with current/older
+      artifacts, auxiliary WIP and installed roots preserved. This bounds the
+      active logical database; checkpoint tails, WAL/SHM/journals, VACUUM/rekey,
+      scratch and full filesystem/workload admission remain open, as do the
+      complete single-owner policy, normal paged recovery and R5/R7. The parent
+      R3 and user-deferred hardware gates remain open. See ADR 0002.
+      Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
     - [x] Bound published revision metadata occurrences across retained history.
       Add version-one global/dataset/guild limits over revision count and
       represented bytes, pages and record work. Count repeated source/private

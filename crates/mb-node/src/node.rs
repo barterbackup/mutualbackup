@@ -1452,6 +1452,23 @@ impl Node {
         &self.data_dir
     }
 
+    /// Bound all control database pages, including schema/index and free pages.
+    /// WAL, scratch and filesystem reservations need their own admission.
+    pub fn configure_control_page_quota(
+        &mut self,
+        quota: mb_store::DatabasePageQuota,
+    ) -> Result<mb_store::DatabasePageQuotaUsage> {
+        Ok(self.control.configure_page_quota(quota)?)
+    }
+
+    pub fn configure_volume_page_quota(
+        &mut self,
+        volume_id: Uuid,
+        quota: mb_store::DatabasePageQuota,
+    ) -> Result<mb_store::DatabasePageQuotaUsage> {
+        self.volumes.configure_page_quota(volume_id, quota)
+    }
+
     /// Declare a logical quota over all control tables and their index keys.
     /// This is not a filesystem, WAL or scratch allocation budget. Existing
     /// records are adopted in bounded, independently committed steps; restart
@@ -15428,6 +15445,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn node_page_quotas_survive_reopen_and_refused_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([186; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert!(
+            node.configure_control_page_quota(mb_store::DatabasePageQuota { max_pages: 1 })
+                .is_err()
+        );
+        assert!(node.control.page_quota_usage().unwrap().is_none());
+        node.configure_control_page_quota(mb_store::DatabasePageQuota { max_pages: 1024 })
+            .unwrap();
+        let volume_id = node.volumes.reader_configs()[0].volume_id;
+        node.configure_volume_page_quota(volume_id, mb_store::DatabasePageQuota { max_pages: 256 })
+            .unwrap();
+        node.configure_failure_domain("page-quota").unwrap();
+        let guild = node
+            .create_guild(record_quota_test_endpoints(&node))
+            .unwrap();
+        drop(node);
+        let mut node = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            node.control
+                .page_quota_usage()
+                .unwrap()
+                .unwrap()
+                .quota
+                .max_pages,
+            1024
+        );
+        assert_eq!(
+            node.guild_summary().unwrap().unwrap().guild_id,
+            guild.guild_id
+        );
+        node.configure_volume_page_quota(volume_id, mb_store::DatabasePageQuota { max_pages: 256 })
+            .unwrap();
+    }
+
+    #[test]
     fn normal_node_writes_consume_declared_control_record_quota_and_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state");
@@ -18409,6 +18464,10 @@ pub(crate) mod tests {
             max_accounted_bytes: 4 * 1024 * 1024 * 1024,
         };
         node.configure_control_record_quota(record_quota).unwrap();
+        let page_quota = mb_store::DatabasePageQuota {
+            max_pages: 1024 * 1024,
+        };
+        node.configure_control_page_quota(page_quota).unwrap();
         let volume_ids = node
             .volumes
             .reader_configs()
@@ -18417,6 +18476,8 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         for volume_id in volume_ids {
             node.configure_volume_record_quota(volume_id, record_quota)
+                .unwrap();
+            node.configure_volume_page_quota(volume_id, page_quota)
                 .unwrap();
         }
         let certified = install_public_restore_fixture(&mut node, &seed);
