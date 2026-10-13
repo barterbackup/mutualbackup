@@ -433,6 +433,9 @@ impl PreservedParentCheck {
                     mb_git::PreservedGitRecord::MetadataObject { .. },
                 )
                 | PreservedExternalGitRecord::Record(
+                    mb_git::PreservedGitRecord::ChunkedMetadataObject { .. },
+                )
+                | PreservedExternalGitRecord::Record(
                     mb_git::PreservedGitRecord::SelectedBranch { .. },
                 )
                 | PreservedExternalGitRecord::CatalogStatus { .. } => {}

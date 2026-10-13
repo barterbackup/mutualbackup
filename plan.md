@@ -5748,3 +5748,21 @@ Exact superseded-inode retirement reclaims 9.49 GiB; target uses 49.92 GiB.
 Current executables, 29 older archived paths, both failed Node artifacts, the
 failed Git fixture, 14 auxiliary WIP files and all 10 installed roots remain
 intact.
+
+Original paged Git metadata now retains immutable v2 headers and 32 KiB
+fragments, preserving original OIDs under the completed catalog owner. Typed
+EOF, same-writer empty/exact-retry checks and exact readback fence publication.
+Both legacy and paged metadata use bounded encrypted ODB fragments and C read
+streams; large streaming does not widen legacy whole-object or collected-ID
+limits. Preserved inventory verifies the full namespace and remains read-only.
+Five new Git regressions pass, including an object above 64 MiB. Qualification
+passes 1,543 cases: 760 fresh and 783 exact unchanged reused, with strict Clippy,
+builds, both bulk cases, four Linux native fixtures and 373-input/23-executable
+audits. The 512.5 MiB corpus uses 22.93 MiB peak RSS; 121 ignored cases remain
+unexecuted. Verified retirement reclaims 9.77 GiB; target uses 50.12 GiB.
+Current artifacts, older saved evidence, auxiliary WIP and installed roots remain
+intact. Full refs/blob installation and normal paged graph consumers, aggregate
+admission/physical quotas, distributed activation, normal production/retention/
+seed recovery, legacy consumers and R5/R7 remain open. Producers stay disabled;
+dense 1 TiB and Windows/macOS hardware stay deferred. Evidence:
+`/tmp/mb-m6-git-metadata-chunks-p158blav`; see ADR 0002.

@@ -313,6 +313,14 @@ pub enum PreservedGitRecord {
         record_format: u16,
         object: crate::GitGraphObject,
     },
+    ChunkedMetadataObject {
+        repository_id: Uuid,
+        record_format: u16,
+        kind: u8,
+        oid: [u8; 20],
+        byte_len: u64,
+        content_hash: [u8; 32],
+    },
     SelectedBranch {
         scope: crate::GitWorktreeScope,
         record_format: u16,
@@ -358,6 +366,20 @@ impl GitRepository {
             crate::checkout::for_each_preserved_record(catalog, repository_id, &mut visit)?;
             crate::catalog_anchor::for_each_preserved_location(catalog, repository_id, &mut visit)?;
             crate::history::for_each_preserved_record(catalog, repository_id, &mut visit)?;
+            crate::metadata_chunks::validate_all(
+                catalog,
+                repository_id,
+                |oid, header, content_hash| {
+                    visit(PreservedGitRecord::ChunkedMetadataObject {
+                        repository_id,
+                        record_format: 2,
+                        kind: header.kind,
+                        oid,
+                        byte_len: header.byte_len,
+                        content_hash,
+                    })
+                },
+            )?;
             crate::head::for_each_preserved_branch(catalog, repository_id, &mut visit)?;
             catalog.validate_preserved_anchor_discovery_records()?;
             for_each_unclassified_preserved_record(catalog, repository_id, visit)
@@ -2006,6 +2028,15 @@ impl GitRepository {
     pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {
         Ok(self.directory.identity()?)
     }
+
+    pub(crate) fn with_paged_metadata_catalog<T>(
+        &self,
+        operation: impl FnOnce(&ControlStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        operation(&self.catalog)
+    }
 }
 
 fn require_private_catalog(directory: &PinnedDirectory) -> Result<(), RepositoryError> {
@@ -2101,6 +2132,8 @@ fn for_each_unclassified_preserved_record(
         "git-bare-fetch-verified-v1/",
         "git-stock-push-intent-v1/",
         "git-metadata-object-v1/",
+        "git-metadata-object-v2/",
+        "git-metadata-fragment-v2/",
         "git-ref-v1/",
         "git-checkout-intent-v1/",
         "git-worktree-checkout-intent-v1/",
@@ -2125,6 +2158,7 @@ fn for_each_unclassified_preserved_record(
         crate::GIT_REF_NAME_BYTES.max(crate::stage::MAX_STAGE_PATH_BYTES),
     )? {
         let known = kind == SOURCE_BACKEND_KIND
+            || kind == crate::metadata_chunks::ROOT
             || kind == "anchor-area-location"
             || kind == mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND
             || kind == mb_store::ANCHOR_DISCOVERY_FENCE_KIND

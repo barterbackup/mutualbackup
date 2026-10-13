@@ -481,10 +481,8 @@ fn branch_records_for_scope(
             return Err(HistoryError::IncompatibleRecord);
         }
         let oid = Oid::from_bytes(&record.oid)?;
-        let object_bytes = control
-            .get_record(&metadata_kind(repository_id), oid.as_bytes())?
+        let object = crate::metadata_odb::point(control, repository_id, oid)?
             .ok_or(HistoryError::IncompatibleRecord)?;
-        let object: MetadataObject = decode_canonical(&object_bytes)?;
         if object.format_version != 1
             || object.kind != 1
             || Oid::hash_object(ObjectType::Commit, &object.bytes)? != oid
@@ -908,10 +906,8 @@ fn checked_commit(
     repository_id: Uuid,
     oid: Oid,
 ) -> Result<(), HistoryError> {
-    let encoded = control
-        .get_record(&metadata_kind(repository_id), oid.as_bytes())?
+    let object = crate::metadata_odb::point(control, repository_id, oid)?
         .ok_or(HistoryError::IncompatibleRecord)?;
-    let object: MetadataObject = decode_canonical(&encoded)?;
     if object.format_version != 1
         || object.kind != object_code(ObjectType::Commit)?
         || Oid::hash_object(ObjectType::Commit, &object.bytes)? != oid

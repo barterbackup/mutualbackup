@@ -2553,6 +2553,25 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Retain original paged Git metadata in bounded v2 fragments.
+      Immutable headers and 32 KiB fragments preserve original OIDs and publish
+      only after complete typed EOF. Same-writer empty/exact-retry checks and
+      exact readback reject conflicting/ignored writes and roll back lost pages.
+      The encrypted ODB streams both legacy v1 and new v2 metadata; whole-object
+      readers and collected identities retain their historical limits. Preserved
+      inventory verifies the full namespace and emits bounded summaries without
+      filesystem ownership. Five new Git cases cover original refs/mixed overlays,
+      read-only public inventory, scope aliases, rollback, corrupt rows and an
+      object above 64 MiB. Frozen qualification passes 1,543 cases: 760 fresh,
+      783 exact unchanged reused. Format, strict Clippy, builds, both bulk cases,
+      four Linux native fixtures and 373-input/23-executable audits pass.
+      The 512.5 MiB corpus uses 22.93 MiB peak RSS; 121 ignored cases remain
+      unexecuted. Verified retirement reclaims 9.77 GiB; target uses
+      50.12 GiB. Full Git refs/blob installation and paged consumers,
+      aggregate/physical admission, distributed activation, normal production/
+      retention/seed recovery, legacy consumers and R1/R2/R3/R5/R7 remain open.
+      Producers stay disabled; hardware stays deferred. Evidence:
+      `/tmp/mb-m6-git-metadata-chunks-p158blav`; see ADR 0002.
     - [x] Move ordinary Git metadata loading to an encrypted on-demand ODB.
       History, ancestry, tags/branches, proposal validation and status stream
       original SQL-bounded metadata into a complete verified disposable index,

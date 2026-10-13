@@ -2,6 +2,7 @@
 //! objects on demand; existing object identities and codecs remain unchanged.
 
 use std::collections::HashSet;
+use std::ffi::c_char;
 use std::ffi::{c_int, c_void};
 use std::sync::{Arc, Mutex};
 
@@ -11,6 +12,7 @@ use mb_core::{canonical_bytes, decode_canonical};
 use mb_store::{ControlStore, RecordScratchStore};
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha1::{Digest, Sha1};
 use uuid::Uuid;
 
 use crate::history::{
@@ -55,7 +57,22 @@ pub(crate) fn decode_bytes<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<
 struct Header {
     kind: u8,
     byte_len: u64,
-    encoded_len: u64,
+    fragments: u64,
+}
+
+fn chunk_key(oid: Oid, offset: u64) -> [u8; 28] {
+    crate::metadata_chunks::key(oid.as_bytes().try_into().expect("SHA-1 OID"), offset)
+}
+
+fn object_hash(value: Header) -> Result<Sha1, HistoryError> {
+    crate::metadata_chunks::Header {
+        format_version: 2,
+        kind: value.kind,
+        byte_len: value.byte_len,
+        fragments: value.fragments,
+    }
+    .hash()
+    .map_err(|_| HistoryError::IncompatibleRecord)
 }
 
 fn decode(oid: Oid, bytes: &[u8]) -> Result<MetadataObject, HistoryError> {
@@ -72,19 +89,99 @@ fn decode(oid: Oid, bytes: &[u8]) -> Result<MetadataObject, HistoryError> {
     Ok(object)
 }
 
+pub(crate) fn point(
+    control: &ControlStore,
+    id: Uuid,
+    oid: Oid,
+) -> Result<Option<MetadataObject>, HistoryError> {
+    let paged =
+        crate::metadata_chunks::root(control, id).map_err(|_| HistoryError::IncompatibleRecord)?;
+    let chunked = if paged.is_some() {
+        crate::metadata_chunks::header(control, id, oid.as_bytes().try_into().expect("SHA-1 OID"))
+            .map_err(|_| HistoryError::IncompatibleRecord)?
+    } else {
+        None
+    };
+    let legacy = control.get_record_bounded(&metadata_kind(id), oid.as_bytes(), ROW_BYTES)?;
+    if let Some(value) = chunked {
+        if value.byte_len > MAX_GRAPH_METADATA_BYTES as u64 {
+            return Err(HistoryError::GraphTooLarge);
+        }
+        let mut bytes = Vec::with_capacity(value.byte_len as usize);
+        crate::metadata_chunks::stream(
+            control,
+            id,
+            oid.as_bytes().try_into().expect("SHA-1 OID"),
+            value,
+            |_, part| {
+                bytes.extend_from_slice(part);
+                Ok(())
+            },
+        )
+        .map_err(|_| HistoryError::IncompatibleRecord)?;
+        let object = MetadataObject {
+            format_version: 1,
+            kind: value.kind,
+            bytes,
+        };
+        if let Some(legacy) = legacy {
+            let previous = decode(oid, &legacy)?;
+            if previous.kind != object.kind || previous.bytes != object.bytes {
+                return Err(HistoryError::IncompatibleRecord);
+            }
+        }
+        return Ok(Some(object));
+    }
+    legacy.map(|bytes| decode(oid, &bytes)).transpose()
+}
+
 fn header(store: &RecordScratchStore, oid: Oid) -> Result<Option<Header>, HistoryError> {
     let Some(bytes) = store.get_record_bounded(HEADER, oid.as_bytes(), 32)? else {
-        if store.record_length(BODY, oid.as_bytes())?.is_some() {
+        if store
+            .record_at_or_before_bounded(
+                BODY,
+                &chunk_key(oid, 0),
+                &chunk_key(oid, u64::MAX),
+                28,
+                crate::GIT_OBJECT_FRAGMENT_BYTES,
+            )?
+            .is_some()
+        {
             return Err(HistoryError::IncompatibleRecord);
         }
         return Ok(None);
     };
     let value: Header = decode_canonical(&bytes)?;
     if object_type(value.kind).is_none()
-        || value.byte_len > MAX_GRAPH_METADATA_BYTES as u64
-        || value.encoded_len > ROW_BYTES as u64
+        || value.byte_len > mb_core::CATALOG_MAX_STREAM_BYTES
+        || value.fragments
+            != value
+                .byte_len
+                .div_ceil(crate::GIT_OBJECT_FRAGMENT_BYTES as u64)
         || canonical_bytes(&value)? != bytes
-        || store.record_length(BODY, oid.as_bytes())?.map(|n| n as u64) != Some(value.encoded_len)
+    {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    let tail = store.record_at_or_before_bounded(
+        BODY,
+        &chunk_key(oid, 0),
+        &chunk_key(oid, u64::MAX),
+        28,
+        crate::GIT_OBJECT_FRAGMENT_BYTES,
+    )?;
+    let expected = (value.fragments > 0).then(|| {
+        chunk_key(
+            oid,
+            (value.fragments - 1) * crate::GIT_OBJECT_FRAGMENT_BYTES as u64,
+        )
+    });
+    if tail.as_ref().map(|(key, _)| key.as_slice()) != expected.as_ref().map(|key| key.as_slice())
+        || tail.as_ref().is_some_and(|(_, bytes)| {
+            bytes.len()
+                != (value.byte_len
+                    - (value.fragments - 1) * crate::GIT_OBJECT_FRAGMENT_BYTES as u64)
+                    as usize
+        })
     {
         return Err(HistoryError::IncompatibleRecord);
     }
@@ -95,14 +192,37 @@ fn get(store: &RecordScratchStore, oid: Oid) -> Result<Option<MetadataObject>, H
     let Some(expected) = header(store, oid)? else {
         return Ok(None);
     };
-    let bytes = store
-        .get_record_bounded(BODY, oid.as_bytes(), ROW_BYTES)?
-        .ok_or(HistoryError::IncompatibleRecord)?;
-    let object = decode(oid, &bytes)?;
-    if object.kind != expected.kind || object.bytes.len() as u64 != expected.byte_len {
+    if expected.byte_len > MAX_GRAPH_METADATA_BYTES as u64 {
+        return Err(HistoryError::GraphTooLarge);
+    }
+    let mut bytes = Vec::with_capacity(expected.byte_len as usize);
+    let mut hash = object_hash(expected)?;
+    let mut offset = 0;
+    while offset < expected.byte_len {
+        let part = store
+            .get_record_bounded(
+                BODY,
+                &chunk_key(oid, offset),
+                crate::GIT_OBJECT_FRAGMENT_BYTES,
+            )?
+            .ok_or(HistoryError::IncompatibleRecord)?;
+        if part.len()
+            != (expected.byte_len - offset).min(crate::GIT_OBJECT_FRAGMENT_BYTES as u64) as usize
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        hash.update(&part);
+        offset += part.len() as u64;
+        bytes.extend(part);
+    }
+    if hash.finalize().as_slice() != oid.as_bytes() {
         return Err(HistoryError::IncompatibleRecord);
     }
-    Ok(Some(object))
+    Ok(Some(MetadataObject {
+        format_version: 1,
+        kind: expected.kind,
+        bytes,
+    }))
 }
 
 fn put(store: &RecordScratchStore, oid: Oid, bytes: &[u8]) -> Result<bool, HistoryError> {
@@ -110,15 +230,26 @@ fn put(store: &RecordScratchStore, oid: Oid, bytes: &[u8]) -> Result<bool, Histo
     let expected = Header {
         kind: object.kind,
         byte_len: object.bytes.len() as u64,
-        encoded_len: bytes.len() as u64,
+        fragments: (object.bytes.len() as u64).div_ceil(crate::GIT_OBJECT_FRAGMENT_BYTES as u64),
     };
-    let fresh = store.put_record_if_absent(BODY, oid.as_bytes(), bytes)?;
-    if store
-        .get_record_bounded(BODY, oid.as_bytes(), ROW_BYTES)?
-        .as_deref()
-        != Some(bytes)
+    let fresh = header(store, oid)?.is_none();
+    if !fresh
+        && get(store, oid)?
+            .is_none_or(|previous| previous.kind != object.kind || previous.bytes != object.bytes)
     {
         return Err(HistoryError::IncompatibleRecord);
+    }
+    for (number, chunk) in object
+        .bytes
+        .chunks(crate::GIT_OBJECT_FRAGMENT_BYTES)
+        .enumerate()
+    {
+        put_chunk(
+            store,
+            oid,
+            number as u64 * crate::GIT_OBJECT_FRAGMENT_BYTES as u64,
+            chunk,
+        )?;
     }
     let bytes = canonical_bytes(&expected)?;
     store.put_record_if_absent(HEADER, oid.as_bytes(), &bytes)?;
@@ -126,6 +257,24 @@ fn put(store: &RecordScratchStore, oid: Oid, bytes: &[u8]) -> Result<bool, Histo
         return Err(HistoryError::IncompatibleRecord);
     }
     Ok(fresh)
+}
+
+fn put_chunk(
+    store: &RecordScratchStore,
+    oid: Oid,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), HistoryError> {
+    let key = chunk_key(oid, offset);
+    store.put_record_if_absent(BODY, &key, bytes)?;
+    if store
+        .get_record_bounded(BODY, &key, crate::GIT_OBJECT_FRAGMENT_BYTES)?
+        .as_deref()
+        != Some(bytes)
+    {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    Ok(())
 }
 
 pub(crate) struct MetadataIndex {
@@ -144,6 +293,13 @@ impl MetadataIndex {
         let maximum = (MAX_GRAPH_OBJECTS as u64)
             .checked_mul(ROW_BYTES as u64 + 128)
             .and_then(|n| n.checked_mul(2))
+            .ok_or(HistoryError::GraphTooLarge)?;
+        let paged = crate::metadata_chunks::root(control, id)
+            .map_err(|_| HistoryError::IncompatibleRecord)?;
+        let maximum = maximum
+            .checked_add(paged.map_or(0, |root| {
+                root.objects.object_bytes * 2 + root.objects.objects * 256
+            }))
             .ok_or(HistoryError::GraphTooLarge)?;
         let store = RecordScratchStore::new(maximum)?;
         let mut count = 0;
@@ -164,6 +320,44 @@ impl MetadataIndex {
                         .downcast::<HistoryError>()
                         .unwrap_or(HistoryError::IncompatibleRecord)
                 })?;
+            crate::metadata_chunks::validate_all(control, id, |oid, value, _| {
+                let oid = Oid::from_bytes(&oid)?;
+                let expected = Header {
+                    kind: value.kind,
+                    byte_len: value.byte_len,
+                    fragments: value.fragments,
+                };
+                if let Some(previous) = header(&store, oid)? {
+                    anyhow::ensure!(
+                        previous == expected,
+                        "legacy and paged metadata headers conflict"
+                    );
+                }
+                crate::metadata_chunks::stream(
+                    control,
+                    id,
+                    oid.as_bytes().try_into()?,
+                    value,
+                    |offset, bytes| {
+                        put_chunk(&store, oid, offset, bytes)?;
+                        Ok(())
+                    },
+                )?;
+                let fresh = store.put_record_if_absent(
+                    HEADER,
+                    oid.as_bytes(),
+                    &canonical_bytes(&expected)?,
+                )?;
+                anyhow::ensure!(
+                    header(&store, oid)? == Some(expected),
+                    "metadata header was not stored"
+                );
+                if fresh {
+                    count += 1
+                }
+                Ok(())
+            })
+            .map_err(|_| HistoryError::IncompatibleRecord)?;
             Ok(())
         })?;
         let records = Arc::new(Mutex::new(store));
@@ -196,6 +390,9 @@ impl MetadataIndex {
     }
 
     pub(crate) fn ids(&self) -> Result<HashSet<Oid>, HistoryError> {
+        if self.count > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
         let store = self
             .records
             .lock()
@@ -237,6 +434,7 @@ fn attach(odb: &Odb<'_>, records: Records) -> Result<(), HistoryError> {
     }
     backend.base.read = Some(read);
     backend.base.read_header = Some(read_header);
+    backend.base.readstream = Some(open_stream);
     backend.base.exists = Some(exists);
     backend.base.free = Some(free);
     let owned = Box::into_raw(backend);
@@ -348,6 +546,140 @@ extern "C" fn free(base: *mut raw::git_odb_backend) {
     if !base.is_null() {
         // SAFETY: libgit2 releases its uniquely owned backend allocation once.
         unsafe { drop(Box::from_raw(base.cast::<Backend>())) };
+    }
+}
+
+#[repr(C)]
+struct ObjectStream {
+    base: raw::git_odb_stream,
+    records: Records,
+    oid: Oid,
+    value: Header,
+    position: u64,
+    chunk: Vec<u8>,
+    hash: Sha1,
+}
+
+extern "C" fn open_stream(
+    out: *mut *mut raw::git_odb_stream,
+    size: *mut usize,
+    kind: *mut raw::git_object_t,
+    base: *mut raw::git_odb_backend,
+    oid: *const raw::git_oid,
+) -> c_int {
+    if out.is_null() || size.is_null() || kind.is_null() {
+        return raw::GIT_ERROR;
+    }
+    let value = match lookup(base, oid, header) {
+        Ok(Some(value)) => value,
+        Ok(None) => return raw::GIT_ENOTFOUND,
+        Err(_) => return raw::GIT_ERROR,
+    };
+    let Ok(length) = usize::try_from(value.byte_len) else {
+        return raw::GIT_ERROR;
+    };
+    let Ok(hash) = object_hash(value) else {
+        return raw::GIT_ERROR;
+    };
+    // SAFETY: lookup checked both pointers. libgit2 retains its backend through
+    // this callback; the Arc additionally owns the index for the stream.
+    let backend = unsafe { &*base.cast::<Backend>() };
+    let Ok(oid) = Oid::from_bytes(unsafe { &(*oid).id }) else {
+        return raw::GIT_ERROR;
+    };
+    // SAFETY: Initialize the C stream completely before transferring ownership.
+    let mut stream: raw::git_odb_stream = unsafe { std::mem::zeroed() };
+    stream.backend = base;
+    stream.mode = raw::GIT_STREAM_RDONLY;
+    stream.declared_size = value.byte_len;
+    stream.read = Some(read_stream);
+    stream.free = Some(free_stream);
+    let stream = Box::new(ObjectStream {
+        base: stream,
+        records: backend.records.clone(),
+        oid,
+        value,
+        position: 0,
+        chunk: Vec::new(),
+        hash,
+    });
+    // SAFETY: libgit2 owns the stream allocation until its free callback.
+    unsafe {
+        *out = Box::into_raw(stream).cast();
+        *size = length;
+        *kind = raw_kind(value.kind)
+    };
+    raw::GIT_OK
+}
+
+extern "C" fn read_stream(
+    stream: *mut raw::git_odb_stream,
+    buffer: *mut c_char,
+    length: usize,
+) -> c_int {
+    if stream.is_null() || (buffer.is_null() && length > 0) {
+        return raw::GIT_ERROR;
+    }
+    if length == 0 {
+        return 0;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<c_int, ()> {
+        // SAFETY: libgit2 passes our live stream and an output of length bytes.
+        let stream = unsafe { &mut *stream.cast::<ObjectStream>() };
+        let amount = length
+            .min(c_int::MAX as usize)
+            .min((stream.value.byte_len - stream.position) as usize);
+        let output = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), amount) };
+        let mut written = 0;
+        while written < amount {
+            let offset = stream.position / crate::GIT_OBJECT_FRAGMENT_BYTES as u64
+                * crate::GIT_OBJECT_FRAGMENT_BYTES as u64;
+            if stream.chunk.is_empty() {
+                stream.chunk = stream
+                    .records
+                    .lock()
+                    .map_err(|_| ())?
+                    .get_record_bounded(
+                        BODY,
+                        &chunk_key(stream.oid, offset),
+                        crate::GIT_OBJECT_FRAGMENT_BYTES,
+                    )
+                    .map_err(|_| ())?
+                    .ok_or(())?;
+                if stream.chunk.len()
+                    != (stream.value.byte_len - offset).min(crate::GIT_OBJECT_FRAGMENT_BYTES as u64)
+                        as usize
+                {
+                    return Err(());
+                }
+            }
+            let from = (stream.position - offset) as usize;
+            let size = (amount - written).min(stream.chunk.len() - from);
+            let bytes = &stream.chunk[from..from + size];
+            stream.hash.update(bytes);
+            output[written..written + size].copy_from_slice(bytes);
+            written += size;
+            stream.position += size as u64;
+            if from + size == stream.chunk.len() {
+                stream.chunk.clear()
+            }
+        }
+        if stream.position == stream.value.byte_len
+            && stream.hash.clone().finalize().as_slice() != stream.oid.as_bytes()
+        {
+            return Err(());
+        }
+        Ok(written as c_int)
+    }))
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(raw::GIT_ERROR)
+}
+
+extern "C" fn free_stream(stream: *mut raw::git_odb_stream) {
+    if !stream.is_null() {
+        // SAFETY: libgit2 frees the uniquely owned ObjectStream once.
+        unsafe { drop(Box::from_raw(stream.cast::<ObjectStream>())) };
     }
 }
 
@@ -499,11 +831,11 @@ mod tests {
             assert_eq!(odb.read(oid).unwrap().data(), b"new object");
             let records = index.records.lock().unwrap();
             let saved = records
-                .get_record_bounded(BODY, tree.as_bytes(), ROW_BYTES)
+                .get_record_bounded(BODY, &chunk_key(tree, 0), crate::GIT_OBJECT_FRAGMENT_BYTES)
                 .unwrap()
                 .unwrap();
             records
-                .delete_record_if_value(BODY, tree.as_bytes(), &saved)
+                .delete_record_if_value(BODY, &chunk_key(tree, 0), &saved)
                 .unwrap();
             drop(records);
             assert!(index.get(tree).is_err());

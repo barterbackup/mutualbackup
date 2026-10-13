@@ -6987,3 +6987,59 @@ Exact superseded-inode retirement reclaims 9.49 GiB; target uses 49.92 GiB.
 Current executables, 29 older archived paths, both failed Node artifacts, the
 failed Git fixture, 14 auxiliary WIP files and all 10 installed roots remain
 intact.
+
+### Original paged Git metadata fragments and C read streams (2026-10-13)
+
+Original paged Git metadata now imports into immutable version-2 headers and
+32 KiB fragments, under a completed owner naming the original catalog root and
+repository scope. The importer reads typed EOF before publication, verifies
+original Git OIDs and exact counts, rejects ignored/conflicting writes, and
+rolls back lost pages or damaged imports. Empty-destination and exact-retry
+checks run in the same private-catalog writer. No refs, blobs, current backup
+head or normal paged producer is installed by this metadata-only operation.
+
+The encrypted ODB normalizes both unchanged legacy v1 rows and new v2 records
+into bounded fragments. Its C read stream holds one fragment and authenticates
+the complete original object; ordinary whole-object readers retain their 64 MiB
+limit. Larger objects can be streamed without widening those readers. Exact
+legacy proposal overlays remain supported. Legacy identity collections retain
+their existing object-count limit, so full normal paged graph consumers remain
+open. Scratch uses existing physical allocation guards; this does not close
+aggregate checkpoint or whole-job admission.
+
+Preserved inventory validates the complete v2 namespace, owner, headers,
+fragments and original OIDs before emitting bounded summaries. Scope aliases,
+unknown suffixes, orphan fragments, malformed lengths and extra tails fail
+closed; summaries grant no filesystem ownership. The public inventory test
+verifies valid records are classified and successful or rejected inspection
+leaves catalog files unchanged. Five new Git cases cover that path, original
+refs and mixed legacy overlays after reopen, transactional ABORT/IGNORE and
+lost-page rollback, damaged rows and an object above 64 MiB. Three existing
+metadata-index cases also pass.
+
+Frozen qualification passes 1,543 distinct cases in 1,543 executions: 760
+fresh runs and 783 exact unchanged cases reused with source/binary guards.
+It includes 125 ordinary Git, 571 Node, 509 unchanged Store and 210 unchanged
+Core cases, 23 prototype acceptance cases, both explicit bulk cases, four
+provisioned Linux native fixtures and other workspace targets. Format, strict
+locked workspace/all-targets Clippy, all debug executable builds and test
+compilation pass. The first Clippy attempt rejected a complex fixture return
+type; the named fixture type passes the repeated strict check. The 1,027-object/
+512.5 MiB metadata corpus passes in 127.65 seconds with 22.93 MiB peak RSS;
+ordinary Git passes in 172.73 seconds versus the preceding 243.74 seconds.
+The longest native fixture passes in 587.88 seconds under its unchanged
+900-second limit. Ordinary Node passes in 1,750.08 seconds. The independent audit
+binds 373 inputs (370 code/dependency inputs), 23 executables and 19 ordinary
+drivers; 121 other ignored cases remain unexecuted. Native cleanup and source/
+binary immutability checks pass.
+
+Exact superseded-inode retirement reclaims 9.77 GiB; target uses 50.12 GiB.
+Current executables, 29 older archived paths, both failed Node artifacts, the
+failed Git fixture, 14 auxiliary WIP files and all 10 installed roots remain
+intact. Two temporary focused-test executables are retired by verified inode
+and hash after their replacement workspace drivers pass. Full refs/blob
+installation, normal paged graph consumers, aggregate admission/physical quotas,
+distributed activation, normal production/retention/seed recovery, legacy
+consumers and R1/R2/R3/R5/R7 remain open. Normal paged producers remain disabled;
+dense 1 TiB and native Windows/macOS host tests remain user-deferred. Evidence:
+`/tmp/mb-m6-git-metadata-chunks-p158blav`.

@@ -1100,6 +1100,31 @@ pub(super) fn collect_external_git_records(
                 account(&entry, used, limit)?;
                 report.git_metadata_objects.push(entry);
             }
+            PreservedExternalGitRecord::Record(
+                mb_git::PreservedGitRecord::ChunkedMetadataObject {
+                    repository_id,
+                    record_format,
+                    kind,
+                    oid,
+                    byte_len,
+                    content_hash,
+                },
+            ) => {
+                let entry = LegacyGitMetadataObject {
+                    repository_id,
+                    record_format,
+                    object: LegacyGitGraphObject {
+                        kind,
+                        oid: hex::encode(oid),
+                        payload_bytes: byte_len,
+                        payload_hash: hex::encode(content_hash),
+                    },
+                    content_address_verified: true,
+                    graph_metadata_validated: false,
+                };
+                account(&entry, used, limit)?;
+                report.git_metadata_objects.push(entry);
+            }
             PreservedExternalGitRecord::Record(mb_git::PreservedGitRecord::SelectedBranch {
                 scope,
                 record_format,
