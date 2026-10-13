@@ -278,15 +278,47 @@ fn retained_case(sector_size: u32) {
         Some((_, CatalogPackingOperationState::PackingComplete(_)))
     ));
     node.cancel_retained_packing_operation(operation).unwrap();
+    assert!(
+        !node
+            .retire_retained_packing_output(operation, &planned)
+            .unwrap()
+    );
     while node
         .control
         .release_catalog_packing_payload(operation.payloads())
         .unwrap()
     {}
+    // Unrelated damaged legacy rows must not be scanned or materialized.
+    node.control
+        .put_record(
+            "volume-attempt-receipt",
+            &[222; 49],
+            b"unrelated damaged row",
+        )
+        .unwrap();
     assert!(
-        node.volumes
-            .discard_attempt(&node.control, &planned.attempt_id, &BTreeSet::new())
+        node.retire_retained_packing_output(operation, &planned)
             .unwrap()
+    );
+    assert!(
+        node.retire_retained_packing_output(operation, &planned)
+            .unwrap()
+    );
+    while let Some(next) = node
+        .control
+        .next_catalog_packing_operation_attempt(operation, None)
+        .unwrap()
+    {
+        assert!(
+            node.retire_retained_packing_output(operation, &next)
+                .unwrap()
+        );
+    }
+    assert!(
+        node.control
+            .get_record("volume-attempt-receipt", &[222; 49])
+            .unwrap()
+            .is_some()
     );
     assert!(
         node.volumes

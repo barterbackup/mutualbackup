@@ -352,6 +352,69 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Bounded cancelled packing output retirement
+
+Cancelled operations now retire one exact planned output under their original
+control custody writer. The immutable operation/plan, original public sector
+and private temporary storage IDs, attempt, guild, role and commitment cannot
+be substituted. Its own output loan and any other pending/checkpoint pins must
+be released before physical callbacks. The durable plan remains through
+missing output descriptors, pre-loan failures, offline copies and shared
+owners. Conditional output/plan deletion and journal counters commit only after
+physical deletion and exact locator retirement succeed. Cancelled operation,
+child and page-role tombstones remain; retirement never resumes production.
+
+The new physical step reads only one exact object and reservation, checks their
+original version/guild/root/length/state/attempt binding, conditionally deletes
+those rows and checks pins again before its writer commits. Different roles or
+objects from the same attempt remain intact. Missing already-retired rows are
+idempotent. No ciphertext-wide allocation or global attempt-family scan is
+needed. READY data still requires the caller's original custody guard.
+
+Node uses the original 49-byte object and 17-byte reservation keys to identify
+the selected volume and retire its original locators. Active volume receipts,
+migration and copy-cleanup ownership remain independent obligations; their
+presence keeps the plan pending. Offline selected volumes also wait. A missing
+pre-loan locator checks exact deterministic attempts across configured volumes
+under independently admitted lookup work, and any offline candidate preserves
+the plan. Unrelated legacy records are neither scanned nor materialized.
+The indexed cursor can visit other outputs and retry retained obligations.
+
+Physical deletion can precede a failed control commit across the two databases.
+The control rollback keeps all plan/output/locator evidence, so reopen safely
+finishes exact absence checks and retirement without deleting another object.
+Deleted SQLite pages and WAL/file tails remain accounted maintenance work;
+this step performs no unbounded vacuum or journal drain. Bounded physical
+compaction and complete enclosing allocation admission remain required.
+
+Three operation regressions cover loan fencing, exact one-plan progress,
+offline/pre-loan evidence, substitutions and ABORT/IGNORE at all three control
+retirement boundaries, including physical success followed by control rollback.
+Three physical-store regressions cover partial reservations, unchanged other
+roles, STAGED/READY and maximum 4-MiB payloads at role 63, original identity
+mismatches, both delete boundaries and late pins. Four real-volume regressions
+cover missing locators, admitted fallback work, partial/reopened uploads,
+offline and shared owners, active READY/migration ownership, unrelated damaged
+legacy rows and control faults after physical deletion. The actual Node packing
+fixture now retires its outputs through this indexed API after cancellation,
+retaining the separate original final role 0.
+
+Frozen qualification passes 1,520 distinct/executed cases: 497 Store and 569
+Node ordinary cases, the remaining ordinary workspace, bulk journal writer
+and four provisioned Linux native fixtures. Format, strict locked workspace/
+all-targets Clippy and four debug builds pass. Audits bind 368 inputs, 365
+code/dependency inputs, 23 executables and 19 drivers; 121 other ignored cases
+remain unexecuted. Retirement reclaims 9.46 GiB; target uses
+48.61 GiB. Older archives, exact failed Node evidence, 14 auxiliary WIP
+files and all 10 installed roots remain preserved. Evidence: `/tmp/mb-m6-packing-cleanup-q_bm7yfn`.
+
+Normal backup/retention/seed recovery still needs complete source custody,
+packing/coding and checkpoint activation under the aggregate single-owner
+admission/record/page/journal/scratch/physical policy. Legacy consumers, R5 and
+fresh installed-artifact qualification remain open. Normal paged producers
+remain disabled. Actual dense 1 TiB and Windows/macOS hardware runs remain
+user-deferred until software is ready.
+
 ## Durable retained packing construction
 
 `CatalogPackingOperation` binds an immutable operation ID, original certified

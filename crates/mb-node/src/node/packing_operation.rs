@@ -133,6 +133,32 @@ impl Node {
         Ok(result)
     }
 
+    /// Retire one indexed temporary output after cancellation and explicit
+    /// loan release. False retains offline/shared/READY-migration obligations;
+    /// the durable cursor can visit other outputs and revisit this one later.
+    pub fn retire_retained_packing_output(
+        &mut self,
+        operation: mb_store::CatalogPackingOperation,
+        planned: &mb_store::CatalogPackingOutputAttempt,
+    ) -> Result<bool> {
+        let control = &self.control;
+        let volumes = &mut self.volumes;
+        control.retire_catalog_packing_operation_output_checked(
+            operation,
+            planned,
+            |_| Ok::<_, anyhow::Error>(()),
+            |view, planned, payload| {
+                volumes.retire_packing_output(
+                    view,
+                    operation.base.guild_id,
+                    planned,
+                    payload,
+                    operation.construction_budget()?,
+                )
+            },
+        )
+    }
+
     pub fn cancel_retained_packing_operation(
         &self,
         operation: mb_store::CatalogPackingOperation,

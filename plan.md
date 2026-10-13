@@ -5649,3 +5649,16 @@ target uses 48.62 GiB. Complete source custody, aggregate single-owner
 admission/quotas, bounded cleanup, coding/activation, normal retention/seed
 recovery, legacy consumers and R5/R7 remain open. Normal producers stay disabled
 and hardware gates remain user-deferred. Evidence: `/tmp/mb-m6-packing-operation-q30xcx8b`; see ADR 0002.
+
+Cancelled packing output now retires through an indexed exact-attempt step.
+Original physical bindings, pending/checkpoint/READY/migration owners and
+conditional plan/output/counter updates preserve offline and interrupted
+cleanup. Missing pre-loan locators use admitted exact lookups; unrelated legacy
+records are not scanned. Reopen resumes physical success followed by control
+rollback. Six Store and four real-volume cases plus the updated actual Node
+fixture pass within 1,520 frozen qualification tests on 368 inputs and 23
+executables. Retirement reclaims 9.46 GiB; target uses 48.61 GiB.
+Physical compaction, aggregate admission/quotas, complete source/coding/
+checkpoint integration, normal retention/seed recovery, legacy consumers and
+R5/R7 remain open. Producers stay disabled and hardware remains user-deferred.
+Evidence: `/tmp/mb-m6-packing-cleanup-q_bm7yfn`; see ADR 0002.

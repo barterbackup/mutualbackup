@@ -291,7 +291,36 @@ fn is_pinned(
 pub struct CatalogPayloadRetirementView<'a> {
     connection: &'a Connection,
 }
-impl CatalogPayloadRetirementView<'_> {
+impl<'a> CatalogPayloadRetirementView<'a> {
+    pub(super) fn new(connection: &'a Connection) -> Self {
+        Self { connection }
+    }
+
+    /// Read one bounded original locator under the held custody writer.
+    pub fn record(
+        &self,
+        kind: &str,
+        key: &[u8],
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, CatalogStoreError> {
+        if kind.len() > 128 || key.len() > 64 || limit > 8192 {
+            return Err(DatabaseError::Integrity.into());
+        }
+        bounded_record(self.connection, kind, key, limit)
+    }
+
+    /// Check exact owner evidence without materializing its body.
+    pub fn record_exists(&self, kind: &str, key: &[u8]) -> Result<bool, CatalogStoreError> {
+        if kind.len() > 128 || key.len() > 64 {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind=?1 AND record_id=?2)",
+            params![kind, key],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Pending producers also own incomplete reservations and STAGED objects.
     pub fn attempt_is_pinned(&self, attempt: [u8; 16]) -> Result<bool, CatalogStoreError> {
         packing_payloads::attempt_is_pinned(self.connection, attempt)

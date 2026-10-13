@@ -2553,6 +2553,22 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Retire cancelled packing output by indexed exact attempts.
+      Delete one original object/reservation under the control custody writer,
+      preserve other roles and all pending/checkpoint/READY/migration owners,
+      and conditionally retire locators, operation rows and counters only after
+      physical success. Offline/missing-locator/pre-loan obligations stay
+      durable; admitted fallback lookups avoid global legacy record scans.
+      Reopen resumes control rollback after physical deletion. Six Store and
+      four real-volume regressions plus the updated Node fixture pass, including
+      maximum 4-MiB coding payload/role-63 compatibility and every delete/CAS
+      fault boundary. Full frozen qualification passes 1,520 cases, format,
+      strict Clippy, four builds and 368-input/23-executable audits; 121 ignored
+      cases remain unexecuted. Retirement reclaims 9.46 GiB; target uses
+      48.61 GiB. Physical compaction, aggregate quotas, complete source/coding/
+      checkpoint integration, normal retention/seed recovery, legacy consumers
+      and R5/R7 remain open. Producers stay disabled; hardware remains deferred.
+      See ADR 0002 and `/tmp/mb-m6-packing-cleanup-q_bm7yfn`.
     - [x] Own retained packing construction through complete directory validation.
       Bind immutable original authority/candidates/evidence and independent work;
       reserve the page role and fence source/output child jobs under guarded

@@ -23,6 +23,7 @@ mod catalog;
 mod directory;
 mod journal_quota;
 mod journal_vfs;
+mod packing_output_retirement;
 mod page_quota;
 #[cfg(target_os = "linux")]
 mod preserved_read;

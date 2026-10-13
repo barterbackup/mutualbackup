@@ -409,7 +409,7 @@ impl CatalogPackingOperationView<'_> {
         packing_payloads::operation_payload(self.connection, retention, storage, shard)
     }
 }
-fn output(
+fn output_descriptor(
     cx: &Connection,
     op: CatalogPackingOperation,
     id: [u8; 32],
@@ -418,6 +418,7 @@ fn output(
         return Ok(None);
     };
     let p: CatalogPackingPayload = decode_canonical(&bytes)?;
+    p.validate()?;
     let planned = attempt(cx, op, id)?.ok_or(DatabaseError::Integrity)?;
     if mb_core::canonical_bytes_bounded(&p, OUTPUT_BYTES)? != bytes
         || p.storage_id != planned.storage_id
@@ -425,13 +426,25 @@ fn output(
         || p.attempt_id != planned.attempt_id
         || p.commitment != planned.commitment
         || p.shard_index != 0
-        || packing_payloads::operation_payload(cx, op.payloads(), p.storage_id, p.shard_index)?
-            .as_ref()
-            != Some(&p)
     {
         return Err(DatabaseError::Integrity.into());
     }
     Ok(Some(p))
+}
+fn output(
+    cx: &Connection,
+    op: CatalogPackingOperation,
+    id: [u8; 32],
+) -> Result<Option<CatalogPackingPayload>, CatalogStoreError> {
+    let p = output_descriptor(cx, op, id)?;
+    if let Some(p) = &p
+        && packing_payloads::operation_payload(cx, op.payloads(), p.storage_id, p.shard_index)?
+            .as_ref()
+            != Some(p)
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(p)
 }
 fn stream<T, E: From<CatalogStoreError>>(value: Result<T, CatalogStreamError<E>>) -> Result<T, E> {
     value.map_err(|e| match e {
@@ -697,6 +710,106 @@ impl ControlStore {
             .transpose()?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Retire one exact cancelled output after its loans are released. The
+    /// callback holds this control writer across physical deletion and exact
+    /// locator retirement. Offline/shared owners return false and retain the
+    /// plan. Physical success followed by control rollback remains retryable.
+    pub fn retire_catalog_packing_operation_output_checked<E: From<CatalogStoreError>>(
+        &self,
+        op: CatalogPackingOperation,
+        planned: &CatalogPackingOutputAttempt,
+        mut guard: impl FnMut(&CatalogPackingOperationView<'_>) -> Result<(), E>,
+        retire: impl FnOnce(
+            &CatalogPayloadRetirementView<'_>,
+            &CatalogPackingOutputAttempt,
+            Option<&CatalogPackingPayload>,
+        ) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(CatalogStoreError::from)?;
+        let view = CatalogPackingOperationView { connection: &tx };
+        guard(&view)?;
+        let old = require(&tx, op)?;
+        if old.state != CatalogPackingOperationState::Cancelled {
+            return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
+        let Some(current) = attempt(&tx, op, planned.sector_id)? else {
+            if bounded_record(&tx, &outputs(op.id), &planned.sector_id, OUTPUT_BYTES)?.is_some() {
+                return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+            }
+            guard(&view)?;
+            tx.commit().map_err(CatalogStoreError::from)?;
+            return Ok(true);
+        };
+        if &current != planned {
+            return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
+        let output = output_descriptor(&tx, op, planned.sector_id)?;
+        let pins = CatalogPayloadRetirementView::new(&tx);
+        if packing_payloads::operation_payload(&tx, op.payloads(), planned.storage_id, 0)?.is_some()
+            || pins.attempt_is_pinned(planned.attempt_id)?
+            || pins.is_pinned(planned.storage_id, 0, planned.commitment.root)?
+        {
+            tx.commit().map_err(CatalogStoreError::from)?;
+            return Ok(false);
+        }
+        if !retire(&pins, planned, output.as_ref())? {
+            guard(&view)?;
+            require(&tx, op)?;
+            tx.commit().map_err(CatalogStoreError::from)?;
+            return Ok(false);
+        }
+        for (kind, bytes) in [
+            (
+                outputs(op.id),
+                output
+                    .as_ref()
+                    .map(|p| mb_core::canonical_bytes_bounded(p, OUTPUT_BYTES))
+                    .transpose()
+                    .map_err(CatalogStoreError::from)?,
+            ),
+            (
+                attempts(op.id),
+                Some(
+                    mb_core::canonical_bytes_bounded(planned, OUTPUT_BYTES)
+                        .map_err(CatalogStoreError::from)?,
+                ),
+            ),
+        ] {
+            if let Some(bytes) = bytes
+                && (tx
+                    .execute(
+                        "DELETE FROM protocol_records WHERE kind=?1 AND record_id=?2 AND bytes=?3",
+                        params![kind, planned.sector_id.as_slice(), bytes],
+                    )
+                    .map_err(CatalogStoreError::from)?
+                    != 1
+                    || bounded_record(&tx, &kind, &planned.sector_id, OUTPUT_BYTES)?.is_some())
+            {
+                return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+            }
+        }
+        change(
+            &tx,
+            old,
+            Journal {
+                outputs: old
+                    .outputs
+                    .checked_sub(u64::from(output.is_some()))
+                    .ok_or(CatalogStoreError::from(DatabaseError::Integrity))?,
+                attempts: old
+                    .attempts
+                    .checked_sub(1)
+                    .ok_or(CatalogStoreError::from(DatabaseError::Integrity))?,
+                ..old
+            },
+        )?;
+        guard(&view)?;
+        require(&tx, op)?;
+        tx.commit().map_err(CatalogStoreError::from)?;
+        Ok(true)
     }
 
     /// Full source/candidate and packing EOFs precede the final writer. Exact

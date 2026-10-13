@@ -18,6 +18,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod packing_output_cleanup;
 #[cfg(test)]
 mod packing_payload_tests;
 

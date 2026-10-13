@@ -40,7 +40,7 @@ pub struct CatalogPackingPayload {
 }
 
 impl CatalogPackingPayload {
-    fn validate(&self) -> Result<(), CatalogStoreError> {
+    pub(super) fn validate(&self) -> Result<(), CatalogStoreError> {
         self.commitment
             .validate()
             .map_err(|_| DatabaseError::Integrity)?;

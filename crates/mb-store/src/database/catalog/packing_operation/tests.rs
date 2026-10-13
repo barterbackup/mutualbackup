@@ -564,3 +564,206 @@ fn packing_operation_keeps_complete_directory_parts_at_supported_slot_boundaries
         .unwrap();
     }
 }
+
+#[test]
+fn cancelled_packing_output_retirement_waits_for_loans_and_retires_one_exact_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = ControlStore::open_with_key(dir.path().join("control.db"), &[7; 32]).unwrap();
+    let f = Fixture::new(true, false);
+    let op = op(&f, 16384);
+    setup(&s, &f);
+    run(&s, &f, op).unwrap();
+    let plan = s
+        .next_catalog_packing_operation_attempt(op, None)
+        .unwrap()
+        .unwrap();
+    let retire = || {
+        s.retire_catalog_packing_operation_output_checked(
+            op,
+            &plan,
+            |v| guard(v, op),
+            |_, _, _| Ok::<_, CatalogStoreError>(true),
+        )
+    };
+    assert!(retire().is_err());
+    s.cancel_catalog_packing_operation(op).unwrap();
+    assert!(
+        !s.retire_catalog_packing_operation_output_checked(
+            op,
+            &plan,
+            |v| guard(v, op),
+            |_, _, _| panic!("owned output cannot reach physical cleanup")
+        )
+        .unwrap()
+    );
+    while s.release_catalog_packing_payload(op.payloads()).unwrap() {}
+    let before = s.records(&attempts(op.id)).unwrap().len();
+    assert!(
+        s.retire_catalog_packing_operation_output_checked(
+            op,
+            &plan,
+            |v| guard(v, op),
+            |_, p, output| {
+                assert_eq!(p, &plan);
+                assert_eq!(output.unwrap().storage_id, plan.storage_id);
+                Ok::<_, CatalogStoreError>(true)
+            }
+        )
+        .unwrap()
+    );
+    assert_eq!(s.records(&attempts(op.id)).unwrap().len(), before - 1);
+    assert!(
+        s.get_record(&outputs(op.id), &plan.sector_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        s.retire_catalog_packing_operation_output_checked(
+            op,
+            &plan,
+            |v| guard(v, op),
+            |_, _, _| panic!("retired retry does no physical I/O")
+        )
+        .unwrap()
+    );
+    assert!(run(&s, &f, op).is_err());
+}
+
+#[test]
+fn cancelled_packing_output_retirement_preserves_offline_plans_and_rejects_substitution() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = ControlStore::open_with_key(dir.path().join("control.db"), &[7; 32]).unwrap();
+    let f = Fixture::new(true, false);
+    let op = op(&f, 16384);
+    setup(&s, &f);
+    assert!(
+        s.produce_catalog_packing_operation_checked(
+            op,
+            f.authority(),
+            (|v| guard(v, op), |_, _| Ok::<_, CatalogStoreError>(())),
+            (
+                |src, bytes| input(&f, src, bytes),
+                |_, _| Err(DatabaseError::Conflict.into())
+            ),
+            |_| Ok(())
+        )
+        .is_err()
+    );
+    s.cancel_catalog_packing_operation(op).unwrap();
+    let plan = s
+        .next_catalog_packing_operation_attempt(op, None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !s.retire_catalog_packing_operation_output_checked(
+            op,
+            &plan,
+            |v| guard(v, op),
+            |_, _, output| {
+                assert!(output.is_none());
+                Ok::<_, CatalogStoreError>(false)
+            }
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        s.next_catalog_packing_operation_attempt(op, None).unwrap(),
+        Some(plan.clone())
+    );
+    let mut wrong = plan.clone();
+    wrong.attempt_id = [94; 16];
+    assert!(
+        s.retire_catalog_packing_operation_output_checked(
+            op,
+            &wrong,
+            |v| guard(v, op),
+            |_, _, _| panic!("substitution before physical cleanup")
+        )
+        .is_err()
+    );
+    assert!(
+        s.retire_catalog_packing_operation_output_checked(
+            op,
+            &plan,
+            |v| guard(v, op),
+            |_, _, _| Ok::<_, CatalogStoreError>(true)
+        )
+        .unwrap()
+    );
+    assert!(
+        s.next_catalog_packing_operation_attempt(op, None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn cancelled_packing_output_retirement_faults_keep_plans_after_physical_success_and_retry() {
+    for kind in [
+        "catalog-packing-operation-output-v1/",
+        "catalog-packing-operation-attempt-v1/",
+        JOURNAL,
+    ] {
+        for action in ["ABORT", "IGNORE"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("control.db");
+            let s = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+            let f = Fixture::new(true, false);
+            let op = op(&f, 16384);
+            setup(&s, &f);
+            run(&s, &f, op).unwrap();
+            s.cancel_catalog_packing_operation(op).unwrap();
+            while s.release_catalog_packing_payload(op.payloads()).unwrap() {}
+            let plan = s
+                .next_catalog_packing_operation_attempt(op, None)
+                .unwrap()
+                .unwrap();
+            let event = if kind == JOURNAL { "UPDATE" } else { "DELETE" };
+            let row = if kind == JOURNAL { "NEW" } else { "OLD" };
+            let effect = if action == "ABORT" {
+                "RAISE(ABORT,'injected')"
+            } else {
+                "RAISE(IGNORE)"
+            };
+            s.connection.execute_batch(&format!("CREATE TEMP TRIGGER retirement_fault BEFORE {event} ON protocol_records WHEN {row}.kind LIKE '{kind}%' BEGIN SELECT {effect}; END;")).unwrap();
+            let physical = Cell::new(true);
+            assert!(
+                s.retire_catalog_packing_operation_output_checked(
+                    op,
+                    &plan,
+                    |v| guard(v, op),
+                    |_, _, _| {
+                        physical.set(false);
+                        Ok::<_, CatalogStoreError>(true)
+                    }
+                )
+                .is_err(),
+                "{kind} {action}"
+            );
+            assert!(!physical.get());
+            assert_eq!(
+                s.next_catalog_packing_operation_attempt(op, None).unwrap(),
+                Some(plan.clone())
+            );
+            assert!(
+                s.get_record(&outputs(op.id), &plan.sector_id)
+                    .unwrap()
+                    .is_some()
+            );
+            drop(s);
+            let s = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+            assert!(
+                s.retire_catalog_packing_operation_output_checked(
+                    op,
+                    &plan,
+                    |v| guard(v, op),
+                    |_, _, _| {
+                        assert!(!physical.get());
+                        Ok::<_, CatalogStoreError>(true)
+                    }
+                )
+                .unwrap()
+            );
+        }
+    }
+}
