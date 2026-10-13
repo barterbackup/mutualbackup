@@ -1,5 +1,6 @@
 mod checkpoint_directories;
 mod checkpoint_directory_retention;
+mod packing_checkpoint_handoff;
 mod paged_checkpoint_custody;
 mod paged_checkpoint_payload;
 mod paged_checkpoint_retention;

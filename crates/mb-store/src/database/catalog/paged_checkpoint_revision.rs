@@ -7,6 +7,7 @@ use mb_core::{
     CatalogCodingTraversalBudget as Work, PagedCheckpointTrust,
 };
 
+use super::checkpoint_body::Header;
 use super::paged_checkpoint_retention::{Layout, Proof, owned_certificate, validate_owner};
 use super::retention_journal as journal;
 use super::*;
@@ -268,7 +269,7 @@ pub(super) fn release<H: Layout>(
 }
 
 macro_rules! revision_api {
-    ($proof:ty, $retain:ident) => {
+    ($proof:ty, $retain:ident, $handoff:ident) => {
         impl ControlStore {
             /// Authenticate and retain one exact published private revision,
             /// including its bootstrap and native/source custody, under the
@@ -283,16 +284,41 @@ macro_rules! revision_api {
             ) -> Result<PagedCatalogSnapshot, E> {
                 self.retain_checkpoint_revision_checked(id, proof, key, read_trust, check)
             }
+
+            /// Acquire exact successor-checkpoint custody before releasing one
+            /// cancelled packing-source loan, in the same guarded writer.
+            /// Close the source-loan job first; that fences further borrowing
+            /// but keeps its bytes live. This does not activate a checkpoint.
+            pub fn $handoff<E: From<CatalogStoreError>>(
+                &self,
+                source: CatalogPackingSourceRetention,
+                id: Uuid,
+                proof: &$proof,
+                key: CatalogCheckpointRevisionKey,
+                read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+                check: impl FnOnce(&PagedCatalogSnapshot) -> Result<(), E>,
+            ) -> Result<PagedCatalogSnapshot, E> {
+                self.retain_checkpoint_revision_with_handoff(
+                    id,
+                    proof,
+                    key,
+                    Some(source),
+                    read_trust,
+                    check,
+                )
+            }
         }
     };
 }
 revision_api!(
     CatalogQuorumPagedCheckpointIndex,
-    retain_catalog_paged_checkpoint_revision_checked
+    retain_catalog_paged_checkpoint_revision_checked,
+    handoff_catalog_packing_source_to_paged_checkpoint_checked
 );
 revision_api!(
     CatalogQuorumPagedCheckpointDirectoryIndex,
-    retain_catalog_paged_checkpoint_directory_revision_checked
+    retain_catalog_paged_checkpoint_directory_revision_checked,
+    handoff_catalog_packing_source_to_paged_checkpoint_directory_checked
 );
 
 impl ControlStore {
@@ -305,6 +331,18 @@ impl ControlStore {
         id: Uuid,
         proof: &P,
         key: CatalogCheckpointRevisionKey,
+        read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
+        check: impl FnOnce(&PagedCatalogSnapshot) -> Result<(), E>,
+    ) -> Result<PagedCatalogSnapshot, E> {
+        self.retain_checkpoint_revision_with_handoff(id, proof, key, None, read_trust, check)
+    }
+
+    fn retain_checkpoint_revision_with_handoff<P: Proof, E: From<CatalogStoreError>>(
+        &self,
+        id: Uuid,
+        proof: &P,
+        key: CatalogCheckpointRevisionKey,
+        source: Option<CatalogPackingSourceRetention>,
         mut read_trust: impl FnMut() -> Result<PagedCheckpointTrust, CatalogStoreError>,
         check: impl FnOnce(&PagedCatalogSnapshot) -> Result<(), E>,
     ) -> Result<PagedCatalogSnapshot, E> {
@@ -314,6 +352,14 @@ impl ControlStore {
             }
             let retention = proof.retention(id)?;
             proof.recheck(&mut read_trust)?;
+            if let Some(source) = source
+                && (retention.checkpoint.guild_id() != source.base.guild_id
+                    || source.base.generation.checked_add(1)
+                        != Some(retention.checkpoint.generation())
+                    || retention.checkpoint.parent() != Some(source.base.checkpoint_hash))
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
             let Some(CatalogCheckpointAuthorityRecord::PagedRevision(signed)) =
                 proof.revision(key)?
             else {
@@ -342,8 +388,15 @@ impl ControlStore {
         }
         let previous_work = admitted_work(&tx, retention)?;
         let bytes = canonical_bytes(&expected).map_err(CatalogStoreError::from)?;
+        let destination = read(&tx, id, catalog.bundle.id)?;
+        let source_owned = source
+            .map(|source| packing_sources::check_handoff(&tx, source, &catalog))
+            .transpose()?;
+        if source_owned == Some(false) && destination.is_none() {
+            return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
+        }
         // Reject one-sided damage rather than silently repairing a lost pin.
-        let next = if read(&tx, id, catalog.bundle.id)?.is_none() {
+        let next = if destination.is_none() {
             let next = previous_work
                 .unwrap_or_default()
                 .checked_add(expected.work)
@@ -359,6 +412,15 @@ impl ControlStore {
             insert_exact(&tx, &owners(catalog.bundle.id), id.as_bytes(), &bytes)?;
             change_work(&tx, retention, previous_work, next)?;
         }
+        if source_owned == Some(true)
+            && !packing_sources::release_exact(
+                &tx,
+                source.ok_or(CatalogStoreError::from(DatabaseError::Integrity))?,
+                catalog.bundle.id,
+            )?
+        {
+            return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+        }
         if read(&tx, id, catalog.bundle.id)?.as_ref() != Some(&catalog) {
             return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
         }
@@ -370,6 +432,11 @@ impl ControlStore {
         owned_certificate(&tx, retention)?;
         admitted_work(&tx, retention)?;
         self.guard_paged_candidate(retention, &mut read_trust)?;
+        if let Some(source) = source
+            && packing_sources::check_handoff(&tx, source, &catalog)?
+        {
+            return Err(CatalogStoreError::from(DatabaseError::Integrity).into());
+        }
         tx.commit().map_err(CatalogStoreError::from)?;
         Ok(catalog)
     }

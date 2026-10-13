@@ -352,6 +352,59 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Atomic packing-source handoff to checkpoint custody
+
+Both public checkpoint layouts now acquire exact successor-checkpoint custody
+before releasing a packing-source loan in the same guarded writer. The completed
+original-history proof, quorum certificate and signed revision must match the
+published destination owner and the exact local private catalog. The successor
+must have the borrowed base as parent and advance its generation by one. Source
+authorization remains with the original packing proof; this transfer grants no
+payload availability or checkpoint activation.
+
+Closing the source-loan job prevents further borrowing while keeping its loans
+live; the enclosing packing operation has its own completion state. Transfer
+requires that closed job and the unchanged original loan. Destination work is
+admitted before private authentication. Forward/reverse destination ownership
+and work are written before the conditional source release; both sides commit
+together within one writer.
+Abort, ignored writes, private failure or a late head/event change roll back
+both owners. An absent source loan permits an exact reauthenticated retry only
+if that same destination dependency already exists; it cannot create a new
+destination owner. Existing bounded failed-job release uses the same checked
+primitive and retains its previous behavior and persisted journal format.
+
+Node borrowing checks explicit CAPP/job work, active database and scoped quota
+admission, indexed original membership, the actual current checkpoint base and
+the locally authenticated original private descriptor. Node handoff wrappers
+apply current original-history trust and local private authentication. The real
+Linux capture/recovery fixture now installs verified original guild history,
+borrows a captured source alongside a shared capture, preserves serving through
+reopen and source loss,
+rejects capture cancellation while borrowed and releases only after closing
+the loan job. Store handoff is qualified for both layouts; this fixture does not
+exercise a complete Node packing operation or successor-checkpoint handoff.
+
+Eight new handoff regressions cover shared ownership/reopen, bootstrap/native
+custody, exact retry, wrong successor identity, open/missing loans, private and
+late-head failure, and abort/ignore at all seven transfer write boundaries.
+Eight existing source-loan regressions also pass. Full frozen qualification
+passes 1,487 distinct/executed tests, including 473 ordinary Store and 560
+ordinary Node tests, the bulk writer and all four provisioned Linux native
+fixtures. Formatting, strict locked workspace/all-targets Clippy and four debug
+builds pass. Audits cover 359 inputs, 356 code/dependency inputs, 23 exact
+executables and 19 drivers; 121 other ignored cases remain unexecuted.
+Retirement reclaims 10.72 GiB; target uses 48.59 GiB. Older archives,
+the exact previous failed Node executable, 14 auxiliary WIP files and 10
+installed roots remain preserved. Evidence: `/tmp/mb-m6-packing-checkpoint-handoff-7zoqtutr`.
+
+Durable Node packing/coding operation and emitted-page/payload custody,
+complete aggregate quotas/admission, distributed availability, checkpoint
+activation, normal backup/retention/seed-only recovery, remaining legacy
+consumers and R5/R7 remain open. Normal paged producers stay disabled.
+Real dense 1 TiB and actual Windows/macOS hardware qualification remain
+user-deferred until the tool and other software items are ready.
+
 ## Durable source custody for pending packing
 
 `CatalogPackingSourceRetention` now loans an exact published paged revision to

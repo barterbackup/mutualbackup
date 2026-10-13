@@ -234,6 +234,73 @@ pub(super) fn require_unretained(
     Ok(())
 }
 
+/// An absent loan is a retry only when that exact destination already owns it.
+pub(super) fn check_handoff(
+    connection: &Connection,
+    retention: CatalogPackingSourceRetention,
+    catalog: &PagedCatalogSnapshot,
+) -> Result<bool, CatalogStoreError> {
+    if require(connection, retention)?.state != CatalogPackingSourceRetentionState::Cancelled {
+        return Err(DatabaseError::Conflict.into());
+    }
+    match read(connection, retention.id, catalog.bundle.id)? {
+        Some(original) if original == *catalog => Ok(true),
+        Some(_) => Err(DatabaseError::Conflict.into()),
+        None => Ok(false),
+    }
+}
+
+// The enclosing Immediate writer owns both ends of a handoff. Ordinary
+// cancellation cleanup uses this same bounded conditional release path.
+pub(super) fn release_exact(
+    connection: &Connection,
+    retention: CatalogPackingSourceRetention,
+    revision: Uuid,
+) -> Result<bool, CatalogStoreError> {
+    let previous = require(connection, retention)?;
+    if previous.state != CatalogPackingSourceRetentionState::Cancelled {
+        return Err(DatabaseError::Conflict.into());
+    }
+    let Some(catalog) = read(connection, retention.id, revision)? else {
+        return Ok(false);
+    };
+    let expected = dependency(&catalog)?;
+    let count = owner_count(connection, revision)?.ok_or(DatabaseError::Integrity)?;
+    let bytes = encode(&expected)?;
+    for (kind, key) in [
+        (revisions(retention.id), revision),
+        (owners(revision), retention.id),
+    ] {
+        if connection.execute(
+            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![kind, key.as_bytes(), bytes],
+        )? != 1
+            || bounded_record(connection, &kind, key.as_bytes(), ROW_BYTES)?.is_some()
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+    }
+    change_owner_count(
+        connection,
+        revision,
+        Some(count),
+        count.checked_sub(1).ok_or(DatabaseError::Integrity)?,
+    )?;
+    change(
+        connection,
+        previous,
+        Journal {
+            dependencies: previous
+                .dependencies
+                .checked_sub(1)
+                .ok_or(DatabaseError::Integrity)?,
+            work: previous.work.remaining_after(expected.work)?,
+            ..previous
+        },
+    )?;
+    Ok(true)
+}
+
 fn owner_count(connection: &Connection, revision: Uuid) -> Result<Option<u64>, CatalogStoreError> {
     let stored = bounded_record(connection, OWNER_COUNT, revision.as_bytes(), ROW_BYTES)?;
     let count: Option<u64> = stored.as_deref().map(decode).transpose()?;
@@ -521,41 +588,9 @@ impl ControlStore {
         let Some(key) = key else { return Ok(false) };
         let revision = Uuid::from_slice(&key.ok_or(DatabaseError::Integrity)?)
             .map_err(|_| DatabaseError::Integrity)?;
-        let catalog = read(&tx, retention.id, revision)?.ok_or(DatabaseError::Integrity)?;
-        let expected = dependency(&catalog)?;
-        let count = owner_count(&tx, revision)?.ok_or(DatabaseError::Integrity)?;
-        let bytes = encode(&expected)?;
-        for (kind, key) in [
-            (revisions(retention.id), revision),
-            (owners(revision), retention.id),
-        ] {
-            if tx.execute(
-                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
-                params![kind, key.as_bytes(), bytes],
-            )? != 1
-                || bounded_record(&tx, &kind, key.as_bytes(), ROW_BYTES)?.is_some()
-            {
-                return Err(DatabaseError::Integrity.into());
-            }
+        if !release_exact(&tx, retention, revision)? {
+            return Err(DatabaseError::Integrity.into());
         }
-        change_owner_count(
-            &tx,
-            revision,
-            Some(count),
-            count.checked_sub(1).ok_or(DatabaseError::Integrity)?,
-        )?;
-        change(
-            &tx,
-            previous,
-            Journal {
-                dependencies: previous
-                    .dependencies
-                    .checked_sub(1)
-                    .ok_or(DatabaseError::Integrity)?,
-                work: previous.work.remaining_after(expected.work)?,
-                ..previous
-            },
-        )?;
         tx.commit()?;
         Ok(true)
     }

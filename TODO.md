@@ -2553,6 +2553,23 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Hand closed packing-source loans to successor checkpoint custody atomically.
+      Both layouts require the completed original-history proof, exact owned
+      certificate/private catalog and immediate successor parent/generation.
+      Admit destination work before authentication; acquire destination pins
+      before conditional source release within one guarded writer. Exact retries
+      require the already-owned destination. Closing source loans fences further
+      borrowing without representing producer completion. Node checks indexed
+      current authority, actual base, CAPP/scoped admission and private seed
+      ownership. Eight transfer/rollback regressions, eight existing loan cases
+      and the extended real Linux capture/reopen/cancel fixture pass. Full frozen
+      qualification passes 1,487 tests, format, strict Clippy, four builds and
+      359-input/23-executable audits; 121 other ignored cases remain unexecuted.
+      Retirement reclaims 10.72 GiB; target uses 48.59 GiB. Durable
+      packing/coding output custody, complete quotas/admission, checkpoint
+      activation, normal backup/retention/seed recovery and R5/R7 stay open.
+      Normal producers stay disabled; hardware qualification remains deferred.
+      See ADR 0002 and `/tmp/mb-m6-packing-checkpoint-handoff-7zoqtutr`.
     - [x] Keep published paged source custody live for pending packing jobs.
       Bind immutable local operation/base/budget, exact signed revision/private
       catalog identity and original bundle/bootstrap/source pins under one writer.

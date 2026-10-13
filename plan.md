@@ -1582,6 +1582,20 @@ Eight lifetime/rollback regressions and 1,479 full qualification tests pass on
 complete quotas/admission, normal backup/retention/seed recovery and remaining
 software gates stay open. See ADR 0002 and `/tmp/mb-m6-packing-source-custody-fgsiuzee`.
 
+Closed packing-source loans can now hand exact private catalog custody to the
+immediate successor checkpoint atomically in both public layouts. Original
+quorum/history, actual base/events, destination admission and local private
+authentication guard acquisition before source release; exact retries keep
+the same destination owner. Node borrowing and the real Linux capture/reopen
+fixture preserve source serving and reject cancellation while borrowed. Eight
+new transfer cases, eight existing loan cases and 1,487 full qualification tests
+pass on 359 inputs and 23 executables. Retirement reclaims 10.72 GiB;
+target uses 48.59 GiB. Durable packing/coding output custody, complete
+quotas/admission, distributed availability/activation, normal backup/retention/
+seed recovery and R5/R7 remain open. Normal producers stay disabled; the user
+defers real dense 1 TiB and native Windows/macOS hardware qualification until
+the tool and other software items are ready. See ADR 0002 and `/tmp/mb-m6-packing-checkpoint-handoff-7zoqtutr`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

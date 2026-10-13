@@ -1,6 +1,106 @@
 //! Shared original-authority and local private/READY custody for both public layouts.
 use super::*;
 
+impl Node {
+    /// Borrow this node's exact published paged source before packing reads.
+    /// The enclosing producer still supplies complete original source/candidate
+    /// authority. Current indexed membership/base and private seed ownership
+    /// are checked independently; no backup head or protection is published.
+    pub fn retain_paged_packing_source(
+        &self,
+        source: mb_store::CatalogPackingSourceRetention,
+        signed: &SignedRecord<mb_core::PagedUserRevision>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            signed.value.owner == self.keys.node_id()
+                && signed.value.guild_id == source.base.guild_id,
+            "packing private source belongs to another owner or guild"
+        );
+        let policy = self
+            .control
+            .catalog_capacity_policy()?
+            .context("packing sources require explicit capacity admission")?;
+        anyhow::ensure!(
+            source.budget == policy.plan()?.job_work
+                && self
+                    .control
+                    .record_quota_usage()?
+                    .is_some_and(|usage| usage.state == mb_store::DatabaseRecordQuotaState::Active)
+                && self.control.page_quota_usage()?.is_some()
+                && self.control.journal_quota_usage()?.is_some()
+                && self.control.catalog_storage_usage()?.is_some()
+                && self
+                    .control
+                    .catalog_dataset_storage_usage(signed.value.scope())?
+                    .is_some()
+                && self
+                    .control
+                    .catalog_guild_storage_usage(source.base.guild_id)?
+                    .is_some(),
+            "packing sources require active database and scoped admission"
+        );
+        let authority = guild_authority::frozen_original_history(&self.control)?;
+        anyhow::ensure!(
+            authority.snapshot().guild_id == source.base.guild_id
+                && authority
+                    .snapshot()
+                    .active_members()
+                    .any(|member| member.node_id == self.keys.node_id()),
+            "packing source owner is not a current guild member"
+        );
+        let guard = |_: &mb_store::CatalogPackingSourceView<'_>| -> Result<()> {
+            authority.check()?;
+            self.control.check_catalog_capacity_policy(policy)?;
+            anyhow::ensure!(
+                self.control
+                    .checkpoint_head_identity(&source.base.guild_id)?
+                    == Some((source.base.generation, source.base.checkpoint_hash)),
+                "packing source checkpoint base changed"
+            );
+            Ok(())
+        };
+        self.control
+            .begin_catalog_packing_source_retention(source, guard)?;
+        self.control.retain_catalog_packing_source_checked(
+            source,
+            signed,
+            (guard, |_, snapshot| -> Result<()> {
+                let opened = crate::PagedPrivateMetadata::open_local_snapshot(
+                    &self.keys,
+                    snapshot,
+                    signed.value.scope(),
+                )?;
+                anyhow::ensure!(
+                    opened.private.is_some() && opened.revision == *signed,
+                    "packing private source is retired or changed"
+                );
+                Ok(())
+            }),
+        )?;
+        authority.check()?;
+        Ok(())
+    }
+
+    /// Fence further source borrowing while retaining all existing loans.
+    /// Successful handoff and failed-operation cleanup both close this source
+    /// owner; the enclosing packing operation has its own completion state.
+    pub fn close_paged_packing_sources(
+        &self,
+        source: mb_store::CatalogPackingSourceRetention,
+    ) -> Result<()> {
+        self.control
+            .cancel_catalog_packing_source_retention(source)?;
+        Ok(())
+    }
+
+    pub fn release_paged_packing_source_step(
+        &self,
+        source: mb_store::CatalogPackingSourceRetention,
+    ) -> Result<bool> {
+        Ok(self.control.release_catalog_packing_source(source)?)
+    }
+}
+
 macro_rules! custody_reads {
     ($node:ty) => {
         impl $node {
@@ -59,8 +159,54 @@ custody_reads!(NodeReader);
 macro_rules! custody {
     ($proof:ty, $retention:ty, $metadata:ident, $revision:ident, $payload:ident,
      $retain:ident, $retain_revision:ident, $retain_payload:ident,
-     $step:ident, $retain_step:ident, $legacy:ident, $retain_legacy:ident) => {
+     $step:ident, $retain_step:ident, $legacy:ident, $retain_legacy:ident,
+     $handoff:ident, $transfer:ident) => {
         impl Node {
+            /// Hand one closed packing-source loan to the exact original-history
+            /// successor checkpoint in one writer, with seed/private, current
+            /// base/event and complete public proof guards. Payload availability
+            /// and checkpoint activation remain required separate operations.
+            pub fn $handoff(
+                &self,
+                source: mb_store::CatalogPackingSourceRetention,
+                id: Uuid,
+                proof: &$proof,
+                key: mb_core::CatalogCheckpointRevisionKey,
+            ) -> Result<()> {
+                anyhow::ensure!(
+                    key.owner == self.keys.node_id(),
+                    "packing source belongs to another owner"
+                );
+                guild_authority::with_history(&self.control, |authority| {
+                    self.control.$transfer(
+                        source,
+                        id,
+                        proof,
+                        key,
+                        || {
+                            authority.paged_checkpoint_trust().map_err(|_| {
+                                mb_store::CatalogStoreError::Database(
+                                    mb_store::DatabaseError::Conflict,
+                                )
+                            })
+                        },
+                        |snapshot| -> Result<()> {
+                            let opened = crate::PagedPrivateMetadata::open_local_snapshot(
+                                &self.keys,
+                                snapshot,
+                                snapshot.bundle.scope,
+                            )?;
+                            anyhow::ensure!(
+                                opened.private.is_some(),
+                                "packing private source is retired"
+                            );
+                            Ok(())
+                        },
+                    )?;
+                    Ok(())
+                })?
+                .context("packing handoff requires original guild authority")
+            }
             /// Retain this node's existing authenticated conversion for an
             /// original legacy revision. The checkpoint keeps the old signed
             /// identity; the conversion stays a separate local private owner.
@@ -289,7 +435,9 @@ custody!(
     retain_paged_checkpoint_local_custody_step,
     retain_catalog_paged_checkpoint_local_custody_step_checked,
     retain_paged_checkpoint_local_legacy_revision,
-    retain_catalog_paged_checkpoint_legacy_revision_checked
+    retain_catalog_paged_checkpoint_legacy_revision_checked,
+    handoff_paged_packing_source_to_checkpoint,
+    handoff_catalog_packing_source_to_paged_checkpoint_checked
 );
 custody!(
     mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
@@ -303,5 +451,7 @@ custody!(
     retain_paged_checkpoint_directory_local_custody_step,
     retain_catalog_paged_checkpoint_directory_local_custody_step_checked,
     retain_paged_checkpoint_directory_local_legacy_revision,
-    retain_catalog_paged_checkpoint_directory_legacy_revision_checked
+    retain_catalog_paged_checkpoint_directory_legacy_revision_checked,
+    handoff_paged_packing_source_to_checkpoint_directory,
+    handoff_catalog_packing_source_to_paged_checkpoint_directory_checked
 );

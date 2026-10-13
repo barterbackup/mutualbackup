@@ -16,6 +16,7 @@ pub(in crate::database::catalog) trait Layout:
     const PIN_PREFIX: u8;
     const OTHER_JOURNAL: &'static str;
     fn guild_id(self) -> [u8; 32];
+    fn parent(self) -> Option<[u8; 32]>;
     fn authority_root(self) -> mb_core::CatalogCheckpointAuthorityRoot;
     fn coding_root(self) -> mb_core::CatalogCodingDirectoryRoot;
     fn validate(self, budget: Work) -> Result<(), CatalogStoreError>;
@@ -44,6 +45,9 @@ macro_rules! header_facts {
         type Certificate = $certificate;
         fn guild_id(self) -> [u8; 32] {
             self.guild_id
+        }
+        fn parent(self) -> Option<[u8; 32]> {
+            self.parent
         }
         fn authority_root(self) -> mb_core::CatalogCheckpointAuthorityRoot {
             self.authority_root

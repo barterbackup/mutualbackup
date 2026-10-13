@@ -139,6 +139,19 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     let mut node = Node::open(&state, seed.clone()).unwrap();
     let certified = install_public_restore_fixture(&mut node, &seed);
     let guild = certified.value.guild_id;
+    let original = node.installed_guild().unwrap().unwrap().certificate;
+    let peers = original
+        .genesis
+        .members
+        .iter()
+        .cloned()
+        .map(|member| GuildPeer {
+            member,
+            endpoints: Vec::new(),
+        })
+        .collect();
+    node.adopt_recovered_guild(original, peers).unwrap();
+    while node.advance_guild_history_index().unwrap() {}
     let signing = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
     node.control
         .put_record(
@@ -240,6 +253,25 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
         after_shared.stored_logical_bytes,
         before_shared.stored_logical_bytes
     );
+    let checkpoint = node.current_checkpoint(guild).unwrap().unwrap();
+    let packing_source = mb_store::CatalogPackingSourceRetention {
+        id: Uuid::new_v4(),
+        base: mb_store::CatalogPackingAuthorityBase {
+            guild_id: guild,
+            checkpoint_hash: checkpoint.hash().unwrap(),
+            generation: checkpoint.checkpoint.generation,
+            membership_epoch: checkpoint
+                .checkpoint
+                .authority
+                .map(|authority| authority.membership_epoch),
+        },
+        budget: capacity().plan().unwrap().job_work,
+    };
+    node.retain_paged_packing_source(packing_source, &first)
+        .unwrap();
+    node.retain_paged_packing_source(packing_source, &first)
+        .unwrap();
+    assert!(node.cancel_paged_native_revision_catalog(first_id).is_err());
     let failed_id = Uuid::new_v4();
     let before_head = node.control.checkpoint_head(&guild).unwrap();
     let sql = format!(
@@ -317,6 +349,23 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     let mut tail = [0; 7];
     sparse.read_exact(&mut tail).unwrap();
     assert_eq!(&tail, b"tail\r\n\0");
+    node.retain_paged_packing_source(packing_source, &first)
+        .unwrap();
+    assert!(node.cancel_paged_native_revision_catalog(first_id).is_err());
+    node.close_paged_packing_sources(packing_source).unwrap();
+    assert!(
+        node.retain_paged_packing_source(packing_source, &first)
+            .is_err()
+    );
+    assert!(
+        node.release_paged_packing_source_step(packing_source)
+            .unwrap()
+    );
+    assert!(
+        !node
+            .release_paged_packing_source_step(packing_source)
+            .unwrap()
+    );
     for id in [first_id, second_id, failed_id] {
         let kind = format!("paged-native-capture-source-v1/{}", id.simple());
         while node
