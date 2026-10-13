@@ -352,6 +352,69 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Durable retained packing construction
+
+`CatalogPackingOperation` binds an immutable operation ID, original certified
+base, complete source/candidate/evidence identity, admitted authority work,
+packing policy and independent construction/source/output credits. Retries
+rebuild the original trusted authority and reject substitutions. Its guarded
+writer links the existing source and payload loan jobs to one reserved Packing
+page intent, checked role links and a bounded journal. Missing or one-sided
+parent records fail closed; ordinary publication, cancellation or child cleanup
+cannot bypass a live operation.
+
+The existing bounded allocator emits the original descriptors, chunks, source
+proofs and directory EOFs. Every physical callback is preceded by a durable
+planned attempt. Temporary physical storage IDs derive from operation and
+original sector IDs in a private namespace, so final information role 0 can
+coexist on the same volume without changing public sector or coding identities.
+Exact output descriptors must join retained payload loans. Full original
+source/sector directory validation, owned part roots, authenticated physical
+outputs and current base/events precede the final completion writer.
+
+Local `PackingComplete` keeps every emitted page and source/output dependency;
+it establishes neither coding completion nor distributed availability. Reopen
+revalidates the original authority and retained directory/output bytes without
+reading deleted original sources or staging duplicate payloads. Cancellation
+atomically fences construction and closes both child jobs and the page role;
+it removes no data. Existing bounded loan/page release remains explicit.
+Planned-attempt and output rows remain charged fencing/cleanup evidence,
+including crashes before any payload loan. Indexed physical and operation-row
+retirement is still required; the existing volume abort scans legacy global
+record families and is not a dense paged cleanup path.
+
+The explicit Node producer requires configured CAPP, active record/page/journal
+and guild page admission, indexed original membership and the actual checkpoint
+head. It writes real original volume attempts in bounded 64-KiB ranges and
+verifies exact physical loans. The existing CAPP still fixes newly packed
+output at 64 KiB; retained coding payloads keep their wider compatibility path.
+Complete input custody remains an independently supplied callback: this change
+does not yet wire all paged/remote/legacy input owners into normal backup.
+Ten Store regressions cover insufficient aggregate credit before I/O,
+initialization/planning/output/cancellation ABORT and IGNORE, late-head rollback,
+missing parent links, deterministic pre-loan crash evidence, full directory
+parts at 16-byte and 32-KiB slots, reopen/retry and cleanup exclusion. A real
+Node regression packs an original signed legacy input, rejects widening the
+existing fixed-output CAPP, and retains output through
+reopen and input loss, preserves public sector identity and coexisting final
+role 0, and releases custody only after cancellation.
+
+Frozen qualification passes 1,510 distinct/executed cases, including 491 Store
+and 565 Node ordinary cases, the bulk journal writer and all four provisioned
+Linux native fixtures. Format, strict locked workspace/all-targets Clippy and
+four debug builds pass. Audits bind 366 inputs, 363 code/dependency inputs,
+23 executables and 19 drivers; 121 other ignored cases remain unexecuted.
+Superseded qualification retirement reclaims 10.75 GiB; target uses
+48.62 GiB. Older archives, exact failed Node evidence, 14 auxiliary WIP
+files and 10 installed result roots remain preserved. Evidence: `/tmp/mb-m6-packing-operation-q30xcx8b`.
+
+Complete single-owner 1 TiB metadata admission, aggregate physical quotas,
+bounded cleanup, source custody integration, coding/checkpoint ownership,
+distributed availability/activation, normal paged retention and seed recovery,
+remaining legacy consumers, R5 and installed artifact qualification stay open.
+Normal paged producers remain disabled. Actual dense 1 TiB and Windows/macOS
+hardware runs remain user-deferred until software is ready.
+
 ## Pending packing payload custody
 
 `CatalogPackingPayloadRetention` now keeps an exact original volume/attempt,

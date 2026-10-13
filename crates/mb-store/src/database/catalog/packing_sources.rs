@@ -170,6 +170,73 @@ fn require(
     Ok(journal)
 }
 
+pub(super) fn operation_state(
+    connection: &Connection,
+    retention: CatalogPackingSourceRetention,
+) -> Result<(CatalogPackingSourceRetentionState, Work), CatalogStoreError> {
+    let value = require(connection, retention)?;
+    Ok((value.state, value.work))
+}
+pub(super) fn operation_source(
+    connection: &Connection,
+    retention: CatalogPackingSourceRetention,
+    revision: Uuid,
+) -> Result<Option<PagedCatalogSnapshot>, CatalogStoreError> {
+    require(connection, retention)?;
+    read(connection, retention.id, revision)
+}
+pub(super) fn begin_for_operation(
+    connection: &Connection,
+    retention: CatalogPackingSourceRetention,
+) -> Result<(), CatalogStoreError> {
+    retention.validate()?;
+    match read_journal(connection, retention.id)? {
+        Some(value)
+            if value.retention != retention
+                || value.state != CatalogPackingSourceRetentionState::Building =>
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        Some(_) => {}
+        None => {
+            let value = Journal {
+                version: 1,
+                retention,
+                state: CatalogPackingSourceRetentionState::Building,
+                dependencies: 0,
+                work: journal_work(),
+            };
+            insert_exact(
+                connection,
+                JOURNAL,
+                retention.id.as_bytes(),
+                &encode(&value)?,
+            )?;
+            if require(connection, retention)? != value {
+                return Err(DatabaseError::Integrity.into());
+            }
+        }
+    }
+    Ok(())
+}
+pub(super) fn close_for_operation(
+    connection: &Connection,
+    retention: CatalogPackingSourceRetention,
+) -> Result<(), CatalogStoreError> {
+    let previous = require(connection, retention)?;
+    if previous.state != CatalogPackingSourceRetentionState::Cancelled {
+        change(
+            connection,
+            previous,
+            Journal {
+                state: CatalogPackingSourceRetentionState::Cancelled,
+                ..previous
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn change(
     connection: &Connection,
     previous: Journal,
@@ -240,6 +307,7 @@ pub(super) fn check_handoff(
     retention: CatalogPackingSourceRetention,
     catalog: &PagedCatalogSnapshot,
 ) -> Result<bool, CatalogStoreError> {
+    packing_operation::require_job_handoff(connection, retention.id)?;
     if require(connection, retention)?.state != CatalogPackingSourceRetentionState::Cancelled {
         return Err(DatabaseError::Conflict.into());
     }
@@ -387,6 +455,7 @@ impl ControlStore {
         retention.validate()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(CatalogStoreError::from)?;
+        packing_operation::require_job_building(&tx, retention.id)?;
         let view = CatalogPackingSourceView { connection: &tx };
         guard(&view)?;
         match read_journal(&tx, retention.id)? {
@@ -444,6 +513,7 @@ impl ControlStore {
             .map_err(CatalogStoreError::from)?;
         let view = CatalogPackingSourceView { connection: &tx };
         let previous = require(&tx, retention)?;
+        packing_operation::require_job_building(&tx, retention.id)?;
         if previous.state != CatalogPackingSourceRetentionState::Building {
             return Err(CatalogStoreError::from(DatabaseError::Conflict).into());
         }
@@ -523,17 +593,8 @@ impl ControlStore {
         retention: CatalogPackingSourceRetention,
     ) -> Result<(), CatalogStoreError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let previous = require(&tx, retention)?;
-        if previous.state != CatalogPackingSourceRetentionState::Cancelled {
-            change(
-                &tx,
-                previous,
-                Journal {
-                    state: CatalogPackingSourceRetentionState::Cancelled,
-                    ..previous
-                },
-            )?;
-        }
+        packing_operation::require_job_retired(&tx, retention.id)?;
+        close_for_operation(&tx, retention)?;
         tx.commit()?;
         Ok(())
     }
@@ -577,6 +638,7 @@ impl ControlStore {
         retention: CatalogPackingSourceRetention,
     ) -> Result<bool, CatalogStoreError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        packing_operation::require_job_retired(&tx, retention.id)?;
         let previous = require(&tx, retention)?;
         if previous.state != CatalogPackingSourceRetentionState::Cancelled {
             return Err(DatabaseError::Conflict.into());

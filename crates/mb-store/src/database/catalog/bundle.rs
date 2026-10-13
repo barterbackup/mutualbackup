@@ -143,6 +143,7 @@ pub(super) fn require_unbundled(
     connection: &Connection,
     intent: CatalogIntent,
 ) -> Result<(), CatalogStoreError> {
+    super::packing_operation::require_role_retired(connection, intent)?;
     super::source::require_unlinked_source(connection, intent)?;
     if bounded_record(connection, LINK, intent.id.as_bytes(), 16)?.is_some() {
         return Err(DatabaseError::Conflict.into());

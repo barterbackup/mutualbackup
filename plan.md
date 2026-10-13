@@ -5636,3 +5636,16 @@ and physical policy, distributed readiness/current ownership, complete legacy
 joins, normal paged producers/retention/seed recovery, R5 and fresh installed
 R7 qualification remain open. Normal paged producers remain disabled. The real
 dense 1 TiB and native Windows/macOS gates remain user-deferred.
+
+Retained packing construction now binds original complete source authority to
+reserved page ownership, durable planned attempts and exact physical output
+loans. Local completion preserves the whole original directory and dependencies
+through reopen; cancellation fences all three children without deleting data.
+Private temporary storage identities preserve public sector/coding IDs and
+coexisting final role 0. Ten Store and one real Node regressions pass within
+1,510 frozen qualified cases, with 366-input/23-executable audits and
+four provisioned Linux native fixtures. Retirement reclaims 10.75 GiB;
+target uses 48.62 GiB. Complete source custody, aggregate single-owner
+admission/quotas, bounded cleanup, coding/activation, normal retention/seed
+recovery, legacy consumers and R5/R7 remain open. Normal producers stay disabled
+and hardware gates remain user-deferred. Evidence: `/tmp/mb-m6-packing-operation-q30xcx8b`; see ADR 0002.

@@ -241,6 +241,35 @@ pub struct CatalogPackingAuthority {
 }
 
 impl CatalogPackingAuthority {
+    /// Bind every original authority row, candidate, source and admitted debt.
+    /// This identity is for immutable local retries, never a substitute for
+    /// constructing the complete independently trusted authority again.
+    pub fn operation_identity(&self) -> Result<[u8; 32], CatalogStoreError> {
+        if self.sources != self.authenticated {
+            return Err(DatabaseError::NotReady.into());
+        }
+        authority_identity(
+            &self.store,
+            &(
+                self.base,
+                self.sources,
+                self.authenticated,
+                self.candidates,
+                self.required_signers,
+                self.authority_work(),
+                self.limit,
+            ),
+        )
+    }
+
+    pub fn authority_work(&self) -> CatalogCodingTraversalBudget {
+        CatalogCodingTraversalBudget {
+            bytes: self.bytes,
+            page_occurrences: self.pages,
+            records: self.records,
+        }
+    }
+
     /// Legacy certificates are decoded and verified by the existing bounded
     /// legacy path. This constructor intentionally does not make that flat
     /// verifier a scalable paged checkpoint consumer.
@@ -766,6 +795,34 @@ impl CatalogPackingAuthority {
             },
         })
     }
+}
+
+pub(super) fn authority_identity(
+    store: &RecordScratchStore,
+    facts: &impl Serialize,
+) -> Result<[u8; 32], CatalogStoreError> {
+    let mut hash =
+        blake3::Hasher::new_derive_key("mutualbackup packing operation original authority v1");
+    hash.update(&encoded(facts, 1024)?);
+    for kind in KINDS {
+        hash.update(&(kind.len() as u64).to_be_bytes());
+        hash.update(kind.as_bytes());
+        let mut after = None;
+        while let Some((key, bytes)) = store.next_record_bounded(
+            kind,
+            after.as_deref(),
+            96,
+            PAGED_USER_REVISION_BYTES.max(EVIDENCE_BYTES),
+        )? {
+            hash.update(&(key.len() as u64).to_be_bytes());
+            hash.update(&key);
+            hash.update(&(bytes.len() as u64).to_be_bytes());
+            hash.update(&bytes);
+            after = Some(key);
+        }
+        hash.update(&u64::MAX.to_be_bytes());
+    }
+    Ok(*hash.finalize().as_bytes())
 }
 
 /// Verified placements retain their trusted base and bounded signed candidates.

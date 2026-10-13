@@ -26,6 +26,7 @@ impl CatalogPackingAuthority {
         {
             return Err(DatabaseError::Conflict.into());
         }
+        let source_identity = self.operation_identity()?;
         self.store.with_record_transaction(|| {
             super::super::packing_directory_validation::build_index(
                 manifest,
@@ -42,6 +43,7 @@ impl CatalogPackingAuthority {
             )
         })?;
         Ok(CatalogCertifiedPackingDirectoryIndex {
+            source_identity,
             base: self.base,
             candidates: self.candidates,
             prior_work,
@@ -55,6 +57,7 @@ impl CatalogPackingAuthority {
 }
 
 pub struct CatalogCertifiedPackingDirectoryIndex {
+    source_identity: [u8; 32],
     base: CatalogPackingAuthorityBase,
     candidates: u64,
     prior_work: CatalogCodingTraversalBudget,
@@ -62,6 +65,21 @@ pub struct CatalogCertifiedPackingDirectoryIndex {
 }
 
 impl CatalogCertifiedPackingDirectoryIndex {
+    pub fn operation_identity(&self) -> [u8; 32] {
+        self.source_identity
+    }
+    pub fn require_complete(&self) -> Result<(), CatalogStoreError> {
+        self.index.require_complete()
+    }
+    pub fn sector(&self, id: [u8; 32]) -> Result<Option<CatalogPackingSector>, CatalogStoreError> {
+        self.index.sector(id)
+    }
+    pub(crate) fn operation_source_id(
+        &self,
+        key: [u8; 32],
+    ) -> Result<mb_core::CatalogPackedSourceId, CatalogStoreError> {
+        self.index.source_id(key)
+    }
     pub fn base(&self) -> CatalogPackingAuthorityBase {
         self.base
     }

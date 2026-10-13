@@ -59,6 +59,7 @@ type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
 mod checkpoint_custody;
 mod guild_authority;
+mod packing_operation;
 mod variable_coverage;
 
 type LegacyPackingAttestationEntries =

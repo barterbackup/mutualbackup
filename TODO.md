@@ -2553,6 +2553,22 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Own retained packing construction through complete directory validation.
+      Bind immutable original authority/candidates/evidence and independent work;
+      reserve the page role and fence source/output child jobs under guarded
+      writers. Persist planned attempts before physical I/O, keep temporary
+      storage IDs separate from unchanged public sector/coding identities, and
+      join exact output loans to every complete original directory descriptor.
+      Local completion retains all dependencies through reopen and source loss;
+      cancellation alone releases no data. Ten Store fault/boundary regressions
+      and a real Node packing/reopen/final-role-0 coexistence case pass.
+      Full frozen qualification passes 1,510 tests, format, strict Clippy,
+      four builds and 366-input/23-executable audits; 121 ignored cases stay
+      unexecuted. Retirement reclaims 10.75 GiB; target uses 48.62 GiB.
+      Complete source-owner integration, bounded indexed physical/operation-row
+      cleanup, aggregate quotas, coding/availability/checkpoint activation,
+      normal retention/seed recovery and R5/R7 remain open. Normal producers stay
+      disabled; hardware gates remain deferred. See ADR 0002 and `/tmp/mb-m6-packing-operation-q30xcx8b`.
     - [x] Retain pending packing payloads and fence physical attempt cleanup.
       Bind immutable operation/base/budget and exact original guild, storage,
       role, commitment, volume and attempt under checked bidirectional pins.

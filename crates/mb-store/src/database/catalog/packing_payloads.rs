@@ -190,6 +190,74 @@ fn require(
     }
     Ok(value)
 }
+
+pub(super) fn operation_state(
+    connection: &Connection,
+    retention: CatalogPackingPayloadRetention,
+) -> Result<(CatalogPackingPayloadRetentionState, Work), CatalogStoreError> {
+    let value = require(connection, retention)?;
+    Ok((value.state, value.work()?))
+}
+pub(super) fn begin_for_operation(
+    connection: &Connection,
+    retention: CatalogPackingPayloadRetention,
+) -> Result<(), CatalogStoreError> {
+    retention.validate()?;
+    match journal(connection, retention.id)? {
+        Some(old)
+            if old.retention != retention
+                || old.state != CatalogPackingPayloadRetentionState::Building =>
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        Some(_) => {}
+        None => {
+            let value = Journal {
+                version: 1,
+                retention,
+                state: CatalogPackingPayloadRetentionState::Building,
+                count: 0,
+                payload_bytes: 0,
+            };
+            insert_exact(
+                connection,
+                JOURNAL,
+                retention.id.as_bytes(),
+                &encode(&value)?,
+            )?;
+            if require(connection, retention)? != value {
+                return Err(DatabaseError::Integrity.into());
+            }
+        }
+    }
+    Ok(())
+}
+pub(super) fn close_for_operation(
+    connection: &Connection,
+    retention: CatalogPackingPayloadRetention,
+) -> Result<(), CatalogStoreError> {
+    let old = require(connection, retention)?;
+    if old.state != CatalogPackingPayloadRetentionState::Cancelled {
+        change(
+            connection,
+            old,
+            Journal {
+                state: CatalogPackingPayloadRetentionState::Cancelled,
+                ..old
+            },
+        )?;
+    }
+    Ok(())
+}
+pub(super) fn operation_payload(
+    connection: &Connection,
+    retention: CatalogPackingPayloadRetention,
+    storage: [u8; 32],
+    shard: u16,
+) -> Result<Option<CatalogPackingPayload>, CatalogStoreError> {
+    require(connection, retention)?;
+    read(connection, retention.id, &key(storage, shard))
+}
 fn change(connection: &Connection, old: Journal, next: Journal) -> Result<(), CatalogStoreError> {
     next.retention.budget.remaining_after(next.work()?)?;
     if connection.execute(
@@ -363,6 +431,7 @@ impl ControlStore {
         retention.validate()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(CatalogStoreError::from)?;
+        packing_operation::require_job_building(&tx, retention.id)?;
         let view = CatalogPackingPayloadView { connection: &tx };
         guard(&view)?;
         match journal(&tx, retention.id)? {
@@ -415,6 +484,7 @@ impl ControlStore {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(CatalogStoreError::from)?;
         let (mut guard, check) = callbacks;
+        packing_operation::require_job_building(&tx, retention.id)?;
         let view = CatalogPackingPayloadView { connection: &tx };
         guard(&view)?;
         let old = require(&tx, retention)?;
@@ -541,17 +611,8 @@ impl ControlStore {
         retention: CatalogPackingPayloadRetention,
     ) -> Result<(), CatalogStoreError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let old = require(&tx, retention)?;
-        if old.state != CatalogPackingPayloadRetentionState::Cancelled {
-            change(
-                &tx,
-                old,
-                Journal {
-                    state: CatalogPackingPayloadRetentionState::Cancelled,
-                    ..old
-                },
-            )?;
-        }
+        packing_operation::require_job_retired(&tx, retention.id)?;
+        close_for_operation(&tx, retention)?;
         tx.commit()?;
         Ok(())
     }
@@ -563,6 +624,7 @@ impl ControlStore {
         retention: CatalogPackingPayloadRetention,
     ) -> Result<bool, CatalogStoreError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        packing_operation::require_job_retired(&tx, retention.id)?;
         let old = require(&tx, retention)?;
         if old.state != CatalogPackingPayloadRetentionState::Cancelled {
             return Err(DatabaseError::Conflict.into());

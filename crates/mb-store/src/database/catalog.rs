@@ -30,6 +30,7 @@ mod packing_coding_retention;
 mod packing_directories_coverage;
 mod packing_directories_retention;
 mod packing_directory_validation;
+mod packing_operation;
 mod packing_payloads;
 mod packing_sources;
 mod packing_validation;
@@ -101,6 +102,10 @@ pub use packing_directories_retention::{
 };
 pub use packing_directory_validation::{
     CatalogPackingDirectoryIndex, CatalogPackingDirectoryValidation,
+};
+pub use packing_operation::{
+    CatalogPackingOperation, CatalogPackingOperationState, CatalogPackingOperationView,
+    CatalogPackingOutputAttempt,
 };
 pub use packing_payloads::{
     CatalogPackingPayload, CatalogPackingPayloadRetention, CatalogPackingPayloadRetentionState,
@@ -325,6 +330,7 @@ fn publish_root(
     intent: CatalogIntent,
     root: CatalogPageRef,
 ) -> Result<(), CatalogStoreError> {
+    packing_operation::require_role_unattached(connection, intent)?;
     root.validate()?;
     let mut record = read_intent(connection, intent)?;
     if record.state != CatalogIntentState::Building
@@ -431,6 +437,66 @@ fn candidate_hash(
     }
 }
 
+pub(super) fn stage_page(
+    connection: &Connection,
+    intent: CatalogIntent,
+    reference: CatalogPageRef,
+    bytes: &[u8],
+) -> Result<(), CatalogStoreError> {
+    let contents = reference.verify_page(intent.scope, intent.section, bytes)?;
+    packing_operation::require_role_building(connection, intent)?;
+    let mut record = read_intent(connection, intent)?;
+    if record.state != CatalogIntentState::Building {
+        return Err(DatabaseError::Conflict.into());
+    }
+    let page = PageMetadata {
+        format_version: 1,
+        scope: intent.scope,
+        section: intent.section,
+        reference,
+    };
+    if let CatalogPageContents::Index(children) = &contents {
+        for child in children {
+            read_page(
+                connection,
+                PageMetadata {
+                    reference: *child,
+                    ..page
+                },
+            )?;
+        }
+    }
+    storage_quota::stage(connection, intent, reference, bytes)?;
+    insert_exact(connection, PAGE, &reference.hash, bytes)?;
+    insert_exact(connection, META, &reference.hash, &canonical_bytes(&page)?)?;
+    read_page(connection, page)?;
+    let owner_kind = owners(intent);
+    if bounded_record(connection, &owner_kind, &reference.hash, 0)?.is_none() {
+        if record.owned_pages == CATALOG_MAX_PAGE_OCCURRENCES {
+            return Err(DatabaseError::CapacityExceeded.into());
+        }
+        insert_exact(connection, &owner_kind, &reference.hash, &[])?;
+        record.owned_pages += 1;
+        record.owned_bytes += bytes.len() as u64;
+        write_intent(connection, &record)?;
+    }
+    insert_exact(connection, &pins(reference.hash), intent.id.as_bytes(), &[])?;
+    if let CatalogPageContents::Index(children) = contents {
+        for child in children {
+            insert_exact(connection, &parents(child.hash), &reference.hash, &[])?;
+            connection.execute(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                params![GC, child.hash],
+            )?;
+        }
+    }
+    connection.execute(
+        "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+        params![GC, reference.hash],
+    )?;
+    Ok(())
+}
+
 impl ControlStore {
     /// IDs are immutable; cancelled records remain as small fencing tombstones.
     /// Retirement of those tombstones needs a future authenticated generation
@@ -462,68 +528,9 @@ impl ControlStore {
         reference: CatalogPageRef,
         bytes: &[u8],
     ) -> Result<(), CatalogStoreError> {
-        let contents = reference.verify_page(intent.scope, intent.section, bytes)?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut record = read_intent(&transaction, intent)?;
-        if record.state != CatalogIntentState::Building {
-            return Err(DatabaseError::Conflict.into());
-        }
-        let page = PageMetadata {
-            format_version: 1,
-            scope: intent.scope,
-            section: intent.section,
-            reference,
-        };
-        if let CatalogPageContents::Index(children) = &contents {
-            for child in children {
-                read_page(
-                    &transaction,
-                    PageMetadata {
-                        reference: *child,
-                        ..page
-                    },
-                )?;
-            }
-        }
-        storage_quota::stage(&transaction, intent, reference, bytes)?;
-        insert_exact(&transaction, PAGE, &reference.hash, bytes)?;
-        insert_exact(
-            &transaction,
-            META,
-            &reference.hash,
-            &canonical_bytes(&page)?,
-        )?;
-        read_page(&transaction, page)?;
-        let owner_kind = owners(intent);
-        if bounded_record(&transaction, &owner_kind, &reference.hash, 0)?.is_none() {
-            if record.owned_pages == CATALOG_MAX_PAGE_OCCURRENCES {
-                return Err(DatabaseError::CapacityExceeded.into());
-            }
-            insert_exact(&transaction, &owner_kind, &reference.hash, &[])?;
-            record.owned_pages += 1;
-            record.owned_bytes += bytes.len() as u64;
-            write_intent(&transaction, &record)?;
-        }
-        insert_exact(
-            &transaction,
-            &pins(reference.hash),
-            intent.id.as_bytes(),
-            &[],
-        )?;
-        if let CatalogPageContents::Index(children) = contents {
-            for child in children {
-                insert_exact(&transaction, &parents(child.hash), &reference.hash, &[])?;
-                transaction.execute(
-                    "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
-                    params![GC, child.hash],
-                )?;
-            }
-        }
-        transaction.execute(
-            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
-            params![GC, reference.hash],
-        )?;
+        stage_page(&transaction, intent, reference, bytes)?;
         transaction.commit()?;
         Ok(())
     }
@@ -612,6 +619,7 @@ impl ControlStore {
     pub fn release_catalog_pin(&self, intent: CatalogIntent) -> Result<bool, CatalogStoreError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        packing_operation::require_role_retired(&transaction, intent)?;
         let mut record = read_intent(&transaction, intent)?;
         let protected = match record.state {
             CatalogIntentState::Building => return Err(DatabaseError::Conflict.into()),
