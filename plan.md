@@ -5675,3 +5675,17 @@ All-format input custody, aggregate admission/quotas, coding/checkpoint
 availability/activation, normal retention/seed recovery, legacy consumers and
 R5/R7 remain open. Producers stay disabled and hardware stays user-deferred.
 Evidence: `/tmp/mb-m6-packing-input-join-bwnl73w8`; see ADR 0002.
+
+Retained packing outputs now enter the existing signed coding-information
+upload lifecycle through exact completed proof/output/loan and original root
+joins, current checkpoint/capacity/indexed event fences and bounded ciphertext
+verification. The real fixture retries receipt publication and reopen, activates
+through the original transcript verifier, then removes temporary outputs while
+preserving final READY information. Two new Store cases and 34 focused cases
+pass within a 1,524-case qualification on 368 inputs and 23 executables: 695
+fresh runs and 829 exact unchanged cases reused with source and binary guards.
+Retirement
+reclaims 9.46 GiB; target uses 49.71 GiB. Complete enclosing checkpoint
+and distributed integration, aggregate admission/quotas, normal retention/seed
+recovery, legacy consumers and R5/R7 remain open. Producers stay disabled and
+hardware stays user-deferred. Evidence: `/tmp/mb-m6-packing-coding-transfer-length-fe8xouxc`; see ADR 0002.

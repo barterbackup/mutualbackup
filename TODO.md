@@ -2553,6 +2553,23 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Transfer retained packing outputs into original signed coding roles.
+      Bind the completed proof, exact output/loan and original sector/root to
+      the current capacity, checkpoint and indexed guild authority. Reuse
+      bounded quota-aware volume uploads and reauthenticate interrupted STAGED
+      or READY retries. Only the original transcript lifecycle activates READY
+      data; temporary outputs retain independent custody until cancellation.
+      Two Store cases and the extended real Node fixture cover substitutions,
+      late authority, receipt publication interruption, bounded damaged rows,
+      source loss/reopen, verified activation and final-role preservation during
+      exact temporary cleanup. All 34 focused cases and the 1,524-case inventory
+      pass: 695 fresh runs and 829 exact unchanged cases reused with source and
+      binary guards. Format, strict Clippy, four builds and audits pass.
+      Retirement reclaims 9.46 GiB; target uses 49.71 GiB.
+      Complete checkpoint/distributed integration, aggregate admission/quotas,
+      normal retention/seed recovery, legacy consumers and R5/R7 remain open.
+      Producers stay disabled; hardware remains deferred. See ADR 0002 and
+      `/tmp/mb-m6-packing-coding-transfer-length-fe8xouxc`.
     - [x] Join original paged packing inputs to exact retained catalog loans.
       Check original guild/owner/protected-root, source address, flat root and
       commitment against held bootstrap/data/private-page bindings under the

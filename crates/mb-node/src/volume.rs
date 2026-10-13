@@ -1499,8 +1499,16 @@ impl StorageVolumes {
         let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
         let record_id = attempt_volume_object_id(attempt_id, group_id, shard);
         let bytes = control
-            .get_record("volume-attempt-receipt", &record_id)?
-            .or(control.get_record("volume-attempt-intent", &record_id)?)
+            .get_record_bounded(
+                "volume-attempt-receipt",
+                &record_id,
+                MAX_VOLUME_RECEIPT_BYTES,
+            )?
+            .or(control.get_record_bounded(
+                "volume-attempt-intent",
+                &record_id,
+                MAX_VOLUME_RECEIPT_BYTES,
+            )?)
             .context("staged parity volume receipt is unavailable")?;
         let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
         validate_attempt_volume_record(&record)?;
@@ -3981,7 +3989,7 @@ fn volume_object_id(group_id: &[u8; 32], shard_index: u8) -> Vec<u8> {
     id
 }
 
-fn attempt_volume_object_id(
+pub(crate) fn attempt_volume_object_id(
     attempt_id: &[u8; 16],
     group_id: &[u8; 32],
     shard_index: u8,

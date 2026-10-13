@@ -352,6 +352,65 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Retained packing outputs into original coding roles
+
+The explicit Node transfer joins a completed original packing proof, its exact
+operation journal, indexed output attempt and still-held payload loan to one
+original signed local information role. Guild, checkpoint base, current
+capacity/coding profile, membership, sector identity and full information
+logical length must agree. Original
+Merkle-bound packing descriptors use their Merkle binding; historical flat
+descriptors retain their BLAKE3 binding. Complete physical ciphertext is checked
+before reservation, using a bounded 64 KiB opening under the existing CAPP.
+Older wider coding profiles retain their original separate upload paths.
+
+The transfer freezes indexed original guild authority and checks it, actual
+checkpoint head, operation state and plan expiry around each upload transition.
+It reuses the node's open catalogs and the existing quota-aware volume
+reservation/write/finish lifecycle. Public sector IDs, signed plans, coding
+attempt IDs and transcripts remain unchanged. Temporary packing bytes retain
+their original loans while the coding role gains independent physical custody.
+Transfer produces STAGED data; only the existing original transcript verifier
+can activate READY data. A completed STAGED retry reauthenticates the exact
+bytes and finishes pending reservation retirement. Authenticated READY data can
+be reused. Present damaged locators fail instead of being treated as absence;
+attempt opening bounds each original receipt/intent to 512 bytes before decode.
+
+Two new Store regressions exercise exact completed-operation/output/loan joins,
+wrong or building/cancelled operations, missing outputs, reopen and damaged
+plan/loan rows. The real Node fixture now consumes retained packing bytes through
+an actual signed 3+2 coding plan. It rejects sector, commitment, root, base and
+logical-length changes
+before reservation, catches a checkpoint change during reservation, rejects
+damaged and oversized receipts, retries after interrupted receipt publication
+and source loss/reopen, and activates through the original verified transcript.
+Exact temporary-output cleanup then preserves the final READY information role.
+The first root-format probe failed before upload because the new bridge treated
+a Merkle descriptor as a flat root; its source, log and exact Node executable are
+preserved. The corrected final source passes all 34 focused cases.
+
+Full qualification binds 1,524 distinct/executed cases, including 501
+Store, 569 Node, the bulk journal writer and four provisioned Linux native
+fixtures. It reruns 695 cases on the corrected source and reuses 829
+unchanged Core/Git/Store/bulk cases only after exact executable hashes and
+unaffected dependency inputs match the preserved prior run. The pre-correction
+run was deliberately interrupted after the logical-length omission was found;
+its source, logs and artifact manifest remain preserved. Format, strict locked
+workspace/all-targets Clippy and four debug builds pass. Audits bind 368 inputs,
+365 code/dependency inputs, 23 executables
+and 19 drivers; 121 other ignored cases remain unexecuted. Retirement reclaims
+9.46 GiB; target uses 49.71 GiB. Older archives, both exact failed
+Node witnesses, the interrupted run's evidence, 14 auxiliary WIP files and all
+10 installed roots are preserved.
+Evidence: `/tmp/mb-m6-packing-coding-transfer-length-fe8xouxc`.
+
+This connects explicit local packing to the existing coding-upload and verified
+activation lifecycle. Complete enclosing checkpoint construction/publication,
+distributed availability, all-format input custody, aggregate admission/quotas,
+normal retention/seed recovery, legacy consumers and R5/R7 remain open. Normal
+paged producers stay disabled. Dense 1 TiB and native Windows/macOS hardware
+qualification remain user-deferred until software is ready.
+
 ## Exact retained paged packing input joins
 
 The packing writer view now joins one original authorised input to an exact

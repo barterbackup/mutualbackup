@@ -726,6 +726,27 @@ impl ControlStore {
         Ok(result)
     }
 
+    /// Resolve one original public sector to its exact completed temporary
+    /// output and still-held payload loan. This is a local custody lookup;
+    /// callers must separately check current authority and physical bytes.
+    pub fn catalog_completed_packing_output(
+        &self,
+        op: CatalogPackingOperation,
+        sector_id: [u8; 32],
+    ) -> Result<(CatalogPackingOutputAttempt, CatalogPackingPayload), CatalogStoreError> {
+        let tx = self.read_snapshot()?;
+        if !matches!(
+            require(&tx, op)?.state,
+            CatalogPackingOperationState::PackingComplete(_)
+        ) {
+            return Err(DatabaseError::NotReady.into());
+        }
+        let planned = attempt(&tx, op, sector_id)?.ok_or(DatabaseError::NotReady)?;
+        let payload = output(&tx, op, sector_id)?.ok_or(DatabaseError::NotReady)?;
+        tx.commit()?;
+        Ok((planned, payload))
+    }
+
     /// Retire one exact cancelled output after its loans are released. The
     /// callback holds this control writer across physical deletion and exact
     /// locator retirement. Offline/shared owners return false and retain the

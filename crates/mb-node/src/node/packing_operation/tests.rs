@@ -12,6 +12,72 @@ fn retained_packing_node_uses_real_volume_custody_reopens_and_preserves_final_ro
     retained_case(mb_core::V1_SECTOR_SIZE as u32);
 }
 
+fn information_plan(
+    node: &Node,
+    output: &mb_store::CatalogPackingOutputAttempt,
+    binding_root: [u8; 32],
+) -> SignedRecord<CodingAttemptPlan> {
+    let state = node.dynamic_guild_state().unwrap().unwrap();
+    let local = node.keys.node_id();
+    let mut members = state.active_members().cloned().collect::<Vec<_>>();
+    let index = members
+        .iter()
+        .position(|member| member.node_id == local)
+        .unwrap();
+    members.swap(0, index);
+    let size = mb_core::V1_SECTOR_SIZE as u32;
+    let information = (0..3)
+        .map(|index| mb_core::InformationRoleV2 {
+            owner: members[index].node_id,
+            failure_domain: members[index].failure_domain.clone(),
+            sector: mb_core::RangeSectorRef {
+                id: if index == 0 {
+                    output.sector_id
+                } else {
+                    [229 + index as u8; 32]
+                },
+                commitment: if index == 0 {
+                    output.commitment.clone()
+                } else {
+                    mb_core::merkle_zero_commitment(size).unwrap()
+                },
+                logical_len: size,
+                virtual_zero: index != 0,
+            },
+        })
+        .collect();
+    node.sign_coding_attempt_plan(CodingAttemptPlan {
+        format_version: 2,
+        attempt_id: [220; 16],
+        checkpoint_hash: node
+            .control
+            .checkpoint_head_identity(&state.guild_id)
+            .unwrap()
+            .unwrap()
+            .1,
+        membership_epoch: state.membership_epoch,
+        geometry: mb_core::CodingPlanGeometry {
+            format_version: 1,
+            guild_id: state.guild_id,
+            profile: CodingProfile::new(3, 2, size),
+            information,
+            parity: (0..2)
+                .map(|row| mb_core::ParityPlacementV2 {
+                    holder: members[3 + row].node_id,
+                    failure_domain: members[3 + row].failure_domain.clone(),
+                    row: row as u16,
+                })
+                .collect(),
+        },
+        delegator: local,
+        coding_coordinator: local,
+        verification_coordinator: members[1].node_id,
+        expires_at_unix_seconds: unix_seconds() + 600,
+        information_roots: Some(vec![binding_root, [0; 32], [0; 32]]),
+    })
+    .unwrap()
+}
+
 fn retained_case(sector_size: u32) {
     let temp = tempfile::tempdir().unwrap();
     let seed = Seed::from_bytes([218; 32]);
@@ -225,39 +291,105 @@ fn retained_case(sector_size: u32) {
         )
         .unwrap();
     let bytes = mb_core::merkle_verify_range(&planned.commitment, &range).unwrap();
-    // Final information role 0 uses the original public sector identity and
-    // coexists on the same physical volume with the retained temporary output.
-    let final_attempt = [221; 16];
-    node.volumes
-        .reserve_attempt(&node.control, &final_attempt, guild, 0, sector_size)
-        .unwrap();
-    for (index, chunk) in bytes.chunks(mb_core::V1_SECTOR_SIZE).enumerate() {
-        node.volumes
-            .write_attempt_range(
-                &node.control,
-                &final_attempt,
-                0,
-                (index * mb_core::V1_SECTOR_SIZE) as u32,
-                chunk,
-            )
-            .unwrap();
+    // The original signed coding lane consumes actual retained bytes. Root,
+    // address and base substitutions reject before taking a new reservation.
+    let plan = information_plan(&node, &planned, planned.commitment.root);
+    for damage in 0..5 {
+        let mut value = plan.value.clone();
+        value.attempt_id = [221 + damage; 16];
+        match damage {
+            0 => value.geometry.information[0].sector.id = [225; 32],
+            1 => value.geometry.information[0].sector.commitment.root = [226; 32],
+            2 => value.information_roots.as_mut().unwrap()[0] = [227; 32],
+            3 => value.checkpoint_hash = [228; 32],
+            _ => value.geometry.information[0].sector.logical_len = 1,
+        }
+        let wrong = node.sign_coding_attempt_plan(value).unwrap();
+        assert!(
+            node.stage_retained_packing_information(operation, &proof, &wrong, 0)
+                .is_err()
+        );
+        let mut key = wrong.value.attempt_id.to_vec();
+        key.push(0);
+        assert!(
+            node.control
+                .get_record("volume-attempt-reservation", &key)
+                .unwrap()
+                .is_none()
+        );
     }
-    node.volumes
-        .finish_attempt_upload(
-            &node.control,
-            &final_attempt,
-            planned.sector_id,
-            0,
-            &planned.commitment,
+    assert!(
+        node.stage_retained_packing_information(operation, &proof, &plan, 1)
+            .is_err()
+    );
+    let mut value = plan.value.clone();
+    value.attempt_id = [231; 16];
+    let late = node.sign_coding_attempt_plan(value).unwrap();
+    node.control.database_shell_statement(&format!(
+        "CREATE TEMP TRIGGER change_transfer_head AFTER INSERT ON protocol_records WHEN NEW.kind = 'volume-attempt-reservation' AND NEW.record_id = X'{}00' BEGIN UPDATE checkpoint_heads SET checkpoint_hash = X'{}' WHERE guild_id = X'{}'; END",
+        hex::encode(late.value.attempt_id), hex::encode([232; 32]), hex::encode(guild)
+    ), false).unwrap();
+    assert!(
+        node.stage_retained_packing_information(operation, &proof, &late, 0)
+            .is_err()
+    );
+    assert_eq!(
+        node.control.checkpoint_head_identity(&guild).unwrap(),
+        Some((1, [232; 32]))
+    );
+    node.control
+        .database_shell_statement("DROP TRIGGER change_transfer_head", false)
+        .unwrap();
+    node.control
+        .database_shell_statement(
+            &format!(
+                "UPDATE checkpoint_heads SET checkpoint_hash = X'{}' WHERE guild_id = X'{}'",
+                hex::encode(trusted),
+                hex::encode(guild)
+            ),
+            false,
         )
         .unwrap();
+    assert!(node.discard_coding_attempt(&late.value.attempt_id).unwrap());
+    node.volumes
+        .verify_packing_payload(&node.control, &payload)
+        .unwrap();
+    crate::volume::interrupt_next_volume_transition(
+        crate::volume::VolumeInterruption::CodingUploadReceiptStored,
+    );
+    assert!(
+        node.stage_retained_packing_information(operation, &proof, &plan, 0)
+            .is_err()
+    );
+    let key =
+        crate::volume::attempt_volume_object_id(&plan.value.attempt_id, &planned.sector_id, 0);
+    let receipt = node
+        .control
+        .get_record("volume-attempt-receipt", &key)
+        .unwrap()
+        .unwrap();
+    for damaged in [b"damaged exact receipt".to_vec(), vec![0; 513]] {
+        node.control
+            .put_record("volume-attempt-receipt", &key, &damaged)
+            .unwrap();
+        assert!(
+            node.stage_retained_packing_information(operation, &proof, &plan, 0)
+                .is_err()
+        );
+    }
+    node.control
+        .put_record("volume-attempt-receipt", &key, &receipt)
+        .unwrap();
+    node.stage_retained_packing_information(operation, &proof, &plan, 0)
+        .unwrap();
+    let final_attempt = plan.value.attempt_id;
     node.volumes
         .verify_packing_payload(&node.control, &payload)
         .unwrap();
     node.forget_local_sector(&reference.id).unwrap();
     drop(proof);
     drop(node);
-    let mut node = Node::open(temp.path(), seed).unwrap();
+    let mut node = Node::open(temp.path(), seed.clone()).unwrap();
     let replay = node
         .produce_retained_packing_operation(
             operation,
@@ -267,6 +399,36 @@ fn retained_case(sector_size: u32) {
         )
         .unwrap();
     assert_eq!(replay.manifest(), manifest);
+    node.stage_retained_packing_information(operation, &replay, &plan, 0)
+        .unwrap();
+    let mut keys = vec![KeyMaterial::from_seed(&seed)];
+    keys.extend(
+        (0_u8..4).map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 228; 32]))),
+    );
+    let shards = mb_core::encode(
+        plan.value.geometry.profile,
+        vec![
+            bytes.clone(),
+            vec![0; mb_core::V1_SECTOR_SIZE],
+            vec![0; mb_core::V1_SECTOR_SIZE],
+        ],
+    )
+    .unwrap();
+    let transcript = crate::node::tests::test_coding_transcript(plan.clone(), &shards, &keys);
+    assert_eq!(
+        mb_core::replay_coding_transcript(&transcript).unwrap(),
+        mb_core::CodingReplayFinding::Verified
+    );
+    node.activate_coding_attempt(&transcript).unwrap();
+    assert_eq!(
+        node.volumes
+            .load_ready_variable(&node.control, &planned.sector_id, 0)
+            .unwrap()
+            .bytes,
+        bytes
+    );
+    node.stage_retained_packing_information(operation, &replay, &plan, 0)
+        .unwrap();
     assert_eq!(
         node.control.checkpoint_head_identity(&guild).unwrap(),
         Some((1, trusted))
@@ -278,6 +440,10 @@ fn retained_case(sector_size: u32) {
         Some((_, CatalogPackingOperationState::PackingComplete(_)))
     ));
     node.cancel_retained_packing_operation(operation).unwrap();
+    assert!(
+        node.stage_retained_packing_information(operation, &replay, &plan, 0)
+            .is_err()
+    );
     assert!(
         !node
             .retire_retained_packing_output(operation, &planned)

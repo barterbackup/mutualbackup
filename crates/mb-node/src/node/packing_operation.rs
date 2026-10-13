@@ -133,6 +133,163 @@ impl Node {
         Ok(result)
     }
 
+    /// Transfer one completed packing output into its original signed coding
+    /// information role. Both attempts retain independent physical ownership;
+    /// only the existing verified transcript lifecycle can make the role READY.
+    pub fn stage_retained_packing_information(
+        &mut self,
+        operation: mb_store::CatalogPackingOperation,
+        proof: &mb_store::CatalogCertifiedPackingDirectoryIndex,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<()> {
+        let role = self.validate_local_coding_information(plan, shard_index)?;
+        anyhow::ensure!(
+            !role.sector.virtual_zero
+                && plan.value.checkpoint_hash == operation.base.checkpoint_hash
+                && plan.value.geometry.guild_id == operation.base.guild_id
+                && plan.value.geometry.profile == operation.policy.coding_profile
+                && operation
+                    .base
+                    .membership_epoch
+                    .is_none_or(|epoch| epoch == plan.value.membership_epoch)
+                && proof.base() == operation.base
+                && proof.operation_identity() == operation.source_identity,
+            "coding information does not belong to this packing operation"
+        );
+        let sector = proof
+            .sector(role.sector.id)?
+            .context("coding information is absent from the completed packing proof")?;
+        let expected_root = match (
+            plan.value.format_version,
+            proof.manifest().directory.packing_version,
+        ) {
+            (2, 1..=3) => sector.flat_root,
+            (3, 1 | 2) => sector.flat_root,
+            _ => anyhow::bail!("new packed information requires an original root-bound plan"),
+        };
+        anyhow::ensure!(
+            role.sector.commitment == sector.commitment
+                && role.sector.logical_len == sector.commitment.byte_len
+                && plan.value.information_root(usize::from(shard_index)) == Some(expected_root),
+            "coding information changed its original packing roots"
+        );
+        let control = &self.control;
+        let authority = guild_authority::frozen_original_history(control)?;
+        let check = || -> Result<()> {
+            authority.check()?;
+            anyhow::ensure!(
+                control.catalog_capacity_policy()? == Some(operation.policy)
+                    && control.checkpoint_head_identity(&operation.base.guild_id)?
+                        == Some((operation.base.generation, operation.base.checkpoint_hash))
+                    && control.catalog_packing_operation(operation.id)?
+                        == Some((
+                            operation,
+                            mb_store::CatalogPackingOperationState::PackingComplete(
+                                proof.manifest()
+                            )
+                        )),
+                "completed packing authority changed during coding transfer"
+            );
+            authority
+                .snapshot()
+                .validate_attempt_authority(&plan.value)?;
+            anyhow::ensure!(
+                plan.value.expires_at_unix_seconds >= unix_seconds(),
+                "coding attempt has expired"
+            );
+            Ok(())
+        };
+        check()?;
+        let (planned, payload) = control.catalog_completed_packing_output(operation, sector.id)?;
+        anyhow::ensure!(
+            planned.sector_index == sector.index
+                && planned.commitment == sector.commitment
+                && payload.commitment.byte_len as usize == mb_core::V1_SECTOR_SIZE,
+            "completed packing output changed its original descriptor"
+        );
+        // CAPP fixes newly packed sectors at 64 KiB. Existing wider coding
+        // profiles retain their original upload path and compatibility limits.
+        let volumes = &mut self.volumes;
+        volumes.verify_packing_payload(control, &payload)?;
+        let opening = volumes.open_attempt_range(
+            control,
+            &payload.attempt_id,
+            &payload.storage_id,
+            payload.shard_index,
+            0,
+            (mb_core::V1_SECTOR_SIZE / mb_core::MERKLE_LEAF_SIZE) as u32,
+        )?;
+        let bytes = mb_core::merkle_verify_range(&sector.commitment, &opening)?;
+        if proof.manifest().directory.packing_version < 3 {
+            anyhow::ensure!(
+                mb_core::sector_root(&bytes) == sector.flat_root,
+                "completed packing bytes changed their original flat root"
+            );
+        }
+        check()?;
+        if volumes
+            .load_ready_variable(control, &sector.id, shard_index)
+            .is_ok_and(|ready| {
+                ready.guild_id == operation.base.guild_id && ready.commitment == sector.commitment
+            })
+        {
+            check()?;
+            return Ok(());
+        }
+        // A finished STAGED upload also survives reopen. Reauthenticate its
+        // exact original bytes before retiring a leftover reservation.
+        let output_key = crate::volume::attempt_volume_object_id(
+            &plan.value.attempt_id,
+            &sector.id,
+            u8::try_from(shard_index)?,
+        );
+        if control
+            .record_length("volume-attempt-receipt", &output_key)?
+            .is_some()
+            || control
+                .record_length("volume-attempt-intent", &output_key)?
+                .is_some()
+        {
+            let opening = volumes.open_attempt_range(
+                control,
+                &plan.value.attempt_id,
+                &sector.id,
+                shard_index,
+                0,
+                (mb_core::V1_SECTOR_SIZE / mb_core::MERKLE_LEAF_SIZE) as u32,
+            )?;
+            anyhow::ensure!(
+                mb_core::merkle_verify_range(&sector.commitment, &opening)? == bytes,
+                "staged coding information differs from its retained packing output"
+            );
+        } else {
+            volumes.reserve_attempt(
+                control,
+                &plan.value.attempt_id,
+                operation.base.guild_id,
+                shard_index,
+                sector.commitment.byte_len,
+            )?;
+            check()?;
+            volumes.write_attempt_range(control, &plan.value.attempt_id, shard_index, 0, &bytes)?;
+            check()?;
+        }
+        volumes.finish_attempt_upload(
+            control,
+            &plan.value.attempt_id,
+            sector.id,
+            shard_index,
+            &sector.commitment,
+        )?;
+        check()?;
+        anyhow::ensure!(
+            control.catalog_completed_packing_output(operation, sector.id)? == (planned, payload),
+            "packing output ownership changed during coding transfer"
+        );
+        Ok(())
+    }
+
     /// Retire one indexed temporary output after cancellation and explicit
     /// loan release. False retains offline/shared/READY-migration obligations;
     /// the durable cursor can visit other outputs and revisit this one later.

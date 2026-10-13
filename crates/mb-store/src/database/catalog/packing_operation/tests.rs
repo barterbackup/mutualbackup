@@ -149,6 +149,92 @@ fn run(
 }
 
 #[test]
+fn completed_packing_output_lookup_requires_exact_operation_plan_and_held_loan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.db");
+    let s = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+    let f = Fixture::new(true, false);
+    let op = op(&f, 16384);
+    setup(&s, &f);
+    s.begin_catalog_packing_operation_checked(
+        op,
+        &f.authority(),
+        (|v| guard(v, op), |_, _| Ok::<_, CatalogStoreError>(())),
+    )
+    .unwrap();
+    assert!(s.catalog_completed_packing_output(op, [1; 32]).is_err());
+    let proof = run(&s, &f, op).unwrap();
+    let planned = s
+        .next_catalog_packing_operation_attempt(op, None)
+        .unwrap()
+        .unwrap();
+    let payload = s
+        .catalog_packing_payload(op.payloads(), planned.storage_id, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        s.catalog_completed_packing_output(op, planned.sector_id)
+            .unwrap(),
+        (planned.clone(), payload.clone())
+    );
+    assert!(s.catalog_completed_packing_output(op, [1; 32]).is_err());
+    let mut wrong = op;
+    wrong.base.checkpoint_hash = [2; 32];
+    assert!(
+        s.catalog_completed_packing_output(wrong, planned.sector_id)
+            .is_err()
+    );
+    drop(proof);
+    drop(s);
+    let s = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+    assert_eq!(
+        s.catalog_completed_packing_output(op, planned.sector_id)
+            .unwrap(),
+        (planned.clone(), payload)
+    );
+    s.cancel_catalog_packing_operation(op).unwrap();
+    assert!(
+        s.catalog_completed_packing_output(op, planned.sector_id)
+            .is_err()
+    );
+}
+
+#[test]
+fn completed_packing_output_lookup_rejects_damaged_exact_plan_and_loan_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = ControlStore::open_with_key(dir.path().join("control.db"), &[7; 32]).unwrap();
+    let f = Fixture::new(true, false);
+    let op = op(&f, 16384);
+    setup(&s, &f);
+    let _proof = run(&s, &f, op).unwrap();
+    let planned = s
+        .next_catalog_packing_operation_attempt(op, None)
+        .unwrap()
+        .unwrap();
+    let kind = attempts(op.id);
+    let original = s.get_record(&kind, &planned.sector_id).unwrap().unwrap();
+    s.put_record(&kind, &planned.sector_id, &[0; OUTPUT_BYTES + 1])
+        .unwrap();
+    assert!(
+        s.catalog_completed_packing_output(op, planned.sector_id)
+            .is_err()
+    );
+    s.put_record(&kind, &planned.sector_id, &original).unwrap();
+    let payload = s
+        .catalog_packing_payload(op.payloads(), planned.storage_id, 0)
+        .unwrap()
+        .unwrap();
+    let kind = format!("catalog-packing-payload-v1/{}", op.id.simple());
+    let mut key = payload.storage_id.to_vec();
+    key.extend_from_slice(&payload.shard_index.to_be_bytes());
+    s.put_record(&kind, &key, &[0; OUTPUT_BYTES + 1]).unwrap();
+    assert!(
+        s.catalog_completed_packing_output(op, planned.sector_id)
+            .is_err()
+    );
+}
+
+#[test]
 fn packing_operation_owns_complete_original_directory_and_payloads_through_reopen_retry_and_cancel()
 {
     let dir = tempfile::tempdir().unwrap();
