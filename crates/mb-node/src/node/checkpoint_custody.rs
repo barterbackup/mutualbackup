@@ -2,6 +2,136 @@
 use super::*;
 
 impl Node {
+    /// Restore the native tree selected by an exact retained checkpoint page.
+    /// Original legacy IDs select their independently retained conversion.
+    /// The complete staged inode owns publication after the final custody writer;
+    /// normal current protection, remote data recovery and Git installation
+    /// retain their separate activation/consumer gates.
+    #[cfg(target_os = "linux")]
+    pub fn restore_retained_checkpoint_native_snapshot(
+        &self,
+        layout: mb_core::PagedCheckpointLayout,
+        owner: Uuid,
+        guild_id: [u8; 32],
+        snapshot: &SnapshotInfo,
+        target: &Path,
+        budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !owner.is_nil()
+                && !snapshot.revision_id.is_nil()
+                && !snapshot.protected_root_id.is_nil()
+                && snapshot.checkpoint_hash != [0; 32],
+            "retained snapshot identity is invalid"
+        );
+        let key = mb_core::CatalogCheckpointRevisionKey {
+            owner: self.keys.node_id(),
+            protected_root_id: snapshot.protected_root_id,
+            sequence: snapshot.sequence,
+            revision_id: snapshot.revision_id,
+        };
+        let mut identity =
+            blake3::Hasher::new_derive_key("mutualbackup retained checkpoint native restore v1");
+        identity.update(&canonical_bytes(&(
+            layout,
+            owner,
+            guild_id,
+            key,
+            snapshot.checkpoint_generation,
+            snapshot.checkpoint_hash,
+        ))?);
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&identity.finalize().as_bytes()[..16]);
+        let operation = Uuid::from_bytes(bytes);
+        if crate::snapshot::resume_matching_restore_publication(
+            &self.control,
+            guild_id,
+            operation,
+            3,
+            target,
+        )? {
+            return Ok(());
+        }
+        macro_rules! restore {
+            ($retention:ident,$point:ident,$publish:ident) => {{
+                let (retention, state) = self
+                    .control
+                    .$retention(owner)?
+                    .context("retained checkpoint is unavailable")?;
+                anyhow::ensure!(
+                    state == mb_store::CatalogPagedCheckpointRetentionState::Published
+                        && retention.checkpoint.guild_id == guild_id
+                        && retention.checkpoint.generation == snapshot.checkpoint_generation
+                        && retention.checkpoint.hash()? == snapshot.checkpoint_hash,
+                    "native snapshot belongs to another retained checkpoint"
+                );
+                let record = self
+                    .control
+                    .$point(retention, key.revision_id, budget)?
+                    .context("retained snapshot revision is unavailable")?;
+                anyhow::ensure!(
+                    record.revision_key() == Some(key),
+                    "native snapshot revision identity differs"
+                );
+                let catalog = match &record {
+                    mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed) => {
+                        let catalog = self
+                            .control
+                            .catalog_paged_checkpoint_revision(owner, key.revision_id)?
+                            .context("checkpoint has no retained private revision")?;
+                        anyhow::ensure!(
+                            catalog.bundle.descriptor == canonical_bytes(signed)?,
+                            "private snapshot differs from original signed revision"
+                        );
+                        catalog
+                    }
+                    mb_core::CatalogCheckpointAuthorityRecord::LegacyRevision(_) => self
+                        .control
+                        .catalog_paged_checkpoint_legacy_revision(owner, key.revision_id)?
+                        .context("checkpoint has no retained original legacy conversion")?,
+                    _ => anyhow::bail!("checkpoint lookup returned a nonrevision record"),
+                };
+                self.control
+                    .$publish(retention, &record, &catalog, || Ok::<_, anyhow::Error>(()))?;
+                let opened = crate::PagedPrivateMetadata::open_local_snapshot(
+                    &self.keys,
+                    &catalog,
+                    catalog.bundle.scope,
+                )?;
+                let private = opened
+                    .private
+                    .context("retained private snapshot is unavailable")?;
+                anyhow::ensure!(
+                    opened.state == mb_store::CatalogBundleState::Published
+                        && opened.revision.value.guild_id == guild_id
+                        && private.git.is_none(),
+                    "native restore requires published native-only private roots"
+                );
+                crate::PagedPrivateMetadata::restore_retained_native_catalog_checked(
+                    &self.control,
+                    &self.keys,
+                    (catalog.bundle.id, Some(operation)),
+                    catalog.bundle.scope,
+                    target,
+                    |sector| self.sector_for_guild(&guild_id, sector),
+                    |publish| self.control.$publish(retention, &record, &catalog, publish),
+                )
+            }};
+        }
+        match layout {
+            mb_core::PagedCheckpointLayout::Individual => restore!(
+                catalog_paged_checkpoint_retention,
+                catalog_paged_checkpoint_indexed_revision,
+                publish_catalog_paged_checkpoint_revision_restore
+            ),
+            mb_core::PagedCheckpointLayout::Directory => restore!(
+                catalog_paged_checkpoint_directory_retention,
+                catalog_paged_checkpoint_directory_indexed_revision,
+                publish_catalog_paged_checkpoint_directory_revision_restore
+            ),
+        }
+    }
+
     /// Build restart-stable lookups from the original completed public proof.
     /// No checkpoint head or distributed protection is published here.
     pub fn build_retained_paged_checkpoint_lookup(

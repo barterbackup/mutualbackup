@@ -5705,3 +5705,23 @@ remain open. Producers stay disabled; dense 1 TiB and Windows/macOS hosts stay
 user-deferred. Evidence: `/tmp/mb-m6-checkpoint-lookup-xwm57bjj`; see ADR 0002.
 
 Exact superseded-inode retirement reclaims 9.47 GiB; target uses 49.73 GiB. Current executables, 29 older archived paths, both failed Node artifacts, 14 auxiliary WIP files and all 10 installed roots remain intact.
+
+Exact native snapshot restoration now consumes both original retained checkpoint
+layouts, preserving original legacy IDs through independently retained
+conversions. Final output publication checks exact original private custody
+under one short writer; data I/O stays outside it. Checkpoint-bound operation
+identity prevents foreign adoption, while the complete durable Publishing inode
+finishes after source/checkpoint retirement without original reads. Two Node
+cases, both legacy fixtures and the real native data failure/reopen fixture
+pass within 1,533 qualified cases: 1,260 fresh and 273 exact unchanged reused.
+Format, strict Clippy, four builds, four Linux native fixtures and
+371-input/23-executable audits pass. 121 ignored cases remain unexecuted.
+Paged Git installation, normal current listing/restore, distributed checkpoint
+activation, aggregate admission/physical quotas, normal production/retention/
+seed recovery, legacy consumers and R5/R7 remain open. Producers stay disabled;
+dense 1 TiB and Windows/macOS hardware stays user-deferred. Evidence:
+`/tmp/mb-m6-checkpoint-restore-7o2i3ix5`; see ADR 0002.
+
+Exact superseded-inode retirement reclaims 9.48 GiB; target uses 49.73 GiB.
+Current executables, 29 older archived paths, both failed Node artifacts, 14
+auxiliary WIP files and all 10 installed roots remain intact.

@@ -3370,6 +3370,29 @@ pub(crate) fn restore_from_builder(
     target: &Path,
     build: impl FnOnce(&PinnedDirectory, [u8; 32]) -> Result<()>,
 ) -> Result<()> {
+    restore_from_builder_checked(
+        control,
+        guild_id,
+        revision_id,
+        job_version,
+        target,
+        build,
+        |publish| publish(),
+    )
+}
+
+/// Complete the short Building-to-Publishing transition under the caller's
+/// ownership writer. A durable Publishing tree already owns its exact inode
+/// and may finish without consulting the original source owner again.
+pub(crate) fn restore_from_builder_checked(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    job_version: u16,
+    target: &Path,
+    build: impl FnOnce(&PinnedDirectory, [u8; 32]) -> Result<()>,
+    publish: impl FnOnce(&mut dyn FnMut() -> Result<Vec<u8>>) -> Result<Vec<u8>>,
+) -> Result<()> {
     ensure!(
         matches!(job_version, 2 | 3),
         "unsupported restore job version"
@@ -3503,7 +3526,15 @@ pub(crate) fn restore_from_builder(
         bail!("restore staging directory changed during construction");
     }
     job.state = RestoreJobState::Publishing;
-    bytes = replace_restore_job(control, &record_id, &bytes, &job)?;
+    bytes = publish(&mut || replace_restore_job(control, &record_id, &bytes, &job))?;
+    ensure!(
+        bytes == canonical_bytes(&job)?
+            && control
+                .get_record_bounded(RESTORE_JOB_KIND, &record_id, V1_SECTOR_SIZE)?
+                .as_deref()
+                == Some(bytes.as_slice()),
+        "restore publication journal was not committed"
+    );
     finish_durable_restore_publication(control, &record_id, &bytes, &job, &parent, &target_name)
 }
 
@@ -3516,6 +3547,47 @@ pub(crate) fn resume_restore_publication(
 ) -> Result<bool> {
     validate_restore_revision(keys, guild_id, revision)?;
     resume_restore_from_identity(control, guild_id, revision.value.revision_id, 2, target)
+}
+
+/// Probe only the exact current target row before taking the restore writer.
+/// A missing/Building/different operation cannot mutate a reservation here.
+pub(crate) fn resume_matching_restore_publication(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    job_version: u16,
+    target: &Path,
+) -> Result<bool> {
+    let (absolute, _, parent) = pinned_restore_parent(target)?;
+    let Some(bytes) = control.get_record_bounded(
+        RESTORE_JOB_KIND,
+        &restore_job_record_id(&absolute)?,
+        V1_SECTOR_SIZE,
+    )?
+    else {
+        return Ok(false);
+    };
+    let job: RestoreJob = decode_canonical(&bytes)?;
+    if job.state != RestoreJobState::Publishing
+        || job.guild_id != guild_id
+        || job.revision_id != revision_id
+        || job.format_version != job_version
+    {
+        return Ok(false);
+    }
+    ensure!(
+        canonical_bytes(&job)? == bytes,
+        "noncanonical restore publication"
+    );
+    validate_reserved_restore_job(
+        &job,
+        guild_id,
+        revision_id,
+        job_version,
+        &absolute,
+        parent.identity()?,
+    )?;
+    resume_restore_from_identity(control, guild_id, revision_id, job_version, target)
 }
 
 pub(crate) fn resume_restore_from_identity(

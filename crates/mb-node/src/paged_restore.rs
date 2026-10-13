@@ -332,8 +332,29 @@ impl PagedPrivateMetadata {
         revision_id: Uuid,
         scope: CatalogScope,
         target: &Path,
-        mut load: impl FnMut(&SectorId) -> Result<Vec<u8>>,
+        load: impl FnMut(&SectorId) -> Result<Vec<u8>>,
     ) -> Result<()> {
+        Self::restore_retained_native_catalog_checked(
+            control,
+            keys,
+            (revision_id, None),
+            scope,
+            target,
+            load,
+            |publish| publish(),
+        )
+    }
+
+    pub(crate) fn restore_retained_native_catalog_checked(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        identity: (Uuid, Option<Uuid>),
+        scope: CatalogScope,
+        target: &Path,
+        mut load: impl FnMut(&SectorId) -> Result<Vec<u8>>,
+        publish: impl FnOnce(&mut dyn FnMut() -> Result<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        let (revision_id, operation) = identity;
         let snapshot = Self::load_local_catalog(control, keys, revision_id, scope)?
             .context("retained paged revision is unavailable")?;
         let signed_hash = snapshot.revision.value.hash()?;
@@ -341,16 +362,15 @@ impl PagedPrivateMetadata {
         let mut identity =
             blake3::Hasher::new_derive_key("mutualbackup paged native restore identity v1");
         identity.update(&signed_hash);
-        let mut operation = [0; 16];
-        operation.copy_from_slice(&identity.finalize().as_bytes()[..16]);
+        let operation = operation.unwrap_or_else(|| {
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&identity.finalize().as_bytes()[..16]);
+            Uuid::from_bytes(bytes)
+        });
         if snapshot.state != CatalogBundleState::Published {
             ensure!(
                 crate::snapshot::resume_restore_from_identity(
-                    control,
-                    guild,
-                    Uuid::from_bytes(operation),
-                    3,
-                    target
+                    control, guild, operation, 3, target
                 )?,
                 "retained paged revision is cancelled"
             );
@@ -359,10 +379,10 @@ impl PagedPrivateMetadata {
         let private = snapshot
             .private
             .context("retained private roots are unavailable")?;
-        crate::snapshot::restore_from_builder(
+        crate::snapshot::restore_from_builder_checked(
             control,
             guild,
-            Uuid::from_bytes(operation),
+            operation,
             3,
             target,
             |root, target_id| {
@@ -387,6 +407,7 @@ impl PagedPrivateMetadata {
                     Ok(())
                 })
             },
+            publish,
         )
     }
 

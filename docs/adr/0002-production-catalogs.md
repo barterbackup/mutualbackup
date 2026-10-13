@@ -6862,3 +6862,59 @@ seed recovery, legacy catch-up and R5/R7 remain open. Normal paged producers
 stay disabled. Dense 1 TiB and native Windows/macOS gates remain user-deferred.
 
 Exact superseded-inode retirement reclaims 9.47 GiB; target uses 49.73 GiB. Current executables, 29 older archived paths, both failed Node artifacts, 14 auxiliary WIP files and all 10 installed roots remain intact.
+
+### Exact retained checkpoint native snapshot restoration (2026-10-13)
+
+The native snapshot consumer now selects the original root-authenticated
+revision from either retained checkpoint layout, requires the exact
+layout/owner/guild/generation/hash/key and published private dependency, and
+restores through the existing inode-bound no-replace journal. Original legacy
+revision IDs select their independently retained and authenticated conversion;
+no original signed identity or current checkpoint is rewritten.
+
+The restore operation identity includes the original checkpoint owner, layout,
+hash, generation, guild and local revision key. A different owner cannot adopt
+an interrupted target. Final Building-to-Publishing journal CAS runs inside a
+short IMMEDIATE writer that checks the exact original record, private bundle,
+backlinks, certificate, parent Published state and enclosing admission before
+and after the write. Native tree and data I/O stay outside that writer. Ignored,
+aborted or reverted writes cannot publish the output.
+
+A complete durable Publishing tree already owns its exact staging/target inode.
+A bounded matching target-row probe permits publication replay after checkpoint
+and private-source retirement, without reading source pages or data; a Building,
+foreign or missing reservation grants no such capability. Missing output still
+requires an available original owner to reconstruct it. Existing ordinary
+legacy and explicit native restore identities/record formats remain unchanged.
+
+Two actual Node fixtures exercise both layouts: wrong layout/owner/guild/hash/
+generation/root/sequence/revision and zero selection work, aborted/ignored final
+writes, same-writer late cancellation rollback, exact retry, capture retirement,
+private-owner reopen, metadata, foreign-owner rejection, interruption after
+rename and exact output completion after complete source retirement. Both
+existing legacy conversion fixtures also restore by the original revision ID.
+The real data-bearing native fixture adds a denied final-custody transition,
+then reopens/retries authenticated data while preserving sparse/raw/hard-linked
+files and directory metadata. Frozen qualification passes 1,533 distinct cases in 1,533 executions:
+1,260 fresh runs and 273 exact unchanged cases reused with source/binary
+guards. The inventory covers 210 Core, 508 ordinary Store, 117 Git, 571 Node,
+23 prototype acceptance, the explicit >512 MiB database case, four provisioned
+Linux native fixtures and all other ordinary workspace targets. The longest
+native fixture passes in 597.08 seconds under its unchanged 900-second limit.
+Format, strict locked workspace/all-targets Clippy, four debug program builds
+and test compilation pass. Frozen evidence binds 371 inputs (368 code/dependency
+inputs) and 23 executables across 19 ordinary drivers; 121 other ignored cases
+remain unexecuted. Native mount/image/loop cleanup and preservation of both
+failed Node artifacts, 14 auxiliary WIP files and 10 installed roots pass.
+
+This is the retained native snapshot consumer, not current protection activation.
+Paged Git history installation still needs its bounded ordinary Git consumers;
+normal current listing/restore, distributed checkpoint availability/activation,
+complete aggregate admission and physical quotas, normal paged production/
+retention/seed recovery, legacy catch-up and R5/R7 remain open. Normal paged
+producers remain disabled. Dense 1 TiB and native Windows/macOS hardware tests
+remain user-deferred. Evidence: `/tmp/mb-m6-checkpoint-restore-7o2i3ix5`.
+
+Exact superseded-inode retirement reclaims 9.48 GiB; target uses 49.73 GiB.
+Current executables, 29 older archived paths, both failed Node artifacts, 14
+auxiliary WIP files and all 10 installed roots remain intact.

@@ -282,6 +282,20 @@ fn change_work<H: Layout>(
     check_work(connection, retention, next)
 }
 
+pub(super) fn restore_snapshot(
+    connection: &Connection,
+    owner: Uuid,
+    reference: &CatalogLegacyRevisionRef,
+) -> Result<Option<PagedCatalogSnapshot>, CatalogStoreError> {
+    let Some((dependency, snapshot)) = read(connection, owner, reference.revision_id)? else {
+        return Ok(None);
+    };
+    if &dependency.reference != reference {
+        return Err(DatabaseError::Conflict.into());
+    }
+    Ok(Some(snapshot))
+}
+
 fn read(
     connection: &Connection,
     owner: Uuid,

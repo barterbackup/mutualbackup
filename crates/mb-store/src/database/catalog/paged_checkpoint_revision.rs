@@ -442,6 +442,80 @@ impl ControlStore {
         Ok(catalog)
     }
 
+    fn publish_checkpoint_revision_restore<H: Layout, T, E: From<CatalogStoreError>>(
+        &self,
+        retention: CatalogPagedCheckpointRetention<H>,
+        record: &CatalogCheckpointAuthorityRecord,
+        expected: &PagedCatalogSnapshot,
+        publish: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(DatabaseError::from)
+            .map_err(CatalogStoreError::from)?;
+        let check = || -> Result<(), CatalogStoreError> {
+            let actual = match record {
+                CatalogCheckpointAuthorityRecord::PagedRevision(signed) => {
+                    if paged_revision::revision(&expected.bundle)? != *signed {
+                        return Err(DatabaseError::Conflict.into());
+                    }
+                    read(&tx, retention.id, signed.value.revision_id)?
+                }
+                CatalogCheckpointAuthorityRecord::LegacyRevision(reference) => {
+                    paged_checkpoint_legacy_revision::restore_snapshot(
+                        &tx,
+                        retention.id,
+                        reference,
+                    )?
+                }
+                _ => return Err(DatabaseError::Conflict.into()),
+            };
+            if expected.state != CatalogBundleState::Published
+                || journal::require(&tx, retention)?.state
+                    != CatalogPagedCheckpointRetentionState::Published
+                || actual.as_ref() != Some(expected)
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            owned_certificate(&tx, retention)?;
+            admitted_work(&tx, retention)?;
+            Ok(())
+        };
+        check()?;
+        let result = publish()?;
+        check()?;
+        tx.commit()
+            .map_err(DatabaseError::from)
+            .map_err(CatalogStoreError::from)?;
+        Ok(result)
+    }
+
+    /// Serialize an already authenticated native restore's final journal
+    /// transition with exact retained private custody. The callback must use
+    /// record writes on this connection and must not start another transaction.
+    /// No filesystem or payload I/O belongs inside this short writer.
+    pub fn publish_catalog_paged_checkpoint_revision_restore<T, E: From<CatalogStoreError>>(
+        &self,
+        retention: CatalogPagedCheckpointRetention,
+        record: &CatalogCheckpointAuthorityRecord,
+        expected: &PagedCatalogSnapshot,
+        publish: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.publish_checkpoint_revision_restore(retention, record, expected, publish)
+    }
+
+    pub fn publish_catalog_paged_checkpoint_directory_revision_restore<
+        T,
+        E: From<CatalogStoreError>,
+    >(
+        &self,
+        retention: CatalogPagedCheckpointDirectoryRetention,
+        record: &CatalogCheckpointAuthorityRecord,
+        expected: &PagedCatalogSnapshot,
+        publish: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.publish_checkpoint_revision_restore(retention, record, expected, publish)
+    }
+
     /// Read one retained private dependency, including a cancelled owner's
     /// dependency until its bounded retirement step has committed.
     pub fn catalog_paged_checkpoint_revision(

@@ -1103,7 +1103,7 @@ mod tests {
     #[test]
     fn paged_native_restore_reopens_failures_and_finishes_renamed_tree_after_source_retirement() {
         use std::os::unix::fs::PermissionsExt;
-        for fault in 0..5 {
+        for fault in 0..6 {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("control.db");
             let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
@@ -1122,10 +1122,10 @@ mod tests {
                 crate::snapshot::interrupt_next_restore_after_rename();
             }
             let result =
-                PagedPrivateMetadata::restore_retained_native_catalog(
+                PagedPrivateMetadata::restore_retained_native_catalog_checked(
                     &store,
                     &keys(),
-                    signed.value.revision_id,
+                    (signed.value.revision_id, None),
                     scope(),
                     &target,
                     |id| {
@@ -1151,6 +1151,10 @@ mod tests {
                             b"raw\r\nbytes\0",
                         )?
                         .1)
+                    },
+                    |publish| {
+                        ensure!(fault != 5, "injected loss of final private custody");
+                        publish()
                     },
                 );
             assert!(result.is_err(), "fault {fault}");

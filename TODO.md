@@ -2553,6 +2553,29 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Restore exact retained checkpoint native snapshots under enclosing custody.
+      Both public layouts select the original authenticated revision and exact
+      private dependency; original legacy IDs use their retained conversion.
+      A checkpoint-bound operation prevents another owner from adopting the
+      target. Native/data I/O stays outside the short final writer, which checks
+      the original record, bundle/backlinks, certificate, parent Published state
+      and admission before/after the Building-to-Publishing journal CAS.
+      A durable Publishing inode finishes after checkpoint/private retirement
+      without source reads; Building or foreign journals grant no such replay.
+      Two actual Node cases cover selection substitution, zero work, aborted/
+      ignored writes, same-writer late cancellation rollback, retry/reopen,
+      capture retirement, metadata and interrupted-rename/source-loss completion.
+      Both legacy conversion fixtures restore by the original revision ID. The
+      real native data fixture refuses final custody after authentic construction
+      and retries after reopen, preserving raw/sparse/hard-linked data.
+      Frozen qualification passes 1,533 cases: 1,260 fresh and 273 exact unchanged
+      reused. Format, strict Clippy, four builds, four Linux native fixtures and
+      371-input/23-executable audits pass; 121 ignored cases remain unexecuted.
+      Exact superseded retirement reclaims 9.48 GiB; target uses 49.73 GiB.
+      Paged Git installation, normal current consumers, distributed activation,
+      complete aggregate/physical admission, normal retention/seed recovery and
+      R1/R2/R3/R5/R7 remain open. Producers stay disabled; hardware stays deferred.
+      Evidence: `/tmp/mb-m6-checkpoint-restore-7o2i3ix5`; see ADR 0002.
     - [x] Build durable original-root checkpoint lookups and retained snapshot pages.
       Both public layouts derive bounded revision UUID/order and coding-group
       locators from complete original-history quorum proofs. Each returned

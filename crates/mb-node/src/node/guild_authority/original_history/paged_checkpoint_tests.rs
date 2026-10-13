@@ -2,10 +2,12 @@ use super::*;
 use crate::node::guild_authority::tests::{event, fixture, relabel};
 use crate::node::tests::test_coding_transcript;
 
+#[cfg(target_os = "linux")]
+mod checkpoint_restore_tests;
 mod transport;
 
 macro_rules! legacy_custody_cases {
-    ($test:ident, $constructor:ident, $metadata:ident, $retain:ident, $step:ident, $cancel:ident, $release:ident) => {
+    ($test:ident, $constructor:ident, $metadata:ident, $retain:ident, $step:ident, $cancel:ident, $release:ident, $layout:ident, $lookup:ident) => {
         #[test]
         fn $test() {
             let (temp, seed, mut node, mut keys) = fixture();
@@ -108,6 +110,26 @@ macro_rules! legacy_custody_cases {
             for id in ids {
                 node.$retain(id, &proof, key, migration_id).unwrap();
             }
+            node.$lookup(ids[0], &proof).unwrap();
+            let snapshot = crate::SnapshotInfo {
+                protected_root_id: key.protected_root_id,
+                revision_id: key.revision_id,
+                sequence: key.sequence,
+                checkpoint_generation: proof.certificate().checkpoint.generation,
+                checkpoint_hash: proof.certificate().hash().unwrap(),
+            };
+            let target = temp.path().join("restored-original-legacy");
+            node.restore_retained_checkpoint_native_snapshot(
+                mb_core::PagedCheckpointLayout::$layout,
+                ids[0],
+                guild,
+                &snapshot,
+                &target,
+                proof.transition().budget(),
+            ).unwrap();
+            assert!(target.is_dir());
+            assert!(node.control.records("restore-job").unwrap().is_empty());
+            assert_eq!(node.control.get_record("user-revision", original.value.revision_id.as_bytes()).unwrap().unwrap(), original_bytes);
             node.$retain(ids[0], &proof, key, migration_id).unwrap();
             let mut other = key;
             other.owner = keys[1].node_id();
@@ -318,12 +340,15 @@ legacy_custody_cases!(
     retain_paged_checkpoint_local_legacy_revision,
     retain_paged_checkpoint_local_custody_step,
     cancel_catalog_paged_checkpoint_retention,
-    release_catalog_paged_checkpoint_root
+    release_catalog_paged_checkpoint_root,
+    Individual,
+    build_retained_paged_checkpoint_lookup
 );
 legacy_custody_cases!(
     directory_checkpoint_legacy_private_custody_preserves_identity_reopens_and_blocks_migration_cancel,
     legacy_private_directory, retain_paged_checkpoint_directory_metadata, retain_paged_checkpoint_directory_local_legacy_revision,
-    retain_paged_checkpoint_directory_local_custody_step, cancel_catalog_paged_checkpoint_directory_retention, release_catalog_paged_checkpoint_directory_root
+    retain_paged_checkpoint_directory_local_custody_step, cancel_catalog_paged_checkpoint_directory_retention, release_catalog_paged_checkpoint_directory_root,
+    Directory, build_retained_paged_checkpoint_directory_lookup
 );
 
 macro_rules! local_custody_cases {
