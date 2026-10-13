@@ -6813,3 +6813,52 @@ dense 1 TiB and native Windows/macOS gates remain user-deferred.
 Full-witness construction qualification passes 1,397 distinct tests in 1,397 executions: 198 Core, 409 ordinary Store, 117 Git, 548 Node, both provisioned Btrfs recovery fixtures, the explicit >512 MiB atomic writer, and all remaining workspace targets. Formatting, strict locked workspace/all-targets Clippy, all four debug builds and compilation pass. The 331 frozen inputs (328 code/dependency inputs) and 23 exact executables are audited; 121 other ignored cases remain unexecuted. Exact superseded-inode retirement reclaims 9.94 GiB; target uses 47.42 GiB. Current binaries/aliases, 7 unchanged shared inodes, 29 older archived paths, 14 auxiliary WIP files and 10 installed roots remain intact. Evidence: `/tmp/mb-m6-full-witness-capacity-final-k91to5f7`. This qualifies construction arithmetic and the listed regressions, not complete metadata admission or a dense 1 TiB recovery. The full enclosing policy and normal paged pipeline remain open; dense 1 TiB and native Windows/macOS tests remain user-deferred.
 
 An isolated subprocess regression proves the scoped-tracing callsite race found during qualification: first registration on an unsubscribed test thread suppressed later scoped events. The trace-test helper now retains a disabled dispatcher without installing it as the default, preserving dynamic callsite filtering and isolated logs. The probe passes after reproducing zero captured events before the fix; all three real signature trace cases also pass. Production logging/admission, the two-worker runtime and the 10-second inbound deadline remain unchanged. The first full attempt remains failed evidence under `/tmp/mb-m6-full-witness-capacity-xna0f2z7`; its inputs and logs are preserved. This fixes diagnostic-test capture, not R5's historical topology/signature stall or its remaining fault matrix.
+
+### Durable retained checkpoint lookups and bounded snapshot pages (2026-10-13)
+
+Both original public layouts now derive owner-scoped revision UUID, ordered
+revision-key and coding-group locators only from completed original-history
+quorum proofs. The SQL rows remain locators: each revision replays its original
+framed authority bytes, and each group first authenticates its forest against
+the signed coding directory before replaying the original witness. No original
+record, signature, root, sector or coding identity changes.
+
+The parent checkpoint owner reserves both all bounded locator rows and the
+complete independent traversal before page I/O, together with private, legacy,
+physical-payload and READY custody. Partial rows remain unreadable until both
+complete EOFs and original current authority pass. Exact prefix retry survives
+reopen. Cancellation immediately fences reads; one conditional indexed cleanup
+step retires a row while holding the reservation, preserving other owners and
+all original public/private/physical data.
+
+Node exposes an exact retained-checkpoint snapshot page for both layouts. It
+bounds scanned revisions to 1..1024, divides the supplied total work budget
+across that limit, authenticates each returned original record and advances an
+exclusive cursor even across foreign owners. The real directory fixture lists
+two original snapshots, releases temporary capture owners and reopens the
+retained list without advancing current checkpoint or protection heads.
+
+Seven Store cases cover both layouts, original point/ordered/group identity,
+corrupt/oversized locators, shared owners, read-only queries, initial budget
+rejection before damaged-page reads, aborted/ignored paired writes and final
+publication, late authority rollback, exact retry/reopen and failed retirement.
+Frozen qualification passes 1,531 distinct cases in 1,531 executions: 1,468
+fresh runs and 63 exact unchanged cases reused with source/binary guards. This
+includes 210 Core, 508 ordinary Store, 117 Git, 569 Node, 23 prototype
+acceptance, the explicit >512 MiB database case, four provisioned Linux native
+fixtures and the other workspace targets. The longest native fixture passes in
+722.92 seconds under its unchanged 900-second limit. Formatting, strict locked
+workspace/all-targets Clippy, four debug program builds and test compilation
+pass. Independent audits verify 370 inputs (367 code/dependency inputs), 23
+executables, 19 ordinary drivers, exact passed inventories, native cleanup,
+14 auxiliary WIP files, two failed Node artifacts and 10 installed roots.
+121 other ignored cases remain unexecuted. Evidence:
+`/tmp/mb-m6-checkpoint-lookup-xwm57bjj`.
+
+This supplies retained lookup and snapshot consumers. Normal current snapshot
+listing/restore, paged checkpoint/distributed activation, complete enclosing
+admission and physical quotas, fixed legacy coding, normal production/retention/
+seed recovery, legacy catch-up and R5/R7 remain open. Normal paged producers
+stay disabled. Dense 1 TiB and native Windows/macOS gates remain user-deferred.
+
+Exact superseded-inode retirement reclaims 9.47 GiB; target uses 49.73 GiB. Current executables, 29 older archived paths, both failed Node artifacts, 14 auxiliary WIP files and all 10 installed roots remain intact.

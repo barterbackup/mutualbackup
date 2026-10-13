@@ -298,6 +298,10 @@ impl ControlStore {
                                 .proof_work
                                 .checked_add(retention.checkpoint.work()?)?
                                 .checked_add(owned_work(&self.connection, retention)?)?
+                                .checked_add(paged_checkpoint_lookup::owned_work(
+                                    &self.connection,
+                                    retention,
+                                )?)?
                                 .checked_add(
                                     paged_checkpoint_legacy_revision::owned_work(
                                         &self.connection,

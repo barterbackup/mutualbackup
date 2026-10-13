@@ -2,6 +2,112 @@
 use super::*;
 
 impl Node {
+    /// Build restart-stable lookups from the original completed public proof.
+    /// No checkpoint head or distributed protection is published here.
+    pub fn build_retained_paged_checkpoint_lookup(
+        &self,
+        id: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
+    ) -> Result<()> {
+        guild_authority::with_history(&self.control, |authority| {
+            self.control
+                .build_catalog_paged_checkpoint_lookup(id, proof, || {
+                    authority.paged_checkpoint_trust().map_err(|_| {
+                        mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                    })
+                })?;
+            Ok(())
+        })?
+        .context("checkpoint lookup requires original guild authority")
+    }
+
+    pub fn build_retained_paged_checkpoint_directory_lookup(
+        &self,
+        id: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    ) -> Result<()> {
+        guild_authority::with_history(&self.control, |authority| {
+            self.control
+                .build_catalog_paged_checkpoint_directory_lookup(id, proof, || {
+                    authority.paged_checkpoint_trust().map_err(|_| {
+                        mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                    })
+                })?;
+            Ok(())
+        })?
+        .context("checkpoint lookup requires original guild authority")
+    }
+
+    /// Visit a bounded number of authenticated revision records from an exact
+    /// retained checkpoint. This lists local history metadata; current-state
+    /// activation and remote availability must be established by the caller.
+    pub fn retained_checkpoint_snapshot_page(
+        &self,
+        layout: mb_core::PagedCheckpointLayout,
+        owner: Uuid,
+        checkpoint_hash: [u8; 32],
+        after: Option<mb_core::CatalogCheckpointRevisionKey>,
+        limit: u16,
+        page_budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<(
+        Vec<SnapshotInfo>,
+        Option<mb_core::CatalogCheckpointRevisionKey>,
+    )> {
+        anyhow::ensure!(
+            limit > 0 && limit <= 1024,
+            "snapshot page limit is outside the admitted range"
+        );
+        let read_budget = mb_core::CatalogCodingTraversalBudget {
+            bytes: page_budget.bytes / u64::from(limit),
+            page_occurrences: page_budget.page_occurrences / u64::from(limit),
+            records: page_budget.records / u64::from(limit),
+        };
+        let mut cursor = after;
+        let mut snapshots = Vec::new();
+        macro_rules! page {
+            ($retention:ident,$next:ident) => {{
+                let (retention, state) = self
+                    .control
+                    .$retention(owner)?
+                    .context("retained checkpoint owner is unavailable")?;
+                anyhow::ensure!(
+                    state == mb_store::CatalogPagedCheckpointRetentionState::Published
+                        && retention.checkpoint.hash()? == checkpoint_hash,
+                    "snapshot page belongs to another checkpoint owner"
+                );
+                for _ in 0..limit {
+                    let Some(record) = self.control.$next(retention, cursor, read_budget)? else {
+                        return Ok((snapshots, None));
+                    };
+                    let key = record
+                        .revision_key()
+                        .context("checkpoint index returned a nonrevision record")?;
+                    cursor = Some(key);
+                    if key.owner == self.keys.node_id() {
+                        snapshots.push(SnapshotInfo {
+                            protected_root_id: key.protected_root_id,
+                            revision_id: key.revision_id,
+                            sequence: key.sequence,
+                            checkpoint_generation: retention.checkpoint.generation,
+                            checkpoint_hash,
+                        });
+                    }
+                }
+            }};
+        }
+        match layout {
+            mb_core::PagedCheckpointLayout::Individual => page!(
+                catalog_paged_checkpoint_retention,
+                next_catalog_paged_checkpoint_indexed_revision
+            ),
+            mb_core::PagedCheckpointLayout::Directory => page!(
+                catalog_paged_checkpoint_directory_retention,
+                next_catalog_paged_checkpoint_directory_indexed_revision
+            ),
+        }
+        Ok((snapshots, cursor))
+    }
+
     /// Retain independently admitted pending packing output under the actual
     /// original-history base. Reservations remain unfinished; existing bytes
     /// authenticate without creating availability evidence or advancing heads.

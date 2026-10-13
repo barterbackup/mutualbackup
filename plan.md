@@ -5689,3 +5689,19 @@ reclaims 9.46 GiB; target uses 49.71 GiB. Complete enclosing checkpoint
 and distributed integration, aggregate admission/quotas, normal retention/seed
 recovery, legacy consumers and R5/R7 remain open. Producers stay disabled and
 hardware stays user-deferred. Evidence: `/tmp/mb-m6-packing-coding-transfer-length-fe8xouxc`; see ADR 0002.
+
+Both original paged checkpoint layouts now support durable root-authenticated
+revision/order/group lookup under the exact retained owner. Locator rows and a
+complete independent traversal share enclosing custody admission; partial
+indices stay unreadable, retry survives reopen and cancelled cleanup preserves
+shared owners. Node lists bounded retained snapshot pages without current-head
+activation. Seven Store regressions and the extended real directory fixture
+pass within 1,531 qualified cases: 1,468 fresh and 63 exact unchanged reused.
+Format, strict Clippy, four builds, four Linux native fixtures and
+370-input/23-executable audits pass. 121 ignored cases remain unexecuted.
+Normal current listing/restore, distributed activation, aggregate admission/
+physical quotas, normal retention/seed recovery, legacy consumers and R5/R7
+remain open. Producers stay disabled; dense 1 TiB and Windows/macOS hosts stay
+user-deferred. Evidence: `/tmp/mb-m6-checkpoint-lookup-xwm57bjj`; see ADR 0002.
+
+Exact superseded-inode retirement reclaims 9.47 GiB; target uses 49.73 GiB. Current executables, 29 older archived paths, both failed Node artifacts, 14 auxiliary WIP files and all 10 installed roots remain intact.

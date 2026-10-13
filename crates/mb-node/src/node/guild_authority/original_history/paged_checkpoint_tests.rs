@@ -710,6 +710,53 @@ fn paged_checkpoint_directory_node_owner_authenticates_private_custody_and_reope
     let retained = node
         .retain_paged_checkpoint_directory_metadata(id, &proof)
         .unwrap();
+    node.build_retained_paged_checkpoint_directory_lookup(id, &proof)
+        .unwrap();
+    let (first_page, cursor) = node
+        .retained_checkpoint_snapshot_page(
+            mb_core::PagedCheckpointLayout::Directory,
+            id,
+            proof.certificate().hash().unwrap(),
+            None,
+            1,
+            proof.transition().budget(),
+        )
+        .unwrap();
+    assert_eq!(first_page.len(), 1);
+    let (second_page, _) = node
+        .retained_checkpoint_snapshot_page(
+            mb_core::PagedCheckpointLayout::Directory,
+            id,
+            proof.certificate().hash().unwrap(),
+            cursor,
+            1,
+            proof.transition().budget(),
+        )
+        .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].revision_id, signed.value.revision_id);
+    assert!(
+        node.retained_checkpoint_snapshot_page(
+            mb_core::PagedCheckpointLayout::Directory,
+            id,
+            [248; 32],
+            None,
+            1,
+            proof.transition().budget()
+        )
+        .is_err()
+    );
+    assert!(
+        node.retained_checkpoint_snapshot_page(
+            mb_core::PagedCheckpointLayout::Directory,
+            id,
+            proof.certificate().hash().unwrap(),
+            None,
+            0,
+            proof.transition().budget()
+        )
+        .is_err()
+    );
     node.retain_paged_checkpoint_directory_local_revision(id, &proof, key)
         .unwrap();
     let mut wrong = key;
@@ -739,6 +786,17 @@ fn paged_checkpoint_directory_node_owner_authenticates_private_custody_and_reope
         .unwrap();
     drop(node);
     let node = Node::open(temp.path(), seed).unwrap();
+    let (snapshots, _) = node
+        .retained_checkpoint_snapshot_page(
+            mb_core::PagedCheckpointLayout::Directory,
+            id,
+            proof.certificate().hash().unwrap(),
+            None,
+            2,
+            proof.transition().budget(),
+        )
+        .unwrap();
+    assert_eq!(snapshots.len(), 2);
     assert_eq!(
         node.control
             .catalog_paged_checkpoint_directory_retention(id)

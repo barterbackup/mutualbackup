@@ -613,6 +613,11 @@ impl ControlStore {
         let record = journal::read::<CatalogPagedCheckpointRetention<H>>(&transaction, id)?
             .ok_or(DatabaseError::NotReady)?;
         self.guard_paged_retirement(record.retention)?;
+        if paged_checkpoint_lookup::release(&transaction, record.retention)? {
+            self.guard_paged_retirement(record.retention)?;
+            transaction.commit()?;
+            return Ok(true);
+        }
         if paged_checkpoint_payload::release(&transaction, record.retention)? {
             self.guard_paged_retirement(record.retention)?;
             transaction.commit()?;

@@ -2553,6 +2553,30 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Build durable original-root checkpoint lookups and retained snapshot pages.
+      Both public layouts derive bounded revision UUID/order and coding-group
+      locators from complete original-history quorum proofs. Each returned
+      record replays original signed roots; nested coding locators authenticate
+      their forest before witness reads. All locator storage and independent
+      traversal share the enclosing private/legacy/payload/READY budget, reserved
+      before page reads. Partial indices remain unreadable until complete EOF
+      and current authority checks; exact retries survive reopen. Cancellation
+      fences reads and bounded conditional cleanup preserves shared owners.
+      Node pages through an exact retained owner/hash with one bounded work
+      allowance and an exclusive cursor; the real directory fixture lists both
+      original snapshots after capture retirement/reopen without advancing heads.
+      Seven Store regressions cover corrupt ranges, oversized rows, shared
+      owners, read-only queries, admission before damaged-page reads,
+      aborted/ignored writes and completion, late authority rollback and
+      interrupted retirement. Frozen qualification passes 1,531 cases:
+      1,468 fresh and 63 exact unchanged cases reused, including four provisioned
+      Linux native fixtures. Format, strict Clippy, four builds and
+      370-input/23-executable audits pass. 121 other ignored cases remain open.
+      Exact superseded-inode retirement reclaims 9.47 GiB; target uses 49.73 GiB.
+      Normal current listing/restore, complete checkpoint/distributed activation,
+      enclosing admission/physical quotas, normal retention/seed recovery and
+      R1/R2/R3/R5/R7 remain open. Producers stay disabled; hardware stays deferred.
+      Evidence: `/tmp/mb-m6-checkpoint-lookup-xwm57bjj`; see ADR 0002.
     - [x] Transfer retained packing outputs into original signed coding roles.
       Bind the completed proof, exact output/loan and original sector/root to
       the current capacity, checkpoint and indexed guild authority. Reuse

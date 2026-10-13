@@ -849,6 +849,17 @@ pub struct CatalogCheckpointAuthorityReader {
     failed: bool,
 }
 impl CatalogCheckpointAuthorityReader {
+    /// Original framed byte range of the last accepted record. A durable
+    /// lookup must bind this cursor to the same authenticated root and only
+    /// publish it after the complete authority traversal has passed.
+    pub fn last_record_range(&self) -> Option<std::ops::Range<u64>> {
+        if self.failed {
+            None
+        } else {
+            self.records.last_record_range()
+        }
+    }
+
     pub fn new(
         scope: CatalogScope,
         root: CatalogCheckpointAuthorityRoot,

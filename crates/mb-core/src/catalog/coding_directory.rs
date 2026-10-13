@@ -545,6 +545,17 @@ impl CatalogCodingDirectoryReader {
         if self.failed { None } else { self.last }
     }
 
+    /// Original directory frame naming the last group's forest. Bind it to
+    /// this signed directory root before using the nested group location.
+    /// Neither cursor alone proves complete EOF or coding authority.
+    pub fn last_group_forest_range(&self) -> Option<std::ops::Range<u64>> {
+        if self.failed || self.last.is_none() {
+            None
+        } else {
+            self.directory.last_record_range()
+        }
+    }
+
     fn next_inner<E>(
         &mut self,
         fetch: &mut impl FnMut(CatalogPageRef) -> Result<Vec<u8>, E>,

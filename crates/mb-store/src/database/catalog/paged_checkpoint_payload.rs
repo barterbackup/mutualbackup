@@ -183,6 +183,7 @@ fn check_work<H: Layout>(
             .proof_work
             .checked_add(retention.checkpoint.work()?)?
             .checked_add(work)?
+            .checked_add(paged_checkpoint_lookup::owned_work(connection, retention)?)?
             .checked_add(
                 paged_checkpoint_legacy_revision::owned_work(connection, retention)?
                     .unwrap_or_default(),
@@ -549,6 +550,7 @@ impl ControlStore {
                     .proof_work
                     .checked_add(retention.checkpoint.work()?)?
                     .checked_add(other_payload_work)?
+                    .checked_add(paged_checkpoint_lookup::owned_work(&tx, retention)?)?
                     .checked_add(paged_checkpoint_custody::owned_work(&tx, retention)?)?
                     .checked_add(
                         paged_checkpoint_legacy_revision::owned_work(&tx, retention)?
