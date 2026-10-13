@@ -2553,6 +2553,23 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Retain pending packing payloads and fence physical attempt cleanup.
+      Bind immutable operation/base/budget and exact original guild, storage,
+      role, commitment, volume and attempt under checked bidirectional pins.
+      Admit logical payload/row work before physical verification; guard actual
+      base/events twice and reauthenticate exact retries. Incomplete reservations,
+      STAGED/READY data and exact locators remain owned through shared loans,
+      reopen, offline copies and one-loan release steps. Node checks indexed
+      membership, explicit CAPP/scoped admission and original physical bindings.
+      Eight Store and four real-volume regressions plus the extended native
+      Node fixture pass, including maximum 4 MiB payload/final-role coverage.
+      Full frozen qualification passes 1,499 tests, format, strict Clippy,
+      four builds and 362-input/23-executable audits; 121 ignored cases remain
+      unexecuted. Cleanup reclaims 11.80 GiB; target uses 48.59 GiB.
+      Complete producer/page/source/output-proof integration, aggregate quotas,
+      bounded indexed volume cleanup, availability/activation, normal retention/
+      seed recovery and R5/R7 remain open. Normal producers stay disabled and
+      hardware gates remain deferred. See ADR 0002 and `/tmp/mb-m6-packing-output-custody-h2mugql5`.
     - [x] Hand closed packing-source loans to successor checkpoint custody atomically.
       Both layouts require the completed original-history proof, exact owned
       certificate/private catalog and immediate successor parent/generation.

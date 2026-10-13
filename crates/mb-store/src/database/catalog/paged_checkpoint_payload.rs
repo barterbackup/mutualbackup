@@ -262,10 +262,13 @@ fn is_pinned(
     shard: u16,
     root: [u8; 32],
 ) -> Result<bool, CatalogStoreError> {
+    let pending = packing_payloads::is_pinned(connection, storage, shard, root)?;
     let owner: Option<Option<Vec<u8>>> = connection.query_row(
         "SELECT CASE WHEN length(record_id) = 50 THEN record_id END FROM protocol_records WHERE kind = ?1 ORDER BY record_id LIMIT 1",
         params![owners(storage, shard)], |row| row.get(0)).optional()?;
-    let Some(owner) = owner else { return Ok(false) };
+    let Some(owner) = owner else {
+        return Ok(pending);
+    };
     let owner = owner.ok_or(DatabaseError::Integrity)?;
     let id = Uuid::from_slice(&owner[..16]).map_err(|_| DatabaseError::Integrity)?;
     let group: [u8; 32] = owner[16..48]
@@ -289,6 +292,48 @@ pub struct CatalogPayloadRetirementView<'a> {
     connection: &'a Connection,
 }
 impl CatalogPayloadRetirementView<'_> {
+    /// Pending producers also own incomplete reservations and STAGED objects.
+    pub fn attempt_is_pinned(&self, attempt: [u8; 16]) -> Result<bool, CatalogStoreError> {
+        packing_payloads::attempt_is_pinned(self.connection, attempt)
+    }
+
+    /// Retire only an exact canonical version-1 attempt locator. All three
+    /// established records begin with the immutable attempt ID. Pending output
+    /// loans keep reservations/receipts live even before a payload is READY.
+    pub fn retire_attempt_record(
+        &self,
+        kind: &str,
+        key: &[u8],
+        attempt: [u8; 16],
+        expected: &[u8],
+    ) -> Result<bool, CatalogStoreError> {
+        let prefix = canonical_bytes(&(1_u16, attempt))?;
+        if !matches!(
+            kind,
+            "volume-attempt-intent" | "volume-attempt-receipt" | "volume-attempt-reservation"
+        ) || key.len() > 64
+            || expected.len() > 512
+            || !expected.starts_with(&prefix)
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        if self.attempt_is_pinned(attempt)? {
+            return Ok(false);
+        }
+        if bounded_record(self.connection, kind, key, 512)?.as_deref() != Some(expected) {
+            return Err(DatabaseError::Conflict.into());
+        }
+        if self.connection.execute(
+            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![kind, key, expected],
+        )? != 1
+            || bounded_record(self.connection, kind, key, 512)?.is_some()
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(true)
+    }
+
     pub fn is_pinned(
         &self,
         storage: [u8; 32],

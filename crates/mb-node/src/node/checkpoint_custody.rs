@@ -2,6 +2,83 @@
 use super::*;
 
 impl Node {
+    /// Retain independently admitted pending packing output under the actual
+    /// original-history base. Reservations remain unfinished; existing bytes
+    /// authenticate without creating availability evidence or advancing heads.
+    /// The enclosing producer still owns complete source/output proof and pages.
+    pub fn retain_paged_packing_payload(
+        &self,
+        retention: mb_store::CatalogPackingPayloadRetention,
+        payload: &mb_store::CatalogPackingPayload,
+    ) -> Result<()> {
+        let policy = self
+            .control
+            .catalog_capacity_policy()?
+            .context("packing output requires explicit capacity admission")?;
+        anyhow::ensure!(
+            retention.budget == policy.plan()?.job_work
+                && payload.guild_id == retention.base.guild_id
+                && self
+                    .control
+                    .record_quota_usage()?
+                    .is_some_and(|usage| usage.state == mb_store::DatabaseRecordQuotaState::Active)
+                && self.control.page_quota_usage()?.is_some()
+                && self.control.journal_quota_usage()?.is_some()
+                && self.control.catalog_storage_usage()?.is_some()
+                && self
+                    .control
+                    .catalog_guild_storage_usage(payload.guild_id)?
+                    .is_some(),
+            "packing output requires active database and guild admission"
+        );
+        let authority = guild_authority::frozen_original_history(&self.control)?;
+        anyhow::ensure!(
+            authority.snapshot().guild_id == payload.guild_id
+                && authority
+                    .snapshot()
+                    .active_members()
+                    .any(|member| member.node_id == self.keys.node_id()),
+            "packing output owner is not a current guild member"
+        );
+        let guard = |_: &mb_store::CatalogPackingPayloadView<'_>| -> Result<()> {
+            authority.check()?;
+            self.control.check_catalog_capacity_policy(policy)?;
+            anyhow::ensure!(
+                self.control.checkpoint_head_identity(&payload.guild_id)?
+                    == Some((retention.base.generation, retention.base.checkpoint_hash)),
+                "packing output checkpoint base changed"
+            );
+            Ok(())
+        };
+        self.control
+            .begin_catalog_packing_payload_retention(retention, guard)?;
+        self.control.retain_catalog_packing_payload_checked(
+            retention,
+            payload,
+            (guard, |payload| {
+                self.volumes.verify_packing_payload(&self.control, payload)
+            }),
+        )?;
+        authority.check()?;
+        Ok(())
+    }
+
+    pub fn close_paged_packing_payloads(
+        &self,
+        retention: mb_store::CatalogPackingPayloadRetention,
+    ) -> Result<()> {
+        self.control
+            .cancel_catalog_packing_payload_retention(retention)?;
+        Ok(())
+    }
+
+    pub fn release_paged_packing_payload_step(
+        &self,
+        retention: mb_store::CatalogPackingPayloadRetention,
+    ) -> Result<bool> {
+        Ok(self.control.release_catalog_packing_payload(retention)?)
+    }
+
     /// Borrow this node's exact published paged source before packing reads.
     /// The enclosing producer still supplies complete original source/candidate
     /// authority. Current indexed membership/base and private seed ownership

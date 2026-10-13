@@ -64,18 +64,20 @@ pub use catalog::{
     CatalogPackingCodingDirectoryIndex, CatalogPackingCodingDirectoryValidation,
     CatalogPackingCodingIndex, CatalogPackingCodingRetention, CatalogPackingCodingRetentionState,
     CatalogPackingCodingValidation, CatalogPackingDirectoryIndex,
-    CatalogPackingDirectoryValidation, CatalogPackingIndex, CatalogPackingPlacement,
-    CatalogPackingSector, CatalogPackingSourceRetention, CatalogPackingSourceRetentionState,
-    CatalogPackingSourceView, CatalogPackingValidation, CatalogPageReservation,
-    CatalogPagedCheckpointDirectoryRetention, CatalogPagedCheckpointRetention,
-    CatalogPagedCheckpointRetentionState, CatalogPayloadRetirementView,
-    CatalogProducedPackingDirectory, CatalogPublicationView, CatalogPublishedRevisionQuota,
-    CatalogPublishedRevisionQuotaScope, CatalogPublishedRevisionQuotaState,
-    CatalogPublishedRevisionQuotaUsage, CatalogPublishedRevisionQuotas,
-    CatalogQuorumPagedCheckpointDirectoryIndex, CatalogQuorumPagedCheckpointIndex,
-    CatalogRetainedSourceQuota, CatalogRetainedSourceReservation, CatalogRetainedSourceUsage,
-    CatalogSectorSource, CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage,
-    CatalogStoreError, CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES,
+    CatalogPackingDirectoryValidation, CatalogPackingIndex, CatalogPackingPayload,
+    CatalogPackingPayloadRetention, CatalogPackingPayloadRetentionState, CatalogPackingPayloadView,
+    CatalogPackingPlacement, CatalogPackingSector, CatalogPackingSourceRetention,
+    CatalogPackingSourceRetentionState, CatalogPackingSourceView, CatalogPackingValidation,
+    CatalogPageReservation, CatalogPagedCheckpointDirectoryRetention,
+    CatalogPagedCheckpointRetention, CatalogPagedCheckpointRetentionState,
+    CatalogPayloadRetirementView, CatalogProducedPackingDirectory, CatalogPublicationView,
+    CatalogPublishedRevisionQuota, CatalogPublishedRevisionQuotaScope,
+    CatalogPublishedRevisionQuotaState, CatalogPublishedRevisionQuotaUsage,
+    CatalogPublishedRevisionQuotas, CatalogQuorumPagedCheckpointDirectoryIndex,
+    CatalogQuorumPagedCheckpointIndex, CatalogRetainedSourceQuota,
+    CatalogRetainedSourceReservation, CatalogRetainedSourceUsage, CatalogSectorSource,
+    CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage, CatalogStoreError,
+    CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES,
     PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
     PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
@@ -3141,6 +3143,154 @@ impl ParityStore {
         Ok(true)
     }
 
+    /// Check exact physical identity without allocating payload bytes. Return
+    /// false for an original incomplete reservation and true for a root-bound
+    /// STAGED/READY object; neither result is certified availability evidence.
+    pub fn check_coding_attempt_binding(
+        &self,
+        attempt: &[u8; 16],
+        guild: &[u8; 32],
+        storage: &[u8; 32],
+        shard: u16,
+        commitment: &MerkleCommitment,
+    ) -> Result<bool, DatabaseError> {
+        commitment
+            .validate()
+            .map_err(|_| DatabaseError::Integrity)?;
+        if *attempt == [0; 16]
+            || *guild == [0; 32]
+            || *storage == [0; 32]
+            || shard >= MAX_CODING_SHARDS
+            || commitment.byte_len > MAX_PROFILE_SHARD_SIZE
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let object = tx
+            .query_row(
+                "SELECT format_version, CASE WHEN length(guild_id)=32 THEN guild_id END,
+            CASE WHEN length(root)=32 THEN root END, byte_length,
+            CASE WHEN length(state)<=6 THEN state END,
+            CASE WHEN length(attempt_id)=16 THEN attempt_id END, length(bytes)
+            FROM parity_objects WHERE group_id=?1 AND shard_index=?2",
+                params![storage.as_slice(), shard],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<Vec<u8>>>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<Vec<u8>>>(5)?,
+                        r.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let complete = if let Some(row) = object {
+            if row.0 != 2
+                || row.1.as_deref() != Some(guild.as_slice())
+                || row.2.as_deref() != Some(commitment.root.as_slice())
+                || row.3 != i64::from(commitment.byte_len)
+                || row.6 != row.3
+                || !matches!(row.4.as_deref(), Some("STAGED" | "READY"))
+                || row.5.as_deref() != Some(attempt.as_slice())
+            {
+                return Err(DatabaseError::Integrity);
+            }
+            true
+        } else {
+            let row = tx.query_row("SELECT CASE WHEN length(guild_id)=32 THEN guild_id END, byte_length, written_until, length(bytes)
+                FROM coding_reservations WHERE attempt_id=?1 AND shard_index=?2",params![attempt.as_slice(),shard], |r| Ok((r.get::<_,Option<Vec<u8>>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).optional()?.ok_or(DatabaseError::NotReady)?;
+            if row.0.as_deref() != Some(guild.as_slice())
+                || row.1 != i64::from(commitment.byte_len)
+                || row.2 < 0
+                || row.2 > row.1
+                || row.2 % MERKLE_LEAF_SIZE as i64 != 0
+                || row.3 != row.1
+            {
+                return Err(DatabaseError::Integrity);
+            }
+            false
+        };
+        tx.commit()?;
+        Ok(complete)
+    }
+
+    /// Authenticate every original STAGED/READY byte with one read-only blob
+    /// pass. The buffer is at most one 64 KiB subtree and the frontier has 19
+    /// hashes, including at the largest historical variable shard size.
+    pub fn authenticate_coding_attempt(
+        &self,
+        attempt: &[u8; 16],
+        guild: &[u8; 32],
+        storage: &[u8; 32],
+        shard: u16,
+        commitment: &MerkleCommitment,
+    ) -> Result<(), DatabaseError> {
+        commitment
+            .validate()
+            .map_err(|_| DatabaseError::Integrity)?;
+        if *attempt == [0; 16]
+            || *guild == [0; 32]
+            || *storage == [0; 32]
+            || shard >= MAX_CODING_SHARDS
+            || commitment.byte_len > MAX_PROFILE_SHARD_SIZE
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let row: i64 = tx
+            .query_row(
+                "SELECT rowid FROM parity_objects WHERE format_version=2
+            AND guild_id=?1 AND group_id=?2 AND shard_index=?3 AND attempt_id=?4
+            AND state IN ('STAGED','READY') AND root=?5 AND byte_length=?6 AND length(bytes)=?6",
+                params![
+                    guild.as_slice(),
+                    storage.as_slice(),
+                    shard,
+                    attempt.as_slice(),
+                    commitment.root.as_slice(),
+                    commitment.byte_len
+                ],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        let size = commitment.byte_len.min(V1_SECTOR_SIZE as u32);
+        let mut accumulator = mb_core::MerkleSubtreeAccumulator::new(commitment.byte_len, size)
+            .map_err(|_| DatabaseError::Integrity)?;
+        let mut bytes = vec![0; size as usize];
+        {
+            let mut blob =
+                self.connection
+                    .blob_open(MAIN_DB, "parity_objects", "bytes", row, true)?;
+            if blob.len() != commitment.byte_len as usize {
+                return Err(DatabaseError::Integrity);
+            }
+            for _ in 0..commitment.byte_len / size {
+                blob.read_exact(&mut bytes)?;
+                let subtree =
+                    mb_core::merkle_open_subtree(&bytes, 0, size / MERKLE_LEAF_SIZE as u32)
+                        .map_err(|_| DatabaseError::Integrity)?;
+                accumulator
+                    .push(subtree.subtree_root)
+                    .map_err(|_| DatabaseError::Integrity)?;
+            }
+        }
+        if accumulator.finish().map_err(|_| DatabaseError::Integrity)? != *commitment {
+            return Err(DatabaseError::Integrity);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Distinguish a delayed abort from a newer attempt that reused the same
     /// group ID after Forget. An absent row is different from a legacy row
     /// without an attempt ID.
@@ -3593,9 +3743,8 @@ impl ParityStore {
                 .ok_or(DatabaseError::Integrity)?
                 .try_into()
                 .map_err(|_| DatabaseError::Integrity)?;
-            if state == "READY"
-                && (preserve_ready.contains(&(group_id, shard_index))
-                    || pinned(group_id, shard_index, root)?)
+            if (state == "READY" && preserve_ready.contains(&(group_id, shard_index)))
+                || pinned(group_id, shard_index, root)?
             {
                 continue;
             }

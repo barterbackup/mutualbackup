@@ -18,6 +18,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod packing_payload_tests;
+
 const VOLUME_MANIFEST_DOMAIN: &[u8] = b"mutualbackup/local-volume-manifest/v1";
 const VOLUME_MANIFEST_FILE: &str = ".mutualbackup-volume";
 const CONTROL_KEY_FILE: &str = "control.key";
@@ -1510,6 +1513,95 @@ impl StorageVolumes {
             .map_err(Into::into)
     }
 
+    /// Check the original pending locator under the enclosing control writer.
+    /// A reservation grants custody of unfinished work, never availability.
+    /// Existing STAGED/READY bytes must authenticate completely in 64 KiB ranges.
+    pub(crate) fn verify_packing_payload(
+        &self,
+        control: &ControlStore,
+        payload: &mb_store::CatalogPackingPayload,
+    ) -> Result<()> {
+        let shard =
+            u8::try_from(payload.shard_index).context("packing payload shard is invalid")?;
+        let object_key = attempt_volume_object_id(&payload.attempt_id, &payload.storage_id, shard);
+        let record = control
+            .get_record_bounded(
+                "volume-attempt-receipt",
+                &object_key,
+                MAX_VOLUME_RECEIPT_BYTES,
+            )?
+            .or(control.get_record_bounded(
+                "volume-attempt-intent",
+                &object_key,
+                MAX_VOLUME_RECEIPT_BYTES,
+            )?);
+        let reservation = control.get_record_bounded(
+            "volume-attempt-reservation",
+            &attempt_reservation_id(&payload.attempt_id, shard),
+            MAX_VOLUME_RECEIPT_BYTES,
+        )?;
+        anyhow::ensure!(
+            record.is_some() || reservation.is_some(),
+            "packing output has no original durable volume owner"
+        );
+        if let Some(bytes) = &record {
+            let record: AttemptVolumeRecord = decode_canonical(bytes)?;
+            validate_attempt_volume_record(&record)?;
+            anyhow::ensure!(
+                record.attempt_id == payload.attempt_id
+                    && record.receipt
+                        == VolumeReceipt {
+                            format_version: 2,
+                            volume_id: payload.volume_id,
+                            guild_id: payload.guild_id,
+                            group_id: payload.storage_id,
+                            shard_index: shard,
+                            root: payload.commitment.root,
+                        },
+                "packing output locator changed"
+            );
+        }
+        if let Some(bytes) = reservation {
+            let reservation: AttemptReservationRecord = decode_canonical(&bytes)?;
+            validate_attempt_reservation_record(&reservation)?;
+            anyhow::ensure!(
+                reservation.attempt_id == payload.attempt_id
+                    && reservation.volume_id == payload.volume_id
+                    && reservation.guild_id == payload.guild_id
+                    && reservation.shard_index == shard
+                    && reservation.byte_length == payload.commitment.byte_len,
+                "packing output reservation changed"
+            );
+        }
+        let store = self
+            .volumes
+            .get(&payload.volume_id)
+            .and_then(|v| v.store.as_ref())
+            .context("packing output volume is offline")?;
+        let complete = store.check_coding_attempt_binding(
+            &payload.attempt_id,
+            &payload.guild_id,
+            &payload.storage_id,
+            payload.shard_index,
+            &payload.commitment,
+        )?;
+        if !complete {
+            anyhow::ensure!(
+                record.is_none(),
+                "packing output locator has lost its physical bytes"
+            );
+            return Ok(());
+        }
+        store.authenticate_coding_attempt(
+            &payload.attempt_id,
+            &payload.guild_id,
+            &payload.storage_id,
+            payload.shard_index,
+            &payload.commitment,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn has_staged_attempt_object(
         &self,
         control: &ControlStore,
@@ -1611,7 +1703,12 @@ impl StorageVolumes {
                 let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
                 validate_attempt_volume_record(&record)?;
                 if record.attempt_id == *attempt_id {
-                    control.delete_record(kind, &record_id)?;
+                    let retired = control.with_catalog_checkpoint_payload_retirement(
+                        |view| -> Result<bool> {
+                            Ok(view.retire_attempt_record(kind, &record_id, *attempt_id, &bytes)?)
+                        },
+                    )?;
+                    anyhow::ensure!(retired, "pending packing output still owns this attempt");
                 }
             }
         }
@@ -1636,7 +1733,11 @@ impl StorageVolumes {
                 {
                     bail!("attempt receipt conflicts with object cleanup");
                 }
-                control.delete_record(kind, &record_id)?;
+                let retired =
+                    control.with_catalog_checkpoint_payload_retirement(|view| -> Result<bool> {
+                        Ok(view.retire_attempt_record(kind, &record_id, *attempt_id, &bytes)?)
+                    })?;
+                anyhow::ensure!(retired, "pending packing output still owns this attempt");
             }
         }
         Ok(())
@@ -1737,6 +1838,11 @@ impl StorageVolumes {
         attempt_id: &[u8; 16],
         preserve_ready: &BTreeSet<([u8; 32], u16)>,
     ) -> Result<bool> {
+        if control.with_catalog_checkpoint_payload_retirement(|view| -> Result<bool> {
+            Ok(view.attempt_is_pinned(*attempt_id)?)
+        })? {
+            return Ok(false);
+        }
         let mut required_volumes = BTreeSet::new();
         let mut cancelled_migrations = Vec::new();
         for (id, bytes) in control.records(VARIABLE_MIGRATION_KIND)? {
@@ -1791,17 +1897,22 @@ impl StorageVolumes {
                 }
                 continue;
             };
-            control.with_catalog_checkpoint_payload_retirement(|view| -> Result<()> {
-                store.discard_uncommitted_attempt_checked(
-                    attempt_id,
-                    preserve_ready,
-                    |storage, shard, root| {
-                        view.is_pinned(storage, shard, root)
-                            .map_err(|_| DatabaseError::Integrity)
-                    },
-                )?;
-                Ok(())
-            })?;
+            let discarded =
+                control.with_catalog_checkpoint_payload_retirement(|view| -> Result<bool> {
+                    if view.attempt_is_pinned(*attempt_id)? {
+                        return Ok(false);
+                    }
+                    store.discard_uncommitted_attempt_checked(
+                        attempt_id,
+                        preserve_ready,
+                        |storage, shard, root| {
+                            view.is_pinned(storage, shard, root)
+                                .map_err(|_| DatabaseError::Integrity)
+                        },
+                    )?;
+                    Ok(true)
+                })?;
+            complete &= discarded;
         }
         for (kind, record_id, record) in attempt_records {
             if self
@@ -1812,6 +1923,7 @@ impl StorageVolumes {
             {
                 continue;
             }
+            let attempt_bytes = canonical_bytes(&record)?;
             let receipt = record.receipt;
             let active_id = volume_object_id(&receipt.group_id, receipt.shard_index);
             let retained_information = preserve_ready
@@ -1846,7 +1958,11 @@ impl StorageVolumes {
                     Ok(())
                 })?;
             }
-            control.delete_record(kind, &record_id)?;
+            let retired =
+                control.with_catalog_checkpoint_payload_retirement(|view| -> Result<bool> {
+                    Ok(view.retire_attempt_record(kind, &record_id, *attempt_id, &attempt_bytes)?)
+                })?;
+            complete &= retired;
         }
         for (record_id, record) in reservations {
             if self
@@ -1855,7 +1971,16 @@ impl StorageVolumes {
                 .and_then(|volume| volume.store.as_ref())
                 .is_some()
             {
-                control.delete_record("volume-attempt-reservation", &record_id)?;
+                let retired =
+                    control.with_catalog_checkpoint_payload_retirement(|view| -> Result<bool> {
+                        Ok(view.retire_attempt_record(
+                            "volume-attempt-reservation",
+                            &record_id,
+                            *attempt_id,
+                            &canonical_bytes(&record)?,
+                        )?)
+                    })?;
+                complete &= retired;
             }
         }
         if complete {

@@ -1596,6 +1596,20 @@ seed recovery and R5/R7 remain open. Normal producers stay disabled; the user
 defers real dense 1 TiB and native Windows/macOS hardware qualification until
 the tool and other software items are ready. See ADR 0002 and `/tmp/mb-m6-packing-checkpoint-handoff-7zoqtutr`.
 
+Pending packing payload loans now preserve exact original physical attempts and
+locators through partial upload, STAGED/READY custody, shared ownership, reopen,
+offline copies and bounded release. Node checks indexed current authority,
+actual base, CAPP/scoped admission and original physical bindings; completed
+bytes authenticate in one bounded incremental-blob pass. Eight Store and four
+real-volume cases,
+maximum 4 MiB/final-role coverage and the extended native fixture pass. Full
+qualification passes 1,499 tests on 362 inputs and 23 executables; retirement
+reclaims 11.80 GiB and target uses 48.59 GiB. Complete durable producer/page/
+source/output-proof integration, aggregate quotas, indexed volume cleanup,
+availability/activation, normal backup/retention/seed recovery and R5/R7 stay
+open. Producers stay disabled; hardware runs remain user-deferred. See ADR 0002
+and `/tmp/mb-m6-packing-output-custody-h2mugql5`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

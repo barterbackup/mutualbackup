@@ -352,6 +352,72 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Pending packing payload custody
+
+`CatalogPackingPayloadRetention` now keeps an exact original volume/attempt,
+guild, storage ID, role and ciphertext commitment live for a pending producer.
+Immutable operation/base/budget, bidirectional payload and attempt dependencies,
+checked counters and bounded canonical rows prevent substitution and one-sided
+ownership repair. Independently supplied work charges each logical payload's
+bytes and five bounded custody rows before physical callbacks. Shared loans
+and exact retries recheck physical custody without another logical charge.
+Zero counters remain stored and charged by global record/SQL quotas.
+
+Current-base/event guards run at both ends of one writer. Verification failure,
+late authority changes, ignored writes and aborts roll back all six acquisition
+or release boundaries. Cancellation closes borrowing but leaves every loan
+live. Cleanup releases at most one exact loan per writer; original volume
+intent/receipt ownership remains until physical cleanup, and other pending or
+checkpoint owners still exclude deletion. This ledger owns neither producer
+pages nor the enclosing operation's completion state.
+
+Physical retirement now checks pending output alongside checkpoint custody.
+Attempt pins protect incomplete reservations, STAGED bytes and their exact
+locators; root pins also protect READY data and migration/GC paths. Volume
+abort returns incomplete while an attempt is loaned; finalization retains the
+original locator and reports the remaining owner. Exact version-1 locator
+retirement checks its original attempt prefix and conditional bytes under the
+same control writer. Existing namespaces and persisted/wire identities remain
+unchanged; no receipt, transcript or checkpoint availability is fabricated.
+
+Node borrowing requires indexed original membership, the actual checkpoint
+base, explicit CAPP/job work and active database/guild admission. It checks the
+original durable reservation or locator and the physical guild, attempt, root,
+length and state. Reservations stay unfinished; existing STAGED/READY payloads
+authenticate completely in one read-only incremental-blob pass with a 64 KiB
+buffer and the original 19-hash Merkle subtree frontier. The real native
+fixture rejects a wrong-root borrow, keeps staged output through reopen and source loss,
+defers abort while borrowed and collects only after explicit release.
+
+Eight Store regressions cover exact identity/sharing/reopen, independent work
+before verification, retries, private/late-head failures, abort/ignore at all
+six write boundaries and damaged/missing/oversized ownership records. Four
+real-volume regressions cover partial uploads, STAGED/READY and offline copies,
+locator/guild/byte corruption and shared release at both 64 KiB and the supported
+maximum 4 MiB payload size, using final role 63. The final focused volume suite
+passes in 14.78 seconds at 105.8 MiB peak RSS. The first repeated-range version
+exceeded its unchanged 300-second focused deadline; exact source/log diagnosis
+is preserved and the verifier now authenticates every byte in one streamed pass.
+Full frozen qualification passes 1,499 distinct/executed tests, including
+481 ordinary Store and 564 ordinary
+Node cases, the bulk writer and all four provisioned Linux native fixtures.
+Format, strict locked workspace/all-targets Clippy and four debug builds pass.
+Audits cover 362 inputs, 359 code/dependency inputs, 23 exact executables and
+19 drivers; 121 other ignored cases remain unexecuted. Retirement reclaims
+11.80 GiB; target uses 48.59 GiB. Older archives, exact prior failed Node
+evidence, 14 auxiliary WIP files and 10 installed roots are preserved.
+Evidence: `/tmp/mb-m6-packing-output-custody-h2mugql5`.
+
+The complete durable packing/coding producer must still join original source
+authority and loans, emitted page intents, output EOF/proof, these payload loans,
+complete aggregate metadata/SQL/journal/scratch/physical admission, distributed
+availability and checkpoint ownership handoff. Normal backup/retention/seed-only
+recovery, remaining legacy consumers and R5/R7 remain open. Existing volume
+attempt cleanup still scans global legacy record families; indexed per-operation
+bounded progress remains required before dense paged production. Normal paged
+producers stay disabled. Real dense 1 TiB and actual Windows/macOS hardware runs
+remain user-deferred until the tool and other software items are ready.
+
 ## Atomic packing-source handoff to checkpoint custody
 
 Both public checkpoint layouts now acquire exact successor-checkpoint custody

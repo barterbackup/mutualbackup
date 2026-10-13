@@ -272,6 +272,59 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     node.retain_paged_packing_source(packing_source, &first)
         .unwrap();
     assert!(node.cancel_paged_native_revision_catalog(first_id).is_err());
+    let packing_output = mb_store::CatalogPackingPayloadRetention {
+        id: packing_source.id,
+        base: packing_source.base,
+        budget: packing_source.budget,
+    };
+    let output_bytes = vec![79; mb_core::V1_SECTOR_SIZE];
+    let output_attempt = *Uuid::new_v4().as_bytes();
+    let output_storage = [80; 32];
+    let output_commitment = mb_core::merkle_commit(&output_bytes).unwrap();
+    node.volumes
+        .reserve_attempt(
+            &node.control,
+            &output_attempt,
+            guild,
+            63,
+            output_commitment.byte_len,
+        )
+        .unwrap();
+    node.volumes
+        .write_attempt_range(&node.control, &output_attempt, 63, 0, &output_bytes)
+        .unwrap();
+    let output_receipt = node
+        .volumes
+        .finish_attempt_upload(
+            &node.control,
+            &output_attempt,
+            output_storage,
+            63,
+            &output_commitment,
+        )
+        .unwrap();
+    let output = mb_store::CatalogPackingPayload {
+        guild_id: guild,
+        storage_id: output_storage,
+        shard_index: 63,
+        commitment: output_commitment,
+        attempt_id: output_attempt,
+        volume_id: output_receipt.volume_id,
+    };
+    let mut wrong_output = output.clone();
+    wrong_output.commitment = mb_core::merkle_commit(&vec![81; mb_core::V1_SECTOR_SIZE]).unwrap();
+    assert!(
+        node.retain_paged_packing_payload(packing_output, &wrong_output)
+            .is_err()
+    );
+    node.retain_paged_packing_payload(packing_output, &output)
+        .unwrap();
+    assert!(
+        !node
+            .volumes
+            .discard_attempt(&node.control, &output_attempt, &BTreeSet::new())
+            .unwrap()
+    );
     let failed_id = Uuid::new_v4();
     let before_head = node.control.checkpoint_head(&guild).unwrap();
     let sql = format!(
@@ -352,6 +405,29 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     node.retain_paged_packing_source(packing_source, &first)
         .unwrap();
     assert!(node.cancel_paged_native_revision_catalog(first_id).is_err());
+    node.retain_paged_packing_payload(packing_output, &output)
+        .unwrap();
+    assert!(
+        !node
+            .volumes
+            .discard_attempt(&node.control, &output_attempt, &BTreeSet::new())
+            .unwrap()
+    );
+    node.close_paged_packing_payloads(packing_output).unwrap();
+    assert!(
+        node.release_paged_packing_payload_step(packing_output)
+            .unwrap()
+    );
+    assert!(
+        !node
+            .release_paged_packing_payload_step(packing_output)
+            .unwrap()
+    );
+    assert!(
+        node.volumes
+            .discard_attempt(&node.control, &output_attempt, &BTreeSet::new())
+            .unwrap()
+    );
     node.close_paged_packing_sources(packing_source).unwrap();
     assert!(
         node.retain_paged_packing_source(packing_source, &first)

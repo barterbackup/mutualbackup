@@ -30,6 +30,7 @@ mod packing_coding_retention;
 mod packing_directories_coverage;
 mod packing_directories_retention;
 mod packing_directory_validation;
+mod packing_payloads;
 mod packing_sources;
 mod packing_validation;
 mod paged_checkpoint;
@@ -100,6 +101,10 @@ pub use packing_directories_retention::{
 };
 pub use packing_directory_validation::{
     CatalogPackingDirectoryIndex, CatalogPackingDirectoryValidation,
+};
+pub use packing_payloads::{
+    CatalogPackingPayload, CatalogPackingPayloadRetention, CatalogPackingPayloadRetentionState,
+    CatalogPackingPayloadView,
 };
 pub use packing_sources::{
     CatalogPackingSourceRetention, CatalogPackingSourceRetentionState, CatalogPackingSourceView,
