@@ -2553,6 +2553,22 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Join original paged packing inputs to exact retained catalog loans.
+      Check original guild/owner/protected-root, source address, flat root and
+      commitment against held bootstrap/data/private-page bindings under the
+      producer writer. Exact revision selection preserves shared owners without
+      substituting the first published index entry. Two Store identity/reopen/
+      corruption cases and 25 focused ordinary cases pass. The extended real
+      native fixture packs mixed legacy/paged inputs, rejects missing loans
+      before reads, preserves checkpoint identity, reopens after source loss and
+      retires exact outputs after cancellation; it passes in 581.15 seconds
+      under the unchanged 900-second bound. Frozen full qualification passes
+      1,522 cases, format, strict Clippy, four builds and 368-input/23-executable
+      audits; 121 ignored cases remain unexecuted. Retirement reclaims
+      9.45 GiB; target uses 48.61 GiB. Complete all-format input custody,
+      aggregate admission/quotas, coding/checkpoint activation, normal retention/
+      seed recovery, legacy consumers and R5/R7 remain open. Producers stay
+      disabled and hardware remains deferred. See ADR 0002 and `/tmp/mb-m6-packing-input-join-bwnl73w8`.
     - [x] Retire cancelled packing output by indexed exact attempts.
       Delete one original object/reservation under the control custody writer,
       preserve other roles and all pending/checkpoint/READY/migration owners,

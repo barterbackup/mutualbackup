@@ -12,8 +12,8 @@ fn capacity() -> CatalogCapacityPolicy {
         format_version: 1,
         datasets: 1,
         revisions_per_dataset: 4,
-        legacy_revisions: 0,
-        legacy_source_occurrences: 0,
+        legacy_revisions: 1,
+        legacy_source_occurrences: 1,
         data_bytes_per_dataset: 512 * 65536,
         data_sources_per_dataset: 512,
         private_work_per_revision: Work {
@@ -29,7 +29,7 @@ fn capacity() -> CatalogCapacityPolicy {
             slot_size: 16384,
         },
         coding_profile: CodingProfile::new(3, 2, 65536),
-        packed_sectors: 1030,
+        packed_sectors: 1031,
         coding_groups: 344,
         replay_work: Work::default(),
     }
@@ -272,6 +272,113 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     node.retain_paged_packing_source(packing_source, &first)
         .unwrap();
     assert!(node.cancel_paged_native_revision_catalog(first_id).is_err());
+    // Pack the actual retained paged candidate with the original legacy base.
+    // The complete source EOF checks exact input loans before any renderer I/O.
+    let reader = node.reader_config().open().unwrap();
+    let legacy = &certified.value.metadata_sectors[0];
+    let binding = reader
+        .sign_legacy_packing_binding(&guild, certified.value.protected_root_id, legacy)
+        .unwrap();
+    let legacy_recipe = reader
+        .control
+        .get_record("local-sector", &legacy.id)
+        .unwrap()
+        .unwrap();
+    let fresh = || {
+        mb_store::CatalogPackingAuthority::from_legacy_checkpoint(
+            checkpoint.hash().unwrap(),
+            &checkpoint,
+            mb_store::RecordScratchStore::new(128 << 20).unwrap(),
+        )
+        .unwrap()
+        .with_legacy_binding(&binding)
+        .unwrap()
+        .with_paged_revision(&first, |page| {
+            reader.control.catalog_page(
+                first.value.scope(),
+                mb_core::CatalogSection::SectorReferences,
+                page,
+            )
+        })
+        .unwrap()
+    };
+    let plan = capacity().plan().unwrap();
+    let operation = mb_store::CatalogPackingOperation::new(
+        Uuid::new_v4(),
+        &fresh(),
+        capacity(),
+        plan.job_work
+            .checked_add(plan.job_work)
+            .unwrap()
+            .checked_add(plan.job_work)
+            .unwrap()
+            .checked_add(plan.job_work)
+            .unwrap(),
+        plan.job_work,
+        plan.job_work,
+    )
+    .unwrap();
+    let reads = std::cell::Cell::new(0_u64);
+    let custody = |view: &mb_store::CatalogPackingOperationView<'_>,
+                   authority: &mb_store::CatalogPackingAuthority|
+     -> anyhow::Result<()> {
+        let mut after = None;
+        while let Some(input) = authority.next_source(after)? {
+            if input.id.object_id == legacy.id {
+                anyhow::ensure!(
+                    view.record(
+                        "local-sector",
+                        &legacy.id,
+                        mb_store::CATALOG_SECTOR_RECIPE_BYTES
+                    )? == Some(legacy_recipe.clone())
+                );
+            } else {
+                let held = view.require_retained_paged_source(operation, first_id, &input)?;
+                anyhow::ensure!(held.bundle.id == first_id);
+            }
+            after = Some(input.id);
+        }
+        Ok(())
+    };
+    assert!(
+        node.produce_retained_packing_operation(operation, fresh(), custody, |_, _| {
+            reads.set(reads.get() + 1);
+            Err(mb_store::CatalogStoreError::Database(
+                mb_store::DatabaseError::Integrity,
+            ))
+        })
+        .is_err()
+    );
+    assert_eq!(
+        reads.get(),
+        0,
+        "missing input loans fail before packing reads"
+    );
+    node.retain_paged_packing_source(operation.sources(), &first)
+        .unwrap();
+    let produced = node
+        .produce_retained_packing_operation(operation, fresh(), custody, |input, bytes| {
+            reads.set(reads.get() + 1);
+            let actual = reader
+                .sector_for_guild(&guild, &input.id.object_id)
+                .map_err(|_| {
+                    mb_store::CatalogStoreError::Database(mb_store::DatabaseError::NotReady)
+                })?;
+            bytes.copy_from_slice(&actual);
+            Ok(())
+        })
+        .unwrap();
+    let packed_manifest = produced.manifest();
+    assert!(reads.get() > 145 && packed_manifest.directory.summary.sectors > 145);
+    assert_eq!(
+        node.control.checkpoint_head_identity(&guild).unwrap(),
+        Some((
+            packing_source.base.generation,
+            packing_source.base.checkpoint_hash
+        ))
+    );
+    drop(produced);
+    drop(reader);
     let packing_output = mb_store::CatalogPackingPayloadRetention {
         id: packing_source.id,
         base: packing_source.base,
@@ -402,6 +509,56 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     let mut tail = [0; 7];
     sparse.read_exact(&mut tail).unwrap();
     assert_eq!(&tail, b"tail\r\n\0");
+    let reader = node.reader_config().open().unwrap();
+    let resumed_authority = mb_store::CatalogPackingAuthority::from_legacy_checkpoint(
+        checkpoint.hash().unwrap(),
+        &checkpoint,
+        mb_store::RecordScratchStore::new(128 << 20).unwrap(),
+    )
+    .unwrap()
+    .with_legacy_binding(&binding)
+    .unwrap()
+    .with_paged_revision(&first, |page| {
+        reader.control.catalog_page(
+            first.value.scope(),
+            mb_core::CatalogSection::SectorReferences,
+            page,
+        )
+    })
+    .unwrap();
+    let replay = node
+        .produce_retained_packing_operation(
+            operation,
+            resumed_authority,
+            |_, _| panic!("completed packing retry owns the complete output"),
+            |_, _| panic!("completed packing retry performs no original-source read"),
+        )
+        .unwrap();
+    assert_eq!(replay.manifest(), packed_manifest);
+    drop(replay);
+    drop(reader);
+    node.cancel_retained_packing_operation(operation).unwrap();
+    while node
+        .control
+        .release_catalog_packing_payload(operation.payloads())
+        .unwrap()
+    {}
+    while let Some(output) = node
+        .control
+        .next_catalog_packing_operation_attempt(operation, None)
+        .unwrap()
+    {
+        assert!(
+            node.retire_retained_packing_output(operation, &output)
+                .unwrap()
+        );
+    }
+    while node
+        .control
+        .release_catalog_packing_source(operation.sources())
+        .unwrap()
+    {}
+    while node.control.release_catalog_pin(operation.pages()).unwrap() {}
     node.retain_paged_packing_source(packing_source, &first)
         .unwrap();
     assert!(node.cancel_paged_native_revision_catalog(first_id).is_err());

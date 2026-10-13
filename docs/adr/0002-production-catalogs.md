@@ -352,6 +352,56 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Exact retained paged packing input joins
+
+The packing writer view now joins one original authorised input to an exact
+retained paged catalog loan by revision ID. The loan's checked forward/reverse
+ownership and bundle identity remain mandatory. Guild, owner and protected-root
+address must match the published signed catalog; source address, flat hash and
+Merkle commitment must match its original bootstrap, data or private-page
+binding. Data joins retain the original anchor/recipe/quota checks; page joins
+retain their original validation facts and page/root ownership. Missing loans,
+changed scopes/roots, missing or ambiguous bindings, and damaged rows fail before
+input reads. An explicit revision prevents another shared owner's earlier
+index entry from replacing the borrowed catalog.
+
+This typed join supplements complete original source authority, source EOF and
+current-base/event checks. Callers still supply complete legacy/remote custody;
+it does not convert a local reference into distributed availability or enable
+normal paged production. Existing schemas, private source addresses, public
+sector IDs, coding profiles and witness layouts remain unchanged.
+
+Two Store regressions cover bootstrap/data/page inputs, exact borrowed/shared
+owners, all source-address/commitment substitutions, close/release fencing,
+reopen and damaged binding isolation. The provisioned native fixture now takes
+an actual retained native paged candidate and the unchanged legacy checkpoint
+source through fresh authenticated packing authority. Missing paged loans reject
+before renderer I/O; acquiring the original private loan permits full source
+and output EOFs, owned packing pages and actual volume payloads. The fixture
+preserves the old checkpoint head, removes the original working tree, reopens
+and validates completed packing without rereading original input. Cancellation
+then releases exact output/source loans and indexed physical attempts before
+original capture cleanup. Its existing shared capture, late-authority rollback,
+restore, hard-link and 1-TiB sparse-file checks remain. The dense file is about
+9 MiB; this is not the deferred real dense 1 TiB gate.
+
+All 25 focused ordinary cases pass. The extended native fixture passes in
+581.15 seconds under its unchanged 900-second deadline with verified mount,
+loop and image cleanup. Frozen full qualification passes 1,522 distinct/executed
+cases, including 499 ordinary Store and 569 Node cases, the bulk journal writer
+and all four provisioned Linux native fixtures. Format, strict locked workspace/
+all-targets Clippy and four debug builds pass. Audits bind 368 inputs, 365
+code/dependency inputs, 23 executables and 19 drivers; 121 other ignored cases
+remain unexecuted. Superseded retirement reclaims 9.45 GiB; target uses
+48.61 GiB. Older archives, exact failed Node evidence, 14 auxiliary WIP
+files and all 10 installed roots remain preserved. Evidence: `/tmp/mb-m6-packing-input-join-bwnl73w8`.
+
+Complete input-owner integration across all formats, shared aggregate admission
+and quotas, coding/checkpoint availability and activation, normal retention/seed
+recovery, remaining legacy consumers and R5/R7 remain open. Normal paged
+producers stay disabled. Dense 1 TiB and actual Windows/macOS hardware gates
+remain user-deferred until software is ready.
+
 ## Bounded cancelled packing output retirement
 
 Cancelled operations now retire one exact planned output under their original

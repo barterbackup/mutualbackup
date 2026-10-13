@@ -494,3 +494,108 @@ fn packing_source_loans_keep_native_binding_live_and_allow_authenticated_replace
     );
     assert!(!store.paged_data_anchor_is_pinned(b).unwrap());
 }
+
+fn authorised(
+    bundle: &CatalogBundle,
+    record: &mb_core::CatalogSectorRecord,
+) -> CatalogPackingAuthorizedSource {
+    let CatalogScope::Dataset {
+        owner,
+        protected_root_id,
+        ..
+    } = bundle.scope
+    else {
+        panic!("dataset fixture")
+    };
+    CatalogPackingAuthorizedSource {
+        id: mb_core::CatalogPackedSourceId {
+            owner,
+            protected_root: mb_core::packing_protected_root(protected_root_id),
+            object_id: record.sector.id,
+        },
+        flat_root: record.sector.root,
+        commitment: record.commitment.clone(),
+    }
+}
+
+#[test]
+fn packing_input_join_requires_the_exact_borrowed_catalog_and_original_source_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = ControlStore::open_with_key(dir.path().join("control.db"), &[7; 32]).unwrap();
+    let (first, bytes) = fixture(&s, 1, None);
+    publish(&s, &first, &bytes).unwrap();
+    let (second, bytes) = fixture(
+        &s,
+        2,
+        Some(
+            paged_revision::revision(&first)
+                .unwrap()
+                .value
+                .hash()
+                .unwrap(),
+        ),
+    );
+    publish(&s, &second, &bytes).unwrap();
+    let job = retention();
+    begin(&s, job).unwrap();
+    retain(&s, job, &second).unwrap();
+    let first_source = authorised(
+        &first,
+        &paged_revision::revision(&first).unwrap().value.metadata,
+    );
+    assert!(retained_source(&s.connection, job, first.id, &first_source).is_err());
+    let record = paged_revision::revision(&second).unwrap().value.metadata;
+    let input = authorised(&second, &record);
+    assert_eq!(
+        retained_source(&s.connection, job, second.id, &input)
+            .unwrap()
+            .bundle,
+        second
+    );
+    for damage in 0..5 {
+        let mut wrong = input.clone();
+        match damage {
+            0 => wrong.id.owner = mb_core::NodeId([94; 32]),
+            1 => wrong.id.protected_root = [95; 32],
+            2 => wrong.id.object_id = [96; 32],
+            3 => wrong.flat_root = [97; 32],
+            _ => wrong.commitment.root = [98; 32],
+        }
+        assert!(retained_source(&s.connection, job, second.id, &wrong).is_err());
+    }
+    s.cancel_catalog_packing_source_retention(job).unwrap();
+    assert!(retained_source(&s.connection, job, second.id, &input).is_ok());
+    while s.release_catalog_packing_source(job).unwrap() {}
+    assert!(retained_source(&s.connection, job, second.id, &input).is_err());
+}
+
+#[test]
+fn packing_input_join_validates_data_and_page_bindings_and_reopens_shared_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.db");
+    let s = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+    let data = data_fixture(&s, Uuid::new_v4());
+    let data_input = authorised(&data.catalog.bundle, &data.source);
+    let job = retention();
+    begin(&s, job).unwrap();
+    retain(&s, job, &data.catalog.bundle).unwrap();
+    assert!(retained_source(&s.connection, job, data.catalog.bundle.id, &data_input).is_ok());
+    let signed = paged_revision::revision(&data.catalog.bundle).unwrap();
+    let (next, bytes) = fixture(&s, 2, Some(signed.value.hash().unwrap()));
+    publish(&s, &next, &bytes).unwrap();
+    retain(&s, job, &next).unwrap();
+    let page = s
+        .paged_revision_page_source(next.id, data.source.sector.id)
+        .unwrap()
+        .unwrap();
+    let input = authorised(&next, &page.source);
+    assert!(retained_source(&s.connection, job, next.id, &input).is_ok());
+    drop(s);
+    let s = ControlStore::open_existing_with_key(&path, &[7; 32]).unwrap();
+    assert!(retained_source(&s.connection, job, next.id, &input).is_ok());
+    let kind = format!("catalog-paged-page-source-v1/{}", next.id.simple());
+    s.put_record(&kind, &input.id.object_id, &[0; 8193])
+        .unwrap();
+    assert!(retained_source(&s.connection, job, next.id, &input).is_err());
+    assert!(retained_source(&s.connection, job, data.catalog.bundle.id, &data_input).is_ok());
+}

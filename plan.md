@@ -5662,3 +5662,16 @@ Physical compaction, aggregate admission/quotas, complete source/coding/
 checkpoint integration, normal retention/seed recovery, legacy consumers and
 R5/R7 remain open. Producers stay disabled and hardware remains user-deferred.
 Evidence: `/tmp/mb-m6-packing-cleanup-q_bm7yfn`; see ADR 0002.
+
+Original paged packing inputs now join exact retained catalog loans under the
+producer writer, preserving bootstrap/data/private-page identities and shared
+owners. The actual native fixture combines the unchanged legacy base with a
+retained paged candidate, rejects missing loans before reads, packs real volume
+outputs, reopens after working-tree loss and cancels through indexed cleanup.
+Two new Store cases, 25 focused ordinary cases and the extended 581.15-second
+native case pass within 1,522 frozen qualification cases on 368 inputs and 23
+executables. Retirement reclaims 9.45 GiB; target uses 48.61 GiB.
+All-format input custody, aggregate admission/quotas, coding/checkpoint
+availability/activation, normal retention/seed recovery, legacy consumers and
+R5/R7 remain open. Producers stay disabled and hardware stays user-deferred.
+Evidence: `/tmp/mb-m6-packing-input-join-bwnl73w8`; see ADR 0002.

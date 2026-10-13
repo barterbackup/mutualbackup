@@ -291,6 +291,53 @@ fn read(
     Ok(Some(catalog))
 }
 
+/// Exact per-revision joins preserve shared-source ownership without a
+/// history-wide lookup or choosing another published owner's first entry.
+pub(super) fn retained_source(
+    connection: &Connection,
+    retention: CatalogPackingSourceRetention,
+    revision: Uuid,
+    authorised: &CatalogPackingAuthorizedSource,
+) -> Result<PagedCatalogSnapshot, CatalogStoreError> {
+    require(connection, retention)?;
+    let catalog = read(connection, retention.id, revision)?.ok_or(DatabaseError::NotReady)?;
+    let CatalogScope::Dataset {
+        guild_id,
+        owner,
+        protected_root_id,
+    } = catalog.bundle.scope
+    else {
+        return Err(DatabaseError::Integrity.into());
+    };
+    if guild_id != retention.base.guild_id
+        || owner != authorised.id.owner
+        || mb_core::packing_protected_root(protected_root_id) != authorised.id.protected_root
+    {
+        return Err(DatabaseError::Conflict.into());
+    }
+    let signed = paged_revision::revision(&catalog.bundle)?;
+    let reference = if signed.value.metadata.sector.id == authorised.id.object_id {
+        signed.value.metadata.clone()
+    } else {
+        let data = paged_data::read_source(connection, revision, authorised.id.object_id)?;
+        let page = paged_revision::page_source(connection, revision, authorised.id.object_id)?;
+        match (data, page) {
+            (Some(data), None) if data.catalog == catalog => data.source,
+            (None, Some(page)) if page.catalog == catalog => page.source,
+            (None, None) => return Err(DatabaseError::NotReady.into()),
+            _ => return Err(DatabaseError::Integrity.into()),
+        }
+    };
+    reference.validate()?;
+    if reference.sector.id != authorised.id.object_id
+        || reference.sector.root != authorised.flat_root
+        || reference.commitment != authorised.commitment
+    {
+        return Err(DatabaseError::Conflict.into());
+    }
+    Ok(catalog)
+}
+
 pub(super) fn require_unretained(
     connection: &Connection,
     revision: Uuid,

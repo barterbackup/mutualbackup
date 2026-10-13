@@ -400,6 +400,20 @@ impl CatalogPackingOperationView<'_> {
     ) -> Result<Option<PagedCatalogSnapshot>, CatalogStoreError> {
         packing_sources::operation_source(self.connection, retention, revision)
     }
+    /// Join one original authorised paged input to an exact already-held
+    /// catalog loan. Resolve the caller's revision directly so another shared
+    /// owner's earlier index entry cannot substitute for the borrowed owner.
+    /// Current authority and complete source EOF are checked by the producer.
+    pub fn require_retained_paged_source(
+        &self,
+        operation: CatalogPackingOperation,
+        revision: Uuid,
+        source: &CatalogPackingAuthorizedSource,
+    ) -> Result<PagedCatalogSnapshot, CatalogStoreError> {
+        operation.validate()?;
+        packing_sources::retained_source(self.connection, operation.sources(), revision, source)
+    }
+
     pub fn payload(
         &self,
         retention: CatalogPackingPayloadRetention,
