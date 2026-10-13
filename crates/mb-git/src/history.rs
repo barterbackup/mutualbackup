@@ -189,10 +189,11 @@ pub struct GitGraphSource {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct MetadataObject {
-    format_version: u16,
-    kind: u8,
-    bytes: Vec<u8>,
+pub(crate) struct MetadataObject {
+    pub(crate) format_version: u16,
+    pub(crate) kind: u8,
+    #[serde(deserialize_with = "crate::metadata_odb::decode_bytes")]
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -304,7 +305,7 @@ pub(crate) fn ref_kind(repository_id: Uuid) -> String {
     format!("{REF_PREFIX}{repository_id}")
 }
 
-fn object_type(code: u8) -> Option<ObjectType> {
+pub(crate) fn object_type(code: u8) -> Option<ObjectType> {
     match code {
         1 => Some(ObjectType::Commit),
         2 => Some(ObjectType::Tree),
@@ -386,28 +387,12 @@ pub(crate) fn commit_descends_from_with_changes(
     Ok(repository.graph_descendant_of(descendant, ancestor)?)
 }
 
-fn load_metadata(
+pub(crate) fn load_metadata(
     control: &ControlStore,
     repository_id: Uuid,
     repository: &Repository,
-) -> Result<HashMap<Oid, MetadataObject>, HistoryError> {
-    let odb = repository.odb()?;
-    let mut objects = HashMap::new();
-    for (key, encoded) in control.records(&metadata_kind(repository_id))? {
-        let object: MetadataObject = decode_canonical(&encoded)?;
-        let kind = object_type(object.kind).ok_or(HistoryError::IncompatibleRecord)?;
-        let oid = Oid::hash_object(kind, &object.bytes)?;
-        if object.format_version != 1 || key != oid.as_bytes() {
-            return Err(HistoryError::IncompatibleRecord);
-        }
-        if odb.write(kind, &object.bytes)? != oid {
-            return Err(HistoryError::IncompatibleRecord);
-        }
-        if objects.insert(oid, object).is_some() || objects.len() > MAX_GRAPH_OBJECTS {
-            return Err(HistoryError::GraphTooLarge);
-        }
-    }
-    Ok(objects)
+) -> Result<crate::metadata_odb::MetadataIndex, HistoryError> {
+    crate::metadata_odb::MetadataIndex::load(control, repository_id, &repository.odb()?)
 }
 
 fn load_proposed_metadata(
@@ -415,10 +400,9 @@ fn load_proposed_metadata(
     repository_id: Uuid,
     repository: &Repository,
     changes: &[(String, Vec<u8>, Vec<u8>)],
-) -> Result<HashMap<Oid, MetadataObject>, HistoryError> {
+) -> Result<crate::metadata_odb::MetadataIndex, HistoryError> {
     let mut stored = load_metadata(control, repository_id, repository)?;
     let namespace = metadata_kind(repository_id);
-    let odb = repository.odb()?;
     for (kind, key, encoded) in changes {
         if *kind != namespace {
             continue;
@@ -428,19 +412,13 @@ fn load_proposed_metadata(
         let oid = Oid::hash_object(kind, &object.bytes)?;
         if object.format_version != 1
             || key != oid.as_bytes()
-            || stored.get(&oid).is_some_and(|previous| {
+            || stored.get(oid)?.is_some_and(|previous| {
                 previous.kind != object.kind || previous.bytes != object.bytes
             })
         {
             return Err(HistoryError::IncompatibleRecord);
         }
-        if odb.write(kind, &object.bytes)? != oid {
-            return Err(HistoryError::IncompatibleRecord);
-        }
-        stored.insert(oid, object);
-        if stored.len() > MAX_GRAPH_OBJECTS {
-            return Err(HistoryError::GraphTooLarge);
-        }
+        stored.insert(oid, encoded)?;
     }
     Ok(stored)
 }
@@ -454,9 +432,7 @@ pub(crate) fn verified_metadata_ids(
     let odb = git2::Odb::new()?;
     let _pack = odb.add_new_mempack_backend(1000)?;
     repository.set_odb(&odb)?;
-    Ok(load_metadata(control, repository_id, &repository)?
-        .into_keys()
-        .collect())
+    load_metadata(control, repository_id, &repository)?.ids()
 }
 
 fn head_oid_for_scope(
@@ -1914,7 +1890,7 @@ fn proposed_graph_metadata(
     let mut objects = Vec::with_capacity(reachable.len());
     let mut metadata_bytes = refs.iter().map(|item| item.name.len() + 20).sum::<usize>();
     for (oid, kind) in reachable {
-        let stored_object = stored.get(&oid).ok_or(HistoryError::IncompatibleRecord)?;
+        let stored_object = stored.get(oid)?.ok_or(HistoryError::IncompatibleRecord)?;
         if object_type(stored_object.kind) != Some(kind) {
             return Err(HistoryError::IncompatibleRecord);
         }
@@ -1927,7 +1903,7 @@ fn proposed_graph_metadata(
         objects.push(GitGraphObject {
             kind: stored_object.kind,
             oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
-            bytes: stored_object.bytes.clone(),
+            bytes: stored_object.bytes,
         });
     }
     let mut blob_ids = blob_ids.into_iter().collect::<Vec<_>>();

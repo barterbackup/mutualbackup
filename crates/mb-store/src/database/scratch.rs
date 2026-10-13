@@ -277,6 +277,55 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn scratch_owner_moves_between_threads_with_serialized_sql_and_final_cleanup() {
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().unwrap();
+        let store = RecordScratchStore::new_in(
+            temp.path(),
+            ScratchStorageLimits::for_database(4 << 20).unwrap(),
+        )
+        .unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        for number in 0u32..4 {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let store = shared.lock().unwrap();
+                store
+                    .put_record_if_absent("moved", &number.to_be_bytes(), &[number as u8; 65536])
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .get_record_bounded("moved", &number.to_be_bytes(), 65536)
+                        .unwrap()
+                        .unwrap(),
+                    vec![number as u8; 65536]
+                );
+            })
+            .join()
+            .unwrap();
+        }
+        let shared = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+        std::thread::spawn(move || {
+            let mut after = None;
+            let mut count = 0;
+            while let Some((key, bytes)) = shared
+                .next_record_bounded("moved", after.as_deref(), 4, 65536)
+                .unwrap()
+            {
+                assert_eq!(bytes, vec![count; 65536]);
+                after = Some(key);
+                count += 1;
+            }
+            assert_eq!(count, 4);
+            drop(shared);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn scratch_records_bound_reads_and_roll_back_conflicts_and_exhaustion() {
         assert!(RecordScratchStore::new(4096).is_err());
         assert!(RecordScratchStore::new(u64::MAX).is_err());

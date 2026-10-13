@@ -76,6 +76,16 @@ pub(super) struct ScratchVfs {
     _state: Box<State>,
 }
 
+// SAFETY: Moving this owner does not move its boxed VFS/State or CString
+// allocations, so SQLite's registered pointers stay valid. The original VFS
+// is SQLite's process-global native adapter, not a thread-local allocation.
+// File descriptors and allocation counters are thread-safe; there are no
+// thread-affine fields. RecordScratchStore retains rusqlite's !Sync connection
+// and closes it before unregistering this adapter. Shared users must serialize
+// the complete connection (as the Git ODB's Mutex does), consistent with
+// https://sqlite.org/threadsafe.html for SQLITE_OPEN_NOMUTEX connections.
+unsafe impl Send for ScratchVfs {}
+
 struct State {
     original: *mut ffi::sqlite3_vfs,
     directory: File,

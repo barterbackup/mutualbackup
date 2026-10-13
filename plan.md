@@ -5725,3 +5725,26 @@ dense 1 TiB and Windows/macOS hardware stays user-deferred. Evidence:
 Exact superseded-inode retirement reclaims 9.48 GiB; target uses 49.73 GiB.
 Current executables, 29 older archived paths, both failed Node artifacts, 14
 auxiliary WIP files and all 10 installed roots remain intact.
+
+Ordinary Git history, proposal and status metadata now uses a complete verified
+encrypted index and on-demand ODB reads, preserving original v1 identities and
+supporting exact overlays without a whole historical metadata array or memory-
+backend copy. The index outlives its source/loader through C ownership; SQL
+callbacks serialize the movable scratch owner and preserve final cleanup.
+Four new ordinary cases and ten focused history cases pass. The explicit
+1,027-object/512.5 MiB metadata corpus uses 23.10 MiB peak RSS for short history,
+status and identity enumeration. Full qualification passes 1,538 cases: 1,265
+fresh and 273 exact unchanged reused, with strict Clippy, builds, both bulk
+cases, four Linux native fixtures and 372-input/23-executable audits. 121 ignored
+cases remain unexecuted. Ordinary Git takes 243.74s against the prior 112.15s,
+reflecting encrypted disk work in place of whole-history memory copies.
+Full paged Git installation/consumers, aggregate admission/physical quotas,
+distributed activation, normal paged production/retention/seed recovery, legacy
+consumers and R5/R7 remain open. Producers stay disabled; dense 1 TiB and
+Windows/macOS hardware stay deferred. Evidence:
+`/tmp/mb-m6-git-metadata-odb-m0x4r7kv`; see ADR 0002.
+
+Exact superseded-inode retirement reclaims 9.49 GiB; target uses 49.92 GiB.
+Current executables, 29 older archived paths, both failed Node artifacts, the
+failed Git fixture, 14 auxiliary WIP files and all 10 installed roots remain
+intact.

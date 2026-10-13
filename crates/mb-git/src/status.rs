@@ -24,7 +24,6 @@ use crate::stage::{
     staged_entries_for_scope,
 };
 
-const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
 const MAX_STATUS_FILES: usize = 100_000;
 pub(crate) type TreeFiles = BTreeMap<Vec<u8>, ([u8; 20], u32)>;
@@ -45,6 +44,8 @@ pub enum StatusError {
     Merge(#[from] MergeBlobError),
     #[error("Git object error: {0}")]
     Git(#[from] git2::Error),
+    #[error("Git metadata index error: {0}")]
+    Metadata(#[source] Box<crate::history::HistoryError>),
     #[error("working-tree or temporary repository error: {0}")]
     Io(#[from] std::io::Error),
     #[error("history catalog or index contains an incompatible record")]
@@ -91,13 +92,6 @@ pub struct GitStatus {
 }
 
 #[derive(Deserialize)]
-struct MetadataObject {
-    format_version: u16,
-    kind: u8,
-    bytes: Vec<u8>,
-}
-
-#[derive(Deserialize)]
 struct RefRecord {
     format_version: u16,
     oid: [u8; 20],
@@ -135,22 +129,8 @@ pub(crate) fn files_for_commit(
     let odb = git2::Odb::new()?;
     let _pack = odb.add_new_mempack_backend(1000)?;
     repository.set_odb(&odb)?;
-    for (key, encoded) in control.records(&format!("{METADATA_PREFIX}{repository_id}"))? {
-        let object: MetadataObject = decode_canonical(&encoded)?;
-        let kind = match object.kind {
-            1 => ObjectType::Commit,
-            2 => ObjectType::Tree,
-            3 => ObjectType::Tag,
-            _ => return Err(StatusError::IncompatibleRecord),
-        };
-        let oid = Oid::hash_object(kind, &object.bytes)?;
-        if object.format_version != 1
-            || key != oid.as_bytes()
-            || odb.write(kind, &object.bytes)? != oid
-        {
-            return Err(StatusError::IncompatibleRecord);
-        }
-    }
+    crate::history::load_metadata(control, repository_id, &repository)
+        .map_err(|error| StatusError::Metadata(Box::new(error)))?;
     let commit = repository
         .find_commit(head)
         .map_err(|_| StatusError::IncompatibleRecord)?;

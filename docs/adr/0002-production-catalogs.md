@@ -6918,3 +6918,72 @@ remain user-deferred. Evidence: `/tmp/mb-m6-checkpoint-restore-7o2i3ix5`.
 Exact superseded-inode retirement reclaims 9.48 GiB; target uses 49.73 GiB.
 Current executables, 29 older archived paths, both failed Node artifacts, 14
 auxiliary WIP files and all 10 installed roots remain intact.
+
+### Encrypted on-demand ordinary Git metadata (2026-10-13)
+
+Ordinary history, ancestry, tag/branch validation, commit/merge proposal
+validation and status now read original metadata through an encrypted
+disposable index attached as a read-only libgit2 ODB. The source streams one
+SQL-bounded key/value row at a time in one SELECT snapshot, authenticates the
+original object type/OID/canonical envelope and completes all rows before
+attaching the index. Historical count and per-object bounds remain supported.
+Normal reads no longer retain a whole historical MetadataObject HashMap or
+populate libgit2's memory backend with every stored object.
+
+Exact proposal additions become visible atomically in the private index;
+conflicting bytes/OIDs, ignored paired writes, invalid keys/lengths/envelopes and
+incomplete prefixes fail closed. Every requested object is bounded and
+reauthenticated before C buffer publication. The original v1 durable record
+codec, names, object IDs, refs, blob anchors and current heads are unchanged.
+Legacy export/preflight still collects only its already bounded reachable
+output; complete large paged Git installation requires the remaining consumer
+and record-format integration.
+
+The C ODB owns an Arc of the encrypted index, independent of the source
+connection and Rust loader. A Mutex serializes the complete SQLCipher connection
+for libgit2 callbacks, and panic/error fences prevent unwinding through C.
+Scratch ownership may move threads because its boxed VFS/state/name addresses
+remain stable, the native VFS is process-global and the connection remains
+non-Sync. Final connection close precedes VFS unregister and DELETEONCLOSE
+cleanup. A regression moves and reads/writes the owner on separate serialized
+threads, then verifies final cleanup on a different thread.
+
+Three Git cases cover original objects and overlays after source/loader drop,
+invalid key/length/identity/nested bounds, ignored/aborted paired writes and
+uncached damaged owned rows. Ten ordinary history regressions also pass. The
+first damaged-empty-tree assertion incorrectly assumed libgit2 would consult
+storage for its built-in canonical empty tree; the uncached nonempty replacement
+passes. Exact failed source/log/binary are preserved separately. An explicit
+1,027-object corpus with over 512 MiB of original metadata exercises short
+history, status and identity enumeration under normal logical/page/journal
+quotas; the 512.5 MiB payload corpus passes in 199.36 seconds with 23.10 MiB peak
+process RSS. This qualifies the listed metadata readers, not full paged Git
+installation or dense 1 TiB recovery.
+
+Frozen qualification passes 1,538 distinct cases in 1,538 executions: 1,265
+fresh runs and 273 exact unchanged cases reused with source/binary guards.
+It includes 210 Core, 509 ordinary Store, 120 Git, 571 Node, 23 prototype
+acceptance, both explicit bulk cases, four provisioned Linux native fixtures
+and the other workspace targets. The longest native fixture passes in 576.79
+seconds under its unchanged 900-second limit. The ordinary Git suite takes
+243.74 seconds against the preceding 112.15-second run; the encrypted index
+adds I/O/crypto work while bounding metadata loading memory. Format, strict
+locked workspace/all-targets Clippy, four debug program builds and test
+compilation pass. Frozen evidence binds 372 inputs (369 code/dependency inputs),
+23 executables and 19 ordinary drivers; 121 other ignored cases remain
+unexecuted. Native mount/image/loop cleanup and preservation of both failed
+Node artifacts, the failed Git fixture, 14 auxiliary WIP files and 10 installed
+roots pass.
+
+This completes the ordinary metadata-loading component. Large paged Git
+installation and normal paging/graph/blob consumers, complete aggregate
+admission/physical quotas, distributed availability/current activation, normal
+paged production/retention/seed recovery, legacy consumers and R5/R7 remain
+open. Normal paged producers remain disabled; dense 1 TiB and native Windows/
+macOS host tests remain user-deferred. Evidence:
+`/tmp/mb-m6-git-metadata-odb-m0x4r7kv`.
+
+Exact superseded-inode retirement reclaims 9.49 GiB; target uses 49.92 GiB.
+Current executables, 29 older archived paths, both failed Node artifacts, the
+failed Git fixture, 14 auxiliary WIP files and all 10 installed roots remain
+intact.

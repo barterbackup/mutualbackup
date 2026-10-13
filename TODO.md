@@ -2553,6 +2553,28 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Move ordinary Git metadata loading to an encrypted on-demand ODB.
+      History, ancestry, tags/branches, proposal validation and status stream
+      original SQL-bounded metadata into a complete verified disposable index,
+      then read requested objects through libgit2. Remove the whole historical
+      MetadataObject array and historical memory-backend copy. Preserve original
+      v1 records, object IDs, refs and native blobs. Exact proposal additions
+      are atomic; malformed/oversized identities and ignored paired writes fail
+      before index publication. The C ODB owns the index through source/loader
+      drop; a Mutex serializes SQL use and cross-thread cleanup is qualified.
+      Three new Git cases, one Store lifetime case and ten focused ordinary
+      history cases pass. The explicit 1,027-object/512.5 MiB metadata corpus
+      exercises history/status/identity reads with 23.10 MiB peak process RSS.
+      Frozen qualification passes 1,538 cases: 1,265 fresh and 273 exact unchanged
+      reused. Format, strict Clippy, four builds, both bulk cases, four Linux
+      native fixtures and 372-input/23-executable audits pass. 121 ignored cases
+      remain unexecuted. Git's ordinary suite takes 243.74s against the prior
+      112.15s; private disk/encryption work replaces whole-history memory copies.
+      Exact superseded retirement reclaims 9.49 GiB; target uses 49.92 GiB.
+      Full paged Git installation/consumers, aggregate admission/physical quotas,
+      distributed activation, normal production/retention/seed recovery and
+      R1/R2/R3/R5/R7 remain open. Producers stay disabled; hardware stays deferred.
+      Evidence: `/tmp/mb-m6-git-metadata-odb-m0x4r7kv`; see ADR 0002.
     - [x] Restore exact retained checkpoint native snapshots under enclosing custody.
       Both public layouts select the original authenticated revision and exact
       private dependency; original legacy IDs use their retained conversion.

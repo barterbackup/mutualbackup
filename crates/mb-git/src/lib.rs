@@ -34,6 +34,8 @@ mod history;
 mod interop;
 #[cfg(target_os = "linux")]
 mod merge;
+#[cfg(target_os = "linux")]
+mod metadata_odb;
 mod object_catalog;
 mod odb;
 mod paged_catalog;
