@@ -25790,28 +25790,43 @@ mod tests {
         addresses: &[Multiaddr],
         endpoints: &[String],
     ) -> QuorumGuildGenesis {
-        let coordinator_id = nodes[0].lock().unwrap().keys().node_id();
-        nodes[0]
-            .lock()
-            .unwrap()
-            .create_guild(vec![endpoints[0].clone()])
-            .unwrap();
+        // Peer loops are already live, including on current-thread runtimes.
+        // Keep synchronous catalog/crypto work off their executor, as the
+        // production request path does. Request deadlines remain unchanged.
+        let mut node_ids = Vec::new();
+        for node in nodes {
+            node_ids.push(
+                node_blocking(node.clone(), |node| Ok(node.keys().node_id()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let coordinator_id = node_ids[0];
+        let endpoint = endpoints[0].clone();
+        node_blocking(nodes[0].clone(), move |node| {
+            node.create_guild(vec![endpoint])
+        })
+        .await
+        .unwrap();
         let expires = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 3600;
         for index in 1..5 {
-            let invite = nodes[0]
-                .lock()
-                .unwrap()
-                .issue_guild_invite(vec![endpoints[0].clone()], expires)
-                .unwrap();
-            let local_peer = nodes[index]
-                .lock()
-                .unwrap()
-                .begin_join_guild(invite.clone(), vec![endpoints[index].clone()])
-                .unwrap();
+            let endpoint = endpoints[0].clone();
+            let invite = node_blocking(nodes[0].clone(), move |node| {
+                node.issue_guild_invite(vec![endpoint], expires)
+            })
+            .await
+            .unwrap();
+            let local_invite = invite.clone();
+            let endpoint = endpoints[index].clone();
+            let local_peer = node_blocking(nodes[index].clone(), move |node| {
+                node.begin_join_guild(local_invite, vec![endpoint])
+            })
+            .await
+            .unwrap();
             clients[index]
                 .add_peer_address(coordinator_id, addresses[0].clone())
                 .await
@@ -25821,16 +25836,20 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let (genesis, peers) = nodes[0].lock().unwrap().proposed_guild_genesis().unwrap();
+        let (genesis, peers) =
+            node_blocking(nodes[0].clone(), |node| node.proposed_guild_genesis())
+                .await
+                .unwrap();
+        let local_genesis = genesis.clone();
         let mut signatures = vec![
-            nodes[0]
-                .lock()
-                .unwrap()
-                .sign_guild_genesis(&genesis)
-                .unwrap(),
+            node_blocking(nodes[0].clone(), move |node| {
+                node.sign_guild_genesis(&local_genesis)
+            })
+            .await
+            .unwrap(),
         ];
         for index in 1..5 {
-            let peer_id = nodes[index].lock().unwrap().keys().node_id();
+            let peer_id = node_ids[index];
             clients[0]
                 .add_peer_address(peer_id, addresses[index].clone())
                 .await
@@ -25848,18 +25867,18 @@ mod tests {
             signatures,
         };
         certificate.verify().unwrap();
-        for node in nodes.iter().skip(1) {
-            let peer_id = node.lock().unwrap().keys().node_id();
+        for peer_id in node_ids.iter().skip(1).copied() {
             clients[0]
                 .install_guild_genesis(peer_id, certificate.clone(), peers.clone())
                 .await
                 .unwrap();
         }
-        nodes[0]
-            .lock()
-            .unwrap()
-            .install_guild_genesis(certificate.clone(), peers)
-            .unwrap();
+        let local_certificate = certificate.clone();
+        node_blocking(nodes[0].clone(), move |node| {
+            node.install_guild_genesis(local_certificate, peers)
+        })
+        .await
+        .unwrap();
         certificate
     }
 

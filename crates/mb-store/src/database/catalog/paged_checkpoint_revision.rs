@@ -185,6 +185,7 @@ pub(super) fn require_unretained(
     connection: &Connection,
     revision: Uuid,
 ) -> Result<(), CatalogStoreError> {
+    packing_sources::require_unretained(connection, revision)?;
     let retained: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind = ?1)",
         params![owners(revision)],

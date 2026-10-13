@@ -352,6 +352,60 @@ obsolete-inode retirement reclaims 10.65 GiB; target uses 47.44 GiB.
 Current executables, 29 older archived paths, 14 auxiliary WIP files and 10
 installed roots are preserved. Evidence: `/tmp/mb-m6-database-page-quota-zeo6a1k8`.
 
+## Durable source custody for pending packing
+
+`CatalogPackingSourceRetention` now loans an exact published paged revision to
+an immutable local packing operation. The operation ID, independently trusted
+checkpoint base and enclosing budget cannot change on retry. The caller checks
+actual current base/events at both ends of the writer and authenticates the
+original signed revision, private descriptor, bootstrap and source bindings
+through its snapshot.
+This loan supplies custody; source authorization remains with the original
+checkpoint/candidate proof and payload verification remains with the producer.
+
+Forward and reverse dependency bytes bind the original bundle hash. Checked
+owner counts reject missing reverse pins instead of allowing cancellation.
+The original bundle owns all root, private-page, bootstrap and physical source
+pins; the loan copies no catalog and changes no source or quota ownership.
+Each byte/page/record dimension is admitted before private callbacks. Shared
+loans and exact retries reauthenticate without charging another dependency.
+Existing revision/bundle and native-capture cancellation now exclude these
+loans, including the capture's journal-fencing transaction. Verified equivalent
+native-source replacement remains available under unchanged commitments.
+
+Cancellation permanently fences the operation ID while keeping its loans live.
+Each cleanup transaction releases at most one exact catalog with conditional
+forward/reverse/count/journal writes. A zero owner count remains as bounded local
+metadata; record/SQL quotas still charge stored rows. Transfer to checkpoint
+custody must finish before the enclosing operation releases its loans. The new
+API does not complete that handoff, the durable Node packing/coding operation,
+payload custody, aggregate physical/pending-job admission or production
+backup/retention/seed-only recovery. Those and the remaining software gates stay
+open; normal paged producers stay disabled. Dense real 1 TiB and actual native
+Windows/macOS qualification remain user-deferred.
+
+Eight regressions cover shared ownership/reopen, bootstrap and native serving,
+capture cancellation, exact identity, all independent budget dimensions before
+authentication, private/late-guard failures, damaged/one-sided rows, checked
+owner counts, verified source replacement and abort/ignore at every acquire and
+release boundary. Full frozen qualification passes 1,479 distinct/executed tests,
+including 465 ordinary Store, 560 ordinary Node, the bulk writer and all four
+provisioned Linux native fixtures. Formatting, strict locked workspace/all-targets
+Clippy and four debug builds pass. Audits cover 358 inputs, 355 code/dependency
+inputs, 23 exact executables and 19 drivers; 121 other ignored cases remain
+unexecuted. Retirement reclaims 19.06 GiB; target uses 48.58 GiB.
+Older archives, 14 auxiliary WIP files and 10 installed roots are preserved.
+The first full run reached 559 Node passes and one real libp2p genesis-install
+fixture timeout before the minority-signature scenario began. The unchanged
+parent/current isolated cases and four concurrent parent copies passed. Common
+guild formation now sends local catalog/signing work through the existing
+blocking worker while retaining all five real peers, signatures, installs and
+request/scenario deadlines. Five signature cases and the corrected full run
+are qualified; this does not close the historical R5 topology/signature cause
+or full interruption matrix. Exact failed source, logs and executable identity
+are retained for diagnosis.
+Evidence: `/tmp/mb-m6-packing-source-custody-fgsiuzee`.
+
 ## Paged checkpoint source authority for subsequent packing
 
 `CatalogPackingAuthority::from_paged_checkpoint` and

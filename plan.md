@@ -1571,6 +1571,17 @@ Durable packing source custody, incremental edits, complete policy/quotas,
 distributed activation, normal backup/retention/seed recovery, legacy consumers
 and R5/R7 remain open. See ADR 0002 and `/tmp/mb-m6-paged-packing-base-nht7o9z5`.
 
+Pending packing jobs can now retain exact published paged source custody with
+immutable operation/base/budget, original private authentication and current
+base/event guards. Bidirectional loans and checked owner counts preserve
+bundle/bootstrap/native serving and exclude cancellation through reopen and
+bounded retirement; verified equivalent source replacement remains available.
+Eight lifetime/rollback regressions and 1,479 full qualification tests pass on
+358 inputs and 23 executables. Retirement reclaims 19.06 GiB; target uses
+48.58 GiB. Durable Node packing/coding and checkpoint ownership handoff,
+complete quotas/admission, normal backup/retention/seed recovery and remaining
+software gates stay open. See ADR 0002 and `/tmp/mb-m6-packing-source-custody-fgsiuzee`.
+
 Prioritize the remaining R1 safe-upgrade/recovery contract and shared R2/R3
 admission and quota policy, including R3-SINGLE-OWNER-METADATA for the required
 single-owner 1 TiB geometry. Complete the enclosing checkpoint authority and

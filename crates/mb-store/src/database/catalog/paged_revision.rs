@@ -1468,7 +1468,10 @@ pub(super) mod tests {
         assert!(store.paged_data_anchor_ids().unwrap().is_empty());
     }
 
-    fn data_fixture(store: &ControlStore, anchor: Uuid) -> super::super::PagedCatalogDataSource {
+    pub(crate) fn data_fixture(
+        store: &ControlStore,
+        anchor: Uuid,
+    ) -> super::super::PagedCatalogDataSource {
         let (bundle, bytes) = fixture(store, 1, None);
         let member = &bundle.roots[0];
         let page = member.root;

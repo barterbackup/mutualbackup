@@ -2553,6 +2553,22 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Keep published paged source custody live for pending packing jobs.
+      Bind immutable local operation/base/budget, exact signed revision/private
+      catalog identity and original bundle/bootstrap/source pins under one writer.
+      Debit independent work before private callbacks; check current base/events
+      at both ends. Bidirectional dependency bytes and owner counts exclude
+      revision/bundle/capture cancellation until one-catalog release steps commit.
+      Shared/reopened loans retain serving; verified source replacement remains
+      available. Cancelled operation IDs never resume. Eight lifetime, budget,
+      identity, corruption and SQL rollback regressions pass. Full frozen
+      qualification passes 1,479 tests, format, strict Clippy, four builds and
+      358-input/23-executable audits; 121 other ignored cases remain unexecuted.
+      Retirement reclaims 19.06 GiB; target uses 48.58 GiB.
+      Durable Node packing/coding and checkpoint ownership handoff, complete
+      quotas/admission, normal backup/retention/seed recovery and remaining
+      software gates stay open. Normal producers stay disabled; hardware gates
+      remain deferred. See ADR 0002 and `/tmp/mb-m6-packing-source-custody-fgsiuzee`.
     - [x] Import complete paged checkpoint authority for subsequent packing.
       Support both public layouts from the independently trusted original state
       hash and exact quorum/body/source EOF/certified-history proof. Debit
