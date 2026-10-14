@@ -17,6 +17,7 @@ const ROW_BYTES: usize = 1024;
 type BoundedRow = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 mod packing;
+mod sources;
 pub use packing::CatalogCheckpointChunkLocation;
 
 pub(super) fn kind(id: Uuid, suffix: &str) -> String {
@@ -150,7 +151,8 @@ pub(super) fn owned_work<H: Layout>(
 ) -> Result<Work, CatalogStoreError> {
     Ok(read(cx, retention)?
         .map_or(Work::default(), |v| v.work)
-        .checked_add(packing::owned_work(cx, retention)?)?)
+        .checked_add(packing::owned_work(cx, retention)?)?
+        .checked_add(sources::owned_work(cx, retention)?)?)
 }
 fn require<H: Layout>(
     cx: &Connection,
@@ -185,6 +187,9 @@ pub(super) fn release<H: Layout>(
     retention: CatalogPagedCheckpointRetention<H>,
 ) -> Result<bool, CatalogStoreError> {
     if packing::release(cx, retention)? {
+        return Ok(true);
+    }
+    if sources::release(cx, retention)? {
         return Ok(true);
     }
     let Some(index) = read(cx, retention)? else {
@@ -323,6 +328,15 @@ fn frame(
 }
 
 impl ControlStore {
+    pub(super) fn lookup_recovery_revision<H: Layout>(
+        &self,
+        retention: CatalogPagedCheckpointRetention<H>,
+        revision: Uuid,
+    ) -> Result<R, CatalogStoreError> {
+        require(&self.connection, retention)?;
+        self.read_lookup_revision(&self.connection, retention, revision, retention.budget)?
+            .ok_or(DatabaseError::NotReady.into())
+    }
     fn build_checkpoint_lookup<P: Proof>(
         &self,
         id: Uuid,

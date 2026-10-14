@@ -98,6 +98,50 @@ impl NodeReader {
 }
 
 impl Node {
+    pub fn build_retained_paged_checkpoint_source_lookup(
+        &self,
+        owner: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
+        revision: Uuid,
+    ) -> Result<()> {
+        guild_authority::with_history(&self.control, |authority| {
+            self.control.build_catalog_paged_checkpoint_source_lookup(
+                owner,
+                proof,
+                revision,
+                || {
+                    authority.paged_checkpoint_trust().map_err(|_| {
+                        mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                    })
+                },
+            )?;
+            Ok(())
+        })?
+        .context("source lookup requires original guild authority")
+    }
+
+    pub fn build_retained_paged_checkpoint_directory_source_lookup(
+        &self,
+        owner: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+        revision: Uuid,
+    ) -> Result<()> {
+        guild_authority::with_history(&self.control, |authority| {
+            self.control
+                .build_catalog_paged_checkpoint_directory_source_lookup(
+                    owner,
+                    proof,
+                    revision,
+                    || {
+                        authority.paged_checkpoint_trust().map_err(|_| {
+                            mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                        })
+                    },
+                )?;
+            Ok(())
+        })?
+        .context("source lookup requires original guild authority")
+    }
     /// Restore the native tree selected by an exact retained checkpoint page.
     /// Original legacy IDs select their independently retained conversion.
     /// The complete staged inode owns publication after the final custody writer;

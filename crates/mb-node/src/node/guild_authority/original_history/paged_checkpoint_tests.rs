@@ -3,6 +3,8 @@ use crate::node::guild_authority::tests::{event, fixture, relabel};
 use crate::node::tests::test_coding_transcript;
 
 #[cfg(target_os = "linux")]
+mod checkpoint_bootstrap_tests;
+#[cfg(target_os = "linux")]
 mod checkpoint_peer_restore_tests;
 #[cfg(target_os = "linux")]
 mod checkpoint_restore_tests;

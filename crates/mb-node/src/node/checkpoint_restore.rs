@@ -131,7 +131,7 @@ pub(super) fn restore<const FULL: bool>(
         return Ok(());
     }
     macro_rules! restore {
-        ($retention:ident,$point:ident,$publish:ident,$chunk:ident,$group:ident) => {{
+        ($retention:ident,$point:ident,$publish:ident,$chunk:ident,$group:ident,$source:ident,$begin:ident,$check:ident,$finish:ident,$reserve:ident) => {{
             let (retention, state) = sources
                 .control
                 .$retention(owner)?
@@ -153,10 +153,79 @@ pub(super) fn restore<const FULL: bool>(
             );
             let catalog = match &record {
                 mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed) => {
-                    let catalog = sources
+                    let existing = sources
                         .control
-                        .catalog_paged_checkpoint_revision(owner, key.revision_id)?
-                        .context("checkpoint has no retained private revision")?;
+                        .catalog_paged_checkpoint_revision(owner, key.revision_id)?;
+                    let catalog = if let Some(catalog) = existing {
+                        catalog
+                    } else {
+                        sources
+                            .control
+                            .$reserve(retention, signed)
+                            .context("reserve original private bootstrap recovery")?;
+                        let bootstrap = recover_original(
+                            &sources,
+                            request,
+                            &signed.value.metadata,
+                            signed.value.scope(),
+                            |source| Ok(sources.control.$chunk(retention, source)?),
+                            |group, work| Ok(sources.control.$group(retention, group, work)?),
+                            fetch,
+                        )
+                        .context("recover original signed bootstrap bytes")?;
+                        crate::paged_bootstrap_recovery::recover(
+                            sources.control,
+                            sources.keys,
+                            (signed, owner),
+                            &bootstrap,
+                            |id| {
+                                Ok(sources.control.$source(
+                                    retention,
+                                    key.revision_id,
+                                    id,
+                                    budget,
+                                )?)
+                            },
+                            |original| {
+                                recover_original(
+                                    &sources,
+                                    request,
+                                    original,
+                                    signed.value.scope(),
+                                    |source| Ok(sources.control.$chunk(retention, source)?),
+                                    |group, work| {
+                                        Ok(sources.control.$group(retention, group, work)?)
+                                    },
+                                    fetch,
+                                )
+                            },
+                            (
+                                &mut |bundle| {
+                                    sources
+                                        .control
+                                        .$begin(retention, bundle)
+                                        .context("reserve recovered private pages")
+                                },
+                                &mut |bundle| {
+                                    sources
+                                        .control
+                                        .$finish(retention, bundle)
+                                        .context("retain recovered private publication")
+                                },
+                                &mut |bundle| {
+                                    sources
+                                        .control
+                                        .$check(retention, bundle)
+                                        .context("check original private recovery owner")
+                                },
+                            ),
+                        )
+                        .context("reconstruct original private bootstrap and pages")?;
+                        sources
+                            .control
+                            .catalog_paged_checkpoint_revision(owner, key.revision_id)?
+                            .context("recovered private revision has no enclosing owner")?
+                    };
                     anyhow::ensure!(
                         catalog.bundle.descriptor == canonical_bytes(signed)?,
                         "private snapshot differs from original signed revision"
@@ -194,48 +263,14 @@ pub(super) fn restore<const FULL: bool>(
                     .control
                     .native_file_catalog_source(catalog.bundle.id, *sector)?
                     .context("recovery source lacks original signed authority")?;
-                if let Ok(bytes) = (sources.local)(sector) {
-                    anyhow::ensure!(
-                        merkle_commit(&bytes)? == original.commitment,
-                        "local recovery source differs from its signed commitment"
-                    );
-                    return Ok(bytes);
-                }
-                super::checkpoint_recovery::recover_source(
+                recover_original(
+                    &sources,
+                    request,
                     &original,
                     catalog.bundle.scope,
-                    budget,
                     |source| Ok(sources.control.$chunk(retention, source)?),
                     |group, work| Ok(sources.control.$group(retention, group, work)?),
-                    |entry, index| {
-                        let group = &entry.retained.group;
-                        let role = &group.roles[usize::from(index)];
-                        let (holder, commitment) = match role {
-                            ShardRoleV2::Information(role) => (role.owner, &role.sector.commitment),
-                            ShardRoleV2::Parity(role) => (role.holder, &role.commitment),
-                        };
-                        if holder == sources.keys.node_id()
-                            && let Some(payload) = sources
-                                .control
-                                .catalog_paged_checkpoint_payload(owner, group.id, index)?
-                        {
-                            let transcript =
-                                *blake3::hash(&canonical_bytes(&entry.transcript)?).as_bytes();
-                            anyhow::ensure!(
-                                payload.guild_id == guild_id
-                                    && payload.holder == holder
-                                    && payload.commitment == *commitment
-                                    && payload.transcript_hash == transcript,
-                                "retained READY role differs from its original witness"
-                            );
-                                match (sources.ready)(&payload) {
-                                    Ok(bytes) => return Ok(Some(bytes)),
-                                    Err(error) => tracing::warn!(group = %hex::encode(group.id), shard_index = index, %error,
-                                        "retained local role is unavailable; trying original alternatives"),
-                                }
-                        }
-                        fetch(entry, index)
-                    },
+                    fetch,
                 )
             };
             if FULL {
@@ -275,14 +310,91 @@ pub(super) fn restore<const FULL: bool>(
             catalog_paged_checkpoint_indexed_revision,
             publish_catalog_paged_checkpoint_revision_restore,
             catalog_paged_checkpoint_chunk_location,
-            catalog_paged_checkpoint_indexed_group
+            catalog_paged_checkpoint_indexed_group,
+            catalog_paged_checkpoint_indexed_source,
+            begin_catalog_paged_checkpoint_private_recovery,
+            check_catalog_paged_checkpoint_private_recovery,
+            finish_catalog_paged_checkpoint_private_recovery,
+            reserve_catalog_paged_checkpoint_bootstrap
         ),
         mb_core::PagedCheckpointLayout::Directory => restore!(
             catalog_paged_checkpoint_directory_retention,
             catalog_paged_checkpoint_directory_indexed_revision,
             publish_catalog_paged_checkpoint_directory_revision_restore,
             catalog_paged_checkpoint_directory_chunk_location,
-            catalog_paged_checkpoint_directory_indexed_group
+            catalog_paged_checkpoint_directory_indexed_group,
+            catalog_paged_checkpoint_directory_indexed_source,
+            begin_catalog_paged_checkpoint_directory_private_recovery,
+            check_catalog_paged_checkpoint_directory_private_recovery,
+            finish_catalog_paged_checkpoint_directory_private_recovery,
+            reserve_catalog_paged_checkpoint_directory_bootstrap
         ),
     }
+}
+
+fn recover_original(
+    sources: &Sources<'_>,
+    request: &RetainedSnapshotRestore,
+    original: &mb_core::CatalogSectorRecord,
+    scope: mb_core::CatalogScope,
+    locate: impl FnMut(
+        mb_core::SourceChunkId,
+    ) -> Result<
+        Option<(
+            mb_core::PackingProfile,
+            mb_store::CatalogCheckpointChunkLocation,
+        )>,
+    >,
+    group: impl FnMut(
+        [u8; 32],
+        mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<Option<mb_core::CatalogCodingEntry>>,
+    fetch: &mut FetchRole<'_>,
+) -> Result<Vec<u8>> {
+    let owner = request.owner;
+    let guild_id = request.guild_id;
+    if let Ok(bytes) = (sources.local)(&original.sector.id) {
+        anyhow::ensure!(
+            merkle_commit(&bytes)? == original.commitment,
+            "local recovery source differs from its signed commitment"
+        );
+        return Ok(bytes);
+    }
+    super::checkpoint_recovery::recover_source(
+        original,
+        scope,
+        request.budget,
+        locate,
+        group,
+        |entry, index| {
+            let group = &entry.retained.group;
+            let role = &group.roles[usize::from(index)];
+            let (holder, commitment) = match role {
+                ShardRoleV2::Information(role) => (role.owner, &role.sector.commitment),
+                ShardRoleV2::Parity(role) => (role.holder, &role.commitment),
+            };
+            if holder == sources.keys.node_id()
+                && let Some(payload) = sources
+                    .control
+                    .catalog_paged_checkpoint_payload(owner, group.id, index)?
+            {
+                let transcript = *blake3::hash(&canonical_bytes(&entry.transcript)?).as_bytes();
+                anyhow::ensure!(
+                    payload.guild_id == guild_id
+                        && payload.holder == holder
+                        && payload.commitment == *commitment
+                        && payload.transcript_hash == transcript,
+                    "retained READY role differs from its original witness"
+                );
+                match (sources.ready)(&payload) {
+                    Ok(bytes) => return Ok(Some(bytes)),
+                    Err(error) => {
+                        tracing::warn!(group = %hex::encode(group.id), shard_index = index, %error,
+                                        "retained local role is unavailable; trying original alternatives")
+                    }
+                }
+            }
+            fetch(entry, index)
+        },
+    )
 }

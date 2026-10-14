@@ -272,6 +272,56 @@ fn cancel_validation(connection: &Connection, id: Uuid) -> Result<(), CatalogSto
     Ok(())
 }
 
+pub(super) fn retire_unpublished_recovery_record(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<bool, CatalogStoreError> {
+    type BoundedRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+    let Some(record) = read_validation(connection, id)? else {
+        return Ok(false);
+    };
+    require_unpublished_validation(connection, id)?;
+    if record.state != CatalogNativeValidationState::Cancelled {
+        cancel_validation(connection, id)?;
+        let current = read_validation(connection, id)?.ok_or(DatabaseError::Integrity)?;
+        if current.state != CatalogNativeValidationState::Cancelled {
+            return Err(DatabaseError::Integrity.into());
+        }
+        return Ok(true);
+    }
+    for kind in [sources(id), links(id), unresolved(id)] {
+        let row: Option<BoundedRow> = connection.query_row(
+            "SELECT CASE WHEN length(record_id)<=32 THEN record_id END,CASE WHEN length(bytes)<=?2 THEN bytes END FROM protocol_records WHERE kind=?1 ORDER BY record_id LIMIT 1",params![kind,VALIDATION_BYTES],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((key, bytes)) = row {
+            let key = key.ok_or(DatabaseError::Integrity)?;
+            let bytes = bytes.ok_or(DatabaseError::Integrity)?;
+            if connection.execute(
+                "DELETE FROM protocol_records WHERE kind=?1 AND record_id=?2 AND bytes=?3",
+                params![kind, key, bytes],
+            )? != 1
+                || bounded_record(connection, &kind, &key, VALIDATION_BYTES)?.is_some()
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+            return Ok(true);
+        }
+    }
+    // A recovery reservation owns this unpublished derived index. Once the
+    // last reservation and all derived rows are gone, remove its journal so a
+    // later original-checkpoint recovery can validate the same revision anew.
+    // Ordinary catalog cancellation continues to retain its existing fence.
+    let bytes = canonical_bytes(&record)?;
+    if connection.execute(
+        "DELETE FROM protocol_records WHERE kind=?1 AND record_id=?2 AND bytes=?3",
+        params![VALIDATION, id.as_bytes(), bytes],
+    )? != 1
+        || read_validation(connection, id)?.is_some()
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    Ok(true)
+}
+
 fn native_snapshot(
     connection: &Connection,
     id: Uuid,

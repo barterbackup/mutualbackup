@@ -154,6 +154,15 @@ pub struct CatalogSectorReader {
 }
 
 impl CatalogSectorReader {
+    /// Original framed range under the authenticated source root. This is a
+    /// locator for point replay, not independent source authority.
+    pub fn last_record_range(&self) -> Option<std::ops::Range<u64>> {
+        if self.failed {
+            None
+        } else {
+            self.records.last_record_range()
+        }
+    }
     pub fn new(scope: CatalogScope, root: CatalogSectorRoot) -> Result<Self, CatalogError> {
         root.validate()?;
         Ok(Self {

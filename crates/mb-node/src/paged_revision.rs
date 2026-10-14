@@ -43,7 +43,7 @@ pub struct PagedPrivateMetadata {
 }
 
 impl PagedPrivateMetadata {
-    fn local_bundle(
+    pub(crate) fn local_bundle(
         &self,
         signed: &SignedRecord<PagedUserRevision>,
         intents: PagedCatalogIntents,

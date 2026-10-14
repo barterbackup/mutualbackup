@@ -40,6 +40,7 @@ mod paged_checkpoint_legacy_revision;
 mod paged_checkpoint_lookup;
 pub use paged_checkpoint_lookup::CatalogCheckpointChunkLocation;
 mod paged_checkpoint_payload;
+mod paged_checkpoint_recovery;
 mod paged_checkpoint_retention;
 mod paged_checkpoint_revision;
 mod paged_data;

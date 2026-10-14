@@ -3,6 +3,79 @@ use crate::database::catalog::checkpoint_body::Header;
 use crate::database::catalog::paged_checkpoint_lookup as lookup;
 use mb_core::CatalogCheckpointAuthorityRecord as R;
 
+macro_rules! source_cases {
+    ($test:ident,$proof:path,$stage:path,$retain:ident,$lookup:ident,$build:ident,$point:ident,$cancel:ident,$release:ident)=>{
+        #[test]
+        fn $test(){
+            for action in ["ABORT","IGNORE"]{
+                let temp=tempfile::tempdir().unwrap();let s=ControlStore::open_with_key(temp.path().join("control.db"),&[71;32]).unwrap();
+                let (mut fixture,history,bundle,_)=super::paged_checkpoint_revision::private_checkpoint(&s);
+                let proof=$proof(&mut fixture,&history);
+                $stage(&s,&fixture,&proof,1000);
+                let owner=s.$retain(Uuid::from_u128(70),&proof,||Ok(proof.trust().clone())).unwrap();
+                let shared=s.$retain(Uuid::from_u128(71),&proof,||Ok(proof.trust().clone())).unwrap();
+                s.$lookup(owner.id,&proof,||Ok(proof.trust().clone())).unwrap();s.$lookup(shared.id,&proof,||Ok(proof.trust().clone())).unwrap();
+                let signed=mb_core::PagedUserRevision::decode_signed(&bundle.descriptor).unwrap();let source=&signed.value.metadata;
+                assert!(s.$point(owner,bundle.id,source.sector.id,budget()).is_err());
+                let name=format!("catalog-checkpoint-source-frame-v1/{}/{}",owner.id.simple(),bundle.id.simple());
+                let fault=if action=="ABORT"{",'test'"}else{""};
+                s.connection.execute_batch(&format!("CREATE TEMP TRIGGER reject_source BEFORE INSERT ON protocol_records WHEN NEW.kind='{name}' BEGIN SELECT RAISE({action}{fault}); END")).unwrap();
+                assert!(s.$build(owner.id,&proof,bundle.id,||Ok(proof.trust().clone())).is_err());
+                assert!(s.next_record_bounded(&name,None,32,1024).unwrap().is_none());
+                s.connection.execute_batch("DROP TRIGGER reject_source").unwrap();
+                s.$build(owner.id,&proof,bundle.id,||Ok(proof.trust().clone())).unwrap();
+                s.$build(shared.id,&proof,bundle.id,||Ok(proof.trust().clone())).unwrap();
+                assert_eq!(s.$point(owner,bundle.id,source.sector.id,budget()).unwrap().as_ref(),Some(source));
+                let bytes=s.get_record(&name,&source.sector.id).unwrap().unwrap();let mut frame:lookup::Frame=decode_canonical(&bytes).unwrap();frame.offset+=1;
+                s.put_record(&name,&source.sector.id,&canonical_bytes(&frame).unwrap()).unwrap();assert!(s.$point(owner,bundle.id,source.sector.id,budget()).is_err());
+                s.put_record(&name,&source.sector.id,&bytes).unwrap();s.delete_record(&name,&source.sector.id).unwrap();
+                assert!(s.$build(owner.id,&proof,bundle.id,||Ok(proof.trust().clone())).is_err());assert!(s.get_record(&name,&source.sector.id).unwrap().is_none());
+                s.put_record(&name,&source.sector.id,&bytes).unwrap();
+                let totals="catalog-checkpoint-source-lookup-work-v1";
+                let debt=s.get_record(totals,owner.id.as_bytes()).unwrap().unwrap();
+                s.put_record(totals,owner.id.as_bytes(),&canonical_bytes(&Work::default()).unwrap()).unwrap();
+                assert!(s.$point(owner,bundle.id,source.sector.id,budget()).is_err());
+                assert!(s.$build(owner.id,&proof,bundle.id,||Ok(proof.trust().clone())).is_err());
+                s.put_record(totals,owner.id.as_bytes(),&debt).unwrap();
+                for work in [Work{bytes:0,..budget()},Work{records:0,..budget()},Work{page_occurrences:0,..budget()}]{assert!(s.$point(owner,bundle.id,source.sector.id,work).is_err());}
+                s.$cancel(owner.id).unwrap();assert!(s.$point(owner,bundle.id,source.sector.id,budget()).is_err());
+                s.connection.execute_batch(&format!("CREATE TEMP TRIGGER reject_source_delete BEFORE DELETE ON protocol_records WHEN OLD.kind='{name}' BEGIN SELECT RAISE({action}{fault}); END")).unwrap();
+                assert!(s.$release(owner.id).is_err());s.connection.execute_batch("DROP TRIGGER reject_source_delete").unwrap();while s.$release(owner.id).unwrap(){}
+                assert_eq!(s.$point(shared,bundle.id,source.sector.id,budget()).unwrap().as_ref(),Some(source));
+            }
+        }
+    };
+}
+
+fn directory_private_sources(
+    fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
+    history: &History,
+) -> CatalogQuorumPagedCheckpointDirectoryIndex {
+    super::checkpoint_directory_retention::proof(fixture, history, budget())
+}
+source_cases!(
+    individual_source_lookup_replays_signed_frames_rejects_faults_and_preserves_shared_owners,
+    super::paged_checkpoint_revision::private_proof,
+    super::paged_checkpoint_retention::stage_paged_owner,
+    retain_catalog_paged_checkpoint,
+    build_catalog_paged_checkpoint_lookup,
+    build_catalog_paged_checkpoint_source_lookup,
+    catalog_paged_checkpoint_indexed_source,
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root
+);
+source_cases!(
+    directory_source_lookup_replays_signed_frames_rejects_faults_and_preserves_shared_owners,
+    directory_private_sources,
+    super::checkpoint_directory_retention::stage,
+    retain_catalog_paged_checkpoint_directory,
+    build_catalog_paged_checkpoint_directory_lookup,
+    build_catalog_paged_checkpoint_directory_source_lookup,
+    catalog_paged_checkpoint_directory_indexed_source,
+    cancel_catalog_paged_checkpoint_directory_retention,
+    release_catalog_paged_checkpoint_directory_root
+);
+
 fn individual(
     fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
     history: &History,

@@ -64,6 +64,55 @@ fn dependency(catalog: &PagedCatalogSnapshot) -> Result<Dependency, CatalogStore
     })
 }
 
+/// Compose recovered private publication with the original retained owner's
+/// pins. Called inside the publication writer, without nested transactions.
+pub(super) fn retain_recovered<H: Layout>(
+    connection: &Connection,
+    retention: CatalogPagedCheckpointRetention<H>,
+    signed: &mb_core::SignedRecord<mb_core::PagedUserRevision>,
+) -> Result<(), CatalogStoreError> {
+    if journal::require(connection, retention)?.state
+        != CatalogPagedCheckpointRetentionState::Published
+    {
+        return Err(DatabaseError::Conflict.into());
+    }
+    owned_certificate(connection, retention)?;
+    let catalog = paged_revision::snapshot(connection, signed.value.revision_id)?
+        .ok_or(DatabaseError::NotReady)?;
+    if catalog.bundle.descriptor != canonical_bytes(signed)? {
+        return Err(DatabaseError::Integrity.into());
+    }
+    let expected = dependency(&catalog)?;
+    let previous = admitted_work(connection, retention)?;
+    if let Some(existing) = read(connection, retention.id, signed.value.revision_id)? {
+        if existing != catalog {
+            return Err(DatabaseError::Integrity.into());
+        }
+    } else {
+        let next = previous.unwrap_or_default().checked_add(expected.work)?;
+        check_work(connection, retention, next)?;
+        let bytes = canonical_bytes(&expected)?;
+        insert_exact(
+            connection,
+            &revisions(retention.id),
+            signed.value.revision_id.as_bytes(),
+            &bytes,
+        )?;
+        insert_exact(
+            connection,
+            &owners(signed.value.revision_id),
+            retention.id.as_bytes(),
+            &bytes,
+        )?;
+        change_work(connection, retention, previous, next)?;
+    }
+    if read(connection, retention.id, signed.value.revision_id)?.as_ref() != Some(&catalog) {
+        return Err(DatabaseError::Integrity.into());
+    }
+    admitted_work(connection, retention)?;
+    Ok(())
+}
+
 pub(super) fn owned_work<H: Layout>(
     connection: &Connection,
     retention: CatalogPagedCheckpointRetention<H>,
@@ -108,6 +157,9 @@ fn check_work<H: Layout>(
             .checked_add(retention.checkpoint.work()?)?
             .checked_add(work)?
             .checked_add(paged_checkpoint_lookup::owned_work(connection, retention)?)?
+            .checked_add(paged_checkpoint_recovery::owned_work(
+                connection, retention,
+            )?)?
             .checked_add(
                 paged_checkpoint_legacy_revision::owned_work(connection, retention)?
                     .unwrap_or_default(),

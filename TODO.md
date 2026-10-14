@@ -2553,6 +2553,37 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Qualify private bootstrap/page reconstruction from public evidence.
+      Private bootstrap recovery from retained public evidence (2026-10-14):
+      The exact retained restore path can reconstruct a missing private catalog from
+      its original signed bootstrap and encrypted page sources. A per-revision source
+      locator index replays each original public source frame; hints supply no source
+      or byte authority. Bootstrap authentication precedes trusting private roots. New private staging requires an explicitly configured page quota.
+      Original retained coding witnesses and local READY or authenticated peer roles
+      recover each source, with complete original Merkle and byte-root checks before
+      private page decryption. Child-first staging and complete stream/graph validation
+      precede the existing atomic private publication writer. Pending bootstrap/page
+      work is charged before fetch and staging; publication transfers custody to the
+      original checkpoint owner. Completed journals remain charged until retirement.
+      Cancellation retires one owned row/page per transaction and preserves shared
+      published revisions. Both layouts exercise a fresh directory containing only
+      public metadata, corrupt peer bytes, cancellation during bootstrap fetch, ABORT
+      and IGNORE publication faults, retry, reopen and retained-owner retirement.
+      Frozen qualification passes 1,561 distinct cases: 1,498 fresh and 63 reused
+      from exactly unchanged executables. All 578 ordinary Node, 513 Store, 131 Git,
+      210 Core and 23 process acceptance cases pass, together with three bulk gates
+      and four provisioned Linux native cases. Format, strict locked all-target
+      workspace Clippy, builds, frozen source/binary checks and native cleanup pass.
+      Independent audit verifies 383 inputs and 23 executables; 121 ignored cases
+      remain unexecuted. Verified retirement removes 23 superseded archive paths and
+      21 exploratory executables, reclaiming 17.39 GiB. Incremental cache cleanup
+      reclaims another 6.32 GiB, for 23.72 GiB total. Target uses 58.88 GiB. Current
+      binaries, failed/older qualified evidence, 14 auxiliary WIP files and all 10
+      installed roots remain preserved. Seed/network public-root discovery, complete
+      operation/global/physical admission, normal producer/distributed activation,
+      legacy recovery and remaining M6 gates stay open. Dense 1 TiB and native
+      Windows/macOS hardware tests remain user-deferred.
+      Evidence: `/tmp/mb-m6-private-bootstrap-recovery-scskxz8e`.
     - [x] Qualify exact retained shard transport and independent full restore.
       Exact retained peer restore (2026-10-14):
       A dedicated restore session retains the original directory lease, keys and

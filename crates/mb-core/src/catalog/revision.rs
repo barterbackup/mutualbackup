@@ -207,6 +207,13 @@ pub struct PagedRevisionSourceReader {
 }
 
 impl PagedRevisionSourceReader {
+    pub fn last_record_range(&self) -> Option<std::ops::Range<u64>> {
+        if self.failed {
+            None
+        } else {
+            self.sources.last_record_range()
+        }
+    }
     pub fn new(
         signed: &SignedRecord<PagedUserRevision>,
         guild_id: [u8; 32],
