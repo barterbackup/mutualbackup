@@ -77,7 +77,7 @@ pub use catalog::{
     CatalogPublishedRevisionQuota, CatalogPublishedRevisionQuotaScope,
     CatalogPublishedRevisionQuotaState, CatalogPublishedRevisionQuotaUsage,
     CatalogPublishedRevisionQuotas, CatalogQuorumPagedCheckpointDirectoryIndex,
-    CatalogQuorumPagedCheckpointIndex, CatalogRetainedSourceQuota,
+    CatalogQuorumPagedCheckpointIndex, CatalogResourcePolicy, CatalogRetainedSourceQuota,
     CatalogRetainedSourceReservation, CatalogRetainedSourceUsage, CatalogSectorSource,
     CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage, CatalogStoreError,
     CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES,

@@ -293,7 +293,9 @@ pub(super) fn validate(connection: &Connection) -> Result<(), DatabaseError> {
     Ok(())
 }
 
-fn usage(connection: &Connection) -> Result<Option<DatabaseRecordQuotaUsage>, DatabaseError> {
+pub(super) fn usage(
+    connection: &Connection,
+) -> Result<Option<DatabaseRecordQuotaUsage>, DatabaseError> {
     if !table_exists(connection, QUOTA_TABLE)? {
         return Ok(None);
     }
@@ -345,6 +347,14 @@ fn begin(
     }
     connection.pragma_update(None, "recursive_triggers", true)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(policy) = super::catalog::required_resource_policy(&transaction)
+        .map_err(|_| DatabaseError::Integrity)?
+        && (quota.max_rows != policy.control_rows
+            || quota.max_accounted_bytes != policy.control_accounted_bytes)
+    {
+        return Err(DatabaseError::Conflict);
+    }
+
     let expected = if let Some(mut previous) = usage(&transaction)? {
         if previous.rows > quota.max_rows || previous.accounted_bytes > quota.max_accounted_bytes {
             return Err(DatabaseError::RecordCapacityExceeded);

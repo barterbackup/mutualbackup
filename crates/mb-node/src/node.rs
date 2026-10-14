@@ -1483,6 +1483,15 @@ impl Node {
         Ok(self.control.configure_catalog_capacity_policy(policy)?)
     }
 
+    /// Bind represented capacity to already active database and immutable-page
+    /// quotas. Filesystem reservations, scratch and volumes remain independent.
+    pub fn configure_catalog_resource_policy(
+        &self,
+        policy: mb_store::CatalogResourcePolicy,
+    ) -> Result<()> {
+        Ok(self.control.configure_catalog_resource_policy(policy)?)
+    }
+
     /// Admit the complete durable WAL/rollback-journal byte extent separately
     /// from main database pages, memory, scratch and filesystem reservations.
     pub fn configure_control_journal_quota(
@@ -15854,12 +15863,56 @@ pub(crate) mod tests {
             .configure_catalog_retained_source_guild_quota(data)
             .unwrap();
         node.configure_catalog_capacity_policy(policy).unwrap();
+        let plan = policy.plan().unwrap();
+        let (rows, bytes) =
+            mb_store::CatalogResourcePolicy::minimum_control_credits(policy).unwrap();
+        let (pages, journal) =
+            mb_store::CatalogResourcePolicy::minimum_database_extents(policy).unwrap();
+        let resources = mb_store::CatalogResourcePolicy {
+            format_version: 1,
+            capacity: policy,
+            control_rows: rows,
+            control_accounted_bytes: bytes,
+            control_pages: pages,
+            control_journal_bytes: journal,
+            immutable_page_bytes: plan.encoded_metadata_page_bytes,
+            immutable_pages: plan.metadata_work.page_occurrences,
+            open_page_reservations: 16,
+        };
+        assert!(node.configure_catalog_resource_policy(resources).is_err());
+        node.configure_control_record_quota(mb_store::DatabaseRecordQuota {
+            max_rows: rows,
+            max_accounted_bytes: bytes,
+        })
+        .unwrap();
+        node.configure_control_page_quota(mb_store::DatabasePageQuota { max_pages: pages })
+            .unwrap();
+        node.configure_control_journal_quota(mb_store::DatabaseJournalQuota { max_bytes: journal })
+            .unwrap();
+        node.control
+            .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
+                page_bytes: resources.immutable_page_bytes,
+                pages: resources.immutable_pages,
+                open_reservations: 16,
+            })
+            .unwrap();
+        node.configure_catalog_resource_policy(resources).unwrap();
+        assert!(
+            node.configure_control_page_quota(mb_store::DatabasePageQuota {
+                max_pages: pages + 1
+            })
+            .is_err()
+        );
         node.configure_failure_domain("capacity-contract").unwrap();
         let guild = node
             .create_guild(record_quota_test_endpoints(&node))
             .unwrap();
         drop(node);
         let node = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            node.control.catalog_resource_policy().unwrap(),
+            Some(resources)
+        );
         assert_eq!(
             node.control.catalog_capacity_policy().unwrap(),
             Some(policy)

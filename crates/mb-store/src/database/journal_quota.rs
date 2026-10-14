@@ -83,7 +83,9 @@ fn validate_policy_tables(connection: &Connection) -> Result<(), DatabaseError> 
     Ok(())
 }
 
-fn usage(connection: &Connection) -> Result<Option<DatabaseJournalQuotaUsage>, DatabaseError> {
+pub(super) fn usage(
+    connection: &Connection,
+) -> Result<Option<DatabaseJournalQuotaUsage>, DatabaseError> {
     match (
         table_exists(connection, POLICY)?,
         table_exists(connection, GUARD)?,
@@ -212,6 +214,13 @@ fn configure(
     let previous_limit = super::journal_vfs::current_limit(connection)?;
     let result = (|| {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(policy) =
+            super::catalog::required_resource_policy(&tx).map_err(|_| DatabaseError::Integrity)?
+            && quota.max_bytes != policy.control_journal_bytes
+        {
+            return Err(DatabaseError::Conflict);
+        }
+
         let previous = usage(&tx)?;
         limit(&tx, quota.max_bytes)?;
         let kind = kind(&tx)?;

@@ -121,6 +121,12 @@ fn ledger(connection: &Connection) -> Result<Option<Ledger>, CatalogStoreError> 
     }
 }
 
+pub(super) fn usage(
+    connection: &Connection,
+) -> Result<Option<CatalogStorageUsage>, CatalogStoreError> {
+    Ok(ledger(connection)?.map(|record| record.usage))
+}
+
 fn reservation(
     connection: &Connection,
     intent: CatalogIntent,
@@ -374,6 +380,14 @@ impl ControlStore {
         quota.validate()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if let Some(policy) = capacity_policy::resource_policy(&transaction)?
+            && (quota.page_bytes != policy.immutable_page_bytes
+                || quota.pages != policy.immutable_pages
+                || quota.open_reservations != policy.open_page_reservations)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+
         let mut record = if let Some(record) = ledger(&transaction)? {
             record
         } else {

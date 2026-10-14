@@ -66,6 +66,219 @@ fn backing(store: &ControlStore) {
         .unwrap();
 }
 
+fn resource_policy() -> CatalogResourcePolicy {
+    let capacity = policy();
+    let plan = capacity.plan().unwrap();
+    let (control_rows, control_accounted_bytes) =
+        CatalogResourcePolicy::minimum_control_credits(capacity).unwrap();
+    let (control_pages, control_journal_bytes) =
+        CatalogResourcePolicy::minimum_database_extents(capacity).unwrap();
+    CatalogResourcePolicy {
+        format_version: 1,
+        capacity,
+        control_rows,
+        control_accounted_bytes,
+        control_pages,
+        control_journal_bytes,
+        immutable_page_bytes: plan.encoded_metadata_page_bytes,
+        immutable_pages: plan.metadata_work.page_occurrences,
+        open_page_reservations: 16,
+    }
+}
+
+#[test]
+fn resource_contract_reports_complete_dense_one_tib_database_geometry() {
+    let mut capacity = policy();
+    capacity.data_bytes_per_dataset = 1 << 40;
+    capacity.data_sources_per_dataset = (1 << 40) / V1_SECTOR_SIZE as u64;
+    capacity.private_work_per_revision = Work {
+        bytes: 2 << 30,
+        page_occurrences: 40_000,
+        records: 5 * mb_core::CATALOG_MAX_RECORDS,
+    };
+    capacity.source_pages_per_revision = mb_core::CATALOG_MAX_PAGE_OCCURRENCES - 40_000;
+    capacity.packed_sectors = 22_422_956;
+    capacity.coding_groups = 7_474_319;
+    let (rows, bytes) = CatalogResourcePolicy::minimum_control_credits(capacity).unwrap();
+    let (pages, journal) = CatalogResourcePolicy::minimum_database_extents(capacity).unwrap();
+    println!(
+        "complete dense one TiB database credits: rows={rows}, bytes={bytes}, pages={pages}, journal={journal}"
+    );
+    assert!(rows > capacity.coding_groups * 64);
+    assert!(bytes > capacity.plan().unwrap().encoded_metadata_page_bytes);
+    assert!(journal > bytes);
+    let plan = capacity.plan().unwrap();
+    CatalogResourcePolicy {
+        format_version: 1,
+        capacity,
+        control_rows: rows,
+        control_accounted_bytes: bytes,
+        control_pages: pages,
+        control_journal_bytes: journal,
+        immutable_page_bytes: plan.encoded_metadata_page_bytes,
+        immutable_pages: plan.metadata_work.page_occurrences,
+        open_page_reservations: 16,
+    }
+    .validate()
+    .unwrap();
+}
+
+fn resource_backing(store: &mut ControlStore, p: CatalogResourcePolicy) {
+    store
+        .begin_record_quota_adoption(crate::database::DatabaseRecordQuota {
+            max_rows: p.control_rows,
+            max_accounted_bytes: p.control_accounted_bytes,
+        })
+        .unwrap();
+    while store.record_quota_usage().unwrap().unwrap().state
+        == crate::database::DatabaseRecordQuotaState::Adopting
+    {
+        store.resume_record_quota_adoption().unwrap();
+    }
+    store
+        .configure_page_quota(crate::database::DatabasePageQuota {
+            max_pages: p.control_pages,
+        })
+        .unwrap();
+    store
+        .configure_journal_quota(crate::database::DatabaseJournalQuota {
+            max_bytes: p.control_journal_bytes,
+        })
+        .unwrap();
+    store
+        .configure_catalog_storage_quota(CatalogStorageQuota {
+            page_bytes: p.immutable_page_bytes,
+            pages: p.immutable_pages,
+            open_reservations: p.open_page_reservations,
+        })
+        .unwrap();
+}
+
+#[test]
+fn resource_contract_requires_all_backing_ledgers_rechecks_existing_writers_and_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let mut store = ControlStore::open(&path, &keys()).unwrap();
+    backing(&store);
+    store.configure_catalog_capacity_policy(policy()).unwrap();
+    let p = resource_policy();
+    p.validate().unwrap();
+    assert!(store.configure_catalog_resource_policy(p).is_err());
+    assert_eq!(store.catalog_resource_policy().unwrap(), None);
+    resource_backing(&mut store, p);
+    store.configure_catalog_resource_policy(p).unwrap();
+    store.configure_catalog_resource_policy(p).unwrap();
+    assert_eq!(store.catalog_resource_policy().unwrap(), Some(p));
+    let result: Result<(), CatalogStoreError> = store.with_record_transaction(|| {
+        store.put_record("resource-prefix", b"rollback", b"new")?;
+        store.put_record("catalog-storage-quota-v1", b"store", b"damaged")?;
+        store.check_catalog_capacity_policy(policy())
+    });
+    assert!(result.is_err());
+    assert!(
+        store
+            .get_record("resource-prefix", b"rollback")
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    let store = ControlStore::open(&path, &keys()).unwrap();
+    assert_eq!(store.catalog_resource_policy().unwrap(), Some(p));
+    store
+        .delete_record("catalog-resource-policy-v1", b"store")
+        .unwrap();
+    store
+        .delete_record("catalog-resource-policy-guard-v1", b"store")
+        .unwrap();
+    assert!(store.catalog_capacity_policy().is_err());
+    assert!(store.catalog_resource_policy().is_err());
+}
+
+#[test]
+fn resource_contract_installation_faults_preserve_original_policy_and_do_not_enroll() {
+    for action in ["ABORT", "IGNORE"] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys()).unwrap();
+        backing(&store);
+        store.configure_catalog_capacity_policy(policy()).unwrap();
+        let p = resource_policy();
+        resource_backing(&mut store, p);
+        store.connection.execute_batch(&format!("CREATE TEMP TRIGGER refuse_resources BEFORE INSERT ON protocol_records WHEN NEW.kind='catalog-resource-policy-guard-v1' BEGIN SELECT RAISE({action}{}); END",if action=="ABORT"{",'test'"}else{""})).unwrap();
+        assert!(store.configure_catalog_resource_policy(p).is_err());
+        assert_eq!(store.catalog_capacity_policy().unwrap(), Some(policy()));
+        assert_eq!(store.catalog_resource_policy().unwrap(), None);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER refuse_resources")
+            .unwrap();
+        store.configure_catalog_resource_policy(p).unwrap();
+        let mut changed = p;
+        changed.control_rows += 1;
+        assert!(store.configure_catalog_resource_policy(changed).is_err());
+        assert!(
+            store
+                .configure_page_quota(crate::database::DatabasePageQuota {
+                    max_pages: p.control_pages + 1,
+                })
+                .is_err()
+        );
+        assert_eq!(store.catalog_resource_policy().unwrap(), Some(p));
+    }
+}
+
+#[test]
+fn resource_contract_late_private_publication_backing_fault_rolls_back_and_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = ControlStore::open(temp.path().join("control.db"), &keys()).unwrap();
+    backing(&store);
+    store.configure_catalog_capacity_policy(policy()).unwrap();
+    let (bundle, bootstrap) = fixture(&store, 1, None);
+    let p = resource_policy();
+    resource_backing(&mut store, p);
+    store.configure_catalog_resource_policy(p).unwrap();
+    let requests: Vec<_> = bundle
+        .roots
+        .iter()
+        .map(|root| {
+            (
+                root.intent,
+                CatalogPageReservation {
+                    page_bytes: root.root.page_occurrences * mb_core::CATALOG_PAGE_BYTES as u64,
+                    pages: root.root.page_occurrences,
+                },
+            )
+        })
+        .collect();
+    store
+        .begin_catalog_with_page_reservations(&requests)
+        .unwrap();
+    let finalized = std::cell::Cell::new(false);
+    let failed = store.publish_paged_revision_catalog_with_guards(
+        &bundle,
+        &bootstrap,
+        |_| Ok::<_, CatalogStoreError>(()),
+        || {
+            finalized.set(true);
+            store.put_record("resource-prefix", b"publication", b"new")?;
+            store.put_record("catalog-storage-quota-v1", b"store", b"broken")?;
+            Ok::<_, CatalogStoreError>(())
+        },
+        || Ok::<_, CatalogStoreError>(()),
+    );
+    assert!(failed.is_err());
+    assert!(finalized.get());
+    assert!(store.paged_revision_catalog(bundle.id).unwrap().is_none());
+    assert!(
+        store
+            .get_record("resource-prefix", b"publication")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.catalog_resource_policy().unwrap(), Some(p));
+    publish(&store, &bundle, &bootstrap).unwrap();
+    assert!(store.paged_revision_catalog(bundle.id).unwrap().is_some());
+}
+
 #[test]
 fn capacity_policy_checked_writer_read_preserves_enclosing_rollback_and_guard_faults() {
     let temp = tempfile::tempdir().unwrap();

@@ -14,6 +14,18 @@ use super::{ControlStore, DatabaseError};
 
 mod bundle;
 mod capacity_policy;
+pub use capacity_policy::CatalogResourcePolicy;
+pub(super) fn required_resource_policy(
+    connection: &Connection,
+) -> Result<Option<CatalogResourcePolicy>, CatalogStoreError> {
+    let kind: Option<Vec<u8>>=connection.query_row("SELECT CASE WHEN length(value) BETWEEN 6 AND 7 THEN value END FROM meta WHERE key='database_kind'",[],|r|r.get(0))?;
+    match kind.as_deref() {
+        Some(b"parity") => return Ok(None),
+        Some(b"control") => {}
+        _ => return Err(DatabaseError::Integrity.into()),
+    }
+    capacity_policy::resource_policy(connection)
+}
 mod checkpoint_body;
 mod checkpoint_coding;
 mod checkpoint_retention;

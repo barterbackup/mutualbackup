@@ -2553,6 +2553,41 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Qualify control database backing for the shared capacity policy.
+      Bind represented catalog capacity to database backing (2026-10-14):
+      An optional durable CatalogResourcePolicy binds the existing immutable
+      CatalogCapacityPolicy to active all-table record, main-page, journal and
+      immutable-page ledgers. Installation uses one writer, exact bounded policy/guard
+      rows and an independent enrollment marker. Missing, enlarged, reduced or
+      substituted backing fails closed at existing capacity admission/publication
+      checks. Public quota resize APIs reject conflicting limits in their own writer;
+      parity stores retain their separate policies. A late private publication fault
+      rolls back the bootstrap, source indexes, completion marker and callback writes.
+
+      The derivation charges page occurrences and persistent source/chunk/custody
+      indexes separately; coding transcript fragments remain page BLOB contents rather
+      than fabricated individual SQL rows. It includes duplicated locator/key credits
+      and original represented metadata, with explicitly configured database/journal
+      headroom. For the supported one-owner dense 1 TiB declaration it derives
+      5,010,809,639 rows, 14,899,935,718,308 accounted bytes, 3,637,679,875 pages and
+      14,987,241,085,032 journal bytes. These conservative local credits fit SQLite's
+      supported page range; they are not measured allocation or dense recovery proof.
+      Four Store regressions and the extended normal Node configuration/startup/reopen
+      case pass. Frozen qualification passes 1,565 distinct cases: 1,292 fresh and 273
+      reused from exactly unchanged executables. All 578 ordinary Node, 517 Store,
+      131 Git and 23 process acceptance cases pass, plus three bulk gates and four
+      provisioned Linux native cases. The unchanged Core executable preserves its 210
+      qualified cases. Format, strict locked all-target workspace Clippy, builds,
+      frozen source/binary checks and native cleanup pass. Independent audit verifies
+      384 inputs and 23 executables; 121 ignored cases remain unexecuted. Verified
+      retirement removes 23 superseded archive paths and two exploratory executables,
+      reclaiming 10.23 GiB. Target uses 58.88 GiB. Current binaries, failed/older
+      qualified evidence, 14 auxiliary WIP files and all 10 installed roots remain
+      preserved. Scratch/volume/filesystem reservation, concurrent operation admission,
+      policy adoption, normal paged production/distributed activation, seed
+      orchestration and remaining M6 gates stay open. Dense 1 TiB and Windows/macOS
+      hardware remains user-deferred.
+      Evidence: `/tmp/mb-m6-resource-policy-tm8b69kx`.
     - [x] Qualify private bootstrap/page reconstruction from public evidence.
       Private bootstrap recovery from retained public evidence (2026-10-14):
       The exact retained restore path can reconstruct a missing private catalog from

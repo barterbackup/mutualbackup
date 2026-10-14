@@ -85,7 +85,9 @@ fn validate_policy_tables(connection: &Connection) -> Result<(), DatabaseError> 
     Ok(())
 }
 
-fn usage(connection: &Connection) -> Result<Option<DatabasePageQuotaUsage>, DatabaseError> {
+pub(super) fn usage(
+    connection: &Connection,
+) -> Result<Option<DatabasePageQuotaUsage>, DatabaseError> {
     match (
         table_exists(connection, POLICY)?,
         table_exists(connection, GUARD)?,
@@ -218,6 +220,13 @@ fn configure(
         connection.pragma_query_value(None, "max_page_count", |row| row.get(0))?;
     let result = (|| {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(policy) =
+            super::catalog::required_resource_policy(&tx).map_err(|_| DatabaseError::Integrity)?
+            && quota.max_pages != policy.control_pages
+        {
+            return Err(DatabaseError::Conflict);
+        }
+
         let previous = usage(&tx)?;
         limit(&tx, quota.max_pages)?;
         let kind = kind(&tx)?;

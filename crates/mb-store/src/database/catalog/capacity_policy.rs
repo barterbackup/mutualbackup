@@ -10,6 +10,14 @@ const ENABLED: &str = "catalog-capacity-policy-enabled-v1";
 const META: &str = "catalog_capacity_policy_version";
 const KEY: &[u8] = b"store";
 const ROW_BYTES: usize = 4096;
+mod resources;
+pub use resources::CatalogResourcePolicy;
+
+pub(super) fn resource_policy(
+    connection: &Connection,
+) -> Result<Option<CatalogResourcePolicy>, CatalogStoreError> {
+    resources::read(connection)
+}
 
 pub(super) fn read(
     connection: &Connection,
@@ -31,13 +39,17 @@ pub(super) fn read(
         policy,
         guard,
     ) {
-        (None, false, None, None, None) => Ok(None),
+        (None, false, None, None, None) => {
+            resources::require_unconfigured(connection)?;
+            Ok(None)
+        }
         (Some([1]), true, Some([1]), Some(bytes), Some(guard)) if bytes == guard => {
             let value: CatalogCapacityPolicy = decode_canonical(&bytes)?;
             if mb_core::canonical_bytes_bounded(&value, ROW_BYTES)? != bytes {
                 return Err(DatabaseError::Integrity.into());
             }
             value.plan()?;
+            resources::check(connection, value)?;
             Ok(Some(value))
         }
         _ => Err(DatabaseError::Integrity.into()),
