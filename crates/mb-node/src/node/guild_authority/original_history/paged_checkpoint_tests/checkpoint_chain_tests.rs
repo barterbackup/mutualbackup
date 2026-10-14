@@ -341,6 +341,11 @@ macro_rules! cases {
 
             let scope=CatalogScope::Guild {guild_id:next.certificate().guild_id()};let mut groups=mb_core::CatalogCodingDirectoryReader::new(scope,next.certificate().coding(),next_job.budget).unwrap();
             while let Some(entry)=groups.next_group(&mut |page|original.control.catalog_page(scope,CatalogSection::Coding,page)).unwrap() {original.retain_recovered_checkpoint_payload(next_job.id,&next,entry.retained.group.id,1).unwrap();}
+            let third=successor(&mut original,&keys,&next,true);let session=original.retained_checkpoint_restore().unwrap();let third_job=acquire(&session,975,&third,Some(&next));let third=session.promote_acquired_checkpoint_after(&third_job,Some(&next)).unwrap();drop(session);
+            let mut groups=mb_core::CatalogCodingDirectoryReader::new(scope,third.certificate().coding(),third_job.budget).unwrap();
+            while let Some(entry)=groups.next_group(&mut |page|original.control.catalog_page(scope,CatalogSection::Coding,page)).unwrap(){original.retain_recovered_checkpoint_payload(third_job.id,&third,entry.retained.group.id,1).unwrap();}
+            original.control.cancel_checkpoint_acquisition(&next_job).unwrap();while original.control.release_checkpoint_acquisition_step(&next_job).unwrap(){}
+            original.control.$cancel(next_job.id).unwrap();while original.control.$release(next_job.id).unwrap(){}
             let rotate=event(&original,&keys,mb_core::GuildEventKind::RotateWriterKey {owner:keys[0].node_id(),epoch:2,public_key:ed25519_dalek::SigningKey::from_bytes(&[92;32]).verifying_key().to_bytes()});original.install_guild_event(rotate).unwrap();
             let revoke=event(&original,&keys,mb_core::GuildEventKind::RevokeWriterKey {owner:keys[0].node_id(),epoch:2});original.install_guild_event(revoke).unwrap();
             let receiver_temp=tempfile::tempdir().unwrap();let receiver=fresh_public_node(receiver_temp.path(),seed.clone(),&original);quota(&receiver);
@@ -353,22 +358,50 @@ macro_rules! cases {
             let first_received=session.promote_acquired_checkpoint_after(&first_remote,None).unwrap();
             let next_certificate=next.certificate();assert!(session.acquire_public_checkpoint_after(Uuid::from_u128(973),next_certificate.clone(),next_job.budget,None,|_|anyhow::bail!("must reject before fetch")).is_err());
             let next_remote=session.acquire_public_checkpoint_after(Uuid::from_u128(974),next_certificate.clone(),next_job.budget,Some(&first_received),|path|source.retained_paged_checkpoint_public_page(next_certificate.guild_id(),next_certificate.layout(),next_job.id,next_certificate.hash()?,&path)).unwrap();
-            drop(first_received);drop(session);drop(receiver);let receiver=Node::open(receiver_temp.path(),seed).unwrap();
+            drop(first_received);drop(session);drop(receiver);let receiver=Node::open(receiver_temp.path(),seed.clone()).unwrap();
             assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap().unwrap().owner,first_remote.id);
             let session=receiver.retained_checkpoint_restore().unwrap();let first_received=session.promote_acquired_checkpoint_after(&first_remote,None).unwrap();
             let received=session.promote_acquired_checkpoint_after(&next_remote,Some(&first_received)).unwrap();
             assert_eq!(received.certificate(),next_certificate);assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap().unwrap().owner,next_remote.id);
+            let third_certificate=third.certificate();let third_remote=session.acquire_public_checkpoint_after(Uuid::from_u128(976),third_certificate.clone(),third_job.budget,Some(&received),|path|source.retained_paged_checkpoint_public_page(third_certificate.guild_id(),third_certificate.layout(),third_job.id,third_certificate.hash()?,&path)).unwrap();
+            let third_received=session.promote_acquired_checkpoint_after(&third_remote,Some(&received)).unwrap();assert_eq!(third_received.certificate(),third_certificate);drop(third_received);
+
+            drop(received);drop(first_received);drop(session);
+            receiver.control.cancel_checkpoint_acquisition(&first_remote).unwrap();while receiver.control.release_checkpoint_acquisition_step(&first_remote).unwrap(){}
+            receiver.control.$cancel(first_remote.id).unwrap();while receiver.control.$release(first_remote.id).unwrap(){}
+            receiver.control.cancel_checkpoint_acquisition(&next_remote).unwrap();while receiver.control.release_checkpoint_acquisition_step(&next_remote).unwrap(){}
+            receiver.control.$cancel(next_remote.id).unwrap();while receiver.control.$release(next_remote.id).unwrap(){}
+            let middle_owner=next_remote.id;
+            let next_remote=third_remote;let next_certificate=third_certificate;
+
+            drop(receiver);let receiver=Node::open(receiver_temp.path(),seed).unwrap();let session=receiver.retained_checkpoint_restore().unwrap();
+            let selected=receiver.control.checkpoint_recovery_tip().unwrap();
+            let rebuild_budget=Work{bytes:16<<30,records:16<<20,page_occurrences:16<<20};
+            assert!(session.rebuild_checkpoint_recovery_proof(Work::default()).is_err());
+            assert!(session.rebuild_checkpoint_recovery_proof(Work{bytes:512<<20,..rebuild_budget}).is_err());
+            assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
+            let names=["catalog-checkpoint-ancestry-link-v1","catalog-checkpoint-ancestry-link-guard-v1"];
+            let links=names.map(|kind|receiver.control.get_record_bounded(kind,middle_owner.as_bytes(),1024).unwrap().unwrap());
+            for kind in names{receiver.control.delete_record(kind,middle_owner.as_bytes()).unwrap();}
+            assert!(session.rebuild_checkpoint_recovery_proof(rebuild_budget).is_err());assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
+            for (kind,bytes) in names.into_iter().zip(links){receiver.control.put_record(kind,middle_owner.as_bytes(),&bytes).unwrap();}
+            let rebuilt=session.rebuild_checkpoint_recovery_proof(rebuild_budget).unwrap();rebuilt.verify().unwrap();assert_eq!(rebuilt.certificate(),next_certificate);
+            assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
+            assert_eq!(receiver.control.checkpoint_acquisition_state(&first_remote).unwrap(),mb_store::CatalogCheckpointAcquisitionState::Cancelled);
+
             let mut revisions=mb_core::CatalogCheckpointAuthorityReader::new_with_budget(scope,next_certificate.authority(),next_job.budget).unwrap();let mut selected=None;
             while let Some(record)=revisions.next_record(&mut |page|receiver.control.catalog_page(scope,CatalogSection::Checkpoint,page)).unwrap() {if let R::PagedRevision(signed)=record {selected=Some(signed.value);}}
             let revision=selected.unwrap();let target=receiver_temp.path().join("second-generation-restore");
             let request=RetainedSnapshotRestore {layout:mb_core::PagedCheckpointLayout::$layout,owner:next_remote.id,guild_id:next_certificate.guild_id(),snapshot:SnapshotInfo {protected_root_id:revision.protected_root_id,revision_id:revision.revision_id,sequence:revision.sequence,checkpoint_generation:next_certificate.generation(),checkpoint_hash:next_certificate.hash().unwrap()},budget:next_job.budget};
             session.restore(&request,&target,|entry,role| {
                 if role!=1 {return Ok(None)}
-                Ok(Some(source.retained_checkpoint_shard(request.guild_id,request.layout,next_job.id,request.snapshot.checkpoint_hash,entry.retained.group.id,role)?))
+                Ok(Some(source.retained_checkpoint_shard(request.guild_id,request.layout,third_job.id,request.snapshot.checkpoint_hash,entry.retained.group.id,role)?))
             }).unwrap();verify_git_restore(&receiver,&target,revision.protected_root_id);
             assert!(receiver.control.checkpoint_head_identity(&request.guild_id).unwrap().is_none());
-            receiver.control.cancel_checkpoint_recovery_tip(&next_remote).unwrap();receiver.control.cancel_checkpoint_acquisition(&first_remote).unwrap();
-            assert!(receiver.control.checkpoint_recovery_tip().unwrap().is_none());assert!(session.promote_acquired_checkpoint_after(&next_remote,Some(&first_received)).is_err());
+            let mut cancelled=false;
+            assert!(session.rebuild_checkpoint_proof_with_observer(rebuild_budget,|generation|{if generation==1{receiver.control.cancel_checkpoint_recovery_tip(&next_remote)?;cancelled=true;}Ok(())}).is_err());assert!(cancelled);
+            assert!(session.rebuild_checkpoint_recovery_proof(rebuild_budget).is_err());
+            assert!(receiver.control.checkpoint_recovery_tip().unwrap().is_none());assert!(session.promote_acquired_checkpoint_after(&next_remote,Some(&rebuilt)).is_err());
             verify_git_restore(&receiver,&target,revision.protected_root_id);drop(original_temp);
         }
     };

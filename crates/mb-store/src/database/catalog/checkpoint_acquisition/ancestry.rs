@@ -267,6 +267,42 @@ pub(super) fn check_parent(
     }
     Ok(())
 }
+pub(super) fn recovery_source(
+    cx: &Connection,
+    id: Uuid,
+    original: bool,
+) -> Result<Option<CatalogCheckpointRecoverySource>, CatalogStoreError> {
+    let (a, archived) = if original {
+        (source(cx, id)?, false)
+    } else {
+        let Some(a) = read(cx, id)? else {
+            return Ok(None);
+        };
+        if a.state != CatalogPagedCheckpointRetentionState::Published {
+            return Ok(None);
+        }
+        (a, true)
+    };
+    let parent = parent_for(cx, id)?;
+    if parent.map(|p| (p.generation, p.hash)) != a.certificate.previous_identity()
+        || parent.is_some_and(|p| p.guild_id != a.certificate.guild_id() || p.owner == id)
+    {
+        return Err(DatabaseError::Integrity.into());
+    }
+    let (trust_hash, proof_work, budget) = match a.receipt {
+        Receipt::Individual(r) => (r.trust_hash, r.proof_work, r.budget),
+        Receipt::Directory(r) => (r.trust_hash, r.proof_work, r.budget),
+    };
+    Ok(Some(CatalogCheckpointRecoverySource {
+        owner: id,
+        certificate: a.certificate,
+        trust_hash,
+        proof_work,
+        budget,
+        parent,
+        archived,
+    }))
+}
 impl ControlStore {
     /// Begin independent predecessor custody from a published full-proof owner.
     /// The original owner must remain published until the copy reaches EOF.

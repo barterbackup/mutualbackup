@@ -7423,3 +7423,36 @@ Automatic proof reconstruction from archived chains, precise per-descendant arch
 retirement, automatic DHT selection, production/activation and complete resource
 admission remain open. Dense 1 TiB and native Windows/macOS runs remain user-deferred.
 Evidence: `/tmp/mb-m6-ancestry-custody-4a8ngxmh`.
+
+Reconstruct selected paged recovery authority after restart (2026-10-14):
+A bounded recovery operation walks exact archived predecessor links into an encrypted
+disposable SQL stack, then rebuilds original history, packing, coding and complete
+transitions in generation order. Only the previous/current complete proofs remain
+live. The selected recovery tip, exact custody descriptor and independently derived
+historical trust fence every validation step. Reconstruction publishes no acquisition,
+lookup, protection head or replacement certificate. Retired predecessor jobs remain
+cancelled. Whole-chain validation declarations and bounded custody reads share an
+explicit checked budget; each debit precedes its work. This work accounting does not
+replace global quotas, physical admission or dense qualification.
+Both layout cases pass three-generation recovery after staging/public/payload owner
+retirement on the source and staging/public retirement on the receiver. Reopen
+rebuilds the selected original proof from independently owned ancestors, preserves
+cancelled jobs and recovery/protection heads, and completes exact native/Git restore.
+Insufficient work, a missing intermediate link and cancellation after the first
+rebuilt proof fail closed. Store cases check exact source descriptors, changed trust,
+source retirement and reads inside an enclosing writer.
+Frozen qualification passes 1,577 distinct cases: 1,304 fresh and 273 reused from
+exactly unchanged executables. All 584 ordinary Node, 523 Store, 131 Git and 23
+process acceptance cases pass, plus three bulk gates and four provisioned Linux
+native cases. The unchanged Core executable retains its 210 qualified cases.
+Format, strict locked all-target workspace Clippy, builds, source/binary hashes and
+native cleanup pass. Independent audit verifies 396 inputs and 23 executables;
+121 ignored cases remain unexecuted. Verified retirement removes 23 superseded
+archive paths and two exploratory executables, reclaiming 10.31 GiB. Target uses
+63.41 GiB. All 13 failed artifacts, 29 older archive paths, 14 auxiliary WIP files
+and 10 installed roots remain preserved.
+Precise descendant archive retirement,
+automatic DHT chain selection, legacy predecessors, normal paged production and
+distributed activation, complete resource admission and other M6 gates remain open.
+Dense 1 TiB and native Windows/macOS runs remain user-deferred.
+Evidence: `/tmp/mb-m6-proof-rebuild-t7h2jw1e`.

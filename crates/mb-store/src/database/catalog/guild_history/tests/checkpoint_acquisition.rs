@@ -140,12 +140,18 @@ macro_rules! archive_cases {
                 let s=ControlStore::open(&path,&history.keys[0]).unwrap();s.begin_checkpoint_ancestry_archive(id).unwrap();
                 while s.advance_checkpoint_ancestry_archive(id).unwrap(){}
                 assert_eq!(s.checkpoint_ancestry_certificate(id).unwrap(),Some(cert.clone()));
+                let source=s.checkpoint_recovery_source(id).unwrap().unwrap();assert!(source.archived);assert_eq!(source.certificate,cert);
+                s.check_checkpoint_recovery_source(&source,proof.trust()).unwrap();
+                s.with_record_transaction::<_,CatalogStoreError>(||{assert_eq!(s.checkpoint_recovery_source(id)?,Some(source.clone()));s.check_checkpoint_recovery_source(&source,proof.trust())}).unwrap();
+                let mut wrong=source.clone();wrong.trust_hash[0]^=1;assert!(s.check_checkpoint_recovery_source(&wrong,proof.trust()).is_err());
+
                 let guard=s.get_record("catalog-checkpoint-ancestry-guard-v1",id.as_bytes()).unwrap().unwrap();
                 s.delete_record("catalog-checkpoint-ancestry-guard-v1",id.as_bytes()).unwrap();assert!(s.checkpoint_ancestry_certificate(id).is_err());
                 s.put_record("catalog-checkpoint-ancestry-guard-v1",id.as_bytes(),&guard).unwrap();
                 s.$cancel(id).unwrap();while s.$release(id).unwrap(){}
                 drop(s);let s=ControlStore::open(&path,&history.keys[0]).unwrap();
                 assert_eq!(s.checkpoint_ancestry_certificate(id).unwrap(),Some(cert));
+                assert_eq!(s.checkpoint_recovery_source(id).unwrap(),Some(source.clone()));s.check_checkpoint_recovery_source(&source,proof.trust()).unwrap();
                 for (scope,section,root) in Certificate::$variant(proof.certificate().clone()).initial_roots(){
                     let dep=crate::database::catalog::retention_journal::Dependency{scope,section,root};
                     let name=format!("catalog-checkpoint-ancestry-dependency-v1/{}",id.simple());

@@ -96,7 +96,37 @@ impl mb_store::CatalogGuildHistorySource for HistoryPrefix<'_> {
     }
 }
 
+mod rebuild;
+
 type Fetch<'a> = dyn FnMut(CatalogPagePath) -> Result<Vec<u8>> + 'a;
+
+#[derive(Clone, Copy)]
+enum ProofInput<'a> {
+    Acquisition {
+        job: &'a Job,
+        recovery: Option<Option<&'a RecoveredCheckpointProof>>,
+    },
+    Retained {
+        source: &'a mb_store::CatalogCheckpointRecoverySource,
+        selected: mb_store::CatalogCheckpointRecoveryTip,
+        previous: Option<&'a RecoveredCheckpointProof>,
+        meter: &'a rebuild::RecoveryWorkMeter,
+    },
+}
+impl<'a> ProofInput<'a> {
+    fn material(self) -> (Uuid, &'a Certificate, Work) {
+        match self {
+            Self::Acquisition { job, .. } => (job.id, &job.certificate, job.budget),
+            Self::Retained { source, .. } => (source.owner, &source.certificate, source.budget),
+        }
+    }
+    fn recovery(self) -> Option<Option<&'a RecoveredCheckpointProof>> {
+        match self {
+            Self::Acquisition { recovery, .. } => recovery,
+            Self::Retained { previous, .. } => Some(previous),
+        }
+    }
+}
 
 impl RetainedCheckpointRestore {
     pub(crate) fn public_checkpoint_trust(&self) -> Result<mb_core::PagedCheckpointTrust> {
@@ -336,8 +366,14 @@ impl RetainedCheckpointRestore {
         job: &Job,
         previous: Option<mb_store::CatalogCheckpointPrevious<'_>>,
     ) -> Result<()> {
-        self.promote_public_checkpoint_inner(job, previous, None)
-            .map(|_| ())
+        self.promote_public_checkpoint_inner(
+            ProofInput::Acquisition {
+                job,
+                recovery: None,
+            },
+            previous,
+        )
+        .map(|_| ())
     }
     pub fn promote_acquired_checkpoint_after(
         &self,
@@ -345,22 +381,28 @@ impl RetainedCheckpointRestore {
         previous: Option<&RecoveredCheckpointProof>,
     ) -> Result<RecoveredCheckpointProof> {
         self.promote_public_checkpoint_inner(
-            job,
+            ProofInput::Acquisition {
+                job,
+                recovery: Some(previous),
+            },
             previous.map(RecoveredCheckpointProof::previous),
-            Some(previous),
         )
     }
     fn promote_public_checkpoint_inner(
         &self,
-        job: &Job,
+        input: ProofInput<'_>,
         previous: Option<mb_store::CatalogCheckpointPrevious<'_>>,
-        recovery: Option<Option<&RecoveredCheckpointProof>>,
     ) -> Result<RecoveredCheckpointProof> {
+        let (id, certificate, budget) = input.material();
+        if let ProofInput::Retained { meter, .. } = input {
+            meter.guard()?;
+        }
+        let recovery = input.recovery();
         let control = &self.reader.control;
         let authority = guild_authority::frozen_original_history(control)?;
         let trust = match recovery {
             Some(previous) => {
-                self.public_checkpoint_trust_after(job.certificate.event_sequence(), previous)?
+                self.public_checkpoint_trust_after(certificate.event_sequence(), previous)?
             }
             None => authority.paged_checkpoint_trust()?,
         };
@@ -368,13 +410,37 @@ impl RetainedCheckpointRestore {
             authority
                 .check()
                 .map_err(|_| mb_store::DatabaseError::Conflict)?;
-            if let Some(previous) = recovery {
-                self.check_recovery_base(job.id, &job.certificate, previous)
-                    .map_err(|_| mb_store::DatabaseError::Conflict)?;
+            match input {
+                ProofInput::Acquisition { .. } => {
+                    if let Some(previous) = recovery {
+                        self.check_recovery_base(id, certificate, previous)
+                            .map_err(|_| mb_store::DatabaseError::Conflict)?;
+                    }
+                }
+                ProofInput::Retained {
+                    source,
+                    selected,
+                    meter,
+                    ..
+                } => {
+                    meter.guard()?;
+                    if control.checkpoint_recovery_tip()? != Some(selected) {
+                        return Err(mb_store::DatabaseError::Conflict.into());
+                    }
+                    control.check_checkpoint_recovery_source(source, &trust)?;
+                }
             }
             Ok(trust.clone())
         };
-        control.check_checkpoint_acquisition_trust(job, &trust)?;
+        match input {
+            ProofInput::Acquisition { job, .. } => {
+                control.check_checkpoint_acquisition_trust(job, &trust)?
+            }
+            ProofInput::Retained { source, .. } => {
+                control.check_checkpoint_recovery_source(source, &trust)?
+            }
+        }
+        current()?;
         let installed: InstalledGuild = decode_canonical(
             &control
                 .get_record_bounded(
@@ -393,7 +459,7 @@ impl RetainedCheckpointRestore {
         let history = mb_store::CatalogGuildHistoryIndex::build(
             scratch()?,
             &installed.certificate,
-            job.budget,
+            budget,
             if recovery.is_some() {
                 mb_store::CatalogDurableGuildHistoryView::historical_authority_work()
             } else {
@@ -412,9 +478,9 @@ impl RetainedCheckpointRestore {
         let view = history.view(current)?;
         let body = mb_store::CatalogCheckpointAuthorityIndex::build(
             context,
-            job.certificate.authority(),
+            certificate.authority(),
             &trust.members,
-            job.budget,
+            budget,
             scratch()?,
             |scope, section, page| control.catalog_page(scope, section, page),
             |fence, kind| {
@@ -440,26 +506,29 @@ impl RetainedCheckpointRestore {
         macro_rules! promote {
             ($proof:expr,$certificate:expr,$retain:ident,$lookup:ident,$chunks:ident,$sources:ident,$variant:ident) => {{
                 let proof = $proof
-                    .validate_certified_history_coding_state(&history, job.budget, current)?
+                    .validate_certified_history_coding_state(&history, budget, current)?
                     .validate_certified_history_authority_transition(
-                        previous, &history, job.budget, current,
+                        previous, &history, budget, current,
                     )?
                     .bind_paged_checkpoint_header($certificate.clone(), current)?;
-                control.$retain(job.id, &proof, current)?;
-                control.$lookup(job.id, &proof, current)?;
-                control.$chunks(job.id, &proof, current)?;
-                let mut after = None;
-                while let Some(record) = proof.index().next_revision(after)? {
-                    after = record.revision_key();
-                    if let mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed) = record
-                    {
-                        control.$sources(job.id, &proof, signed.value.revision_id, current)?;
+                if matches!(input, ProofInput::Acquisition { .. }) {
+                    control.$retain(id, &proof, current)?;
+                    control.$lookup(id, &proof, current)?;
+                    control.$chunks(id, &proof, current)?;
+                    let mut after = None;
+                    while let Some(record) = proof.index().next_revision(after)? {
+                        after = record.revision_key();
+                        if let mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed) =
+                            record
+                        {
+                            control.$sources(id, &proof, signed.value.revision_id, current)?;
+                        }
                     }
                 }
                 RecoveredCheckpointProof::$variant(Box::new(proof))
             }};
         }
-        let proof = match &job.certificate {
+        let proof = match certificate {
             Certificate::Individual(c) => {
                 let proof = body
                     .validate_packing(
@@ -514,20 +583,22 @@ impl RetainedCheckpointRestore {
                 )
             }
         };
-        authority.check()?;
-        if recovery.is_some() {
-            if let Some(tip) = control.checkpoint_recovery_tip()?
-                && tip.owner != job.id
-            {
-                current()?;
-                control.begin_checkpoint_ancestry_archive(tip.owner)?;
-                while control.advance_checkpoint_ancestry_archive(tip.owner)? {
+        current()?;
+        if let ProofInput::Acquisition { job, .. } = input {
+            if recovery.is_some() {
+                if let Some(tip) = control.checkpoint_recovery_tip()?
+                    && tip.owner != id
+                {
                     current()?;
+                    control.begin_checkpoint_ancestry_archive(tip.owner)?;
+                    while control.advance_checkpoint_ancestry_archive(tip.owner)? {
+                        current()?;
+                    }
                 }
+                control.finish_checkpoint_recovery_acquisition(job)?;
+            } else {
+                control.finish_checkpoint_acquisition(job)?;
             }
-            control.finish_checkpoint_recovery_acquisition(job)?;
-        } else {
-            control.finish_checkpoint_acquisition(job)?;
         }
         Ok(proof)
     }

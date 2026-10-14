@@ -29,8 +29,8 @@ pub(super) fn required_resource_policy(
 mod checkpoint_acquisition;
 mod checkpoint_body;
 pub use checkpoint_acquisition::{
-    CatalogCheckpointAcquisition, CatalogCheckpointAcquisitionState, CatalogCheckpointRecoveryTip,
-    CatalogPublicCheckpoint,
+    CatalogCheckpointAcquisition, CatalogCheckpointAcquisitionState,
+    CatalogCheckpointRecoverySource, CatalogCheckpointRecoveryTip, CatalogPublicCheckpoint,
 };
 mod checkpoint_coding;
 mod checkpoint_retention;
