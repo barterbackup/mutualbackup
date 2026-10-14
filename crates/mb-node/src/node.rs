@@ -57,6 +57,8 @@ use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig};
 
 type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
+#[cfg(target_os = "linux")]
+mod checkpoint_acquisition;
 mod checkpoint_custody;
 #[cfg(target_os = "linux")]
 mod checkpoint_recovery;

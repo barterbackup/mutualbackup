@@ -2,6 +2,7 @@ use super::*;
 use crate::node::guild_authority::tests::{event, fixture, relabel};
 use crate::node::tests::test_coding_transcript;
 
+mod checkpoint_acquisition_tests;
 #[cfg(target_os = "linux")]
 mod checkpoint_bootstrap_tests;
 #[cfg(target_os = "linux")]

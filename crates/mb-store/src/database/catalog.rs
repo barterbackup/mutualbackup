@@ -26,7 +26,11 @@ pub(super) fn required_resource_policy(
     }
     capacity_policy::resource_policy(connection)
 }
+mod checkpoint_acquisition;
 mod checkpoint_body;
+pub use checkpoint_acquisition::{
+    CatalogCheckpointAcquisition, CatalogCheckpointAcquisitionState, CatalogPublicCheckpoint,
+};
 mod checkpoint_coding;
 mod checkpoint_retention;
 mod checkpoint_transition;

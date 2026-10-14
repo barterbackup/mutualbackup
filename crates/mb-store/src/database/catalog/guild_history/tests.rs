@@ -1,3 +1,4 @@
+mod checkpoint_acquisition;
 mod checkpoint_directories;
 mod checkpoint_directory_retention;
 mod packing_checkpoint_handoff;

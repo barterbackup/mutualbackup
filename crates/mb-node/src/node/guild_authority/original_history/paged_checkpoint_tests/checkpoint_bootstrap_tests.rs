@@ -108,7 +108,7 @@ fn copy_public_tree(
         .unwrap();
 }
 
-fn fresh_public_node(temp: &Path, seed: Seed, source: &Node) -> Node {
+pub(super) fn fresh_public_node(temp: &Path, seed: Seed, source: &Node) -> Node {
     let (_, certificate, peers) = crate::node::tests::recovery_guild_fixture();
     let mut node = Node::open(temp, seed).unwrap();
     node.adopt_recovered_guild(certificate, peers).unwrap();

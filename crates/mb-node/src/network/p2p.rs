@@ -2488,6 +2488,73 @@ impl P2pClient {
         })).await.context("retained restore worker panicked")?
     }
 
+    /// Acquire all authenticated public trees through one independently
+    /// leased session. Original local event history supplies quorum trust;
+    /// downloaded prefixes remain unavailable until full proof promotion.
+    #[cfg(target_os = "linux")]
+    pub async fn acquire_retained_checkpoint_public_catalog(
+        &self,
+        session: crate::RetainedCheckpointRestore,
+        id: Uuid,
+        peer: crate::RetainedCheckpointPeer,
+        layout: mb_core::PagedCheckpointLayout,
+        checkpoint_hash: [u8; 32],
+        budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<(
+        crate::RetainedCheckpointRestore,
+        mb_store::CatalogCheckpointAcquisition,
+    )> {
+        anyhow::ensure!(
+            !peer.owner_id.is_nil() && peer.node_id.0 != [0; 32],
+            "invalid public checkpoint peer"
+        );
+        let trust = session.public_checkpoint_trust()?;
+        let certificate = match layout {
+            mb_core::PagedCheckpointLayout::Individual => {
+                mb_store::CatalogPublicCheckpoint::Individual(
+                    self.retained_paged_checkpoint_certificate(
+                        peer.node_id,
+                        peer.owner_id,
+                        checkpoint_hash,
+                        &trust,
+                        budget,
+                    )
+                    .await?,
+                )
+            }
+            mb_core::PagedCheckpointLayout::Directory => {
+                mb_store::CatalogPublicCheckpoint::Directory(
+                    self.retained_paged_checkpoint_directory_certificate(
+                        peer.node_id,
+                        peer.owner_id,
+                        checkpoint_hash,
+                        &trust,
+                        budget,
+                    )
+                    .await?,
+                )
+            }
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let layout = certificate.layout();
+            let hash = certificate.hash()?;
+            let job = session.acquire_public_checkpoint(id, certificate, budget, |path| {
+                runtime.block_on(client.retained_paged_checkpoint_public_page(
+                    peer.node_id,
+                    layout,
+                    peer.owner_id,
+                    hash,
+                    path,
+                ))
+            })?;
+            Ok((session, job))
+        })
+        .await
+        .context("public checkpoint acquisition worker panicked")?
+    }
+
     pub(crate) async fn variable_emergency_shard(
         &self,
         peer: NodeId,

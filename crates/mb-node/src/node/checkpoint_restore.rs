@@ -22,7 +22,7 @@ pub struct RetainedCheckpointPeer {
 /// A dedicated writable journal connection and directory lease. This session
 /// needs no Node mutation lock while reading local or remote original roles.
 pub struct RetainedCheckpointRestore {
-    reader: NodeReader,
+    pub(super) reader: NodeReader,
 }
 
 pub(super) struct Sources<'a> {

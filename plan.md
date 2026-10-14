@@ -5942,3 +5942,39 @@ policy adoption, normal paged production/distributed activation, seed
 orchestration and remaining M6 gates stay open. Dense 1 TiB and Windows/macOS
 hardware remains user-deferred.
 Evidence: `/tmp/mb-m6-resource-policy-tm8b69kx`.
+
+Durable public checkpoint acquisition and full peer recovery (2026-10-14):
+Public acquisition now persists the exact original certificate, independent
+history trust hash, bounded work ledger and deterministic per-root staging
+owners. Paired job rows and exact readback reject partial or silently ignored
+writes. Reservations precede page fetches; actual owned pages remain bounded
+by each authenticated root. Acquisition traverses every authority, source,
+packing and coding tree child-first and resumes committed prefixes. Peer I/O
+uses the independent leased restore session outside Node and SQL writer locks.
+The client fetches and verifies the original certificate over authenticated
+QUIC. Downloaded pages grant staging ownership; promotion revalidates complete
+original history, packing/coding joins and predecessor transition before the
+ordinary retained public owner and durable restore indexes are published.
+Cancellation fences late arrivals and retires one pin/root per transaction,
+preserving independently published shared custody and restart fences.
+Both layouts pass focused cases that remove the entire original Node directory,
+fetch public metadata from a surviving different holder, resume an interrupted
+fetch, cancel during a peer read, reconstruct missing private metadata, restore
+exact native/Git bytes and reopen the receiving Node. Store cases cover ABORT
+and IGNORE insertion/update/deletion faults, damaged paired state, quota rollback
+and rejection of extra shared-page pins beyond the original root's allowance.
+Frozen qualification passes 1,569 distinct cases: 1,296 fresh and 273 reused
+from exactly unchanged executables. All 580 ordinary Node, 519 Store, 131 Git
+and 23 process acceptance cases pass, plus three bulk gates and four provisioned
+Linux native cases. The unchanged Core executable preserves its 210 qualified
+cases. Format, strict locked all-target workspace Clippy, builds, source/binary
+hash checks and native cleanup pass. Independent audit verifies 388 inputs and
+23 executables; 121 ignored cases remain unexecuted. Verified retirement removes
+23 superseded archive paths and two exploratory executables, reclaiming 10.24 GiB.
+Target uses 58.91 GiB. Current binaries, failed/older qualified evidence, 14 auxiliary
+WIP files and all 10 installed roots remain preserved.
+Automatic DHT discovery/history bootstrap,
+normal paged production/distributed activation, complete scratch/volume/global
+admission, legacy completion and remaining M6 gates remain open. Dense 1 TiB
+and Windows/macOS hardware qualification remains user-deferred.
+Evidence: `/tmp/mb-m6-public-acquisition-q_0ftu3y`.
