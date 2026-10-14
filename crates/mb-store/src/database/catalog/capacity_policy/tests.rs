@@ -685,3 +685,37 @@ fn capacity_policy_refuses_declared_geometry_without_sufficient_backing_limits()
     );
     store.configure_catalog_capacity_policy(policy()).unwrap();
 }
+
+#[test]
+fn capacity_policy_reads_inside_writer_keep_backing_checks_and_outer_rollback() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ControlStore::open(temp.path().join("control.db"), &keys()).unwrap();
+    let abort: Result<(), CatalogStoreError> = store.with_record_transaction(|| {
+        assert_eq!(store.catalog_capacity_policy()?, None);
+        store.put_record("probe", b"writer", b"rollback")?;
+        Err(DatabaseError::Conflict.into())
+    });
+    assert!(abort.is_err());
+    assert!(store.get_record("probe", b"writer").unwrap().is_none());
+    backing(&store);
+    let policy = policy();
+    store.configure_catalog_capacity_policy(policy).unwrap();
+    let abort: Result<(), CatalogStoreError> = store.with_record_transaction(|| {
+        assert_eq!(store.catalog_capacity_policy()?, Some(policy));
+        store.put_record("probe", b"writer", b"rollback")?;
+        Err(DatabaseError::Conflict.into())
+    });
+    assert!(abort.is_err());
+    assert!(store.get_record("probe", b"writer").unwrap().is_none());
+    store
+        .database_shell_statement(
+            "DELETE FROM protocol_records WHERE kind='catalog-capacity-policy-guard-v1'",
+            false,
+        )
+        .unwrap();
+    let refusal: Result<(), CatalogStoreError> = store.with_record_transaction(|| {
+        store.catalog_capacity_policy()?;
+        Ok(())
+    });
+    assert!(refusal.is_err());
+}

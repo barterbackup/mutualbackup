@@ -1,5 +1,7 @@
 //! Normal durable consumers of the shared original-history validator.
 use super::*;
+#[cfg(all(test, target_os = "linux"))]
+mod history_recovery_tests;
 use mb_core::CatalogCodingTraversalBudget as Work;
 use mb_store::{
     CatalogDurableGuildHistory as History, CatalogGuildHistoryMutation as Mutation,
@@ -8,7 +10,7 @@ use mb_store::{
 
 // One event and its original evidence/point rows, using existing envelope
 // bounds. This is a per-step admission bound, not an unlimited replay job.
-fn budget() -> Work {
+pub(crate) fn budget() -> Work {
     Work {
         bytes: (3 * mb_core::CATALOG_CODING_TRANSCRIPT_BYTES
             + 32 * (GUILD_EVENT_BYTES + GUILD_AUTHORITY_SNAPSHOT_BYTES)

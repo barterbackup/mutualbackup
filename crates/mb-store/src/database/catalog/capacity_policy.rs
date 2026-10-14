@@ -217,14 +217,22 @@ impl ControlStore {
     pub fn catalog_capacity_policy(
         &self,
     ) -> Result<Option<CatalogCapacityPolicy>, CatalogStoreError> {
-        let tx = self.read_snapshot()?;
-        let value = read(&tx)?;
-        if value.is_some() {
-            revision_quota::require_capacity_backing(&tx)?;
-            retained_source_quota::require_capacity_backing(&tx)?;
+        let checked = |connection: &Connection| -> Result<_, CatalogStoreError> {
+            let value = read(connection)?;
+            if value.is_some() {
+                revision_quota::require_capacity_backing(connection)?;
+                retained_source_quota::require_capacity_backing(connection)?;
+            }
+            Ok(value)
+        };
+        if !self.connection.is_autocommit() {
+            checked(&self.connection)
+        } else {
+            let tx = self.read_snapshot()?;
+            let value = checked(&tx)?;
+            tx.commit()?;
+            Ok(value)
         }
-        tx.commit()?;
-        Ok(value)
     }
 
     /// Establish an immutable contract on an empty retained catalog. Existing

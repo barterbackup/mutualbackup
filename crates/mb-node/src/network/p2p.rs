@@ -2488,6 +2488,117 @@ impl P2pClient {
         })).await.context("retained restore worker panicked")?
     }
 
+    /// Bootstrap original certified history one bounded tail/witness at a
+    /// time. The selected tip is a locator hint, and supplies no event authority.
+    /// Verified prefixes and immutable total-work admission survive interruption.
+    #[cfg(target_os = "linux")]
+    pub async fn bootstrap_retained_checkpoint_history(
+        &self,
+        node: Arc<Mutex<Node>>,
+        id: Uuid,
+        publisher: NodeId,
+        target: crate::CheckpointHistoryTarget,
+        budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<crate::CheckpointHistoryRecovery> {
+        target.validate()?;
+        budget.remaining_after(target.required_work()?)?;
+        anyhow::ensure!(
+            !id.is_nil() && publisher.0 != [0; 32],
+            "invalid history recovery peer or job"
+        );
+        let genesis = self.guild_genesis(publisher, target.guild_id).await?;
+        anyhow::ensure!(
+            genesis.genesis.guild_id == target.guild_id && genesis.hash()? == target.genesis_hash,
+            "history publisher returned another genesis"
+        );
+        let job = node_blocking(node.clone(), move |node| {
+            node.begin_checkpoint_history_from_genesis(id, genesis, target, budget)
+        })
+        .await?;
+        loop {
+            let request = job.clone();
+            let (state, sequence, head) = node_blocking(node.clone(), move |node| {
+                node.checkpoint_history_recovery_progress(&request)
+            })
+            .await?;
+            if state == crate::CheckpointHistoryRecoveryState::Complete {
+                return Ok(job);
+            }
+            anyhow::ensure!(
+                state == crate::CheckpointHistoryRecoveryState::Building,
+                "history recovery was cancelled"
+            );
+            let tail = self
+                .guild_event_tail(publisher, target.guild_id, sequence, head)
+                .await?;
+            anyhow::ensure!(
+                tail.format_version == 1
+                    && !tail.events.is_empty()
+                    && tail.events.len() <= mb_core::MAX_GUILD_EVENT_TAIL,
+                "history publisher returned an invalid or incomplete tail"
+            );
+            // The existing wire decoder bounds the complete tail by the peer
+            // frame. Drop each event after its original evidence is committed.
+            for event in tail.events {
+                let request = job.clone();
+                let (state, current, parent) = node_blocking(node.clone(), move |node| {
+                    node.checkpoint_history_recovery_progress(&request)
+                })
+                .await?;
+                if state == crate::CheckpointHistoryRecoveryState::Complete {
+                    return Ok(job);
+                }
+                anyhow::ensure!(
+                    state == crate::CheckpointHistoryRecoveryState::Building
+                        && event.event.sequence
+                            == current
+                                .checked_add(1)
+                                .context("history sequence exhausted")?
+                        && event.event.parent == parent
+                        && event.event.sequence <= target.event_sequence,
+                    "history publisher returned an out-of-order event"
+                );
+                let transcript = if let Some((group, _)) = event.event.kind.coding_group_add() {
+                    Some(
+                        self.coding_transcript_for_event(
+                            publisher,
+                            target.guild_id,
+                            group.id,
+                            event.event.sequence,
+                            event.event.hash()?,
+                        )
+                        .await?
+                        .into_inner(),
+                    )
+                } else {
+                    None
+                };
+                let binding = if matches!(
+                    event.event.kind,
+                    mb_core::GuildEventKind::AddCodingGroup { .. }
+                ) {
+                    Some(
+                        self.legacy_coding_add_binding(
+                            publisher,
+                            target.guild_id,
+                            event.event.sequence,
+                            event.event.hash()?,
+                        )
+                        .await?
+                        .context("historical coding Add lacks its original quorum binding")?,
+                    )
+                } else {
+                    None
+                };
+                let request = job.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.install_checkpoint_history_event(&request, event, transcript, binding)
+                })
+                .await?;
+            }
+        }
+    }
+
     /// Acquire all authenticated public trees through one independently
     /// leased session. Original local event history supplies quorum trust;
     /// downloaded prefixes remain unavailable until full proof promotion.

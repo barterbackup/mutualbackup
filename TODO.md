@@ -2553,6 +2553,45 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Qualify bounded original-history peer bootstrap before recovery.
+      Bounded original-history peer bootstrap before retained recovery (2026-10-14):
+      An explicit peer recovery operation fetches original genesis, bounded event tails
+      and one original coding transcript/binding at a time. The recovered seed's original
+      genesis signature/key and the existing durable original-history validator govern
+      adoption and every event's complete effects. A selected tip remains a hint; only
+      replayed original quorum events establish authority. A conservative complete work
+      declaration is checked before fetches and stored in an immutable paired journal.
+      Original event/evidence records, compact authority, history point indexes and the
+      journal's progress share the existing publication writer and final readbacks.
+      No growing flat history is collected, and no SQL writer or Node lock spans peer
+      I/O. Verified prefixes resume after reopen; cancellation fences late responses and
+      identity reuse while retaining authentic shared history. Completion requires the
+      exact selected tip. Capacity backing is rechecked under the publication writer.
+      The optional capacity-policy getter now composes inside an enclosing writer,
+      preserving backing checks and the caller's rollback. Two local history cases cover
+      ABORT/IGNORE publication faults, wrong tips, corrupt signatures/state, immutable
+      target/budget, prefix reopen and cancellation. A Store regression checks configured
+      and unconfigured reads plus damaged backing under a writer. Both real QUIC layouts
+      start the receiving Node from its seed alone, retrieve original history and coding
+      evidence from a surviving holder, then acquire public catalogs and complete exact
+      native/Git restore after the entire original Node directory is removed.
+      Frozen qualification passes 1,572 distinct cases: 1,299 fresh and 273 reused
+      from exactly unchanged executables. All 582 ordinary Node, 520 Store, 131 Git
+      and 23 process acceptance cases pass, plus three bulk gates and four provisioned
+      Linux native cases. The unchanged Core executable preserves its 210 qualified
+      cases. Format, strict locked all-target workspace Clippy, builds, source/binary
+      hash checks and native cleanup pass. Independent audit verifies 390 inputs and
+      23 executables; 121 ignored cases remain unexecuted. Verified retirement removes
+      23 superseded archive paths and two exploratory executables, reclaiming 10.27 GiB.
+      Target uses 60.02 GiB, including the new preserved nested-read failure binary,
+      source snapshot and log. Current binaries, failed/older qualified evidence,
+      14 auxiliary WIP files and all 10 installed roots remain preserved.
+      Automatic DHT selection/publication,
+      predecessor checkpoint chain recovery, normal paged production/distributed
+      activation, full global/physical admission, legacy completion and remaining M6
+      gates stay open. The work declaration is not a physical reservation or dense
+      qualification. Dense 1 TiB and Windows/macOS hardware runs remain user-deferred.
+      Evidence: `/tmp/mb-m6-history-bootstrap-ncgbzx4c`.
     - [x] Qualify durable complete public acquisition and peer recovery.
       Durable public checkpoint acquisition and full peer recovery (2026-10-14):
       Public acquisition now persists the exact original certificate, independent

@@ -96,7 +96,8 @@ macro_rules! cases {
             }
             let receiver_temp = tempfile::tempdir().unwrap();
             let fresh = receiver_temp.path();
-            let receiver = fresh_public_node(fresh, seed.clone(), &survivor);
+            let receiver = Node::open(fresh, seed.clone()).unwrap();
+            assert!(receiver.guild_summary().unwrap().is_none());
             receiver
                 .control
                 .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
@@ -145,6 +146,34 @@ macro_rules! cases {
             .await
             .unwrap();
             client.add_peer_address(server_id, address).await.unwrap();
+            let history_target = crate::CheckpointHistoryTarget {
+                guild_id: proof.trust().guild_id,
+                genesis_hash: proof.trust().genesis_hash,
+                event_sequence: proof.trust().event_sequence,
+                event_head: proof.trust().event_head,
+            };
+            let history = client
+                .bootstrap_retained_checkpoint_history(
+                    receiver.clone(),
+                    Uuid::from_u128(859),
+                    server_id,
+                    history_target,
+                    history_target.required_work().unwrap(),
+                )
+                .await
+                .expect("seed-only original history bootstrap over QUIC");
+            assert_eq!(
+                receiver
+                    .lock()
+                    .unwrap()
+                    .checkpoint_history_recovery_progress(&history)
+                    .unwrap(),
+                (
+                    crate::CheckpointHistoryRecoveryState::Complete,
+                    history_target.event_sequence,
+                    history_target.event_head
+                )
+            );
             let peer = RetainedCheckpointPeer {
                 node_id: server_id,
                 owner_id: survivor_owner,

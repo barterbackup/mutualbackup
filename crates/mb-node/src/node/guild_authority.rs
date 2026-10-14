@@ -296,6 +296,50 @@ fn publish_authority(
     deletions: &[(String, Vec<u8>)],
     prepared_history: Option<mb_store::CatalogGuildHistoryMutation>,
 ) -> Result<()> {
+    publish_authority_guarded(
+        control,
+        installed,
+        authority,
+        before,
+        records,
+        deletions,
+        (prepared_history, |_| Ok(())),
+    )
+}
+
+pub(super) fn publish_indexed_recovery_event(
+    control: &ControlStore,
+    installed: &InstalledGuild,
+    history: &mb_store::CatalogDurableGuildHistory,
+    event: &QuorumGuildEvent,
+    records: &[ControlRecord],
+    guard: impl Fn(bool) -> Result<()>,
+) -> Result<()> {
+    let mutation = original_history::prepare_event(control, history, event, records)?;
+    publish_authority_guarded(
+        control,
+        installed,
+        mutation.authority().clone(),
+        Some(history.authority()),
+        records,
+        &[],
+        (Some(mutation), guard),
+    )
+}
+
+fn publish_authority_guarded(
+    control: &ControlStore,
+    installed: &InstalledGuild,
+    authority: GuildAuthoritySnapshot,
+    before: Option<&GuildAuthoritySnapshot>,
+    records: &[ControlRecord],
+    deletions: &[(String, Vec<u8>)],
+    publication: (
+        Option<mb_store::CatalogGuildHistoryMutation>,
+        impl Fn(bool) -> Result<()>,
+    ),
+) -> Result<()> {
+    let (prepared_history, guard) = publication;
     let initial = GuildAuthoritySnapshot::from_genesis(&installed.certificate)?;
     let next = make(initial.event_head, authority)?;
     if next.authority.guild_id != initial.guild_id
@@ -329,6 +373,7 @@ fn publish_authority(
         None => original_history::prepare(control, installed, &next, before.as_ref(), records)?,
     };
     control.with_record_transaction(|| -> Result<()> {
+        guard(false)?;
         if control.get_record_bounded(KIND, KEY, BYTES)? != expected {
             anyhow::bail!("compact guild authority changed before publication");
         }
@@ -386,6 +431,7 @@ fn publish_authority(
         }
         membership.check(control)?;
         original_history.verify_published(control)?;
+        guard(true)?;
         Ok(())
     })
 }
