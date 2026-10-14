@@ -3,6 +3,7 @@
 use super::*;
 use mb_core::{CatalogCodingTraversalBudget as Work, PagedCheckpointLayout, PagedCheckpointTrust};
 
+mod ancestry;
 mod recovery_tip;
 pub use recovery_tip::CatalogCheckpointRecoveryTip;
 pub(super) fn recovery_candidate(

@@ -289,7 +289,7 @@ fn successor(
 }
 
 macro_rules! cases {
-    ($test:ident,$constructor:ident,$variant:ident,$layout:ident,$cancel:ident)=>{
+    ($test:ident,$constructor:ident,$variant:ident,$layout:ident,$cancel:ident,$release:ident)=>{
         #[test]
         fn $test() {
             let (original_temp,seed,mut original,mut keys)=fixture();let local=keys.iter().position(|key|key.node_id()==original.keys.node_id()).unwrap();keys.swap(0,local);
@@ -316,13 +316,39 @@ macro_rules! cases {
                 assert_eq!(original.control.checkpoint_acquisition_state(&next_job).unwrap(),mb_store::CatalogCheckpointAcquisitionState::Building);
                 original.control.database_shell_statement("DROP TRIGGER tip_fault",false).unwrap();
             }
+            for action in ["ABORT","IGNORE"] {
+                let fault=if action=="ABORT" {",'test'"} else {""};
+                original.control.database_shell_statement(&format!("CREATE TRIGGER ancestry_fault BEFORE INSERT ON protocol_records WHEN NEW.kind='catalog-checkpoint-ancestry-link-guard-v1' BEGIN SELECT RAISE({action}{fault}); END"),false).unwrap();
+                assert!(session.promote_acquired_checkpoint_after(&next_job,Some(&first)).is_err());
+                assert_eq!(original.control.checkpoint_recovery_tip().unwrap().unwrap().owner,first_job.id);
+                original.control.database_shell_statement("DROP TRIGGER ancestry_fault",false).unwrap();
+            }
             let next=session.promote_acquired_checkpoint_after(&next_job,Some(&first)).unwrap();drop(session);
+            for kind in ["catalog-checkpoint-ancestry-link-v1","catalog-checkpoint-ancestry-link-guard-v1"] {original.control.delete_record(kind,next_job.id.as_bytes()).unwrap();}
+            assert!(original.control.checkpoint_recovery_tip().is_err());
+            assert!(original.control.adopt_checkpoint_recovery_ancestry(Uuid::from_u128(999)).is_err());
+            original.control.adopt_checkpoint_recovery_ancestry(first_job.id).unwrap();
+            assert_eq!(original.control.checkpoint_recovery_tip().unwrap().unwrap().owner,next_job.id);
+
+            assert_eq!(original.control.checkpoint_ancestry_certificate(first_job.id).unwrap(),Some(first.certificate().clone()));
+            assert!(original.control.cancel_checkpoint_ancestry_archive(first_job.id).is_err());
+            original.control.cancel_checkpoint_acquisition(&first_job).unwrap();
+            while original.control.release_checkpoint_acquisition_step(&first_job).unwrap(){}
+            original.control.$cancel(first_job.id).unwrap();
+            while original.control.$release(first_job.id).unwrap(){}
+            assert_eq!(original.control.checkpoint_ancestry_certificate(first_job.id).unwrap(),Some(first.certificate().clone()));
+            assert_eq!(original.control.checkpoint_recovery_tip().unwrap().unwrap().owner,next_job.id);
+
             let scope=CatalogScope::Guild {guild_id:next.certificate().guild_id()};let mut groups=mb_core::CatalogCodingDirectoryReader::new(scope,next.certificate().coding(),next_job.budget).unwrap();
             while let Some(entry)=groups.next_group(&mut |page|original.control.catalog_page(scope,CatalogSection::Coding,page)).unwrap() {original.retain_recovered_checkpoint_payload(next_job.id,&next,entry.retained.group.id,1).unwrap();}
             let rotate=event(&original,&keys,mb_core::GuildEventKind::RotateWriterKey {owner:keys[0].node_id(),epoch:2,public_key:ed25519_dalek::SigningKey::from_bytes(&[92;32]).verifying_key().to_bytes()});original.install_guild_event(rotate).unwrap();
             let revoke=event(&original,&keys,mb_core::GuildEventKind::RevokeWriterKey {owner:keys[0].node_id(),epoch:2});original.install_guild_event(revoke).unwrap();
             let receiver_temp=tempfile::tempdir().unwrap();let receiver=fresh_public_node(receiver_temp.path(),seed.clone(),&original);quota(&receiver);
             let source=original.reader_config().open().unwrap();let session=receiver.retained_checkpoint_restore().unwrap();
+            let certificate=first.certificate();let bytes=source.retained_paged_checkpoint_certificate(certificate.guild_id(),certificate.layout(),first_job.id,certificate.hash().unwrap()).unwrap();
+            let expected=match &certificate {Certificate::Individual(c)=>mb_core::canonical_bytes(c).unwrap(),Certificate::Directory(c)=>mb_core::canonical_bytes(c).unwrap()};assert_eq!(bytes,expected);
+            assert!(source.retained_paged_checkpoint_certificate(certificate.guild_id(),certificate.layout(),first_job.id,[0;32]).is_err());
+
             let first_certificate=first.certificate();let first_remote=session.acquire_public_checkpoint_after(Uuid::from_u128(972),first_certificate.clone(),first_job.budget,None,|path|source.retained_paged_checkpoint_public_page(first_certificate.guild_id(),first_certificate.layout(),first_job.id,first_certificate.hash()?,&path)).unwrap();
             let first_received=session.promote_acquired_checkpoint_after(&first_remote,None).unwrap();
             let next_certificate=next.certificate();assert!(session.acquire_public_checkpoint_after(Uuid::from_u128(973),next_certificate.clone(),next_job.budget,None,|_|anyhow::bail!("must reject before fetch")).is_err());
@@ -352,12 +378,14 @@ cases!(
     git_owner_proof,
     Individual,
     Individual,
-    cancel_catalog_paged_checkpoint_retention
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root
 );
 cases!(
     directory_checkpoint_chain_uses_original_history_prefix_and_resumes_after_tip_faults,
     git_directory_proof,
     Directory,
     Directory,
-    cancel_catalog_paged_checkpoint_directory_retention
+    cancel_catalog_paged_checkpoint_directory_retention,
+    release_catalog_paged_checkpoint_directory_root
 );

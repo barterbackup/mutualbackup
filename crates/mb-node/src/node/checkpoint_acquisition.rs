@@ -516,6 +516,15 @@ impl RetainedCheckpointRestore {
         };
         authority.check()?;
         if recovery.is_some() {
+            if let Some(tip) = control.checkpoint_recovery_tip()?
+                && tip.owner != job.id
+            {
+                current()?;
+                control.begin_checkpoint_ancestry_archive(tip.owner)?;
+                while control.advance_checkpoint_ancestry_archive(tip.owner)? {
+                    current()?;
+                }
+            }
             control.finish_checkpoint_recovery_acquisition(job)?;
         } else {
             control.finish_checkpoint_acquisition(job)?;

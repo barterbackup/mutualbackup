@@ -551,14 +551,38 @@ macro_rules! custody_reads {
                 id: Uuid,
                 checkpoint_hash: [u8; 32],
             ) -> Result<Vec<u8>> {
-                self.control
-                    .catalog_retained_paged_checkpoint_certificate(
-                        layout,
-                        guild_id,
-                        id,
-                        checkpoint_hash,
-                    )?
-                    .context("paged checkpoint metadata owner is not published")
+                if let Some(bytes) = self.control.catalog_retained_paged_checkpoint_certificate(
+                    layout,
+                    guild_id,
+                    id,
+                    checkpoint_hash,
+                )? {
+                    return Ok(bytes);
+                }
+                let certificate = self
+                    .control
+                    .checkpoint_ancestry_certificate(id)?
+                    .context("paged checkpoint metadata owner is not published")?;
+                anyhow::ensure!(
+                    certificate.guild_id() == guild_id
+                        && certificate.layout() == layout
+                        && certificate.hash()? == checkpoint_hash,
+                    "checkpoint ancestry identity does not match request"
+                );
+                Ok(match certificate {
+                    mb_store::CatalogPublicCheckpoint::Individual(c) => {
+                        mb_core::canonical_bytes_bounded(
+                            &c,
+                            mb_core::PAGED_QUORUM_CHECKPOINT_BYTES,
+                        )?
+                    }
+                    mb_store::CatalogPublicCheckpoint::Directory(c) => {
+                        mb_core::canonical_bytes_bounded(
+                            &c,
+                            mb_core::PAGED_QUORUM_CHECKPOINT_BYTES,
+                        )?
+                    }
+                })
             }
 
             /// Fetch only public metadata reachable from this owner's exact
@@ -579,14 +603,18 @@ macro_rules! custody_reads {
                     path_guild == guild_id,
                     "paged checkpoint path belongs to another guild"
                 );
+                if let Some(bytes) = self.control.catalog_retained_paged_checkpoint_public_page(
+                    layout,
+                    id,
+                    checkpoint_hash,
+                    path,
+                )? {
+                    return Ok(bytes);
+                }
+                self.retained_paged_checkpoint_certificate(guild_id, layout, id, checkpoint_hash)?;
                 self.control
-                    .catalog_retained_paged_checkpoint_public_page(
-                        layout,
-                        id,
-                        checkpoint_hash,
-                        path,
-                    )?
-                    .context("paged checkpoint metadata owner is not published")
+                    .checkpoint_ancestry_page(id, path)?
+                    .context("paged checkpoint ancestry is not published")
             }
         }
     };

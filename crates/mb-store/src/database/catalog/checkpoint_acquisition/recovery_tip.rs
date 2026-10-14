@@ -26,6 +26,12 @@ fn for_job(
 pub(super) fn read(
     cx: &Connection,
 ) -> Result<Option<CatalogCheckpointRecoveryTip>, CatalogStoreError> {
+    read_inner(cx, true)
+}
+fn read_inner(
+    cx: &Connection,
+    check_ancestry: bool,
+) -> Result<Option<CatalogCheckpointRecoveryTip>, CatalogStoreError> {
     let bytes = bounded_record(cx, TIP, KEY, BYTES)?;
     let guard = bounded_record(cx, GUARD, KEY, BYTES)?;
     if bytes != guard {
@@ -62,6 +68,9 @@ pub(super) fn read(
     match &job.spec.certificate {
         CatalogPublicCheckpoint::Individual(c) => owner!(mb_core::PagedGuildCheckpoint, c),
         CatalogPublicCheckpoint::Directory(c) => owner!(mb_core::PagedGuildCheckpointDirectory, c),
+    }
+    if check_ancestry {
+        ancestry::check_parent(cx, &job.spec)?;
     }
     Ok(Some(tip))
 }
@@ -113,6 +122,9 @@ pub(super) fn publish(
     if old.map(|tip| (tip.generation, tip.hash)) != spec.certificate.previous_identity() {
         return Err(DatabaseError::Conflict.into());
     }
+    if let Some(previous) = old {
+        ancestry::link_parent(cx, spec.id, previous)?;
+    }
     let bytes = canonical_bytes(&next)?;
     for name in [TIP, GUARD] {
         match old {
@@ -128,6 +140,37 @@ pub(super) fn publish(
     Ok(())
 }
 impl ControlStore {
+    /// Adopt a pre-ancestry recovery tip only after its exact predecessor has
+    /// acquired independent public custody. No signed identity is synthesized.
+    pub fn adopt_checkpoint_recovery_ancestry(
+        &self,
+        parent_owner: Uuid,
+    ) -> Result<(), CatalogStoreError> {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let tip = read_inner(&tx, false)?.ok_or(DatabaseError::NotReady)?;
+        let job = super::read(&tx, tip.owner)?.ok_or(DatabaseError::Integrity)?;
+        let certificate =
+            ancestry::certificate(&tx, parent_owner)?.ok_or(DatabaseError::NotReady)?;
+        let parent = CatalogCheckpointRecoveryTip {
+            owner: parent_owner,
+            guild_id: certificate.guild_id(),
+            layout: certificate.layout(),
+            generation: certificate.generation(),
+            hash: certificate.hash()?,
+        };
+        if certificate.guild_id() != job.spec.certificate.guild_id()
+            || Some((parent.generation, parent.hash)) != job.spec.certificate.previous_identity()
+            || parent.owner == tip.owner
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        ancestry::link_parent(&tx, tip.owner, parent)?;
+        if read(&tx)? != Some(tip) {
+            return Err(DatabaseError::Integrity.into());
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn checkpoint_recovery_tip(
         &self,
     ) -> Result<Option<CatalogCheckpointRecoveryTip>, CatalogStoreError> {

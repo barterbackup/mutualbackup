@@ -6057,3 +6057,35 @@ predecessor recovery, complete ancestry retention/retirement, normal paged produ
 and distributed activation, full global/physical admission and remaining M6 gates stay
 open. Dense 1 TiB and Windows/macOS hardware runs remain user-deferred.
 Evidence: `/tmp/mb-m6-checkpoint-chain-fzqs3acu`.
+
+Independent public predecessor custody (2026-10-14):
+Recovery successors now archive their exact predecessor's original certificate,
+full-proof receipt and all public metadata roots before moving the paired recovery
+tip. The independent owner copies one root per short writer, authenticates EOF
+against frozen source counters and resumes after reopen. It carries no private,
+native, bootstrap or READY payload ownership. Paired progress/link records and
+readbacks reject failed or ignored writes; active recovery progress fences archive
+cancellation. Explicit adoption verifies the exact original parent before adding
+ancestry to an older recovery tip. Existing peer certificate/page reads also serve
+the exact public archive after source retirement, checking guild, layout, hash
+and each authenticated root/path. Original retention, acquisition and wire
+layouts are unchanged.
+Two archive lifecycle cases pass ABORT/IGNORE progress and pin faults, interruption,
+reopen, source-owner retirement, authenticated public reads, private-read rejection,
+archive cancellation and permanent ID fencing. Both layout chain cases also pass
+paired-link faults, explicit ancestry adoption, predecessor staging/public retirement,
+archived certificate/page reads, receiver reopen and exact native/Git restore.
+Frozen qualification passes 1,577 distinct cases: 1,304 fresh and 273 reused from
+exactly unchanged executables. All 584 ordinary Node, 523 Store, 131 Git and 23
+process acceptance cases pass, plus three bulk gates and four provisioned Linux
+native cases. The unchanged Core executable retains its 210 qualified cases.
+Format, strict locked all-target workspace Clippy, builds, source/binary hashes and
+native cleanup pass. Independent audit verifies 394 inputs and 23 executables;
+121 ignored cases remain unexecuted. Verified retirement removes 23 superseded
+archive paths and two exploratory executables, reclaiming 10.30 GiB. Target uses
+63.42 GiB. All 13 failed artifacts, 29 older archive paths, 14 auxiliary WIP files
+and 10 installed roots remain preserved.
+Automatic proof reconstruction from archived chains, precise per-descendant archive
+retirement, automatic DHT selection, production/activation and complete resource
+admission remain open. Dense 1 TiB and native Windows/macOS runs remain user-deferred.
+Evidence: `/tmp/mb-m6-ancestry-custody-4a8ngxmh`.

@@ -110,3 +110,78 @@ cases!(
     Directory,
     retain_catalog_paged_checkpoint_directory
 );
+
+macro_rules! archive_cases {
+    ($test:ident,$proof:path,$stage:path,$variant:ident,$retain:ident,$cancel:ident,$release:ident)=>{
+        #[test]
+        fn $test(){
+            for action in ["ABORT","IGNORE"] {
+                let (mut fixture,history)=real_checkpoint();let proof=$proof(&mut fixture,&history);
+                let temp=tempfile::tempdir().unwrap();let path=temp.path().join("control.db");
+                let s=ControlStore::open(&path,&history.keys[0]).unwrap();$stage(&s,&fixture,&proof,1000);
+                let cert=Certificate::$variant(proof.certificate().clone());let id=Uuid::from_u128(882);
+                assert!(s.begin_checkpoint_ancestry_archive(id).is_err());
+                s.$retain(id,&proof,||Ok(proof.trust().clone())).unwrap();
+                let fault=if action=="ABORT"{",'test'"}else{""};
+                s.connection.execute_batch(&format!("CREATE TEMP TRIGGER archive_fault BEFORE INSERT ON protocol_records WHEN NEW.kind='catalog-checkpoint-ancestry-guard-v1' BEGIN SELECT RAISE({action}{fault}); END")).unwrap();
+                assert!(s.begin_checkpoint_ancestry_archive(id).is_err());
+                assert!(s.get_record("catalog-checkpoint-ancestry-v1",id.as_bytes()).unwrap().is_none());
+                s.connection.execute_batch("DROP TRIGGER archive_fault").unwrap();s.begin_checkpoint_ancestry_archive(id).unwrap();
+                assert!(s.checkpoint_ancestry_certificate(id).unwrap().is_none());
+                for kind in ["catalog-checkpoint-ancestry-guard-v1".to_owned(),format!("catalog-checkpoint-ancestry-dependency-v1/{}",id.simple())] {
+                    let verb=if kind.contains("dependency"){"INSERT"}else{"UPDATE"};
+                    let before=s.get_record("catalog-checkpoint-ancestry-v1",id.as_bytes()).unwrap();
+                    s.connection.execute_batch(&format!("CREATE TEMP TRIGGER archive_fault BEFORE {verb} ON protocol_records WHEN NEW.kind='{kind}' BEGIN SELECT RAISE({action}{fault}); END")).unwrap();
+                    assert!(s.advance_checkpoint_ancestry_archive(id).is_err());
+                    assert_eq!(s.get_record("catalog-checkpoint-ancestry-v1",id.as_bytes()).unwrap(),before);
+                    s.connection.execute_batch("DROP TRIGGER archive_fault").unwrap();
+                }
+                assert!(s.advance_checkpoint_ancestry_archive(id).unwrap());drop(s);
+                let s=ControlStore::open(&path,&history.keys[0]).unwrap();s.begin_checkpoint_ancestry_archive(id).unwrap();
+                while s.advance_checkpoint_ancestry_archive(id).unwrap(){}
+                assert_eq!(s.checkpoint_ancestry_certificate(id).unwrap(),Some(cert.clone()));
+                let guard=s.get_record("catalog-checkpoint-ancestry-guard-v1",id.as_bytes()).unwrap().unwrap();
+                s.delete_record("catalog-checkpoint-ancestry-guard-v1",id.as_bytes()).unwrap();assert!(s.checkpoint_ancestry_certificate(id).is_err());
+                s.put_record("catalog-checkpoint-ancestry-guard-v1",id.as_bytes(),&guard).unwrap();
+                s.$cancel(id).unwrap();while s.$release(id).unwrap(){}
+                drop(s);let s=ControlStore::open(&path,&history.keys[0]).unwrap();
+                assert_eq!(s.checkpoint_ancestry_certificate(id).unwrap(),Some(cert));
+                for (scope,section,root) in Certificate::$variant(proof.certificate().clone()).initial_roots(){
+                    let dep=crate::database::catalog::retention_journal::Dependency{scope,section,root};
+                    let name=format!("catalog-checkpoint-ancestry-dependency-v1/{}",id.simple());
+                    assert_eq!(s.get_record(&name,&root.hash).unwrap(),Some(mb_core::canonical_bytes(&dep).unwrap()));
+                    let mut pin=[0;17];pin[0]=7;pin[1..].copy_from_slice(id.as_bytes());
+                    assert_eq!(s.get_record(&crate::database::catalog::pins(root.hash),&pin).unwrap(),Some(vec![]));
+                    let expected=s.catalog_page(scope,section,root).unwrap();
+                    let path=mb_core::CatalogPagePath{scope,section,pages:vec![root]};
+                    assert_eq!(s.checkpoint_ancestry_page(id,&path).unwrap(),Some(expected));
+                    let mut private=path;private.section=CatalogSection::FileMetadata;assert!(s.checkpoint_ancestry_page(id,&private).is_err());
+                }
+                s.cancel_checkpoint_ancestry_archive(id).unwrap();
+                s.connection.execute_batch(&format!("CREATE TEMP TRIGGER archive_fault BEFORE UPDATE ON protocol_records WHEN NEW.kind='catalog-checkpoint-ancestry-guard-v1' BEGIN SELECT RAISE({action}{fault}); END")).unwrap();
+                assert!(s.release_checkpoint_ancestry_archive_step(id).is_err());
+                s.connection.execute_batch("DROP TRIGGER archive_fault").unwrap();
+                while s.release_checkpoint_ancestry_archive_step(id).unwrap(){}
+                assert!(s.checkpoint_ancestry_certificate(id).unwrap().is_none());assert!(s.begin_checkpoint_ancestry_archive(id).is_err());
+            }
+        }
+    }
+}
+archive_cases!(
+    individual_ancestry_archive_resumes_and_outlives_original_owner,
+    individual,
+    super::paged_checkpoint_retention::stage_paged_owner,
+    Individual,
+    retain_catalog_paged_checkpoint,
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root
+);
+archive_cases!(
+    directory_ancestry_archive_resumes_and_outlives_original_owner,
+    directory,
+    super::checkpoint_directory_retention::stage,
+    Directory,
+    retain_catalog_paged_checkpoint_directory,
+    cancel_catalog_paged_checkpoint_directory_retention,
+    release_catalog_paged_checkpoint_directory_root
+);
