@@ -2,7 +2,7 @@ use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 macro_rules! cases {
-    ($test:ident,$constructor:ident,$layout:ident,$metadata:ident,$revision:ident,$lookup:ident,$cancel:ident,$release:ident,$journal:literal,$restore:ident,$mode:literal) => {
+    ($test:ident,$constructor:ident,$layout:ident,$metadata:ident,$revision:ident,$lookup:ident,$cancel:ident,$release:ident,$journal:literal,$restore:ident,$mode:literal,$chunks:ident,$payload:ident) => {
         #[test]
         fn $test() {
             let (temp, seed, mut node, mut keys) = fixture();
@@ -29,6 +29,22 @@ macro_rules! cases {
                 checkpoint_hash: proof.certificate().hash().unwrap(),
             };
             let layout = mb_core::PagedCheckpointLayout::$layout;
+            if $mode == 0o555 {
+                node.$chunks(owner, &proof).unwrap();
+                let mut after = None;
+                while let Some(row) = proof.index().index().next_group(after).unwrap() {
+                    let group = row.group.range.group_id;
+                    node.$payload(owner, &proof, group, 1).unwrap();
+                    after = Some(group);
+                }
+                // Deliberately retire the readable plaintext source. Only the
+                // exact checkpoint's local parity role can provide its bytes.
+                let area = mb_store::StableAnchorAreaLocator::prepare_for_root(
+                    &node.data_dir.join("retained-git-source")
+                ).unwrap();
+                std::fs::remove_dir_all(area.path_hint).unwrap();
+            }
+
             let target = temp.path().join("invalid-selection");
             for field in 0..5 {
                 let mut wrong = snapshot.clone();
@@ -51,6 +67,45 @@ macro_rules! cases {
             assert!(node.$restore(layout, owner, guild, &snapshot, &target, Work { bytes: 0, ..budget }).is_err());
             assert!(!target.exists());
             assert!(node.control.records("restore-job").unwrap().is_empty());
+
+            if $mode == 0o555 {
+                let data = mb_core::make_content_sector_id(
+                    &node.keys.guild_content_id_key(&guild), node.keys.node_id(), guild,
+                    key.protected_root_id, mb_core::SectorPurpose::Data, b"retained raw\r\n\0",
+                ).unwrap();
+                assert!(node.sector_for_guild(&guild, &data).is_err());
+                let source = mb_core::SourceChunkId {
+                    owner: node.keys.node_id(),
+                    protected_root: mb_core::packing_protected_root(key.protected_root_id),
+                    object_id: data, chunk_index: 0,
+                };
+                let row_key = canonical_bytes(&source).unwrap();
+                let name = format!("catalog-checkpoint-chunk-location-v1/{}", owner.simple());
+                let saved = node.control.get_record(&name, &row_key).unwrap().unwrap();
+                let mut hint: mb_store::CatalogCheckpointChunkLocation = decode_canonical(&saved).unwrap();
+                hint.slot_index = (hint.slot_index + 1) % 4;
+                node.control.put_record(&name, &row_key, &canonical_bytes(&hint).unwrap()).unwrap();
+                let target = temp.path().join("substituted-slot");
+                let error = node.$restore(layout, owner, guild, &snapshot, &target, budget).unwrap_err();
+                assert!(error.to_string().contains("original complete commitment"), "{error:#}");
+                assert!(!target.exists());
+                node.control.put_record(&name, &row_key, &saved).unwrap();
+                node.$restore(layout, owner, guild, &snapshot, &target, budget).unwrap();
+                assert!(node.control.records("restore-job").unwrap().is_empty());
+
+                let hint: mb_store::CatalogCheckpointChunkLocation = decode_canonical(&saved).unwrap();
+                let payload_kind = format!("catalog-checkpoint-payload-v1/{}", owner.simple());
+                let mut payload_key = hint.group_id.to_vec();
+                payload_key.extend_from_slice(&1u16.to_be_bytes());
+                let payload = node.control.get_record(&payload_kind, &payload_key).unwrap().unwrap();
+                node.control.delete_record(&payload_kind, &payload_key).unwrap();
+                let target = temp.path().join("missing-retained-role");
+                assert!(node.$restore(layout, owner, guild, &snapshot, &target, budget).is_err());
+                assert!(!target.exists());
+                node.control.put_record(&payload_kind, &payload_key, &payload).unwrap();
+                node.$restore(layout, owner, guild, &snapshot, &target, budget).unwrap();
+                assert!(node.control.records("restore-job").unwrap().is_empty());
+            }
 
             for (number, action) in ["ABORT", "IGNORE"].into_iter().enumerate() {
                 let target = temp.path().join(format!("publication-fault-{number}"));
@@ -128,7 +183,9 @@ cases!(
     release_catalog_paged_checkpoint_root,
     "catalog-paged-checkpoint-retention-v1",
     restore_retained_checkpoint_native_snapshot,
-    0o700
+    0o700,
+    build_retained_paged_checkpoint_chunk_index,
+    retain_paged_checkpoint_local_payload
 );
 cases!(
     retained_directory_checkpoint_native_restore_fences_publication_and_reopens_owned_output,
@@ -141,7 +198,9 @@ cases!(
     release_catalog_paged_checkpoint_directory_root,
     "catalog-directory-checkpoint-retention-v1",
     restore_retained_checkpoint_native_snapshot,
-    0o700
+    0o700,
+    build_retained_paged_checkpoint_directory_chunk_index,
+    retain_paged_checkpoint_directory_local_payload
 );
 
 fn git_owner_proof(
@@ -221,7 +280,9 @@ cases!(
     release_catalog_paged_checkpoint_root,
     "catalog-paged-checkpoint-retention-v1",
     restore_retained_checkpoint_snapshot,
-    0o555
+    0o555,
+    build_retained_paged_checkpoint_chunk_index,
+    retain_paged_checkpoint_local_payload
 );
 cases!(
     retained_directory_checkpoint_git_restore_fences_publication_and_reopens_owned_output,
@@ -234,5 +295,7 @@ cases!(
     release_catalog_paged_checkpoint_directory_root,
     "catalog-directory-checkpoint-retention-v1",
     restore_retained_checkpoint_snapshot,
-    0o555
+    0o555,
+    build_retained_paged_checkpoint_directory_chunk_index,
+    retain_paged_checkpoint_directory_local_payload
 );

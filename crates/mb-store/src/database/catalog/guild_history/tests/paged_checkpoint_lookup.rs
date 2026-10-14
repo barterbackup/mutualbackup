@@ -16,6 +16,98 @@ fn directory(
     super::checkpoint_directory_retention::proof(fixture, history, budget())
 }
 
+macro_rules! recovery_cases {
+    ($test:ident,$proof:ident,$stage:path,$retain:ident,$lookup:ident,$build:ident,$point:ident,$cancel:ident,$release:ident) => {
+        #[test]
+        fn $test() {
+            use crate::database::catalog::paged_checkpoint_retention::Proof;
+            for action in ["ABORT", "IGNORE"] {
+                let (mut fixture, history) = real_checkpoint();
+                let proof = $proof(&mut fixture, &history);
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("control.db");
+                let s = ControlStore::open(&path, &history.keys[0]).unwrap();
+                $stage(&s, &fixture, &proof, 1000);
+                let owner = s.$retain(Uuid::from_u128(1), &proof, || Ok(proof.trust().clone())).unwrap();
+                let shared = s.$retain(Uuid::from_u128(2), &proof, || Ok(proof.trust().clone())).unwrap();
+                s.$lookup(owner.id, &proof, || Ok(proof.trust().clone())).unwrap();
+                s.$lookup(shared.id, &proof, || Ok(proof.trust().clone())).unwrap();
+                let (key, source, placement, coverage) = proof.next_placement(None).unwrap().unwrap();
+                let name = format!("catalog-checkpoint-chunk-location-v1/{}", owner.id.simple());
+                assert!(s.$point(owner, source).is_err());
+                let fault = if action == "ABORT" { ",'test'" } else { "" };
+                for phase in ["rows", "cursor"] {
+                    let trigger = if phase == "rows" {
+                        format!("BEFORE INSERT ON protocol_records WHEN NEW.kind='{name}'")
+                    } else {
+                        "BEFORE UPDATE ON protocol_records WHEN NEW.kind='catalog-checkpoint-chunk-index-v1'".into()
+                    };
+                    s.connection.execute_batch(&format!("CREATE TEMP TRIGGER fail_chunks {trigger} BEGIN SELECT RAISE({action}{fault}); END")).unwrap();
+                    assert!(s.$build(owner.id, &proof, || Ok(proof.trust().clone())).is_err());
+                    assert!(s.$point(owner, source).is_err());
+                    assert!(s.next_record_bounded(&name, None, 104, 256).unwrap().is_none());
+                    s.connection.execute_batch("DROP TRIGGER fail_chunks").unwrap();
+                }
+                drop(s);
+                let s = ControlStore::open(&path, &history.keys[0]).unwrap();
+                s.$build(owner.id, &proof, || Ok(proof.trust().clone())).unwrap();
+                s.$build(shared.id, &proof, || Ok(proof.trust().clone())).unwrap();
+                let expected = CatalogCheckpointChunkLocation {
+                    sector_id: placement.sector_id, slot_index: placement.slot_index,
+                    group_id: coverage.group_id, shard_index: coverage.shard_index,
+                };
+                assert_eq!(s.$point(owner, source).unwrap().unwrap().1, expected);
+                let original = s.get_record(&name, &key).unwrap().unwrap();
+                s.put_record(&name, &key, &vec![0; 257]).unwrap();
+                assert!(s.$point(owner, source).is_err());
+                assert!(s.$build(owner.id, &proof, || Ok(proof.trust().clone())).is_err());
+                s.put_record(&name, &key, &original).unwrap();
+                s.delete_record(&name, &key).unwrap();
+                assert!(s.$build(owner.id, &proof, || Ok(proof.trust().clone())).is_err());
+                assert!(s.get_record(&name, &key).unwrap().is_none());
+                s.put_record(&name, &key, &original).unwrap();
+                s.$build(owner.id, &proof, || Ok(proof.trust().clone())).unwrap();
+                s.$cancel(owner.id).unwrap();
+                assert!(s.$point(owner, source).is_err());
+                s.connection.execute_batch(&format!("CREATE TEMP TRIGGER fail_chunk_delete BEFORE DELETE ON protocol_records WHEN OLD.kind='{name}' BEGIN SELECT RAISE({action}{fault}); END")).unwrap();
+                assert!(s.$release(owner.id).is_err());
+                s.connection.execute_batch("DROP TRIGGER fail_chunk_delete").unwrap();
+                while s.$release(owner.id).unwrap() {}
+                assert!(s.next_record_bounded(&name, None, 104, 256).unwrap().is_none());
+                assert!(s.get_record("catalog-checkpoint-chunk-index-v1", owner.id.as_bytes()).unwrap().is_none());
+                assert_eq!(s.$point(shared, source).unwrap().unwrap().1, expected);
+                drop(s);
+                let s = ControlStore::open(&path, &history.keys[0]).unwrap();
+                assert_eq!(s.$point(shared, source).unwrap().unwrap().1, expected);
+                assert!(s.checkpoint_head_identity(&proof.trust().guild_id).unwrap().is_none());
+            }
+        }
+    };
+}
+
+recovery_cases!(
+    retained_individual_chunk_locators_reopen_reject_substitution_and_retire_with_shared_owners,
+    individual,
+    super::paged_checkpoint_retention::stage_paged_owner,
+    retain_catalog_paged_checkpoint,
+    build_catalog_paged_checkpoint_lookup,
+    build_catalog_paged_checkpoint_chunk_index,
+    catalog_paged_checkpoint_chunk_location,
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root
+);
+recovery_cases!(
+    retained_directory_chunk_locators_reopen_reject_substitution_and_retire_with_shared_owners,
+    directory,
+    super::checkpoint_directory_retention::stage,
+    retain_catalog_paged_checkpoint_directory,
+    build_catalog_paged_checkpoint_directory_lookup,
+    build_catalog_paged_checkpoint_directory_chunk_index,
+    catalog_paged_checkpoint_directory_chunk_location,
+    cancel_catalog_paged_checkpoint_directory_retention,
+    release_catalog_paged_checkpoint_directory_root
+);
+
 macro_rules! cases {
     ($roundtrip:ident,$damaged:ident,$faults:ident,$proof:ident,$stage:path,$retain:ident,$build:ident,$point:ident,$next:ident,$group:ident,$cancel:ident,$release:ident)=>{
         #[test]

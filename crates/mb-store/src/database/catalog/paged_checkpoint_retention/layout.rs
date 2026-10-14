@@ -192,6 +192,13 @@ fn dependencies<const N: usize>(
         .collect()
 }
 
+type RecoveryPlacement = (
+    Vec<u8>,
+    mb_core::SourceChunkId,
+    CatalogPackingPlacement,
+    CatalogCodingCoverage,
+);
+
 pub(in crate::database::catalog) trait Proof {
     type Header: Layout;
     fn retention(
@@ -218,6 +225,10 @@ pub(in crate::database::catalog) trait Proof {
     fn has_member(&self, holder: mb_core::NodeId) -> bool;
     fn source_id(&self, key: [u8; 32])
     -> Result<mb_core::CatalogPackedSourceId, CatalogStoreError>;
+    fn next_placement(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<RecoveryPlacement>, CatalogStoreError>;
     fn read_group(
         &self,
         group: [u8; 32],
@@ -287,6 +298,29 @@ macro_rules! proof {
                 key: [u8; 32],
             ) -> Result<mb_core::CatalogPackedSourceId, CatalogStoreError> {
                 self.index().index().packing().source_id(key)
+            }
+            fn next_placement(
+                &self,
+                after: Option<&[u8]>,
+            ) -> Result<Option<RecoveryPlacement>, CatalogStoreError> {
+                self.index().require_complete()?;
+                let header = self.certificate().checkpoint;
+                let Some((key, source, placement)) =
+                    super::super::packing_validation::next_placement(
+                        super::super::checkpoint_body::Body::store(self.index()),
+                        header.packing_geometry().0,
+                        header.sectors(),
+                        after,
+                    )?
+                else {
+                    return Ok(None);
+                };
+                let coverage = self
+                    .index()
+                    .index()
+                    .coverage(placement.sector_id)?
+                    .ok_or(DatabaseError::Integrity)?;
+                Ok(Some((key, source, placement, coverage)))
             }
             fn read_group(
                 &self,

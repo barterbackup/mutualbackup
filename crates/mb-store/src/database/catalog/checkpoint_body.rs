@@ -14,6 +14,7 @@ pub(super) trait Header: Copy + Eq + Serialize {
     fn generation(self) -> u64;
     fn coding(self) -> CatalogCodingSummary;
     fn sectors(self) -> u64;
+    fn packing_geometry(self) -> (mb_core::PackingProfile, u64);
 }
 
 impl Header for PagedGuildCheckpoint {
@@ -32,6 +33,9 @@ impl Header for PagedGuildCheckpoint {
     fn sectors(self) -> u64 {
         self.packed_sectors.sectors
     }
+    fn packing_geometry(self) -> (mb_core::PackingProfile, u64) {
+        (self.packed_sectors.profile, self.packed_sources.chunks)
+    }
 }
 impl Header for PagedGuildCheckpointDirectory {
     fn hash(self) -> Result<[u8; 32], ModelError> {
@@ -48,6 +52,9 @@ impl Header for PagedGuildCheckpointDirectory {
     }
     fn sectors(self) -> u64 {
         self.packing.summary.sectors
+    }
+    fn packing_geometry(self) -> (mb_core::PackingProfile, u64) {
+        (self.packing.profile, self.packing.summary.source_chunks)
     }
 }
 

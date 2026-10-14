@@ -1396,8 +1396,8 @@ fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
                 guild_id: guild,
                 profile: coding_profile,
                 information: vec![mb_core::InformationRoleV2 {
-                    owner,
-                    failure_domain: member(&keys[0]).failure_domain.clone(),
+                    owner: keys[usize::from(GIT)].node_id(),
+                    failure_domain: member(&keys[usize::from(GIT)]).failure_domain.clone(),
                     sector: mb_core::RangeSectorRef {
                         id: descriptor.id,
                         commitment: descriptor.commitment.clone(),
@@ -1406,8 +1406,8 @@ fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
                     },
                 }],
                 parity: vec![mb_core::ParityPlacementV2 {
-                    holder: keys[1].node_id(),
-                    failure_domain: member(&keys[1]).failure_domain.clone(),
+                    holder: keys[usize::from(!GIT)].node_id(),
+                    failure_domain: member(&keys[usize::from(!GIT)]).failure_domain.clone(),
                     row: 0,
                 }],
             },
@@ -1440,6 +1440,24 @@ fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
         };
         node.install_coding_group_event(add, transcript.clone())
             .unwrap();
+        if GIT {
+            // Only parity is local. Full restore must reconstruct information
+            // from retained READY bytes after its original source disappears.
+            node.stage_coding_parity(
+                &transcript.value.plan,
+                &transcript.value.manifest,
+                &mb_store::VariableParityObject {
+                    format_version: 2,
+                    guild_id: guild,
+                    group_id: transcript.value.manifest.value.group.id,
+                    shard_index: 1,
+                    commitment: merkle_commit(&shards[1]).unwrap(),
+                    bytes: shards[1].clone(),
+                },
+            )
+            .unwrap();
+            node.activate_coding_attempt(&transcript).unwrap();
+        }
         let retained = node
             .dynamic_guild_state()
             .unwrap()

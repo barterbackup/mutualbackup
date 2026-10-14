@@ -388,6 +388,26 @@ pub(super) fn read_placement(
     Ok(Some(placement))
 }
 
+/// Walk verified source placements with one bounded scratch row at a time.
+/// The enclosing completed checkpoint proof supplies source authority.
+pub(super) fn next_placement(
+    store: &RecordScratchStore,
+    profile: mb_core::PackingProfile,
+    sectors: u64,
+    after: Option<&[u8]>,
+) -> Result<Option<(Vec<u8>, SourceChunkId, CatalogPackingPlacement)>, CatalogStoreError> {
+    let Some((key, _)) = store.next_record_bounded(CHUNKS, after, KEY_BYTES, ROW_BYTES)? else {
+        return Ok(None);
+    };
+    let source: SourceChunkId = decode_canonical(&key)?;
+    if canonical_bytes_bounded(&source, KEY_BYTES)? != key {
+        return Err(DatabaseError::Integrity.into());
+    }
+    let placement =
+        read_placement(store, profile, sectors, source)?.ok_or(DatabaseError::Integrity)?;
+    Ok(Some((key, source, placement)))
+}
+
 pub(super) fn read_sector(
     store: &RecordScratchStore,
     profile: mb_core::PackingProfile,

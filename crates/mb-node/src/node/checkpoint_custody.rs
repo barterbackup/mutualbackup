@@ -89,7 +89,7 @@ impl Node {
             return Ok(());
         }
         macro_rules! restore {
-            ($retention:ident,$point:ident,$publish:ident) => {{
+            ($retention:ident,$point:ident,$publish:ident,$chunk:ident,$group:ident) => {{
                 let (retention, state) = self
                     .control
                     .$retention(owner)?
@@ -143,6 +143,54 @@ impl Node {
                         && (FULL || private.git.is_none()),
                     "restore requires compatible published private roots"
                 );
+                let mut recover = |sector: &SectorId| -> Result<Vec<u8>> {
+                    let original = self
+                        .control
+                        .native_file_catalog_source(catalog.bundle.id, *sector)?
+                        .context("recovery source lacks original signed authority")?;
+                    if let Ok(bytes) = self.sector_for_guild(&guild_id, sector) {
+                        anyhow::ensure!(
+                            merkle_commit(&bytes)? == original.commitment,
+                            "local recovery source differs from its signed commitment"
+                        );
+                        return Ok(bytes);
+                    }
+                    super::checkpoint_recovery::recover_source(
+                        &original,
+                        catalog.bundle.scope,
+                        budget,
+                        |source| Ok(self.control.$chunk(retention, source)?),
+                        |group, work| Ok(self.control.$group(retention, group, work)?),
+                        |group, index, holder, commitment, transcript| {
+                            if holder != self.keys.node_id() {
+                                return Ok(None);
+                            }
+                            let Some(payload) = self
+                                .control
+                                .catalog_paged_checkpoint_payload(owner, group, index)?
+                            else {
+                                return Ok(None);
+                            };
+                            anyhow::ensure!(
+                                payload.guild_id == guild_id
+                                    && payload.holder == holder
+                                    && payload.commitment == *commitment
+                                    && payload.transcript_hash == transcript,
+                                "retained READY role differs from its original witness"
+                            );
+                            let ready = self.volumes.load_ready_variable(
+                                &self.control,
+                                &payload.storage_id,
+                                index,
+                            )?;
+                            anyhow::ensure!(
+                                ready.guild_id == guild_id && ready.commitment == *commitment,
+                                "retained READY bytes differ from their owner"
+                            );
+                            Ok(Some(ready.bytes))
+                        },
+                    )
+                };
                 if FULL {
                     crate::PagedPrivateMetadata::restore_retained_catalog_checked(
                         &self.control,
@@ -150,7 +198,7 @@ impl Node {
                         (catalog.bundle.id, Some(operation)),
                         catalog.bundle.scope,
                         target,
-                        |sector| self.sector_for_guild(&guild_id, sector),
+                        &mut recover,
                         |publish| self.control.$publish(retention, &record, &catalog, publish),
                     )
                 } else {
@@ -160,7 +208,7 @@ impl Node {
                         (catalog.bundle.id, Some(operation)),
                         catalog.bundle.scope,
                         target,
-                        |sector| self.sector_for_guild(&guild_id, sector),
+                        &mut recover,
                         |publish| self.control.$publish(retention, &record, &catalog, publish),
                     )
                 }
@@ -170,12 +218,16 @@ impl Node {
             mb_core::PagedCheckpointLayout::Individual => restore!(
                 catalog_paged_checkpoint_retention,
                 catalog_paged_checkpoint_indexed_revision,
-                publish_catalog_paged_checkpoint_revision_restore
+                publish_catalog_paged_checkpoint_revision_restore,
+                catalog_paged_checkpoint_chunk_location,
+                catalog_paged_checkpoint_indexed_group
             ),
             mb_core::PagedCheckpointLayout::Directory => restore!(
                 catalog_paged_checkpoint_directory_retention,
                 catalog_paged_checkpoint_directory_indexed_revision,
-                publish_catalog_paged_checkpoint_directory_revision_restore
+                publish_catalog_paged_checkpoint_directory_revision_restore,
+                catalog_paged_checkpoint_directory_chunk_location,
+                catalog_paged_checkpoint_directory_indexed_group
             ),
         }
     }
@@ -197,6 +249,42 @@ impl Node {
             Ok(())
         })?
         .context("checkpoint lookup requires original guild authority")
+    }
+
+    /// Retain bounded recovery hints from the complete original public proof.
+    /// Original witnesses and full source commitments remain recovery authority.
+    pub fn build_retained_paged_checkpoint_chunk_index(
+        &self,
+        owner: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointIndex,
+    ) -> Result<()> {
+        guild_authority::with_history(&self.control, |authority| {
+            self.control
+                .build_catalog_paged_checkpoint_chunk_index(owner, proof, || {
+                    authority.paged_checkpoint_trust().map_err(|_| {
+                        mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                    })
+                })?;
+            Ok(())
+        })?
+        .context("checkpoint recovery index requires original guild authority")
+    }
+
+    pub fn build_retained_paged_checkpoint_directory_chunk_index(
+        &self,
+        owner: Uuid,
+        proof: &mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    ) -> Result<()> {
+        guild_authority::with_history(&self.control, |authority| {
+            self.control
+                .build_catalog_paged_checkpoint_directory_chunk_index(owner, proof, || {
+                    authority.paged_checkpoint_trust().map_err(|_| {
+                        mb_store::CatalogStoreError::Database(mb_store::DatabaseError::Conflict)
+                    })
+                })?;
+            Ok(())
+        })?
+        .context("checkpoint recovery index requires original guild authority")
     }
 
     pub fn build_retained_paged_checkpoint_directory_lookup(

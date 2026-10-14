@@ -116,7 +116,7 @@ impl CatalogCheckpointCodingDirectoriesIndex {
     pub fn index(&self) -> &CatalogPackingCodingDirectoriesIndex {
         &self.index
     }
-    pub(super) fn require_complete(&self) -> Result<(), CatalogStoreError> {
+    pub(in crate::database::catalog) fn require_complete(&self) -> Result<(), CatalogStoreError> {
         self.index.require_complete()?;
         require_authority(
             &self.index.packing().store,

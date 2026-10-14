@@ -5815,3 +5815,33 @@ Exact superseded-binary retirement reclaims 9.51 GiB; target uses 52.47 GiB.
 Current binaries, older qualified/failed evidence, 14 auxiliary WIP files
 and all 10 installed roots remain preserved.
 Evidence: `/tmp/mb-m6-paged-git-restore-iz6u03oj`.
+
+Retained packed-source recovery (2026-10-14):
+The exact retained checkpoint can now retain recovery locators from its complete
+original packing/coding proof. Batches contain at most 64 rows. A bounded cursor
+binds the original header/certificate/trust and complete chunk EOF; all declared
+locator debt is charged before copying. Retries verify original rows and reject
+missing or substituted completed entries. Cancellation fences use, and bounded
+retirement preserves shared owners. Locator rows supply no byte authority.
+Linux native/full restore falls back to original root-authenticated coding
+witnesses and retained local READY roles, reconstructs missing information and
+checks original packed Merkle/legacy byte roots plus the complete signed source
+Merkle and byte roots before decryption. One source and one bounded codeword
+remain live; witness/payload work share an admitted per-source envelope. Both
+checkpoint layouts pass parity-only source-loss restore, slot substitution,
+missing-role, publication faults, cancellation, capture retirement and reopen
+fixtures; two Store cases cover index rollback/retry/reopen and shared retirement.
+Remote peer transport, seed/private bootstrap orchestration, complete operation
+admission/physical quotas, normal producers/distributed activation and remaining
+M6 gates remain open. Dense 1 TiB/native Windows/macOS hardware remains deferred.
+Frozen qualification passes 1,554 distinct cases: 1,281 fresh and 273
+exact unchanged reused. All 511 ordinary Store, 573 Node and 131 Git
+cases pass, along with four provisioned Linux native cases and three bulk
+gates. Format, strict locked all-target workspace Clippy, builds, frozen
+source/binary checks and native cleanup pass. Full Git import peaks at
+22.09 MiB RSS; metadata ODB peaks at 23.44 MiB. There are 121 unexecuted
+ignored cases. Independent audit verifies 377 inputs and 23 executables.
+Exact superseded-binary retirement reclaims 8.82 GiB; target uses
+52.49 GiB. Current binaries, failed/older qualified evidence, 14 auxiliary
+WIP files and all 10 installed roots remain preserved. Evidence:
+`/tmp/mb-m6-retained-packed-recovery-_48f21xm`.

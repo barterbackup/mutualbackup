@@ -16,6 +16,9 @@ const JOURNAL: &str = "catalog-checkpoint-lookup-v1";
 const ROW_BYTES: usize = 1024;
 type BoundedRow = (Option<Vec<u8>>, Option<Vec<u8>>);
 
+mod packing;
+pub use packing::CatalogCheckpointChunkLocation;
+
 pub(super) fn kind(id: Uuid, suffix: &str) -> String {
     format!("catalog-checkpoint-lookup-{suffix}-v1/{}", id.simple())
 }
@@ -145,7 +148,9 @@ pub(super) fn owned_work<H: Layout>(
     cx: &Connection,
     retention: CatalogPagedCheckpointRetention<H>,
 ) -> Result<Work, CatalogStoreError> {
-    Ok(read(cx, retention)?.map_or(Work::default(), |v| v.work))
+    Ok(read(cx, retention)?
+        .map_or(Work::default(), |v| v.work)
+        .checked_add(packing::owned_work(cx, retention)?)?)
 }
 fn require<H: Layout>(
     cx: &Connection,
@@ -179,6 +184,9 @@ pub(super) fn release<H: Layout>(
     cx: &Connection,
     retention: CatalogPagedCheckpointRetention<H>,
 ) -> Result<bool, CatalogStoreError> {
+    if packing::release(cx, retention)? {
+        return Ok(true);
+    }
     let Some(index) = read(cx, retention)? else {
         return Ok(false);
     };
