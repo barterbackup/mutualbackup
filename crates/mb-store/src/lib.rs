@@ -44,7 +44,8 @@ pub use database::{
     AnchorDiscoveryJobStatus, DatabaseDirectory, DatabaseOpenGuard, PreservedReadGuard,
 };
 pub use database::{
-    CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
+    CATALOG_ACQUISITION_WORK_JOBS, CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS,
+    CATALOG_SECTOR_RECIPE_BYTES, CatalogAcquisitionWorkState, CatalogAcquisitionWorkUsage,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingDirectoriesIndex,
     CatalogCertifiedCodingDirectoryIndex, CatalogCertifiedCodingGroup, CatalogCertifiedCodingIndex,
     CatalogCertifiedPackingDirectoryIndex, CatalogCertifiedPackingIndex,

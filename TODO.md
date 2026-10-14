@@ -2553,6 +2553,43 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Qualify resource-backed acquisition traversal reservations.
+      Shared traversal admission for durable public acquisitions (2026-10-14):
+      A resource-backed acquisition reserves its complete declared traversal budget from
+      one database-wide ledger before public-tree fetching/staging. Budget dimensions
+      remain independent; concurrent connections share credits and at most 64 jobs (or
+      the resource policy's smaller slot count). Paired immutable leases, held indexes,
+      counters and readiness markers survive reopen. Completion/cancellation release
+      credits in their publication writer; failed or ignored writes roll back both job
+      state and credit release. Cancelled IDs remain fenced by original job records.
+      Resource enrollment freezes new acquisition admission while a bounded cursor adopts one old
+      job per transaction. Unadoptable old debt remains explicit and cancellable; no old
+      job, original certificate, retained data or signed head is rewritten for admission.
+      A persistent insert trigger rejects unfunded older writers; exact schema/marker
+      validation rejects missing or altered enforcement on reopen. Node checks custody
+      before each public fetch/validation guard and exposes adoption progress/steps.
+      This governs active acquisition traversal. Completed-proof replay, other producers,
+      SQL/WAL/page/payload/scratch/physical reservations and full shared R2/R3 admission
+      still require their complete integration. Normal paged producers remain disabled.
+      Seven new Store cases pass independent work dimensions, existing/concurrent
+      connections, restart, one-job adoption steps, cancellation of excessive legacy
+      debt, job-slot limits, missing/altered enforcement and ABORT/IGNORE reserve/release
+      faults. Both public layouts release work only with complete owner publication;
+      failed completion keeps the job Building and its credits held. Existing resource
+      contract tests and both real QUIC acquisition/restore cases pass.
+      Frozen qualification passes 1,584 distinct cases: 1,311 fresh and 273 reused from
+      exactly unchanged executables. All 584 ordinary Node, 530 Store, 131 Git and 23
+      process acceptance cases pass, plus three bulk gates and four provisioned Linux
+      native cases. The unchanged Core executable retains its 210 qualified cases.
+      Format, strict locked all-target workspace Clippy, builds, source/binary hashes and
+      native cleanup pass. Independent audit verifies 398 inputs and 23 executables;
+      121 ignored cases remain unexecuted. Verified retirement removes 23 superseded
+      archive paths and two exploratory executables, reclaiming 10.31 GiB. Target uses
+      63.94 GiB, including both new preserved fixture failure binaries, source snapshots
+      and logs. All 15 failed artifacts, 29 older archive paths, 14 auxiliary WIP files
+      and 10 installed roots remain preserved. Dense 1 TiB and native Windows/macOS
+      qualification remain user-deferred. R1/R2/R3/R5/R7 and remaining M6 gates stay open.
+      Evidence: `/tmp/mb-m6-acquisition-work-l1vs9a84`.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

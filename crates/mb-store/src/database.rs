@@ -40,7 +40,8 @@ pub use anchor_discovery::{
     AnchorDiscoveryJobStatus,
 };
 pub use catalog::{
-    CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS, CATALOG_SECTOR_RECIPE_BYTES,
+    CATALOG_ACQUISITION_WORK_JOBS, CATALOG_BUNDLE_DESCRIPTOR_BYTES, CATALOG_BUNDLE_ROOTS,
+    CATALOG_SECTOR_RECIPE_BYTES, CatalogAcquisitionWorkState, CatalogAcquisitionWorkUsage,
     CatalogBundle, CatalogBundleRoot, CatalogBundleState, CatalogCertifiedCodingDirectoriesIndex,
     CatalogCertifiedCodingDirectoryIndex, CatalogCertifiedCodingGroup, CatalogCertifiedCodingIndex,
     CatalogCertifiedPackingDirectoryIndex, CatalogCertifiedPackingIndex,
@@ -4586,6 +4587,11 @@ fn require_exact_tables(
     let mut quota_objects = record_quota::schema(connection)?;
     quota_objects.extend(page_quota::schema(connection)?);
     quota_objects.extend(journal_quota::schema(connection)?);
+    let control = expected.iter().any(|(name, _)| *name == "protocol_records");
+    if control {
+        quota_objects.extend(catalog::acquisition_work_schema(connection)?);
+    }
+
     let expected = expected
         .iter()
         .copied()
@@ -4629,7 +4635,11 @@ fn require_exact_tables(
     }
     record_quota::validate(connection)?;
     page_quota::apply(connection)?;
-    journal_quota::apply(connection)
+    journal_quota::apply(connection)?;
+    if control {
+        catalog::validate_acquisition_work(connection)?;
+    }
+    Ok(())
 }
 
 fn normalize_schema_sql(sql: &str) -> String {

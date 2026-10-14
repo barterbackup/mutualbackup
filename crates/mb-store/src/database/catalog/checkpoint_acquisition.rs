@@ -6,8 +6,12 @@ use mb_core::{CatalogCodingTraversalBudget as Work, PagedCheckpointLayout, Paged
 mod ancestry;
 mod recovery_source;
 mod recovery_tip;
+pub(super) mod work_admission;
 pub use recovery_source::CatalogCheckpointRecoverySource;
 pub use recovery_tip::CatalogCheckpointRecoveryTip;
+pub use work_admission::{
+    CATALOG_ACQUISITION_WORK_JOBS, CatalogAcquisitionWorkState, CatalogAcquisitionWorkUsage,
+};
 pub(super) fn recovery_candidate(
     cx: &Connection,
     id: Uuid,
@@ -255,6 +259,7 @@ fn require(cx: &Connection, spec: &CatalogCheckpointAcquisition) -> Result<Job, 
     {
         return Err(DatabaseError::Conflict.into());
     }
+    work_admission::require(cx, spec)?;
     Ok(job)
 }
 fn write(cx: &Connection, previous: &Job, next: &Job) -> Result<(), CatalogStoreError> {
@@ -312,6 +317,9 @@ impl ControlStore {
         {
             return Err(DatabaseError::Conflict.into());
         }
+        if job.state == CatalogCheckpointAcquisitionState::Building {
+            work_admission::require(&tx, spec)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -323,6 +331,9 @@ impl ControlStore {
         budget: Work,
     ) -> Result<CatalogCheckpointAcquisition, CatalogStoreError> {
         certificate.verify(&trust, budget)?;
+        if self.advance_checkpoint_acquisition_work_admission()? {
+            return Err(DatabaseError::NotReady.into());
+        }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if storage_quota::usage(&tx)?.is_none() {
             return Err(DatabaseError::NotReady.into());
@@ -349,6 +360,9 @@ impl ControlStore {
             if old.spec != spec || old.state == CatalogCheckpointAcquisitionState::Cancelled {
                 return Err(DatabaseError::Conflict.into());
             }
+            if old.state == CatalogCheckpointAcquisitionState::Building {
+                work_admission::reserve(&tx, &spec)?;
+            }
         } else {
             if tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind=?1)",
@@ -370,6 +384,7 @@ impl ControlStore {
                 roots: 0,
                 used,
             };
+            work_admission::reserve(&tx, &spec)?;
             insert_exact(&tx, JOB, id.as_bytes(), &canonical_bytes(&job)?)?;
             insert_exact(&tx, GUARD, id.as_bytes(), &canonical_bytes(&job)?)?;
             if read(&tx, id)?.as_ref() != Some(&job) {
@@ -524,6 +539,7 @@ impl ControlStore {
         if recovery_owner(&tx, spec.id)? {
             return Err(DatabaseError::Conflict.into());
         }
+        work_admission::release(&tx, spec)?;
         let next = Job {
             state: CatalogCheckpointAcquisitionState::Cancelled,
             ..job.clone()
@@ -560,6 +576,9 @@ impl ControlStore {
         {
             return Err(DatabaseError::Conflict.into());
         }
+        if job.state == CatalogCheckpointAcquisitionState::Building {
+            work_admission::require(&tx, spec)?;
+        }
         macro_rules! verify {
             ($header:ty,$certificate:expr)=>{{
                 use super::retention_journal as journal;
@@ -590,6 +609,7 @@ impl ControlStore {
                 verify!(mb_core::PagedGuildCheckpointDirectory, c)
             }
         }
+        work_admission::release(&tx, spec)?;
         let next = Job {
             state: CatalogCheckpointAcquisitionState::Complete,
             ..job.clone()

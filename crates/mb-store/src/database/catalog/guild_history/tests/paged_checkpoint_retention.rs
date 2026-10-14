@@ -5,6 +5,15 @@ pub(super) fn paged_owner_proof(
     history: &History,
     previous: Option<&CatalogQuorumPagedCheckpointIndex>,
 ) -> CatalogQuorumPagedCheckpointIndex {
+    paged_owner_proof_with_budget(fixture, history, previous, budget())
+}
+
+pub(super) fn paged_owner_proof_with_budget(
+    fixture: &mut super::super::super::checkpoint_validation::tests::Fixture,
+    history: &History,
+    previous: Option<&CatalogQuorumPagedCheckpointIndex>,
+    limit: Work,
+) -> CatalogQuorumPagedCheckpointIndex {
     let mut trust = history.trust();
     trust.previous = previous.map(|previous| mb_core::PagedCheckpointParent {
         generation: previous.certificate().checkpoint.generation,
@@ -16,7 +25,7 @@ pub(super) fn paged_owner_proof(
         .validate_certified_history_authority_transition(
             previous.map(CatalogCheckpointPrevious::Paged),
             &reader,
-            budget(),
+            limit,
             || Ok(trust.clone()),
         )
         .unwrap();

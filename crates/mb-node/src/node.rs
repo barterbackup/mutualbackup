@@ -1502,6 +1502,19 @@ impl Node {
         Ok(self.control.configure_catalog_resource_policy(policy)?)
     }
 
+    /// Advance one acquisition work-admission adoption step after resource
+    /// enrollment. Existing job data and immutable job identities are preserved.
+    pub fn advance_checkpoint_acquisition_work_admission(&self) -> Result<bool> {
+        Ok(self
+            .control
+            .advance_checkpoint_acquisition_work_admission()?)
+    }
+    pub fn checkpoint_acquisition_work_usage(
+        &self,
+    ) -> Result<Option<mb_store::CatalogAcquisitionWorkUsage>> {
+        Ok(self.control.checkpoint_acquisition_work_usage()?)
+    }
+
     /// Admit the complete durable WAL/rollback-journal byte extent separately
     /// from main database pages, memory, scratch and filesystem reservations.
     pub fn configure_control_journal_quota(

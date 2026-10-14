@@ -1,3 +1,4 @@
+mod work;
 use super::*;
 use crate::database::catalog::checkpoint_acquisition::{
     CatalogCheckpointAcquisitionState as State, CatalogPublicCheckpoint as Certificate,

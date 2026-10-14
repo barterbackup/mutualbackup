@@ -29,6 +29,7 @@ pub(super) fn required_resource_policy(
 mod checkpoint_acquisition;
 mod checkpoint_body;
 pub use checkpoint_acquisition::{
+    CATALOG_ACQUISITION_WORK_JOBS, CatalogAcquisitionWorkState, CatalogAcquisitionWorkUsage,
     CatalogCheckpointAcquisition, CatalogCheckpointAcquisitionState,
     CatalogCheckpointRecoverySource, CatalogCheckpointRecoveryTip, CatalogPublicCheckpoint,
 };
@@ -754,6 +755,15 @@ impl ControlStore {
         transaction.commit()?;
         Ok(true)
     }
+}
+
+pub(super) fn acquisition_work_schema(
+    cx: &Connection,
+) -> Result<Vec<(String, String)>, DatabaseError> {
+    checkpoint_acquisition::work_admission::schema(cx)
+}
+pub(super) fn validate_acquisition_work(cx: &Connection) -> Result<(), DatabaseError> {
+    checkpoint_acquisition::work_admission::validate_open(cx)
 }
 
 #[cfg(test)]

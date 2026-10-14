@@ -201,6 +201,7 @@ impl ControlStore {
             }
         }
         check(&tx, policy.capacity)?;
+        super::super::checkpoint_acquisition::work_admission::enroll(&tx, policy)?;
         tx.commit()?;
         Ok(())
     }

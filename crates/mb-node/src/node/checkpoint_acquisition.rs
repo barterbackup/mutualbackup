@@ -228,6 +228,7 @@ impl RetainedCheckpointRestore {
         let job = control.begin_checkpoint_acquisition(id, certificate, trust.clone(), budget)?;
         let check = || -> Result<()> {
             authority.check()?;
+            control.check_checkpoint_acquisition_trust(&job, &trust)?;
             if let Some(previous) = recovery {
                 self.check_recovery_base(id, &job.certificate, previous)?;
             }
