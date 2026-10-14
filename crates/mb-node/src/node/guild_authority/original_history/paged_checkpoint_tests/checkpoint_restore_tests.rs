@@ -203,7 +203,7 @@ cases!(
     retain_paged_checkpoint_directory_local_payload
 );
 
-fn git_owner_proof(
+pub(super) fn git_owner_proof(
     node: &mut Node,
     keys: &[KeyMaterial],
     _: bool,
@@ -221,7 +221,7 @@ fn git_owner_proof(
         false,
     )
 }
-fn git_directory_proof(
+pub(super) fn git_directory_proof(
     node: &mut Node,
     keys: &[KeyMaterial],
     private: bool,
@@ -232,7 +232,7 @@ fn git_directory_proof(
     let (proof, intents) = git_owner_proof(node, keys, private);
     directory_from_original(node, keys, proof, intents)
 }
-fn verify_git_restore(node: &Node, target: &Path, id: Uuid) {
+pub(super) fn verify_git_restore(node: &Node, target: &Path, id: Uuid) {
     use std::os::unix::ffi::OsStrExt;
     let path = target.join(std::ffi::OsStr::from_bytes(b"payload-\xff"));
     let bytes = std::fs::read(path).unwrap();

@@ -428,7 +428,7 @@ async fn exercise(directory: bool) {
     server_task.await.unwrap().unwrap();
 }
 
-fn config(node_id: NodeId) -> P2pConfig {
+pub(super) fn config(node_id: NodeId) -> P2pConfig {
     P2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         external_addresses: Vec::new(),

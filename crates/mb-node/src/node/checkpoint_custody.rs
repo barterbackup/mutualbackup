@@ -1,6 +1,102 @@
 //! Shared original-authority and local private/READY custody for both public layouts.
 use super::*;
 
+impl NodeReader {
+    /// Serve one exact retained physical role through original coding roots,
+    /// independently of current heads, placement projections or Forget state.
+    pub(crate) fn retained_checkpoint_shard(
+        &self,
+        guild: [u8; 32],
+        layout: mb_core::PagedCheckpointLayout,
+        owner: Uuid,
+        checkpoint_hash: [u8; 32],
+        group: [u8; 32],
+        index: u16,
+    ) -> Result<Vec<u8>> {
+        let work = mb_core::CatalogCodingTraversalBudget {
+            bytes: 16 * 1024 * 1024,
+            page_occurrences: 256,
+            records: 512,
+        };
+        macro_rules! serve {
+            ($retention:ident,$group:ident) => {{
+                let (retention, state) = self
+                    .control
+                    .$retention(owner)?
+                    .context("retained checkpoint shard owner is unavailable")?;
+                anyhow::ensure!(
+                    state == mb_store::CatalogPagedCheckpointRetentionState::Published
+                        && retention.checkpoint.guild_id == guild
+                        && retention.checkpoint.hash()? == checkpoint_hash,
+                    "shard request differs from its retained checkpoint"
+                );
+                let entry = self
+                    .control
+                    .$group(retention, group, work)?
+                    .context("shard lacks its original retained coding witness")?;
+                let payload = self
+                    .control
+                    .catalog_paged_checkpoint_payload(owner, group, index)?
+                    .context("shard lacks retained READY custody")?;
+                let role = entry
+                    .retained
+                    .group
+                    .roles
+                    .get(usize::from(index))
+                    .context("retained shard index is outside its original group")?;
+                let (holder, storage, commitment) = match role {
+                    ShardRoleV2::Information(role) if !role.sector.virtual_zero => {
+                        (role.owner, role.sector.id, &role.sector.commitment)
+                    }
+                    ShardRoleV2::Parity(role) => (role.holder, group, &role.commitment),
+                    _ => anyhow::bail!("virtual information has no physical retained shard"),
+                };
+                anyhow::ensure!(
+                    holder == self.keys.node_id()
+                        && payload.holder == holder
+                        && payload.guild_id == guild
+                        && payload.storage_id == storage
+                        && payload.commitment == *commitment
+                        && payload.transcript_hash
+                            == *blake3::hash(&canonical_bytes(&entry.transcript)?).as_bytes(),
+                    "retained physical role differs from its original witness"
+                );
+                let object = self.ready_variable_object(&storage, index)?;
+                anyhow::ensure!(
+                    object.guild_id == guild
+                        && object.commitment == *commitment
+                        && merkle_commit(&object.bytes)? == *commitment,
+                    "retained shard bytes fail their original commitment"
+                );
+                let current = self
+                    .control
+                    .$retention(owner)?
+                    .context("retained shard owner disappeared during reading")?;
+                anyhow::ensure!(
+                    current == (retention, state)
+                        && self
+                            .control
+                            .catalog_paged_checkpoint_payload(owner, group, index)?
+                            .as_ref()
+                            == Some(&payload),
+                    "retained shard custody changed during reading"
+                );
+                Ok(object.bytes)
+            }};
+        }
+        match layout {
+            mb_core::PagedCheckpointLayout::Individual => serve!(
+                catalog_paged_checkpoint_retention,
+                catalog_paged_checkpoint_indexed_group
+            ),
+            mb_core::PagedCheckpointLayout::Directory => serve!(
+                catalog_paged_checkpoint_directory_retention,
+                catalog_paged_checkpoint_directory_indexed_group
+            ),
+        }
+    }
+}
+
 impl Node {
     /// Restore the native tree selected by an exact retained checkpoint page.
     /// Original legacy IDs select their independently retained conversion.
@@ -49,187 +145,36 @@ impl Node {
         target: &Path,
         budget: mb_core::CatalogCodingTraversalBudget,
     ) -> Result<()> {
-        let version = if FULL { 4 } else { 3 };
-        anyhow::ensure!(
-            !owner.is_nil()
-                && !snapshot.revision_id.is_nil()
-                && !snapshot.protected_root_id.is_nil()
-                && snapshot.checkpoint_hash != [0; 32],
-            "retained snapshot identity is invalid"
-        );
-        let key = mb_core::CatalogCheckpointRevisionKey {
-            owner: self.keys.node_id(),
-            protected_root_id: snapshot.protected_root_id,
-            sequence: snapshot.sequence,
-            revision_id: snapshot.revision_id,
+        let local = |sector: &SectorId| self.sector_for_guild(&guild_id, sector);
+        let ready = |payload: &mb_store::CatalogCheckpointPayload| {
+            let object = self.volumes.load_ready_variable(
+                &self.control,
+                &payload.storage_id,
+                payload.shard_index,
+            )?;
+            anyhow::ensure!(
+                object.guild_id == payload.guild_id && object.commitment == payload.commitment,
+                "retained READY bytes differ from their owner"
+            );
+            Ok(object.bytes)
         };
-        let mut identity = blake3::Hasher::new_derive_key(if FULL {
-            "mutualbackup retained checkpoint complete restore v1"
-        } else {
-            "mutualbackup retained checkpoint native restore v1"
-        });
-        identity.update(&canonical_bytes(&(
-            layout,
-            owner,
-            guild_id,
-            key,
-            snapshot.checkpoint_generation,
-            snapshot.checkpoint_hash,
-        ))?);
-        let mut bytes = [0; 16];
-        bytes.copy_from_slice(&identity.finalize().as_bytes()[..16]);
-        let operation = Uuid::from_bytes(bytes);
-        if crate::snapshot::resume_matching_restore_publication(
-            &self.control,
-            guild_id,
-            operation,
-            version,
+        super::checkpoint_restore::restore::<FULL>(
+            super::checkpoint_restore::Sources {
+                control: &self.control,
+                keys: &self.keys,
+                local: &local,
+                ready: &ready,
+            },
+            &RetainedSnapshotRestore {
+                layout,
+                owner,
+                guild_id,
+                snapshot: snapshot.clone(),
+                budget,
+            },
             target,
-        )? {
-            return Ok(());
-        }
-        macro_rules! restore {
-            ($retention:ident,$point:ident,$publish:ident,$chunk:ident,$group:ident) => {{
-                let (retention, state) = self
-                    .control
-                    .$retention(owner)?
-                    .context("retained checkpoint is unavailable")?;
-                anyhow::ensure!(
-                    state == mb_store::CatalogPagedCheckpointRetentionState::Published
-                        && retention.checkpoint.guild_id == guild_id
-                        && retention.checkpoint.generation == snapshot.checkpoint_generation
-                        && retention.checkpoint.hash()? == snapshot.checkpoint_hash,
-                    "native snapshot belongs to another retained checkpoint"
-                );
-                let record = self
-                    .control
-                    .$point(retention, key.revision_id, budget)?
-                    .context("retained snapshot revision is unavailable")?;
-                anyhow::ensure!(
-                    record.revision_key() == Some(key),
-                    "native snapshot revision identity differs"
-                );
-                let catalog = match &record {
-                    mb_core::CatalogCheckpointAuthorityRecord::PagedRevision(signed) => {
-                        let catalog = self
-                            .control
-                            .catalog_paged_checkpoint_revision(owner, key.revision_id)?
-                            .context("checkpoint has no retained private revision")?;
-                        anyhow::ensure!(
-                            catalog.bundle.descriptor == canonical_bytes(signed)?,
-                            "private snapshot differs from original signed revision"
-                        );
-                        catalog
-                    }
-                    mb_core::CatalogCheckpointAuthorityRecord::LegacyRevision(_) => self
-                        .control
-                        .catalog_paged_checkpoint_legacy_revision(owner, key.revision_id)?
-                        .context("checkpoint has no retained original legacy conversion")?,
-                    _ => anyhow::bail!("checkpoint lookup returned a nonrevision record"),
-                };
-                self.control
-                    .$publish(retention, &record, &catalog, || Ok::<_, anyhow::Error>(()))?;
-                let opened = crate::PagedPrivateMetadata::open_local_snapshot(
-                    &self.keys,
-                    &catalog,
-                    catalog.bundle.scope,
-                )?;
-                let private = opened
-                    .private
-                    .context("retained private snapshot is unavailable")?;
-                anyhow::ensure!(
-                    opened.state == mb_store::CatalogBundleState::Published
-                        && opened.revision.value.guild_id == guild_id
-                        && (FULL || private.git.is_none()),
-                    "restore requires compatible published private roots"
-                );
-                let mut recover = |sector: &SectorId| -> Result<Vec<u8>> {
-                    let original = self
-                        .control
-                        .native_file_catalog_source(catalog.bundle.id, *sector)?
-                        .context("recovery source lacks original signed authority")?;
-                    if let Ok(bytes) = self.sector_for_guild(&guild_id, sector) {
-                        anyhow::ensure!(
-                            merkle_commit(&bytes)? == original.commitment,
-                            "local recovery source differs from its signed commitment"
-                        );
-                        return Ok(bytes);
-                    }
-                    super::checkpoint_recovery::recover_source(
-                        &original,
-                        catalog.bundle.scope,
-                        budget,
-                        |source| Ok(self.control.$chunk(retention, source)?),
-                        |group, work| Ok(self.control.$group(retention, group, work)?),
-                        |group, index, holder, commitment, transcript| {
-                            if holder != self.keys.node_id() {
-                                return Ok(None);
-                            }
-                            let Some(payload) = self
-                                .control
-                                .catalog_paged_checkpoint_payload(owner, group, index)?
-                            else {
-                                return Ok(None);
-                            };
-                            anyhow::ensure!(
-                                payload.guild_id == guild_id
-                                    && payload.holder == holder
-                                    && payload.commitment == *commitment
-                                    && payload.transcript_hash == transcript,
-                                "retained READY role differs from its original witness"
-                            );
-                            let ready = self.volumes.load_ready_variable(
-                                &self.control,
-                                &payload.storage_id,
-                                index,
-                            )?;
-                            anyhow::ensure!(
-                                ready.guild_id == guild_id && ready.commitment == *commitment,
-                                "retained READY bytes differ from their owner"
-                            );
-                            Ok(Some(ready.bytes))
-                        },
-                    )
-                };
-                if FULL {
-                    crate::PagedPrivateMetadata::restore_retained_catalog_checked(
-                        &self.control,
-                        &self.keys,
-                        (catalog.bundle.id, Some(operation)),
-                        catalog.bundle.scope,
-                        target,
-                        &mut recover,
-                        |publish| self.control.$publish(retention, &record, &catalog, publish),
-                    )
-                } else {
-                    crate::PagedPrivateMetadata::restore_retained_native_catalog_checked(
-                        &self.control,
-                        &self.keys,
-                        (catalog.bundle.id, Some(operation)),
-                        catalog.bundle.scope,
-                        target,
-                        &mut recover,
-                        |publish| self.control.$publish(retention, &record, &catalog, publish),
-                    )
-                }
-            }};
-        }
-        match layout {
-            mb_core::PagedCheckpointLayout::Individual => restore!(
-                catalog_paged_checkpoint_retention,
-                catalog_paged_checkpoint_indexed_revision,
-                publish_catalog_paged_checkpoint_revision_restore,
-                catalog_paged_checkpoint_chunk_location,
-                catalog_paged_checkpoint_indexed_group
-            ),
-            mb_core::PagedCheckpointLayout::Directory => restore!(
-                catalog_paged_checkpoint_directory_retention,
-                catalog_paged_checkpoint_directory_indexed_revision,
-                publish_catalog_paged_checkpoint_directory_revision_restore,
-                catalog_paged_checkpoint_directory_chunk_location,
-                catalog_paged_checkpoint_directory_indexed_group
-            ),
-        }
+            &mut |_, _| Ok(None),
+        )
     }
 
     /// Build restart-stable lookups from the original completed public proof.

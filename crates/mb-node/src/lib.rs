@@ -92,6 +92,8 @@ pub use node::{
     DhtPublicationSet, DhtSequenceFloors, GuildAuditReport, GuildPeer, GuildPhase, GuildSummary,
     LockedDataDir, Node, ProtectionState, RecoveredShards, SnapshotInfo,
 };
+#[cfg(target_os = "linux")]
+pub use node::{RetainedCheckpointPeer, RetainedCheckpointRestore, RetainedSnapshotRestore};
 pub use paged_revision::{
     PAGED_PRIVATE_METADATA_BYTES, PagedCatalogIntents, PagedPrivateMetadata,
     PagedRevisionCatalogSnapshot,

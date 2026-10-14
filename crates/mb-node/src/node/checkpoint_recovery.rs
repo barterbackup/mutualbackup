@@ -5,8 +5,7 @@
 use anyhow::{Context, Result, ensure};
 use mb_core::{
     CatalogCodingEntry, CatalogCodingTraversalBudget as Work, CatalogScope, CatalogSectorRecord,
-    MerkleCommitment, NodeId, PackingProfile, ShardRoleV2, SourceChunkId, canonical_bytes,
-    merkle_commit, packing_protected_root, sector_root,
+    PackingProfile, ShardRoleV2, SourceChunkId, merkle_commit, packing_protected_root, sector_root,
 };
 use mb_store::CatalogCheckpointChunkLocation;
 
@@ -18,7 +17,7 @@ pub(super) fn recover_source(
     budget: Work,
     mut locate: impl FnMut(SourceChunkId) -> Result<Option<Location>>,
     mut group: impl FnMut([u8; 32], Work) -> Result<Option<CatalogCodingEntry>>,
-    mut shard: impl FnMut([u8; 32], u16, NodeId, &MerkleCommitment, [u8; 32]) -> Result<Option<Vec<u8>>>,
+    mut shard: impl FnMut(&CatalogCodingEntry, u16) -> Result<Option<Vec<u8>>>,
 ) -> Result<Vec<u8>> {
     let CatalogScope::Dataset {
         guild_id,
@@ -105,21 +104,18 @@ pub(super) fn recover_source(
                 records: coding.roles.len() as u64 + 1,
                 page_occurrences: 0,
             })?;
-            let transcript = *blake3::hash(&canonical_bytes(&entry.transcript)?).as_bytes();
             let mut shards = Vec::with_capacity(coding.roles.len());
             for (index, role) in coding.roles.iter().enumerate() {
-                let (holder, commitment, zero) = match role {
-                    ShardRoleV2::Information(role) => (
-                        role.owner,
-                        &role.sector.commitment,
-                        role.sector.virtual_zero,
-                    ),
-                    ShardRoleV2::Parity(role) => (role.holder, &role.commitment, false),
+                let (commitment, zero) = match role {
+                    ShardRoleV2::Information(role) => {
+                        (&role.sector.commitment, role.sector.virtual_zero)
+                    }
+                    ShardRoleV2::Parity(role) => (&role.commitment, false),
                 };
                 let bytes = if zero {
                     Some(vec![0; coding.profile.shard_size as usize])
                 } else {
-                    shard(coding.id, index as u16, holder, commitment, transcript)?
+                    shard(&entry, index as u16)?
                 };
                 if let Some(bytes) = &bytes {
                     ensure!(

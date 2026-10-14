@@ -60,6 +60,12 @@ type ControlRecord = (String, Vec<u8>, Vec<u8>);
 mod checkpoint_custody;
 #[cfg(target_os = "linux")]
 mod checkpoint_recovery;
+#[cfg(target_os = "linux")]
+mod checkpoint_restore;
+#[cfg(target_os = "linux")]
+pub use checkpoint_restore::{
+    RetainedCheckpointPeer, RetainedCheckpointRestore, RetainedSnapshotRestore,
+};
 mod guild_authority;
 mod packing_operation;
 mod variable_coverage;
@@ -888,6 +894,15 @@ pub(crate) struct NodeReader {
 
 impl NodeReaderConfig {
     pub(crate) fn open(&self) -> Result<NodeReader> {
+        self.open_with_query_only(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_for_retained_restore(&self) -> Result<NodeReader> {
+        self.open_with_query_only(false)
+    }
+
+    fn open_with_query_only(&self, query_only: bool) -> Result<NodeReader> {
         #[cfg(target_os = "linux")]
         let control = {
             let current =
@@ -910,7 +925,9 @@ impl NodeReaderConfig {
         };
         #[cfg(not(target_os = "linux"))]
         let control = ControlStore::open_with_key(&self.control_path, &self.control_database_key)?;
-        control.make_query_only()?;
+        if query_only {
+            control.make_query_only()?;
+        }
         Ok(NodeReader {
             keys: self.keys.clone(),
             control,

@@ -698,6 +698,7 @@ fn process_peer_request(
                             | PeerRequest::GetLegacyCodingAddBinding { .. }
                             | PeerRequest::GetRetainedPagedCheckpointCertificate { .. }
                             | PeerRequest::GetRetainedPagedCheckpointPage { .. }
+                            | PeerRequest::GetRetainedPagedCheckpointShard { .. }
                     ) {
                         reader.authorize_historical_member(&guild_id, caller)?;
                     } else {
@@ -1008,6 +1009,21 @@ fn execute_read_request(
     request: PeerRequest,
 ) -> Result<PeerResponse> {
     match request {
+        PeerRequest::GetRetainedPagedCheckpointShard {
+            guild_id,
+            layout,
+            owner_id,
+            checkpoint_hash,
+            group_id,
+            shard_index,
+        } => Ok(PeerResponse::Bytes(node.retained_checkpoint_shard(
+            guild_id,
+            layout,
+            owner_id,
+            checkpoint_hash,
+            group_id,
+            shard_index,
+        )?)),
         PeerRequest::GetRetainedPagedCheckpointCertificate {
             guild_id,
             layout,
@@ -1606,7 +1622,8 @@ fn execute_peer_request(
             bail!("legacy coding Add binding read was sent to a mutation worker")
         }
         PeerRequest::GetRetainedPagedCheckpointCertificate { .. }
-        | PeerRequest::GetRetainedPagedCheckpointPage { .. } => {
+        | PeerRequest::GetRetainedPagedCheckpointPage { .. }
+        | PeerRequest::GetRetainedPagedCheckpointShard { .. } => {
             bail!("retained paged checkpoint read was sent to a mutation worker")
         }
         PeerRequest::ExchangeEndpoints { .. } => {

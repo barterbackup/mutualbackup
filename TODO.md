@@ -2553,6 +2553,37 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Qualify exact retained shard transport and independent full restore.
+      Exact retained peer restore (2026-10-14):
+      A dedicated restore session retains the original directory lease, keys and
+      writable job connection. Existing Node APIs keep their original writer and
+      format-3/4 identities. Peer work uses the independent session, outside the Node
+      mutation lock and production SQL writers, with one original role request live.
+      The appended shard RPC checks historical guild membership, exact layout/owner/
+      checkpoint hash, root-authenticated coding entry and paired local READY custody.
+      It verifies full bytes and rechecks custody after reading. Current heads or
+      post-Forget placement projections supply no substitute authority. The client
+      checks original role identity/commitment and bounded canonical peer-owner maps;
+      failed roles yield to original alternatives. Complete source and blob checks
+      and the original final retained private writer still govern publication.
+      Two real QUIC cases cover both layouts, missing live sources, Retire/Forget,
+      unauthorized/wrong-context callers, restore with the Node mutex held, cancellation
+      during peer reads, interrupted rename and source-free replay after network
+      shutdown. A third case covers writable journal use and exclusion after Node drop.
+      Seed/private bootstrap discovery/reconstruction, full operation/global/physical
+      admission, normal producer/distributed activation and remaining M6 gates stay
+      open. Dense 1 TiB and native Windows/macOS hardware tests remain user-deferred.
+      Frozen qualification passes 1,557 distinct cases: 639 fresh and 918 exact
+      unchanged reused. All 576 ordinary Node and 23 process acceptance cases
+      pass, along with four provisioned Linux native cases. Unchanged Store,
+      Git, Core and three bulk gate executables match their qualified parent
+      exactly. Format, strict locked all-target workspace Clippy, builds, frozen
+      source/binary checks and native cleanup pass. There are 121 unexecuted
+      ignored cases. Independent audit verifies 379 inputs and 23 executables.
+      Exact superseded-binary retirement reclaims 8.28 GiB; target uses
+      52.51 GiB. Current binaries, failed/older qualified evidence, 14 auxiliary
+      WIP files and all 10 installed roots remain preserved. Evidence:
+      `/tmp/mb-m6-retained-peer-restore-iipr46fk`.
     - [x] Qualify retained packed-source reconstruction without live anchors.
       Retained packed-source recovery (2026-10-14):
       The exact retained checkpoint can now retain recovery locators from its complete

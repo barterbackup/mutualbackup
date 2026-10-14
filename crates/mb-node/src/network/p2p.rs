@@ -2403,6 +2403,91 @@ impl P2pClient {
         Ok(bytes)
     }
 
+    /// Fetch an original physical role from the holder's exact retained owner.
+    /// Current placement state supplies no substitute checkpoint authority.
+    #[cfg(target_os = "linux")]
+    pub async fn retained_checkpoint_shard(
+        &self,
+        peer: crate::RetainedCheckpointPeer,
+        request: &crate::RetainedSnapshotRestore,
+        entry: &mb_core::CatalogCodingEntry,
+        index: u16,
+    ) -> Result<Vec<u8>> {
+        let group = &entry.retained.group;
+        let role = group
+            .roles
+            .get(usize::from(index))
+            .context("retained shard index is outside its group")?;
+        let (holder, commitment) = match role {
+            ShardRoleV2::Information(role) => (role.owner, &role.sector.commitment),
+            ShardRoleV2::Parity(role) => (role.holder, &role.commitment),
+        };
+        anyhow::ensure!(
+            !peer.owner_id.is_nil() && holder == peer.node_id && group.guild_id == request.guild_id,
+            "retained shard peer differs from its original role"
+        );
+        let response = self
+            .call(
+                peer.node_id,
+                PeerRequest::GetRetainedPagedCheckpointShard {
+                    guild_id: request.guild_id,
+                    layout: request.layout,
+                    owner_id: peer.owner_id,
+                    checkpoint_hash: request.snapshot.checkpoint_hash,
+                    group_id: group.id,
+                    shard_index: index,
+                },
+            )
+            .await?;
+        let PeerResponse::Bytes(bytes) = response else {
+            bail!("peer returned the wrong retained shard response")
+        };
+        anyhow::ensure!(
+            merkle_commit(&bytes)? == *commitment,
+            "peer returned a retained shard with the wrong original commitment"
+        );
+        Ok(bytes)
+    }
+
+    /// Restore through one independent owned session. One original role is
+    /// fetched at a time outside the Node mutation lock and SQL writer.
+    #[cfg(target_os = "linux")]
+    pub async fn restore_retained_checkpoint_snapshot(
+        &self,
+        session: crate::RetainedCheckpointRestore,
+        request: crate::RetainedSnapshotRestore,
+        target: std::path::PathBuf,
+        peers: Vec<crate::RetainedCheckpointPeer>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            peers.len() <= mb_core::MAX_CODING_SHARDS as usize
+                && peers
+                    .windows(2)
+                    .all(|pair| pair[0].node_id < pair[1].node_id)
+                && peers
+                    .iter()
+                    .all(|peer| !peer.owner_id.is_nil() && peer.node_id.0 != [0; 32]),
+            "retained shard peers are not canonical and bounded"
+        );
+        let runtime = tokio::runtime::Handle::current();
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || session.restore(&request, &target, |entry, index| {
+            let role = &entry.retained.group.roles[usize::from(index)];
+            let holder = match role {
+                ShardRoleV2::Information(role) => role.owner,
+                ShardRoleV2::Parity(role) => role.holder,
+            };
+            let Ok(position) = peers.binary_search_by_key(&holder, |peer| peer.node_id) else { return Ok(None) };
+            match runtime.block_on(client.retained_checkpoint_shard(peers[position], &request, entry, index)) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) => {
+                    tracing::warn!(group = %hex::encode(entry.retained.group.id), shard_index = index, %holder, %error, "retained role fetch failed; trying original alternatives");
+                    Ok(None)
+                }
+            }
+        })).await.context("retained restore worker panicked")?
+    }
+
     pub(crate) async fn variable_emergency_shard(
         &self,
         peer: NodeId,

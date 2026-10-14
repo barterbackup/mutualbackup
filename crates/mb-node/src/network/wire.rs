@@ -351,6 +351,14 @@ pub(super) enum PeerRequest {
         checkpoint_hash: [u8; 32],
         path: mb_core::CatalogPagePath,
     },
+    GetRetainedPagedCheckpointShard {
+        guild_id: [u8; 32],
+        layout: mb_core::PagedCheckpointLayout,
+        owner_id: Uuid,
+        checkpoint_hash: [u8; 32],
+        group_id: [u8; 32],
+        shard_index: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -397,6 +405,7 @@ impl PeerRequest {
                 | Self::GetLegacyCodingAddBinding { .. }
                 | Self::GetRetainedPagedCheckpointCertificate { .. }
                 | Self::GetRetainedPagedCheckpointPage { .. }
+                | Self::GetRetainedPagedCheckpointShard { .. }
                 | Self::ExchangeEndpoints { .. }
                 | Self::CodingCapacity { .. }
         )
@@ -424,6 +433,7 @@ impl PeerRequest {
             | Self::GetLegacyCodingAddBinding { .. }
             | Self::GetRetainedPagedCheckpointCertificate { .. }
             | Self::GetRetainedPagedCheckpointPage { .. }
+            | Self::GetRetainedPagedCheckpointShard { .. }
             | Self::ExchangeEndpoints { .. }
             | Self::CodingCapacity { .. } => None,
             #[cfg(test)]
@@ -493,6 +503,7 @@ impl PeerRequest {
             | Self::GetSectorCommitment { guild_id, .. }
             | Self::GetParity { guild_id, .. }
             | Self::GetVariableShard { guild_id, .. }
+            | Self::GetRetainedPagedCheckpointShard { guild_id, .. }
             | Self::GetVariableEmergencyShard { guild_id, .. }
             | Self::StoreRepairShard { guild_id, .. }
             | Self::StoreVariableRepairShard { guild_id, .. }
