@@ -2553,6 +2553,33 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Restore complete native trees and paged Git catalogs from exact
+      retained checkpoint selections with authenticated local data sources.
+      Complete retained native/Git restore (2026-10-14):
+      The Linux full restore API installs original paged Git history and recovered
+      blob anchors inside the durable inode-owned staging tree. Format-4 jobs retain
+      a distinct identity from native-only format-3 jobs. Final custody publication
+      continues to use the original retained checkpoint writer; completed Publishing
+      jobs may finish after source retirement. Root metadata applies after Git
+      installation, and future anchor location hints survive the final rename. The
+      public default Git importer now obtains scratch from its real registered
+      directory capability. Tests cover both checkpoint layouts, stable authenticated
+      local data sources, original raw paths, sparse bytes, Git history/status, fault
+      rollback, reopen and source-free publication replay. Frozen qualification
+      passes 1,552 distinct cases: 769 fresh and 783 exact
+      unchanged reused. All 573 ordinary Node and 131 ordinary Git cases pass, along
+      with four provisioned Linux native cases and the three bulk gates. Formatting,
+      strict locked workspace/all-target Clippy, builds and source/binary preservation
+      checks pass. The >512 MiB Git import peaks at 22.45 MiB RSS; metadata ODB peaks
+      at 22.77 MiB. There are 121 unexecuted ignored cases. Both failed fixture
+      attempts retain their exact source, log and binary. Remote packed-shard
+      reconstruction, seed-only orchestration, aggregate quotas, normal producers and
+      remaining Milestone 6 gates stay open. Hardware qualification stays deferred.
+      Independent audit verifies 375 inputs and 23 qualified executables.
+      Exact superseded-binary retirement reclaims 9.51 GiB; target uses 52.47 GiB.
+      Current binaries, older qualified/failed evidence, 14 auxiliary WIP files
+      and all 10 installed roots remain preserved.
+      Evidence: `/tmp/mb-m6-paged-git-restore-iz6u03oj`.
     - [x] Install complete paged Git catalogs from recovered native blob anchors.
       Complete graph validation and all page/blob I/O precede the destination
       writer. An encrypted disk index stages bounded metadata/ref/blob rows and

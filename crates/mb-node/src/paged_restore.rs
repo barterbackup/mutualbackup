@@ -351,16 +351,48 @@ impl PagedPrivateMetadata {
         identity: (Uuid, Option<Uuid>),
         scope: CatalogScope,
         target: &Path,
+        load: impl FnMut(&SectorId) -> Result<Vec<u8>>,
+        publish: impl FnOnce(&mut dyn FnMut() -> Result<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        Self::restore_retained_catalog_inner::<false>(
+            control, keys, identity, scope, target, load, publish,
+        )
+    }
+
+    pub(crate) fn restore_retained_catalog_checked(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        identity: (Uuid, Option<Uuid>),
+        scope: CatalogScope,
+        target: &Path,
+        load: impl FnMut(&SectorId) -> Result<Vec<u8>>,
+        publish: impl FnOnce(&mut dyn FnMut() -> Result<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        Self::restore_retained_catalog_inner::<true>(
+            control, keys, identity, scope, target, load, publish,
+        )
+    }
+
+    fn restore_retained_catalog_inner<const FULL: bool>(
+        control: &ControlStore,
+        keys: &KeyMaterial,
+        identity: (Uuid, Option<Uuid>),
+        scope: CatalogScope,
+        target: &Path,
         mut load: impl FnMut(&SectorId) -> Result<Vec<u8>>,
         publish: impl FnOnce(&mut dyn FnMut() -> Result<Vec<u8>>) -> Result<Vec<u8>>,
     ) -> Result<()> {
+        let version = if FULL { 4 } else { 3 };
         let (revision_id, operation) = identity;
         let snapshot = Self::load_local_catalog(control, keys, revision_id, scope)?
             .context("retained paged revision is unavailable")?;
         let signed_hash = snapshot.revision.value.hash()?;
         let guild = snapshot.revision.value.guild_id;
-        let mut identity =
-            blake3::Hasher::new_derive_key("mutualbackup paged native restore identity v1");
+        let mut identity = blake3::Hasher::new_derive_key(if FULL {
+            "mutualbackup paged complete restore identity v1"
+        } else {
+            "mutualbackup paged native restore identity v1"
+        });
         identity.update(&signed_hash);
         let operation = operation.unwrap_or_else(|| {
             let mut bytes = [0; 16];
@@ -370,7 +402,7 @@ impl PagedPrivateMetadata {
         if snapshot.state != CatalogBundleState::Published {
             ensure!(
                 crate::snapshot::resume_restore_from_identity(
-                    control, guild, operation, 3, target
+                    control, guild, operation, version, target
                 )?,
                 "retained paged revision is cancelled"
             );
@@ -379,17 +411,29 @@ impl PagedPrivateMetadata {
         let private = snapshot
             .private
             .context("retained private roots are unavailable")?;
+        if FULL && private.git.is_some() {
+            let mut namespace = CatalogFileReader::new(scope, private.native.namespace)?;
+            while let Some(entry) = namespace.next_file(&mut |page| {
+                control.catalog_page(scope, CatalogSection::FileMetadata, page)
+            })? {
+                ensure!(
+                    entry.path.split(|byte| *byte == b'/').next()
+                        != Some(mb_store::GIT_CATALOG_DIRECTORY.as_bytes()),
+                    "Git restore namespace collides with its private catalog"
+                );
+            }
+        }
         crate::snapshot::restore_from_builder_checked(
             control,
             guild,
             operation,
-            3,
+            version,
             target,
             |root, target_id| {
                 let index = RestoreIndex::new(control, target_id)?;
                 index.clear_legacy()?;
                 index.records.with_record_transaction(|| {
-                    private.build_native_restore(
+                    private.build_native_restore::<FULL>(
                         keys,
                         revision_id,
                         scope,
@@ -397,6 +441,21 @@ impl PagedPrivateMetadata {
                         &index,
                         &mut load,
                     )?;
+                    if FULL {
+                        if let Some(git) = &private.git {
+                            let future = crate::snapshot::full_paged_restore_target(
+                                control, target_id, root,
+                            )?;
+                            crate::paged_git_restore::restore(
+                                control,
+                                keys,
+                                (revision_id, scope, git),
+                                (root, &future),
+                                &mut load,
+                            )?;
+                        }
+                        apply_stat(root.as_file(), private.native.namespace.root_stat)?;
+                    }
                     let current = Self::load_local_catalog(control, keys, revision_id, scope)?
                         .context("retained root disappeared during restore")?;
                     ensure!(
@@ -411,7 +470,7 @@ impl PagedPrivateMetadata {
         )
     }
 
-    fn build_native_restore(
+    fn build_native_restore<const DEFER_ROOT: bool>(
         &self,
         keys: &KeyMaterial,
         revision_id: Uuid,
@@ -626,6 +685,11 @@ impl PagedPrivateMetadata {
         root.remove_child_directory(&pool_name, pool_identity)?;
         index.verify_tree(root)?;
         index.finish_directories(root)?;
-        apply_stat(root.as_file(), self.native.namespace.root_stat)
+        if DEFER_ROOT {
+            root.sync_all()?;
+            Ok(())
+        } else {
+            apply_stat(root.as_file(), self.native.namespace.root_stat)
+        }
     }
 }

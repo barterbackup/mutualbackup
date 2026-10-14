@@ -193,6 +193,7 @@ impl Staging<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn import(
     control: &ControlStore,
     id: Uuid,
@@ -211,7 +212,15 @@ pub(crate) fn import(
         mb_store::ScratchStorageLimits::for_database(mb_core::CATALOG_MAX_STREAM_BYTES * 4)?,
         &[control.path().to_path_buf()],
     )?;
-    import_with_scratch(control, id, scope, git, &store, &mut fetch, &mut anchor)
+    import_with_scratch(
+        control,
+        id,
+        scope,
+        git,
+        &store,
+        None,
+        (&mut fetch, &mut anchor),
+    )
 }
 
 fn import_with_scratch(
@@ -220,9 +229,13 @@ fn import_with_scratch(
     scope: CatalogScope,
     git: &GitCatalogRoot,
     store: &RecordScratchStore,
-    mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
-    mut anchor: impl FnMut([u8; 20]) -> Result<FileAnchorManifest>,
+    rename: Option<(&std::path::Path, &std::path::Path)>,
+    callbacks: (
+        impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
+        impl FnMut([u8; 20]) -> Result<FileAnchorManifest>,
+    ),
 ) -> Result<()> {
+    let (mut fetch, mut anchor) = callbacks;
     ensure!(
         !control.is_read_only()?,
         "Git installation requires a writable destination"
@@ -290,7 +303,22 @@ fn import_with_scratch(
                         == Some(manifest.anchor_id.as_bytes()),
                     "blob anchor join was ignored"
                 );
-                let (kind, key, bytes) = crate::catalog_anchor::location_record(&manifest, &area)?;
+                let saved = if let Some((current, future)) = rename {
+                    let relative = area
+                        .strip_prefix(current)
+                        .context("renamed backup blob area is outside its owned root")?;
+                    ensure!(
+                        future.is_absolute()
+                            && relative
+                                .components()
+                                .all(|part| matches!(part, std::path::Component::Normal(_))),
+                        "invalid future blob area location"
+                    );
+                    future.join(relative)
+                } else {
+                    area.clone()
+                };
+                let (kind, key, bytes) = crate::catalog_anchor::location_record(&manifest, &saved)?;
                 staging.put(&kind, &key, &bytes)?;
             }
         }
@@ -365,8 +393,16 @@ impl crate::GitRepository {
         fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
         anchor: impl FnMut([u8; 20]) -> Result<FileAnchorManifest>,
     ) -> Result<()> {
-        self.with_paged_metadata_catalog(|control| {
-            import(control, self.id(), scope, git, fetch, anchor)
+        self.with_paged_backup_scratch(|control, scratch| {
+            import_with_scratch(
+                control,
+                self.id(),
+                scope,
+                git,
+                scratch,
+                None,
+                (fetch, anchor),
+            )
         })
     }
 
@@ -381,7 +417,40 @@ impl crate::GitRepository {
         anchor: impl FnMut([u8; 20]) -> Result<FileAnchorManifest>,
     ) -> Result<()> {
         self.with_paged_metadata_catalog(|control| {
-            import_with_scratch(control, self.id(), scope, git, scratch, fetch, anchor)
+            import_with_scratch(
+                control,
+                self.id(),
+                scope,
+                git,
+                scratch,
+                None,
+                (fetch, anchor),
+            )
+        })
+    }
+
+    /// Install in an owned hidden tree which will be renamed to `target`.
+    /// Every blob area must be inside this root; validated future hints keep
+    /// native reads independent of the discarded staging pathname.
+    pub fn import_paged_backup_for_rename(
+        &self,
+        scope: CatalogScope,
+        git: &GitCatalogRoot,
+        scratch: &RecordScratchStore,
+        target: &std::path::Path,
+        fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
+        anchor: impl FnMut([u8; 20]) -> Result<FileAnchorManifest>,
+    ) -> Result<()> {
+        self.with_paged_metadata_catalog(|control| {
+            import_with_scratch(
+                control,
+                self.id(),
+                scope,
+                git,
+                scratch,
+                Some((self.root(), target)),
+                (fetch, anchor),
+            )
         })
     }
 }
@@ -586,6 +655,59 @@ mod tests {
     }
 
     #[test]
+    fn paged_import_public_repository_default_and_owned_root_rename_keep_blob_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("hidden");
+        std::fs::create_dir(&root).unwrap();
+        let f = fixture(&root, b"target");
+        let id = f.root.repository_id;
+        let repository = crate::GitRepository::init(&root, id, &[225; 32]).unwrap();
+        repository
+            .import_paged_backup(
+                scope(),
+                &f.root,
+                |p| Ok(f.pages[&p.hash].clone()),
+                |oid| Ok(f.anchors[&oid].clone()),
+            )
+            .unwrap();
+        assert_eq!(repository.log(1).unwrap()[0].oid, f.head);
+        drop(repository);
+        let second = temp.path().join("renamed-hidden");
+        std::fs::create_dir(&second).unwrap();
+        let g = fixture(&second, b"target");
+        let repository = crate::GitRepository::init(&second, id, &[225; 32]).unwrap();
+        let scratch = RecordScratchStore::new(16 << 20).unwrap();
+        let target = temp.path().join("published");
+        repository
+            .import_paged_backup_for_rename(
+                scope(),
+                &g.root,
+                &scratch,
+                &target,
+                |p| Ok(g.pages[&p.hash].clone()),
+                |oid| Ok(g.anchors[&oid].clone()),
+            )
+            .unwrap();
+        drop(repository);
+        std::fs::rename(&second, &target).unwrap();
+        let repository = crate::GitRepository::open(&target, id, &[225; 32]).unwrap();
+        assert_eq!(repository.log(1).unwrap()[0].oid, g.head);
+        let path = target
+            .join(mb_store::GIT_CATALOG_DIRECTORY)
+            .join("catalog.db");
+        let control = ControlStore::open_existing_read_only_with_key(path, &[225; 32]).unwrap();
+        let odb =
+            crate::NativeOdb::from_catalog_anchors(&control, g.anchors.values().cloned()).unwrap();
+        assert_eq!(
+            odb.odb()
+                .read(Oid::from_bytes(&g.regular).unwrap())
+                .unwrap()
+                .data(),
+            b"raw\r\n\0original"
+        );
+    }
+
+    #[test]
     fn paged_import_original_history_refs_modes_and_shared_head_index_survive_reopen() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
@@ -600,7 +722,7 @@ mod tests {
         let path = directory.join("catalog.db");
         let pinned = mb_store::PinnedDirectory::open(&directory).unwrap();
         // An unregistered procfs path is not a database directory capability.
-        // Use the same registered store API as an actual GitRepository below.
+        // The standalone helper accepts only registered directory capabilities.
         let control =
             ControlStore::open_with_key(pinned.descriptor_path().join("catalog.db"), &[225; 32])
                 .unwrap();

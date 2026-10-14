@@ -2038,6 +2038,26 @@ impl GitRepository {
         self.ensure_no_merge_session()?;
         operation(&self.catalog)
     }
+
+    pub(crate) fn with_paged_backup_scratch<T>(
+        &self,
+        operation: impl FnOnce(&ControlStore, &mb_store::RecordScratchStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.with_paged_metadata_catalog(|catalog| {
+            let directory = mb_store::DatabaseDirectory::from_file(std::sync::Arc::new(
+                self.directory.as_file().try_clone()?,
+            ))?;
+            let checkpoint = directory.leaf(std::ffi::OsStr::new(CATALOG_DATABASE))?;
+            let scratch = mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
+                directory.path(),
+                mb_store::ScratchStorageLimits::for_database(
+                    mb_core::CATALOG_MAX_STREAM_BYTES * 4,
+                )?,
+                &[checkpoint],
+            )?;
+            operation(catalog, &scratch)
+        })
+    }
 }
 
 fn require_private_catalog(directory: &PinnedDirectory) -> Result<(), RepositoryError> {

@@ -19,6 +19,8 @@ mod node;
 mod paged_capture;
 mod paged_data;
 #[cfg(target_os = "linux")]
+mod paged_git_restore;
+#[cfg(target_os = "linux")]
 mod paged_legacy;
 mod paged_migration;
 #[cfg(target_os = "linux")]

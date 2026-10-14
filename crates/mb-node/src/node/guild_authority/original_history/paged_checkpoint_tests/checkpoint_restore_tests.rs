@@ -2,7 +2,7 @@ use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 macro_rules! cases {
-    ($test:ident,$constructor:ident,$layout:ident,$metadata:ident,$revision:ident,$lookup:ident,$cancel:ident,$release:ident,$journal:literal) => {
+    ($test:ident,$constructor:ident,$layout:ident,$metadata:ident,$revision:ident,$lookup:ident,$cancel:ident,$release:ident,$journal:literal,$restore:ident,$mode:literal) => {
         #[test]
         fn $test() {
             let (temp, seed, mut node, mut keys) = fixture();
@@ -39,27 +39,27 @@ macro_rules! cases {
                     3 => wrong.revision_id = Uuid::from_u128(998),
                     _ => wrong.sequence += 1,
                 }
-                assert!(node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &wrong, &target, budget).is_err());
+                assert!(node.$restore(layout, owner, guild, &wrong, &target, budget).is_err());
             }
             let other_layout = match layout {
                 mb_core::PagedCheckpointLayout::Individual => mb_core::PagedCheckpointLayout::Directory,
                 mb_core::PagedCheckpointLayout::Directory => mb_core::PagedCheckpointLayout::Individual,
             };
             for (layout, id, guild) in [(other_layout, owner, guild), (layout, Uuid::from_u128(997), guild), (layout, owner, [249; 32])] {
-                assert!(node.restore_retained_checkpoint_native_snapshot(layout, id, guild, &snapshot, &target, budget).is_err());
+                assert!(node.$restore(layout, id, guild, &snapshot, &target, budget).is_err());
             }
-            assert!(node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, Work { bytes: 0, ..budget }).is_err());
+            assert!(node.$restore(layout, owner, guild, &snapshot, &target, Work { bytes: 0, ..budget }).is_err());
             assert!(!target.exists());
             assert!(node.control.records("restore-job").unwrap().is_empty());
 
             for (number, action) in ["ABORT", "IGNORE"].into_iter().enumerate() {
                 let target = temp.path().join(format!("publication-fault-{number}"));
                 node.control.database_shell_statement(&format!("CREATE TEMP TRIGGER refuse_restore BEFORE UPDATE ON protocol_records WHEN NEW.kind='restore-job' AND substr(NEW.bytes,-1)=X'01' BEGIN SELECT RAISE({action}{}); END", if action == "ABORT" { ",'test'" } else { "" }), false).unwrap();
-                assert!(node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, budget).is_err());
+                assert!(node.$restore(layout, owner, guild, &snapshot, &target, budget).is_err());
                 assert!(!target.exists());
                 assert_eq!(node.control.records("restore-job").unwrap().len(), 1);
                 node.control.database_shell_statement("DROP TRIGGER refuse_restore", false).unwrap();
-                node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, budget).unwrap();
+                node.$restore(layout, owner, guild, &snapshot, &target, budget).unwrap();
                 assert!(target.is_dir());
                 assert!(node.control.records("restore-job").unwrap().is_empty());
             }
@@ -72,11 +72,11 @@ macro_rules! cases {
             node.control.put_record($journal, owner.as_bytes(), &published).unwrap();
             let target = temp.path().join("late-cancellation");
             node.control.database_shell_statement(&format!("CREATE TEMP TRIGGER cancel_restore AFTER UPDATE ON protocol_records WHEN NEW.kind='restore-job' AND substr(NEW.bytes,-1)=X'01' BEGIN UPDATE protocol_records SET bytes=X'{}' WHERE kind='{}' AND record_id=X'{}'; END", hex::encode(&cancelled), $journal, hex::encode(owner.as_bytes())), false).unwrap();
-            assert!(node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, budget).is_err());
+            assert!(node.$restore(layout, owner, guild, &snapshot, &target, budget).is_err());
             assert!(!target.exists());
             assert_eq!(node.control.get_record($journal, owner.as_bytes()).unwrap().unwrap(), published);
             node.control.database_shell_statement("DROP TRIGGER cancel_restore", false).unwrap();
-            node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, budget).unwrap();
+            node.$restore(layout, owner, guild, &snapshot, &target, budget).unwrap();
             assert!(node.control.records("restore-job").unwrap().is_empty());
 
             for intent in captures {
@@ -87,30 +87,32 @@ macro_rules! cases {
             drop(node);
             let node = Node::open(temp.path(), seed.clone()).unwrap();
             let target = temp.path().join("retained-after-reopen");
-            node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, budget).unwrap();
+            node.$restore(layout, owner, guild, &snapshot, &target, budget).unwrap();
             let stat = std::fs::metadata(&target).unwrap();
-            assert_eq!(stat.permissions().mode() & 0o777, 0o700);
+            assert_eq!(stat.permissions().mode() & 0o777, $mode);
             assert_eq!((stat.mtime(), stat.mtime_nsec()), (123, 456));
             assert!(node.control.checkpoint_head_identity(&guild).unwrap().is_none());
+            if $mode == 0o555 { verify_git_restore(&node, &target, key.protected_root_id); }
 
             let target = temp.path().join("interrupted-published-tree");
             crate::snapshot::interrupt_next_restore_after_rename();
-            assert!(node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, budget).is_err());
+            assert!(node.$restore(layout, owner, guild, &snapshot, &target, budget).is_err());
             assert!(target.is_dir());
             let inode = std::fs::metadata(&target).unwrap().ino();
             assert_eq!(node.control.records("restore-job").unwrap().len(), 1);
-            assert!(node.restore_retained_checkpoint_native_snapshot(layout, Uuid::from_u128(996), guild, &snapshot, &target, budget).is_err());
+            assert!(node.$restore(layout, Uuid::from_u128(996), guild, &snapshot, &target, budget).is_err());
             assert_eq!(std::fs::metadata(&target).unwrap().ino(), inode);
             node.control.$cancel(owner).unwrap();
             while node.control.$release(owner).unwrap() {}
             node.control.cancel_paged_revision_catalog(signed.value.revision_id).unwrap();
             drop(node);
             let node = Node::open(temp.path(), seed).unwrap();
-            node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &target, Work::default()).unwrap();
+            node.$restore(layout, owner, guild, &snapshot, &target, Work::default()).unwrap();
             assert_eq!(std::fs::metadata(&target).unwrap().ino(), inode);
+            if $mode == 0o555 { verify_git_restore(&node, &target, key.protected_root_id); }
             assert!(node.control.records("restore-job").unwrap().is_empty());
             assert!(node.control.checkpoint_head_identity(&guild).unwrap().is_none());
-            assert!(node.restore_retained_checkpoint_native_snapshot(layout, owner, guild, &snapshot, &temp.path().join("cancelled-new-request"), budget).is_err());
+            assert!(node.$restore(layout, owner, guild, &snapshot, &temp.path().join("cancelled-new-request"), budget).is_err());
         }
     };
 }
@@ -124,7 +126,9 @@ cases!(
     build_retained_paged_checkpoint_lookup,
     cancel_catalog_paged_checkpoint_retention,
     release_catalog_paged_checkpoint_root,
-    "catalog-paged-checkpoint-retention-v1"
+    "catalog-paged-checkpoint-retention-v1",
+    restore_retained_checkpoint_native_snapshot,
+    0o700
 );
 cases!(
     retained_directory_checkpoint_native_restore_fences_publication_and_reopens_owned_output,
@@ -135,5 +139,100 @@ cases!(
     build_retained_paged_checkpoint_directory_lookup,
     cancel_catalog_paged_checkpoint_directory_retention,
     release_catalog_paged_checkpoint_directory_root,
-    "catalog-directory-checkpoint-retention-v1"
+    "catalog-directory-checkpoint-retention-v1",
+    restore_retained_checkpoint_native_snapshot,
+    0o700
+);
+
+fn git_owner_proof(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    _: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    checkpoint_owner_proof_with_git_inner::<true>(
+        node,
+        keys,
+        true,
+        unix_seconds() + 600,
+        true,
+        true,
+        false,
+    )
+}
+fn git_directory_proof(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointDirectoryIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
+    let (proof, intents) = git_owner_proof(node, keys, private);
+    directory_from_original(node, keys, proof, intents)
+}
+fn verify_git_restore(node: &Node, target: &Path, id: Uuid) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = target.join(std::ffi::OsStr::from_bytes(b"payload-\xff"));
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(bytes.len(), 8192);
+    let payload = b"retained raw\r\n\0";
+    assert_eq!(&bytes[4096..4096 + payload.len()], payload);
+    assert!(
+        bytes[..4096]
+            .iter()
+            .chain(&bytes[4096 + payload.len()..])
+            .all(|b| *b == 0)
+    );
+    let repository =
+        mb_git::GitRepository::open(target, id, &mb_git::catalog_key(&node.keys, id)).unwrap();
+    assert_eq!(repository.log(1).unwrap().len(), 1);
+    assert_eq!(repository.tags().unwrap().len(), 1);
+    let status = repository.status().unwrap();
+    assert!(
+        status.changes.is_empty() && status.untracked.is_empty() && status.pending_adds.is_empty()
+    );
+    let mut anchors = 0;
+    mb_git::GitRepository::for_each_preserved_record(
+        target,
+        id,
+        &mb_git::catalog_key(&node.keys, id),
+        |record| {
+            if let mb_git::PreservedGitRecord::ObjectAnchor { anchor, .. } = record {
+                assert!(anchor.area.known_path(None).is_none());
+                anchors += 1;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(anchors, 1);
+}
+cases!(
+    retained_individual_checkpoint_git_restore_fences_publication_and_reopens_owned_output,
+    git_owner_proof,
+    Individual,
+    retain_paged_checkpoint_metadata,
+    retain_paged_checkpoint_local_revision,
+    build_retained_paged_checkpoint_lookup,
+    cancel_catalog_paged_checkpoint_retention,
+    release_catalog_paged_checkpoint_root,
+    "catalog-paged-checkpoint-retention-v1",
+    restore_retained_checkpoint_snapshot,
+    0o555
+);
+cases!(
+    retained_directory_checkpoint_git_restore_fences_publication_and_reopens_owned_output,
+    git_directory_proof,
+    Directory,
+    retain_paged_checkpoint_directory_metadata,
+    retain_paged_checkpoint_directory_local_revision,
+    build_retained_paged_checkpoint_directory_lookup,
+    cancel_catalog_paged_checkpoint_directory_retention,
+    release_catalog_paged_checkpoint_directory_root,
+    "catalog-directory-checkpoint-retention-v1",
+    restore_retained_checkpoint_snapshot,
+    0o555
 );

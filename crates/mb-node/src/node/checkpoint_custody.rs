@@ -17,6 +17,39 @@ impl Node {
         target: &Path,
         budget: mb_core::CatalogCodingTraversalBudget,
     ) -> Result<()> {
+        self.restore_retained_checkpoint_snapshot_inner::<false>(
+            layout, owner, guild_id, snapshot, target, budget,
+        )
+    }
+
+    /// Restore the complete native tree and optional paged Git catalog from
+    /// this exact retained checkpoint, including original legacy conversions.
+    #[cfg(target_os = "linux")]
+    pub fn restore_retained_checkpoint_snapshot(
+        &self,
+        layout: mb_core::PagedCheckpointLayout,
+        owner: Uuid,
+        guild_id: [u8; 32],
+        snapshot: &SnapshotInfo,
+        target: &Path,
+        budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<()> {
+        self.restore_retained_checkpoint_snapshot_inner::<true>(
+            layout, owner, guild_id, snapshot, target, budget,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_retained_checkpoint_snapshot_inner<const FULL: bool>(
+        &self,
+        layout: mb_core::PagedCheckpointLayout,
+        owner: Uuid,
+        guild_id: [u8; 32],
+        snapshot: &SnapshotInfo,
+        target: &Path,
+        budget: mb_core::CatalogCodingTraversalBudget,
+    ) -> Result<()> {
+        let version = if FULL { 4 } else { 3 };
         anyhow::ensure!(
             !owner.is_nil()
                 && !snapshot.revision_id.is_nil()
@@ -30,8 +63,11 @@ impl Node {
             sequence: snapshot.sequence,
             revision_id: snapshot.revision_id,
         };
-        let mut identity =
-            blake3::Hasher::new_derive_key("mutualbackup retained checkpoint native restore v1");
+        let mut identity = blake3::Hasher::new_derive_key(if FULL {
+            "mutualbackup retained checkpoint complete restore v1"
+        } else {
+            "mutualbackup retained checkpoint native restore v1"
+        });
         identity.update(&canonical_bytes(&(
             layout,
             owner,
@@ -47,7 +83,7 @@ impl Node {
             &self.control,
             guild_id,
             operation,
-            3,
+            version,
             target,
         )? {
             return Ok(());
@@ -104,18 +140,30 @@ impl Node {
                 anyhow::ensure!(
                     opened.state == mb_store::CatalogBundleState::Published
                         && opened.revision.value.guild_id == guild_id
-                        && private.git.is_none(),
-                    "native restore requires published native-only private roots"
+                        && (FULL || private.git.is_none()),
+                    "restore requires compatible published private roots"
                 );
-                crate::PagedPrivateMetadata::restore_retained_native_catalog_checked(
-                    &self.control,
-                    &self.keys,
-                    (catalog.bundle.id, Some(operation)),
-                    catalog.bundle.scope,
-                    target,
-                    |sector| self.sector_for_guild(&guild_id, sector),
-                    |publish| self.control.$publish(retention, &record, &catalog, publish),
-                )
+                if FULL {
+                    crate::PagedPrivateMetadata::restore_retained_catalog_checked(
+                        &self.control,
+                        &self.keys,
+                        (catalog.bundle.id, Some(operation)),
+                        catalog.bundle.scope,
+                        target,
+                        |sector| self.sector_for_guild(&guild_id, sector),
+                        |publish| self.control.$publish(retention, &record, &catalog, publish),
+                    )
+                } else {
+                    crate::PagedPrivateMetadata::restore_retained_native_catalog_checked(
+                        &self.control,
+                        &self.keys,
+                        (catalog.bundle.id, Some(operation)),
+                        catalog.bundle.scope,
+                        target,
+                        |sector| self.sector_for_guild(&guild_id, sector),
+                        |publish| self.control.$publish(retention, &record, &catalog, publish),
+                    )
+                }
             }};
         }
         match layout {

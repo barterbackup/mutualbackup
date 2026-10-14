@@ -3360,8 +3360,8 @@ where
     )
 }
 
-/// Shared no-replace publication and inode-bound replay. Version 3 reserves
-/// paged native restores; version 2 keeps ordinary legacy job identities.
+/// Shared no-replace publication and inode-bound replay. Version 4 reserves
+/// complete paged native/Git restores; version 3 remains native-only.
 pub(crate) fn restore_from_builder(
     control: &ControlStore,
     guild_id: [u8; 32],
@@ -3394,7 +3394,7 @@ pub(crate) fn restore_from_builder_checked(
     publish: impl FnOnce(&mut dyn FnMut() -> Result<Vec<u8>>) -> Result<Vec<u8>>,
 ) -> Result<()> {
     ensure!(
-        matches!(job_version, 2 | 3),
+        matches!(job_version, 2..=4),
         "unsupported restore job version"
     );
     let _operation = lock_restore_operations(control)?;
@@ -3702,6 +3702,26 @@ fn replace_restore_job(
     Ok(replacement)
 }
 
+pub(crate) fn full_paged_restore_target(
+    control: &ControlStore,
+    id: [u8; 32],
+    root: &PinnedDirectory,
+) -> Result<PathBuf> {
+    let bytes = control
+        .get_record_bounded(RESTORE_JOB_KIND, &id, V1_SECTOR_SIZE)?
+        .context("complete paged restore has no durable job")?;
+    let job: RestoreJob = decode_canonical(&bytes)?;
+    ensure!(
+        job.format_version == 4
+            && job.state == RestoreJobState::Building
+            && job.staged_identity == Some(root.identity()?)
+            && restore_job_record_id(&job.target)? == id
+            && canonical_bytes(&job)? == bytes,
+        "complete paged restore staging ownership differs"
+    );
+    Ok(job.target)
+}
+
 fn restore_job_record_id(target: &Path) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup restore target reservation v1");
     hasher.update(&canonical_bytes(&RawLocalPath(target.to_path_buf()))?);
@@ -3727,13 +3747,13 @@ fn reserved_restore_job(
                 let job: RestoreJob = decode_canonical(bytes)?;
                 match job.format_version {
                     1 if record_id == job.revision_id.as_bytes() => {}
-                    2 | 3 if record_id == restore_job_record_id(&job.target)? => {}
+                    2..=4 if record_id == restore_job_record_id(&job.target)? => {}
                     _ => bail!("unfinished durable restore job is inconsistent"),
                 }
                 if job.target == target {
                     ensure!(
-                        job_version != 3 || job.format_version == 3,
-                        "paged restore target is reserved by a legacy restore"
+                        job_version < 3 || job.format_version == job_version,
+                        "paged restore target is reserved by another restore format"
                     );
                     matching.push((record_id.to_vec(), bytes.to_vec(), job));
                 }
@@ -3754,7 +3774,7 @@ fn reserved_restore_job(
         let Some((record_id, bytes, mut job)) = matching.pop() else {
             return Ok(None);
         };
-        if matches!(job.format_version, 2 | 3) {
+        if matches!(job.format_version, 2..=4) {
             return Ok(Some(ReservedRestoreJob {
                 record_id: target_record_id,
                 bytes,

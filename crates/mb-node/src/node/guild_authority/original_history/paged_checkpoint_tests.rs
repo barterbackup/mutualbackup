@@ -863,7 +863,7 @@ fn paged_checkpoint_directory_node_owner_authenticates_private_custody_and_reope
     );
 }
 
-fn local_private_checkpoint_revision(
+fn local_private_checkpoint_revision_inner<const GIT: bool>(
     node: &Node,
     writer: &ed25519_dalek::SigningKey,
     guild: [u8; 32],
@@ -895,6 +895,32 @@ fn local_private_checkpoint_revision(
         intent
     });
     let mut records = std::collections::BTreeMap::new();
+    let data = GIT.then(|| {
+        let payload = b"retained raw\r\n\0";
+        let id = mb_core::make_content_sector_id(
+            &node.keys.guild_content_id_key(&guild),
+            node.keys.node_id(),
+            guild,
+            root,
+            mb_core::SectorPurpose::Data,
+            payload,
+        )
+        .unwrap();
+        let (sector, bytes) =
+            mb_core::encrypted_sector(&node.keys.guild_data_key(&guild), id, payload).unwrap();
+        records.insert(
+            id,
+            (
+                CatalogSectorRecord {
+                    format_version: 1,
+                    sector: sector.clone(),
+                    commitment: mb_core::merkle_commit(&bytes).unwrap(),
+                },
+                bytes,
+            ),
+        );
+        (sector, payload.as_slice())
+    });
     let mut stage =
         |intent: mb_store::CatalogIntent, page: mb_core::CatalogPageRef, bytes: Vec<u8>| {
             node.control.stage_catalog_page(intent, page, &bytes)?;
@@ -918,21 +944,84 @@ fn local_private_checkpoint_revision(
             );
             Ok::<_, mb_store::CatalogStoreError>(())
         };
-    let namespace = mb_core::CatalogFileBuilder::new(
-        scope,
-        mb_core::CatalogFileStat {
-            mode: 0o700,
-            modified_secs: 123,
-            modified_nanos: 456,
-        },
-    )
-    .unwrap()
-    .finish(&mut |page, bytes| stage(intents[0], page, bytes))
-    .unwrap();
-    let recipes = mb_core::CatalogFileRecipeBuilder::new(scope)
-        .unwrap()
+    let stat = mb_core::CatalogFileStat {
+        mode: if GIT { 0o555 } else { 0o700 },
+        modified_secs: 123,
+        modified_nanos: 456,
+    };
+    let mut namespace = mb_core::CatalogFileBuilder::new(scope, stat).unwrap();
+    let mut recipes = mb_core::CatalogFileRecipeBuilder::new(scope).unwrap();
+    if let Some((reference, payload)) = &data {
+        namespace
+            .push(
+                &mb_core::CatalogFileRecord {
+                    format_version: 1,
+                    path: b"payload-\xff".to_vec(),
+                    stat: mb_core::CatalogFileStat {
+                        mode: 0o755,
+                        ..stat
+                    },
+                    kind: mb_core::CatalogFileKind::File {
+                        file_key: 0,
+                        logical_len: 8192,
+                        link_group: None,
+                    },
+                },
+                &mut |page, bytes| stage(intents[0], page, bytes),
+            )
+            .unwrap();
+        recipes
+            .push_file(
+                0,
+                8192,
+                std::iter::once(mb_core::CatalogFileExtent {
+                    offset: 4096,
+                    logical_len: payload.len() as u64,
+                    sectors: std::slice::from_ref(reference),
+                }),
+                &mut |page, bytes| stage(intents[1], page, bytes),
+            )
+            .unwrap();
+    }
+    let namespace = namespace
+        .finish(&mut |page, bytes| stage(intents[0], page, bytes))
+        .unwrap();
+    let recipes = recipes
         .finish(&mut |page, bytes| stage(intents[1], page, bytes))
         .unwrap();
+    let git_intents = GIT.then(|| {
+        std::array::from_fn::<_, 3, _>(|_| {
+            let intent = mb_store::CatalogIntent {
+                id: Uuid::new_v4(),
+                scope,
+                section: CatalogSection::GitGraph,
+            };
+            node.control.begin_catalog(intent).unwrap();
+            intent
+        })
+    });
+    let git = git_intents.map(|git_intents| {
+        let (reference, payload) = data.as_ref().unwrap();
+        let mut blob = vec![0; 8192]; blob[4096..4096 + payload.len()].copy_from_slice(payload);
+        let blob_oid = git2::Oid::hash_object(git2::ObjectType::Blob, &blob).unwrap();
+        let mut tree = b"100755 payload-\xff\0".to_vec(); tree.extend_from_slice(blob_oid.as_bytes());
+        let tree_oid = git2::Oid::hash_object(git2::ObjectType::Tree, &tree).unwrap();
+        let mut commit = format!("tree {tree_oid}\nauthor A <a@test> 1 +0000\ncommitter A <a@test> 1 +0000\n\nretained original\n").into_bytes();
+        commit.resize(commit.len() + 2 * mb_git::GIT_OBJECT_FRAGMENT_BYTES + 17, b'x');
+        let commit_oid = git2::Oid::hash_object(git2::ObjectType::Commit, &commit).unwrap();
+        let tag = format!("object {commit_oid}\ntype commit\ntag saved\ntagger A <a@test> 1 +0000\n\noriginal tag\n").into_bytes();
+        let tag_oid = git2::Oid::hash_object(git2::ObjectType::Tag, &tag).unwrap();
+        let mut objects = [(2, tree_oid, tree), (1, commit_oid, commit), (3, tag_oid, tag)]; objects.sort_by_key(|row| row.1);
+        let mut builder = mb_git::GitObjectCatalogBuilder::new(scope).unwrap();
+        for (kind, oid, bytes) in &objects { builder.push_object(oid.as_bytes().try_into().unwrap(), *kind, bytes.len() as u64, &mut bytes.as_slice(), &mut |page, bytes| stage(git_intents[1], page, bytes)).unwrap(); }
+        let objects = builder.finish(&mut |page, bytes| stage(git_intents[1], page, bytes)).unwrap();
+        let mut refs = mb_git::GitRefCatalogBuilder::new(scope, b"main").unwrap();
+        for (name, oid) in [(b"refs/heads/main".as_slice(), commit_oid), (b"refs/tags/saved".as_slice(), tag_oid)] { refs.push_ref(&mb_git::GitRefRecord { format_version: 1, name: name.to_vec(), oid: oid.as_bytes().try_into().unwrap() }, &mut |page, bytes| stage(git_intents[0], page, bytes)).unwrap(); }
+        let refs = refs.finish(&mut |page, bytes| stage(git_intents[0], page, bytes)).unwrap();
+        let mut blobs = mb_git::GitBlobCatalogBuilder::new(scope).unwrap();
+        for record in [mb_git::GitBlobRecord::Blob { format_version: 1, oid: blob_oid.as_bytes().try_into().unwrap(), logical_len: 8192, extents: 1, sectors: 1 }, mb_git::GitBlobRecord::Extent { offset: 4096, logical_len: payload.len() as u64, sectors: 1 }, mb_git::GitBlobRecord::Sectors { first_sector: 0, references: vec![reference.clone()] }] { blobs.push_record(&record, &mut |page, bytes| stage(git_intents[2], page, bytes)).unwrap(); }
+        mb_git::GitCatalogRoot { format_version: 1, repository_id: root, refs, objects, blobs: blobs.finish(&mut |page, bytes| stage(git_intents[2], page, bytes)).unwrap() }
+    });
     let private = crate::PagedPrivateMetadata {
         format_version: mb_core::PAGED_USER_REVISION_VERSION,
         native: mb_core::CatalogNativeFileRoot {
@@ -940,7 +1029,7 @@ fn local_private_checkpoint_revision(
             namespace,
             recipes,
         },
-        git: None,
+        git,
     };
     let (metadata, bootstrap) = private.seal(&node.keys, scope).unwrap();
     records.insert(metadata.sector.id, (metadata.clone(), bootstrap));
@@ -972,8 +1061,25 @@ fn local_private_checkpoint_revision(
     }
     .sign(writer, &node.keys)
     .unwrap();
+    let data_source = data.as_ref().map(|(_, payload)| {
+        let source_root = node.data_dir.join("retained-git-source");
+        std::fs::create_dir(&source_root).unwrap();
+        let area = mb_store::StableAnchorAreaLocator::prepare_for_root(&source_root).unwrap();
+        let anchor_id = Uuid::new_v4();
+        let directory = area.path_hint.join(anchor_id.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("payload"), payload).unwrap();
+        crate::PagedAnchorSectorSource {
+            locator: mb_store::StableAnchorFileLocator {
+                area,
+                anchor_id,
+                relative_path: "payload".into(),
+            },
+            offset: 0,
+        }
+    });
     private
-        .publish_local_catalog(
+        .publish_local_catalog_with_data_sources(
             &node.control,
             &node.keys,
             &signed,
@@ -985,7 +1091,13 @@ fn local_private_checkpoint_revision(
             crate::PagedCatalogIntents {
                 native: [intents[0], intents[1]],
                 sources: intents[2],
-                git: None,
+                git: git_intents,
+            },
+            |record| {
+                Ok(data.as_ref().and_then(|(reference, _)| {
+                    (record.sector.id == reference.id)
+                        .then(|| data_source.as_ref().unwrap().clone())
+                }))
             },
         )
         .unwrap();
@@ -1112,6 +1224,29 @@ fn checkpoint_owner_proof_at_with_legacy_private(
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
+    checkpoint_owner_proof_with_git_inner::<false>(
+        node,
+        keys,
+        private,
+        expires,
+        budgeted,
+        rooted_sources,
+        legacy_private,
+    )
+}
+
+fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
+    node: &mut Node,
+    keys: &[KeyMaterial],
+    private: bool,
+    expires: u64,
+    budgeted: bool,
+    rooted_sources: bool,
+    legacy_private: bool,
+) -> (
+    mb_store::CatalogQuorumPagedCheckpointIndex,
+    Vec<mb_store::CatalogIntent>,
+) {
     use mb_core::{
         CatalogBuilder, CatalogCheckpointAuthorityBuilder, CatalogCheckpointAuthorityRecord as R,
         CatalogCodingDirectoryBuilder, CatalogLegacyRevisionRef, CatalogPackedSectorBuilder,
@@ -1206,7 +1341,7 @@ fn checkpoint_owner_proof_at_with_legacy_private(
         ),
     )]);
     let paged = private.then(|| {
-        let (signed, sources) = local_private_checkpoint_revision(
+        let (signed, sources) = local_private_checkpoint_revision_inner::<GIT>(
             node,
             &writer,
             guild,
