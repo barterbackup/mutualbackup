@@ -1,6 +1,7 @@
 mod checkpoint_acquisition;
 mod checkpoint_directories;
 mod checkpoint_directory_retention;
+mod historical_authority;
 mod packing_checkpoint_handoff;
 mod paged_checkpoint_custody;
 mod paged_checkpoint_lookup;

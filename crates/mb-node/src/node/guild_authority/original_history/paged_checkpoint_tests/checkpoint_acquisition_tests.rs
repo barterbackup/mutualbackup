@@ -120,6 +120,21 @@ macro_rules! cases {
             drop(original);
             std::fs::remove_dir_all(temp.path()).unwrap();
             assert!(!temp.path().exists());
+            let later = event(
+                &survivor,
+                &keys,
+                mb_core::GuildEventKind::SetQuorum {
+                    policy: mb_core::QuorumPolicy {
+                        format_version: 1,
+                        rule: mb_core::QuorumRule::Majority,
+                    },
+                },
+            );
+            survivor.install_guild_event(later).unwrap();
+            let latest = super::super::super::frozen_original_history(&survivor.control)
+                .unwrap()
+                .paged_checkpoint_trust()
+                .unwrap();
             let server_id = survivor.keys.node_id();
             let server_node = Arc::new(Mutex::new(survivor));
             let (server, server_loop) =
@@ -147,10 +162,10 @@ macro_rules! cases {
             .unwrap();
             client.add_peer_address(server_id, address).await.unwrap();
             let history_target = crate::CheckpointHistoryTarget {
-                guild_id: proof.trust().guild_id,
-                genesis_hash: proof.trust().genesis_hash,
-                event_sequence: proof.trust().event_sequence,
-                event_head: proof.trust().event_head,
+                guild_id: latest.guild_id,
+                genesis_hash: latest.genesis_hash,
+                event_sequence: latest.event_sequence,
+                event_head: latest.event_head,
             };
             let history = client
                 .bootstrap_retained_checkpoint_history(
@@ -184,10 +199,11 @@ macro_rules! cases {
             let interrupted_certificate = certificate.clone();
             let interrupted = tokio::task::spawn_blocking(move || {
                 let mut calls = 0;
-                let result = session.acquire_public_checkpoint(
+                let result = session.acquire_public_checkpoint_after(
                     owner,
                     interrupted_certificate.clone(),
                     budget,
+                    None,
                     |path| {
                         calls += 1;
                         if calls == 2 {
@@ -232,10 +248,11 @@ macro_rules! cases {
             let cancel_job = cancelled.clone();
             let cancelled_result = tokio::task::spawn_blocking(move || {
                 let mut checked = false;
-                let result = cancel_session.acquire_public_checkpoint(
+                let result = cancel_session.acquire_public_checkpoint_after(
                     cancelled_id,
                     cancel_certificate.clone(),
                     budget,
+                    None,
                     |path| {
                         let bytes = runtime.block_on(
                             cancel_client.retained_paged_checkpoint_public_page(
@@ -276,14 +293,18 @@ macro_rules! cases {
                 .unwrap()
                 .retained_checkpoint_restore()
                 .unwrap();
-            let (session, job) = client
-                .acquire_retained_checkpoint_public_catalog(
+            let (session, job, _) = client
+                .acquire_retained_checkpoint_public_catalog_after(
                     session,
                     owner,
                     peer,
-                    certificate.layout(),
-                    certificate.hash().unwrap(),
+                    (
+                        certificate.layout(),
+                        certificate.hash().unwrap(),
+                        certificate.event_sequence(),
+                    ),
                     budget,
+                    None,
                 )
                 .await
                 .expect("cold public acquisition over QUIC");
@@ -306,7 +327,7 @@ macro_rules! cases {
                 mb_store::CatalogCheckpointAcquisitionState::Building
             );
             session
-                .promote_acquired_checkpoint(&job, None)
+                .promote_acquired_checkpoint_after(&job, None)
                 .expect("cold complete original public proof");
             let request = RetainedSnapshotRestore {
                 layout: mb_core::PagedCheckpointLayout::$layout,
@@ -331,7 +352,7 @@ macro_rules! cases {
                 .lock()
                 .unwrap()
                 .control
-                .cancel_checkpoint_acquisition(&job)
+                .cancel_checkpoint_recovery_tip(&job)
                 .unwrap();
             while receiver
                 .lock()

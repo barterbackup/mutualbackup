@@ -470,6 +470,39 @@ impl<'a> AuthorityReader<'a> {
         Ok(trust)
     }
 
+    pub(crate) fn paged_checkpoint_trust_at(
+        &self,
+        sequence: u64,
+        previous: Option<mb_core::PagedCheckpointParent>,
+    ) -> Result<mb_core::PagedCheckpointTrust> {
+        self.check()?;
+        let history = self
+            .history
+            .as_ref()
+            .context("historical checkpoint trust requires complete original indexing")?;
+        let view = history.view(self.control, history.genesis_hash(), &self.current)?;
+        let snapshot = view.authority_at_event(
+            sequence,
+            mb_store::CatalogDurableGuildHistoryView::historical_authority_work(),
+        )?;
+        let trust = mb_core::PagedCheckpointTrust {
+            guild_id: snapshot.guild_id,
+            genesis_hash: history.genesis_hash(),
+            event_sequence: snapshot.event_sequence,
+            event_head: snapshot.event_head,
+            authority: mb_core::CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: snapshot.membership_epoch,
+                quorum: snapshot.quorum,
+            },
+            members: snapshot.active_members().cloned().collect(),
+            previous,
+        };
+        trust.validate()?;
+        self.check()?;
+        Ok(trust)
+    }
+
     pub(crate) fn current_recovery_key(
         &self,
         owner: NodeId,

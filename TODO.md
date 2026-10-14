@@ -2553,6 +2553,46 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Qualify historical predecessor proofs and checkpoint recovery progress.
+      Historical predecessor proofs and separate checkpoint recovery progress (2026-10-14):
+      The durable original-history view derives bounded membership at an exact original
+      event tip. It reads fixed tip/epoch rows, verifies the original event certificate,
+      rechecks canonical bytes and fences the complete current index. Checkpoint recovery
+      replays the selected original prefix for writer, coding and transition validation,
+      even after later quorum changes or writer revocation. A completed predecessor proof
+      must carry the certified original-history transition marker; generic quorum-bound
+      transition proofs do not satisfy this recovery boundary.
+      An independent paired recovery tip advances only with a completed acquisition and
+      published original public metadata owner. Its exact certificate, trust hash, budget,
+      layout and generation are checked. Failed or ignored tip writes roll back acquisition
+      completion. The active recovery tip fences owner/job cancellation; explicit tip
+      cancellation preserves public owners and original protection heads while fencing late
+      completion. Normal protection heads and activation remain separate. Peer acquisition
+      can carry one complete predecessor proof between steps, using the existing authenticated
+      certificate/page RPCs and leased restore session. Historical READY custody retains
+      full original witness and byte checks.
+      Both layout chain cases pass focused tests for second-generation proof validation,
+      ABORT/IGNORE tip publication faults, interrupted child acquisition and receiver reopen,
+      missing/uncertified predecessors, later writer rotation/revocation, and exact native/Git
+      restore from original retained parity. The historical lookup case verifies every original
+      tip across later membership/quorum changes, reopen, insufficient work and corrupt signatures.
+      Both real QUIC seed-only cases also fetch an older checkpoint after a later quorum event.
+      Frozen qualification passes 1,575 distinct cases: 1,302 fresh and 273 reused
+      from exactly unchanged executables. All 584 ordinary Node, 521 Store, 131 Git
+      and 23 process acceptance cases pass, plus three bulk gates and four provisioned
+      Linux native cases. The unchanged Core executable preserves its 210 qualified
+      cases. Format, strict locked all-target workspace Clippy, builds, source/binary
+      hash checks and native cleanup pass. Independent audit verifies 393 inputs and
+      23 executables; 121 ignored cases remain unexecuted. Verified retirement removes
+      23 superseded archive paths and two exploratory executables, reclaiming 10.28 GiB.
+      Target uses 62.29 GiB, including two new preserved fixture failure binaries with
+      source snapshots and logs. Current binaries, failed/older qualified evidence,
+      14 auxiliary WIP files and all 10 installed roots remain preserved.
+      Automatic DHT discovery/selection, legacy
+      predecessor recovery, complete ancestry retention/retirement, normal paged production
+      and distributed activation, full global/physical admission and remaining M6 gates stay
+      open. Dense 1 TiB and Windows/macOS hardware runs remain user-deferred.
+      Evidence: `/tmp/mb-m6-checkpoint-chain-fzqs3acu`.
     - [x] Qualify bounded original-history peer bootstrap before recovery.
       Bounded original-history peer bootstrap before retained recovery (2026-10-14):
       An explicit peer recovery operation fetches original genesis, bounded event tails

@@ -6,6 +6,8 @@ mod checkpoint_acquisition_tests;
 #[cfg(target_os = "linux")]
 mod checkpoint_bootstrap_tests;
 #[cfg(target_os = "linux")]
+mod checkpoint_chain_tests;
+#[cfg(target_os = "linux")]
 mod checkpoint_peer_restore_tests;
 #[cfg(target_os = "linux")]
 mod checkpoint_restore_tests;

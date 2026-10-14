@@ -59,6 +59,8 @@ type ControlRecord = (String, Vec<u8>, Vec<u8>);
 
 #[cfg(target_os = "linux")]
 mod checkpoint_acquisition;
+#[cfg(target_os = "linux")]
+pub use checkpoint_acquisition::RecoveredCheckpointProof;
 mod checkpoint_custody;
 #[cfg(target_os = "linux")]
 mod checkpoint_history;

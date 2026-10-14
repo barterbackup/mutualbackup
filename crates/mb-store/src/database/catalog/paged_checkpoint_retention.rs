@@ -278,11 +278,20 @@ impl ControlStore {
             retained_source_quota::require_capacity_backing(&self.connection)?;
         }
         let trust = read_trust()?;
-        if snapshot_hash(&trust)? != retention.trust_hash
-            || self.checkpoint_head_identity(&retention.checkpoint.guild_id())?
-                != trust
-                    .previous
-                    .map(|parent| (parent.generation, parent.hash))
+        if snapshot_hash(&trust)? != retention.trust_hash {
+            return Err(DatabaseError::Conflict.into());
+        }
+        if self.checkpoint_head_identity(&retention.checkpoint.guild_id())?
+            != trust
+                .previous
+                .map(|parent| (parent.generation, parent.hash))
+            && !checkpoint_acquisition::recovery_candidate(
+                &self.connection,
+                retention.id,
+                retention.checkpoint.hash()?,
+                retention.trust_hash,
+                retention.budget,
+            )?
         {
             return Err(DatabaseError::Conflict.into());
         }
@@ -574,6 +583,9 @@ impl ControlStore {
         retention: CatalogPagedCheckpointRetention<H>,
     ) -> Result<(), CatalogStoreError> {
         require_layout::<H>(&self.connection, retention.id)?;
+        if checkpoint_acquisition::recovery_owner(&self.connection, retention.id)? {
+            return Err(DatabaseError::Conflict.into());
+        }
         let owned = retention.checkpoint.hash()?;
         if self
             .checkpoint_head_identity(&retention.checkpoint.guild_id())?

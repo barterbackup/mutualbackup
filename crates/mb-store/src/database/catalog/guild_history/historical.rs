@@ -5,10 +5,10 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct Tip {
     pub(super) sequence: u64,
-    head: [u8; 32],
-    membership_epoch: u64,
-    retained: u64,
-    retired: u64,
+    pub(super) head: [u8; 32],
+    pub(super) membership_epoch: u64,
+    pub(super) retained: u64,
+    pub(super) retired: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

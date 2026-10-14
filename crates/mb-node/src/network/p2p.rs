@@ -2599,6 +2599,79 @@ impl P2pClient {
         }
     }
 
+    /// Recover a selected original checkpoint after a complete predecessor.
+    /// Selection fields are hints; original history and predecessor proof supply
+    /// quorum/transition authority. Keep only one previous proof between steps.
+    #[cfg(target_os = "linux")]
+    pub async fn acquire_retained_checkpoint_public_catalog_after(
+        &self,
+        session: crate::RetainedCheckpointRestore,
+        id: Uuid,
+        peer: crate::RetainedCheckpointPeer,
+        selection: (mb_core::PagedCheckpointLayout, [u8; 32], u64),
+        budget: mb_core::CatalogCodingTraversalBudget,
+        previous: Option<crate::RecoveredCheckpointProof>,
+    ) -> Result<(
+        crate::RetainedCheckpointRestore,
+        mb_store::CatalogCheckpointAcquisition,
+        Option<crate::RecoveredCheckpointProof>,
+    )> {
+        anyhow::ensure!(
+            !id.is_nil() && !peer.owner_id.is_nil() && peer.node_id.0 != [0; 32],
+            "invalid recovery checkpoint peer or job"
+        );
+        let (layout, hash, sequence) = selection;
+        let trust = session.public_checkpoint_trust_after(sequence, previous.as_ref())?;
+        let certificate = match layout {
+            mb_core::PagedCheckpointLayout::Individual => {
+                mb_store::CatalogPublicCheckpoint::Individual(
+                    self.retained_paged_checkpoint_certificate(
+                        peer.node_id,
+                        peer.owner_id,
+                        hash,
+                        &trust,
+                        budget,
+                    )
+                    .await?,
+                )
+            }
+            mb_core::PagedCheckpointLayout::Directory => {
+                mb_store::CatalogPublicCheckpoint::Directory(
+                    self.retained_paged_checkpoint_directory_certificate(
+                        peer.node_id,
+                        peer.owner_id,
+                        hash,
+                        &trust,
+                        budget,
+                    )
+                    .await?,
+                )
+            }
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let client = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let job = session.acquire_public_checkpoint_after(
+                id,
+                certificate,
+                budget,
+                previous.as_ref(),
+                |path| {
+                    runtime.block_on(client.retained_paged_checkpoint_public_page(
+                        peer.node_id,
+                        layout,
+                        peer.owner_id,
+                        hash,
+                        path,
+                    ))
+                },
+            )?;
+            Ok((session, job, previous))
+        })
+        .await
+        .context("checkpoint chain acquisition worker panicked")?
+    }
+
     /// Acquire all authenticated public trees through one independently
     /// leased session. Original local event history supplies quorum trust;
     /// downloaded prefixes remain unavailable until full proof promotion.

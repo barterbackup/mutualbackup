@@ -733,6 +733,100 @@ pub struct CatalogDurableGuildHistoryView<'a> {
     control: &'a ControlStore,
 }
 impl CatalogDurableGuildHistoryView<'_> {
+    /// Fixed original event/epoch reads derive membership at a certified
+    /// historical tip. Non-membership effects remain in the complete durable
+    /// history and are replayed by the enclosing checkpoint proof.
+    pub fn historical_authority_work() -> Work {
+        Work {
+            bytes: (GUILD_AUTHORITY_SNAPSHOT_BYTES * 4 + GUILD_EVENT_BYTES * 2 + ROW_BYTES * 8)
+                as u64,
+            records: 16,
+            page_occurrences: 0,
+        }
+    }
+    pub fn authority_at_event(
+        &self,
+        sequence: u64,
+        budget: Work,
+    ) -> Result<GuildAuthoritySnapshot, CatalogStoreError> {
+        budget.remaining_after(Self::historical_authority_work())?;
+        if sequence > self.history.authority().event_sequence {
+            return Err(DatabaseError::NotReady.into());
+        }
+        let tip = self.event_tip(sequence)?;
+        let mut roster = self.epoch_roster(tip.membership_epoch, sequence)?;
+        roster.event_sequence = sequence;
+        roster.event_head = tip.head;
+        roster.validate()?;
+        if sequence == 0 {
+            if tip.head != self.history.genesis_hash()
+                || tip.membership_epoch != 1
+                || tip.retained != 0
+                || tip.retired != 0
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+        } else {
+            let previous = self.event_tip(sequence - 1)?;
+            let mut before = self.epoch_roster(previous.membership_epoch, sequence - 1)?;
+            before.event_sequence = previous.sequence;
+            before.event_head = previous.head;
+            let key = sequence.to_be_bytes();
+            let bytes = self
+                .control
+                .get_record_bounded("guild-event", &key, GUILD_EVENT_BYTES)?
+                .ok_or(DatabaseError::NotReady)?;
+            let event = QuorumGuildEvent::decode_bounded(&bytes)?;
+            before.advance_indexed::<CatalogStoreError, _>(&event, |_, _| Ok(()))?;
+            if before != roster
+                || event.event.hash()? != tip.head
+                || self
+                    .control
+                    .get_record_bounded("guild-event", &key, GUILD_EVENT_BYTES)?
+                    .as_deref()
+                    != Some(bytes.as_slice())
+            {
+                return Err(DatabaseError::Integrity.into());
+            }
+        }
+        self.history.check(self.control)?;
+        Ok(roster)
+    }
+    fn event_tip(&self, sequence: u64) -> Result<historical::Tip, CatalogStoreError> {
+        let tip = self
+            .point::<historical::Tip>(EVENTS, &sequence.to_be_bytes())?
+            .ok_or(DatabaseError::NotReady)?;
+        if tip.sequence != sequence
+            || tip.head == [0; 32]
+            || tip.membership_epoch == 0
+            || tip.membership_epoch > self.history.authority().membership_epoch
+            || tip.retired > tip.retained
+            || tip.retained > sequence
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(tip)
+    }
+    fn epoch_roster(
+        &self,
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<GuildAuthoritySnapshot, CatalogStoreError> {
+        let roster = self
+            .point::<GuildAuthoritySnapshot>(MEMBERS, &epoch.to_be_bytes())?
+            .ok_or(DatabaseError::NotReady)?;
+        GuildAuthoritySnapshot::decode(&canonical_bytes_bounded(
+            &roster,
+            GUILD_AUTHORITY_SNAPSHOT_BYTES,
+        )?)?;
+        if roster.guild_id != self.history.authority().guild_id
+            || roster.membership_epoch != epoch
+            || roster.event_sequence > sequence
+        {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(roster)
+    }
     /// Authenticate an original plan against its independently indexed roster.
     /// Historical activation evidence remains valid after expiry or removal;
     /// this does not authorize launching or protecting a new coding attempt.

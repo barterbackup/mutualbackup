@@ -3,6 +3,21 @@
 use super::*;
 use mb_core::{CatalogCodingTraversalBudget as Work, PagedCheckpointLayout, PagedCheckpointTrust};
 
+mod recovery_tip;
+pub use recovery_tip::CatalogCheckpointRecoveryTip;
+pub(super) fn recovery_candidate(
+    cx: &Connection,
+    id: Uuid,
+    hash: [u8; 32],
+    trust_hash: [u8; 32],
+    budget: Work,
+) -> Result<bool, CatalogStoreError> {
+    recovery_tip::allows_candidate(cx, id, hash, trust_hash, budget)
+}
+pub(super) fn recovery_owner(cx: &Connection, id: Uuid) -> Result<bool, CatalogStoreError> {
+    Ok(recovery_tip::read(cx)?.is_some_and(|tip| tip.owner == id))
+}
+
 const JOB: &str = "catalog-checkpoint-acquisition-v1";
 const GUARD: &str = "catalog-checkpoint-acquisition-guard-v1";
 const BYTES: usize =
@@ -31,6 +46,30 @@ impl CatalogPublicCheckpoint {
         match self {
             Self::Individual(c) => c.checkpoint.guild_id,
             Self::Directory(c) => c.checkpoint.guild_id,
+        }
+    }
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Individual(c) => c.checkpoint.generation,
+            Self::Directory(c) => c.checkpoint.generation,
+        }
+    }
+    pub fn event_sequence(&self) -> u64 {
+        match self {
+            Self::Individual(c) => c.checkpoint.event_sequence,
+            Self::Directory(c) => c.checkpoint.event_sequence,
+        }
+    }
+    pub fn previous_identity(&self) -> Option<(u64, [u8; 32])> {
+        match self {
+            Self::Individual(c) => c
+                .checkpoint
+                .parent
+                .map(|hash| (c.checkpoint.generation.saturating_sub(1), hash)),
+            Self::Directory(c) => c
+                .checkpoint
+                .parent
+                .map(|hash| (c.checkpoint.generation.saturating_sub(1), hash)),
         }
     }
     pub fn authority(&self) -> mb_core::CatalogCheckpointAuthorityRoot {
@@ -479,6 +518,9 @@ impl ControlStore {
         if job.spec != *spec {
             return Err(DatabaseError::Conflict.into());
         }
+        if recovery_owner(&tx, spec.id)? {
+            return Err(DatabaseError::Conflict.into());
+        }
         let next = Job {
             state: CatalogCheckpointAcquisitionState::Cancelled,
             ..job.clone()
@@ -493,6 +535,19 @@ impl ControlStore {
     pub fn finish_checkpoint_acquisition(
         &self,
         spec: &CatalogCheckpointAcquisition,
+    ) -> Result<(), CatalogStoreError> {
+        self.finish_checkpoint_acquisition_inner(spec, false)
+    }
+    pub fn finish_checkpoint_recovery_acquisition(
+        &self,
+        spec: &CatalogCheckpointAcquisition,
+    ) -> Result<(), CatalogStoreError> {
+        self.finish_checkpoint_acquisition_inner(spec, true)
+    }
+    fn finish_checkpoint_acquisition_inner(
+        &self,
+        spec: &CatalogCheckpointAcquisition,
+        recovery: bool,
     ) -> Result<(), CatalogStoreError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let job = read(&tx, spec.id)?.ok_or(DatabaseError::NotReady)?;
@@ -537,6 +592,9 @@ impl ControlStore {
             ..job.clone()
         };
         write(&tx, &job, &next)?;
+        if recovery {
+            recovery_tip::publish(&tx, spec)?;
+        }
         tx.commit()?;
         Ok(())
     }

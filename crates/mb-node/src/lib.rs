@@ -97,7 +97,8 @@ pub use node::{
 #[cfg(target_os = "linux")]
 pub use node::{
     CheckpointHistoryRecovery, CheckpointHistoryRecoveryState, CheckpointHistoryTarget,
-    RetainedCheckpointPeer, RetainedCheckpointRestore, RetainedSnapshotRestore,
+    RecoveredCheckpointProof, RetainedCheckpointPeer, RetainedCheckpointRestore,
+    RetainedSnapshotRestore,
 };
 pub use paged_revision::{
     PAGED_PRIVATE_METADATA_BYTES, PagedCatalogIntents, PagedPrivateMetadata,
