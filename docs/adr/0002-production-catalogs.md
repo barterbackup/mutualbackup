@@ -7043,3 +7043,79 @@ distributed activation, normal production/retention/seed recovery, legacy
 consumers and R1/R2/R3/R5/R7 remain open. Normal paged producers remain disabled;
 dense 1 TiB and native Windows/macOS host tests remain user-deferred. Evidence:
 `/tmp/mb-m6-git-metadata-chunks-p158blav`.
+
+### Bounded complete paged Git catalog installation (2026-10-14)
+
+Complete paged Git catalogs now install exact metadata, refs, native blob
+mappings, the selected branch and the clean HEAD index into an empty local
+catalog. The caller authenticates the enclosing descriptor and retains the
+independently recovered native anchors. Original refs, object IDs, raw names,
+executable/symlink modes and shared-tree paths are preserved. The operation does
+not advance a protected backup head or certify distributed availability.
+
+Complete semantic graph validation runs first in an encrypted disposable index.
+The original paged object stream is then staged as immutable v2 headers and
+32 KiB fragments; refs and output rows are also bounded. Each blob anchor must
+verify native ownership/content, original plaintext Git OID and logical length;
+every historical symlink blob must contain a publishable target. Page/blob I/O
+stays outside the destination writer. HEAD expansion stores DFS frames on disk,
+preserves each shared-tree path and separately bounds expanded output entries.
+
+Default scratch is pinned on the destination catalog filesystem and includes
+checkpoint-copy/WAL reservations and the existing physical allocation guards.
+Node consumers can supply their explicitly admitted private scratch with
+configured volume headroom. Complete aggregate job/data quotas remain separate.
+
+The final destination transaction rechecks empty or exact-retry identity,
+performs checked row insertion/readback and publishes installation provenance
+only after complete metadata validation. Abort/ignore or a late competing
+writer rolls back the whole installation. Completed retries compare existing output
+rows; missing or changed rows are rejected without restoring deleted refs or
+replacing user changes. Metadata-only staging for the exact original object
+root can be completed; unrelated metadata or blob owners cannot be adopted.
+
+Preserved inventory validates the installation namespace and its original
+metadata-root link. The marker records immutable provenance; ordinary mutable
+refs/index rows keep their existing meanings and validators. Five regressions
+cover read-only public inventory, long refs, original history/tags/bytes/modes
+and shared paths after reopen; ABORT/IGNORE on output rows and final ownership;
+lost pages, substituted anchors and NUL symlink targets; late competing rows,
+missing completed retry rows and namespace aliases; and installation/streaming
+of a commit above 64 MiB without a legacy metadata row or whole-object read.
+An explicit 1,027-object corpus above 512 MiB exercises graph validation,
+private staging, atomic installation and ordinary short-history/tag reads.
+
+This completes the local Git catalog installation component from already
+recovered native blob anchors. Checkpoint-bound blob recovery/custody transfer,
+normal paged graph/refs/blob consumers and complete aggregate/physical admission
+remain required before normal producers, retention and seed-only recovery can
+be activated. R1/R2/R3/R5/R7 and native platform gates remain open. Dense 1 TiB
+and Windows/macOS host qualification remain user-deferred.
+
+Frozen qualification passes 1,549 distinct cases in 1,549 executions: 766
+fresh runs and 783 exact unchanged cases reused with source/binary guards.
+It includes 130 ordinary Git, 571 Node, 509 unchanged Store, 210 unchanged Core,
+23 prototype acceptance, three explicit bulk cases, four provisioned Linux
+native fixtures and other workspace targets. Format, strict locked workspace/
+all-targets Clippy, all executable builds and test compilation pass. The new
+1,027-object/537,395,310-byte full-import corpus passes in 312.28 seconds with
+23.35 MiB peak RSS. The existing 512.5 MiB metadata reader corpus passes in
+136.50 seconds with 24.19 MiB peak RSS. Ordinary Git passes in 166.06 seconds,
+Node in 1,713.61 seconds; the longest native fixture passes in 556.07 seconds
+under its unchanged 900-second limit.
+
+The first full run passed its bulk/native cases but failed one Git fixture:
+129 passed, one failed and 66 ignored. That fixture incorrectly used an
+unregistered procfs path as a database directory capability. The corrected
+fixture explicitly rejects that path, then uses the same registered directory-
+bound store API as GitRepository. Default scratch now directly preserves the
+registered capability and checkpoint path. The complete corrected run passes;
+the exact failed source, log and executable remain preserved separately.
+
+The independent audit binds 374 inputs (371 code/dependency inputs), 23
+executables and 19 ordinary drivers. Source/binary immutability and native
+mount/image/loop cleanup pass. 121 other ignored cases remain unexecuted.
+Exact superseded-inode retirement reclaims 9.50 GiB; target uses 50.30 GiB.
+Current executables, 29 older archived paths, both failed Node artifacts, both
+failed Git fixtures, 14 auxiliary WIP files and all 10 installed roots remain
+intact. Evidence: `/tmp/mb-m6-paged-git-install-gbaalutb`.

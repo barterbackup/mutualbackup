@@ -43,6 +43,8 @@ mod odb;
 mod paged_catalog;
 mod paged_graph;
 #[cfg(target_os = "linux")]
+mod paged_import;
+#[cfg(target_os = "linux")]
 mod prune;
 mod ref_catalog;
 #[cfg(target_os = "linux")]

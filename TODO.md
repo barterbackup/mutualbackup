@@ -2553,6 +2553,29 @@ and native-platform gates remain open.
     assume other owners will fill the reserved slots, silently narrow the
     supported domain/dataset target, or treat isolated fully occupied coding
     sizes as complete 1 TiB admission. See ADR 0002.
+    - [x] Install complete paged Git catalogs from recovered native blob anchors.
+      Complete graph validation and all page/blob I/O precede the destination
+      writer. An encrypted disk index stages bounded metadata/ref/blob rows and
+      expands shared HEAD trees with disk-backed frames, preserving raw paths
+      and executable/symlink modes. Original plaintext blob OIDs/lengths and all
+      historical symlink targets must verify. The final transaction rechecks
+      empty/exact-retry identity, checks every write and publishes provenance.
+      Completed retries reject missing/changed rows without restoring deleted
+      refs or replacing user changes. Default scratch uses the registered catalog
+      filesystem capability with WAL reservations; Node may supply admitted
+      scratch with configured headroom. Five ordinary Git regressions and one
+      explicit >512 MiB import corpus pass. Frozen qualification passes 1,549
+      cases: 766 fresh and 783 exact unchanged reused. Format, strict Clippy,
+      builds, three bulk gates, four Linux native fixtures and 374-input/
+      23-executable audits pass. Full import peaks at 23.35 MiB RSS; 121
+      ignored cases remain unexecuted. An initially incorrect descriptor fixture
+      is corrected; its exact failed source/log/binary remains preserved.
+      Verified retirement reclaims 9.50 GiB; target uses 50.30 GiB.
+      Checkpoint-bound blob recovery/custody transfer, normal paged graph/ref/
+      blob consumers, complete aggregate/physical admission, distributed
+      activation, normal production/retention/seed recovery and R1/R2/R3/R5/R7
+      remain open. Producers stay disabled; hardware stays deferred. Evidence:
+      `/tmp/mb-m6-paged-git-install-gbaalutb`; see ADR 0002.
     - [x] Retain original paged Git metadata in bounded v2 fragments.
       Immutable headers and 32 KiB fragments preserve original OIDs and publish
       only after complete typed EOF. Same-writer empty/exact-retry checks and

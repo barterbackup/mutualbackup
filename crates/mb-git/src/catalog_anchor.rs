@@ -17,6 +17,21 @@ const MAX_HINT: usize = MAX_PATH + 16;
 #[derive(Serialize, Deserialize)]
 struct RawPath(#[serde(with = "mb_store::raw_path_bytes")] PathBuf);
 
+pub(crate) fn location_record(
+    manifest: &FileAnchorManifest,
+    path: &Path,
+) -> anyhow::Result<(String, Vec<u8>, Vec<u8>)> {
+    anyhow::ensure!(
+        path.as_os_str().as_encoded_bytes().len() <= MAX_PATH,
+        "anchor location exceeds its bound"
+    );
+    Ok((
+        HINT_KIND.to_owned(),
+        manifest.area.area_id.as_bytes().to_vec(),
+        mb_core::canonical_bytes_bounded(&RawPath(path.to_path_buf()), MAX_HINT)?,
+    ))
+}
+
 pub(crate) fn hint(
     control: &ControlStore,
     manifest: &FileAnchorManifest,

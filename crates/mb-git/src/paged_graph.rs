@@ -22,6 +22,7 @@ const NODES: &str = "git-graph-node";
 const EDGES: &str = "git-graph-edge";
 const STACK: &str = "git-graph-stack";
 const NAMES: &str = "git-graph-tree-name";
+const SYMLINKS: &str = "git-graph-symlink-blob";
 
 #[derive(Serialize, Deserialize)]
 struct Node {
@@ -41,6 +42,7 @@ struct Edge {
     kind: u8,
     name: Vec<u8>,
     symlink: bool,
+    mode: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -149,6 +151,17 @@ impl GraphIndex<'_> {
             (Some(ObjectType::Blob), 0o100644 | 0o100755 | 0o120000) => 4,
             _ => anyhow::bail!("unsupported Git tree entry kind or mode"),
         };
+        if entry.filemode() == 0o120000 {
+            self.store
+                .put_record_if_absent(SYMLINKS, entry.id().as_bytes(), &[])?;
+            ensure!(
+                self.store
+                    .get_record_bounded(SYMLINKS, entry.id().as_bytes(), 0)?
+                    .as_deref()
+                    == Some(&[]),
+                "symlink identity write was ignored"
+            );
+        }
         self.edge(
             oid,
             node,
@@ -157,6 +170,7 @@ impl GraphIndex<'_> {
                 kind,
                 name: name.to_vec(),
                 symlink: entry.filemode() == 0o120000,
+                mode: entry.filemode() as u32,
             },
         )
     }
@@ -373,6 +387,7 @@ impl TextParser {
                             kind: 2,
                             name: Vec::new(),
                             symlink: false,
+                            mode: 0,
                         },
                     )?;
                     self.phase = 1;
@@ -387,6 +402,7 @@ impl TextParser {
                             kind: 1,
                             name: Vec::new(),
                             symlink: false,
+                            mode: 0,
                         },
                     )?;
                 }
@@ -425,6 +441,7 @@ impl TextParser {
                             kind,
                             name: Vec::new(),
                             symlink: false,
+                            mode: 0,
                         },
                     )?;
                     self.phase = 2;
@@ -741,6 +758,107 @@ impl GitCatalogRoot {
         })?;
         Ok(())
     }
+}
+
+/// Use only the complete semantic index produced for this root. This expands
+/// shared trees by path while keeping DFS frames on disk and bounds the actual
+/// index output independently of the number of unique graph objects.
+#[cfg(target_os = "linux")]
+pub(crate) fn for_each_head_entry(
+    root: &GitCatalogRoot,
+    store: &RecordScratchStore,
+    mut visit: impl FnMut(&[u8], [u8; 20], u32) -> Result<()>,
+) -> Result<()> {
+    #[derive(Serialize, Deserialize)]
+    struct TreeFrame {
+        oid: [u8; 20],
+        next: u64,
+        prefix: Vec<u8>,
+    }
+    const FRAMES: &str = "git-import-head-frame";
+    let Some(head) = root.refs.selected_head else {
+        return Ok(());
+    };
+    let (commit, _): (Node, _) = row(store, NODES, &head)?;
+    ensure!(
+        commit.kind == 1 && commit.state == 2,
+        "unverified selected commit"
+    );
+    let (tree, _): (Edge, _) = row(store, EDGES, &edge_key(&head, 0))?;
+    ensure!(tree.kind == 2, "selected commit has no tree");
+    let mut depth = 1u64;
+    let mut count = 0u64;
+    put(
+        store,
+        FRAMES,
+        &depth.to_be_bytes(),
+        &encode(&TreeFrame {
+            oid: tree.target,
+            next: 0,
+            prefix: Vec::new(),
+        })?,
+    )?;
+    while depth != 0 {
+        let key = depth.to_be_bytes();
+        let (mut frame, original): (TreeFrame, _) = row(store, FRAMES, &key)?;
+        let (node, _): (Node, _) = row(store, NODES, &frame.oid)?;
+        ensure!(node.kind == 2 && node.state == 2, "unverified HEAD tree");
+        if frame.next == node.edges {
+            store.delete_record_if_value(FRAMES, &key, &original)?;
+            depth -= 1;
+            continue;
+        }
+        let (edge, _): (Edge, _) = row(store, EDGES, &edge_key(&frame.oid, frame.next))?;
+        let mut path = frame.prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&edge.name);
+        ensure!(
+            path.len() <= crate::stage::MAX_STAGE_PATH_BYTES,
+            "HEAD path exceeds its bound"
+        );
+        frame.next += 1;
+        store.replace_record_if_value(FRAMES, &key, &original, &encode(&frame)?)?;
+        match edge.kind {
+            2 => {
+                ensure!(
+                    depth < crate::stage::MAX_STAGE_PATH_BYTES as u64,
+                    "HEAD tree depth exceeds its bound"
+                );
+                depth += 1;
+                put(
+                    store,
+                    FRAMES,
+                    &depth.to_be_bytes(),
+                    &encode(&TreeFrame {
+                        oid: edge.target,
+                        next: 0,
+                        prefix: path,
+                    })?,
+                )?;
+            }
+            4 => {
+                count = count.checked_add(1).context("HEAD entry count overflow")?;
+                ensure!(
+                    count <= CATALOG_MAX_RECORDS,
+                    "expanded HEAD index exceeds its bound"
+                );
+                ensure!(
+                    matches!(edge.mode, 0o100644 | 0o100755 | 0o120000),
+                    "invalid HEAD mode"
+                );
+                visit(&path, edge.target, edge.mode)?;
+            }
+            _ => anyhow::bail!("invalid HEAD tree edge"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn blob_is_symlink(store: &RecordScratchStore, oid: &[u8; 20]) -> Result<bool> {
+    Ok(store.get_record_bounded(SYMLINKS, oid, 0)?.is_some())
 }
 
 #[cfg(test)]
@@ -1061,6 +1179,7 @@ mod tests {
                         kind: 1,
                         name: Vec::new(),
                         symlink: false,
+                        mode: 0,
                     },
                 )
                 .unwrap();

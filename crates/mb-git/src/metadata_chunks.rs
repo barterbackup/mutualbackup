@@ -59,7 +59,7 @@ impl Header {
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Root {
     format_version: u16,
-    scope: CatalogScope,
+    pub(crate) scope: CatalogScope,
     pub(crate) objects: GitObjectCatalogRoot,
 }
 
@@ -291,58 +291,75 @@ pub(crate) fn import(
                 "paged metadata requires an empty metadata destination"
             );
         }
-        let mut reader = GitObjectCatalogReader::new(scope, objects)?;
-        let mut active = None;
-        loop {
-            let record = reader
-                .next_record(&mut fetch)
-                .map_err(|error| match error {
-                    CatalogStreamError::Catalog(error) => anyhow::Error::new(error),
-                    CatalogStreamError::Storage(error) => error,
-                })?;
-            match record {
-                Some(GitObjectRecord::Header {
-                    oid,
-                    kind: code,
-                    byte_len,
-                    ..
-                }) => {
-                    let value = Header {
-                        format_version: 2,
-                        kind: code,
-                        byte_len,
-                        fragments: byte_len.div_ceil(GIT_OBJECT_FRAGMENT_BYTES as u64),
-                    };
-                    value.validate()?;
-                    exact(
-                        control,
-                        &kind(HEADERS, id),
-                        &oid,
-                        &canonical_bytes(&value)?,
-                        HEADER_BYTES,
-                    )?;
-                    active = Some(oid);
-                }
-                Some(GitObjectRecord::Fragment { offset, bytes }) => exact(
-                    control,
-                    &kind(FRAGMENTS, id),
-                    &key(active.context("metadata fragment has no object")?, offset),
-                    &bytes,
-                    GIT_OBJECT_FRAGMENT_BYTES,
-                )?,
-                None => break,
-            }
-        }
-        exact(
-            control,
-            ROOT,
-            id.as_bytes(),
-            &canonical_bytes(&expected)?,
-            1024,
-        )?;
+        for_each_import_record(id, scope, objects, &mut fetch, |kind, key, bytes, limit| {
+            exact(control, kind, key, bytes, limit)
+        })?;
         validate_all(control, id, |_, _, _| Ok(()))?;
         Ok(())
     })
+}
+
+/// Stream bounded destination rows into a private staging sink. The completed
+/// owner is emitted only after the original reader authenticates typed EOF.
+pub(crate) fn for_each_import_record(
+    id: Uuid,
+    scope: CatalogScope,
+    objects: GitObjectCatalogRoot,
+    mut fetch: impl FnMut(CatalogPageRef) -> Result<Vec<u8>>,
+    mut put: impl FnMut(&str, &[u8], &[u8], usize) -> Result<()>,
+) -> Result<()> {
+    objects.validate()?;
+    ensure!(
+        matches!(scope, CatalogScope::Dataset { protected_root_id, .. } if protected_root_id == id),
+        "paged metadata repository differs"
+    );
+    let expected = Root {
+        format_version: 1,
+        scope,
+        objects,
+    };
+    let mut reader = GitObjectCatalogReader::new(scope, objects)?;
+    let mut active = None;
+    loop {
+        let record = reader
+            .next_record(&mut fetch)
+            .map_err(|error| match error {
+                CatalogStreamError::Catalog(error) => anyhow::Error::new(error),
+                CatalogStreamError::Storage(error) => error,
+            })?;
+        match record {
+            Some(GitObjectRecord::Header {
+                oid,
+                kind: code,
+                byte_len,
+                ..
+            }) => {
+                let value = Header {
+                    format_version: 2,
+                    kind: code,
+                    byte_len,
+                    fragments: byte_len.div_ceil(GIT_OBJECT_FRAGMENT_BYTES as u64),
+                };
+                value.validate()?;
+                put(
+                    &kind(HEADERS, id),
+                    &oid,
+                    &canonical_bytes(&value)?,
+                    HEADER_BYTES,
+                )?;
+                active = Some(oid);
+            }
+            Some(GitObjectRecord::Fragment { offset, bytes }) => put(
+                &kind(FRAGMENTS, id),
+                &key(active.context("metadata fragment has no object")?, offset),
+                &bytes,
+                GIT_OBJECT_FRAGMENT_BYTES,
+            )?,
+            None => break,
+        }
+    }
+    put(ROOT, id.as_bytes(), &canonical_bytes(&expected)?, 1024)?;
+    Ok(())
 }
 
 impl crate::GitRepository {

@@ -380,6 +380,7 @@ impl GitRepository {
                     })
                 },
             )?;
+            crate::paged_import::validate_preserved(catalog, repository_id)?;
             crate::head::for_each_preserved_branch(catalog, repository_id, &mut visit)?;
             catalog.validate_preserved_anchor_discovery_records()?;
             for_each_unclassified_preserved_record(catalog, repository_id, visit)
@@ -2159,6 +2160,7 @@ fn for_each_unclassified_preserved_record(
     )? {
         let known = kind == SOURCE_BACKEND_KIND
             || kind == crate::metadata_chunks::ROOT
+            || kind == crate::paged_import::OWNER
             || kind == "anchor-area-location"
             || kind == mb_store::ANCHOR_DISCOVERY_JOURNAL_KIND
             || kind == mb_store::ANCHOR_DISCOVERY_FENCE_KIND

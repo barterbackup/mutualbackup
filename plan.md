@@ -5766,3 +5766,25 @@ admission/physical quotas, distributed activation, normal production/retention/
 seed recovery, legacy consumers and R5/R7 remain open. Producers stay disabled;
 dense 1 TiB and Windows/macOS hardware stay deferred. Evidence:
 `/tmp/mb-m6-git-metadata-chunks-p158blav`; see ADR 0002.
+
+Complete paged Git catalogs now install exact metadata, refs, verified native
+blob mappings, the selected branch and a clean HEAD index without collecting
+historical objects or output rows. Private encrypted staging and complete graph/
+plaintext validation precede the destination writer. Disk-backed HEAD expansion
+preserves shared paths, raw names and modes. Atomic checked publication fences
+late competing writes and ignored rows; completed retries preserve changed or
+deleted user rows by rejecting them. Scratch uses registered catalog filesystem
+capabilities/WAL reservations, or the Node consumer's admitted private index.
+Five ordinary regressions and the explicit 1,027-object/>512 MiB full-import
+corpus pass. Frozen qualification passes 1,549 cases: 766 fresh and 783 exact
+unchanged reused, with strict Clippy, builds, three bulk gates, four Linux native
+fixtures and 374-input/23-executable audits. Full import uses 23.35 MiB peak
+RSS; 121 ignored cases remain unexecuted. The initially incorrect procfs fixture
+is corrected and its failed source/log/binary preserved. Verified retirement
+reclaims 9.50 GiB; target uses 50.30 GiB. Current artifacts, older evidence,
+auxiliary WIP and installed roots remain intact. Checkpoint-bound blob recovery/
+custody transfer, normal paged graph/ref/blob consumers, aggregate admission/
+physical quotas, distributed activation, normal production/retention/seed
+recovery, legacy consumers and R5/R7 remain open. Producers stay disabled; dense
+1 TiB and Windows/macOS hardware stay deferred. Evidence:
+`/tmp/mb-m6-paged-git-install-gbaalutb`; see ADR 0002.
