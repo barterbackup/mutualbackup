@@ -67,12 +67,12 @@ qualification open. Dense 1 TiB and native Windows/macOS qualification remain
 deferred as previously recorded; their acceptance requirements are unchanged.
 
 Follow-up on `f886221` closes the focused retained-writer recovery and Linux
-volume-handoff items below. Complete debug-source qualification stopped at the
-native capture/packing lifecycle's 900-second timeout; its exact-binary
-diagnostic passes in 752 seconds. Preserve that unexplained failure, rerun the
-normal gate with phase diagnostics, then continue shared resource admission and
-normal paged integration. The installed jobs did not start; all enclosing M6
-gates remain open.
+volume-handoff items below. The `c2c82ef` source gate passes all four provisioned
+native cases, but fails the first 90-second uninterrupted network coverage wait
+before offline-spare injection. Preserve that failure and the earlier native
+900-second timeout. Isolated and four-case diagnostic probes pass without
+explaining the network outlier. Installed jobs did not start. Continue shared
+resource admission and normal paged integration; all enclosing M6 gates stay open.
 
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
@@ -5021,6 +5021,37 @@ gates remain open.
   either commit verified protection or expose an actionable blocked state with
   durable retry. Keep the historical evidence below; later successes do not
   explain the original 5,400-second outlier.
+
+  - [x] Preserve and instrument the initial checkpoint coverage timeout.
+    Full source qualification and first-coverage diagnostics (2026-10-15):
+    The complete C2 source gate on `c2c82ef` failed. All four provisioned native
+    cases passed, including the unchanged 900-second capture/packing fixture in
+    669.62 seconds; three bulk gates, Store (532), Git (131), process acceptance
+    (23), builds, format and strict Clippy passed or reused exact executable bytes.
+    The ordinary Node suite reported 593 passed, one failed and 29 ignored in
+    2,809.88 seconds. `offline_first_spare_renews_live_checkpoint_coverage` exceeded
+    its first 90-second uninterrupted coverage wait while all five nodes were still
+    online, before the offline-spare injection. This is distinct from its later
+    renewal wait and from the historical 5,400-second relay-only missing-signer stall.
+    The failed source snapshot and all 23 exact executables are preserved with
+    independently verified SHA/inode/mode identities; source and binaries stayed
+    unchanged, and owned mount/loop cleanup passed. Both installed queues stopped
+    at the failed prerequisite. No installed candidate was built or tested.
+
+    The first-wait failure branch now records worker completion flags and per-node
+    launch/activation/delegated progress through nonblocking mutex inspection, then
+    preserves the fixture directory for inspection. The original deadline, payload,
+    assertions and successful path are unchanged. Its frozen full-workspace build
+    has the same 554 runtime-library feature selections as the failed candidate.
+    The exact failing case passes in isolation (76.68 seconds), and a four-thread
+    cohort with the three long-running cases overlapping the original failure passes
+    all four cases (322.32 seconds). These are diagnostic positives; they identify
+    no cause and do not qualify the failed full source or close R5/R7. Formatting and
+    strict workspace/all-target Clippy pass. Independent audit verifies all 401 frozen
+    source inputs, the executed binary identity and both selected case inventories. Preserve both unexplained timeouts; qualify subsequent source
+    with these diagnostics without extending deadlines or weakening protection.
+    Evidence: `/tmp/mb-m6-native-phase-qual-wnub781m` and
+    `/tmp/mb-m6-coverage-diagnostic-u1wi9jdl`.
 
   - [x] Make scoped signature-trace callsite registration deterministic under
     parallel tests. A fresh-process probe reproduces suppressed scoped events

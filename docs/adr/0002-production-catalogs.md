@@ -7546,3 +7546,33 @@ payload, assertions, cleanup steps or timeout. Full qualification must rerun.
 The queued installed build/recovery jobs stopped on the failed prerequisite;
 no installed candidate was built. R1/R2/R3/R5/R7, normal paged integration and
 remaining M6 gates stay open; deferred hardware acceptance is unchanged.
+
+### Full source qualification and first-coverage diagnostics (2026-10-15):
+The complete C2 source gate on `c2c82ef` failed. All four provisioned native
+cases passed, including the unchanged 900-second capture/packing fixture in
+669.62 seconds; three bulk gates, Store (532), Git (131), process acceptance
+(23), builds, format and strict Clippy passed or reused exact executable bytes.
+The ordinary Node suite reported 593 passed, one failed and 29 ignored in
+2,809.88 seconds. `offline_first_spare_renews_live_checkpoint_coverage` exceeded
+its first 90-second uninterrupted coverage wait while all five nodes were still
+online, before the offline-spare injection. This is distinct from its later
+renewal wait and from the historical 5,400-second relay-only missing-signer stall.
+The failed source snapshot and all 23 exact executables are preserved with
+independently verified SHA/inode/mode identities; source and binaries stayed
+unchanged, and owned mount/loop cleanup passed. Both installed queues stopped
+at the failed prerequisite. No installed candidate was built or tested.
+
+The first-wait failure branch now records worker completion flags and per-node
+launch/activation/delegated progress through nonblocking mutex inspection, then
+preserves the fixture directory for inspection. The original deadline, payload,
+assertions and successful path are unchanged. Its frozen full-workspace build
+has the same 554 runtime-library feature selections as the failed candidate.
+The exact failing case passes in isolation (76.68 seconds), and a four-thread
+cohort with the three long-running cases overlapping the original failure passes
+all four cases (322.32 seconds). These are diagnostic positives; they identify
+no cause and do not qualify the failed full source or close R5/R7. Formatting and
+strict workspace/all-target Clippy pass. Independent audit verifies all 401 frozen
+source inputs, the executed binary identity and both selected case inventories. Preserve both unexplained timeouts; qualify subsequent source
+with these diagnostics without extending deadlines or weakening protection.
+Evidence: `/tmp/mb-m6-native-phase-qual-wnub781m` and
+`/tmp/mb-m6-coverage-diagnostic-u1wi9jdl`.

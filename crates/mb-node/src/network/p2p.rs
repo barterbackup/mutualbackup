@@ -29289,13 +29289,79 @@ mod tests {
                 tokio::spawn(run_delegated_coding_jobs(node.clone(), client.clone()))
             })
             .collect::<Vec<_>>();
-        tokio::time::timeout(
+        let coverage = tokio::time::timeout(
             Duration::from_secs(90),
             wait_for_variable_coding_groups(nodes[0].clone(), checkpoint.clone()),
         )
-        .await
-        .expect("uninterrupted backup wait must finish")
-        .unwrap();
+        .await;
+        if !matches!(&coverage, Ok(Ok(()))) {
+            let progress = nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| match node.try_lock() {
+                    Ok(node) => {
+                        let launches = node.coding_launch_jobs_for_test().map(|jobs| {
+                            jobs.into_iter()
+                                .take(64)
+                                .map(|job| {
+                                    (
+                                        job.plan.value.attempt_id,
+                                        job.plan.value.coding_coordinator,
+                                        job.plan.value.verification_coordinator,
+                                        job.dispatched,
+                                        job.error,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        let activations = node.coding_activation_jobs_for_test().map(|jobs| {
+                            jobs.into_iter()
+                                .take(64)
+                                .map(|job| {
+                                    (
+                                        job.transcript.value.plan.value.attempt_id,
+                                        job.complete,
+                                        job.error,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        let delegated = node.delegated_coding_jobs_for_test().map(|jobs| {
+                            jobs.into_iter()
+                                .take(64)
+                                .map(|job| (job.plan.value.attempt_id, job.state, job.error))
+                                .collect::<Vec<_>>()
+                        });
+                        let state = node.dynamic_guild_state().map(|state| {
+                            state.map(|state| {
+                                (
+                                    state.event_sequence,
+                                    state.coding_groups
+                                        .into_iter()
+                                        .map(|group| (group.group.id, group.retired_at_event))
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                        });
+                        format!(
+                            "node={index}, id={:?}, launches={launches:?}, activations={activations:?}, delegated={delegated:?}, state={state:?}",
+                            node.keys().node_id(),
+                        )
+                    }
+                    Err(error) => format!("node={index}, lock unavailable: {error}"),
+                })
+                .collect::<Vec<_>>();
+            let workers = coding_tasks
+                .iter()
+                .map(|task| task.is_finished())
+                .collect::<Vec<_>>();
+            let directory = temp.keep();
+            panic!(
+                "uninterrupted backup wait must finish: result={coverage:?}, offline_spare={offline_spare}, healthy={:?}, workers={workers:?}, progress={progress:?}, preserved={}",
+                healthy.value.attempt_id,
+                directory.display(),
+            );
+        }
         assert_ne!(successor.value.attempt_id, initial.value.attempt_id);
         assert_ne!(
             successor.value.coding_coordinator,
