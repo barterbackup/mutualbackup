@@ -48,6 +48,24 @@ R3-SINGLE-OWNER-METADATA, then complete normal paged production and retained
 1 TiB recovery qualification. R4 and R6 are complete; R5 diagnosis and R7 release
 and native-platform gates remain open.
 
+Source review on 2026-10-15 covered progress in `e36afa7..6001cdd` and the
+uncommitted Linux parity-volume handoff, now committed as `e619290`. Review
+focused on capacity/ownership lifecycles, native/Git capture and restore,
+checkpoint acquisition/ancestry and writer admission. Shared quota enforcement,
+durable packing custody, complete retained native/Git restore and seed-owned
+checkpoint acquisition are substantial progress. These remain explicit staged
+APIs; normal paged producers and the complete backup/retention/recovery pipeline
+are not enabled. One new recovery correctness blocker is recorded below as
+R3-RETAINED-WRITER-RECOVERY. No new data-loss or unauthorized-publication defect
+was confirmed in the reviewed paths. The volume handoff is a coherent source
+increment, but its qualification remains pending. This review ran no builds,
+tests or runtime probes; earlier qualification records apply only to their
+recorded inputs. Resolve the recovery blocker and qualify the volume handoff,
+then finish shared resource admission, distributed readiness/current activation
+and normal paged integration. Keep R5 diagnosis and R7 current installed-artifact
+qualification open. Dense 1 TiB and native Windows/macOS qualification remain
+deferred as previously recorded; their acceptance requirements are unchanged.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -1654,9 +1672,10 @@ and native-platform gates remain open.
     - [ ] Qualify initial and established Linux parity-volume writer handoff.
       Pin the directory across read-only catalog/key admission, manifest
       publication, first writer, rekey and reopen. Default-volume callers retain
-      the control directory through initialization, reopen and configuration. Fence database, journal and
-      manifest versions before writes. Preserve incomplete existing schemas
-      instead of reinitializing unknown volumes. Qualification pending under
+      the control directory through initialization, reopen and configuration.
+      Fence database, journal and manifest versions before writes. Preserve
+      incomplete existing schemas instead of reinitializing unknown volumes.
+      Qualification pending under
       `/tmp/mb-m6-volume-owner-vid28npy`; full R1 remains open.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
@@ -1855,6 +1874,30 @@ and native-platform gates remain open.
   retained Git history, and datasets above the old ceiling meet the declared
   limits with bounded memory; interrupted backup, prune, and seed-only recovery
   preserve exact data and old supported revisions remain readable.
+
+  - [ ] **R3-RETAINED-WRITER-RECOVERY / P2 — Recover unchanged retained
+    revisions after writer rotation, revocation or owner removal.** Source
+    review through `6001cdd` found that
+    `crates/mb-node/src/node/checkpoint_acquisition.rs::promote_public_checkpoint_inner`
+    requires every `LatestRetained` fence to equal the writer current at the
+    checkpoint's event prefix. A legitimate successor can carry unchanged
+    predecessor revisions signed by an older or removed writer. The body build
+    therefore rejects that checkpoint before the complete predecessor transition
+    can distinguish retained history from new mutation. The same helper is used
+    by peer acquisition and proof reconstruction after restart; both public
+    layouts are affected. The check originated in `a357250`; historical-prefix
+    recovery and retained proof reconstruction preserve it. This is a recovery
+    refusal, not acceptance of unauthorized revisions; normal paged producers
+    remain disabled. Authenticate original writer keys in the body and enforce
+    current writer authority for new revisions in the complete predecessor
+    transition, preserving all signature, ancestry, tombstone and custody checks.
+    Acceptance: acquire and rebuild both layouts with unchanged retained
+    revisions after rotation, revocation and owner removal, including restart
+    after predecessor-owner retirement. Reject new mutations under those old
+    fences, unknown keys and altered predecessor revisions. Existing transition
+    tests cover retained removed-owner history, but the peer chain fixtures
+    rotate/revoke only after creating their successors and miss this ordering.
+    Source-only finding; no new runtime evidence was produced in this review.
 
   - [x] Add the authenticated page foundation in `mb-core` and record the
     implementation direction in
