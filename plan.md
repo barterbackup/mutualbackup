@@ -1626,8 +1626,10 @@ availability/activation, normal backup/retention/seed recovery and R5/R7 stay
 open. Producers stay disabled; hardware runs remain user-deferred. See ADR 0002
 and `/tmp/mb-m6-packing-output-custody-h2mugql5`.
 
-First correct R3-RETAINED-WRITER-RECOVERY and qualify the committed Linux
-parity-volume handoff. Continue the remaining R1 safe-upgrade/recovery contract
+R3-RETAINED-WRITER-RECOVERY and the Linux parity-volume handoff now have focused
+passing evidence below. Preserve the native capture/packing timeout and finish
+normal source qualification with phase diagnostics before rerunning the installed
+candidate gates. Continue the remaining R1 safe-upgrade/recovery contract
 and complete shared R2/R3 resource admission, including SQL/WAL/page, scratch,
 traversal and physical reservations for R3-SINGLE-OWNER-METADATA. Individual
 quota and acquisition increments do not close the required single-owner 1 TiB
@@ -6180,7 +6182,7 @@ and 10 installed roots remain preserved. Dense 1 TiB and native Windows/macOS
 qualification remain user-deferred. R1/R2/R3/R5/R7 and remaining M6 gates stay open.
 Evidence: `/tmp/mb-m6-acquisition-work-l1vs9a84`.
 
-Linux parity-volume writer admission (2026-10-15, qualification pending):
+Linux parity-volume writer admission (2026-10-15, focused qualification below):
 Initial and established volume writers retain one directory through read-only
 key/catalog admission, manifest publication, schema open and rekey. Database,
 journal and manifest versions fence the first write. Preserved readers retain
@@ -6197,5 +6199,38 @@ held directory and rechecks it before registry publication; default-volume
 configuration/reactivation use the same binding. Directory ownership and write
 permissions are checked at admission fences. The original failing executable,
 source snapshot and probe remain under
-`/tmp/mb-m6-default-volume-handoff-probe-pl_d55ra`; corrected daemon and full
-qualification remain pending in `/tmp/mb-m6-volume-owner-vid28npy`.
+`/tmp/mb-m6-default-volume-handoff-probe-pl_d55ra`; corrected-daemon and
+volume-suite evidence is recorded below. Complete source and installed
+qualification remain open.
+
+
+Retained writer recovery and focused volume qualification (2026-10-15):
+`f886221` authenticates original writer keys during public body admission and
+leaves current-writer enforcement for new revisions to the complete certified
+predecessor transition. Both layouts pass all three authority changes (rotation,
+revocation and owner removal), hostile signed mutations, and restart after
+predecessor retirement. The revised three-generation chain cases fail before
+the fix and pass afterward, preserving original ancestry and exact native/Git
+restore. All 81 ordinary volume cases pass, including eight writer-admission
+cases; two provisioned volume cases remain ignored. The rebuilt real daemon
+also passes the default-directory swap probe, with its identity checked against
+the frozen binary manifest. Independent focused audits verify 401 source inputs
+and the corresponding executed binaries. Evidence:
+`/tmp/mb-m6-retained-writer-nfid0c74`.
+
+The complete debug-source qualification did not pass: the fourth provisioned
+native capture/packing lifecycle exceeded its unchanged 900-second limit.
+Three bulk-memory gates and the preceding three native cases passed; the ordinary
+workspace suites had not started. All source and binary hashes remained unchanged,
+and mount/image/loop cleanup was verified. A diagnostic run of the exact failed
+binary with phase breakpoints passes in 752 seconds under the same limit, including
+packing, source-loss replay, restore and bounded retirement. It does not explain
+the original timeout or qualify a replacement full run. The original failure,
+24 executables and exact source snapshot are retained under
+`/tmp/mb-m6-native-capture-timeout-_t11hqvs` and
+`target/failed/f886221-native-capture-timeout`. The fixture now emits bounded
+phase/progress diagnostics directly to the private log without changing its
+payload, assertions, cleanup steps or timeout. Full qualification must rerun.
+The queued installed build/recovery jobs stopped on the failed prerequisite;
+no installed candidate was built. R1/R2/R3/R5/R7, normal paged integration and
+remaining M6 gates stay open; deferred hardware acceptance is unchanged.

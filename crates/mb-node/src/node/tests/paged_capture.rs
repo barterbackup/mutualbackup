@@ -132,6 +132,17 @@ fn paged_native_capture_admission_requires_all_database_and_scoped_page_policies
 fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_owned_sources() {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::MetadataExt;
+    let started = std::time::Instant::now();
+    // Bypass libtest's per-test capture so a killed or timed-out provisioned
+    // run retains its last entered phase in the caller's private log.
+    let phase = |name: &str| {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "native paged capture phase: {name}, elapsed={:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    };
+    phase("setup");
     let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").expect("provisioned Btrfs root");
     let temp = tempfile::tempdir_in(root).unwrap();
     let seed = Seed::from_bytes([218; 32]);
@@ -213,6 +224,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     drop(sparse);
     let protected = node.add_protected_root(&source).unwrap();
     let first_id = Uuid::new_v4();
+    phase("first-capture");
     let first = node
         .prepare_paged_native_revision_catalog(guild, protected.root_id, &source, 1, first_id)
         .unwrap();
@@ -238,6 +250,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
         .catalog_retained_source_usage(first.value.scope())
         .unwrap()
         .unwrap();
+    phase("shared-capture");
     let second = node
         .prepare_paged_native_revision_catalog(guild, protected.root_id, &source, 1, second_id)
         .unwrap();
@@ -356,9 +369,13 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     );
     node.retain_paged_packing_source(operation.sources(), &first)
         .unwrap();
+    phase("packing");
     let produced = node
         .produce_retained_packing_operation(operation, fresh(), custody, |input, bytes| {
             reads.set(reads.get() + 1);
+            if reads.get().is_multiple_of(32) {
+                phase(&format!("packing-read-{}", reads.get()));
+            }
             let actual = reader
                 .sector_for_guild(&guild, &input.id.object_id)
                 .map_err(|_| {
@@ -369,6 +386,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
         })
         .unwrap();
     let packed_manifest = produced.manifest();
+    phase("packing-complete");
     assert!(reads.get() > 145 && packed_manifest.directory.summary.sectors > 145);
     assert_eq!(
         node.control.checkpoint_head_identity(&guild).unwrap(),
@@ -433,6 +451,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
             .unwrap()
     );
     let failed_id = Uuid::new_v4();
+    phase("late-authority-rollback");
     let before_head = node.control.checkpoint_head(&guild).unwrap();
     let sql = format!(
         "CREATE TEMP TRIGGER native_capture_late_authority AFTER INSERT ON protocol_records WHEN NEW.kind='catalog-paged-publication-v1' AND NEW.record_id=X'{}' BEGIN UPDATE checkpoint_heads SET checkpoint_bytes=X'00' WHERE guild_id=X'{}'; END",
@@ -466,6 +485,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     );
     std::fs::remove_dir_all(&source).unwrap();
     drop(node);
+    phase("reopen-after-source-loss");
     let mut node = Node::open(&state, seed.clone()).unwrap();
     assert_eq!(
         canonical_bytes(
@@ -489,6 +509,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
         .unwrap();
     assert_eq!(resumed.value.revision_id, failed_id);
     let target = temp.path().join("restored");
+    phase("restore");
     node.restore_retained_native_catalog(first_id, &target)
         .unwrap();
     assert_eq!(std::fs::read(target.join("nested/dense")).unwrap(), dense);
@@ -510,6 +531,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     sparse.read_exact(&mut tail).unwrap();
     assert_eq!(&tail, b"tail\r\n\0");
     let reader = node.reader_config().open().unwrap();
+    phase("packing-replay");
     let resumed_authority = mb_store::CatalogPackingAuthority::from_legacy_checkpoint(
         checkpoint.hash().unwrap(),
         &checkpoint,
@@ -537,12 +559,14 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
     assert_eq!(replay.manifest(), packed_manifest);
     drop(replay);
     drop(reader);
+    phase("packing-cancellation");
     node.cancel_retained_packing_operation(operation).unwrap();
     while node
         .control
         .release_catalog_packing_payload(operation.payloads())
         .unwrap()
     {}
+    let mut retired_outputs = 0u64;
     while let Some(output) = node
         .control
         .next_catalog_packing_operation_attempt(operation, None)
@@ -552,6 +576,10 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
             node.retire_retained_packing_output(operation, &output)
                 .unwrap()
         );
+        retired_outputs += 1;
+        if retired_outputs.is_multiple_of(32) {
+            phase(&format!("retired-output-{retired_outputs}"));
+        }
     }
     while node
         .control
@@ -586,6 +614,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
             .unwrap()
     );
     node.close_paged_packing_sources(packing_source).unwrap();
+    phase("source-loan-retirement");
     assert!(
         node.retain_paged_packing_source(packing_source, &first)
             .is_err()
@@ -599,6 +628,7 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
             .release_paged_packing_source_step(packing_source)
             .unwrap()
     );
+    phase("capture-record-cleanup");
     for id in [first_id, second_id, failed_id] {
         let kind = format!("paged-native-capture-source-v1/{}", id.simple());
         while node
@@ -617,7 +647,11 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
                 .is_err()
         );
     }
-    for _ in 0..2000 {
+    phase("cancelled-capture-cleanup");
+    for pass in 0..2000 {
+        if pass % 50 == 0 {
+            phase(&format!("cancelled-capture-cleanup-{pass}"));
+        }
         let mut progress = false;
         for id in [first_id, second_id, failed_id] {
             match node.cleanup_paged_native_revision_catalog_step(id) {
@@ -644,8 +678,10 @@ fn native_paged_capture_operation_reopens_rolls_back_late_authority_and_cancels_
         0
     );
     drop(node);
+    phase("final-reopen");
     let mut node = Node::open(&state, seed).unwrap();
     for id in [first_id, second_id, failed_id] {
         assert!(!node.cleanup_paged_native_revision_catalog_step(id).unwrap());
     }
+    phase("complete");
 }

@@ -66,6 +66,14 @@ and normal paged integration. Keep R5 diagnosis and R7 current installed-artifac
 qualification open. Dense 1 TiB and native Windows/macOS qualification remain
 deferred as previously recorded; their acceptance requirements are unchanged.
 
+Follow-up on `f886221` closes the focused retained-writer recovery and Linux
+volume-handoff items below. Complete debug-source qualification stopped at the
+native capture/packing lifecycle's 900-second timeout; its exact-binary
+diagnostic passes in 752 seconds. Preserve that unexplained failure, rerun the
+normal gate with phase diagnostics, then continue shared resource admission and
+normal paged integration. The installed jobs did not start; all enclosing M6
+gates remain open.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -1669,14 +1677,21 @@ deferred as previously recorded; their acceptance requirements are unchanged.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.
-    - [ ] Qualify initial and established Linux parity-volume writer handoff.
+    - [x] Qualify initial and established Linux parity-volume writer handoff.
       Pin the directory across read-only catalog/key admission, manifest
       publication, first writer, rekey and reopen. Default-volume callers retain
       the control directory through initialization, reopen and configuration.
       Fence database, journal and manifest versions before writes. Preserve
       incomplete existing schemas instead of reinitializing unknown volumes.
-      Qualification pending under
-      `/tmp/mb-m6-volume-owner-vid28npy`; full R1 remains open.
+      On `f886221`, all 81 ordinary volume cases pass, including all eight
+      initial/established/default writer-admission cases. Two provisioned volume
+      cases remain ignored. The rebuilt real daemon rejects the swapped default
+      pathname before volume open, preserving the replacement sentinel and
+      creating no parity catalog or manifest in either directory. Source (401
+      files), daemon and test-executable hashes are recorded and checked.
+      Evidence: `/tmp/mb-m6-retained-writer-nfid0c74`, including the independent
+      `focused-volume-audit.json`. This closes the listed Linux handoff slice;
+      full R1 upgrade/recovery and R7 installed qualification remain open.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
   Historical `crates/mb-git/src/history.rs` admission allowed up to 64 MiB of
@@ -1875,7 +1890,7 @@ deferred as previously recorded; their acceptance requirements are unchanged.
   limits with bounded memory; interrupted backup, prune, and seed-only recovery
   preserve exact data and old supported revisions remain readable.
 
-  - [ ] **R3-RETAINED-WRITER-RECOVERY / P2 — Recover unchanged retained
+  - [x] **R3-RETAINED-WRITER-RECOVERY / P2 — Recover unchanged retained
     revisions after writer rotation, revocation or owner removal.** Source
     review through `6001cdd` found that
     `crates/mb-node/src/node/checkpoint_acquisition.rs::promote_public_checkpoint_inner`
@@ -1897,7 +1912,21 @@ deferred as previously recorded; their acceptance requirements are unchanged.
     fences, unknown keys and altered predecessor revisions. Existing transition
     tests cover retained removed-owner history, but the peer chain fixtures
     rotate/revoke only after creating their successors and miss this ordering.
-    Source-only finding; no new runtime evidence was produced in this review.
+    The finding above was source-only. Implemented in `f886221`: body admission
+    authenticates every original writer key, while the complete certified
+    predecessor transition requires current authority for new revisions.
+    Both layouts pass acquisition and restart reconstruction after rotation,
+    revocation and owner removal, rejecting old-fence mutations, unknown keys
+    and reauthored predecessor revisions without advancing recovery progress.
+    The two existing three-generation chain cases now change writer authority
+    before successors are created; both reproduce the original refusal before
+    the fix and pass afterward, including source/receiver predecessor retirement,
+    archive reconstruction, and exact native/Git restore. Two additional test
+    functions exercise all three authority changes in each layout and reopen
+    after receiver predecessor retirement. Independent focused-source audit
+    verifies all 401 inputs and the executed binary. Evidence:
+    `/tmp/mb-m6-retained-writer-nfid0c74`. Normal paged producers remain disabled;
+    this closes the recovery refusal, not the enclosing R3/R7 gates.
 
   - [x] Add the authenticated page foundation in `mb-core` and record the
     implementation direction in

@@ -1447,5 +1447,21 @@ held directory and rechecks it before registry publication; default-volume
 configuration/reactivation use the same binding. Directory ownership and write
 permissions are checked at admission fences. The original failing executable,
 source snapshot and probe remain under
-`/tmp/mb-m6-default-volume-handoff-probe-pl_d55ra`; corrected daemon and full
-qualification remain pending in `/tmp/mb-m6-volume-owner-vid28npy`.
+`/tmp/mb-m6-default-volume-handoff-probe-pl_d55ra`; corrected-daemon and
+volume-suite evidence is recorded below. Complete source and installed
+qualification remain open.
+
+
+On `f886221`, focused Linux qualification passes all 81 ordinary volume cases,
+including the eight writer-admission cases, and the rebuilt real-daemon default
+pathname swap probe. The replacement sentinel is preserved; neither directory
+receives a new manifest or parity catalog after the swap. Frozen daemon/test
+identities and 401 source inputs are checked in
+`/tmp/mb-m6-retained-writer-nfid0c74/focused-volume-audit.json`.
+Two provisioned volume cases remain ignored. This qualifies the directory handoff
+slice only. Full source qualification stopped at a separate native
+capture/packing lifecycle's 900-second timeout; its exact-binary diagnostic passes
+in 752 seconds, with the original failure and inputs preserved under
+`/tmp/mb-m6-native-capture-timeout-_t11hqvs`. The original timeout is unexplained,
+and the installed build/recovery jobs did not start. Complete upgrade/source-loss,
+legacy conversion and installed/platform acceptance remain required.
