@@ -110,7 +110,7 @@ enum ProofInput<'a> {
         source: &'a mb_store::CatalogCheckpointRecoverySource,
         selected: mb_store::CatalogCheckpointRecoveryTip,
         previous: Option<&'a RecoveredCheckpointProof>,
-        meter: &'a rebuild::RecoveryWorkMeter,
+        meter: &'a rebuild::RecoveryWorkMeter<'a>,
     },
 }
 impl<'a> ProofInput<'a> {

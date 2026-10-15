@@ -2682,6 +2682,23 @@ gates remain open.
       overlarge single-job rejection, reopen, immutable replay, ABORT/IGNORE faults
       and torn policy/marker rejection. All ten acquisition-work cases, strict
       Store all-target Clippy and formatting pass. The shared R2/R3 gate remains open.
+    - [ ] Qualify shared complete-proof recovery traversal scopes.
+      The implementation reserves whole-chain declarations in the acquisition ledger,
+      checks its bounded paired lease at validation guards, and releases after work
+      stops. Linux boot/PID/start/process-instance/catalog identities and local weak
+      tokens permit one abandoned-scope reclamation per writer without stealing live
+      or durable acquisition work. Actual process-kill, mixed-budget, write-fault,
+      copied-catalog and both-layout recovery cases now pass: sixteen focused Store
+      cases and both three-generation resource-backed Node layouts, with strict
+      workspace/all-target Clippy and formatting. Rebuild failures release credits;
+      each successful generation observes the whole declaration held and rejects a
+      competing traversal. Exact native/Git restore still works after predecessor
+      retirement, writer changes and reopen. The two earlier unfunded fixture
+      failures and diagnostic backtrace remain preserved. Evidence:
+      `/tmp/mb-m6-live-recovery-source-funded-32gxlx5y`.
+      Keep this item open for the owner-domain audit across PID namespaces and
+      independently loaded modules before integration. Physical scratch/payload/
+      SQL/WAL backing and other producers remain separate; normal producers stay off.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted
