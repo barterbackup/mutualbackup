@@ -211,7 +211,7 @@ pub(super) fn git_owner_proof(
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
-    checkpoint_owner_proof_with_git_inner::<true>(
+    checkpoint_owner_proof_with_git_inner::<true, false>(
         node,
         keys,
         true,

@@ -137,9 +137,10 @@ impl CatalogCheckpointAuthorityValidation {
     }
 }
 
-/// Every retained fence must match certified writer history. Its latest epoch
-/// must also be the retained owner's authorized checkpoint head. Removed owners
-/// may retain historical sources; this callback must enforce that distinction.
+/// Every retained fence must match certified writer history. LatestRetained
+/// identifies the latest epoch represented in this body, which may differ from
+/// current writer authority. The complete predecessor transition requires a
+/// current writer for new revisions and preserves unchanged historical ones.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogCheckpointWriterAuthorization {
     Historical,

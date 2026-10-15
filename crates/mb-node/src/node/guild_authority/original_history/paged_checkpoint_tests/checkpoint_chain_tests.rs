@@ -6,7 +6,7 @@ use mb_core::{CatalogCheckpointAuthorityRecord as R, CatalogScope, CatalogSectio
 use mb_core::{QuorumPagedCheckpoint, QuorumPagedCheckpointDirectory};
 use mb_store::CatalogPublicCheckpoint as Certificate;
 
-fn quota(node: &Node) {
+pub(super) fn quota(node: &Node) {
     node.control
         .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
             page_bytes: 128 << 20,
@@ -15,7 +15,7 @@ fn quota(node: &Node) {
         })
         .unwrap();
 }
-fn acquire(
+pub(super) fn acquire(
     session: &crate::RetainedCheckpointRestore,
     id: u128,
     proof: &RecoveredCheckpointProof,
@@ -35,7 +35,7 @@ fn acquire(
         )
         .unwrap()
 }
-fn successor(
+pub(super) fn successor(
     node: &mut Node,
     keys: &[KeyMaterial],
     previous: &RecoveredCheckpointProof,
@@ -182,12 +182,10 @@ fn successor(
         work,
         mb_store::RecordScratchStore::new(4 << 20).unwrap(),
         |scope, section, page| node.control.catalog_page(scope, section, page),
-        |fence, kind| {
+        |fence, _kind| {
             if view
                 .writer_key(fence.owner, fence.epoch, &trust)?
                 .is_none_or(|key| key.public_key != fence.public_key)
-                || (kind == mb_store::CatalogCheckpointWriterAuthorization::LatestRetained
-                    && view.current_writer(fence.owner, &trust)? != Some(fence.clone()))
             {
                 return Err(mb_store::DatabaseError::Conflict.into());
             }
@@ -231,7 +229,12 @@ fn successor(
             };
             let mut header = None;
             let mut signatures = Vec::new();
-            for key in keys {
+            for key in keys.iter().filter(|key| {
+                trust
+                    .members
+                    .iter()
+                    .any(|member| member.node_id == key.node_id())
+            }) {
                 let (value, signature) = transition.$sign(key, || Ok(trust.clone())).unwrap();
                 header = Some(value);
                 signatures.push(signature);
@@ -307,6 +310,7 @@ macro_rules! cases {
             let uncertified=successor(&mut original,&keys,&first,false);
             assert!(uncertified.verify().unwrap_err().to_string().contains("certified original history"));
             assert!(original.retained_checkpoint_restore().unwrap().public_checkpoint_trust_after(uncertified.certificate().event_sequence(),Some(&uncertified)).is_err());
+            let rotate=event(&original,&keys,mb_core::GuildEventKind::RotateWriterKey {owner:keys[0].node_id(),epoch:2,public_key:ed25519_dalek::SigningKey::from_bytes(&[92;32]).verifying_key().to_bytes()});original.install_guild_event(rotate).unwrap();
             let next=successor(&mut original,&keys,&first,true);let session=original.retained_checkpoint_restore().unwrap();let next_job=acquire(&session,971,&next,Some(&first));
             for action in ["ABORT","IGNORE"] {
                 let fault=if action=="ABORT" {",'test'"} else {""};
@@ -341,13 +345,12 @@ macro_rules! cases {
 
             let scope=CatalogScope::Guild {guild_id:next.certificate().guild_id()};let mut groups=mb_core::CatalogCodingDirectoryReader::new(scope,next.certificate().coding(),next_job.budget).unwrap();
             while let Some(entry)=groups.next_group(&mut |page|original.control.catalog_page(scope,CatalogSection::Coding,page)).unwrap() {original.retain_recovered_checkpoint_payload(next_job.id,&next,entry.retained.group.id,1).unwrap();}
+            let revoke=event(&original,&keys,mb_core::GuildEventKind::RevokeWriterKey {owner:keys[0].node_id(),epoch:1});original.install_guild_event(revoke).unwrap();
             let third=successor(&mut original,&keys,&next,true);let session=original.retained_checkpoint_restore().unwrap();let third_job=acquire(&session,975,&third,Some(&next));let third=session.promote_acquired_checkpoint_after(&third_job,Some(&next)).unwrap();drop(session);
             let mut groups=mb_core::CatalogCodingDirectoryReader::new(scope,third.certificate().coding(),third_job.budget).unwrap();
             while let Some(entry)=groups.next_group(&mut |page|original.control.catalog_page(scope,CatalogSection::Coding,page)).unwrap(){original.retain_recovered_checkpoint_payload(third_job.id,&third,entry.retained.group.id,1).unwrap();}
             original.control.cancel_checkpoint_acquisition(&next_job).unwrap();while original.control.release_checkpoint_acquisition_step(&next_job).unwrap(){}
             original.control.$cancel(next_job.id).unwrap();while original.control.$release(next_job.id).unwrap(){}
-            let rotate=event(&original,&keys,mb_core::GuildEventKind::RotateWriterKey {owner:keys[0].node_id(),epoch:2,public_key:ed25519_dalek::SigningKey::from_bytes(&[92;32]).verifying_key().to_bytes()});original.install_guild_event(rotate).unwrap();
-            let revoke=event(&original,&keys,mb_core::GuildEventKind::RevokeWriterKey {owner:keys[0].node_id(),epoch:2});original.install_guild_event(revoke).unwrap();
             let receiver_temp=tempfile::tempdir().unwrap();let receiver=fresh_public_node(receiver_temp.path(),seed.clone(),&original);quota(&receiver);
             let source=original.reader_config().open().unwrap();let session=receiver.retained_checkpoint_restore().unwrap();
             let certificate=first.certificate();let bytes=source.retained_paged_checkpoint_certificate(certificate.guild_id(),certificate.layout(),first_job.id,certificate.hash().unwrap()).unwrap();

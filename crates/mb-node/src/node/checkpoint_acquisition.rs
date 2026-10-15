@@ -484,14 +484,15 @@ impl RetainedCheckpointRestore {
             budget,
             scratch()?,
             |scope, section, page| control.catalog_page(scope, section, page),
-            |fence, kind| {
+            |fence, _kind| {
                 let original = view
                     .writer_key(fence.owner, fence.epoch, &trust)?
                     .ok_or(mb_store::DatabaseError::NotReady)?;
-                if original.public_key != fence.public_key
-                    || (kind == mb_store::CatalogCheckpointWriterAuthorization::LatestRetained
-                        && view.current_writer(fence.owner, &trust)? != Some(fence.clone()))
-                {
+                // The latest retained epoch may already be revoked or belong
+                // to a removed owner. Authenticate its original key here; the
+                // complete predecessor transition below requires the current
+                // writer for every revision that is not unchanged history.
+                if original.public_key != fence.public_key {
                     return Err(mb_store::DatabaseError::Conflict.into());
                 }
                 Ok(())
@@ -510,7 +511,8 @@ impl RetainedCheckpointRestore {
                     .validate_certified_history_coding_state(&history, budget, current)?
                     .validate_certified_history_authority_transition(
                         previous, &history, budget, current,
-                    )?
+                    )
+                    .context("validate original checkpoint transition")?
                     .bind_paged_checkpoint_header($certificate.clone(), current)?;
                 if matches!(input, ProofInput::Acquisition { .. }) {
                     control.$retain(id, &proof, current)?;

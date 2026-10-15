@@ -11,6 +11,8 @@ mod checkpoint_chain_tests;
 mod checkpoint_peer_restore_tests;
 #[cfg(target_os = "linux")]
 mod checkpoint_restore_tests;
+#[cfg(target_os = "linux")]
+mod retained_writer_tests;
 mod transport;
 
 macro_rules! legacy_custody_cases {
@@ -1231,7 +1233,7 @@ fn checkpoint_owner_proof_at_with_legacy_private(
     mb_store::CatalogQuorumPagedCheckpointIndex,
     Vec<mb_store::CatalogIntent>,
 ) {
-    checkpoint_owner_proof_with_git_inner::<false>(
+    checkpoint_owner_proof_with_git_inner::<false, false>(
         node,
         keys,
         private,
@@ -1242,7 +1244,7 @@ fn checkpoint_owner_proof_at_with_legacy_private(
     )
 }
 
-fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
+fn checkpoint_owner_proof_with_git_inner<const GIT: bool, const DETACHED_OWNER: bool>(
     node: &mut Node,
     keys: &[KeyMaterial],
     private: bool,
@@ -1403,8 +1405,12 @@ fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
                 guild_id: guild,
                 profile: coding_profile,
                 information: vec![mb_core::InformationRoleV2 {
-                    owner: keys[usize::from(GIT)].node_id(),
-                    failure_domain: member(&keys[usize::from(GIT)]).failure_domain.clone(),
+                    owner: keys[if DETACHED_OWNER { 1 } else { usize::from(GIT) }].node_id(),
+                    failure_domain: member(
+                        &keys[if DETACHED_OWNER { 1 } else { usize::from(GIT) }],
+                    )
+                    .failure_domain
+                    .clone(),
                     sector: mb_core::RangeSectorRef {
                         id: descriptor.id,
                         commitment: descriptor.commitment.clone(),
@@ -1413,8 +1419,12 @@ fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
                     },
                 }],
                 parity: vec![mb_core::ParityPlacementV2 {
-                    holder: keys[usize::from(!GIT)].node_id(),
-                    failure_domain: member(&keys[usize::from(!GIT)]).failure_domain.clone(),
+                    holder: keys[if DETACHED_OWNER { 2 } else { usize::from(!GIT) }].node_id(),
+                    failure_domain: member(
+                        &keys[if DETACHED_OWNER { 2 } else { usize::from(!GIT) }],
+                    )
+                    .failure_domain
+                    .clone(),
                     row: 0,
                 }],
             },
@@ -1447,7 +1457,7 @@ fn checkpoint_owner_proof_with_git_inner<const GIT: bool>(
         };
         node.install_coding_group_event(add, transcript.clone())
             .unwrap();
-        if GIT {
+        if GIT && !DETACHED_OWNER {
             // Only parity is local. Full restore must reconstruct information
             // from retained READY bytes after its original source disappears.
             node.stage_coding_parity(
