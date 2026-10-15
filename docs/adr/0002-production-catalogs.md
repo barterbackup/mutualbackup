@@ -7546,3 +7546,20 @@ payload, assertions, cleanup steps or timeout. Full qualification must rerun.
 The queued installed build/recovery jobs stopped on the failed prerequisite;
 no installed candidate was built. R1/R2/R3/R5/R7, normal paged integration and
 remaining M6 gates stay open; deferred hardware acceptance is unchanged.
+
+Explicit cumulative traversal pool policy (2026-10-15):
+An optional immutable CatalogTraversalPoolPolicy expands shared traversal credits
+only after the existing resource contract and acquisition adoption are active.
+The policy independently bounds bytes, records and page occurrences and cannot
+shrink the original pool. Each acquisition retains its original per-checkpoint
+limit; original resource-policy, job and lease encodings are unchanged. Paired
+bounded records, a version marker and transactional readback preserve all old
+job bytes and debt during enrollment/replay. Installation fails atomically on
+aborted or ignored writes; missing/altered pairs or markers reject reopen.
+All ten focused acquisition-work Store cases pass, including three new cases
+covering concurrent independent dimensions, single-job limits, immutability,
+reopen and enrollment faults. Strict Store all-target Clippy and formatting pass.
+This is a work-credit policy,
+not physical backing or completed-proof permit integration. Other producers,
+SQL/WAL/payload/scratch reservations and full shared R2/R3 admission remain open;
+normal paged producers remain disabled.

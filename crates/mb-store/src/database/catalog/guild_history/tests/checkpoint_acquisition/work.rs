@@ -110,6 +110,330 @@ fn base(cert: &Certificate) -> Work {
 }
 
 #[test]
+fn traversal_pool_configuration_requires_adopted_backing_and_preserves_original_jobs() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    let capacity = capacity(&cert);
+    let old_limit = capacity.plan().unwrap().job_work;
+    let policy = CatalogTraversalPoolPolicy {
+        format_version: 1,
+        capacity,
+        limit: old_limit.checked_add(old_limit).unwrap(),
+    };
+    assert!(
+        store
+            .configure_catalog_traversal_pool_policy(policy)
+            .is_err()
+    );
+    assert_eq!(store.catalog_traversal_pool_policy().unwrap(), None);
+    configure(&mut store, &cert, 16);
+    assert!(
+        store
+            .configure_catalog_traversal_pool_policy(policy)
+            .is_err()
+    );
+    activate(&store);
+    let job = store
+        .begin_checkpoint_acquisition(
+            Uuid::from_u128(2100),
+            cert,
+            proof.trust().clone(),
+            base(&Certificate::Individual(proof.certificate().clone())),
+        )
+        .unwrap();
+    let kinds = [
+        "catalog-checkpoint-acquisition-v1",
+        "catalog-checkpoint-acquisition-guard-v1",
+        "catalog-acquisition-work-lease-v1",
+        "catalog-acquisition-work-lease-guard-v1",
+    ];
+    let original = kinds.map(|kind| {
+        store
+            .get_record_bounded(kind, job.id.as_bytes(), 1 << 20)
+            .unwrap()
+            .unwrap()
+    });
+    let usage = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+    store
+        .configure_catalog_traversal_pool_policy(policy)
+        .unwrap();
+    store
+        .configure_catalog_traversal_pool_policy(policy)
+        .unwrap();
+    let expanded = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+    assert_eq!(expanded.limit, policy.limit);
+    assert_eq!(expanded.reserved, usage.reserved);
+    assert_eq!(expanded.open_jobs, usage.open_jobs);
+    for (kind, bytes) in kinds.into_iter().zip(original) {
+        assert_eq!(
+            store
+                .get_record_bounded(kind, job.id.as_bytes(), 1 << 20)
+                .unwrap(),
+            Some(bytes)
+        );
+    }
+    for dimension in 0..3 {
+        let mut smaller = old_limit;
+        match dimension {
+            0 => smaller.bytes -= 1,
+            1 => smaller.records -= 1,
+            _ => smaller.page_occurrences -= 1,
+        }
+        let mut oversized = old_limit;
+        match dimension {
+            0 => oversized.bytes += 1,
+            1 => oversized.records += 1,
+            _ => oversized.page_occurrences += 1,
+        }
+        policy.limit.remaining_after(oversized).unwrap();
+        assert!(
+            store
+                .begin_checkpoint_acquisition(
+                    Uuid::from_u128(2120 + dimension),
+                    Certificate::Individual(proof.certificate().clone()),
+                    proof.trust().clone(),
+                    oversized,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .configure_catalog_traversal_pool_policy(CatalogTraversalPoolPolicy {
+                    limit: smaller,
+                    ..policy
+                })
+                .is_err()
+        );
+    }
+    assert!(
+        store
+            .configure_catalog_traversal_pool_policy(CatalogTraversalPoolPolicy {
+                limit: policy.limit.checked_add(old_limit).unwrap(),
+                ..policy
+            })
+            .is_err()
+    );
+    drop(store);
+    let store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    assert_eq!(store.catalog_traversal_pool_policy().unwrap(), Some(policy));
+    assert_eq!(
+        store.checkpoint_acquisition_work_usage().unwrap().unwrap(),
+        expanded
+    );
+    store.cancel_checkpoint_acquisition(&job).unwrap();
+    assert_eq!(
+        store
+            .checkpoint_acquisition_work_usage()
+            .unwrap()
+            .unwrap()
+            .reserved,
+        Work::default()
+    );
+}
+
+#[test]
+fn traversal_pool_enforces_each_cumulative_dimension_across_connections() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    for dimension in 0..3 {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+        let other = ControlStore::open(&path, &history.keys[0]).unwrap();
+        configure(&mut store, &cert, 16);
+        activate(&store);
+        let old = store
+            .checkpoint_acquisition_work_usage()
+            .unwrap()
+            .unwrap()
+            .limit;
+        store
+            .configure_catalog_traversal_pool_policy(CatalogTraversalPoolPolicy {
+                format_version: 1,
+                capacity: capacity(&cert),
+                limit: old.checked_add(old).unwrap(),
+            })
+            .unwrap();
+        let mut amount = base(&cert);
+        match dimension {
+            0 => amount.bytes = old.bytes / 2 + old.bytes / 4 + 1,
+            1 => amount.records = old.records / 2 + old.records / 4 + 1,
+            _ => amount.page_occurrences = old.page_occurrences / 2 + old.page_occurrences / 4 + 1,
+        }
+        let first = store
+            .begin_checkpoint_acquisition(
+                Uuid::from_u128(2110),
+                cert.clone(),
+                proof.trust().clone(),
+                amount,
+            )
+            .unwrap();
+        let second = other
+            .begin_checkpoint_acquisition(
+                Uuid::from_u128(2111),
+                cert.clone(),
+                proof.trust().clone(),
+                amount,
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin_checkpoint_acquisition(
+                    Uuid::from_u128(2112),
+                    cert.clone(),
+                    proof.trust().clone(),
+                    amount
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .checkpoint_acquisition_work_usage()
+                .unwrap()
+                .unwrap()
+                .reserved,
+            amount.checked_add(amount).unwrap()
+        );
+        other.cancel_checkpoint_acquisition(&first).unwrap();
+        store.cancel_checkpoint_acquisition(&second).unwrap();
+        assert_eq!(
+            store
+                .checkpoint_acquisition_work_usage()
+                .unwrap()
+                .unwrap()
+                .reserved,
+            Work::default()
+        );
+    }
+}
+
+#[test]
+fn traversal_pool_configuration_faults_preserve_debt_and_reject_torn_policy() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    configure(&mut store, &cert, 16);
+    activate(&store);
+    let job = store
+        .begin_checkpoint_acquisition(
+            Uuid::from_u128(2130),
+            cert.clone(),
+            proof.trust().clone(),
+            base(&cert),
+        )
+        .unwrap();
+    let before = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+    let policy = CatalogTraversalPoolPolicy {
+        format_version: 1,
+        capacity: capacity(&cert),
+        limit: before.limit.checked_add(before.limit).unwrap(),
+    };
+    for action in ["ABORT", "IGNORE"] {
+        for target in ["policy", "guard", "marker"] {
+            let suffix = if action == "ABORT" { ",'test'" } else { "" };
+            let (table, condition) = match target {
+                "policy" => ("protocol_records", "NEW.kind='catalog-traversal-pool-v1'"),
+                "guard" => (
+                    "protocol_records",
+                    "NEW.kind='catalog-traversal-pool-guard-v1'",
+                ),
+                _ => ("meta", "NEW.key='catalog_traversal_pool_version'"),
+            };
+            store.connection.execute_batch(&format!(
+                "CREATE TEMP TRIGGER pool_fault BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE({action}{suffix}); END"
+            )).unwrap();
+            assert!(
+                store
+                    .configure_catalog_traversal_pool_policy(policy)
+                    .is_err()
+            );
+            store
+                .connection
+                .execute_batch("DROP TRIGGER pool_fault")
+                .unwrap();
+            assert_eq!(store.catalog_traversal_pool_policy().unwrap(), None);
+            assert_eq!(
+                store.checkpoint_acquisition_work_usage().unwrap().unwrap(),
+                before
+            );
+            let reopened = ControlStore::open(&path, &history.keys[0]).unwrap();
+            assert_eq!(reopened.catalog_traversal_pool_policy().unwrap(), None);
+            assert_eq!(
+                reopened.checkpoint_acquisition_state(&job).unwrap(),
+                State::Building
+            );
+        }
+    }
+    store
+        .configure_catalog_traversal_pool_policy(policy)
+        .unwrap();
+    let bytes = store
+        .get_record_bounded("catalog-traversal-pool-guard-v1", b"store", 4096)
+        .unwrap()
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "DELETE FROM protocol_records WHERE kind='catalog-traversal-pool-guard-v1'",
+            [],
+        )
+        .unwrap();
+    assert!(store.catalog_traversal_pool_policy().is_err());
+    assert!(ControlStore::open(&path, &history.keys[0]).is_err());
+    store.connection.execute("INSERT INTO protocol_records(kind,record_id,bytes) VALUES ('catalog-traversal-pool-guard-v1',?1,?2)", params![b"store", bytes]).unwrap();
+    for marker in [&[2u8][..], &[1u8, 0][..]] {
+        store
+            .connection
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='catalog_traversal_pool_version'",
+                [marker],
+            )
+            .unwrap();
+        assert!(store.catalog_traversal_pool_policy().is_err());
+        assert!(ControlStore::open(&path, &history.keys[0]).is_err());
+    }
+    store
+        .connection
+        .execute(
+            "DELETE FROM meta WHERE key='catalog_traversal_pool_version'",
+            [],
+        )
+        .unwrap();
+    assert!(ControlStore::open(&path, &history.keys[0]).is_err());
+    store
+        .connection
+        .execute(
+            "INSERT INTO meta(key,value) VALUES ('catalog_traversal_pool_version',?1)",
+            [&[1u8][..]],
+        )
+        .unwrap();
+    drop(store);
+    let store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    assert_eq!(store.catalog_traversal_pool_policy().unwrap(), Some(policy));
+    assert_eq!(
+        store
+            .checkpoint_acquisition_work_usage()
+            .unwrap()
+            .unwrap()
+            .reserved,
+        before.reserved
+    );
+    assert_eq!(
+        store.checkpoint_acquisition_state(&job).unwrap(),
+        State::Building
+    );
+    store.cancel_checkpoint_acquisition(&job).unwrap();
+}
+
+#[test]
 fn acquisition_work_shared_dimensions_reopen_and_cancellation_fence_other_connections() {
     let (mut fixture, history) = real_checkpoint();
     let proof = individual(&mut fixture, &history);

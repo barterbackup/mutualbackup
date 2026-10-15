@@ -87,14 +87,15 @@ pub use database::{
     CatalogQuorumPagedCheckpointIndex, CatalogResourcePolicy, CatalogRetainedSourceQuota,
     CatalogRetainedSourceReservation, CatalogRetainedSourceUsage, CatalogSectorSource,
     CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage, CatalogStoreError,
-    CatalogValidatedCoding, CatalogValidatedLink, CheckpointRow, ControlStore, DatabaseError,
-    DatabaseJournalQuota, DatabaseJournalQuotaUsage, DatabasePageQuota, DatabasePageQuotaUsage,
-    DatabaseRecordQuota, DatabaseRecordQuotaState, DatabaseRecordQuotaUsage, DatabaseShellResult,
-    KindedProtocolRecordMetadata, KindedProtocolRecordRow, ObjectAttemptState,
-    PAGED_DATA_RECIPE_BYTES, PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource,
-    PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject,
-    ParityScrubReport, ParityStore, ProtocolRecordRow, ReadyVariableObject, RecordScratchStore,
-    RecoveryShardLocator, ScratchStorageLimits, VariableParityObject,
+    CatalogTraversalPoolPolicy, CatalogValidatedCoding, CatalogValidatedLink, CheckpointRow,
+    ControlStore, DatabaseError, DatabaseJournalQuota, DatabaseJournalQuotaUsage,
+    DatabasePageQuota, DatabasePageQuotaUsage, DatabaseRecordQuota, DatabaseRecordQuotaState,
+    DatabaseRecordQuotaUsage, DatabaseShellResult, KindedProtocolRecordMetadata,
+    KindedProtocolRecordRow, ObjectAttemptState, PAGED_DATA_RECIPE_BYTES,
+    PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
+    PagedCatalogSectorSource, PagedCatalogSnapshot, ParityObject, ParityScrubReport, ParityStore,
+    ProtocolRecordRow, ReadyVariableObject, RecordScratchStore, RecoveryShardLocator,
+    ScratchStorageLimits, VariableParityObject,
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";

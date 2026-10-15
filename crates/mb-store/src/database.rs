@@ -83,9 +83,9 @@ pub use catalog::{
     CatalogQuorumPagedCheckpointIndex, CatalogResourcePolicy, CatalogRetainedSourceQuota,
     CatalogRetainedSourceReservation, CatalogRetainedSourceUsage, CatalogSectorSource,
     CatalogSourceSweep, CatalogStorageQuota, CatalogStorageUsage, CatalogStoreError,
-    CatalogValidatedCoding, CatalogValidatedLink, PAGED_DATA_RECIPE_BYTES,
-    PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource, PagedCatalogPageSource,
-    PagedCatalogSectorSource, PagedCatalogSnapshot,
+    CatalogTraversalPoolPolicy, CatalogValidatedCoding, CatalogValidatedLink,
+    PAGED_DATA_RECIPE_BYTES, PAGED_DATA_SHARED_BINDING_BYTES, PagedCatalogDataSource,
+    PagedCatalogPageSource, PagedCatalogSectorSource, PagedCatalogSnapshot,
 };
 #[cfg(target_os = "linux")]
 pub use directory::{DatabaseDirectory, DatabaseOpenGuard};

@@ -2669,6 +2669,19 @@ gates remain open.
       and 10 installed roots remain preserved. Dense 1 TiB and native Windows/macOS
       qualification remain user-deferred. R1/R2/R3/R5/R7 and remaining M6 gates stay open.
       Evidence: `/tmp/mb-m6-acquisition-work-l1vs9a84`.
+    - [x] Define a separate cumulative traversal work ceiling (2026-10-15).
+      An optional immutable policy expands only the shared work pool after resource
+      backing and old-job adoption are active. Each checkpoint retains its original
+      declaration limit; original job/lease and resource-policy encodings stay intact.
+      Paired bounded policy records, a version marker and readback verification make
+      failed or ignored installation atomic. Existing jobs and reservations retain
+      their exact bytes and debt across installation and reopen. This policy grants
+      work credits only; completed-proof permits and physical/SQL/WAL/scratch backing
+      remain separate integration work. Normal paged producers remain disabled.
+      Three focused Store cases pass independent dimensions across connections,
+      overlarge single-job rejection, reopen, immutable replay, ABORT/IGNORE faults
+      and torn policy/marker rejection. All ten acquisition-work cases, strict
+      Store all-target Clippy and formatting pass. The shared R2/R3 gate remains open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

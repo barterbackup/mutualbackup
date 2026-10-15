@@ -32,6 +32,7 @@ pub use checkpoint_acquisition::{
     CATALOG_ACQUISITION_WORK_JOBS, CatalogAcquisitionWorkState, CatalogAcquisitionWorkUsage,
     CatalogCheckpointAcquisition, CatalogCheckpointAcquisitionState,
     CatalogCheckpointRecoverySource, CatalogCheckpointRecoveryTip, CatalogPublicCheckpoint,
+    CatalogTraversalPoolPolicy,
 };
 mod checkpoint_coding;
 mod checkpoint_retention;

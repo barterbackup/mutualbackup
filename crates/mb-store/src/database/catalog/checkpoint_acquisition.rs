@@ -11,6 +11,7 @@ pub use recovery_source::CatalogCheckpointRecoverySource;
 pub use recovery_tip::CatalogCheckpointRecoveryTip;
 pub use work_admission::{
     CATALOG_ACQUISITION_WORK_JOBS, CatalogAcquisitionWorkState, CatalogAcquisitionWorkUsage,
+    CatalogTraversalPoolPolicy,
 };
 pub(super) fn recovery_candidate(
     cx: &Connection,

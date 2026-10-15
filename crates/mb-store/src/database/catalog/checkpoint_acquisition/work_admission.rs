@@ -2,6 +2,9 @@
 //! SQL/WAL, payloads and physical scratch keep their separate backing ledgers.
 use super::*;
 
+mod pool;
+pub use pool::CatalogTraversalPoolPolicy;
+
 const LEDGER: &str = "catalog-acquisition-work-v1";
 const GUARD: &str = "catalog-acquisition-work-guard-v1";
 const LEASE: &str = "catalog-acquisition-work-lease-v1";
@@ -107,6 +110,7 @@ fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
         .optional()?;
     let bytes = paired(cx, LEDGER, GUARD, KEY)?;
     let Some(bytes) = bytes else {
+        pool::require_unconfigured(cx)?;
         let orphan: bool = cx.query_row(
             "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1,?2,?3,?4))",
             params![LEASE, LEASE_GUARD, HELD, HELD_GUARD],
@@ -140,11 +144,7 @@ fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
     {
         return Err(DatabaseError::Integrity.into());
     }
-    l.policy
-        .capacity
-        .plan()?
-        .job_work
-        .remaining_after(l.reserved)?;
+    pool::limit(cx, l.policy)?.remaining_after(l.reserved)?;
     let mut query=cx.prepare("SELECT CASE WHEN length(record_id)=16 THEN record_id END,CASE WHEN length(bytes)<=?2 THEN bytes END FROM protocol_records WHERE kind=?1 ORDER BY record_id LIMIT ?3")?;
     let mut rows = query.query(params![
         HELD,
@@ -281,6 +281,11 @@ fn reserve_inner(
     spec: &CatalogCheckpointAcquisition,
     old: Ledger,
 ) -> Result<(), CatalogStoreError> {
+    old.policy
+        .capacity
+        .plan()?
+        .job_work
+        .remaining_after(spec.budget)?;
     if let Some(l) = lease(cx, spec)? {
         if !l.held {
             return Err(DatabaseError::Conflict.into());
@@ -295,11 +300,7 @@ fn reserve_inner(
             .ok_or(DatabaseError::CapacityExceeded)?,
         ..old
     };
-    old.policy
-        .capacity
-        .plan()?
-        .job_work
-        .remaining_after(next.reserved)?;
+    pool::limit(cx, old.policy)?.remaining_after(next.reserved)?;
     if next.open > max_jobs(old.policy) {
         return Err(DatabaseError::CapacityExceeded.into());
     }
@@ -344,6 +345,11 @@ pub(super) fn require(
             Ok(())
         }
         Some(l) => {
+            l.policy
+                .capacity
+                .plan()?
+                .job_work
+                .remaining_after(spec.budget)?;
             if l.state != CatalogAcquisitionWorkState::Active
                 || lease(cx, spec)? != Some(expected(spec)?)
             {
@@ -490,7 +496,7 @@ impl ControlStore {
                 .map(|l| {
                     Ok(CatalogAcquisitionWorkUsage {
                         state: l.state,
-                        limit: l.policy.capacity.plan()?.job_work,
+                        limit: pool::limit(cx, l.policy)?,
                         reserved: l.reserved,
                         open_jobs: l.open,
                         max_jobs: max_jobs(l.policy),
