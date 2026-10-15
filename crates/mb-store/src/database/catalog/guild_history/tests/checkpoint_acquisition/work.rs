@@ -3,6 +3,7 @@ use crate::database::{
     DatabaseJournalQuota, DatabasePageQuota, DatabaseRecordQuota, DatabaseRecordQuotaState,
 };
 use mb_core::{CatalogCapacityPolicy, CodingProfile};
+mod live;
 
 fn capacity(cert: &Certificate) -> CatalogCapacityPolicy {
     let profile = match cert {

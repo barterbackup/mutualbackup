@@ -1,8 +1,11 @@
-//! Shared traversal admission for durable acquisition jobs. Encoded pages,
+//! Shared traversal admission for durable acquisition jobs and live recovery. Encoded pages,
 //! SQL/WAL, payloads and physical scratch keep their separate backing ledgers.
 use super::*;
 
+mod live;
+mod live_owner;
 mod pool;
+pub use live::CatalogCheckpointRecoveryWork;
 pub use pool::CatalogTraversalPoolPolicy;
 
 const LEDGER: &str = "catalog-acquisition-work-v1";
@@ -29,6 +32,7 @@ pub struct CatalogAcquisitionWorkUsage {
     pub state: CatalogAcquisitionWorkState,
     pub limit: Work,
     pub reserved: Work,
+    /// Shared slots held by durable acquisitions and disposable proof traversals.
     pub open_jobs: u32,
     pub max_jobs: u32,
     pub scanned_jobs: u64,
@@ -112,8 +116,15 @@ fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
     let Some(bytes) = bytes else {
         pool::require_unconfigured(cx)?;
         let orphan: bool = cx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1,?2,?3,?4))",
-            params![LEASE, LEASE_GUARD, HELD, HELD_GUARD],
+            "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1,?2,?3,?4,?5,?6))",
+            params![
+                LEASE,
+                LEASE_GUARD,
+                HELD,
+                HELD_GUARD,
+                live::SCOPE,
+                live::SCOPE_GUARD
+            ],
             |r| r.get(0),
         )?;
         let trigger: bool = cx.query_row(
@@ -180,6 +191,7 @@ fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
     if count != l.open || guards != u64::from(count) || sum != l.reserved {
         return Err(DatabaseError::Integrity.into());
     }
+    live::validate(cx)?;
     Ok(Some(l))
 }
 fn write(cx: &Connection, old: Ledger, next: Ledger) -> Result<(), CatalogStoreError> {
