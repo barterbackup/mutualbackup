@@ -1651,6 +1651,13 @@ and native-platform gates remain open.
   - [ ] Finish the verified mount-free export/recovery policy, including
     unavailable historical metadata, and qualify legacy upgrade/recovery.
     Rejection and runtime removal do not certify historical conversion.
+    - [ ] Qualify initial and established Linux parity-volume writer handoff.
+      Pin the directory across read-only catalog/key admission, manifest
+      publication, first writer, rekey and reopen. Default-volume callers retain
+      the control directory through initialization, reopen and configuration. Fence database, journal and
+      manifest versions before writes. Preserve incomplete existing schemas
+      instead of reinitializing unknown volumes. Qualification pending under
+      `/tmp/mb-m6-volume-owner-vid28npy`; full R1 remains open.
 
 - [ ] **R2 / P1 — Make Git mutation and backup use one enforceable size budget.**
   Historical `crates/mb-git/src/history.rs` admission allowed up to 64 MiB of

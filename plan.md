@@ -6159,3 +6159,23 @@ and logs. All 15 failed artifacts, 29 older archive paths, 14 auxiliary WIP file
 and 10 installed roots remain preserved. Dense 1 TiB and native Windows/macOS
 qualification remain user-deferred. R1/R2/R3/R5/R7 and remaining M6 gates stay open.
 Evidence: `/tmp/mb-m6-acquisition-work-l1vs9a84`.
+
+Linux parity-volume writer admission (2026-10-15, qualification pending):
+Initial and established volume writers retain one directory through read-only
+key/catalog admission, manifest publication, schema open and rekey. Database,
+journal and manifest versions fence the first write. Preserved readers retain
+capability paths through SQLite main/WAL opens after directory rename. Unknown
+volumes with incomplete existing schemas reject without reinitialization;
+manifest-only unregistered initialization can resume, while registered missing
+databases stay failed. This does not close the complete R1 upgrade/recovery or
+shared R2/R3 policy. Evidence: `/tmp/mb-m6-volume-owner-vid28npy`.
+
+A real-daemon debugger probe confirms the pre-fix default caller could create
+a new manifest and parity catalog in a replacement data pathname while its
+original control directory and lock stayed held. The caller now supplies that
+held directory and rechecks it before registry publication; default-volume
+configuration/reactivation use the same binding. Directory ownership and write
+permissions are checked at admission fences. The original failing executable,
+source snapshot and probe remain under
+`/tmp/mb-m6-default-volume-handoff-probe-pl_d55ra`; corrected daemon and full
+qualification remain pending in `/tmp/mb-m6-volume-owner-vid28npy`.

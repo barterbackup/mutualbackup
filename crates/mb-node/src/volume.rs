@@ -18,7 +18,11 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+mod opening;
 mod packing_output_cleanup;
+#[cfg(target_os = "linux")]
+use opening::{initialize_volume, open_volume_store};
 #[cfg(test)]
 mod packing_payload_tests;
 
@@ -520,8 +524,28 @@ impl StorageVolumes {
         keys: Arc<KeyMaterial>,
         control: &ControlStore,
     ) -> Result<Self> {
+        require_control_directory(control, data_dir)?;
         let mut records = load_volume_records(control)?;
+        #[cfg(all(test, target_os = "linux"))]
+        opening::BEFORE_DEFAULT_VOLUME_OPEN.with(|hook| {
+            if let Some(operation) = hook.borrow_mut().take() {
+                operation();
+            }
+        });
         if records.is_empty() {
+            #[cfg(target_os = "linux")]
+            let record = match control.directory() {
+                Some(directory) => opening::initialize_volume_in_directory(
+                    data_dir,
+                    directory,
+                    Some("parity.db"),
+                    u64::MAX,
+                    0,
+                    &keys,
+                ),
+                None => initialize_volume(data_dir, Some("parity.db"), u64::MAX, 0, &keys),
+            }?;
+            #[cfg(not(target_os = "linux"))]
             let record = initialize_volume(data_dir, Some("parity.db"), u64::MAX, 0, &keys)?;
             records.push(record);
             store_volume_records(control, &records)?;
@@ -550,7 +574,13 @@ impl StorageVolumes {
                 }
                 record.path = path;
                 if record.configured || record.state == StorageVolumeState::Draining {
-                    match open_volume_store(&record, &database_key, &keys) {
+                    match open_volume_store_for_control(
+                        &record,
+                        &database_key,
+                        &keys,
+                        control,
+                        data_dir,
+                    ) {
                         Ok(opened) => {
                             if matches!(
                                 record.state,
@@ -594,6 +624,7 @@ impl StorageVolumes {
             default_path: data_dir.to_path_buf(),
             volumes,
         };
+        require_control_directory(control, data_dir)?;
         set.persist(control)?;
         Ok(set)
     }
@@ -605,6 +636,7 @@ impl StorageVolumes {
         budget_bytes: u64,
         headroom_bytes: u64,
     ) -> Result<()> {
+        require_control_directory(control, &self.default_path)?;
         if budget_bytes == 0 || headroom_bytes >= budget_bytes {
             bail!("parity volume budget must exceed its reserved headroom");
         }
@@ -672,10 +704,12 @@ impl StorageVolumes {
                     StorageVolumeState::Offline | StorageVolumeState::Draining
                 ) && volume.store.is_none()
                 {
-                    volume.store = Some(open_volume_store(
+                    volume.store = Some(open_volume_store_for_control(
                         &volume.record,
                         &volume.database_key,
                         &self.keys,
+                        control,
+                        &self.default_path,
                     )?);
                 }
                 if volume.record.state == StorageVolumeState::Offline {
@@ -709,7 +743,13 @@ impl StorageVolumes {
                     continue;
                 }
                 volume.record.configured = true;
-                match open_volume_store(&volume.record, &volume.database_key, &self.keys) {
+                match open_volume_store_for_control(
+                    &volume.record,
+                    &volume.database_key,
+                    &self.keys,
+                    control,
+                    &self.default_path,
+                ) {
                     Ok(store) => {
                         if volume.record.state != StorageVolumeState::Draining {
                             volume.record.state = StorageVolumeState::Online;
@@ -738,7 +778,13 @@ impl StorageVolumes {
                 &volume_database_id(record.volume_id),
                 &record.wrapped_database_key,
             )?;
-            let store = open_volume_store(&record, &database_key, &self.keys)?;
+            let store = open_volume_store_for_control(
+                &record,
+                &database_key,
+                &self.keys,
+                control,
+                &self.default_path,
+            )?;
             self.volumes.insert(
                 record.volume_id,
                 StorageVolume {
@@ -758,6 +804,7 @@ impl StorageVolumes {
                 }
             }
         }
+        require_control_directory(control, &self.default_path)?;
         self.persist(control)
     }
 
@@ -2876,7 +2923,13 @@ impl StorageVolumes {
             bail!("only a completed retired volume can be reactivated");
         }
         require_online_directory(&volume.record.path)?;
-        let store = open_volume_store(&volume.record, &volume.database_key, &self.keys)?;
+        let store = open_volume_store_for_control(
+            &volume.record,
+            &volume.database_key,
+            &self.keys,
+            control,
+            &self.default_path,
+        )?;
         volume.record.configured = true;
         volume.record.state = StorageVolumeState::Online;
         volume.record.last_error = None;
@@ -3337,6 +3390,35 @@ fn open_control_store_impl(
     }
 }
 
+fn require_control_directory(control: &ControlStore, data_dir: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(directory) = control.directory() {
+        opening::require_current_directory(directory, data_dir)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (control, data_dir);
+    Ok(())
+}
+
+fn open_volume_store_for_control(
+    record: &VolumeRecord,
+    database_key: &[u8; 32],
+    keys: &KeyMaterial,
+    control: &ControlStore,
+    data_dir: &Path,
+) -> Result<ParityStore> {
+    #[cfg(target_os = "linux")]
+    if record.path == data_dir
+        && let Some(directory) = control.directory()
+    {
+        return opening::open_volume_store_in_directory(record, database_key, keys, directory);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (control, data_dir);
+    open_volume_store(record, database_key, keys)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn initialize_volume(
     root: &Path,
     database_file: Option<&str>,
@@ -3435,6 +3517,7 @@ fn read_volume_manifest(root: &Path, keys: &KeyMaterial) -> Result<Option<Volume
     Ok(Some(signed.value))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn open_volume_store(
     record: &VolumeRecord,
     database_key: &[u8; 32],
@@ -6217,6 +6300,14 @@ mod tests {
             .find(|status| status.volume_id == receipt.volume_id)
             .unwrap();
         assert_eq!(status.state, StorageVolumeState::Failed);
+        #[cfg(target_os = "linux")]
+        assert!(
+            status
+                .last_error
+                .unwrap()
+                .contains("established parity database is absent")
+        );
+        #[cfg(not(target_os = "linux"))]
         assert!(status.last_error.unwrap().contains("database I/O error"));
         assert!(volumes.protection_degraded(&control).unwrap());
         assert!(!database_path.exists());
@@ -6312,8 +6403,9 @@ mod tests {
         assert!(!database_path.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn unknown_manifest_with_an_incomplete_database_resumes_initialization() {
+    fn unknown_manifest_with_an_incomplete_database_is_preserved_without_reinitialization() {
         let temp = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
         let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([88; 32])));
@@ -6362,22 +6454,47 @@ mod tests {
 
         let (control, _) = open_control_store(temp.path(), &keys).unwrap();
         let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
-        volumes
-            .configure(
-                &control,
-                &[external.path().to_path_buf()],
-                (V1_SECTOR_SIZE * 2) as u64,
-                0,
-            )
-            .unwrap();
-        let status = volumes
-            .statuses()
+        let before = fs::read_dir(external.path())
             .unwrap()
-            .into_iter()
-            .find(|status| status.volume_id == external_id)
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let registry = control
+            .get_record("node-config", b"storage-volumes")
             .unwrap();
-        assert_eq!(status.state, StorageVolumeState::Online);
-        assert_eq!(status.object_count, Some(0));
+        assert!(
+            volumes
+                .configure(
+                    &control,
+                    &[external.path().to_path_buf()],
+                    (V1_SECTOR_SIZE * 2) as u64,
+                    0,
+                )
+                .is_err()
+        );
+        let after = fs::read_dir(external.path())
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(after, before);
+        assert_eq!(
+            control
+                .get_record("node-config", b"storage-volumes")
+                .unwrap(),
+            registry
+        );
+        assert!(!volumes.volumes.contains_key(&external_id));
     }
 
     #[test]

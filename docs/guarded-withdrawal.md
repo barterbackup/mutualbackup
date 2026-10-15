@@ -95,6 +95,17 @@ history has been converted.
 Fresh native installations continue to use reflink capture. Unsupported source
 filesystems are rejected; withdrawal does not introduce a copy or mount fallback.
 
+Linux parity-volume initialization now holds its original directory through
+read-only database/key admission, manifest publication, first writable open,
+rekey and reopen. Established volume opens also check database, journal and
+manifest versions before journal-mode or schema writes. An incomplete existing
+catalog is preserved and rejected rather than initialized as an empty volume.
+Keep every database/journal file and manifest and inspect a separate complete
+snapshot. An unregistered manifest with no database can resume initial creation;
+a registered missing database remains failed and is never recreated. These
+checks do not certify complete legacy history conversion or safe retirement.
+Qualification is pending: `/tmp/mb-m6-volume-owner-vid28npy`.
+
 
 ## Offline export of available signed revisions (Linux)
 
@@ -1428,3 +1439,13 @@ signed, tampered and equivocal evidence and oversized records/query counts. CLI
 parsing and absent-genesis rejection pass. Original catalog bytes, absent key/
 parity files and temporary client cleanup are checked. Full ordinary/provisioned/
 platform suites, relay/Tor discovery and all M6 release gates remain open.
+
+A real-daemon debugger probe confirms the pre-fix default caller could create
+a new manifest and parity catalog in a replacement data pathname while its
+original control directory and lock stayed held. The caller now supplies that
+held directory and rechecks it before registry publication; default-volume
+configuration/reactivation use the same binding. Directory ownership and write
+permissions are checked at admission fences. The original failing executable,
+source snapshot and probe remain under
+`/tmp/mb-m6-default-volume-handoff-probe-pl_d55ra`; corrected daemon and full
+qualification remain pending in `/tmp/mb-m6-volume-owner-vid28npy`.

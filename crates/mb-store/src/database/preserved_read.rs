@@ -29,6 +29,33 @@ static PARENT_VFS: OnceLock<usize> = OnceLock::new();
 static PRIVATE_WAL_PARENT_VFS: OnceLock<usize> = OnceLock::new();
 static REGISTERED_VFS: OnceLock<i32> = OnceLock::new();
 
+unsafe extern "C" fn preserved_full_path(
+    vfs: *mut ffi::sqlite3_vfs,
+    input: *const std::ffi::c_char,
+    capacity: i32,
+    output: *mut std::ffi::c_char,
+) -> i32 {
+    if input.is_null() {
+        return ffi::SQLITE_CANTOPEN;
+    }
+    // Keep a held directory's capability through SQLite's main/WAL opens.
+    // The ordinary Unix callback resolves procfs back to a replaceable path.
+    if unsafe { std::ffi::CStr::from_ptr(input) }
+        .to_bytes()
+        .starts_with(b"/proc/self/fd/")
+    {
+        return unsafe { super::directory::full_path(vfs, input, capacity, output) };
+    }
+    let Some(parent) = PARENT_VFS.get() else {
+        return ffi::SQLITE_CANTOPEN;
+    };
+    let parent = *parent as *mut ffi::sqlite3_vfs;
+    match unsafe { (*parent).xFullPathname } {
+        Some(callback) => unsafe { callback(parent, input, capacity, output) },
+        None => ffi::SQLITE_CANTOPEN,
+    }
+}
+
 unsafe extern "C" fn read_only_open(
     _vfs: *mut ffi::sqlite3_vfs,
     name: ffi::sqlite3_filename,
@@ -126,6 +153,7 @@ fn register_vfs() -> Result<()> {
                 vfs.zName = name.as_ptr();
                 vfs.xOpen = Some(open);
                 vfs.xDelete = Some(reject_delete);
+                vfs.xFullPathname = Some(preserved_full_path);
                 let code = ffi::sqlite3_vfs_register(Box::into_raw(Box::new(vfs)), 0);
                 if code != ffi::SQLITE_OK {
                     return code;

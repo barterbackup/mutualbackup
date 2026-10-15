@@ -361,7 +361,7 @@ fn valid_leaf(name: &[u8]) -> bool {
         && !name.contains(&0)
 }
 
-unsafe extern "C" fn full_path(
+pub(super) unsafe extern "C" fn full_path(
     _vfs: *mut ffi::sqlite3_vfs,
     input: *const std::ffi::c_char,
     capacity: i32,
@@ -484,6 +484,29 @@ impl ControlStore {
 }
 
 impl ParityStore {
+    pub fn verify_open_guard(&self, guard: &DatabaseOpenGuard) -> Result<(), DatabaseError> {
+        guard.verify_opened(&self.path, &self.connection)
+    }
+
+    /// Open only the main file and journals admitted by a completed read-only
+    /// inspection. Check their versions before journal/schema changes.
+    pub fn open_admitted_in_directory_with_key(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        volume: &[u8; 16],
+        key: &[u8; 32],
+        guard: &DatabaseOpenGuard,
+    ) -> Result<Self, DatabaseError> {
+        let (mut connection, path) =
+            directory.connect_with_guard(name, key, guard.main.is_some(), Some(guard))?;
+        initialize_or_validate_parity(&mut connection, volume)?;
+        Ok(Self {
+            connection,
+            path,
+            directory: Some(directory.clone()),
+        })
+    }
+
     pub fn open_in_directory_with_key(
         directory: &DatabaseDirectory,
         name: &OsStr,
@@ -527,6 +550,140 @@ impl ParityStore {
 mod tests {
     use super::*;
     use std::os::unix::{ffi::OsStringExt, fs::symlink};
+
+    #[test]
+    fn admitted_parity_open_rejects_replaced_inputs_before_journals_or_schema_writes() {
+        for changed in ["main", "wal", "manifest", "absent"] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = DatabaseDirectory::open(temp.path()).unwrap();
+            let path = directory.leaf("parity.db").unwrap();
+            let manifest = directory.leaf("manifest").unwrap();
+            std::fs::write(&manifest, b"original").unwrap();
+            if changed != "absent" {
+                drop(
+                    ParityStore::open_in_directory_with_key(
+                        &directory,
+                        OsStr::new("parity.db"),
+                        &[6; 16],
+                        &[7; 32],
+                    )
+                    .unwrap(),
+                );
+            }
+            let guard = DatabaseOpenGuard::capture(&path, &[OsStr::new("manifest")]).unwrap();
+            match changed {
+                "main" => {
+                    std::fs::rename(&path, temp.path().join("original.db")).unwrap();
+                    std::fs::write(&path, b"replacement").unwrap();
+                }
+                "wal" => std::fs::write(temp.path().join("parity.db-wal"), b"new WAL").unwrap(),
+                "manifest" => std::fs::write(&manifest, b"changed").unwrap(),
+                "absent" => {
+                    drop(
+                        ParityStore::open_in_directory_with_key(
+                            &directory,
+                            OsStr::new("parity.db"),
+                            &[6; 16],
+                            &[7; 32],
+                        )
+                        .unwrap(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let snapshot = || {
+                std::fs::read_dir(temp.path())
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (
+                            path.file_name().unwrap().to_owned(),
+                            std::fs::read(path).unwrap(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+            assert!(
+                ParityStore::open_admitted_in_directory_with_key(
+                    &directory,
+                    OsStr::new("parity.db"),
+                    &[6; 16],
+                    &[7; 32],
+                    &guard
+                )
+                .is_err(),
+                "{changed}"
+            );
+            assert_eq!(snapshot(), before, "{changed}");
+        }
+    }
+
+    #[test]
+    fn preserved_directory_parity_reads_original_wal_after_rename_and_first_connection_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let visible = temp.path().join("volume");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&visible).unwrap();
+        let directory = DatabaseDirectory::open(&visible).unwrap();
+        let mut writer = ParityStore::open_in_directory_with_key(
+            &directory,
+            OsStr::new("parity.db"),
+            &[6; 16],
+            &[7; 32],
+        )
+        .unwrap();
+        let bytes = vec![42; mb_core::V1_SECTOR_SIZE];
+        let original = super::super::ParityObject {
+            format_version: 1,
+            guild_id: [3; 32],
+            group_id: [4; 32],
+            shard_index: 3,
+            root: mb_core::sector_root(&bytes),
+            bytes,
+        };
+        writer.stage_and_publish(&original).unwrap();
+        std::fs::rename(&visible, &moved).unwrap();
+        std::fs::create_dir(&visible).unwrap();
+        let replacement =
+            ParityStore::open_with_key(visible.join("parity.db"), &[6; 16], &[7; 32]).unwrap();
+        drop(replacement);
+        let snapshot = || {
+            std::fs::read_dir(&visible)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        std::fs::read(path).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let path = directory.leaf("parity.db").unwrap();
+        let (reader, guard) =
+            ParityStore::open_preserved_read_only_with_keys(&path, &[6; 16], &[[7; 32]]).unwrap();
+        assert_eq!(
+            reader
+                .load_ready(&original.group_id, original.shard_index)
+                .unwrap(),
+            original
+        );
+        guard.verify_unchanged().unwrap();
+        drop(reader);
+        drop(writer);
+        let (reader, guard) =
+            ParityStore::open_preserved_read_only_with_keys(&path, &[6; 16], &[[7; 32]]).unwrap();
+        assert_eq!(
+            reader
+                .load_ready(&original.group_id, original.shard_index)
+                .unwrap(),
+            original
+        );
+        guard.verify_unchanged().unwrap();
+        assert_eq!(snapshot(), before);
+    }
 
     #[test]
     fn directory_wal_readers_and_writers_survive_reparenting_without_touching_replacements() {
