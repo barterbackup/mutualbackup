@@ -185,6 +185,10 @@ pub enum CatalogStoreError {
     )]
     ScratchPoolRequired,
     #[error(
+        "legacy scratch pool has no enrolled ownership domain; new funded work is unavailable for this catalog"
+    )]
+    UnanchoredScratchPool,
+    #[error(
         "catalog scratch pool is exhausted; reclaim stopped scratch declarations or finish active work"
     )]
     ScratchPoolExhausted,
