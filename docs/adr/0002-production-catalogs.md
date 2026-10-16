@@ -7934,3 +7934,59 @@ normal paged production/retention/recovery remain open. No producer is enabled.
 Complete current-source/installed qualification, the three separate unexplained
 R5 observations and other M6 gates remain open. Dense 1 TiB and native Windows/
 macOS qualification remain user-deferred.
+
+### 2026-10-16 — Obtain native SQL descriptors through the pinned C VFS
+
+Qualified `6e90abf` vendors the crates.io `libsqlite3-sys` 0.35.0 package,
+verified against archive SHA-256
+`133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f`.
+`UPSTREAM.json` records all 28 original file hashes; 24 files are unchanged.
+Only `build.rs`, `src/lib.rs`, and the two SQLite/SQLCipher amalgamations change.
+The original MIT/SQLCipher licenses remain. Seven targeted whitespace
+attributes preserve upstream generated source verbatim. The package's original
+lockfile is tracked explicitly despite its upstream ignore rule. The workspace
+lock changes only the native package source/checksum, preserving dependency
+versions and declared SQLCipher/OpenSSL features.
+
+The bundled Linux Unix VFS implements local file-control opcode 1043: an `int *`
+receives the already open descriptor, borrowed until its sqlite3_file closes.
+Null arguments reject; unavailable descriptors/other VFSes return NOTFOUND.
+The bridge neither opens/closes descriptors nor changes native locking or file
+status flags. Private `unixFile` layout knowledge remains in its defining C
+translation unit. Rust uses a short non-reentrant borrowed descriptor for
+`fstat`/`fstatfs`. Ownership checks compare actual native main identity, regular
+file/link count and supported filesystem with the existing pathname, directory
+and HAS_MOVED checks. Generic logical quota behavior remains available.
+
+Three new real SQLCipher cases verify the original native inode after pathname
+replacement, live WAL identity/null/memory handling, and independent-process
+rollback-mode writer exclusion before/after 128 inspections. The independent
+writer succeeds after rollback, and the original connection then writes again.
+Initial qualification passes those three cases plus strict locked workspace/
+all-target Clippy and format. Independent audit verifies the fresh driver, all
+442 inputs/source archive, upstream hashes, only four intended upstream edits,
+identical plain-SQLite/SQLCipher extension blocks and unchanged dependency
+versions. Evidence: `/tmp/mb-m6-native-sql-file-qual-zssj11g9`.
+
+Combined qualification on that exact source passes all 582 ordinary Store cases
+(29 ignored), namespace/OverlayFS probes, Node retained checkpoint-chain2/
+volume81/snapshot36 and a fresh-process repeat. Provisioned Btrfs repeats the
+three descriptor cases, funded scratch1 and traversal25, and passes snapshot8
+plus all four retained native recovery cases. The complete focused inventory
+is 715 distinct cases in 746 executions. Strict locked workspace/all-target
+Clippy, format and independent 442-input/two-driver/exact-case/archive audits
+pass. Original negative artifacts and regression function identities remain
+preserved; owned native mounts/loops/images are independently verified clean.
+Evidence: `/tmp/mb-m6-native-sql-integration-jfhn_muh`. The copied audit initially
+expected a snapshot file from before the already-qualified destructor fix; its
+stale script/correction record are preserved. The corrected check binds the
+unchanged snapshot file to qualified `6586467`; no runtime/test edit or rerun
+was needed.
+
+This provides safe descriptor/identity access, not physical backing. Native
+main/WAL/rollback, SHM growth, temporary files, filesystem/CoW/copy headroom,
+shared persistent allocation, old-writer/quiescent enrollment and full enclosing
+policy still require integration. Normal paged producers remain disabled. Full
+current-source/installed gates, normal capture/retention/seed recovery and the
+three separate unexplained R5 observations remain open. Dense 1 TiB and native
+Windows/macOS qualification remain user-deferred.
