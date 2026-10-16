@@ -555,6 +555,41 @@ fn scratch_partial_restored_ledger_cannot_skip_an_unrecorded_live_slot() {
 }
 
 #[test]
+fn scratch_restored_declaration_cannot_impersonate_a_new_owner_of_the_same_slot() {
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let path = temp.path().join("control.db");
+    let snapshot = temp.path().join("old-owner.db");
+    let stopped = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    let checkpoint: (u32, u32, u32) = store
+        .connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint.0, 0);
+    std::fs::copy(&path, &snapshot).unwrap();
+    drop(stopped);
+    let actual = store.reserve_catalog_scratch(9).unwrap().unwrap();
+    assert_eq!(usage(&store), (9, 1));
+    drop(store);
+    std::fs::copy(&snapshot, &path).unwrap();
+    let restored = ControlStore::open(&path, &keys()).unwrap();
+    assert_eq!(usage(&restored), (3, 1));
+    assert!(
+        restored.reserve_catalog_scratch(6).is_err(),
+        "a restored small declaration impersonated the later full-pool owner of its reused kernel slot"
+    );
+    actual.check(9).unwrap();
+    drop(actual);
+    let next = restored.reserve_catalog_scratch(9).unwrap().unwrap();
+    assert_eq!(usage(&restored), (9, 1));
+    next.check(9).unwrap();
+}
+
+#[test]
 fn scratch_identity_pin_close_preserves_another_sqlite_connections_posix_writer_lock() {
     const CHILD: &str = "MB_SCRATCH_PIN_SQLITE_CHILD";
     const CASE: &str = "database::catalog::capacity_policy::tests::scratch::scratch_identity_pin_close_preserves_another_sqlite_connections_posix_writer_lock";
