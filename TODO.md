@@ -88,6 +88,16 @@ Keep the earlier native timeout and historical relay-only stall as separate
 unresolved observations. M6 remains open for qualification, R1 completion,
 shared resource admission and normal paged production/retention/recovery.
 
+Qualification follow-up on 2026-10-16: the complete source gate passed on
+`d8e0581`; its 1,613 cases are historical evidence after the subsequent source
+changes. Standalone source reads, exact funded owners and initial scratch
+enrollment now have the focused qualification recorded below. Enrollment source
+`5ac6b59` passes 703 distinct cases in 707 executions, including all 574 ordinary
+Store cases. A fresh combined complete-source and installed-artifact gate is
+still required. None of these positives diagnoses the original initial-coverage,
+native-capture or relay-only observations. R1/R2/R3/R5/R7 and M6 remain open;
+normal paged producers remain disabled.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -2752,6 +2762,31 @@ shared resource admission and normal paged production/retention/recovery.
       all-producer/global physical admission, persistent SQL/WAL/volume backing
       and normal paged integration remain open. Normal producers stay disabled;
       this is not complete-source or installed qualification.
+    - [x] Bind the initial scratch enrollment to its ownership domain.
+      Two actual regressions on `711d450` restore the valid pre-first-lease
+      catalog, then move or hard-link that same main inode into another
+      directory. Both admit 9 bytes while an original 3-byte declaration is
+      still live against a 9-byte pool. Sources, exact driver and logs remain
+      preserved at `/tmp/mb-m6-enrollment-domain-red-6i988wob`.
+      Corrected `5ac6b59` commits the synced paired domain with initial pool
+      enrollment. Local pool ledger/marker version 2 requires the domain even
+      with zero declarations; existing version-1 decoding and bytes remain
+      supported. An unanchored old pool is inspectable but cannot grant or
+      automatically upgrade: its unknown prior location cannot prove quiescence.
+      Funded ownership checks reject hard-linked main files. Moving the whole
+      directory with its bookkeeping preserves live leases and exact capacity.
+      All 574 ordinary Store cases pass, including 23 scratch and 6 lock cases,
+      enrollment ABORT/IGNORE faults, missing-domain rejection and the two
+      identical regression test sources. Actual namespace/OverlayFS probes,
+      Node recovery2/volume81/snapshot36/native8 and funded Btrfs scratch pass:
+      703 distinct cases in 707 executions. Strict workspace/all-target Clippy,
+      formatting and independent 410-input/two-driver/exact-case audit pass;
+      native mount/loop/image cleanup and original negative identities verify.
+      Evidence: `/tmp/mb-m6-enrollment-domain-qual-e1obth6s`.
+      This closes the initial funded scratch-domain gap, not full old-writer/
+      quiescent upgrade, traversal enrollment/relocation policy, global physical
+      SQL/WAL/volume backing or normal paged integration. Producers stay disabled;
+      full current-source, installed and remaining M6 gates remain open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

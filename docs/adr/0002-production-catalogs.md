@@ -7756,3 +7756,48 @@ producer is enabled. This is focused integration, not a complete current-source
 or installed-artifact gate, and diagnoses none of the three historical R5
 observations. R1/R2/R3/R5/R7 and M6 remain open; dense1TiB and native Windows/macOS
 qualification remain user-deferred.
+
+### 2026-10-16 — Anchor scratch ownership during initial enrollment
+
+Actual regressions on test-only `711d450` expose the remaining pre-first-lease
+gap in the lazy domain. After restoring the valid enrolled snapshot to the same
+main inode, moving or hard-linking only that database to another parent admits
+a new 9-byte declaration while the original 3-byte lease remains live against
+a 9-byte pool. Both failures reach the intended assertion after checking main
+inode equality, original lease validity and the restored empty ledger. Their
+source archive, exact driver and logs remain preserved at
+`/tmp/mb-m6-enrollment-domain-red-6i988wob`.
+
+Qualified `5ac6b59` records the synced kernel rendezvous in the initial policy
+writer, before the first declaration. Local pool ledger/marker version 2 requires
+the paired domain even when empty. Version-1 pool decoding and original bytes
+remain supported; an unanchored old pool remains inspectable but refuses new
+grants and automatic configuration replay. Unknown prior ownership cannot be
+made quiescent merely by installing a new local file. An explicit offline
+upgrade policy remains separate work. Signed/resource/public policy formats
+and generic resource-policy enrollment remain unchanged.
+
+Main identities, owned allocation guards and O_PATH pins reject main files with
+multiple links. Moving the entire directory, preserving ownership bookkeeping,
+keeps live declarations and capacity intact through the pinned capabilities.
+Missing both domain records in an empty version-2 enrollment is an integrity
+error. Domain/guard/marker enrollment ABORT and IGNORE faults roll back the
+policy atomically; an unused filesystem rendezvous grants no credits.
+
+The independent audit verifies 410 frozen inputs, two exact drivers, identical
+regression test source, all case selections and original negative identities.
+All 574 ordinary Store cases pass, including 23 scratch and six lock cases.
+Actual PID-namespace/OverlayFS probes and Node recovery2, volume81, snapshot36
+and native8 pass; funded scratch also passes on provisioned Btrfs. There are
+703 distinct cases in 707 executions. Strict locked workspace/all-target Clippy,
+formatting and native mount/loop/image cleanup pass. Evidence:
+`/tmp/mb-m6-enrollment-domain-qual-e1obth6s`.
+
+This qualifies initial funded scratch ownership and the exercised relocation
+cases. Full old-writer/quiescent upgrade, traversal enrollment/relocation policy,
+all-producer physical SQL/WAL/volume backing and normal paged integration remain
+open. Producers remain disabled. The complete `d8e0581` source gate is historical
+after these source changes; a new complete source and installed-artifact gate
+remains required. None of the three historical R5 causes is established, and
+R1/R2/R3/R5/R7 and M6 remain open. Dense 1 TiB and native Windows/macOS
+qualification remain user-deferred.
