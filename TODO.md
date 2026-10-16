@@ -2828,6 +2828,34 @@ normal paged producers remain disabled.
       temporary/volume backing, old-writer/quiescent policy, enclosing admission,
       normal paged integration and current-source/installed/R5/R7 remain open.
       Producers stay disabled; deferred hardware qualification is unchanged.
+    - [x] Fund runtime native control SQL file-family growth.
+      Qualified `1f3333d` adds explicit Linux physical creation/existing-open
+      APIs with separate main/journal/SHM/temporary/total/file ceilings and
+      headroom. Pinned main identity and paginated extent inspection reject
+      known sharing/inline/encoded/unknown allocations before SQL work. Btrfs
+      requires NoCow on nonempty files. Real private allocation precedes native
+      growth; partial failures, closed linked journals and unlinked live files
+      remain charged. Native SHM initialization funds its reset under exclusive
+      DMS; short journals use a funded filesystem block to prevent Btrfs inline
+      conversion. Anonymous temporaries transfer their existing descriptor to
+      the native adapter. Generic logical APIs and dependency versions stay
+      unchanged; original vendor sources/licenses remain verified.
+      All 590 ordinary Store, namespace/OverlayFS, Node recovery2/volume81/
+      snapshot36 and Btrfs descriptor3/traversal25/funded-scratch1/snapshot8/
+      retained4 pass. Ten Btrfs physical cases cover actual ENOSPC rollback/
+      retry, stopped-reflink refusal before SQL initialization, four-mode
+      fresh-process crash recovery through the ordinary adapter, family quota
+      rollback, retained temporary spill, directory rename and reopen:
+      725 distinct cases in 764 executions. Strict workspace/all-target Clippy,
+      plain SQLite C syntax, format, independent 445-input/two-driver/archive/
+      upstream/exact-case audits and owned native cleanup pass. Earlier failed
+      fixtures preserve source, driver, logs and detached images. Evidence:
+      `/tmp/mb-m6-physical-sql-integration-s53h9st1` and
+      `/tmp/mb-m6-physical-io-btrfs-r2siostk`. Persistent/global/enclosing policy,
+      checkpoint/rebuild copy reserves, old-writer/quiescent enrollment, parity
+      volumes, partial creation/restart ownership and normal paged integration
+      remain open. Producers stay disabled; complete current-source/installed,
+      R1/R2/R3/R5/R7 and user-deferred capacity/platform gates remain open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted
