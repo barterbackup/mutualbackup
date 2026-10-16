@@ -74,6 +74,20 @@ before offline-spare injection. Preserve that failure and the earlier native
 explaining the network outlier. Installed jobs did not start. Continue shared
 resource admission and normal paged integration; all enclosing M6 gates stay open.
 
+Source review on 2026-10-16 of `28e863c..fb19875` confirms the retained-writer
+correction: original keys remain authenticated, and both checkpoint layouts
+validate the complete predecessor transition before publication. New revisions
+still require current writer authority. Regression source covers the previously
+missing authority-change ordering, hostile revisions and restart reconstruction.
+No new severe defect was found in these changes or the timeout diagnostics;
+deadlines, protection assertions and successful cleanup remain intact. The tree
+was clean at review start. No builds, tests or runtime probes ran in this pass.
+The next qualification gate is the unexplained initial-coverage failure below;
+the recorded isolated/cohort passes do not replace a complete passing source run.
+Keep the earlier native timeout and historical relay-only stall as separate
+unresolved observations. M6 remains open for qualification, R1 completion,
+shared resource admission and normal paged production/retention/recovery.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -5022,6 +5036,19 @@ resource admission and normal paged integration; all enclosing M6 gates stay ope
   durable retry. Keep the historical evidence below; later successes do not
   explain the original 5,400-second outlier.
 
+  - [ ] Diagnose the initial-coverage qualification failure and complete the
+    exact-source gate before resuming installed qualification. The `c2c82ef`
+    ordinary Node run timed out in the first 90-second coverage wait of
+    `offline_first_spare_renews_live_checkpoint_coverage`, with all five nodes
+    online and before fault injection. Use the `fb19875` worker/attempt/authority
+    diagnostics to distinguish contention, stalled progress and an exited worker;
+    no cause has yet been established. Preserve the failed source/binary/log
+    identities and keep the original payload, deadlines and protection assertions.
+    The isolated and four-case positives are diagnostic evidence only. Require
+    complete source qualification on one recorded source/artifact set before
+    starting installed jobs. Retain the earlier 900-second native capture/packing
+    timeout and the historical 5,400-second relay-only stall separately; a later
+    pass does not establish a common cause or close either investigation.
   - [x] Preserve and instrument the initial checkpoint coverage timeout.
     Full source qualification and first-coverage diagnostics (2026-10-15):
     The complete C2 source gate on `c2c82ef` failed. All four provisioned native
@@ -5048,7 +5075,8 @@ resource admission and normal paged integration; all enclosing M6 gates stay ope
     all four cases (322.32 seconds). These are diagnostic positives; they identify
     no cause and do not qualify the failed full source or close R5/R7. Formatting and
     strict workspace/all-target Clippy pass. Independent audit verifies all 401 frozen
-    source inputs, the executed binary identity and both selected case inventories. Preserve both unexplained timeouts; qualify subsequent source
+    source inputs, the executed binary identity and both selected case inventories.
+    Preserve both unexplained timeouts; qualify subsequent source
     with these diagnostics without extending deadlines or weakening protection.
     Evidence: `/tmp/mb-m6-native-phase-qual-wnub781m` and
     `/tmp/mb-m6-coverage-diagnostic-u1wi9jdl`.

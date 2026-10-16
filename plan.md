@@ -1315,7 +1315,7 @@ uses that same live node rather than a parallel replacement. Pause for a focused
 source, runtime, security, and usability review at every gate before committing
 the next milestone's detailed scope.
 
-**Current position (2026-10-15):** Milestones 0 through 5 have recorded passing
+**Current position (2026-10-16):** Milestones 0 through 5 have recorded passing
 gates; Milestone 6 remains open. The accepted direction removes FUSE-backed
 guarded capture and Git integration. Prior milestone passes do not close the
 new non-FUSE production findings below. Continue native Git, source-backend,
@@ -1326,21 +1326,34 @@ requirements. The recorded implementation and runtime results that follow the
 current correction queue are historical, including any superseded statements
 that guarded completion is required.
 
+Source review on 2026-10-16 of `28e863c..fb19875` confirms the retained-writer
+recovery correction. Original key authentication remains in body admission;
+both layouts run the complete predecessor transition before publication, so new
+revisions still require current authority. The regression source now covers
+authority changes before successor creation, hostile revisions and restart
+reconstruction. No new severe defect was found in the reviewed changes. Timeout
+diagnostics preserve the original deadlines, assertions and successful cleanup.
+The working tree was clean at review start; this pass ran no builds, tests or
+runtime probes. Focused qualification is recorded below, but the latest complete
+source gate failed its first network-coverage wait and installed jobs did not
+start. Diagnostic reruns establish no cause and do not close R5/R7 or M6.
+
 The 2026-10-15 source review of `e36afa7..6001cdd` and the Linux parity-volume
 handoff now committed as `e619290` found substantive progress in shared quotas,
 durable packing custody, retained native/Git restore and seed-owned checkpoint
 acquisition. Normal paged producers remain disabled; these explicit staged APIs
 do not close the complete production pipeline. The review found one new P2
-recovery blocker: acquisition/proof reconstruction requires every retained
+recovery blocker: acquisition/proof reconstruction required every retained
 writer fence to remain current, rejecting legitimate successor checkpoints that
 retain unchanged revisions after writer rotation, revocation or owner removal.
-Preserve original-key authentication and use the complete predecessor transition
-to enforce current authority for new mutations. Both public layouts need this
-correction and recovery/restart coverage; see R3-RETAINED-WRITER-RECOVERY in
+The required correction was to preserve original-key authentication and use the
+complete predecessor transition to enforce current authority for new mutations.
+It is now implemented in both layouts; see R3-RETAINED-WRITER-RECOVERY in
 `TODO.md`. No new data-loss or unauthorized-publication defect was confirmed in
-the reviewed paths. The volume handoff is committed with qualification pending.
-This pass ran no builds, tests or runtime probes; previous runtime evidence
-remains limited to its recorded inputs.
+the reviewed paths. Volume-handoff qualification was pending at that review;
+the subsequent focused qualification is recorded below. That pass ran no builds,
+tests or runtime probes; previous runtime evidence remains limited to its
+recorded inputs.
 
 Source review of `6c10666..e36afa7` on 2026-10-10 confirms the preceding review's
 two recovery-inventory findings are corrected: supported long Git refs and
@@ -1627,10 +1640,14 @@ open. Producers stay disabled; hardware runs remain user-deferred. See ADR 0002
 and `/tmp/mb-m6-packing-output-custody-h2mugql5`.
 
 R3-RETAINED-WRITER-RECOVERY and the Linux parity-volume handoff now have focused
-passing evidence below. Preserve the native capture/packing timeout and finish
-normal source qualification with phase diagnostics before rerunning the installed
-candidate gates. Continue the remaining R1 safe-upgrade/recovery contract
-and complete shared R2/R3 resource admission, including SQL/WAL/page, scratch,
+passing evidence below. Diagnose the first 90-second network-coverage timeout
+that blocked complete source qualification on `c2c82ef`, using the `fb19875`
+diagnostics without extending deadlines or weakening protection. Preserve the
+earlier native capture/packing timeout and historical relay-only stall separately;
+the later diagnostic positives establish no cause. Complete exact-source
+qualification before resuming installed candidate gates. Continue the remaining
+R1 safe-upgrade/recovery contract and complete shared R2/R3 resource admission,
+including SQL/WAL/page, scratch,
 traversal and physical reservations for R3-SINGLE-OWNER-METADATA. Individual
 quota and acquisition increments do not close the required single-owner 1 TiB
 policy. Finish distributed availability/current activation, remaining checkpoint
@@ -1638,9 +1655,9 @@ ownership joins and normal paged capture/packing/checkpoint/retention and
 seed-only recovery under that policy before enabling producers or claiming
 retained-capacity completion. R5 topology/signature diagnosis and repeated
 validation should continue alongside them. R4 evacuation and R6 packaging are
-complete; preserve their regressions
-under R7 exact release-artifact validation. Complete all applicable corrections
-before Milestone 7 compatibility freeze. Native Windows/macOS work remains in
+complete; preserve their regressions under R7 exact release-artifact validation.
+Complete all applicable corrections before Milestone 7 compatibility freeze.
+Native Windows/macOS work remains in
 the roadmap; a narrower production platform scope requires an explicit product
 decision rather than treating missing platform support as complete.
 
