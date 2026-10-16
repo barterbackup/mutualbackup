@@ -4703,6 +4703,28 @@ shared resource admission and normal paged production/retention/recovery.
     Validation: all 150 ordinary store tests pass (26 provisioned tests remain
     ignored), including existing reset/CAS and pin-transfer regressions. This
     slice does not qualify other discovery consumers/platforms or the full M6 gate.
+  - [x] Qualify durable standalone capture/recovery source reads.
+    A valid-source regression on `553dbed` passes original metadata/byte
+    admission, then reproduces old recovery replacing unfinished relocation
+    with a fresh reflink capture attempt. Source `54801e4` instead preserves
+    Pending across fresh processes, reuses the original anchor and recipes,
+    verifies exact bytes and clears the completed catalog scan. Dense/sparse
+    standalone capture and reanchoring resolve one durable area before file
+    reads; final local records retain the discovered path, not the stale hint.
+    The identical valid fixture passes on the corrected driver. All 36 ordinary
+    snapshot cases and all eight provisioned Btrfs snapshot cases pass: 44
+    distinct cases in 45 executions. Strict locked workspace/all-target Clippy,
+    formatting and independent 407-input/one-driver/case-inventory audits pass.
+    Owned mount/loop/image cleanup is verified. Evidence:
+    `/tmp/mb-m6-valid-discovery-red-wsdkvy6n` and
+    `/tmp/mb-m6-valid-discovery-green-ju7em9d8`.
+    Earlier selector-only and File-versus-FileV2 fixture failures establish no
+    production cause; their separate source/binary/log evidence is preserved.
+    The valid negative and positive use byte-identical admitted fixture code.
+    This closes the standalone read-consumer slice. Best-effort cleanup,
+    operational retry/backoff, other consumers/filesystems/platforms and full
+    R1/R2/R3/R5/R7 gates remain open. It is not complete-source or installed
+    qualification and does not enable normal paged producers.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
     progress to remaining standalone capture/recovery and best-effort cleanup
     call paths; complete consumer lifecycle qualification;
@@ -5120,6 +5142,20 @@ shared resource admission and normal paged production/retention/recovery.
     starting installed jobs. Retain the earlier 900-second native capture/packing
     timeout and the historical 5,400-second relay-only stall separately; a later
     pass does not establish a common cause or close either investigation.
+    Current-source prerequisite passes on `d8e0581` (2026-10-16): all
+    1,613 distinct cases run freshly on one frozen source/executable set.
+    The complete Node suite passes all 594 ordinary cases, including this exact
+    previously failing fixture; Core 210, Store 547, Git 131, process 23, all
+    other ordinary targets, bulk3, kernel2 and native4 also pass. The native
+    lifecycle completes in 644.67 seconds under the original 900-second bound.
+    Strict workspace Clippy, formatting, builds and independent 407-input/
+    23-executable audit pass; native cleanup and old failure preservation are
+    verified. Read-only host/thread telemetry covers the latter run. No deadline,
+    payload or protection assertion changed. This satisfies the complete-source
+    prerequisite, but does not diagnose any of the three distinct historical
+    observations or close this item/R5/R7. No installed jobs ran; 121 ignored
+    cases remain unexecuted. Evidence:
+    `/tmp/mb-m6-shared-traversal-qual-s1de_h23`.
   - [x] Preserve and instrument the initial checkpoint coverage timeout.
     Full source qualification and first-coverage diagnostics (2026-10-15):
     The complete C2 source gate on `c2c82ef` failed. All four provisioned native

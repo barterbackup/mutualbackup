@@ -7638,6 +7638,71 @@ disabled. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and native Windows/macO
 qualification remain user-deferred. A complete current-source qualification is
 still required with the initial-coverage diagnostics before installed jobs.
 
+Complete current debug-source qualification (2026-10-16):
+`d8e0581` passes 1,613 distinct fresh cases across all 19 ordinary
+workspace drivers, three bulk-memory gates, both provisioned kernel ownership
+probes (PID namespaces and OverlayFS), and four native capture/recovery cases.
+The ordinary suites pass Core 210, Store 547, Git 131, Node 594 and process
+acceptance 23; all other ordinary targets pass. No executable-result reuse was
+needed. Format, strict locked workspace/all-target Clippy, four program builds
+and the real default-volume directory-swap probe pass. Independent audit verifies
+all 407 frozen source inputs and 23 executed programs/drivers, original failure
+artifacts, auxiliary WIP and installed roots. Native mount/image/loop cleanup
+is verified. 121 ignored cases remain unexecuted; this is the recorded Linux
+source slice, not the complete R7 native/upgrade/multi-volume/Tor/platform matrix.
+
+The previously failing initial coverage case passes inside this complete Node
+run with its original 90-second deadline, payload and protection assertions.
+The long native capture/packing lifecycle passes in 644.67 seconds under its
+original 900-second limit. A low-cost read-only sampler records CPU/thread
+scheduling, memory and I/O for the latter part of the run. These positives do
+not explain the earlier initial-coverage failure, native timeout or historical
+5,400-second relay-only stall; preserve their separate source/binary/log evidence.
+R5 causal diagnosis remains open. No installed candidate was built or tested.
+
+Evidence: `/tmp/mb-m6-shared-traversal-qual-s1de_h23`; independent `final-audit.json`, full per-case inventories,
+source and binary manifests, native phase logs and `runtime-resources.jsonl`.
+The isolated scratch-pool/work-accounting branch remains unqualified and is not
+part of this source set. R1/R2/R3/R5/R7, shared physical admission, distributed
+activation and normal paged production/retention/recovery remain open. Dense
+1 TiB and native Windows/macOS qualification remain user-deferred.
+
+Standalone durable capture/recovery consumers (focused qualification, 2026-10-16):
+Original runtime on `553dbed` passes the regression's original metadata/byte
+admission, then treats unfinished relocation as unavailable old data and
+attempts a fresh reflink capture. Corrected source `54801e4` resolves standalone
+dense/sparse capture and recovered-anchor reads through the durable catalog
+cursor. A second rename returns to that resolver. Pending old-anchor reuse
+requests retry while retaining original ownership. Recovery checks signed
+metadata and bytes before completing assistance; final records retain the
+actual discovered path instead of restoring the stale immutable hint.
+
+The valid fixture retries across fresh processes in a 5,000-entry namespace,
+requiring unchanged original manifests/recipes while pending, exact-byte
+completion and journal cleanup. Independent audit verifies identical fixture
+code in the negative and positive drivers. Initial selector-only and wrong
+File-versus-FileV2 fixture failures prove no production cause and remain
+separately preserved. The valid fixture carries actual native identity/extents
+and explicitly passes original metadata validation in parent and fresh child.
+
+All 36 ordinary snapshot cases and all eight provisioned Btrfs snapshot cases
+pass, covering capture repair, old-intent migration, Git/source-loss recovery,
+reanchoring after capture-before-commit interruption, durable retirement and
+bounded directory handles: 44 distinct cases in 45 executions. Strict locked
+workspace/all-target Clippy and formatting pass. Independent audit verifies all
+407 frozen inputs, one executed driver and exact selected/passed inventories.
+The owned Btrfs mount, loop and image are verified cleaned. Evidence:
+`/tmp/mb-m6-valid-discovery-red-wsdkvy6n` and
+`/tmp/mb-m6-valid-discovery-green-ju7em9d8`.
+
+This closes the standalone read-consumer slice, not the enclosing integration.
+Best-effort cleanup still has process-local paths; operational retry/backoff,
+other consumers/filesystems/platforms, complete admission and normal paged
+production/retention/recovery remain open with R1/R2/R3/R5/R7. This is not a new
+complete-source or installed-artifact gate and explains none of the original
+initial-coverage/native-capture/relay-only observations. Dense 1 TiB and native
+Windows/macOS qualification remain user-deferred.
+
 Funded scratch ownership binding (correction pending qualification, 2026-10-16):
 The aggregate scratch component reserves full VFS physical ceilings and job
 slots; actual fallocate, checkpoint-copy reserves and shared filesystem headroom
