@@ -6461,3 +6461,33 @@ producer is enabled. This is focused integration, not a complete current-source
 or installed-artifact gate, and diagnoses none of the three historical R5
 observations. R1/R2/R3/R5/R7 and M6 remain open; dense1TiB and native Windows/macOS
 qualification remain user-deferred.
+
+### 2026-10-16 — Initial funded scratch ownership enrollment
+
+Two preserved regressions on `711d450` restore the valid pre-first-lease
+snapshot, then move or hard-link the same main inode into another directory.
+Both admit 9 bytes against a 9-byte pool while an original 3-byte lease is live.
+Qualified `5ac6b59` commits the synced paired lock domain with initial scratch
+enrollment. Local ledger/marker version 2 requires the domain even when empty;
+version-1 bytes remain readable, but unanchored old pools cannot grant or
+automatically upgrade. Funded ownership refuses hard-linked main files, while
+whole-directory relocation with bookkeeping preserves live capacity.
+
+All 574 ordinary Store cases, actual namespace/OverlayFS probes and focused
+Node recovery/volume/snapshot/native integration pass: 703 distinct cases in
+707 executions. Enrollment write faults, missing domain pairs, both identical
+regression test sources, legacy inspection and whole-directory relocation are
+covered. Strict locked workspace/all-target Clippy, formatting and independent
+410-input/two-driver/exact-case audit pass; original negatives and owned native
+mount/loop/image cleanup are verified. Evidence:
+`/tmp/mb-m6-enrollment-domain-qual-e1obth6s` and
+`/tmp/mb-m6-enrollment-domain-red-6i988wob`.
+
+This closes the initial funded scratch-domain gap. Full old-writer/quiescent
+upgrade, traversal enrollment/relocation, all-producer/global physical SQL/WAL/
+volume backing and normal paged integration remain open. No producer is enabled.
+The full `d8e0581` source gate is historical after subsequent source changes;
+new combined complete-source and installed qualification remain required. R5's
+initial-coverage, native-capture and historical relay-only observations remain
+separate and unexplained. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and
+native Windows/macOS qualification remain user-deferred.
