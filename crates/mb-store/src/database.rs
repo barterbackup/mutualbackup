@@ -2238,6 +2238,8 @@ pub struct ObjectAttemptState {
 
 pub struct ParityStore {
     connection: Connection,
+    #[cfg(target_os = "linux")]
+    physical_vfs: Option<journal_vfs::PhysicalVfs>,
     path: PathBuf,
     #[cfg(target_os = "linux")]
     directory: Option<DatabaseDirectory>,
@@ -2262,6 +2264,8 @@ impl ParityStore {
             validate_parity_schema_version(&connection, stored_schema_version(&connection)?)?;
             Ok(Self {
                 connection,
+                #[cfg(target_os = "linux")]
+                physical_vfs: None,
                 path: path.to_path_buf(),
                 #[cfg(target_os = "linux")]
                 directory: None,
@@ -2290,6 +2294,8 @@ impl ParityStore {
         initialize_or_validate_parity(&mut connection, volume_id)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            physical_vfs: None,
             path: path.to_path_buf(),
             #[cfg(target_os = "linux")]
             directory: None,
@@ -2313,6 +2319,8 @@ impl ParityStore {
         initialize_or_validate_parity(&mut connection, volume_id)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            physical_vfs: None,
             path: path.to_path_buf(),
             #[cfg(target_os = "linux")]
             directory: None,
@@ -2343,6 +2351,8 @@ impl ParityStore {
         validate_parity_schema_version(&connection, stored_schema_version(&connection)?)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            physical_vfs: None,
             path: path.to_path_buf(),
             #[cfg(target_os = "linux")]
             directory: None,
