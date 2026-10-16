@@ -6281,3 +6281,64 @@ source inputs, the executed binary identity and both selected case inventories. 
 with these diagnostics without extending deadlines or weakening protection.
 Evidence: `/tmp/mb-m6-native-phase-qual-wnub781m` and
 `/tmp/mb-m6-coverage-diagnostic-u1wi9jdl`.
+
+Explicit cumulative traversal pool policy (2026-10-15):
+An optional immutable CatalogTraversalPoolPolicy expands shared traversal credits
+only after the existing resource contract and acquisition adoption are active.
+The policy independently bounds bytes, records and page occurrences and cannot
+shrink the original pool. Each acquisition retains its original per-checkpoint
+limit; original resource-policy, job and lease encodings are unchanged. Paired
+bounded records, a version marker and transactional readback preserve all old
+job bytes and debt during enrollment/replay. Installation fails atomically on
+aborted or ignored writes; missing/altered pairs or markers reject reopen.
+All ten focused acquisition-work Store cases pass, including three new cases
+covering concurrent independent dimensions, single-job limits, immutability,
+reopen and enrollment faults. Strict Store all-target Clippy and formatting pass.
+This is a work-credit policy,
+not physical backing or completed-proof permit integration. Other producers,
+SQL/WAL/payload/scratch reservations and full shared R2/R3 admission remain open;
+normal paged producers remain disabled.
+
+Kernel-owned complete-proof traversal admission (focused qualification, 2026-10-16):
+Complete recovery-proof reconstruction reserves whole-chain work from the same
+cumulative ledger and bounded slots as durable acquisitions before scratch or
+ancestry traversal. Guards recheck paired leases; setup prepays admission,
+release and failed-finish cleanup. Short verified writers release work only
+after traversal stops. Failed cleanup leaves debt. The scope grants no recovery,
+certificate, history, payload or publication authority.
+
+Review reproduced premature reclamation through independent module/PID contexts
+and an actual OverlayFS alias of a live catalog. Kernel OFD locks on a separate
+empty file replace PID/weak-token guesses. Paired domains bind the actual catalog
+and lock inode; creation is synced and held directory/file mappings are checked.
+No extra descriptor opens the SQLite main file. Btrfs, ext4, XFS and tmpfs are
+supported; layered/remote filesystems and foreign-device main-file mounts reject
+before inferring independent copies. OverlayFS is explicitly unsupported.
+
+New domain envelopes are version 2. Original version-1 domains remain readable;
+the original catalog can reclaim a stopped kernel slot. Copies retain version-1
+debt, and a new UUID/version is installed only without current scopes. Experimental
+process-owner v1 envelopes retain their exact bytes and remain debt even in a
+copy: their filesystem provenance cannot prove independence. Proven version-2
+copies drain inherited scopes before rebinding, preserving original live credits.
+Reclamation releases at most one abandoned scope, never a resumable acquisition.
+Signed/wire, original acquisition job/lease and resource-policy formats stay intact.
+
+The frozen candidate passes 24 Store cases (19 work, three lock, one provisioned
+PID-namespace and one provisioned OverlayFS) plus both three-generation resource-
+backed Node layouts. Coverage includes write faults, failed Drop, actual SIGKILL,
+damaged pairs, directory/file replacement, original/copy legacy debt, version
+upgrade, mixed budgets, live ownership and exact native/Git recovery after
+retirement, writer changes and reopen. Strict workspace/all-target Clippy,
+formatting, diff and source/executed-binary identity checks pass. The OverlayFS
+mount is verified unmounted; its small fixture is retained for inspection.
+Evidence: `/tmp/mb-m6-kernel-local-fs-1xcjw5mf`. Original red evidence remains preserved at
+`/tmp/mb-m6-live-owner-red-16g84bt1` and
+`/tmp/mb-m6-live-overlay-red-s_dep78t`, including source and executable identities.
+
+This closes the focused owner-domain and recovery work-scope slice. Physical
+SQL/WAL/page/payload/scratch backing, other producers, distributed current
+activation and normal paged integration remain open. Normal producers stay
+disabled. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and native Windows/macOS
+qualification remain user-deferred. A complete current-source qualification is
+still required with the initial-coverage diagnostics before installed jobs.

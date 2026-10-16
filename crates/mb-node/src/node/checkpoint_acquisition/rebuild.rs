@@ -6,8 +6,10 @@ use mb_store::{CatalogCheckpointRecoverySource as Source, CatalogCheckpointRecov
 const STACK: &str = "checkpoint-recovery-proof-stack";
 const SOURCE_BYTES: usize = mb_core::PAGED_QUORUM_CHECKPOINT_BYTES + 32768;
 const LOOKUP_WORK: Work = Work {
-    bytes: 2 * 1024 * 1024,
-    records: 32,
+    // Include the bounded shared-ledger integrity scan (at most 64 slots),
+    // paired live scopes and the original recovery-custody metadata reads.
+    bytes: 8 * 1024 * 1024,
+    records: 1024,
     page_occurrences: 0,
 };
 
@@ -20,11 +22,12 @@ fn identity(source: &Source) -> Result<Tip> {
         hash: source.certificate.hash()?,
     })
 }
-pub(super) struct RecoveryWorkMeter {
+pub(super) struct RecoveryWorkMeter<'a> {
     budget: Work,
     used: std::cell::Cell<Work>,
+    admission: mb_store::CatalogCheckpointRecoveryWork<'a>,
 }
-impl RecoveryWorkMeter {
+impl RecoveryWorkMeter<'_> {
     pub(super) fn charge(
         &self,
         extra: Work,
@@ -35,13 +38,15 @@ impl RecoveryWorkMeter {
         Ok(())
     }
     pub(super) fn guard(&self) -> std::result::Result<(), mb_store::CatalogStoreError> {
-        self.charge(LOOKUP_WORK)
+        self.charge(LOOKUP_WORK)?;
+        self.admission.check()
     }
 }
 impl RetainedCheckpointRestore {
     /// Reconstruct the complete selected original checkpoint proof after reopen,
     /// including independently owned predecessors whose original owners retired.
-    /// The caller admits the whole chain; no durable recovery/protection state
+    /// The caller declares the whole chain and resource-backed catalogs reserve
+    /// it from the shared traversal pool. No durable recovery/protection state
     /// changes. Only the previous and current disposable proof stay live.
     pub fn rebuild_checkpoint_recovery_proof(
         &self,
@@ -55,14 +60,23 @@ impl RetainedCheckpointRestore {
         mut after_proof: impl FnMut(u64) -> Result<()>,
     ) -> Result<RecoveredCheckpointProof> {
         let control = &self.reader.control;
-        let meter = RecoveryWorkMeter {
-            budget,
-            used: std::cell::Cell::new(Work::default()),
-        };
-        meter.guard()?;
+        // Prepay the tip lookup, admission scans and short release writer,
+        // including Drop's cleanup retry after a failed explicit finish. Eight
+        // bounded read batches cover these even with all 64 slots occupied.
+        // Reserve before scratch or ancestry; validation holds no SQL writer.
+        let mut setup = Work::default();
+        for _ in 0..8 {
+            setup = setup.checked_add(LOOKUP_WORK)?;
+        }
+        budget.remaining_after(setup)?;
         let selected = control
             .checkpoint_recovery_tip()?
             .context("no selected checkpoint recovery progress")?;
+        let mut meter = RecoveryWorkMeter {
+            budget,
+            used: std::cell::Cell::new(setup),
+            admission: control.begin_checkpoint_recovery_work(selected, budget)?,
+        };
         let current = || -> Result<()> {
             meter.guard()?;
             anyhow::ensure!(
@@ -72,6 +86,9 @@ impl RetainedCheckpointRestore {
             Ok(())
         };
         current()?;
+        // Scratch admission also enumerates the separately bounded volume
+        // registry and its checkpoint/headroom descriptors.
+        meter.charge(LOOKUP_WORK)?;
         let stack = crate::volume::paged_scratch_store(
             control,
             budget.bytes.min(mb_core::CATALOG_MAX_STREAM_BYTES * 4),
@@ -183,6 +200,7 @@ impl RetainedCheckpointRestore {
                 && proof.certificate().guild_id() == selected.guild_id,
             "checkpoint proof stack did not reach selected progress"
         );
+        meter.admission.finish()?;
         Ok(proof)
     }
 }

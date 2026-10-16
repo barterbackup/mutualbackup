@@ -15,6 +15,58 @@ mod checkpoint_restore_tests;
 mod retained_writer_tests;
 mod transport;
 
+// Existing fixtures support both unconfigured legacy staging and explicitly
+// backed catalogs. Resource-backed paths reserve before staging and publish
+// each complete public tree so its unused credits and job slot can close.
+fn begin_fixture_private_catalog(node: &Node, intent: mb_store::CatalogIntent) {
+    if let Some(resource) = node.control.catalog_resource_policy().unwrap() {
+        let pages = if intent.section == mb_core::CatalogSection::SectorReferences {
+            resource.capacity.source_pages_per_revision
+        } else {
+            resource.capacity.private_work_per_revision.page_occurrences
+        };
+        node.control
+            .begin_catalog_with_page_reservation(
+                intent,
+                mb_store::CatalogPageReservation {
+                    page_bytes: pages * mb_core::CATALOG_PAGE_BYTES as u64,
+                    pages,
+                },
+            )
+            .unwrap();
+    } else {
+        node.control.begin_catalog(intent).unwrap();
+    }
+}
+
+fn stage_fixture_public_page(
+    node: &Node,
+    intent: mb_store::CatalogIntent,
+    page: mb_core::CatalogPageRef,
+    bytes: &[u8],
+) {
+    let backed = node.control.catalog_resource_policy().unwrap().is_some();
+    if backed {
+        node.control
+            .begin_catalog_with_page_reservation(
+                intent,
+                mb_store::CatalogPageReservation {
+                    page_bytes: page.page_occurrences * mb_core::CATALOG_PAGE_BYTES as u64,
+                    pages: page.page_occurrences,
+                },
+            )
+            .unwrap();
+    } else {
+        node.control.begin_catalog(intent).unwrap();
+    }
+    node.control
+        .stage_catalog_page(intent, page, bytes)
+        .unwrap();
+    if backed {
+        node.control.publish_catalog(intent, page).unwrap();
+    }
+}
+
 macro_rules! legacy_custody_cases {
     ($test:ident, $constructor:ident, $metadata:ident, $retain:ident, $step:ident, $cancel:ident, $release:ident, $layout:ident, $lookup:ident) => {
         #[test]
@@ -628,10 +680,7 @@ fn directory_from_original(
             scope,
             section: CatalogSection::Packing,
         };
-        node.control.begin_catalog(intent).unwrap();
-        node.control
-            .stage_catalog_page(intent, *page, bytes)
-            .unwrap();
+        stage_fixture_public_page(node, intent, *page, bytes);
         intents.push(intent);
     }
     let installed = node.installed_guild().unwrap().unwrap();
@@ -900,7 +949,7 @@ fn local_private_checkpoint_revision_inner<const GIT: bool>(
             scope,
             section,
         };
-        node.control.begin_catalog(intent).unwrap();
+        begin_fixture_private_catalog(node, intent);
         intent
     });
     let mut records = std::collections::BTreeMap::new();
@@ -1005,7 +1054,7 @@ fn local_private_checkpoint_revision_inner<const GIT: bool>(
                 scope,
                 section: CatalogSection::GitGraph,
             };
-            node.control.begin_catalog(intent).unwrap();
+            begin_fixture_private_catalog(node, intent);
             intent
         })
     });
@@ -1087,6 +1136,27 @@ fn local_private_checkpoint_revision_inner<const GIT: bool>(
             offset: 0,
         }
     });
+    if node.control.catalog_resource_policy().unwrap().is_some() {
+        let capacity = data
+            .as_ref()
+            .map(
+                |(reference, _)| mb_store::CatalogRetainedSourceReservation {
+                    logical_bytes: u64::from(reference.logical_len),
+                    sources: 1,
+                },
+            )
+            .unwrap_or_default();
+        node.control
+            .with_record_transaction(|| {
+                node.control
+                    .reserve_catalog_retained_sources_in_transaction(
+                        signed.value.revision_id,
+                        scope,
+                        capacity,
+                    )
+            })
+            .unwrap();
+    }
     private
         .publish_local_catalog_with_data_sources(
             &node.control,
@@ -1689,10 +1759,7 @@ fn checkpoint_owner_proof_with_git_inner<const GIT: bool, const DETACHED_OWNER: 
                 scope,
                 section: *section,
             };
-            node.control.begin_catalog(intent).unwrap();
-            node.control
-                .stage_catalog_page(intent, *page, bytes)
-                .unwrap();
+            stage_fixture_public_page(node, intent, *page, bytes);
             intent
         })
         .collect();

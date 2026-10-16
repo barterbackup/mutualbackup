@@ -2683,6 +2683,43 @@ shared resource admission and normal paged production/retention/recovery.
       and 10 installed roots remain preserved. Dense 1 TiB and native Windows/macOS
       qualification remain user-deferred. R1/R2/R3/R5/R7 and remaining M6 gates stay open.
       Evidence: `/tmp/mb-m6-acquisition-work-l1vs9a84`.
+    - [x] Define a separate cumulative traversal work ceiling (2026-10-15).
+      An optional immutable policy expands only the shared work pool after resource
+      backing and old-job adoption are active. Each checkpoint retains its original
+      declaration limit; original job/lease and resource-policy encodings stay intact.
+      Paired bounded policy records, a version marker and readback verification make
+      failed or ignored installation atomic. Existing jobs and reservations retain
+      their exact bytes and debt across installation and reopen. This policy grants
+      work credits only; completed-proof permits and physical/SQL/WAL/scratch backing
+      remain separate integration work. Normal paged producers remain disabled.
+      Three focused Store cases pass independent dimensions across connections,
+      overlarge single-job rejection, reopen, immutable replay, ABORT/IGNORE faults
+      and torn policy/marker rejection. All ten acquisition-work cases, strict
+      Store all-target Clippy and formatting pass. The shared R2/R3 gate remains open.
+    - [x] Qualify shared complete-proof recovery traversal scopes.
+      Whole-chain proof reconstruction reserves shared work before scratch or
+      ancestry, rechecks paired leases and prepays release/failed-finish cleanup.
+      Review reproduced live-credit stealing across module/PID contexts and
+      through an actual OverlayFS alias. Separate-file kernel OFD slots replace
+      PID/weak-token ownership; synced paired domains bind catalog/lock identity
+      and pinned directories. Only Btrfs/ext4/XFS/tmpfs permit copy inference;
+      layered/remote filesystems and foreign-device main files reject explicitly.
+      New domain version 2 preserves original version-1 decoding and same-catalog
+      kernel reclamation. Copies keep old domain/process-envelope debt; upgrade
+      rotates the domain UUID only without current scopes. Proven v2 copies
+      drain inherited scopes before rebinding without changing original credits.
+      At most one abandoned scope is reclaimed; durable jobs keep their debt.
+      All 24 Store cases (19 work, three locks, provisioned namespace and OverlayFS)
+      and both three-generation resource-backed Node layouts pass. Write faults,
+      failed Drop, SIGKILL, damaged pairs, replacements, legacy copy/reopen/upgrade,
+      mixed budgets and exact retained native/Git recovery are covered. Strict
+      workspace/all-target Clippy, formatting and source/binary identity checks
+      pass; the OverlayFS mount is verified unmounted. Original red artifacts stay
+      preserved. Evidence: `/tmp/mb-m6-kernel-local-fs-1xcjw5mf`;
+      `/tmp/mb-m6-live-owner-red-16g84bt1` and
+      `/tmp/mb-m6-live-overlay-red-s_dep78t`.
+      Physical SQL/WAL/page/payload/scratch backing, other producers, distributed
+      activation and normal paged integration remain open. Producers stay disabled.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

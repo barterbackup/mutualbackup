@@ -5,8 +5,12 @@ use crate::{RecoveredCheckpointProof, RetainedSnapshotRestore};
 use mb_core::{CatalogCheckpointAuthorityRecord as R, CatalogScope, CatalogSection};
 use mb_core::{QuorumPagedCheckpoint, QuorumPagedCheckpointDirectory};
 use mb_store::CatalogPublicCheckpoint as Certificate;
+mod resources;
 
 pub(super) fn quota(node: &Node) {
+    if node.control.catalog_resource_policy().unwrap().is_some() {
+        return;
+    }
     node.control
         .configure_catalog_storage_quota(mb_store::CatalogStorageQuota {
             page_bytes: 128 << 20,
@@ -25,10 +29,9 @@ pub(super) fn acquire(
         .acquire_public_checkpoint_after(
             Uuid::from_u128(id),
             proof.certificate(),
-            Work {
-                bytes: 64 << 20,
-                records: 65536,
-                page_occurrences: 65536,
+            match proof {
+                RecoveredCheckpointProof::Individual(proof) => proof.transition().budget(),
+                RecoveredCheckpointProof::Directory(proof) => proof.transition().budget(),
             },
             previous,
             |_| anyhow::bail!("fixture public pages should already be local"),
@@ -53,11 +56,16 @@ pub(super) fn successor(
     );
     node.install_guild_event(certified).unwrap();
     let old = previous.certificate();
-    let work = Work {
-        bytes: 64 << 20,
-        records: 65536,
-        page_occurrences: 65536,
-    };
+    let work = node
+        .control
+        .catalog_capacity_policy()
+        .unwrap()
+        .map(|policy| policy.plan().unwrap().job_work)
+        .unwrap_or(Work {
+            bytes: 64 << 20,
+            records: 65536,
+            page_occurrences: 65536,
+        });
     let session = node.retained_checkpoint_restore().unwrap();
     let sequence = super::super::super::frozen_original_history(&node.control)
         .unwrap()
@@ -296,6 +304,7 @@ macro_rules! cases {
         #[test]
         fn $test() {
             let (original_temp,seed,mut original,mut keys)=fixture();let local=keys.iter().position(|key|key.node_id()==original.keys.node_id()).unwrap();keys.swap(0,local);
+            resources::configure(&mut original);
             let (first,_captures)=$constructor(&mut original,&keys,true);let first=RecoveredCheckpointProof::$variant(Box::new(first));quota(&original);
             let session=original.retained_checkpoint_restore().unwrap();let first_job=acquire(&session,970,&first,None);
             for action in ["ABORT","IGNORE"] {
@@ -351,7 +360,7 @@ macro_rules! cases {
             while let Some(entry)=groups.next_group(&mut |page|original.control.catalog_page(scope,CatalogSection::Coding,page)).unwrap(){original.retain_recovered_checkpoint_payload(third_job.id,&third,entry.retained.group.id,1).unwrap();}
             original.control.cancel_checkpoint_acquisition(&next_job).unwrap();while original.control.release_checkpoint_acquisition_step(&next_job).unwrap(){}
             original.control.$cancel(next_job.id).unwrap();while original.control.$release(next_job.id).unwrap(){}
-            let receiver_temp=tempfile::tempdir().unwrap();let receiver=fresh_public_node(receiver_temp.path(),seed.clone(),&original);quota(&receiver);
+            let receiver_temp=tempfile::tempdir().unwrap();let mut receiver=fresh_public_node(receiver_temp.path(),seed.clone(),&original);resources::configure(&mut receiver);quota(&receiver);
             let source=original.reader_config().open().unwrap();let session=receiver.retained_checkpoint_restore().unwrap();
             let certificate=first.certificate();let bytes=source.retained_paged_checkpoint_certificate(certificate.guild_id(),certificate.layout(),first_job.id,certificate.hash().unwrap()).unwrap();
             let expected=match &certificate {Certificate::Individual(c)=>mb_core::canonical_bytes(c).unwrap(),Certificate::Directory(c)=>mb_core::canonical_bytes(c).unwrap()};assert_eq!(bytes,expected);
@@ -379,7 +388,7 @@ macro_rules! cases {
 
             drop(receiver);let receiver=Node::open(receiver_temp.path(),seed).unwrap();let session=receiver.retained_checkpoint_restore().unwrap();
             let selected=receiver.control.checkpoint_recovery_tip().unwrap();
-            let rebuild_budget=Work{bytes:16<<30,records:16<<20,page_occurrences:16<<20};
+            let rebuild_budget=resources::rebuild_budget(&receiver);resources::released(&receiver);
             assert!(session.rebuild_checkpoint_recovery_proof(Work::default()).is_err());
             assert!(session.rebuild_checkpoint_recovery_proof(Work{bytes:512<<20,..rebuild_budget}).is_err());
             assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
@@ -388,7 +397,14 @@ macro_rules! cases {
             for kind in names{receiver.control.delete_record(kind,middle_owner.as_bytes()).unwrap();}
             assert!(session.rebuild_checkpoint_recovery_proof(rebuild_budget).is_err());assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
             for (kind,bytes) in names.into_iter().zip(links){receiver.control.put_record(kind,middle_owner.as_bytes(),&bytes).unwrap();}
-            let rebuilt=session.rebuild_checkpoint_recovery_proof(rebuild_budget).unwrap();rebuilt.verify().unwrap();assert_eq!(rebuilt.certificate(),next_certificate);
+            resources::released(&receiver);
+            let rebuilt=session.rebuild_checkpoint_proof_with_observer(rebuild_budget,|_| {
+                let usage=receiver.checkpoint_acquisition_work_usage()?.unwrap();
+                assert_eq!(usage.reserved,rebuild_budget);assert_eq!(usage.open_jobs,1);
+                assert!(!receiver.reclaim_abandoned_checkpoint_recovery_work()?);
+                assert!(receiver.control.begin_checkpoint_recovery_work(selected.unwrap(),rebuild_budget).is_err());
+                Ok(())
+            }).unwrap();resources::released(&receiver);rebuilt.verify().unwrap();assert_eq!(rebuilt.certificate(),next_certificate);
             assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
             assert_eq!(receiver.control.checkpoint_acquisition_state(&first_remote).unwrap(),mb_store::CatalogCheckpointAcquisitionState::Cancelled);
 
@@ -402,7 +418,7 @@ macro_rules! cases {
             }).unwrap();verify_git_restore(&receiver,&target,revision.protected_root_id);
             assert!(receiver.control.checkpoint_head_identity(&request.guild_id).unwrap().is_none());
             let mut cancelled=false;
-            assert!(session.rebuild_checkpoint_proof_with_observer(rebuild_budget,|generation|{if generation==1{receiver.control.cancel_checkpoint_recovery_tip(&next_remote)?;cancelled=true;}Ok(())}).is_err());assert!(cancelled);
+            assert!(session.rebuild_checkpoint_proof_with_observer(rebuild_budget,|generation|{if generation==1{receiver.control.cancel_checkpoint_recovery_tip(&next_remote)?;cancelled=true;}Ok(())}).is_err());assert!(cancelled);resources::released(&receiver);
             assert!(session.rebuild_checkpoint_recovery_proof(rebuild_budget).is_err());
             assert!(receiver.control.checkpoint_recovery_tip().unwrap().is_none());assert!(session.promote_acquired_checkpoint_after(&next_remote,Some(&rebuilt)).is_err());
             verify_git_restore(&receiver,&target,revision.protected_root_id);drop(original_temp);

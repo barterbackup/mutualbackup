@@ -31,7 +31,8 @@ mod checkpoint_body;
 pub use checkpoint_acquisition::{
     CATALOG_ACQUISITION_WORK_JOBS, CatalogAcquisitionWorkState, CatalogAcquisitionWorkUsage,
     CatalogCheckpointAcquisition, CatalogCheckpointAcquisitionState,
-    CatalogCheckpointRecoverySource, CatalogCheckpointRecoveryTip, CatalogPublicCheckpoint,
+    CatalogCheckpointRecoverySource, CatalogCheckpointRecoveryTip, CatalogCheckpointRecoveryWork,
+    CatalogPublicCheckpoint, CatalogTraversalPoolPolicy,
 };
 mod checkpoint_coding;
 mod checkpoint_retention;
@@ -173,6 +174,10 @@ const RECORD_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum CatalogStoreError {
+    #[error("process-owned catalog traversal admission is unsupported on this platform")]
+    UnsupportedTraversalOwnership,
+    #[error("catalog traversal work locks are unsupported on this filesystem")]
+    UnsupportedTraversalFilesystem,
     #[error(
         "retained data-source quota is exhausted; finish cancelled-source cleanup or increase the dataset limit"
     )]

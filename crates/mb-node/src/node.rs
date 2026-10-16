@@ -1502,6 +1502,22 @@ impl Node {
         Ok(self.control.configure_catalog_resource_policy(policy)?)
     }
 
+    /// Set cumulative traversal credits separately from each checkpoint's
+    /// represented capacity. Resource backing and old-job adoption must be active.
+    pub fn configure_catalog_traversal_pool_policy(
+        &self,
+        policy: mb_store::CatalogTraversalPoolPolicy,
+    ) -> Result<()> {
+        Ok(self
+            .control
+            .configure_catalog_traversal_pool_policy(policy)?)
+    }
+
+    /// Reclaim one stopped recovery traversal while preserving resumable jobs.
+    pub fn reclaim_abandoned_checkpoint_recovery_work(&self) -> Result<bool> {
+        Ok(self.control.reclaim_abandoned_checkpoint_recovery_work()?)
+    }
+
     /// Advance one acquisition work-admission adoption step after resource
     /// enrollment. Existing job data and immutable job identities are preserved.
     pub fn advance_checkpoint_acquisition_work_admission(&self) -> Result<bool> {
