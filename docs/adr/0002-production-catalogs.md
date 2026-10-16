@@ -7846,3 +7846,40 @@ normal paged integration remain open. No producer is enabled. Complete current
 source and installed qualification, the three separate unexplained R5
 observations and other M6 gates remain open. Dense 1 TiB and native Windows/
 macOS qualification remain user-deferred.
+
+### 2026-10-16 — Refuse destructive completed-root capture replay
+
+Actual native `4a60cf4` includes the preceding destructor fix. After a partial
+retained transfer, it verifies the completed manifest, SQL pins and exact source
+availability; it then damages only the local capture manifest and removes the
+restored plaintext while retaining the canonical root. The source remains
+readable before retry. Raw root capture removes the completed candidate before
+fresh capture returns SourceChanged. The still-pinned binding becomes unreadable,
+and the intended availability assertion fails. Source, exact fresh driver, logs
+and detached native image remain preserved at
+`/tmp/mb-m6-owned-capture-replay-red-l1ykilkv`.
+
+Qualified `6586467` returns an existing completed manifest's read error before
+cleanup or replay. Unknown/damaged local metadata grants no deletion authority.
+Valid completed replay, staging/link-pool cleanup and initial capture retain
+their existing behavior. Checked discard and abandonment remain separate.
+No signed, resource or stored manifest format changes.
+
+The identical complete regression test source now keeps the exact binding,
+generation, pins and readable payload after failure. After repairing its local
+manifest, the test finishes fresh recovery and retirement with its original
+byte, history and quota assertions. All 27 ordinary anchor cases, withdrawal1,
+ordinary snapshot36 and native anchor18/snapshot8/retained4 pass. With a repeated
+fresh-process discovery check this is 94 distinct cases in 95 executions. Strict
+locked workspace/all-target Clippy and formatting pass. The independent audit
+verifies 410 inputs, both exact freshly compiled drivers, every case selection,
+positive native cleanup and both retained-recovery negative artifacts. Evidence:
+`/tmp/mb-m6-owned-capture-replay-qual-iyp5qixj`.
+
+Two externally remounted cases remain unexecuted. This qualifies whole-root
+completed replay only; file/blob variants and final area-sync failure cleanup
+remain separate review scope. Remaining consumer/backoff and complete R1/R3
+admission, normal paged integration, full current-source/installed qualification
+and the three unexplained R5 observations remain open. Normal paged producers
+remain disabled. M6 stays open; dense 1 TiB and native Windows/macOS
+qualification remain user-deferred.

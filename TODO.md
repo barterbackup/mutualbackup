@@ -4784,6 +4784,29 @@ normal paged producers remain disabled.
     the fixture literal lint before building/running tests. This closes the
     destructor ownership defect; other cleanup/replay consumers, operational
     retry/backoff, complete R1/R3 and current-source/installed M6 gates stay open.
+  - [x] Refuse destructive replay of malformed completed root captures.
+    Actual native `4a60cf4`, already containing the destructor correction,
+    transfers one retained source, damages only its completed local capture
+    manifest and removes restored plaintext while keeping the canonical root.
+    The retained source is readable before retry. Backend replay removes its
+    completed candidate before fresh capture fails; the original binding stays
+    pinned but becomes unreadable. The intended availability assertion fails:
+    zero passed, one failed. Source, exact fresh driver and detached native image
+    remain at `/tmp/mb-m6-owned-capture-replay-red-l1ykilkv`.
+    Corrected `6586467` returns the completed-manifest read error before cleanup.
+    Valid completed replay and initial capture keep their existing behavior;
+    checked discard/abandonment owns deletion. The identical complete regression
+    source now preserves binding/generation and readable data, then completes
+    fresh recovery and retirement after local manifest repair.
+    All 27 ordinary anchor cases, withdrawal1, ordinary snapshot36, native
+    anchor18/snapshot8/retained4 and fresh-process discovery pass: 94 distinct
+    cases in 95 executions. Strict locked workspace/all-target Clippy, formatting
+    and independent 410-input/two-driver/fresh-compiler/exact-case audit pass;
+    original failure identities and native mount/loop/image cleanup verify.
+    Evidence: `/tmp/mb-m6-owned-capture-replay-qual-iyp5qixj`.
+    Two external-remount cases remain unexecuted. File/blob replay variants,
+    final area-sync failure cleanup, remaining consumer/backoff integration,
+    complete R1/R3 and full current-source/installed M6 gates remain open.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
     progress to remaining standalone capture/recovery and best-effort cleanup
     call paths; complete consumer lifecycle qualification;
