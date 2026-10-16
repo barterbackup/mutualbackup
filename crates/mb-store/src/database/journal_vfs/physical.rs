@@ -346,6 +346,29 @@ impl ControlStore {
         created.sync_all()?;
         directory.file().sync_all()?;
         drop(created);
+        Self::connect_physical(directory, path, key, vfs)
+    }
+
+    /// Open a caller-owned existing catalog under explicit runtime ceilings.
+    /// This does not perform old-writer enrollment or persistent policy
+    /// migration. Nonempty Btrfs files must already have NoCow enabled.
+    pub fn open_physical_existing_in_directory_with_key(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        key: &[u8; 32],
+        limits: DatabasePhysicalIoLimits,
+    ) -> Result<Self, DatabaseError> {
+        let path = directory.leaf(name)?;
+        let vfs = PhysicalVfs::new(directory, limits)?;
+        Self::connect_physical(directory, path, key, vfs)
+    }
+
+    fn connect_physical(
+        directory: &DatabaseDirectory,
+        path: std::path::PathBuf,
+        key: &[u8; 32],
+        vfs: PhysicalVfs,
+    ) -> Result<Self, DatabaseError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
