@@ -11,6 +11,10 @@ use std::sync::{
 
 use super::DatabaseError;
 use rusqlite::{Connection, OpenFlags, ffi};
+#[cfg(target_os = "linux")]
+mod physical;
+#[cfg(target_os = "linux")]
+pub(super) use physical::PhysicalVfs;
 
 pub(super) const NAME: &CStr = c"mutualbackup-journal-quota";
 const SET_LIMIT: c_int = 1042;
@@ -29,6 +33,12 @@ struct File {
 struct State {
     journal: bool,
     limit: Arc<AtomicU64>,
+    #[cfg(target_os = "linux")]
+    physical: Option<super::physical_io::Binding>,
+    #[cfg(target_os = "linux")]
+    shm: Option<super::physical_io::Binding>,
+    #[cfg(target_os = "linux")]
+    temporary: Option<(std::fs::File, std::ffi::CString)>,
 }
 
 #[repr(C)]
@@ -170,7 +180,7 @@ pub(super) fn journal_bytes(connection: &Connection) -> Result<u64, DatabaseErro
 }
 
 unsafe extern "C" fn open(
-    _: *mut ffi::sqlite3_vfs,
+    vfs: *mut ffi::sqlite3_vfs,
     name: ffi::sqlite3_filename,
     output: *mut ffi::sqlite3_file,
     flags: c_int,
@@ -180,6 +190,11 @@ unsafe extern "C" fn open(
         // SQLite supplies szOsFile bytes. The prefix and native allocation do
         // not overlap; callbacks receive the untouched native filename pointer.
         (*output).pMethods = ptr::null();
+        #[cfg(target_os = "linux")]
+        let pool = match physical::pool(vfs) {
+            Ok(pool) => pool,
+            Err(_) => return ffi::SQLITE_CANTOPEN,
+        };
         let parent = *PARENT.get().expect("registered VFS") as *mut ffi::sqlite3_vfs;
         let inner = output
             .cast::<u8>()
@@ -200,27 +215,69 @@ unsafe extern "C" fn open(
         } else {
             Arc::new(AtomicU64::new(u64::MAX))
         };
-        let code = (*parent).xOpen.expect("native xOpen")(parent, name, inner, flags, out_flags);
+        #[cfg(target_os = "linux")]
+        let prepared = match physical::prepare(pool.as_ref(), name, flags) {
+            Ok(value) => value,
+            Err(error) => return super::physical_io::sqlite_code(error, ffi::SQLITE_CANTOPEN),
+        };
+        #[cfg(target_os = "linux")]
+        let (native_name, native_flags) = prepared.as_ref().map_or((name, flags), |(_, path)| {
+            (
+                path.as_ptr(),
+                flags
+                    & !(ffi::SQLITE_OPEN_CREATE
+                        | ffi::SQLITE_OPEN_EXCLUSIVE
+                        | ffi::SQLITE_OPEN_DELETEONCLOSE
+                        | ffi::SQLITE_OPEN_NOFOLLOW),
+            )
+        });
+        #[cfg(not(target_os = "linux"))]
+        let (native_name, native_flags) = (name, flags);
+        let code = (*parent).xOpen.expect("native xOpen")(
+            parent,
+            native_name,
+            inner,
+            native_flags,
+            out_flags,
+        );
         if code != ffi::SQLITE_OK {
             if !(*inner).pMethods.is_null() {
                 ((*(*inner).pMethods).xClose.expect("native xClose"))(inner);
             }
             return code;
         }
+        #[cfg(target_os = "linux")]
+        let binding = match physical::bind(pool.as_ref(), inner, flags) {
+            Ok(value) => value,
+            Err(error) => {
+                ((*(*inner).pMethods).xClose.expect("native xClose"))(inner);
+                return super::physical_io::sqlite_code(error, ffi::SQLITE_CANTOPEN);
+            }
+        };
         ptr::write(
             output.cast::<File>(),
             File {
                 base: ffi::sqlite3_file { pMethods: &METHODS },
                 parent: inner,
-                state: Box::into_raw(Box::new(State { journal, limit })),
+                state: Box::into_raw(Box::new(State {
+                    journal,
+                    limit,
+                    #[cfg(target_os = "linux")]
+                    physical: binding,
+                    #[cfg(target_os = "linux")]
+                    shm: None,
+                    #[cfg(target_os = "linux")]
+                    temporary: prepared,
+                })),
                 _padding: [0; 5],
             },
         );
-        if journal
+        if (journal
             && (*(*output.cast::<File>()).state)
                 .limit
                 .load(Ordering::Acquire)
-                != u64::MAX
+                != u64::MAX)
+            || physical_active(output)
         {
             let mut zero: c_int = 0;
             // Disable existing native rounding as well as later chunk requests.
@@ -240,8 +297,74 @@ unsafe extern "C" fn close(file: *mut ffi::sqlite3_file) -> c_int {
     protect(|| unsafe {
         let file = &mut *file.cast::<File>();
         let code = ((*(*file.parent).pMethods).xClose.expect("native xClose"))(file.parent);
+        #[cfg(target_os = "linux")]
+        {
+            let state = &mut *file.state;
+            drop(state.temporary.take());
+            if let Some(binding) = &mut state.shm {
+                let _ = binding.close();
+            }
+            if let Some(binding) = &mut state.physical {
+                let _ = binding.close();
+            }
+        }
         drop(Box::from_raw(file.state));
         file.base.pMethods = ptr::null();
+        code
+    })
+}
+
+unsafe fn physical_active(file: *mut ffi::sqlite3_file) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { (*(*file.cast::<File>()).state).physical.is_some() }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        false
+    }
+}
+
+unsafe extern "C" fn shm_map(
+    file: *mut ffi::sqlite3_file,
+    page: c_int,
+    bytes: c_int,
+    extend: c_int,
+    output: *mut *mut c_void,
+) -> c_int {
+    protect(|| unsafe {
+        let file = &*file.cast::<File>();
+        if (*(*file.parent).pMethods).iVersion < 2 {
+            return ffi::SQLITE_IOERR_SHMMAP;
+        }
+        #[cfg(target_os = "linux")]
+        if (*file.state).physical.is_some() {
+            return physical::shm_map(file, page, bytes, extend, output);
+        }
+        match (*(*file.parent).pMethods).xShmMap {
+            Some(map) => map(file.parent, page, bytes, extend, output),
+            None => ffi::SQLITE_IOERR_SHMMAP,
+        }
+    })
+}
+
+unsafe extern "C" fn shm_unmap(file: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
+    protect(|| unsafe {
+        let file = &*file.cast::<File>();
+        if (*(*file.parent).pMethods).iVersion < 2 {
+            return ffi::SQLITE_OK;
+        }
+        let code = match (*(*file.parent).pMethods).xShmUnmap {
+            Some(unmap) => unmap(file.parent, delete),
+            None => ffi::SQLITE_OK,
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(mut binding) = (*file.state).shm.take()
+            && let Err(error) = binding.close()
+        {
+            return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_SHMMAP);
+        }
         code
     })
 }
@@ -265,6 +388,12 @@ unsafe extern "C" fn write(
         if state.journal && end > state.limit.load(Ordering::Acquire) {
             return ffi::SQLITE_FULL;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(binding) = &state.physical
+            && let Err(error) = binding.fund(offset as u64, end)
+        {
+            return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE);
+        }
         if state.journal && state.limit.load(Ordering::Acquire) != u64::MAX {
             let mut zero: c_int = 0;
             let code = ((*(*file.parent).pMethods)
@@ -278,12 +407,19 @@ unsafe extern "C" fn write(
                 return code;
             }
         }
-        ((*(*file.parent).pMethods).xWrite.expect("native xWrite"))(
+        let code = ((*(*file.parent).pMethods).xWrite.expect("native xWrite"))(
             file.parent,
             bytes,
             amount,
             offset,
-        )
+        );
+        #[cfg(target_os = "linux")]
+        if let Some(binding) = &state.physical
+            && let Err(error) = binding.refresh_after_io()
+        {
+            return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE);
+        }
+        code
     })
 }
 
@@ -295,6 +431,22 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, bytes: i64) -> c_int
         };
         if (*file.state).journal && bytes_u64 > (*file.state).limit.load(Ordering::Acquire) {
             return ffi::SQLITE_FULL;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(binding) = &(*file.state).physical {
+            let mut previous = 0i64;
+            let code = ((*(*file.parent).pMethods).xFileSize.expect("native size"))(
+                file.parent,
+                &mut previous,
+            );
+            if code != ffi::SQLITE_OK {
+                return code;
+            }
+            if bytes > previous
+                && let Err(error) = binding.fund(previous.max(0) as u64, bytes_u64)
+            {
+                return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_TRUNCATE);
+            }
         }
         if (*file.state).journal && (*file.state).limit.load(Ordering::Acquire) != u64::MAX {
             let mut zero: c_int = 0;
@@ -309,9 +461,16 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, bytes: i64) -> c_int
                 return code;
             }
         }
-        ((*(*file.parent).pMethods)
+        let code = ((*(*file.parent).pMethods)
             .xTruncate
-            .expect("native xTruncate"))(file.parent, bytes)
+            .expect("native xTruncate"))(file.parent, bytes);
+        #[cfg(target_os = "linux")]
+        if let Some(binding) = &(*file.state).physical
+            && let Err(error) = binding.refresh_after_io()
+        {
+            return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_TRUNCATE);
+        }
+        code
     })
 }
 
@@ -331,7 +490,9 @@ unsafe extern "C" fn control(
             change.previous = state.limit.swap(change.next, Ordering::AcqRel);
             return ffi::SQLITE_OK;
         }
-        if state.journal && state.limit.load(Ordering::Acquire) != u64::MAX {
+        if (state.journal && state.limit.load(Ordering::Acquire) != u64::MAX)
+            || physical_active(file as *const File as *mut ffi::sqlite3_file)
+        {
             // Hints are optional; a rounded preallocation must not exceed the
             // actual admitted writes. Native I/O continues without preallocation.
             if op == ffi::SQLITE_FCNTL_SIZE_HINT {
@@ -378,9 +539,7 @@ forward!(unlock, xUnlock, (mode: c_int), ffi::SQLITE_IOERR_UNLOCK);
 forward!(reserved, xCheckReservedLock, (output: *mut c_int), ffi::SQLITE_IOERR_CHECKRESERVEDLOCK);
 forward!(sector_size, xSectorSize, (), 4096);
 forward!(characteristics, xDeviceCharacteristics, (), 0);
-forward!(shm_map, xShmMap, (page: c_int, bytes: c_int, extend: c_int, output: *mut *mut c_void), ffi::SQLITE_IOERR_SHMMAP, 2);
 forward!(shm_lock, xShmLock, (offset: c_int, count: c_int, flags: c_int), ffi::SQLITE_IOERR_SHMLOCK, 2);
-forward!(shm_unmap, xShmUnmap, (delete: c_int), ffi::SQLITE_OK, 2);
 forward!(unfetch, xUnfetch, (offset: i64, input: *mut c_void), ffi::SQLITE_OK, 3);
 
 unsafe extern "C" fn shm_barrier(file: *mut ffi::sqlite3_file) {

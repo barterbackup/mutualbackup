@@ -108,3 +108,6 @@ pub use source::{
 pub use database::physical_allocation_domain;
 
 pub const SCHEMA_VERSION: u32 = 10;
+
+#[cfg(target_os = "linux")]
+pub use database::DatabasePhysicalIoLimits;

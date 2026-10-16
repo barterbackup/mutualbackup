@@ -419,6 +419,7 @@ pub(super) fn open_control(
         validate_control_schema(&connection, schema)?;
         Ok(ControlStore {
             connection,
+            physical_vfs: None,
             path: path.to_path_buf(),
             #[cfg(target_os = "linux")]
             directory: None,

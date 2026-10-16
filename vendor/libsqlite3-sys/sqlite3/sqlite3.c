@@ -42819,6 +42819,9 @@ static int unixGetTempname(int nBuf, char *zBuf);
 /*
 ** Information and control of an open file handle.
 */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD) && !defined(SQLITE_OMIT_WAL)
+static int mutualbackupShmDescriptor(unixFile *pFile);
+#endif
 static int unixFileControl(sqlite3_file *id, int op, void *pArg){
   unixFile *pFile = (unixFile*)id;
   switch( op ){
@@ -42834,6 +42837,19 @@ static int unixFileControl(sqlite3_file *id, int op, void *pArg){
       *(int*)pArg = pFile->h;
       return SQLITE_OK;
     }
+    case MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD+1: {
+#ifndef SQLITE_OMIT_WAL
+      int descriptor;
+      if( pArg==0 ) return SQLITE_MISUSE;
+      descriptor = mutualbackupShmDescriptor(pFile);
+      if( descriptor<0 ) return SQLITE_NOTFOUND;
+      *(int*)pArg = descriptor;
+      return SQLITE_OK;
+#else
+      return SQLITE_NOTFOUND;
+#endif
+    }
+
 #endif
 
 #if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
@@ -43384,6 +43400,13 @@ static int unixShmRegionPerMap(void){
 ** This is not a VFS shared-memory method; it is a utility function called
 ** by VFS shared-memory methods.
 */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+/* Borrow only an already open SHM file. The connection retains its node. */
+static int mutualbackupShmDescriptor(unixFile *pFile){
+  return pFile->pShm ? pFile->pShm->pShmNode->hShm : -1;
+}
+#endif
+
 static void unixShmPurge(unixFile *pFd){
   unixShmNode *p = pFd->pInode->pShmNode;
   assert( unixMutexHeld() );

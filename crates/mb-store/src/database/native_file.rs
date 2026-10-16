@@ -69,6 +69,37 @@ fn main_descriptor(connection: &Connection) -> Result<BorrowedFd<'_>, DatabaseEr
     Ok(unsafe { BorrowedFd::borrow_raw(descriptor) })
 }
 
+/// The caller retains the native sqlite3_file and, for SHM, its connection's
+/// mapping for the entire borrow. It must not close/reenter SQLite during use.
+pub(super) unsafe fn descriptor_for<'a>(
+    file: *mut ffi::sqlite3_file,
+    opcode: libc::c_int,
+) -> Result<Option<BorrowedFd<'a>>, DatabaseError> {
+    if file.is_null() || unsafe { (*file).pMethods.is_null() } {
+        return Err(DatabaseError::Integrity);
+    }
+    let mut descriptor: libc::c_int = -1;
+    let code = unsafe {
+        ((*(*file).pMethods)
+            .xFileControl
+            .ok_or(DatabaseError::Integrity)?)(
+            file,
+            opcode,
+            (&mut descriptor as *mut libc::c_int).cast(),
+        )
+    };
+    if code == ffi::SQLITE_NOTFOUND {
+        return Ok(None);
+    }
+    if code != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None).into());
+    }
+    if descriptor < 0 {
+        return Err(DatabaseError::Integrity);
+    }
+    Ok(Some(unsafe { BorrowedFd::borrow_raw(descriptor) }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

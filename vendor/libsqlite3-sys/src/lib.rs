@@ -11,6 +11,9 @@ pub use self::error::*;
 /// callers must never close it or alter native locking/file-status flags.
 /// Other VFSes and non-Linux targets return SQLITE_NOTFOUND.
 pub const MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD: std::ffi::c_int = 1043;
+/// Borrow an already open Unix SHM descriptor. The caller must retain its
+/// mapped main-file connection; this opcode neither opens nor grows SHM.
+pub const MUTUALBACKUP_SQLITE_FCNTL_SHM_FD: std::ffi::c_int = 1044;
 
 use std::mem;
 

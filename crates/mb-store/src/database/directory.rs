@@ -442,6 +442,7 @@ impl ControlStore {
         initialize_or_validate_control(&mut connection)?;
         Ok(Self {
             connection,
+            physical_vfs: None,
             path,
             directory: Some(directory.clone()),
         })
@@ -473,6 +474,7 @@ impl ControlStore {
         initialize_or_validate_control(&mut connection)?;
         Ok(Self {
             connection,
+            physical_vfs: None,
             path,
             directory: Some(directory.clone()),
         })

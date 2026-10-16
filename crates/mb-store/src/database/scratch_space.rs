@@ -47,7 +47,7 @@ fn domain_for_file(file: &File) -> Result<[u8; 32], DatabaseError> {
     Ok(*digest.finalize().as_bytes())
 }
 
-fn shared_allocation_lock() -> Result<(File, PathBuf), DatabaseError> {
+pub(super) fn shared_allocation_lock() -> Result<(File, PathBuf), DatabaseError> {
     // One fixed, private rendezvous for this host user. It deliberately remains
     // present across jobs; unlinking a live advisory-lock inode breaks mutual
     // exclusion. Descriptor/path identity is rechecked after each acquisition.
