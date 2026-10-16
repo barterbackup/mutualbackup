@@ -85,7 +85,7 @@ pub(super) fn configure(node: &mut Node) {
             open_reservations: 16,
         })
         .unwrap();
-    node.configure_catalog_resource_policy(mb_store::CatalogResourcePolicy {
+    let resources = mb_store::CatalogResourcePolicy {
         format_version: 1,
         capacity,
         control_rows: rows,
@@ -95,8 +95,12 @@ pub(super) fn configure(node: &mut Node) {
         immutable_page_bytes: plan.encoded_metadata_page_bytes,
         immutable_pages: plan.metadata_work.page_occurrences,
         open_page_reservations: 16,
-    })
-    .unwrap();
+    };
+    #[cfg(target_os = "linux")]
+    node.configure_catalog_resource_policy_with_native_work(resources)
+        .unwrap();
+    #[cfg(not(target_os = "linux"))]
+    node.configure_catalog_resource_policy(resources).unwrap();
     while node
         .advance_checkpoint_acquisition_work_admission()
         .unwrap()

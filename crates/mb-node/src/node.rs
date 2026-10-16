@@ -1502,6 +1502,16 @@ impl Node {
         Ok(self.control.configure_catalog_resource_policy(policy)?)
     }
 
+    /// Bind native live-work ownership with initial resource enrollment.
+    pub fn configure_catalog_resource_policy_with_native_work(
+        &self,
+        policy: mb_store::CatalogResourcePolicy,
+    ) -> Result<()> {
+        Ok(self
+            .control
+            .configure_catalog_resource_policy_with_native_work(policy)?)
+    }
+
     /// Bound simultaneous scratch physical declarations independently from
     /// traversal work. Actual Linux extents/headroom remain checked by the VFS.
     pub fn configure_catalog_scratch_pool_policy(
