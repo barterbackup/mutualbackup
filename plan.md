@@ -6590,3 +6590,43 @@ prerequisite; physical SQL/WAL/SHM/temporary/volume reservation, complete
 old-writer/quiescent policy, normal paged integration, full current-source/
 installed qualification and R5 causes remain open. Producers stay disabled;
 dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+### 2026-10-16 — Admit runtime native SQL file-family allocation
+
+Qualified `1f3333d` adds an explicit Linux runtime physical VFS for new and
+caller-owned existing control catalogs. Real private extents precede main,
+WAL/rollback, SHM and anonymous temporary growth. Independent family/total/file
+ceilings and free-space headroom bound admission; closed linked files and
+unlinked live descriptions stay charged. Main identity is pinned before SQLite
+opens it. Known shared/inline/encoded/unknown extents refuse admission, and a
+nonempty Btrfs file must already have NoCow enabled. Generic logical APIs remain
+available with their existing behavior.
+
+Btrfs probes exposed inline short-header conversion despite NoCow and KEEP_SIZE
+preallocation. Journal initialization now funds one full filesystem block;
+native SHM reset funds its zeroed marker under the exclusive SQLite DMS lock.
+Anonymous SQL temporaries transfer their existing descriptor into the native
+adapter without reopening a procfs symlink. The native C extension remains
+inside the pinned defining translation unit; no Rust private-layout access or
+global syscall hook is introduced. All original vendor hashes/licenses and
+dependency versions remain preserved.
+
+Qualification passes 725 distinct cases in 764 executions: all 590 ordinary
+Store, namespace/OverlayFS, Node recovery2/volume81/snapshot36, native descriptor/
+traversal/scratch/snapshot/retained coverage and ten real Btrfs physical cases.
+Those include full-transaction quota refusal/retry, actual filesystem ENOSPC/
+retry, stopped-catalog reflink refusal before SQL initialization, four-mode
+fresh-process crash recovery through the ordinary adapter, retained temporary
+spill and directory relocation. Strict workspace/all-target Clippy, plain
+SQLite C syntax, format, source/archive/two-driver/upstream/exact-case audits
+and owned native cleanup pass. Failed attempts retain their exact source,
+driver, logs and detached images. Evidence:
+`/tmp/mb-m6-physical-sql-integration-s53h9st1` and
+`/tmp/mb-m6-physical-io-btrfs-r2siostk`.
+
+This qualifies per-connection runtime file admission. Persistent/global and
+enclosing operation quotas, checkpoint/rebuild copy reserves, old-writer/
+quiescent enrollment, parity volume coverage and normal paged integration remain
+open. Partial creation/restart is still caller-owned. Producers stay disabled;
+complete current-source/installed/R5/R7 gates and user-deferred dense 1 TiB and
+native Windows/macOS qualification remain open.

@@ -11,6 +11,9 @@ pub use self::error::*;
 /// callers must never close it or alter native locking/file-status flags.
 /// Other VFSes and non-Linux targets return SQLITE_NOTFOUND.
 pub const MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD: std::ffi::c_int = 1043;
+/// Borrow an already open Unix SHM descriptor. The caller must retain its
+/// mapped main-file connection; this opcode neither opens nor grows SHM.
+pub const MUTUALBACKUP_SQLITE_FCNTL_SHM_FD: std::ffi::c_int = 1044;
 
 use std::mem;
 
@@ -43,3 +46,25 @@ impl Default for sqlite3_vtab_cursor {
         unsafe { mem::zeroed() }
     }
 }
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    /// Adopt an anonymous regular temporary descriptor using the bundled Unix
+    /// VFS. On acceptance `*descriptor` becomes -1 and native xClose owns it,
+    /// including initialization-error cleanup. Rejection leaves it unchanged.
+    pub fn sqlite3_mutualbackup_open_temp_fd(
+        vfs: *mut sqlite3_vfs,
+        file: *mut sqlite3_file,
+        descriptor: *mut std::ffi::c_int,
+    ) -> std::ffi::c_int;
+}
+
+/// Bundled Linux native SHM admission callback, invoked under exclusive DMS.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct MutualBackupShmInit {
+    pub context: *mut std::ffi::c_void,
+    pub init: unsafe extern "C" fn(*mut std::ffi::c_void, std::ffi::c_int, *mut i64) -> std::ffi::c_int,
+}
+#[cfg(target_os = "linux")]
+pub const MUTUALBACKUP_SQLITE_FCNTL_SHM_INIT: std::ffi::c_int = MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD + 2;

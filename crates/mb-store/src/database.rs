@@ -28,6 +28,8 @@ mod native_file;
 mod packing_output_retirement;
 mod page_quota;
 #[cfg(target_os = "linux")]
+mod physical_io;
+#[cfg(target_os = "linux")]
 mod preserved_read;
 mod read_snapshot;
 mod record_quota;
@@ -95,6 +97,8 @@ pub use directory::{DatabaseDirectory, DatabaseOpenGuard};
 pub use journal_quota::{DatabaseJournalQuota, DatabaseJournalQuotaUsage};
 pub use page_quota::{DatabasePageQuota, DatabasePageQuotaUsage};
 #[cfg(target_os = "linux")]
+pub use physical_io::DatabasePhysicalIoLimits;
+#[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;
 pub use record_quota::{DatabaseRecordQuota, DatabaseRecordQuotaState, DatabaseRecordQuotaUsage};
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
@@ -126,6 +130,10 @@ pub enum DatabaseError {
     SqlCipherUnavailable,
     #[error("disk-backed encrypted scratch storage is unavailable or its budget is invalid")]
     ScratchUnavailable,
+    #[error(
+        "native database storage is unsupported, shared, or lacks the declared physical backing"
+    )]
+    PhysicalIoUnavailable,
     #[error("SQLCipher page HMAC is disabled")]
     HmacDisabled,
     #[error("stored object failed root or length verification")]
@@ -144,6 +152,8 @@ pub enum DatabaseError {
 
 pub struct ControlStore {
     connection: Connection,
+    #[cfg(target_os = "linux")]
+    physical_vfs: Option<journal_vfs::PhysicalVfs>,
     path: PathBuf,
     #[cfg(target_os = "linux")]
     directory: Option<DatabaseDirectory>,
@@ -172,6 +182,8 @@ impl ControlStore {
         initialize_or_validate_control(&mut connection)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            physical_vfs: None,
             path: path.to_path_buf(),
             #[cfg(target_os = "linux")]
             directory: None,
@@ -193,6 +205,8 @@ impl ControlStore {
         initialize_or_validate_control(&mut connection)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            physical_vfs: None,
             path: path.to_path_buf(),
             #[cfg(target_os = "linux")]
             directory: None,
@@ -225,6 +239,8 @@ impl ControlStore {
         validate_control_schema(&connection, version)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            physical_vfs: None,
             path: path.to_path_buf(),
             #[cfg(target_os = "linux")]
             directory: None,

@@ -39095,6 +39095,14 @@ struct UnixUnusedFd {
 ** The unixFile structure is subclass of sqlite3_file specific to the unix
 ** VFS implementations.
 */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+/* Private bundled ABI: initialize owned SHM backing while native SQLite holds
+** its exclusive DMS lock and after the native stale-index reset. */
+typedef struct mutualbackupShmInit {
+  void *pContext;
+  int (*xInit)(void*, int, sqlite3_int64*);
+} mutualbackupShmInit;
+#endif
 typedef struct unixFile unixFile;
 struct unixFile {
   sqlite3_io_methods const *pMethod;  /* Always the first entry */
@@ -39109,6 +39117,9 @@ struct unixFile {
   const char *zPath;                  /* Name of the file */
   unixShm *pShm;                      /* Shared memory segment information */
   int szChunk;                        /* Configured by FCNTL_CHUNK_SIZE */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+  mutualbackupShmInit mbShmInit;
+#endif
 #if SQLITE_MAX_MMAP_SIZE>0
   int nFetchOut;                      /* Number of outstanding xFetch refs */
   sqlite3_int64 mmapSize;             /* Usable size of mapping at pMapRegion */
@@ -42819,6 +42830,9 @@ static int unixGetTempname(int nBuf, char *zBuf);
 /*
 ** Information and control of an open file handle.
 */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD) && !defined(SQLITE_OMIT_WAL)
+static int mutualbackupShmDescriptor(unixFile *pFile);
+#endif
 static int unixFileControl(sqlite3_file *id, int op, void *pArg){
   unixFile *pFile = (unixFile*)id;
   switch( op ){
@@ -42834,6 +42848,28 @@ static int unixFileControl(sqlite3_file *id, int op, void *pArg){
       *(int*)pArg = pFile->h;
       return SQLITE_OK;
     }
+    case MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD+1: {
+#ifndef SQLITE_OMIT_WAL
+      int descriptor;
+      if( pArg==0 ) return SQLITE_MISUSE;
+      descriptor = mutualbackupShmDescriptor(pFile);
+      if( descriptor<0 ) return SQLITE_NOTFOUND;
+      *(int*)pArg = descriptor;
+      return SQLITE_OK;
+#else
+      return SQLITE_NOTFOUND;
+#endif
+    }
+    case MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD+2: {
+      mutualbackupShmInit *pInit = (mutualbackupShmInit*)pArg;
+      if( pInit==0 || pInit->xInit==0 || pInit->pContext==0 || pFile->pShm!=0 ){
+        return SQLITE_MISUSE;
+      }
+      pFile->mbShmInit = *pInit;
+      return SQLITE_OK;
+    }
+
+
 #endif
 
 #if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
@@ -43384,6 +43420,13 @@ static int unixShmRegionPerMap(void){
 ** This is not a VFS shared-memory method; it is a utility function called
 ** by VFS shared-memory methods.
 */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+/* Borrow only an already open SHM file. The connection retains its node. */
+static int mutualbackupShmDescriptor(unixFile *pFile){
+  return pFile->pShm ? pFile->pShm->pShmNode->hShm : -1;
+}
+#endif
+
 static void unixShmPurge(unixFile *pFd){
   unixShmNode *p = pFd->pInode->pShmNode;
   assert( unixMutexHeld() );
@@ -43475,8 +43518,28 @@ static int unixLockSharedMemory(unixFile *pDbFd, unixShmNode *pShmNode){
       ** -shm header size) rather than 0 as a system debugging aid, to
       ** help detect if a -shm file truncation is legitimate or is the work
       ** or a rogue process. */
-      if( rc==SQLITE_OK && robust_ftruncate(pShmNode->hShm, 3) ){
-        rc = unixLogError(SQLITE_IOERR_SHMOPEN,"ftruncate",pShmNode->zFilename);
+      {
+        sqlite3_int64 markerSize = 3;
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+        if( rc==SQLITE_OK && pDbFd->mbShmInit.xInit ){
+          /* This connection owns the exclusive native DMS lock. Reset first,
+          ** then admit backing before extending the zeroed index marker. A
+          ** full filesystem block prevents Btrfs from turning the marker into
+          ** inline metadata and discarding preallocated data backing. */
+          if( robust_ftruncate(pShmNode->hShm, 0) ){
+            rc = unixLogError(SQLITE_IOERR_SHMOPEN,"ftruncate",pShmNode->zFilename);
+          }else{
+            rc = pDbFd->mbShmInit.xInit(pDbFd->mbShmInit.pContext,
+                                      pShmNode->hShm, &markerSize);
+            if( rc==SQLITE_OK && (markerSize<4096 || markerSize>65536) ){
+              rc = SQLITE_MISUSE;
+            }
+          }
+        }
+#endif
+        if( rc==SQLITE_OK && robust_ftruncate(pShmNode->hShm, markerSize) ){
+          rc = unixLogError(SQLITE_IOERR_SHMOPEN,"ftruncate",pShmNode->zFilename);
+        }
       }
     }
   }else if( lock.l_type==F_WRLCK ){
@@ -44824,6 +44887,28 @@ static int fillInUnixFile(
   }
   return rc;
 }
+
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+/* Take ownership of one anonymous temporary file without reopening a procfs
+** symlink or changing any main-file description/lock. On acceptance *pFd is
+** -1, including native initialization errors. Rejection leaves ownership with
+** the caller. The caller supplies the built-in Unix VFS and its file storage.
+*/
+SQLITE_API int sqlite3_mutualbackup_open_temp_fd(
+  sqlite3_vfs *pVfs, sqlite3_file *pFile, int *pFd
+){
+  struct stat info;
+  int descriptor;
+  if( !pVfs || !pFile || !pFd || *pFd<0 ) return SQLITE_MISUSE;
+  pFile->pMethods = 0;
+  if( osFstat(*pFd, &info) ) return SQLITE_IOERR_FSTAT;
+  if( !S_ISREG(info.st_mode) || info.st_nlink!=0 ) return SQLITE_MISUSE;
+  descriptor = *pFd;
+  *pFd = -1;
+  memset(pFile, 0, sizeof(unixFile));
+  return fillInUnixFile(pVfs, descriptor, pFile, 0, UNIXFILE_NOLOCK);
+}
+#endif
 
 /*
 ** Directories to consider for temp files.
