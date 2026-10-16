@@ -1,0 +1,8 @@
+# Preserve original upstream whitespace in generated bindings/amalgamations.
+bindgen-bindings/bindgen_3.14.0_ext.rs -whitespace
+sqlcipher/sqlite3ext.h -whitespace
+sqlite3/bindgen_bundled_version_ext.rs -whitespace
+sqlite3/sqlite3.c -whitespace
+sqlite3/sqlite3ext.h -whitespace
+sqlite3/wasm32-wasi-vfs.c -whitespace
+wrapper_ext.h -whitespace
