@@ -345,6 +345,7 @@ impl ControlStore {
             .open(&path)?;
         created.sync_all()?;
         directory.file().sync_all()?;
+        vfs.pool.pin_created_main(&created)?;
         drop(created);
         Self::connect_physical(directory, path, key, vfs)
     }
@@ -360,6 +361,7 @@ impl ControlStore {
     ) -> Result<Self, DatabaseError> {
         let path = directory.leaf(name)?;
         let vfs = PhysicalVfs::new(directory, limits)?;
+        vfs.pool.pin_main_path(&path)?;
         Self::connect_physical(directory, path, key, vfs)
     }
 

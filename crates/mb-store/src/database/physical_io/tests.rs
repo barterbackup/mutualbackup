@@ -438,29 +438,23 @@ fn closed_reflinked_native_catalog_refuses_shared_backing_before_main_write() {
     ));
     drop(source);
     drop(copy);
-    let store = ControlStore::open_physical_existing_in_directory_with_key(
+    let error = ControlStore::open_physical_existing_in_directory_with_key(
         &directory,
         std::ffi::OsStr::new("control.db"),
         &[7; 32],
         limits(),
     )
-    .unwrap();
-    store
-        .connection
-        .execute_batch("PRAGMA journal_mode=DELETE")
-        .unwrap();
-    let error = store
-        .put_record("physical", b"preserve", b"must not replace shared pages")
-        .unwrap_err();
+    .err()
+    .expect("known shared catalog backing must refuse before SQL initialization");
     assert!(
         matches!(error, DatabaseError::Sql(ref e) if e.sqlite_error_code()==Some(rusqlite::ErrorCode::DiskFull)),
         "{error:?}"
     );
     assert_eq!(
-        store.get_record("physical", b"preserve").unwrap(),
-        Some(b"original closed catalog".to_vec())
+        std::fs::read_dir(temp.path()).unwrap().count(),
+        2,
+        "refused open created a journal or index"
     );
-    drop(store);
     assert_eq!(std::fs::read(original).unwrap(), before);
     assert_eq!(
         std::fs::read(temp.path().join("closed-copy.db")).unwrap(),

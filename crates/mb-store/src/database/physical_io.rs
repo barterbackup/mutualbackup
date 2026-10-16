@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{DatabaseDirectory, DatabaseError};
@@ -83,6 +83,7 @@ pub(super) struct Pool {
     pub(super) directory: DatabaseDirectory,
     allocation_lock: File,
     lock_path: PathBuf,
+    main: Mutex<Option<File>>,
     files: Mutex<BTreeMap<Identity, Entry>>,
 }
 
@@ -107,8 +108,40 @@ impl Pool {
             directory: directory.clone(),
             allocation_lock,
             lock_path,
+            main: Mutex::new(None),
             files: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    pub(super) fn pin_main_path(&self, path: &Path) -> Result<(), DatabaseError> {
+        let pin = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        self.remember_main(pin)
+    }
+
+    pub(super) fn pin_created_main(&self, created: &File) -> Result<(), DatabaseError> {
+        let pin = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", created.as_raw_fd()))?;
+        self.remember_main(pin)
+    }
+
+    fn remember_main(&self, pin: File) -> Result<(), DatabaseError> {
+        if !pin.metadata()?.is_file() {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+        let mut main = self
+            .main
+            .lock()
+            .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+        if main.is_some() {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+        *main = Some(pin);
+        Ok(())
     }
 
     fn allocation_guard(&self) -> Result<AllocationGuard<'_>, DatabaseError> {
@@ -218,6 +251,19 @@ impl Pool {
             return Err(DatabaseError::PhysicalIoUnavailable);
         }
         let id = (metadata.dev(), metadata.ino());
+        if role == Role::Main {
+            let main = self
+                .main
+                .lock()
+                .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+            let expected = main
+                .as_ref()
+                .ok_or(DatabaseError::PhysicalIoUnavailable)?
+                .metadata()?;
+            if (expected.dev(), expected.ino()) != id {
+                return Err(DatabaseError::PhysicalIoUnavailable);
+            }
+        }
         let mut files = self
             .files
             .lock()
@@ -237,6 +283,7 @@ impl Pool {
                 return Err(DatabaseError::CapacityExceeded);
             }
             initialize_private_file(descriptor, metadata.len(), metadata.blocks())?;
+            validate_private_allocations(descriptor)?;
             files.insert(
                 id,
                 Entry {
@@ -490,10 +537,10 @@ struct Fiemap {
     extents: [Extent; 128],
 }
 
-fn private_missing_bytes(descriptor: RawFd, start: u64, end: u64) -> Result<u64, DatabaseError> {
+fn read_extents(descriptor: RawFd, start: u64, length: u64) -> Result<Fiemap, DatabaseError> {
     let mut map = Fiemap {
         start,
-        length: end - start,
+        length,
         flags: 1,
         mapped: 0,
         count: 128,
@@ -506,19 +553,58 @@ fn private_missing_bytes(descriptor: RawFd, start: u64, end: u64) -> Result<u64,
     if map.mapped > map.count {
         return Err(DatabaseError::PhysicalIoUnavailable);
     }
+    Ok(map)
+}
+
+fn validate_extent(descriptor: RawFd, extent: &Extent) -> Result<(), DatabaseError> {
+    if extent.flags & !(1 | 0x800 | 0x1000) != 0 || extent.physical == 0 || extent.length == 0 {
+        #[cfg(test)]
+        if std::env::var_os("MB_PHYSICAL_IO_TRACE").is_some() {
+            eprintln!(
+                "physical FIEMAP refused fd={descriptor} logical={} physical={} length={} flags={:x}",
+                extent.logical, extent.physical, extent.length, extent.flags
+            );
+        }
+        return Err(DatabaseError::PhysicalIoUnavailable);
+    }
+    // This parameter also identifies diagnostic output in test builds.
+    let _ = descriptor;
+    Ok(())
+}
+
+/// Inspect all existing allocated extents before SQLite can begin a writer.
+/// Holes remain unfunded until the corresponding write; known sharing or
+/// inline/encoded/delayed allocations refuse open. Pagination bounds memory
+/// without imposing an extent-count or catalog-size ceiling.
+fn validate_private_allocations(descriptor: RawFd) -> Result<(), DatabaseError> {
+    let mut cursor = 0;
+    loop {
+        let map = read_extents(descriptor, cursor, u64::MAX - cursor)?;
+        let previous = cursor;
+        for extent in &map.extents[..map.mapped as usize] {
+            validate_extent(descriptor, extent)?;
+            cursor = cursor.max(
+                extent
+                    .logical
+                    .checked_add(extent.length)
+                    .ok_or(DatabaseError::PhysicalIoUnavailable)?,
+            );
+        }
+        if map.mapped == 0 || map.extents[map.mapped as usize - 1].flags & 1 != 0 {
+            return Ok(());
+        }
+        if cursor <= previous || cursor == u64::MAX {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+    }
+}
+
+fn private_missing_bytes(descriptor: RawFd, start: u64, end: u64) -> Result<u64, DatabaseError> {
+    let map = read_extents(descriptor, start, end - start)?;
     let mut cursor = start;
     let mut missing = 0u64;
     for extent in &map.extents[..map.mapped as usize] {
-        if extent.flags & !(1 | 0x800 | 0x1000) != 0 || extent.physical == 0 || extent.length == 0 {
-            #[cfg(test)]
-            if std::env::var_os("MB_PHYSICAL_IO_TRACE").is_some() {
-                eprintln!(
-                    "physical FIEMAP refused fd={descriptor} range={start}..{end} logical={} physical={} length={} flags={:x}",
-                    extent.logical, extent.physical, extent.length, extent.flags
-                );
-            }
-            return Err(DatabaseError::PhysicalIoUnavailable);
-        }
+        validate_extent(descriptor, extent)?;
         let next = extent
             .logical
             .checked_add(extent.length)
