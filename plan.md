@@ -6654,3 +6654,25 @@ source/archive/exact-case audits and native cleanup pass. Evidence:
 `/tmp/mb-m6-physical-io-btrfs-h7oknki6`. This increment does not replace the
 complete current-source/installed gate or close R1/R2/R3/R5/R7. Producers stay
 disabled; user-deferred dense capacity and native platform gates remain open.
+
+### 2026-10-16 — Authenticate a bounded local native policy with its key
+
+Qualified `0d9d685` adds an explicit Core native key envelope format 2. Its
+fixed 118-byte ciphertext authenticates the original 32-byte key and a 70-byte
+policy containing a nonzero identity and native file-family/total/headroom/file
+ceilings. A distinct wrapping context and exact lengths reject malformed,
+altered, wrong-role/identity and unsupported records. The native decoder returns
+the key with its validated policy; generic unwrap keeps its original v1-only
+behavior. This makes missing future startup dispatch reject the new format.
+
+All 214 ordinary Core cases pass, including four new compatibility, tampering,
+semantic-boundary and full-width cases (218 executions with the focused repeat).
+A synthetic original v1 envelope and its exact 62-byte canonical Postcard form
+were generated through the previously qualified Core library before changes;
+both remain readable and byte-identical. Strict workspace/all-target Clippy,
+format and independent 447-input/fresh-driver/source/archive/original-library
+fixture audits pass. Evidence: `/tmp/mb-m6-native-policy-core-qual-6em4yli1`.
+No production path publishes or consumes format 2. Node startup/preserved-read
+dispatch, fresh birth/restart, old-writer/restore policy, aggregate/enclosing
+admission and normal producers remain open, together with R1/R2/R3/R5/R7 and
+current-source/installed/deferred hardware gates.
