@@ -4758,6 +4758,32 @@ normal paged producers remain disabled.
     operational retry/backoff, other consumers/filesystems/platforms and full
     R1/R2/R3/R5/R7 gates remain open. It is not complete-source or installed
     qualification and does not enable normal paged producers.
+  - [x] Preserve pinned recovery candidates through retry validation errors.
+    Actual native `090ee7e` transfers one retained source, then retries with a
+    temporarily unreadable captured payload. The retry returns EACCES, but its
+    destructor removes the replacement while the retained source still pins it.
+    The freshly built negative reaches this ownership assertion after valid
+    metadata, source availability and pin preflights: zero passed, one failed.
+    Source, exact driver and detached native image remain preserved at
+    `/tmp/mb-m6-pinned-retry-red-rebuilt-zzocozlf`.
+    Corrected `956a238` removes that destructor/wrapper; the already durable
+    capture/recovery intent owns the manifest through errors. Normal capture
+    errors still use checked plan discard; recovery abandonment and retirement
+    retain their pin checks. The same native workload now keeps the exact
+    binding/generation and readable source, then finishes fresh recovery and
+    retirement. Its only fixture adjustment is decimal zero to octal `0o000`
+    for Clippy, with identical permission bits.
+    All 36 ordinary snapshots, eight native snapshots and three native retained
+    migration/adoption/retry cases pass: 47 distinct cases in 48 executions.
+    Strict locked workspace/all-target Clippy, formatting and independent
+    410-input/one-driver/exact-case/fresh-compiler audits pass; positive native
+    mount/loop/image cleanup and original negative preservation verify.
+    Evidence: `/tmp/mb-m6-intent-owned-recovery-qual-octal-6qg68qcl`.
+    The first copied-cache driver was rejected before any execution; its
+    zero-case result is excluded. A separate first positive attempt stopped at
+    the fixture literal lint before building/running tests. This closes the
+    destructor ownership defect; other cleanup/replay consumers, operational
+    retry/backoff, complete R1/R3 and current-source/installed M6 gates stay open.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
     progress to remaining standalone capture/recovery and best-effort cleanup
     call paths; complete consumer lifecycle qualification;

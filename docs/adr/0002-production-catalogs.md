@@ -7801,3 +7801,48 @@ after these source changes; a new complete source and installed-artifact gate
 remains required. None of the three historical R5 causes is established, and
 R1/R2/R3/R5/R7 and M6 remain open. Dense 1 TiB and native Windows/macOS
 qualification remain user-deferred.
+
+### 2026-10-16 — Keep intent-owned recovery candidates through errors
+
+A real native regression on `090ee7e` partially transfers retained-source
+ownership, verifies the replacement is readable and pinned, then makes one
+captured payload temporarily unreadable. Retry returns the expected EACCES,
+but PendingAnchor's destructor removes the completed replacement without
+consulting its retained pins. The intended ownership assertion fails after
+all admission/preflight checks. Source, exact fresh driver, logs and detached
+4 GiB native image remain preserved at
+`/tmp/mb-m6-pinned-retry-red-rebuilt-zzocozlf`.
+
+Qualified `956a238` removes the wrapper and destructive destructor. Both callers
+already persist a capture/recovery intent before capturing. That intent keeps
+the completed manifest through validation errors, partial retained transfers
+and failed final publication. Ordinary capture errors still use checked plan
+discard. Explicit recovery abandonment and retirement keep their existing pin
+and original-owner checks; manifests and signed/resource/wire formats stay
+unchanged. The regression now preserves the exact source binding/generation,
+reads its bytes after permission repair, then completes fresh recovery and
+retirement with the original quota and byte assertions.
+
+All 36 ordinary snapshot cases and eleven native cases pass: eight snapshots
+and retained migration, quota adoption and the new retry regression. There are
+47 distinct cases in 48 executions, including a repeated fresh-process source
+discovery check. Strict locked workspace/all-target Clippy and formatting pass.
+The independent audit verifies 410 inputs, the exact freshly compiled driver,
+case inventories, native mount/loop/image cleanup and negative preservation.
+Only the fixture's decimal-zero permission literal changes to octal `0o000`;
+its permission bits and workload stay identical. Evidence:
+`/tmp/mb-m6-intent-owned-recovery-qual-octal-6qg68qcl`.
+
+The first copied cache reused the prior enrollment executable: exact-case
+inventory rejected it before any test or native fixture ran. Its excluded
+source/binary record remains at `/tmp/mb-m6-pinned-retry-red-9xqxqf3f`; explicit
+fingerprint invalidation and fresh-artifact checks produced the actual negative.
+An initial positive attempt stopped at the fixture literal lint before test
+execution; neither control failure is production evidence.
+
+This closes the destructor ownership defect. Other cleanup/replay paths,
+operational retry/backoff, the complete R1 policy, shared R2/R3 admission and
+normal paged integration remain open. No producer is enabled. Complete current
+source and installed qualification, the three separate unexplained R5
+observations and other M6 gates remain open. Dense 1 TiB and native Windows/
+macOS qualification remain user-deferred.
