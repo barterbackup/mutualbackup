@@ -2720,32 +2720,40 @@ shared resource admission and normal paged production/retention/recovery.
       `/tmp/mb-m6-live-overlay-red-s_dep78t`.
       Physical SQL/WAL/page/payload/scratch backing, other producers, distributed
       activation and normal paged integration remain open. Producers stay disabled.
-    - [ ] Qualify funded scratch declarations with replacement-safe ownership.
-      The separate pool reserves full per-VFS physical ceilings and job slots,
-      retains kernel ownership through final file close, and leaves bounded
-      reclaimable debt. Actual extent allocation, checkpoint-copy reserves and
-      shared headroom stay mandatory. Retained-proof admission prepays bounded
-      pool/reclamation and registry scans before creating each scratch index.
-      Preceding source `309d0e1` passes 643 distinct cases in 683 executions:
-      Store 558, both real ownership probes, both resource-backed retained
-      recovery layouts and 81 volume cases, plus strict workspace Clippy/format.
-      The independent execution audit verifies 409 inputs and both drivers;
-      OverlayFS cleanup is verified. Integration was withheld after review.
-      Two regressions on `4bf685d` then reproduce acceptance of a recycled
-      database inode and a whole-pool grant after restoring an empty ledger
-      while the old kernel lease is still live. Preserve both negative cases
-      and the earlier positives; a suite pass does not qualify those behaviors.
-      The corrected implementation holds the original inode with O_PATH and
-      probes every unrepresented kernel slot before selecting one, including
-      partial restored ledgers. It adds an independent DELETE-mode SQLite
-      writer-exclusion check for closing the pin. These corrections await
-      runtime and ownership qualification; do not merge or enable producers.
-      Evidence: `/tmp/mb-m6-scratch-meter-qual-omuq5vui` and
-      `/tmp/mb-m6-scratch-owner-red-0zn7e2qb`.
-      This bounds funded declarations only: older binaries and already-live
-      anonymous unfunded scratch are not fenced/adopted. Complete quiescent
-      enrollment/adoption, all-producer/global physical admission, persistent
-      SQL/WAL/volume backing and normal paged integration remain open.
+    - [ ] Qualify funded scratch declarations with exact owner binding.
+      Original `309d0e1` passes 643 distinct cases in 683 executions, including
+      Store 558, both real ownership probes, both resource-backed recovery
+      layouts and 81 volume cases. Execution audit verifies 409 inputs, both
+      drivers and OverlayFS cleanup. Integration was withheld after review.
+      Two regressions on `4bf685d` reproduce a recycled database inode and a
+      whole-pool grant after restoring an empty ledger with an old live lease.
+      The O_PATH/unused-slot correction also fails on `ecfc26e`: an old small
+      declaration impersonates the later full-pool owner of its reused slot.
+      Preserve all three negatives and the earlier positive separately.
+      The new correction pins the original main inode with O_PATH and gives
+      each scope an independently locked, UUID-named empty owner file. A private
+      directory holds at most one file per slot (64 total), including crash
+      orphans. Admission checks exact UUID/file identity and owner/aggregate
+      liveness for represented and unrecorded scopes before selecting a slot.
+      Bounded replacement removes only a stopped prior empty owner. Reclamation
+      still requires a free aggregate slot or proven independent copy.
+      New domain version 3, scratch declaration 2 and traversal declaration 3
+      append local owner identity; old canonical layouts/hashes remain readable.
+      Legacy kernel debt blocks new grants until stopped and drained. Version-1
+      copies and process envelopes keep unproven debt; proven 2/3 copies retain
+      independent reclamation. Signed/wire and resource-policy bytes stay intact.
+      New cases cover reused slots in both pools, valid partial restores, owner
+      replacement, bounded churn, original legacy bytes and DELETE-mode SQLite
+      writer exclusion after pin close. Strict Store/all-target Clippy and format
+      pass; corrected runtime/native/ownership qualification is still pending.
+      Do not merge or enable producers. Evidence:
+      `/tmp/mb-m6-scratch-meter-qual-omuq5vui`,
+      `/tmp/mb-m6-scratch-owner-red-0zn7e2qb` and
+      `/tmp/mb-m6-scratch-reused-slot-red-lqv6lhm4`.
+      This bounds funded declarations only. Older unfunded producers and already
+      live anonymous scratch remain outside enrollment. Complete quiescent
+      adoption, all-producer/global physical admission, SQL/WAL/volume backing
+      and normal paged integration remain open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

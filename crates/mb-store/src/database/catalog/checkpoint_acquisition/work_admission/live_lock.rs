@@ -1,6 +1,8 @@
 //! Kernel ownership of traversal slots. The separate empty file avoids the
 //! SQLite POSIX-lock hazard of opening/closing another main-file descriptor.
 use super::*;
+mod slot_owner;
+pub(in crate::database::catalog) use slot_owner::SlotOwner;
 
 #[derive(Clone, Copy)]
 pub(in crate::database::catalog) struct Class {
@@ -92,7 +94,7 @@ pub(in crate::database::catalog) struct Domain {
 impl Domain {
     pub(in crate::database::catalog) fn permits_copy_reclamation(self) -> bool {
         // v1 did not establish a non-layered local filesystem identity.
-        self.version == 2
+        matches!(self.version, 2 | 3)
     }
 }
 
@@ -104,7 +106,7 @@ pub(in crate::database::catalog) fn read(
         return Ok(None);
     };
     let domain: Domain = canonical(&bytes)?;
-    if !matches!(domain.version, 1 | 2)
+    if !matches!(domain.version, 1..=3)
         || domain.id.is_nil()
         || domain.database.inode == 0
         || domain.file.inode == 0
@@ -184,7 +186,10 @@ impl FileLock {
         rotate: bool,
         class: Class,
     ) -> Result<Self, CatalogStoreError> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
         let database = Identity::database(store)?;
         let directory = Self::directory(store)?;
         Self::local_filesystem(directory.file())?;
@@ -201,32 +206,62 @@ impl FileLock {
                 .mode(0o600);
             options
         };
+        let existing = || -> Result<std::fs::File, CatalogStoreError> {
+            // Inspect through O_PATH before any I/O descriptor is opened.
+            // A substituted hard link to SQLite's main file must not cause
+            // close(2) to remove that connection's native POSIX locks.
+            let pin = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(DatabaseError::from)?;
+            let metadata = pin.metadata().map_err(DatabaseError::from)?;
+            if !metadata.is_file()
+                || metadata.len() != 0
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o7777 != 0o600
+                || metadata.dev() != database.device
+                || (metadata.dev(), metadata.ino()) == (database.device, database.inode)
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            Ok(std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(format!("/proc/self/fd/{}", pin.as_raw_fd()))
+                .map_err(DatabaseError::from)?)
+        };
         let file = if rotate {
             match options().create_new(true).open(&path) {
                 Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    options().open(&path).map_err(DatabaseError::from)?
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => existing()?,
                 Err(error) => return Err(DatabaseError::from(error).into()),
             }
         } else {
-            options().open(&path).map_err(DatabaseError::from)?
+            existing()?
         };
         let metadata = file.metadata().map_err(DatabaseError::from)?;
         let file_id = Identity {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
+        if domain.is_some_and(|old| old.database == database && old.file != file_id) {
+            // An empty restored ledger cannot authorize replacing a recorded
+            // rendezvous while an old description might still own its slots.
+            return Err(DatabaseError::Conflict.into());
+        }
         let next = match domain {
             Some(domain)
                 if domain.database == database
                     && domain.file == file_id
-                    && (!rotate || domain.version == 2) =>
+                    && (!rotate || domain.version == 3) =>
             {
                 domain
             }
             _ if rotate => Domain {
-                version: 2,
+                version: 3,
                 id: Uuid::new_v4(),
                 database,
                 file: file_id,
@@ -325,11 +360,15 @@ impl FileLock {
     ) -> Result<Self, CatalogStoreError> {
         let old = read(cx, class)?;
         let database = Identity::database(store)?;
-        if has_scopes && old.is_none_or(|d| d.database != database) {
+        if has_scopes && old.is_none_or(|d| d.database != database || d.version != 3) {
             return Err(DatabaseError::NotReady.into());
         }
         let file = Self::open(store, old, !has_scopes, class)?;
         if old != Some(file.domain) {
+            // Covers unknown owners omitted by a restored pre-admission
+            // snapshot, including owners whose files predate the ledger.
+            file.require_idle_slots()?;
+            file.validate_owners(&[None; CATALOG_ACQUISITION_WORK_JOBS as usize])?;
             write(cx, old, file.domain, class)?;
         }
         Ok(file)
@@ -424,6 +463,16 @@ impl FileLock {
             }
         }
         selected.ok_or(DatabaseError::CapacityExceeded.into())
+    }
+
+    fn require_idle_slots(&self) -> Result<(), CatalogStoreError> {
+        for slot in 0..CATALOG_ACQUISITION_WORK_JOBS as u8 {
+            if !self.try_slot(slot)? {
+                return Err(CatalogStoreError::UnrecordedLiveCatalogWork);
+            }
+            self.unlock_slot(slot)?;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

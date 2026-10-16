@@ -1,7 +1,9 @@
 //! Aggregate admission for anonymous catalog scratch. A declaration reserves
 //! its complete physical ceiling before creating files; the scratch VFS still
 //! allocates actual extents and protects filesystem headroom on every growth.
-use super::checkpoint_acquisition::work_admission::live_lock::{self, FileLock, Identity};
+use super::checkpoint_acquisition::work_admission::live_lock::{
+    self, FileLock, Identity, SlotOwner,
+};
 use super::*;
 
 const LEDGER: &str = "catalog-scratch-pool-v1";
@@ -47,13 +49,68 @@ struct Ledger {
     reserved: u64,
     jobs: u32,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Spec {
     version: u16,
     id: Uuid,
     physical_bytes: u64,
     domain: Uuid,
     slot: u8,
+    owner: Option<Identity>,
+}
+impl Serialize for Spec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.owner {
+            Some(owner) => (
+                self.version,
+                self.id,
+                self.physical_bytes,
+                self.domain,
+                self.slot,
+                owner,
+            )
+                .serialize(serializer),
+            None => (
+                self.version,
+                self.id,
+                self.physical_bytes,
+                self.domain,
+                self.slot,
+            )
+                .serialize(serializer),
+        }
+    }
+}
+impl Spec {
+    fn decode(bytes: &[u8]) -> Result<Self, CatalogStoreError> {
+        type Owned = (u16, Uuid, u64, Uuid, u8, Identity);
+        if let Ok((2, id, physical_bytes, domain, slot, owner)) = decode::<Owned>(bytes) {
+            if owner.inode == 0 {
+                return Err(DatabaseError::Integrity.into());
+            }
+            return Ok(Self {
+                version: 2,
+                id,
+                physical_bytes,
+                domain,
+                slot,
+                owner: Some(owner),
+            });
+        }
+        let (version, id, physical_bytes, domain, slot): (u16, Uuid, u64, Uuid, u8) =
+            decode(bytes)?;
+        if version != 1 {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(Self {
+            version,
+            id,
+            physical_bytes,
+            domain,
+            slot,
+            owner: None,
+        })
+    }
 }
 fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>, CatalogStoreError> {
     Ok(mb_core::canonical_bytes_bounded(value, BYTES)?)
@@ -89,9 +146,8 @@ fn entries(cx: &Connection) -> Result<Vec<Spec>, CatalogStoreError> {
         let key: Option<Vec<u8>> = row.get(0)?;
         let key = key.ok_or(DatabaseError::Integrity)?;
         let bytes = pair(cx, LEASE, LEASE_GUARD, &key)?.ok_or(DatabaseError::Integrity)?;
-        let spec: Spec = decode(&bytes)?;
-        if spec.version != 1
-            || spec.id.is_nil()
+        let spec = Spec::decode(&bytes)?;
+        if spec.id.is_nil()
             || spec.id.as_bytes().as_slice() != key
             || spec.physical_bytes == 0
             || u32::from(spec.slot) >= SLOTS
@@ -236,6 +292,7 @@ pub struct CatalogScratchLease {
     spec: Spec,
     #[cfg(target_os = "linux")]
     _database_identity: std::fs::File,
+    owner: SlotOwner,
     token: FileLock,
 }
 impl CatalogScratchLease {
@@ -255,7 +312,8 @@ impl CatalogScratchLease {
         if maximum_physical_bytes > self.spec.physical_bytes {
             return Err(DatabaseError::CapacityExceeded.into());
         }
-        self.token.check_owned()
+        self.token.check_owned()?;
+        self.owner.check()
     }
 }
 
@@ -370,31 +428,43 @@ impl ControlStore {
             return Err(CatalogStoreError::ScratchPoolExhausted);
         }
         let scopes = entries(&tx)?;
+        if scopes.iter().any(|spec| spec.owner.is_none()) {
+            return Err(DatabaseError::NotReady.into());
+        }
         let token = FileLock::admit(&tx, self, !scopes.is_empty(), live_lock::SCRATCH)?;
         let mut used = [false; SLOTS as usize];
+        let mut expected = [None; SLOTS as usize];
         for spec in scopes {
             used[spec.slot as usize] = true;
+            expected[spec.slot as usize] =
+                Some((spec.id, spec.owner.ok_or(DatabaseError::Integrity)?));
         }
+        token.validate_owners(&expected)?;
         let slot = token.claim_slot(&used)?;
         #[cfg(target_os = "linux")]
         let database_identity = token.pin_database()?;
+        let id = Uuid::new_v4();
+        let owner = token.create_owner(slot, id)?;
         let spec = Spec {
-            version: 1,
-            id: Uuid::new_v4(),
+            version: 2,
+            id,
             physical_bytes,
             domain: token.domain.id,
             slot,
+            owner: Some(owner.identity),
         };
         for kind in [LEASE, LEASE_GUARD] {
             insert_exact(&tx, kind, spec.id.as_bytes(), &encoded(&spec)?)?;
         }
         write(&tx, old, next)?;
         token.check(self)?;
+        owner.check()?;
         tx.commit()?;
         Ok(Some(CatalogScratchLease {
             spec,
             #[cfg(target_os = "linux")]
             _database_identity: database_identity,
+            owner,
             token,
         }))
     }

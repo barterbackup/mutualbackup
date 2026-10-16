@@ -648,3 +648,98 @@ fn scratch_identity_pin_close_preserves_another_sqlite_connections_posix_writer_
     }
     writer.rollback().unwrap();
 }
+
+#[test]
+fn scratch_legacy_declarations_keep_original_bytes_and_block_new_grants_until_stopped() {
+    let (_temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let lease = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    let (key, bytes) = store
+        .records("catalog-scratch-lease-v1")
+        .unwrap()
+        .pop()
+        .unwrap();
+    type Owned = (u16, Uuid, u64, Uuid, u8, (u64, u64));
+    let (version, id, bytes, domain, slot, _): Owned = mb_core::decode_canonical(&bytes).unwrap();
+    assert_eq!(version, 2);
+    let original = mb_core::canonical_bytes(&(1_u16, id, bytes, domain, slot)).unwrap();
+    for kind in ["catalog-scratch-lease-v1", "catalog-scratch-lease-guard-v1"] {
+        store
+            .connection
+            .execute(
+                "UPDATE protocol_records SET bytes=?1 WHERE kind=?2 AND record_id=?3",
+                params![original, kind, key],
+            )
+            .unwrap();
+    }
+    assert_eq!(usage(&store), (3, 1));
+    assert!(!store.reclaim_abandoned_catalog_scratch().unwrap());
+    assert!(store.reserve_catalog_scratch(3).is_err());
+    assert_eq!(
+        store
+            .get_record("catalog-scratch-lease-v1", &key)
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    drop(lease);
+    assert!(store.reclaim_abandoned_catalog_scratch().unwrap());
+    let next = store.reserve_catalog_scratch(9).unwrap().unwrap();
+    assert_eq!(usage(&store), (9, 1));
+    next.check(9).unwrap();
+}
+
+#[test]
+fn scratch_owner_files_are_bounded_and_recycling_preserves_another_live_owner() {
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let live = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    for _ in 0..32 {
+        let next = store.reserve_catalog_scratch(3).unwrap().unwrap();
+        live.check(3).unwrap();
+        let directories: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|s| s == "owners"))
+            .collect();
+        assert_eq!(directories.len(), 1);
+        assert_eq!(std::fs::read_dir(&directories[0]).unwrap().count(), 2);
+        drop(next);
+    }
+    live.check(3).unwrap();
+}
+
+#[test]
+fn scratch_owner_file_replacement_refuses_growth_without_releasing_live_credits() {
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let live = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    let directory = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|s| s == "owners"))
+        .unwrap();
+    let path = std::fs::read_dir(&directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved = temp.path().join("saved-owner");
+    std::fs::rename(&path, &saved).unwrap();
+    std::fs::write(&path, []).unwrap();
+    assert!(live.check(3).is_err());
+    assert!(!store.reclaim_abandoned_catalog_scratch().unwrap());
+    assert!(store.reserve_catalog_scratch(3).is_err());
+    assert_eq!(usage(&store), (3, 1));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(saved, path).unwrap();
+    live.check(3).unwrap();
+    assert!(!store.reclaim_abandoned_catalog_scratch().unwrap());
+}

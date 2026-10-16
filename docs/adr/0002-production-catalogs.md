@@ -7638,39 +7638,54 @@ disabled. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and native Windows/macO
 qualification remain user-deferred. A complete current-source qualification is
 still required with the initial-coverage diagnostics before installed jobs.
 
-Funded scratch ownership review (correction pending qualification, 2026-10-16):
-The isolated aggregate scratch component reserves complete physical ceilings
-and job slots from a paired immutable pool bound to the resource policy. Actual
-fallocate, checkpoint-copy and shared headroom checks remain independent.
-Retained-proof reconstruction prepays bounded declaration/reclamation and
-volume-registry work before creating each scratch index or ancestry stack.
+Funded scratch ownership binding (correction pending qualification, 2026-10-16):
+The aggregate scratch component reserves full VFS physical ceilings and job
+slots; actual fallocate, checkpoint-copy reserves and shared filesystem headroom
+remain mandatory. Retained-proof callers prepay bounded declaration/reclamation
+and volume-registry work before creating their scratch indexes and stack.
 
-Preceding source `309d0e1` passes 643 distinct cases in 683 executions: 558
-ordinary Store cases, both actual PID/OverlayFS probes, both resource-backed
-three-generation recovery layouts and 81 ordinary volume cases. Strict locked
-workspace/all-target Clippy and format pass. Independent execution audit verifies
-409 inputs, both drivers, exact case inventories and unmounted OverlayFS.
-This positive did not authorize integration. Review identified missing lifetime
-proof after the original SQLite connection closes. Two exact regressions on
-`4bf685d` reproduce a lease accepting a recreated database with the same inode,
-and a new full-pool grant after a valid empty-ledger restore while an original
-lease remains live. Both failed source/binary/log identities are preserved.
+Preceding `309d0e1` passes 643 distinct cases in 683 executions (Store558, actual
+kernel probes2, Node retained recovery2 and volume81), strict workspace Clippy
+and format. Independent execution audit verifies409 inputs, both drivers and
+OverlayFS cleanup. Integration was withheld after review. Two real regressions
+on `4bf685d` reproduce acceptance of a recycled database inode and a full-pool
+grant after restoring an empty ledger while an old lease remains live. The first
+O_PATH/unused-slot correction is also insufficient: `ecfc26e` reproduces an old
+small declaration impersonating a later full-pool owner of the same reused slot.
+All exact failed sources, executables and logs remain preserved.
 
-The correction pins the original database inode with an O_PATH capability,
-without retaining another SQLite connection or an ordinary main-file I/O
-handle. Closing an ordinary descriptor would release native POSIX locks; an
-independent rollback-mode writer test covers the pin close. Both scratch and
-traversal admission now probe every unrepresented kernel slot before choosing
-one. Missing live declarations cause refusal instead of replacement grants,
-even when a valid restored ledger retains some other scopes. Probes release
-unused slots; original domain, declaration, signed and wire encodings stay intact.
-The correction and new regressions remain unqualified; do not merge or enable
-producers until the new source/executable checks pass.
+The new correction pins the original main inode through O_PATH, whose close
+must preserve other SQLite POSIX locks. Each scope additionally holds an OFD
+lock on an empty UUID-named owner file, bound by exact device/inode in its local
+declaration. One private directory per class has at most one file per aggregate
+slot (64 total), including failed-admission/crash orphans. Under the existing
+writer, a bounded scan verifies every live owner's UUID/identity against the
+current declaration set and checks aggregate liveness. Dead debt remains charged;
+missing/reused live owners refuse new grants. All unused aggregate slots are
+also probed. The selected slot replaces only a stopped prior empty owner file;
+file/directory entries are synced before committing. Guards check both owner
+and aggregate mappings. Reclamation still requires a free aggregate slot or
+proven independent copy. Existing files are inspected through O_PATH before
+ordinary I/O, avoiding a substituted SQLite main-file descriptor.
 
-Evidence: `/tmp/mb-m6-scratch-meter-qual-omuq5vui` and
-`/tmp/mb-m6-scratch-owner-red-0zn7e2qb`. This component bounds funded declarations
-only. It cannot fence older binaries or adopt already-live anonymous unfunded
-scratch. Quiescent enrollment/adoption, all-producer/global physical admission,
-persistent SQL/WAL/volume backing, distributed activation and normal paged
-production/retention/seed recovery remain open. R1/R2/R3/R5/R7 and M6 remain
-open; dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+New domain version3, scratch declaration2 and traversal declaration3 bind owner
+identity locally. Explicit old/new codecs preserve original canonical bytes and
+lease hashes. Old kernel declarations remain readable/debt and block new grants
+until stopped and drained; version1 copies and old process envelopes retain
+unproven debt. Proven version2/3 copies keep independent reclamation. No signed,
+wire, original resource-policy or per-checkpoint admission format changes.
+
+New cases cover both pools' reused slots, valid partial restore, owner-file
+replacement, bounded churn, actual legacy byte/hash replay and an independent
+DELETE-mode SQLCipher writer after pin close. Strict Store/all-target Clippy and
+format pass. Runtime/native/ownership checks remain pending; do not merge or
+enable producers. Evidence: `/tmp/mb-m6-scratch-meter-qual-omuq5vui`,
+`/tmp/mb-m6-scratch-owner-red-0zn7e2qb` and
+`/tmp/mb-m6-scratch-reused-slot-red-lqv6lhm4`.
+
+This governs funded declarations only. Older unfunded producers and already-live
+anonymous scratch are not fenced/adopted. Complete quiescent enrollment/adoption,
+all-producer/global physical admission, persistent SQL/WAL/volume backing,
+distributed activation and normal paged production/retention/recovery remain
+open with R1/R2/R3/R5/R7 and M6. Dense 1 TiB and native Windows/macOS
+qualification remain user-deferred.
