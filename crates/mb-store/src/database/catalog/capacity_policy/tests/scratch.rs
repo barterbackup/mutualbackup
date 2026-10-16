@@ -518,6 +518,71 @@ fn scratch_empty_restored_ledger_cannot_rebind_while_original_kernel_slot_is_liv
     next.check(9).unwrap();
 }
 
+fn restored_prelease_snapshot_cannot_relocate_live_ownership(hard_link: bool) {
+    use std::os::unix::fs::MetadataExt;
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let path = temp.path().join("control.db");
+    let snapshot = temp.path().join("before-first-lease.db");
+    let checkpoint: (u32, u32, u32) = store
+        .connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint.0, 0);
+    std::fs::copy(&path, &snapshot).unwrap();
+    let original = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    let identity = std::fs::metadata(&path).unwrap();
+    drop(store);
+    // Restore only SQLite to its valid state immediately after enrollment,
+    // keeping the same inode and the original lease/lock descriptions alive.
+    std::fs::copy(&snapshot, &path).unwrap();
+    original.check(3).unwrap();
+    let other = temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let relocated = other.join("control.db");
+    if hard_link {
+        std::fs::hard_link(&path, &relocated).unwrap();
+    } else {
+        std::fs::rename(&path, &relocated).unwrap();
+    }
+    let named = std::fs::metadata(&relocated).unwrap();
+    assert_eq!((identity.dev(), identity.ino()), (named.dev(), named.ino()));
+    let alias = ControlStore::open(&relocated, &keys()).unwrap();
+    assert_eq!(usage(&alias), (0, 0));
+    assert!(
+        alias.reserve_catalog_scratch(9).is_err(),
+        "relocated pre-lease snapshot admitted 9 bytes while the original 3-byte lease remained live (hard_link={hard_link})"
+    );
+    assert_eq!(usage(&alias), (0, 0));
+    drop(alias);
+    if hard_link {
+        std::fs::remove_file(&relocated).unwrap();
+    } else {
+        std::fs::rename(&relocated, &path).unwrap();
+    }
+    original.check(3).unwrap();
+    let restored = ControlStore::open(&path, &keys()).unwrap();
+    assert!(restored.reserve_catalog_scratch(9).is_err());
+    drop(original);
+    let next = restored.reserve_catalog_scratch(9).unwrap().unwrap();
+    assert_eq!(usage(&restored), (9, 1));
+    next.check(9).unwrap();
+}
+
+#[test]
+fn scratch_restored_prelease_database_move_cannot_hide_a_live_owner() {
+    restored_prelease_snapshot_cannot_relocate_live_ownership(false);
+}
+
+#[test]
+fn scratch_restored_prelease_database_hard_link_cannot_hide_a_live_owner() {
+    restored_prelease_snapshot_cannot_relocate_live_ownership(true);
+}
+
 #[test]
 fn scratch_partial_restored_ledger_cannot_skip_an_unrecorded_live_slot() {
     let (temp, store) = setup();
