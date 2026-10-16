@@ -6676,3 +6676,21 @@ No production path publishes or consumes format 2. Node startup/preserved-read
 dispatch, fresh birth/restart, old-writer/restore policy, aggregate/enclosing
 admission and normal producers remain open, together with R1/R2/R3/R5/R7 and
 current-source/installed/deferred hardware gates.
+
+### 2026-10-16 — Recheck the complete ordinary Node cohort after native SQL work
+
+Frozen runtime baseline `efbe298` passes all 595 ordinary Node cases, including
+`offline_first_spare_renews_live_checkpoint_coverage`, in 2,807.29 seconds. The
+original four-thread cohort and 5,000-second overall runner bound are retained;
+fixture payloads, individual deadlines and protection assertions are unchanged.
+Thirty-one explicitly ignored Node cases remain outside this run. Independent
+audit verifies the exact reused fresh driver, all 446 snapshot inputs/archive,
+complete passing-case inventory and 559 process/thread/scheduling/pressure/I/O
+samples. Evidence: `/tmp/mb-m6-physical-node-full-vglt6js3`.
+
+This is ordinary Node evidence on the runtime baseline, before the subsequent
+Core key-policy codec. It does not requalify the complete current workspace or
+an installed artifact, diagnose any historical liveness observation or close
+the required fault matrix. The original first-90-second coverage failure,
+900-second native capture timeout and 5,400-second relay-only stall stay separate
+and open. R5/R7 and the remaining R1/R2/R3/Milestone 6 gates remain open.

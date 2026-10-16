@@ -5344,6 +5344,19 @@ normal paged producers remain disabled.
     observations or close this item/R5/R7. No installed jobs ran; 121 ignored
     cases remain unexecuted. Evidence:
     `/tmp/mb-m6-shared-traversal-qual-s1de_h23`.
+    Runtime-baseline ordinary Node recheck (2026-10-16): `efbe298` passes all
+    595 ordinary cases in 2,807.29 seconds, including the original first-coverage
+    fixture, with the original four threads and 5,000-second overall runner
+    bound. Individual deadlines, payloads and protection assertions are unchanged.
+    Independent audit verifies the exact fresh driver, 446 frozen inputs/source
+    archive, all passing identities and 559 process/thread/scheduling/pressure/
+    I/O samples; 31 ignored Node fixtures remain unexecuted here. Evidence:
+    `/tmp/mb-m6-physical-node-full-vglt6js3`. This source predates the later Core
+    policy-key codec. It is ordinary Node evidence only, not a new complete
+    current-workspace/installed gate or cause for any of the three separate
+    historical observations. The original first-90-second coverage failure,
+    900-second native capture timeout, 5,400-second relay-only stall and complete
+    R5 fault matrix remain open. No installed jobs ran.
   - [x] Preserve and instrument the initial checkpoint coverage timeout.
     Full source qualification and first-coverage diagnostics (2026-10-15):
     The complete C2 source gate on `c2c82ef` failed. All four provisioned native
