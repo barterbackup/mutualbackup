@@ -37,8 +37,6 @@ struct State {
     physical: Option<super::physical_io::Binding>,
     #[cfg(target_os = "linux")]
     shm: Option<super::physical_io::Binding>,
-    #[cfg(target_os = "linux")]
-    temporary: Option<(std::fs::File, std::ffi::CString)>,
 }
 
 #[repr(C)]
@@ -221,25 +219,24 @@ unsafe extern "C" fn open(
             Err(error) => return super::physical_io::sqlite_code(error, ffi::SQLITE_CANTOPEN),
         };
         #[cfg(target_os = "linux")]
-        let (native_name, native_flags) = prepared.as_ref().map_or((name, flags), |(_, path)| {
-            (
-                path.as_ptr(),
-                flags
-                    & !(ffi::SQLITE_OPEN_CREATE
-                        | ffi::SQLITE_OPEN_EXCLUSIVE
-                        | ffi::SQLITE_OPEN_DELETEONCLOSE
-                        | ffi::SQLITE_OPEN_NOFOLLOW),
-            )
-        });
+        let code = if let Some(temporary) = prepared {
+            use std::os::fd::{FromRawFd, IntoRawFd};
+            let mut descriptor = temporary.into_raw_fd();
+            let code = ffi::sqlite3_mutualbackup_open_temp_fd(parent, inner, &mut descriptor);
+            if descriptor >= 0 {
+                // Rejected before transfer: this is our newly created anonymous
+                // temporary inode, never another main-file description.
+                drop(std::fs::File::from_raw_fd(descriptor));
+            }
+            if !out_flags.is_null() {
+                *out_flags = flags;
+            }
+            code
+        } else {
+            (*parent).xOpen.expect("native xOpen")(parent, name, inner, flags, out_flags)
+        };
         #[cfg(not(target_os = "linux"))]
-        let (native_name, native_flags) = (name, flags);
-        let code = (*parent).xOpen.expect("native xOpen")(
-            parent,
-            native_name,
-            inner,
-            native_flags,
-            out_flags,
-        );
+        let code = (*parent).xOpen.expect("native xOpen")(parent, name, inner, flags, out_flags);
         if code != ffi::SQLITE_OK {
             if !(*inner).pMethods.is_null() {
                 ((*(*inner).pMethods).xClose.expect("native xClose"))(inner);
@@ -266,8 +263,6 @@ unsafe extern "C" fn open(
                     physical: binding,
                     #[cfg(target_os = "linux")]
                     shm: None,
-                    #[cfg(target_os = "linux")]
-                    temporary: prepared,
                 })),
                 _padding: [0; 5],
             },
@@ -300,7 +295,6 @@ unsafe extern "C" fn close(file: *mut ffi::sqlite3_file) -> c_int {
         #[cfg(target_os = "linux")]
         {
             let state = &mut *file.state;
-            drop(state.temporary.take());
             if let Some(binding) = &mut state.shm {
                 let _ = binding.close();
             }

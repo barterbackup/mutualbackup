@@ -44511,6 +44511,28 @@ static int fillInUnixFile(
   return rc;
 }
 
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+/* Take ownership of one anonymous temporary file without reopening a procfs
+** symlink or changing any main-file description/lock. On acceptance *pFd is
+** -1, including native initialization errors. Rejection leaves ownership with
+** the caller. The caller supplies the built-in Unix VFS and its file storage.
+*/
+SQLITE_API int sqlite3_mutualbackup_open_temp_fd(
+  sqlite3_vfs *pVfs, sqlite3_file *pFile, int *pFd
+){
+  struct stat info;
+  int descriptor;
+  if( !pVfs || !pFile || !pFd || *pFd<0 ) return SQLITE_MISUSE;
+  pFile->pMethods = 0;
+  if( osFstat(*pFd, &info) ) return SQLITE_IOERR_FSTAT;
+  if( !S_ISREG(info.st_mode) || info.st_nlink!=0 ) return SQLITE_MISUSE;
+  descriptor = *pFd;
+  *pFd = -1;
+  memset(pFile, 0, sizeof(unixFile));
+  return fillInUnixFile(pVfs, descriptor, pFile, 0, UNIXFILE_NOLOCK);
+}
+#endif
+
 /*
 ** Directories to consider for temp files.
 */

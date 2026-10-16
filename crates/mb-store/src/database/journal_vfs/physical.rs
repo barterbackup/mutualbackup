@@ -83,7 +83,7 @@ pub(super) fn prepare(
     pool: Option<&Arc<Pool>>,
     name: ffi::sqlite3_filename,
     flags: c_int,
-) -> Result<Option<(IoFile, CString)>, DatabaseError> {
+) -> Result<Option<IoFile>, DatabaseError> {
     let Some(pool) = pool else { return Ok(None) };
     if flags & (ffi::SQLITE_OPEN_MAIN_DB | ffi::SQLITE_OPEN_MAIN_JOURNAL | ffi::SQLITE_OPEN_WAL)
         != 0
@@ -93,14 +93,9 @@ pub(super) fn prepare(
     if !name.is_null() && flags & ffi::SQLITE_OPEN_DELETEONCLOSE == 0 {
         return Err(DatabaseError::PhysicalIoUnavailable);
     }
-    // Give native temporary I/O an anonymous inode on the admitted filesystem.
-    // Retain its original descriptor/path until after native xClose. It cannot
-    // alias the main file, and closing this extra temporary description cannot
-    // discard a main-file POSIX lock.
-    let temporary = tempfile::tempfile_in(pool.directory.path())?;
-    let path = CString::new(format!("/proc/self/fd/{}", temporary.as_raw_fd()))
-        .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
-    Ok(Some((temporary, path)))
+    // Hand the anonymous descriptor directly to the native Unix adapter. Its
+    // normal O_NOFOLLOW path open deliberately cannot reopen procfs FD links.
+    Ok(Some(tempfile::tempfile_in(pool.directory.path())?))
 }
 
 pub(super) unsafe fn bind(

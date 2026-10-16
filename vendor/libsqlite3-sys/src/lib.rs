@@ -46,3 +46,15 @@ impl Default for sqlite3_vtab_cursor {
         unsafe { mem::zeroed() }
     }
 }
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    /// Adopt an anonymous regular temporary descriptor using the bundled Unix
+    /// VFS. On acceptance `*descriptor` becomes -1 and native xClose owns it,
+    /// including initialization-error cleanup. Rejection leaves it unchanged.
+    pub fn sqlite3_mutualbackup_open_temp_fd(
+        vfs: *mut sqlite3_vfs,
+        file: *mut sqlite3_file,
+        descriptor: *mut std::ffi::c_int,
+    ) -> std::ffi::c_int;
+}
