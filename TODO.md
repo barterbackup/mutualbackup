@@ -2856,6 +2856,24 @@ normal paged producers remain disabled.
       volumes, partial creation/restart ownership and normal paged integration
       remain open. Producers stay disabled; complete current-source/installed,
       R1/R2/R3/R5/R7 and user-deferred capacity/platform gates remain open.
+    - [x] Extend runtime native file admission to parity catalogs.
+      Qualified `efbe298` adds explicit Linux physical parity creation/existing-
+      open APIs. Shared helpers retain main identity, encryption/schema/volume
+      checks and the private VFS until native close. Generic parity constructors
+      preserve their behavior. Four new standard/Btrfs cases preserve fixed and
+      variable READY bytes, acknowledgement/receipt/activation evidence through
+      reopen, roll back a late real SQL allocation-cap refusal and retry, reject
+      existing/wrong-volume/missing-main opens and retain directory identity.
+      Fourteen combined Btrfs physical cases pass, including actual ENOSPC and
+      stopped-sharing refusal. Focused exact-source qualification passes
+      177 distinct cases/executions: database67, directory12, descriptors3,
+      Node volumes81 and physical14. Strict workspace/all-target Clippy, format,
+      independent 446-input/two-fresh-driver/archive/exact-case audits and native
+      cleanup pass. Evidence: `/tmp/mb-m6-parity-sql-integration-mcrfxq_2` and
+      `/tmp/mb-m6-physical-io-btrfs-h7oknki6`. Persistent/global/enclosing volume
+      policy, checkpoint/rebuild copies, old-writer/quiescent enrollment and
+      normal volume/paged startup remain open. Producers stay disabled; complete
+      current-source/installed/R1/R2/R3/R5/R7 and deferred hardware gates remain.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

@@ -8066,3 +8066,47 @@ No normal paged producer is enabled. This focused qualification does not replace
 complete current-source/installed qualification, resolve the three separate R5
 observations or close R1/R2/R3/R5/R7. Dense 1 TiB and native Windows/macOS runs
 remain user-deferred.
+
+### 2026-10-16 — Retain runtime physical admission through parity ownership
+
+Qualified `efbe298` extends the same private native VFS to parity catalogs.
+Both Store types own their registered adapter after the connection field, so
+native file close precedes adapter retirement. Shared private helpers create
+and sync a new main inode, pin the intended existing/new identity, construct
+the VFS before native SQL opens and configure encryption before validating the
+corresponding control/parity schema. The new parity factories retain volume
+identity checks. Generic parity constructors explicitly carry no runtime
+physical adapter and retain their previous semantics. The public APIs still
+require caller-owned files; they do not install a durable volume policy or
+migrate/enroll older writers.
+
+The four new tests exercise actual fixed READY publication with acknowledgement,
+variable staging/activation with original receipt/attempt/verification evidence,
+closed reopen and independent ordinary-adapter reads. A variable object exceeds
+the physical journal ceiling after SQL work begins; its transaction leaves no
+staged attempt while the prior READY object and acknowledgement remain exact.
+A smaller retry stages and activates successfully. Existing creation, wrong
+volume identity and missing-main reopen reject without replacing the original
+catalog. Directory rename retains future journal and publication I/O through
+the original capability. All four cases pass on the standard filesystem and
+Btrfs. The unchanged ten control physical cases also pass on Btrfs, including
+actual ENOSPC/retry, stopped shared-extent refusal and four-mode crash recovery.
+The original control regression file and all pinned native C files are byte
+identical to qualified `1f3333d`.
+
+Focused qualification on this exact source passes 177 distinct cases in 177
+executions: 67 ordinary database cases, 12 directory cases, three native
+descriptor cases, 81 Node volume cases and fourteen provisioned Btrfs physical
+cases. The separate four-case standard filesystem run also passes. Strict locked
+workspace/all-target Clippy, format and independent 446-input/two-fresh-driver/
+source/archive/exact-case/native-cleanup audits pass. Evidence:
+`/tmp/mb-m6-parity-sql-integration-mcrfxq_2`;
+`/tmp/mb-m6-physical-io-btrfs-h7oknki6`.
+
+This qualifies explicit runtime parity SQL admission and the exercised generic
+regressions. Node volume startup is not switched to these APIs. Persistent
+volume/control policy, aggregate/enclosing reservations, checkpoint/rebuild
+copies, old-writer/quiescent migration and normal paged integration remain open.
+Normal producers stay disabled. Complete current-source/installed validation,
+R1/R2/R3/R5/R7 and user-deferred dense 1 TiB/native Windows/macOS qualification
+remain open.
