@@ -4898,6 +4898,201 @@ mod metadata_compatibility_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn recovered_source_discovery_survives_fresh_processes_without_replacing_the_anchor() {
+        const CHILD: &str = "MB_RECOVERED_DISCOVERY_CHILD";
+        const CASE: &str = "snapshot::tests::recovered_source_discovery_survives_fresh_processes_without_replacing_the_anchor";
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([49; 32]));
+        let guild = [50; 32];
+        if let Some(directory) = std::env::var_os(CHILD) {
+            let directory = PathBuf::from(directory);
+            let control = ControlStore::open_existing_with_key(
+                directory.join("control.db"),
+                &keys.database_key(b"control.db"),
+            )
+            .unwrap();
+            let revision = decode_canonical(
+                &control
+                    .get_record("fixture-revision", b"revision")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            match reanchor_recovered_revision(&control, &keys, guild, &revision, &directory) {
+                Ok(()) => return,
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<mb_store::AnchorError>(),
+                        Some(mb_store::AnchorError::AnchorAreaDiscoveryPending)
+                    ) =>
+                {
+                    std::process::exit(25)
+                }
+                Err(error) => panic!("recovery failed instead of resuming discovery: {error:#}"),
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let scan = temp.path().join("scan");
+        let root = scan.join("source");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        let mut area = mb_store::StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        area.volume_root_hint = scan.clone();
+        let anchor_id = Uuid::new_v4();
+        let payload = b"original retained recovery bytes";
+        fs::create_dir(area.path_hint.join(anchor_id.to_string())).unwrap();
+        fs::write(
+            area.path_hint.join(anchor_id.to_string()).join("payload"),
+            payload,
+        )
+        .unwrap();
+        for n in 0..5_000 {
+            fs::write(scan.join(format!("entry-{n}")), []).unwrap();
+        }
+        let moved = scan.join(".mutualbackup-anchors-relocated");
+        fs::rename(&area.path_hint, &moved).unwrap();
+        let (reference, ciphertext) =
+            encrypted_sector(&keys.guild_data_key(&guild), [51; 32], payload).unwrap();
+        let metadata = PrivateMetadata {
+            format_version: 3,
+            root_mode: 0o755,
+            root_modified_secs: 1_700_000_000,
+            root_modified_nanos: 123,
+            entries: vec![PrivateEntry::File {
+                path: "payload".into(),
+                mode: 0o644,
+                logical_len: payload.len() as u64,
+                modified_secs: 1,
+                modified_nanos: 0,
+                sectors: vec![reference.clone()],
+            }],
+        };
+        let (mut revision, _) = restore_fixture(&keys, guild, metadata.entries.clone(), Vec::new());
+        revision.value.data_sectors = vec![reference.clone()];
+        revision
+            .value
+            .sign_writer(&SigningKey::from_bytes(&[75; 32]))
+            .unwrap();
+        revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision.value, &keys).unwrap();
+        let manifest = mb_store::StableAnchorManifest {
+            format_version: 2,
+            anchor_id,
+            source_root_hint: root,
+            area,
+            root_mode: metadata.root_mode,
+            root_modified_secs: metadata.root_modified_secs,
+            root_modified_nanos: metadata.root_modified_nanos,
+            entries: vec![CapturedEntry::File {
+                path: "payload".into(),
+                mode: 0o644,
+                logical_len: payload.len() as u64,
+                modified_secs: 1,
+                modified_nanos: 0,
+            }],
+        };
+        let original = canonical_bytes(&manifest).unwrap();
+        let database = state.join("control.db");
+        let control = ControlStore::open(&database, &keys).unwrap();
+        control
+            .put_record(
+                "fixture-revision",
+                b"revision",
+                &canonical_bytes(&revision).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                "anchor-manifest",
+                revision.value.revision_id.as_bytes(),
+                &original,
+            )
+            .unwrap();
+        let encoded = canonical_bytes(&metadata).unwrap();
+        for (reference, plaintext) in revision
+            .value
+            .metadata_sectors
+            .iter()
+            .zip(encoded.chunks(V1_SECTOR_SIZE))
+        {
+            let recipe = LocalSectorRecipe {
+                guild_id: guild,
+                reference: reference.clone(),
+                source: LocalPlaintextSource::Inline(plaintext.to_vec()),
+            };
+            control
+                .put_record(
+                    "local-sector",
+                    &reference.id,
+                    &canonical_bytes(&recipe).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(control);
+        let mut pending = 0;
+        let mut complete = false;
+        for _ in 0..40 {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([CASE, "--exact", "--nocapture"])
+                .env(CHILD, &state)
+                .output()
+                .unwrap();
+            let control = ControlStore::open(&database, &keys).unwrap();
+            assert_eq!(
+                control
+                    .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+            assert!(
+                control
+                    .records(RECOVERY_ANCHOR_INTENT_KIND)
+                    .unwrap()
+                    .is_empty()
+            );
+            if output.status.code() == Some(25) {
+                pending += 1;
+                assert!(
+                    anchor_area_hint(&control, manifest.area.area_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    control
+                        .get_record("local-sector", &reference.id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(control.anchor_discovery_jobs(None).unwrap().jobs.len(), 1);
+                continue;
+            }
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                anchor_area_hint(&control, manifest.area.area_id).unwrap(),
+                Some(moved.clone())
+            );
+            assert!(control.anchor_discovery_jobs(None).unwrap().jobs.is_empty());
+            assert_eq!(
+                render_sector(&control, &keys, &reference.id, Some(&guild)).unwrap(),
+                ciphertext
+            );
+            complete = true;
+            break;
+        }
+        assert!(pending > 0, "fixture must exceed a single discovery step");
+        assert!(
+            complete,
+            "fresh-process retries must finish the durable scan"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn stable_source_discovery_reopens_without_publishing_unverified_locations() {
         let temp = tempfile::tempdir().unwrap();
         let scan = temp.path().join("scan");
