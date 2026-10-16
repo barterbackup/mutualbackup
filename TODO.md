@@ -2787,6 +2787,28 @@ normal paged producers remain disabled.
       quiescent upgrade, traversal enrollment/relocation policy, global physical
       SQL/WAL/volume backing or normal paged integration. Producers stay disabled;
       full current-source, installed and remaining M6 gates remain open.
+    - [x] Bind initial native traversal enrollment to its ownership domain.
+      Actual `e3dbcdb` restores valid pre-scope work rows, checkpoints WAL, then
+      moves the same main inode while an original kernel owner remains live.
+      The relocated catalog grants the full pool; the intended assertion fails.
+      Corrected `86ed876` offers explicit Store/Node native resource enrollment,
+      committing its synced domain with local ledger/marker version 2. That
+      version requires the domain even with zero scopes. Generic logical
+      configuration/resource/signed formats remain unchanged. Old anchored
+      ledgers retain bytes and behavior; unanchored catalogs support inspection
+      and durable logical jobs, but refuse live grants or automatic upgrade.
+      All 579 ordinary Store, actual namespace/OverlayFS probes, Node recovery2/
+      volume81/snapshot36 and Btrfs traversal25/funded-scratch1/snapshot8/retained4
+      pass: 712 distinct cases in 740 executions. New tests cover initial domain
+      loss, old ledger bytes, logical hard links, whole-directory relocation
+      and enrollment ABORT/IGNORE faults. Strict workspace/all-target Clippy,
+      format and independent 410-input/two-driver/archive/exact-case audit pass;
+      native cleanup and original negative identities verify. Evidence:
+      `/tmp/mb-m6-traversal-enrollment-red-xyq8st3b` and
+      `/tmp/mb-m6-traversal-enrollment-qual-rlkbx25j`. Complete old-writer/quiescent
+      upgrade, restore/relocation policy, physical SQL/WAL/volume backing and
+      normal paged integration remain open. Producers stay disabled; full
+      current-source/installed, R5/R7 and deferred hardware gates stay open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted
