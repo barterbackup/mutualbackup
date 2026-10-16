@@ -457,3 +457,63 @@ fn scratch_sigkill_returns_only_stopped_credits() {
     assert!(!store.reclaim_abandoned_catalog_scratch().unwrap());
     own.check(3).unwrap();
 }
+
+#[test]
+fn scratch_lease_rejects_recreated_database_after_original_connection_closes() {
+    use std::os::unix::fs::MetadataExt;
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 1))
+        .unwrap();
+    let lease = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    let path = temp.path().join("control.db");
+    let original = std::fs::metadata(&path).unwrap().ino();
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+    // The lease must keep its original file identity alive even after SQLite
+    // closes. On the qualified ext4 host the old code recycled it immediately.
+    for index in 0..512 {
+        std::fs::write(&path, []).unwrap();
+        let replacement = std::fs::metadata(&path).unwrap().ino();
+        assert!(
+            lease.check(3).is_err(),
+            "recreated database was accepted: original inode {original}, replacement {replacement}, attempt {index}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[test]
+fn scratch_empty_restored_ledger_cannot_rebind_while_original_kernel_slot_is_live() {
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 1))
+        .unwrap();
+    let path = temp.path().join("control.db");
+    let snapshot = temp.path().join("before-lease.db");
+    let checkpoint: (u32, u32, u32) = store
+        .connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint.0, 0);
+    std::fs::copy(&path, &snapshot).unwrap();
+    let original = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    drop(store);
+    // Restore an earlier valid same-inode catalog while its old VFS token is
+    // still alive. Empty persisted rows must not erase kernel ownership.
+    std::fs::copy(&snapshot, &path).unwrap();
+    let restored = ControlStore::open(&path, &keys()).unwrap();
+    assert_eq!(usage(&restored), (0, 0));
+    assert!(
+        restored.reserve_catalog_scratch(9).is_err(),
+        "restored empty ledger admitted the full pool while an old declaration remained live"
+    );
+    assert_eq!(usage(&restored), (0, 0));
+    original.check(3).unwrap();
+    drop(original);
+    let next = restored.reserve_catalog_scratch(9).unwrap().unwrap();
+    assert_eq!(usage(&restored), (9, 1));
+    next.check(9).unwrap();
+}
