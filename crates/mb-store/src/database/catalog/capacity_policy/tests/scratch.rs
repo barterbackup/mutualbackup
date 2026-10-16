@@ -59,6 +59,12 @@ fn scratch_byte_and_job_limits_compete_across_connections_without_stealing_live_
         .unwrap();
     let observer = ControlStore::open(temp.path().join("control.db"), &keys()).unwrap();
     let a = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    // A second slot is available: only the byte ceiling refuses this request.
+    assert!(matches!(
+        observer.reserve_catalog_scratch(7),
+        Err(CatalogStoreError::ScratchPoolExhausted)
+    ));
+    assert_eq!(usage(&store), (3, 1));
     let b = observer.reserve_catalog_scratch(6).unwrap().unwrap();
     assert_eq!(usage(&store), (9, 2));
     assert!(matches!(
@@ -69,6 +75,12 @@ fn scratch_byte_and_job_limits_compete_across_connections_without_stealing_live_
     a.check(3).unwrap();
     b.check(6).unwrap();
     drop(a);
+    // Dead-credit cleanup commits even when the next declaration cannot fit.
+    assert!(matches!(
+        store.reserve_catalog_scratch(4),
+        Err(CatalogStoreError::ScratchPoolExhausted)
+    ));
+    assert_eq!(usage(&observer), (6, 1));
     let c = store.reserve_catalog_scratch(1).unwrap().unwrap();
     assert_eq!(usage(&observer), (7, 2));
     assert!(matches!(
@@ -158,13 +170,18 @@ fn scratch_reservation_and_reclamation_are_atomic_under_abort_and_ignore_faults(
                 .unwrap();
             let lease = store.reserve_catalog_scratch(3).unwrap().unwrap();
             drop(lease);
-            store.connection.execute_batch(&format!("CREATE TEMP TRIGGER refuse_scratch BEFORE DELETE ON protocol_records WHEN OLD.kind='catalog-scratch-lease-guard-v1' BEGIN SELECT RAISE({action}); END")).unwrap();
-            assert!(store.reclaim_abandoned_catalog_scratch().is_err());
-            assert_eq!(usage(&store), (3, 1));
-            store
-                .connection
-                .execute_batch("DROP TRIGGER refuse_scratch")
-                .unwrap();
+            for (verb, side, kind) in [
+                ("DELETE", "OLD", "catalog-scratch-lease-guard-v1"),
+                ("UPDATE", "NEW", "catalog-scratch-pool-guard-v1"),
+            ] {
+                store.connection.execute_batch(&format!("CREATE TEMP TRIGGER refuse_scratch BEFORE {verb} ON protocol_records WHEN {side}.kind='{kind}' BEGIN SELECT RAISE({action}); END")).unwrap();
+                assert!(store.reclaim_abandoned_catalog_scratch().is_err());
+                assert_eq!(usage(&store), (3, 1));
+                store
+                    .connection
+                    .execute_batch("DROP TRIGGER refuse_scratch")
+                    .unwrap();
+            }
             assert!(store.reclaim_abandoned_catalog_scratch().unwrap());
             assert_eq!(usage(&store), (0, 0));
         }
