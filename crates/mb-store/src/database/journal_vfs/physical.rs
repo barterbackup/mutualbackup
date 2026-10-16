@@ -142,6 +142,87 @@ unsafe extern "C" fn delete(
     })
 }
 
+pub(super) unsafe fn install_shm_init(file: &File) -> c_int {
+    let mut init = ffi::MutualBackupShmInit {
+        context: file.state.cast(),
+        init: initialize_shm,
+    };
+    unsafe {
+        ((*(*file.parent).pMethods)
+            .xFileControl
+            .expect("native control"))(
+            file.parent,
+            ffi::MUTUALBACKUP_SQLITE_FCNTL_SHM_INIT,
+            (&mut init as *mut ffi::MutualBackupShmInit).cast(),
+        )
+    }
+}
+
+unsafe extern "C" fn initialize_shm(
+    context: *mut c_void,
+    descriptor: c_int,
+    marker: *mut i64,
+) -> c_int {
+    protect(|| unsafe {
+        let state = &mut *context.cast::<State>();
+        let Some(main) = &state.physical else {
+            return ffi::SQLITE_IOERR_SHMOPEN;
+        };
+        if state.shm.is_some() {
+            return ffi::SQLITE_IOERR_SHMOPEN;
+        }
+        // Native SQLite has reset its stale index under the exclusive DMS
+        // lock. No independent pathname open or external truncation occurs.
+        let binding = match main.pool.bind(descriptor, Role::Shm) {
+            Ok(binding) => binding,
+            Err(error) => return physical_io::sqlite_code(error, ffi::SQLITE_IOERR_SHMOPEN),
+        };
+        let result = binding
+            .block_size()
+            .and_then(|bytes| binding.fund(0, bytes).map(|()| bytes));
+        state.shm = Some(binding);
+        match result {
+            Ok(bytes) => {
+                *marker = bytes as i64;
+                ffi::SQLITE_OK
+            }
+            Err(error) => physical_io::sqlite_code(error, ffi::SQLITE_IOERR_SHMOPEN),
+        }
+    })
+}
+
+/// Journals may be preextended by a VFS. Keep their initial short header in
+/// a complete, admitted filesystem block so Btrfs retains its data extent.
+/// The main database's EOF is never padded this way.
+pub(super) unsafe fn prepare_header_write(
+    file: &File,
+    binding: &physical_io::Binding,
+    end: u64,
+) -> c_int {
+    let minimum = match binding.block_size() {
+        Ok(bytes) => bytes,
+        Err(error) => return physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE),
+    };
+    if end >= minimum {
+        return ffi::SQLITE_OK;
+    }
+    let methods = unsafe { &*(*file.parent).pMethods };
+    let mut old = 0i64;
+    let code = unsafe { (methods.xFileSize.expect("native size"))(file.parent, &mut old) };
+    if code != ffi::SQLITE_OK || old >= minimum as i64 {
+        return code;
+    }
+    if let Err(error) = binding.fund(0, minimum) {
+        return physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE);
+    }
+    let code =
+        unsafe { (methods.xTruncate.expect("native truncate"))(file.parent, minimum as i64) };
+    if let Err(error) = binding.refresh_after_io() {
+        return physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE);
+    }
+    code
+}
+
 pub(super) unsafe fn shm_map(
     file: &File,
     page: c_int,
@@ -155,8 +236,7 @@ pub(super) unsafe fn shm_map(
     if page < 0 || bytes <= 0 {
         return ffi::SQLITE_IOERR_SHMMAP;
     }
-    let state = unsafe { &mut *file.state };
-    let Some(binding) = &state.physical else {
+    let Some(binding) = (unsafe { &*file.state }).physical.as_ref() else {
         return ffi::SQLITE_IOERR_SHMMAP;
     };
     let pool = Arc::clone(&binding.pool);
@@ -185,13 +265,17 @@ pub(super) unsafe fn shm_map(
         return ffi::SQLITE_IOERR_SHMMAP;
     };
     // A non-extending native probe opens the normal SHM node and takes its
-    // native locks, but creates no payload extents. A fresh DMS marker is a
-    // sparse three-byte truncation. Fund before the extending native map.
+    // native locks. Its first-opener callback admits the reset index while
+    // holding exclusive DMS. Do not retain a State borrow across that callback.
     let mut probe = ptr::null_mut();
     let code = unsafe { map(file.parent, page, bytes, 0, &mut probe) };
     if code != ffi::SQLITE_OK {
+        if let Some(mut binding) = unsafe { &mut *file.state }.shm.take() {
+            let _ = binding.close();
+        }
         return code;
     }
+    let state = unsafe { &mut *file.state };
     let descriptor = match unsafe {
         crate::database::native_file::descriptor_for(
             file.parent,
@@ -253,14 +337,15 @@ impl ControlStore {
         let vfs = PhysicalVfs::new(directory, limits)?;
         // This is a new empty inode, before any SQLite descriptor or lock can
         // exist. Never truncate a pre-existing catalog to enroll this mode.
-        drop(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .mode(0o600)
-                .open(&path)?,
-        );
+        let created = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .mode(0o600)
+            .open(&path)?;
+        created.sync_all()?;
+        directory.file().sync_all()?;
+        drop(created);
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;

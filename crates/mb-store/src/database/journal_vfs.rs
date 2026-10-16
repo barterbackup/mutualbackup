@@ -37,6 +37,8 @@ struct State {
     physical: Option<super::physical_io::Binding>,
     #[cfg(target_os = "linux")]
     shm: Option<super::physical_io::Binding>,
+    #[cfg(target_os = "linux")]
+    physical_header: bool,
 }
 
 #[repr(C)]
@@ -263,6 +265,14 @@ unsafe extern "C" fn open(
                     physical: binding,
                     #[cfg(target_os = "linux")]
                     shm: None,
+                    #[cfg(target_os = "linux")]
+                    physical_header: flags
+                        & (ffi::SQLITE_OPEN_WAL
+                            | ffi::SQLITE_OPEN_MAIN_JOURNAL
+                            | ffi::SQLITE_OPEN_TEMP_JOURNAL
+                            | ffi::SQLITE_OPEN_SUBJOURNAL
+                            | ffi::SQLITE_OPEN_SUPER_JOURNAL)
+                        != 0,
                 })),
                 _padding: [0; 5],
             },
@@ -283,6 +293,14 @@ unsafe extern "C" fn open(
                 ffi::SQLITE_FCNTL_CHUNK_SIZE,
                 (&mut zero as *mut c_int).cast(),
             );
+        }
+        #[cfg(target_os = "linux")]
+        if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 && physical_active(output) {
+            let code = physical::install_shm_init(&*output.cast::<File>());
+            if code != ffi::SQLITE_OK {
+                close(output);
+                return code;
+            }
         }
         ffi::SQLITE_OK
     })
@@ -383,10 +401,16 @@ unsafe extern "C" fn write(
             return ffi::SQLITE_FULL;
         }
         #[cfg(target_os = "linux")]
-        if let Some(binding) = &state.physical
-            && let Err(error) = binding.fund(offset as u64, end)
-        {
-            return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE);
+        if let Some(binding) = &state.physical {
+            if state.physical_header && end != offset as u64 {
+                let code = physical::prepare_header_write(file, binding, end);
+                if code != ffi::SQLITE_OK {
+                    return code;
+                }
+            }
+            if let Err(error) = binding.fund(offset as u64, end) {
+                return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE);
+            }
         }
         if state.journal && state.limit.load(Ordering::Acquire) != u64::MAX {
             let mut zero: c_int = 0;

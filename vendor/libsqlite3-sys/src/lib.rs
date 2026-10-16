@@ -58,3 +58,13 @@ unsafe extern "C" {
         descriptor: *mut std::ffi::c_int,
     ) -> std::ffi::c_int;
 }
+
+/// Bundled Linux native SHM admission callback, invoked under exclusive DMS.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct MutualBackupShmInit {
+    pub context: *mut std::ffi::c_void,
+    pub init: unsafe extern "C" fn(*mut std::ffi::c_void, std::ffi::c_int, *mut i64) -> std::ffi::c_int,
+}
+#[cfg(target_os = "linux")]
+pub const MUTUALBACKUP_SQLITE_FCNTL_SHM_INIT: std::ffi::c_int = MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD + 2;

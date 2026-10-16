@@ -38752,6 +38752,14 @@ struct UnixUnusedFd {
 ** The unixFile structure is subclass of sqlite3_file specific to the unix
 ** VFS implementations.
 */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+/* Private bundled ABI: initialize owned SHM backing while native SQLite holds
+** its exclusive DMS lock and after the native stale-index reset. */
+typedef struct mutualbackupShmInit {
+  void *pContext;
+  int (*xInit)(void*, int, sqlite3_int64*);
+} mutualbackupShmInit;
+#endif
 typedef struct unixFile unixFile;
 struct unixFile {
   sqlite3_io_methods const *pMethod;  /* Always the first entry */
@@ -38766,6 +38774,9 @@ struct unixFile {
   const char *zPath;                  /* Name of the file */
   unixShm *pShm;                      /* Shared memory segment information */
   int szChunk;                        /* Configured by FCNTL_CHUNK_SIZE */
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+  mutualbackupShmInit mbShmInit;
+#endif
 #if SQLITE_MAX_MMAP_SIZE>0
   int nFetchOut;                      /* Number of outstanding xFetch refs */
   sqlite3_int64 mmapSize;             /* Usable size of mapping at pMapRegion */
@@ -42523,6 +42534,15 @@ static int unixFileControl(sqlite3_file *id, int op, void *pArg){
       return SQLITE_NOTFOUND;
 #endif
     }
+    case MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD+2: {
+      mutualbackupShmInit *pInit = (mutualbackupShmInit*)pArg;
+      if( pInit==0 || pInit->xInit==0 || pInit->pContext==0 || pFile->pShm!=0 ){
+        return SQLITE_MISUSE;
+      }
+      pFile->mbShmInit = *pInit;
+      return SQLITE_OK;
+    }
+
 
 #endif
 
@@ -43160,8 +43180,28 @@ static int unixLockSharedMemory(unixFile *pDbFd, unixShmNode *pShmNode){
       ** -shm header size) rather than 0 as a system debugging aid, to
       ** help detect if a -shm file truncation is legitimate or is the work
       ** or a rogue process. */
-      if( rc==SQLITE_OK && robust_ftruncate(pShmNode->hShm, 3) ){
-        rc = unixLogError(SQLITE_IOERR_SHMOPEN,"ftruncate",pShmNode->zFilename);
+      {
+        sqlite3_int64 markerSize = 3;
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+        if( rc==SQLITE_OK && pDbFd->mbShmInit.xInit ){
+          /* This connection owns the exclusive native DMS lock. Reset first,
+          ** then admit backing before extending the zeroed index marker. A
+          ** full filesystem block prevents Btrfs from turning the marker into
+          ** inline metadata and discarding preallocated data backing. */
+          if( robust_ftruncate(pShmNode->hShm, 0) ){
+            rc = unixLogError(SQLITE_IOERR_SHMOPEN,"ftruncate",pShmNode->zFilename);
+          }else{
+            rc = pDbFd->mbShmInit.xInit(pDbFd->mbShmInit.pContext,
+                                      pShmNode->hShm, &markerSize);
+            if( rc==SQLITE_OK && (markerSize<4096 || markerSize>65536) ){
+              rc = SQLITE_MISUSE;
+            }
+          }
+        }
+#endif
+        if( rc==SQLITE_OK && robust_ftruncate(pShmNode->hShm, markerSize) ){
+          rc = unixLogError(SQLITE_IOERR_SHMOPEN,"ftruncate",pShmNode->zFilename);
+        }
       }
     }
   }else if( lock.l_type==F_WRLCK ){

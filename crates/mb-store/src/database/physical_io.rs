@@ -273,6 +273,9 @@ pub(super) struct Binding {
 }
 
 impl Binding {
+    pub(super) fn block_size(&self) -> Result<u64, DatabaseError> {
+        allocation_block_size(self.descriptor)
+    }
     /// Allocate and validate the complete rounded write range before native
     /// data I/O. Known sharing/encoded/delayed/unknown extents grant no backing.
     pub(super) fn fund(&self, offset: u64, end: u64) -> Result<(), DatabaseError> {
@@ -429,9 +432,9 @@ fn initialize_private_file(
                     "physical NoCow fd={descriptor} flags={flags:x} length={length} blocks={blocks}"
                 );
             }
-            // SQLite initializes a new SHM inode by truncating it to a sparse
-            // three-byte marker. No written extent may be converted in place.
-            if blocks != 0 || length > 3 {
+            // Only an empty inode may enter NoCow. Native SHM initialization
+            // calls this after its own reset under the exclusive DMS lock.
+            if blocks != 0 || length != 0 {
                 return Err(DatabaseError::PhysicalIoUnavailable);
             }
             flags |= 0x0080_0000;
@@ -451,6 +454,19 @@ fn initialize_private_file(
         }
     }
     Ok(())
+}
+
+fn allocation_block_size(descriptor: RawFd) -> Result<u64, DatabaseError> {
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(descriptor, filesystem.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let bytes = unsafe { filesystem.assume_init() }.f_bsize;
+    let bytes = u64::try_from(bytes).map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+    if !bytes.is_power_of_two() || !(4096..=CHUNK).contains(&bytes) {
+        return Err(DatabaseError::PhysicalIoUnavailable);
+    }
+    Ok(bytes)
 }
 
 #[repr(C)]
