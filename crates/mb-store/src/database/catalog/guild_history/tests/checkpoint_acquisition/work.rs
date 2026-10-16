@@ -34,6 +34,18 @@ fn capacity(cert: &Certificate) -> CatalogCapacityPolicy {
     }
 }
 fn configure(s: &mut ControlStore, cert: &Certificate, slots: u32) {
+    let policy = configure_backing(s, cert, slots);
+    #[cfg(target_os = "linux")]
+    s.configure_catalog_resource_policy_with_native_work(policy)
+        .unwrap();
+    #[cfg(not(target_os = "linux"))]
+    s.configure_catalog_resource_policy(policy).unwrap();
+}
+fn configure_backing(
+    s: &mut ControlStore,
+    cert: &Certificate,
+    slots: u32,
+) -> CatalogResourcePolicy {
     let capacity = capacity(cert);
     let plan = capacity.plan().unwrap();
     let q = CatalogPublishedRevisionQuota {
@@ -84,7 +96,7 @@ fn configure(s: &mut ControlStore, cert: &Certificate, slots: u32) {
         open_reservations: slots,
     })
     .unwrap();
-    s.configure_catalog_resource_policy(CatalogResourcePolicy {
+    CatalogResourcePolicy {
         format_version: 1,
         capacity,
         control_rows: rows,
@@ -94,8 +106,7 @@ fn configure(s: &mut ControlStore, cert: &Certificate, slots: u32) {
         immutable_page_bytes: plan.encoded_metadata_page_bytes,
         immutable_pages: plan.metadata_work.page_occurrences,
         open_page_reservations: slots,
-    })
-    .unwrap();
+    }
 }
 fn activate(s: &ControlStore) {
     while s.advance_checkpoint_acquisition_work_admission().unwrap() {}

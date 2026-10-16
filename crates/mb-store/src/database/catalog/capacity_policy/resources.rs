@@ -177,6 +177,27 @@ impl ControlStore {
         &self,
         policy: CatalogResourcePolicy,
     ) -> Result<(), CatalogStoreError> {
+        self.configure_catalog_resource_policy_inner(policy, false)
+    }
+
+    /// Atomically bind native traversal ownership with initial resource
+    /// enrollment, before any live recovery scope can outlive that state.
+    /// Preserve the catalog's whole directory and ownership files on relocation.
+    /// Existing unanchored enrollment cannot establish offline quiescence and
+    /// cannot be automatically upgraded. Generic logical resource configuration
+    /// remains available independently of native filesystem/platform support.
+    pub fn configure_catalog_resource_policy_with_native_work(
+        &self,
+        policy: CatalogResourcePolicy,
+    ) -> Result<(), CatalogStoreError> {
+        self.configure_catalog_resource_policy_inner(policy, true)
+    }
+
+    fn configure_catalog_resource_policy_inner(
+        &self,
+        policy: CatalogResourcePolicy,
+        native_work: bool,
+    ) -> Result<(), CatalogStoreError> {
         policy.validate()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if super::read(&tx)? != Some(policy.capacity) {
@@ -201,7 +222,11 @@ impl ControlStore {
             }
         }
         check(&tx, policy.capacity)?;
-        super::super::checkpoint_acquisition::work_admission::enroll(&tx, policy)?;
+        super::super::checkpoint_acquisition::work_admission::enroll(
+            &tx,
+            policy,
+            native_work.then_some(self),
+        )?;
         tx.commit()?;
         Ok(())
     }

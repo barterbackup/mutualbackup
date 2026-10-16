@@ -374,6 +374,8 @@ impl ControlStore {
         if old.state != CatalogAcquisitionWorkState::Active {
             return Err(DatabaseError::NotReady.into());
         }
+        live_lock::read(&tx, live_lock::TRAVERSAL)?
+            .ok_or(CatalogStoreError::UnanchoredTraversalPool)?;
         let next = Ledger {
             reserved: old.reserved.checked_add(budget)?,
             open: old

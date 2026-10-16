@@ -6544,3 +6544,26 @@ and remaining consumer/backoff work remain open. This does not close complete
 R1/R2/R3 admission, normal paged production/retention/recovery, R5 causes or
 R7 current-source/installed gates. M6 remains open; dense 1 TiB and native
 Windows/macOS qualification remain user-deferred.
+
+### 2026-10-16 — Bind initial native traversal ownership
+
+Actual regression `e3dbcdb` restores valid pre-scope work rows through SQLite,
+then moves the same main inode while its original kernel owner remains live.
+The relocated catalog grants the full pool. Corrected `86ed876` provides explicit
+initial native resource enrollment, committing its synced paired domain and
+local ledger/marker version 2 in the same writer. That version requires the
+domain even before the first scope. Generic logical configuration and original
+resource/signed encodings remain unchanged. Older anchored work stays supported;
+unanchored catalogs remain inspectable and support durable logical jobs, but
+cannot grant live traversal work or automatically establish quiescence.
+
+Qualification passes all 579 ordinary Store cases, namespace/OverlayFS probes,
+Node retained recovery2/volume81/snapshot36, and provisioned Btrfs traversal25/
+funded-scratch1/snapshot8/retained4: 712 distinct cases in 740 executions. Strict
+locked workspace/all-target Clippy, format and independent 410-input/two-driver/
+exact-case/archive audit pass; native cleanup and original failure preservation
+verify. Evidence: `/tmp/mb-m6-traversal-enrollment-red-xyq8st3b` and
+`/tmp/mb-m6-traversal-enrollment-qual-rlkbx25j`. Full old-writer/quiescent upgrade,
+complete restore/relocation policy, physical SQL/WAL/volume backing, normal paged
+integration, R5 causes and current-source/installed R7 remain open. Producers
+stay disabled; dense 1 TiB and native Windows/macOS remain user-deferred.

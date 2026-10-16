@@ -7883,3 +7883,54 @@ admission, normal paged integration, full current-source/installed qualification
 and the three unexplained R5 observations remain open. Normal paged producers
 remain disabled. M6 stays open; dense 1 TiB and native Windows/macOS
 qualification remain user-deferred.
+
+### 2026-10-16 — Enroll the traversal ownership domain before live work
+
+Test-only `e3dbcdb` saves complete valid derived-work rows after resource
+enrollment/adoption and before any live scope. It retains an actual kernel
+owner, restores the saved rows through the same SQLite connection, checkpoints
+WAL, and moves only the main file to another directory. Device/inode stay the
+same and work usage validates as empty. The relocated catalog admits the full
+work pool while that original kernel owner is still live. The intended assertion
+fails: zero passed, one failed. All 410 inputs, the source archive and exact
+fresh driver are independently preserved at
+`/tmp/mb-m6-traversal-enrollment-red-xyq8st3b`.
+
+Corrected `86ed876` adds explicit
+`configure_catalog_resource_policy_with_native_work` on Store and Node. Initial
+enrollment commits the already synced paired traversal domain with resource
+backing and local work ledger/marker version 2 in one writer. The version-2
+reader requires the domain even with no scopes. The original generic logical
+configuration API, resource policy encoding, job/lease/domain codecs and signed
+formats retain their behavior/bytes. Generic configuration also stays usable for
+hard-linked main files, which cannot establish native ownership. Native live
+grants require a recorded domain. Existing anchored version-1 ledgers keep their
+exact bytes and live scopes; unanchored old ledgers remain readable and support
+durable logical acquisitions but refuse new live scopes and automatic upgrade.
+Their unknown prior location cannot establish offline quiescence.
+
+The identical regression function now passes. New cases cover missing initial
+domains before the first scope, original ledger compatibility and exact bytes,
+continued durable acquisition/cancellation, logical hard-link configuration, and
+whole-directory relocation with two live scopes sharing the exact work ceiling.
+ABORT/IGNORE faults cover both domain rows, both work rows and the marker during
+initial enrollment, with resource/work rollback, reopen and retry.
+
+Frozen qualification passes all 579 ordinary Store cases (29 ignored), actual
+namespace/OverlayFS probes, Node retained recovery2/volume81/snapshot36 and a
+fresh-process repeat. Provisioned Btrfs repeats funded scratch1 and traversal25,
+and passes snapshot8 plus all four retained native recovery cases. The complete
+focused inventory is 712 distinct cases in 740 executions. Strict locked
+workspace/all-target Clippy and format pass. Independent audit verifies all 410
+inputs, both fresh drivers, the source archive, exact case inventories, identical
+regression function and original negative artifacts. Owned mounts/loops/images
+are cleaned and independently checked. Evidence:
+`/tmp/mb-m6-traversal-enrollment-qual-rlkbx25j`.
+
+This closes initial native traversal enrollment, with whole-directory relocation
+through pinned directory capabilities. Full old-writer/quiescent upgrade,
+complete offline restore/relocation policy, physical SQL/WAL/volume backing and
+normal paged production/retention/recovery remain open. No producer is enabled.
+Complete current-source/installed qualification, the three separate unexplained
+R5 observations and other M6 gates remain open. Dense 1 TiB and native Windows/
+macOS qualification remain user-deferred.

@@ -189,6 +189,10 @@ pub enum CatalogStoreError {
     )]
     UnanchoredScratchPool,
     #[error(
+        "catalog traversal has no enrolled ownership domain; new live work requires native ownership at initial resource enrollment"
+    )]
+    UnanchoredTraversalPool,
+    #[error(
         "catalog scratch pool is exhausted; reclaim stopped scratch declarations or finish active work"
     )]
     ScratchPoolExhausted,
