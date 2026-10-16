@@ -7564,44 +7564,46 @@ not physical backing or completed-proof permit integration. Other producers,
 SQL/WAL/payload/scratch reservations and full shared R2/R3 admission remain open;
 normal paged producers remain disabled.
 
-Process-owned complete-proof traversal admission (focused qualification, 2026-10-15):
-Complete recovery-proof reconstruction reserves its whole-chain declaration from
-the same work ledger and bounded slots as durable public acquisitions before
-creating scratch or walking ancestry. Its opaque disposable scope pairs immutable
-purpose/budget/owner records with the existing leases and held indexes. Every
-bounded validation guard rechecks custody and charges the shared-ledger read bound.
-Validation and peer work keep no long SQLite writer open. The declaration releases
-in a short verified writer after success or failure; ignored/aborted cleanup keeps
-all debt held. The permit conveys no certificate, history or publication authority.
+Kernel-owned complete-proof traversal admission (focused qualification, 2026-10-16):
+Complete recovery-proof reconstruction reserves whole-chain work from the same
+cumulative ledger and bounded slots as durable acquisitions before scratch or
+ancestry traversal. Guards recheck paired leases; setup prepays admission,
+release and failed-finish cleanup. Short verified writers release work only
+after traversal stops. Failed cleanup leaves debt. The scope grants no recovery,
+certificate, history, payload or publication authority.
 
-Linux owner identity binds boot, PID/start time, process-instance nonce and actual
-catalog device/inode. A local weak token distinguishes a still-running scope from
-failed Drop cleanup. Within the tested process domain, other live processes retain their credits
-through cancellation, age and timeouts. Explicit reclamation scans at most 64 bounded scopes and releases
-at most one abandoned scope per writer; durable acquisition jobs stay resumable and
-are never reclaimed by process death. A copied catalog can retire inherited scopes
-without changing the original process's credits. Process-inspection permission and I/O errors fail closed. Resource-backed scope
-ownership on other platforms returns an explicit
-unsupported error; the legacy unconfigured path is fenced by later enrollment.
+Review reproduced premature reclamation through independent module/PID contexts
+and an actual OverlayFS alias of a live catalog. Kernel OFD locks on a separate
+empty file replace PID/weak-token guesses. Paired domains bind the actual catalog
+and lock inode; creation is synced and held directory/file mappings are checked.
+No extra descriptor opens the SQLite main file. Btrfs, ext4, XFS and tmpfs are
+supported; layered/remote filesystems and foreign-device main-file mounts reject
+before inferring independent copies. OverlayFS is explicitly unsupported.
 
-Traversal work credits do not reserve returned-proof memory or physical scratch,
-payload/coding extents, SQL/WAL growth or other producers' work. The common physical
-and enclosing R2/R3 policies and distributed/current activation remain open. Normal
-paged producers remain disabled. Both three-generation resource-backed layout
-cases pass in 385 seconds, including original-writer changes, predecessor-owner
-retirement, reopen, exact native/Git restore, held-credit observation, competing
-traversal refusal and release on insufficient work, missing ancestry and late
-cancellation. Sixteen focused Store cases pass mixed budgets, restart, a real
-child SIGKILL, one-scope reclamation, copied catalogs, paired-row damage and
-ABORT/IGNORE reservation/release faults. Strict workspace/all-target Clippy,
-formatting and diff checks pass. The final candidate retains 406 source inputs;
-Store results are reused only because Store/Core/dependency inputs are identical.
-The first two Node fixture failures, their source/binaries and the data-binding
-backtrace are preserved; fixture staging now reserves both pages and actual
-retained data through existing admission APIs. Evidence:
-`/tmp/mb-m6-live-recovery-source-funded-32gxlx5y`.
+New domain envelopes are version 2. Original version-1 domains remain readable;
+the original catalog can reclaim a stopped kernel slot. Copies retain version-1
+debt, and a new UUID/version is installed only without current scopes. Experimental
+process-owner v1 envelopes retain their exact bytes and remain debt even in a
+copy: their filesystem provenance cannot prove independence. Proven version-2
+copies drain inherited scopes before rebinding, preserving original live credits.
+Reclamation releases at most one abandoned scope, never a resumable acquisition.
+Signed/wire, original acquisition job/lease and resource-policy formats stay intact.
 
-These focused cases use one Linux PID namespace. Ownership across namespaces or
-independently loaded Store modules needs additional review before integration.
-The API and Node integration remain in an isolated development branch; this
-increment closes neither that owner-domain audit nor the full shared R2/R3 gate.
+The frozen candidate passes 24 Store cases (19 work, three lock, one provisioned
+PID-namespace and one provisioned OverlayFS) plus both three-generation resource-
+backed Node layouts. Coverage includes write faults, failed Drop, actual SIGKILL,
+damaged pairs, directory/file replacement, original/copy legacy debt, version
+upgrade, mixed budgets, live ownership and exact native/Git recovery after
+retirement, writer changes and reopen. Strict workspace/all-target Clippy,
+formatting, diff and source/executed-binary identity checks pass. The OverlayFS
+mount is verified unmounted; its small fixture is retained for inspection.
+Evidence: `/tmp/mb-m6-kernel-local-fs-1xcjw5mf`. Original red evidence remains preserved at
+`/tmp/mb-m6-live-owner-red-16g84bt1` and
+`/tmp/mb-m6-live-overlay-red-s_dep78t`, including source and executable identities.
+
+This closes the focused owner-domain and recovery work-scope slice. Physical
+SQL/WAL/page/payload/scratch backing, other producers, distributed current
+activation and normal paged integration remain open. Normal producers stay
+disabled. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and native Windows/macOS
+qualification remain user-deferred. A complete current-source qualification is
+still required with the initial-coverage diagnostics before installed jobs.
