@@ -18932,27 +18932,48 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn native_capture_migrates_and_restores_retained_paged_sparse_tree() {
-        native_retained_paged_sparse_tree_with_quota(true, false);
+        native_retained_paged_sparse_tree_with_quota(true, NativeRetainedRecoveryFault::None);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn native_existing_paged_sources_adopt_quotas_and_restore_after_source_loss() {
-        native_retained_paged_sparse_tree_with_quota(false, false);
+        native_retained_paged_sparse_tree_with_quota(false, NativeRetainedRecoveryFault::None);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn native_paged_recovery_keeps_pinned_anchor_after_retry_validation_error() {
-        native_retained_paged_sparse_tree_with_quota(true, true);
+        native_retained_paged_sparse_tree_with_quota(
+            true,
+            NativeRetainedRecoveryFault::PayloadRead,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn native_paged_recovery_preserves_pinned_data_when_capture_manifest_is_damaged() {
+        native_retained_paged_sparse_tree_with_quota(
+            true,
+            NativeRetainedRecoveryFault::CaptureManifest,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum NativeRetainedRecoveryFault {
+        None,
+        PayloadRead,
+        CaptureManifest,
     }
 
     #[cfg(target_os = "linux")]
     fn native_retained_paged_sparse_tree_with_quota(
         quotas_before_migration: bool,
-        retry_validation_error: bool,
+        retry_fault: NativeRetainedRecoveryFault,
     ) {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -19325,7 +19346,7 @@ pub(crate) mod tests {
                 (current.generation == 1).then_some(current)
             })
             .unwrap();
-        if retry_validation_error {
+        if retry_fault != NativeRetainedRecoveryFault::None {
             let intent_bytes = node
                 .control
                 .get_record(
@@ -19363,11 +19384,66 @@ pub(crate) mod tests {
                 .area
                 .path_hint
                 .join(candidate.anchor_id.to_string());
-            let denied = candidate_root.join("nested/dense");
-            let permissions = std::fs::metadata(&denied).unwrap().permissions();
-            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let denied_error = std::fs::File::open(&denied).unwrap_err();
-            assert_eq!(denied_error.kind(), std::io::ErrorKind::PermissionDenied);
+            let mut denied_payload = None;
+            let mut damaged_manifest = None;
+            match retry_fault {
+                NativeRetainedRecoveryFault::PayloadRead => {
+                    let denied = candidate_root.join("nested/dense");
+                    let permissions = std::fs::metadata(&denied).unwrap().permissions();
+                    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+                        .unwrap();
+                    let denied_error = std::fs::File::open(&denied).unwrap_err();
+                    assert_eq!(denied_error.kind(), std::io::ErrorKind::PermissionDenied);
+                    denied_payload = Some((denied, permissions));
+                }
+                NativeRetainedRecoveryFault::CaptureManifest => {
+                    let manifests = std::fs::read_dir(&candidate_root)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .as_encoded_bytes()
+                                .starts_with(b".mutualbackup-capture-manifest-")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(manifests.len(), 1);
+                    let path = manifests.into_iter().next().unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    let decoded: mb_store::StableAnchorManifest = decode_canonical(&bytes).unwrap();
+                    assert_eq!(decoded, candidate);
+                    let permissions = std::fs::metadata(&path).unwrap().permissions();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    std::fs::write(&path, [0xff]).unwrap();
+                    assert!(plan.captured_manifest(&node.control).is_err());
+                    // The completed anchor is the retained source. Its local
+                    // manifest is damaged and the restored plaintext cannot
+                    // supply a successful replacement, but the canonical root
+                    // and all owned anchor payloads still exist.
+                    for relative in ["nested", "nested/deeper"] {
+                        std::fs::set_permissions(
+                            ordinary.join(relative),
+                            std::fs::Permissions::from_mode(0o700),
+                        )
+                        .unwrap();
+                    }
+                    for relative in ["linked", "nested/dense", "nested/deeper/sparse"] {
+                        std::fs::remove_file(ordinary.join(relative)).unwrap();
+                    }
+                    assert_eq!(ordinary.canonicalize().unwrap(), source);
+                    assert!(
+                        crate::PagedPrivateMetadata::native_data_source_available(
+                            &node.control,
+                            &node.keys,
+                            &partial,
+                        )
+                        .unwrap()
+                    );
+                    damaged_manifest = Some((path, bytes, permissions));
+                }
+                NativeRetainedRecoveryFault::None => unreachable!(),
+            }
             let error = crate::snapshot::reanchor_recovered_revision(
                 &node.control,
                 &node.keys,
@@ -19376,16 +19452,33 @@ pub(crate) mod tests {
                 &ordinary,
             )
             .unwrap_err();
-            eprintln!("recovery retry validation error: {error:#}");
-            assert!(
-                format!("{error:#}").contains("Permission denied"),
-                "{error:#}"
-            );
-            assert!(
-                candidate_root.is_dir(),
-                "validation error removed a recovery anchor already pinned by a retained owner"
-            );
-            std::fs::set_permissions(&denied, permissions).unwrap();
+            if let Some((denied, permissions)) = denied_payload {
+                eprintln!("recovery retry validation error: {error:#}");
+                assert!(
+                    format!("{error:#}").contains("Permission denied"),
+                    "{error:#}"
+                );
+                assert!(
+                    candidate_root.is_dir(),
+                    "validation error removed a recovery anchor already pinned by a retained owner"
+                );
+                std::fs::set_permissions(&denied, permissions).unwrap();
+            }
+            if let Some((path, bytes, permissions)) = damaged_manifest {
+                eprintln!("recovery retry with damaged capture manifest: {error:#}");
+                assert!(
+                    crate::PagedPrivateMetadata::native_data_source_available(
+                        &node.control,
+                        &node.keys,
+                        &partial,
+                    )
+                    .unwrap(),
+                    "capture replay invalidated an already pinned data source after local manifest damage"
+                );
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(&path, permissions).unwrap();
+                assert_eq!(plan.captured_manifest(&node.control).unwrap(), candidate);
+            }
             assert_eq!(
                 node.control
                     .get_record(
