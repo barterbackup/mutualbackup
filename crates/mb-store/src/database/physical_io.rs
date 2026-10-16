@@ -399,6 +399,10 @@ fn initialize_private_file(
     length: u64,
     blocks: u64,
 ) -> Result<(), DatabaseError> {
+    #[cfg(test)]
+    if std::env::var_os("MB_PHYSICAL_IO_TRACE").is_some() {
+        eprintln!("physical init fd={descriptor} length={length} blocks={blocks}");
+    }
     let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(descriptor, filesystem.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error().into());
@@ -419,6 +423,12 @@ fn initialize_private_file(
             return Err(io::Error::last_os_error().into());
         }
         if flags & 0x0080_0000 == 0 {
+            #[cfg(test)]
+            if std::env::var_os("MB_PHYSICAL_IO_TRACE").is_some() {
+                eprintln!(
+                    "physical NoCow fd={descriptor} flags={flags:x} length={length} blocks={blocks}"
+                );
+            }
             // SQLite initializes a new SHM inode by truncating it to a sparse
             // three-byte marker. No written extent may be converted in place.
             if blocks != 0 || length > 3 {
@@ -432,6 +442,10 @@ fn initialize_private_file(
             if unsafe { libc::ioctl(descriptor, libc::FS_IOC_GETFLAGS, &mut flags) } != 0
                 || flags & 0x0080_0000 == 0
             {
+                #[cfg(test)]
+                if std::env::var_os("MB_PHYSICAL_IO_TRACE").is_some() {
+                    eprintln!("physical NoCow refused fd={descriptor} flags={flags:x}");
+                }
                 return Err(DatabaseError::PhysicalIoUnavailable);
             }
         }
@@ -480,6 +494,13 @@ fn private_missing_bytes(descriptor: RawFd, start: u64, end: u64) -> Result<u64,
     let mut missing = 0u64;
     for extent in &map.extents[..map.mapped as usize] {
         if extent.flags & !(1 | 0x800 | 0x1000) != 0 || extent.physical == 0 || extent.length == 0 {
+            #[cfg(test)]
+            if std::env::var_os("MB_PHYSICAL_IO_TRACE").is_some() {
+                eprintln!(
+                    "physical FIEMAP refused fd={descriptor} range={start}..{end} logical={} physical={} length={} flags={:x}",
+                    extent.logical, extent.physical, extent.length, extent.flags
+                );
+            }
             return Err(DatabaseError::PhysicalIoUnavailable);
         }
         let next = extent
@@ -510,6 +531,10 @@ fn private_missing_bytes(descriptor: RawFd, start: u64, end: u64) -> Result<u64,
 }
 
 pub(super) fn sqlite_code(error: DatabaseError, fallback: i32) -> i32 {
+    #[cfg(test)]
+    if std::env::var_os("MB_PHYSICAL_IO_TRACE").is_some() {
+        eprintln!("physical refusal: {error:?}");
+    }
     match error {
         DatabaseError::CapacityExceeded | DatabaseError::PhysicalIoUnavailable => {
             rusqlite::ffi::SQLITE_FULL
