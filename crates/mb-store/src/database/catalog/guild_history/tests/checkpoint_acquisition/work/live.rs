@@ -1,5 +1,108 @@
 use super::*;
 
+#[test]
+fn restored_pre_scope_database_move_cannot_hide_a_live_traversal_owner() {
+    use std::os::unix::fs::MetadataExt;
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    configure(&mut store, &cert, 16);
+    activate(&store);
+    let kinds = [
+        "catalog-acquisition-work-v1",
+        "catalog-acquisition-work-guard-v1",
+        "catalog-live-recovery-work-v2",
+        "catalog-live-recovery-work-guard-v2",
+        "catalog-acquisition-work-lease-v1",
+        "catalog-acquisition-work-lease-guard-v1",
+        "catalog-acquisition-work-held-v1",
+        "catalog-acquisition-work-held-guard-v1",
+        "catalog-live-work-domain-v1",
+        "catalog-live-work-domain-guard-v1",
+    ];
+    // This is a complete valid derived-work snapshot after resource enrollment
+    // and adoption, before any recovery scope has acquired a kernel slot.
+    let snapshot: Vec<_> = kinds
+        .iter()
+        .map(|kind| (*kind, store.records(kind).unwrap()))
+        .collect();
+    let empty = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+    assert_eq!(empty.open_jobs, 0);
+    assert_eq!(empty.reserved, Work::default());
+    let original = store
+        .begin_checkpoint_recovery_work(selected(&cert), base(&cert))
+        .unwrap();
+    original.check().unwrap();
+    // Restore through SQLite so its live connection and native pager remain
+    // consistent. The scope's original kernel descriptions remain live.
+    let tx = rusqlite::Transaction::new_unchecked(
+        &store.connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
+    for (kind, records) in &snapshot {
+        tx.execute("DELETE FROM protocol_records WHERE kind=?1", [kind])
+            .unwrap();
+        for (id, bytes) in records {
+            tx.execute(
+                "INSERT INTO protocol_records(kind,record_id,bytes) VALUES(?1,?2,?3)",
+                params![kind, id, bytes],
+            )
+            .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        store.checkpoint_acquisition_work_usage().unwrap(),
+        Some(empty)
+    );
+    let checkpoint: (u32, u32, u32) = store
+        .connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint.0, 0);
+    let before = std::fs::metadata(&path).unwrap();
+    let other = temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let moved = other.join("control.db");
+    std::fs::rename(&path, &moved).unwrap();
+    let after = std::fs::metadata(&moved).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    let alias = ControlStore::open(&moved, &history.keys[0]).unwrap();
+    assert_eq!(
+        alias.checkpoint_acquisition_work_usage().unwrap(),
+        Some(empty)
+    );
+    assert!(
+        alias
+            .begin_checkpoint_recovery_work(selected(&cert), empty.limit)
+            .is_err(),
+        "moving the restored pre-scope catalog granted the full work pool while its original kernel owner remained live"
+    );
+    assert_eq!(
+        alias.checkpoint_acquisition_work_usage().unwrap(),
+        Some(empty)
+    );
+    drop(alias);
+    std::fs::rename(&moved, &path).unwrap();
+    assert!(
+        store
+            .begin_checkpoint_recovery_work(selected(&cert), empty.limit)
+            .is_err()
+    );
+    drop(original);
+    let mut next = store
+        .begin_checkpoint_recovery_work(selected(&cert), empty.limit)
+        .unwrap();
+    next.check().unwrap();
+    next.finish().unwrap();
+}
+
 fn selected(cert: &Certificate) -> CatalogCheckpointRecoveryTip {
     CatalogCheckpointRecoveryTip {
         owner: Uuid::from_u128(2200),
