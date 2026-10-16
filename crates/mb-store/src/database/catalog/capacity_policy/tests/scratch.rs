@@ -24,6 +24,56 @@ fn usage(store: &ControlStore) -> (u64, u32) {
 }
 
 #[test]
+fn scratch_unconfigured_probes_preserve_read_only_inputs_and_enclosing_transactions() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let store = ControlStore::open(&path, &keys()).unwrap();
+    let tx = rusqlite::Transaction::new_unchecked(
+        &store.connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO protocol_records(kind,record_id,bytes) VALUES ('fixture',x'01',x'02')",
+        [],
+    )
+    .unwrap();
+    assert!(store.reserve_catalog_scratch(10).unwrap().is_none());
+    assert!(!store.reclaim_abandoned_catalog_scratch().unwrap());
+    assert!(!store.connection.is_autocommit());
+    assert_eq!(store.get_record("fixture", &[1]).unwrap(), Some(vec![2]));
+    tx.rollback().unwrap();
+    assert_eq!(store.get_record("fixture", &[1]).unwrap(), None);
+    drop(store);
+    let original = std::fs::read(&path).unwrap();
+    let mut before = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    before.sort();
+    let database_key = keys().database_key(crate::database::CONTROL_DATABASE_ID);
+    let (reader, guard) =
+        ControlStore::open_preserved_read_only_with_keys(&path, &[database_key]).unwrap();
+    reader
+        .with_read_only_snapshot(|| {
+            assert!(reader.reserve_catalog_scratch(10)?.is_none());
+            assert!(!reader.reclaim_abandoned_catalog_scratch()?);
+            assert!(!reader.connection.is_autocommit());
+            Ok(())
+        })
+        .unwrap();
+    guard.verify_unchanged().unwrap();
+    drop(reader);
+    let mut after = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    after.sort();
+    assert_eq!(before, after);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
 fn scratch_enrollment_is_required_only_for_resource_backed_catalogs() {
     let temp = tempfile::tempdir().unwrap();
     let store = ControlStore::open(temp.path().join("old.db"), &keys()).unwrap();

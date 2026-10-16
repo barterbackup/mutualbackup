@@ -125,6 +125,19 @@ fn resource(cx: &Connection) -> Result<Option<[u8; 32]>, CatalogStoreError> {
     }
     Ok(Some(mb_core::canonical_hash_bounded(&resource, BYTES)?))
 }
+fn snapshot<T>(
+    store: &ControlStore,
+    operation: impl FnOnce(&Connection) -> Result<T, CatalogStoreError>,
+) -> Result<T, CatalogStoreError> {
+    if !store.connection.is_autocommit() {
+        return operation(&store.connection);
+    }
+    let tx = store.read_snapshot()?;
+    let value = operation(&tx)?;
+    tx.commit()?;
+    Ok(value)
+}
+
 fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
     let marker: Option<Option<Vec<u8>>> = cx
         .query_row(
@@ -311,7 +324,24 @@ impl ControlStore {
         &self,
         physical_bytes: u64,
     ) -> Result<Option<CatalogScratchLease>, CatalogStoreError> {
-        if !self.connection.is_autocommit() || physical_bytes == 0 {
+        if physical_bytes == 0 {
+            return Err(DatabaseError::NotReady.into());
+        }
+        // Unconfigured legacy/read-only consumers need no writer or token.
+        // Compose this probe with a caller's existing read/write snapshot.
+        let configured = snapshot(self, |cx| {
+            if read(cx)?.is_some() {
+                return Ok(true);
+            }
+            if capacity_policy::resource_policy(cx)?.is_some() {
+                return Err(CatalogStoreError::ScratchPoolRequired);
+            }
+            Ok(false)
+        })?;
+        if !configured {
+            return Ok(None);
+        }
+        if !self.connection.is_autocommit() {
             return Err(DatabaseError::NotReady.into());
         }
         self.reclaim_abandoned_catalog_scratch()?;
@@ -370,6 +400,9 @@ impl ControlStore {
     /// no authority. Copies require the same proven v2 filesystem semantics as
     /// traversal scopes; unproven/live domains retain debt.
     pub fn reclaim_abandoned_catalog_scratch(&self) -> Result<bool, CatalogStoreError> {
+        if !snapshot(self, |cx| Ok(read(cx)?.is_some()))? {
+            return Ok(false);
+        }
         if !self.connection.is_autocommit() {
             return Err(DatabaseError::NotReady.into());
         }
