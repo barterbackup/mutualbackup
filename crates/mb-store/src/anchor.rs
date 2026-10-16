@@ -2996,18 +2996,17 @@ impl ReflinkAnchor {
         let anchor_root = area_path.join(&anchor_name);
         let link_pool = area_path.join(&link_pool_name);
         match open_path_no_xdev_beneath(&area_file, Path::new(&anchor_name)) {
-            Ok(_) => match read_planned_manifest_at(&area_file, &area_path, plan) {
-                Ok(manifest) => {
-                    remove_directory_at(&area_file, &staging_name, &staging)?;
-                    remove_directory_at(&area_file, &link_pool_name, &link_pool)?;
-                    area_file.sync_all()?;
-                    return Ok(manifest);
-                }
-                Err(_) => {
-                    remove_directory_at(&area_file, &anchor_name, &anchor_root)?;
-                    area_file.sync_all()?;
-                }
-            },
+            Ok(_) => {
+                // A completed candidate may already back published retained
+                // sources while its enclosing recovery intent is unfinished.
+                // A damaged/unreadable local manifest cannot authorize removing
+                // those payloads. Explicit checked abandonment owns cleanup.
+                let manifest = read_planned_manifest_at(&area_file, &area_path, plan)?;
+                remove_directory_at(&area_file, &staging_name, &staging)?;
+                remove_directory_at(&area_file, &link_pool_name, &link_pool)?;
+                area_file.sync_all()?;
+                return Ok(manifest);
+            }
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
             Err(_) => return Err(AnchorError::AnchorAreaCollision(anchor_root)),
         }
