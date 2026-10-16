@@ -8110,3 +8110,53 @@ copies, old-writer/quiescent migration and normal paged integration remain open.
 Normal producers stay disabled. Complete current-source/installed validation,
 R1/R2/R3/R5/R7 and user-deferred dense 1 TiB/native Windows/macOS qualification
 remain open.
+
+### 2026-10-16 — Authenticate native policy metadata in a separate key format
+
+Qualified `0d9d685` provides the bounded Core key/policy codec needed before
+persistent startup can select the native physical adapter. The original
+`WrappedDatabaseKey` structure and every existing generic wrap/unwrap function
+remain byte-identical. Local envelope format 2 uses a distinct wrapping context
+and authenticates exactly 102 plaintext bytes: the database key followed by a
+fixed 70-byte native policy. ChaCha20-Poly1305 produces 118 ciphertext bytes.
+The policy encodes its version, nonzero 16-byte identity, six big-endian u64
+limits and a u32 inode count. Semantic checks match the runtime's 64 KiB
+quantum, role/total ceilings, i64 extent boundary and one-to-64 tracked files.
+Headroom retains its complete u64 width. Temporary wrapping keys and decrypted
+plaintext storage are cleared on return.
+
+The explicit native decoder returns both key and validated policy. Existing
+generic unwrap rejects format 2 before decryption; callers cannot silently use
+that API to discard the authenticated limits. Wrong database identity, owner,
+nonce, ciphertext byte, length, envelope/policy version or invalid semantic
+bounds reject without returning a key. This is a codec boundary, not proof of
+birth, writer ownership, available filesystem space or aggregate reservation.
+No Node startup, volume manifest or other production code publishes or consumes
+this new envelope yet.
+
+Before changing Core, an external probe linked the already-qualified original
+Core library and generated a synthetic v1 key envelope. A second probe encoded
+that exact record using the original bounded canonical Postcard serializer.
+The 62 original bytes, nonce/ciphertext, source/executable/library hashes and
+compile commands remain under `/tmp/mb-m6-native-policy-original-v1-0ghky5tj`.
+The new regression reads those literal bytes and recovers the original key.
+Other new tests reject every altered ciphertext byte, wrong context/identity,
+nonce and envelope lengths/versions. Authenticated malformed policies exercise
+post-decryption semantic checks. Invalid configurations reject wrapping, and
+full i64/u64-width limits survive a round trip.
+
+All 214 ordinary Core cases pass, including the four new tests; the focused
+four-case repeat brings the total to 218 executions. Strict locked workspace/
+all-target Clippy, format and independent 447-input/one-fresh-driver/source/
+archive/original-library/fixture audits pass. The audit verifies the generic v1
+implementation is byte-identical and finds no production use of format 2.
+Evidence: `/tmp/mb-m6-native-policy-core-qual-6em4yli1`.
+
+The next startup integration must retain the policy before mutable SQL opens,
+preserve explicit read-only inspection and implement fresh birth/restart without
+confusing restored SQL or missing rows with new enrollment. Old-writer quiescent
+upgrade, global/enclosing metadata/work/index/payload/copy reservation and normal
+volume/paged production remain open. No producer is enabled. This focused Core
+qualification does not establish a complete current-source/installed gate or
+resolve the three historical R5 observations. R1/R2/R3/R5/R7 and user-deferred
+dense 1 TiB/native Windows/macOS qualification remain open.

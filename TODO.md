@@ -2874,6 +2874,25 @@ normal paged producers remain disabled.
       policy, checkpoint/rebuild copies, old-writer/quiescent enrollment and
       normal volume/paged startup remain open. Producers stay disabled; complete
       current-source/installed/R1/R2/R3/R5/R7 and deferred hardware gates remain.
+    - [x] Authenticate bounded native I/O policy with local database keys.
+      Qualified `0d9d685` adds explicit Core native envelope format 2 with a
+      distinct wrapping context, fixed 118-byte ciphertext and validated
+      70-byte policy. Generic v1 wrap/unwrap and original record bytes remain
+      unchanged; generic unwrap rejects v2. Native decoding returns both key
+      and policy, checks exact sizes/versions/identity/limits and clears
+      temporary secret storage. Four new tests cover all ciphertext-byte
+      alterations, context/nonce/version/length errors, authenticated malformed
+      policies, full-width capacities and an original v1 fixture generated
+      through the previously qualified library with exact Postcard bytes.
+      All 214 ordinary Core cases pass (218 executions with the focused repeat).
+      Strict workspace/all-target Clippy, format and independent 447-input/
+      fresh-driver/source/archive/original-library/fixture audits pass. Evidence:
+      `/tmp/mb-m6-native-policy-core-qual-6em4yli1`. No production path publishes
+      or consumes v2. Node startup/preserved-read dispatch, fresh birth/restart,
+      old-writer/restore policy, persistent aggregate/enclosing reservation and
+      normal volume/paged production remain open. Producers stay disabled;
+      full current-source/installed/R1/R2/R3/R5/R7 and deferred hardware gates
+      remain open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

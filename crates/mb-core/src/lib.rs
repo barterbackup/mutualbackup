@@ -90,8 +90,8 @@ pub use guild::{
     verify_legacy_coding_add_signature,
 };
 pub use keys::{
-    DatabaseKeyError, KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed,
-    SeedParseError, WrappedDatabaseKey,
+    DatabaseKeyError, KeyIdentityError, KeyMaterial, NativeDatabaseIoPolicy, NodeId,
+    RecoveryPublicKey, Seed, SeedParseError, WrappedDatabaseKey,
 };
 pub use model::{
     CheckpointAuthority, CodingGroup, CodingGroupId, CodingGroupV2, EndpointRecord,
