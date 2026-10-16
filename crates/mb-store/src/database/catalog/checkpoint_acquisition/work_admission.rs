@@ -150,14 +150,17 @@ fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
         return Err(DatabaseError::Integrity.into());
     }
 
-    if marker != Some(Some(vec![1]))
-        || l.version != 1
+    if !matches!(l.version, 1 | 2)
+        || marker != Some(Some(vec![l.version as u8]))
         || capacity_policy::resource_policy(cx)? != Some(l.policy)
         || capacity_policy::read(cx)? != Some(l.policy.capacity)
         || l.open > max_jobs(l.policy)
         || (l.open == 0) != (l.reserved == Work::default())
         || l.after.is_none() && l.scanned != 0
     {
+        return Err(DatabaseError::Integrity.into());
+    }
+    if l.version == 2 && live_lock::read(cx, live_lock::TRAVERSAL)?.is_none() {
         return Err(DatabaseError::Integrity.into());
     }
     pool::limit(cx, l.policy)?.remaining_after(l.reserved)?;
@@ -262,15 +265,22 @@ fn lease(
 pub(in crate::database::catalog) fn enroll(
     cx: &Connection,
     policy: CatalogResourcePolicy,
+    native_work: Option<&ControlStore>,
 ) -> Result<(), CatalogStoreError> {
     if let Some(l) = read(cx)? {
         if l.policy != policy {
             return Err(DatabaseError::Conflict.into());
         }
+        if native_work.is_some() && live_lock::read(cx, live_lock::TRAVERSAL)?.is_none() {
+            return Err(CatalogStoreError::UnanchoredTraversalPool);
+        }
         return Ok(());
     }
+    let token = native_work
+        .map(|store| live_lock::FileLock::admit(cx, store, false, live_lock::TRAVERSAL))
+        .transpose()?;
     let l = Ledger {
-        version: 1,
+        version: if native_work.is_some() { 2 } else { 1 },
         policy,
         state: CatalogAcquisitionWorkState::Adopting,
         after: None,
@@ -285,11 +295,14 @@ pub(in crate::database::catalog) fn enroll(
     }
     if cx.execute(
         "INSERT INTO meta(key,value) VALUES (?1,?2)",
-        params![META, &[1u8][..]],
+        params![META, &[l.version as u8][..]],
     )? != 1
         || read(cx)? != Some(l)
     {
         return Err(DatabaseError::Integrity.into());
+    }
+    if let Some(token) = token {
+        token.check(native_work.ok_or(DatabaseError::Integrity)?)?;
     }
     Ok(())
 }
@@ -453,7 +466,7 @@ pub(in crate::database::catalog) fn schema(
         .optional()?;
     match enrolled {
         None => Ok(Vec::new()),
-        Some(Some(v)) if v == [1] => Ok(vec![(TRIGGER.to_owned(), trigger_sql())]),
+        Some(Some(v)) if v == [1] || v == [2] => Ok(vec![(TRIGGER.to_owned(), trigger_sql())]),
         _ => Err(DatabaseError::Integrity),
     }
 }
@@ -474,7 +487,7 @@ impl ControlStore {
             tx.commit()?;
             return Ok(false);
         };
-        enroll(&tx, p)?;
+        enroll(&tx, p, None)?;
         let old = read(&tx)?.ok_or(DatabaseError::Integrity)?;
         if old.state == CatalogAcquisitionWorkState::Active {
             tx.commit()?;

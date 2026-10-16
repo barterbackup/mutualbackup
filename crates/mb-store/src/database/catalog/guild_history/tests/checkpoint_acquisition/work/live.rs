@@ -1,5 +1,108 @@
 use super::*;
 
+#[test]
+fn restored_pre_scope_database_move_cannot_hide_a_live_traversal_owner() {
+    use std::os::unix::fs::MetadataExt;
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    configure(&mut store, &cert, 16);
+    activate(&store);
+    let kinds = [
+        "catalog-acquisition-work-v1",
+        "catalog-acquisition-work-guard-v1",
+        "catalog-live-recovery-work-v2",
+        "catalog-live-recovery-work-guard-v2",
+        "catalog-acquisition-work-lease-v1",
+        "catalog-acquisition-work-lease-guard-v1",
+        "catalog-acquisition-work-held-v1",
+        "catalog-acquisition-work-held-guard-v1",
+        "catalog-live-work-domain-v1",
+        "catalog-live-work-domain-guard-v1",
+    ];
+    // This is a complete valid derived-work snapshot after resource enrollment
+    // and adoption, before any recovery scope has acquired a kernel slot.
+    let snapshot: Vec<_> = kinds
+        .iter()
+        .map(|kind| (*kind, store.records(kind).unwrap()))
+        .collect();
+    let empty = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+    assert_eq!(empty.open_jobs, 0);
+    assert_eq!(empty.reserved, Work::default());
+    let original = store
+        .begin_checkpoint_recovery_work(selected(&cert), base(&cert))
+        .unwrap();
+    original.check().unwrap();
+    // Restore through SQLite so its live connection and native pager remain
+    // consistent. The scope's original kernel descriptions remain live.
+    let tx = rusqlite::Transaction::new_unchecked(
+        &store.connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
+    for (kind, records) in &snapshot {
+        tx.execute("DELETE FROM protocol_records WHERE kind=?1", [kind])
+            .unwrap();
+        for (id, bytes) in records {
+            tx.execute(
+                "INSERT INTO protocol_records(kind,record_id,bytes) VALUES(?1,?2,?3)",
+                params![kind, id, bytes],
+            )
+            .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        store.checkpoint_acquisition_work_usage().unwrap(),
+        Some(empty)
+    );
+    let checkpoint: (u32, u32, u32) = store
+        .connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint.0, 0);
+    let before = std::fs::metadata(&path).unwrap();
+    let other = temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let moved = other.join("control.db");
+    std::fs::rename(&path, &moved).unwrap();
+    let after = std::fs::metadata(&moved).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    let alias = ControlStore::open(&moved, &history.keys[0]).unwrap();
+    assert_eq!(
+        alias.checkpoint_acquisition_work_usage().unwrap(),
+        Some(empty)
+    );
+    assert!(
+        alias
+            .begin_checkpoint_recovery_work(selected(&cert), empty.limit)
+            .is_err(),
+        "moving the restored pre-scope catalog granted the full work pool while its original kernel owner remained live"
+    );
+    assert_eq!(
+        alias.checkpoint_acquisition_work_usage().unwrap(),
+        Some(empty)
+    );
+    drop(alias);
+    std::fs::rename(&moved, &path).unwrap();
+    assert!(
+        store
+            .begin_checkpoint_recovery_work(selected(&cert), empty.limit)
+            .is_err()
+    );
+    drop(original);
+    let mut next = store
+        .begin_checkpoint_recovery_work(selected(&cert), empty.limit)
+        .unwrap();
+    next.check().unwrap();
+    next.finish().unwrap();
+}
+
 fn selected(cert: &Certificate) -> CatalogCheckpointRecoveryTip {
     CatalogCheckpointRecoveryTip {
         owner: Uuid::from_u128(2200),
@@ -8,6 +111,268 @@ fn selected(cert: &Certificate) -> CatalogCheckpointRecoveryTip {
         generation: cert.generation(),
         hash: cert.hash().unwrap(),
     }
+}
+
+#[test]
+fn native_work_enrollment_requires_its_domain_before_the_first_scope() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    configure(&mut store, &cert, 16);
+    activate(&store);
+    assert_eq!(
+        store.records("catalog-live-work-domain-v1").unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .checkpoint_acquisition_work_usage()
+            .unwrap()
+            .unwrap()
+            .open_jobs,
+        0
+    );
+    store.connection.execute("DELETE FROM protocol_records WHERE kind IN ('catalog-live-work-domain-v1','catalog-live-work-domain-guard-v1')", []).unwrap();
+    assert!(store.checkpoint_acquisition_work_usage().is_err());
+    assert!(
+        store
+            .begin_checkpoint_recovery_work(selected(&cert), base(&cert))
+            .is_err()
+    );
+    assert!(
+        store
+            .advance_checkpoint_acquisition_work_admission()
+            .is_err()
+    );
+    assert!(ControlStore::open(&path, &history.keys[0]).is_err());
+}
+
+#[test]
+fn original_work_enrollment_preserves_bytes_and_requires_a_domain_for_live_grants() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    for anchored in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+        configure(&mut store, &cert, 16);
+        activate(&store);
+        let encoded = store
+            .get_record("catalog-acquisition-work-v1", b"store")
+            .unwrap()
+            .unwrap();
+        type OriginalLedger = (
+            u16,
+            CatalogResourcePolicy,
+            CatalogAcquisitionWorkState,
+            Option<[u8; 16]>,
+            u64,
+            Work,
+            u32,
+        );
+        let mut original: OriginalLedger = mb_core::decode_canonical(&encoded).unwrap();
+        assert_eq!(original.0, 2);
+        original.0 = 1;
+        let bytes = mb_core::canonical_bytes(&original).unwrap();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &store.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        for kind in [
+            "catalog-acquisition-work-v1",
+            "catalog-acquisition-work-guard-v1",
+        ] {
+            assert_eq!(
+                tx.execute(
+                    "UPDATE protocol_records SET bytes=?1 WHERE kind=?2 AND record_id=?3",
+                    params![bytes, kind, b"store"]
+                )
+                .unwrap(),
+                1
+            );
+        }
+        tx.execute(
+            "UPDATE meta SET value=x'01' WHERE key='catalog_acquisition_work_version'",
+            [],
+        )
+        .unwrap();
+        if !anchored {
+            tx.execute("DELETE FROM protocol_records WHERE kind IN ('catalog-live-work-domain-v1','catalog-live-work-domain-guard-v1')", []).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(store);
+        let store = ControlStore::open(&path, &history.keys[0]).unwrap();
+        store.configure_catalog_resource_policy(original.1).unwrap();
+        assert!(
+            !store
+                .advance_checkpoint_acquisition_work_admission()
+                .unwrap()
+        );
+        assert!(!store.reclaim_abandoned_checkpoint_recovery_work().unwrap());
+        let before = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+        if anchored {
+            store
+                .configure_catalog_resource_policy_with_native_work(original.1)
+                .unwrap();
+            let mut work = store
+                .begin_checkpoint_recovery_work(selected(&cert), base(&cert))
+                .unwrap();
+            work.check().unwrap();
+            work.finish().unwrap();
+        } else {
+            assert!(matches!(
+                store.configure_catalog_resource_policy_with_native_work(original.1),
+                Err(CatalogStoreError::UnanchoredTraversalPool)
+            ));
+            assert!(matches!(
+                store.begin_checkpoint_recovery_work(selected(&cert), base(&cert)),
+                Err(CatalogStoreError::UnanchoredTraversalPool)
+            ));
+            assert!(
+                store
+                    .records("catalog-live-work-domain-v1")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            store.checkpoint_acquisition_work_usage().unwrap(),
+            Some(before)
+        );
+        assert_eq!(
+            store
+                .get_record("catalog-acquisition-work-v1", b"store")
+                .unwrap(),
+            Some(bytes)
+        );
+        // Durable acquisitions keep their original logical admission without
+        // claiming that a disposable live traversal has native ownership.
+        let job = store
+            .begin_checkpoint_acquisition(
+                Uuid::from_u128(2201),
+                cert.clone(),
+                proof.trust().clone(),
+                base(&cert),
+            )
+            .unwrap();
+        assert_eq!(
+            store.checkpoint_acquisition_state(&job).unwrap(),
+            State::Building
+        );
+        store.cancel_checkpoint_acquisition(&job).unwrap();
+        assert_eq!(
+            store.checkpoint_acquisition_work_usage().unwrap(),
+            Some(before)
+        );
+    }
+}
+
+#[test]
+fn logical_resource_enrollment_remains_available_for_hard_linked_catalogs() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.db");
+    let alias = temp.path().join("alias.db");
+    let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
+    let policy = configure_backing(&mut store, &cert, 16);
+    std::fs::hard_link(&path, &alias).unwrap();
+    assert!(
+        store
+            .configure_catalog_resource_policy_with_native_work(policy)
+            .is_err()
+    );
+    assert_eq!(store.catalog_resource_policy().unwrap(), None);
+    assert_eq!(store.checkpoint_acquisition_work_usage().unwrap(), None);
+    store.configure_catalog_resource_policy(policy).unwrap();
+    activate(&store);
+    assert_eq!(store.catalog_resource_policy().unwrap(), Some(policy));
+    assert!(
+        store
+            .records("catalog-live-work-domain-v1")
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::remove_file(&alias).unwrap();
+    assert!(matches!(
+        store.begin_checkpoint_recovery_work(selected(&cert), base(&cert)),
+        Err(CatalogStoreError::UnanchoredTraversalPool)
+    ));
+    assert!(matches!(
+        store.configure_catalog_resource_policy_with_native_work(policy),
+        Err(CatalogStoreError::UnanchoredTraversalPool)
+    ));
+}
+
+#[test]
+fn whole_directory_relocation_preserves_live_traversal_ownership_and_capacity() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original");
+    let moved = temp.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+    let directory = crate::database::DatabaseDirectory::open(&original).unwrap();
+    let mut store = ControlStore::open_in_directory_with_key(
+        &directory,
+        std::ffi::OsStr::new("control.db"),
+        &history.keys[0].database_key(crate::database::CONTROL_DATABASE_ID),
+    )
+    .unwrap();
+    configure(&mut store, &cert, 16);
+    activate(&store);
+    let before = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+    let amount = base(&cert);
+    let mut first = store
+        .begin_checkpoint_recovery_work(selected(&cert), amount)
+        .unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+    std::fs::write(original.join("sentinel"), b"preserve").unwrap();
+    first.check().unwrap();
+    let observer = ControlStore::open(moved.join("control.db"), &history.keys[0]).unwrap();
+    assert!(
+        !observer
+            .reclaim_abandoned_checkpoint_recovery_work()
+            .unwrap()
+    );
+    let remaining = before.limit.remaining_after(amount).unwrap();
+    let mut second = observer
+        .begin_checkpoint_recovery_work(selected(&cert), remaining)
+        .unwrap();
+    assert_eq!(
+        observer
+            .checkpoint_acquisition_work_usage()
+            .unwrap()
+            .unwrap()
+            .reserved,
+        before.limit
+    );
+    assert!(
+        store
+            .begin_checkpoint_recovery_work(selected(&cert), amount)
+            .is_err()
+    );
+    first.check().unwrap();
+    second.check().unwrap();
+    first.finish().unwrap();
+    second.finish().unwrap();
+    assert_eq!(
+        store.checkpoint_acquisition_work_usage().unwrap(),
+        Some(before)
+    );
+    assert_eq!(std::fs::read_dir(&original).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(original.join("sentinel")).unwrap(),
+        b"preserve"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -578,28 +943,37 @@ fn live_recovery_domain_installation_is_atomic_under_write_faults() {
         for kind in [
             "catalog-live-work-domain-v1",
             "catalog-live-work-domain-guard-v1",
+            "catalog-acquisition-work-v1",
+            "catalog-acquisition-work-guard-v1",
+            "marker",
         ] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("control.db");
             let mut store = ControlStore::open(&path, &history.keys[0]).unwrap();
-            configure(&mut store, &cert, 16);
-            activate(&store);
-            let before = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+            let policy = configure_backing(&mut store, &cert, 16);
+            assert_eq!(store.catalog_resource_policy().unwrap(), None);
+            assert_eq!(store.checkpoint_acquisition_work_usage().unwrap(), None);
             let suffix = if action == "ABORT" { ",'test'" } else { "" };
-            store.connection.execute_batch(&format!("CREATE TEMP TRIGGER domain_fault BEFORE INSERT ON protocol_records WHEN NEW.kind='{kind}' BEGIN SELECT RAISE({action}{suffix}); END")).unwrap();
+            let (table, condition) = if kind == "marker" {
+                (
+                    "meta",
+                    "NEW.key='catalog_acquisition_work_version'".to_owned(),
+                )
+            } else {
+                ("protocol_records", format!("NEW.kind='{kind}'"))
+            };
+            store.connection.execute_batch(&format!("CREATE TEMP TRIGGER domain_fault BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE({action}{suffix}); END")).unwrap();
             assert!(
                 store
-                    .begin_checkpoint_recovery_work(selected(&cert), base(&cert))
+                    .configure_catalog_resource_policy_with_native_work(policy)
                     .is_err()
             );
             store
                 .connection
                 .execute_batch("DROP TRIGGER domain_fault")
                 .unwrap();
-            assert_eq!(
-                store.checkpoint_acquisition_work_usage().unwrap().unwrap(),
-                before
-            );
+            assert_eq!(store.catalog_resource_policy().unwrap(), None);
+            assert_eq!(store.checkpoint_acquisition_work_usage().unwrap(), None);
             assert!(
                 store
                     .next_record_bounded("catalog-live-work-domain-v1", None, 16, 4096)
@@ -610,6 +984,11 @@ fn live_recovery_domain_installation_is_atomic_under_write_faults() {
             // Failed SQL can leave only an empty, synced lock file. Reopen may
             // adopt it, and its abandoned file description holds no slot.
             let store = ControlStore::open(&path, &history.keys[0]).unwrap();
+            store
+                .configure_catalog_resource_policy_with_native_work(policy)
+                .unwrap();
+            activate(&store);
+            let before = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
             let mut work = store
                 .begin_checkpoint_recovery_work(selected(&cert), base(&cert))
                 .unwrap();
