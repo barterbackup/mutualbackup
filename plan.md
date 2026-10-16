@@ -6518,3 +6518,29 @@ Other cleanup/replay consumers, operational backoff, complete R1/R2/R3 admission
 and normal paged integration remain open; producers stay disabled. Full current
 source/installed, R5 causal and remaining M6 gates remain open. Dense 1 TiB and
 native Windows/macOS qualification remain user-deferred.
+
+### 2026-10-16 — Preserve completed root payloads on malformed replay
+
+Actual native `4a60cf4`, with the prior destructor fix, transfers retained
+ownership and verifies its pinned source remains readable after local manifest
+damage and restored plaintext loss. Backend replay deletes the completed
+candidate before recapture fails, invalidating that still-owned source. Qualified
+`6586467` instead returns the completed-manifest error before cleanup. Valid
+completed replay and initial capture retain their existing behavior; checked
+discard/abandonment retains deletion responsibility.
+
+The identical complete regression test source preserves binding/generation,
+pins and readable bytes, then completes fresh recovery/retirement after local
+manifest repair. All 27 ordinary anchors, withdrawal1, ordinary snapshot36 and
+native anchor18/snapshot8/retained4 pass: 94 distinct cases in 95 executions.
+Strict locked workspace/all-target Clippy, formatting and independent 410-input/
+two-driver/fresh-compiler/exact-case audit pass; native cleanup and original
+failure preservation verify. Evidence:
+`/tmp/mb-m6-owned-capture-replay-red-l1ykilkv` and
+`/tmp/mb-m6-owned-capture-replay-qual-iyp5qixj`.
+
+External-remount2, file/blob replay variants, final area-sync failure cleanup
+and remaining consumer/backoff work remain open. This does not close complete
+R1/R2/R3 admission, normal paged production/retention/recovery, R5 causes or
+R7 current-source/installed gates. M6 remains open; dense 1 TiB and native
+Windows/macOS qualification remain user-deferred.
