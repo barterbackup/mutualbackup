@@ -8178,3 +8178,48 @@ an installed artifact, diagnose any historical liveness observation or close
 the required fault matrix. The original first-90-second coverage failure,
 900-second native capture timeout and 5,400-second relay-only stall stay separate
 and open. R5/R7 and the remaining R1/R2/R3/Milestone 6 gates remain open.
+
+### 2026-10-16 — Preserve native-policy keys through explicit read-only readers
+
+Qualified `e40dda0` introduces one private read-only key decoder. For native
+format 2 it authenticates and validates the complete Core policy, then returns
+the key only to preserved inspection, which grants no file/work capacity. All
+original formats continue through their existing generic decoder. Control
+snapshot/key-snapshot/preserved-store inspection and preserved parity use this
+explicit path. Original manifests, wrapped keys, data rows and signed records
+are not migrated or rewritten.
+
+Read-only support must not let mutable startup drop the policy. Linux current-
+writer validation remains v1-only and runs before inspection for both existing
+catalog preflight and admitted writer handoff. Original mutable control key
+selection/rekeying/open dispatch is byte-identical. A native-policy directory,
+including manifest-only state, rejects before node-lock creation and permission
+changes while the dedicated managed-native birth/enrollment path is unavailable.
+No production publisher installs native key envelopes.
+
+Four new tests exercise closed, WAL-only and live control readers through all
+three production preserved interfaces. Signed parity manifests preserve fixed/
+variable READY bytes, acknowledgement, attempt/receipt and activation evidence.
+File identities, modes, sizes and stable contents remain exact; volatile live
+SHM reader bytes are not treated as persistent payload. The WAL-only fixtures
+create no SHM. Both missing/existing control cases reject mutable Node startup
+with unchanged input sets, directory inode/mode/timestamps and no node lock.
+Altered ciphertext/context/owner/length/version records reject before inspection
+callbacks. All four cases repeat on a provisioned Btrfs filesystem.
+
+Frozen qualification passes 155 distinct cases in 159 executions: all 85 ordinary
+volume, 16 source-policy and 51 legacy inspection/export cases, four native
+policy reader repeats, two privileged bind/renamed-root cases and the original
+Btrfs manifest-publication/interrupted-key-resume case. Strict locked workspace/
+all-target Clippy, format and independent 448-input/one-fresh-driver/source/
+archive/exact-case audits pass. Native mount/loop/image cleanup is verified.
+The audit checks the mutable opener remains byte-identical and the current-writer
+key gate precedes read-only handoff. Evidence:
+`/tmp/mb-m6-native-policy-inspection-qual-lal21imp`.
+
+This preserves read-only recovery while keeping native-policy mutation refused.
+Fresh publication/birth/restart, shared managed SQL ownership, old-writer/copy
+adoption, global/enclosing metadata/work/index/payload/copy reservation and
+normal producer integration remain open. No normal producer is enabled. This
+focused qualification does not close R1/R2/R3/R5/R7 or replace complete current-
+source/installed or user-deferred dense 1 TiB/native Windows/macOS qualification.

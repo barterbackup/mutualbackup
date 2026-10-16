@@ -24,6 +24,8 @@ mod packing_output_cleanup;
 #[cfg(target_os = "linux")]
 use opening::{initialize_volume, open_volume_store};
 #[cfg(test)]
+mod native_policy_inspection_tests;
+#[cfg(test)]
 mod packing_payload_tests;
 
 const VOLUME_MANIFEST_DOMAIN: &[u8] = b"mutualbackup/local-volume-manifest/v1";
@@ -152,7 +154,8 @@ impl PreservedParityVolume {
                 if signed.signer != keys.node_id() {
                     bail!("parity volume manifest was not signed by its owner");
                 }
-                let key = keys.unwrap_database_key(
+                let key = unwrap_key_for_preserved_reader(
+                    keys,
                     &volume_database_id(signed.value.volume_id),
                     &signed.value.wrapped_database_key,
                 )?;
@@ -3158,8 +3161,7 @@ pub(crate) fn inspect_control_store(
     }
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
     if let Some(envelope) = read_private_record_optional::<WrappedDatabaseKey>(&envelope_path)? {
-        let database_key = keys
-            .unwrap_database_key(b"control.db/v2", &envelope)
+        let database_key = unwrap_key_for_preserved_reader(keys, b"control.db/v2", &envelope)
             .context("cannot unwrap control database key")?;
         match ControlStore::open_existing_read_only_with_key(&database_path, &database_key) {
             Ok(store) => return Ok(Some(store)),
@@ -3233,7 +3235,7 @@ fn preserved_control_keys(data_dir: &Path, keys: &KeyMaterial) -> Result<Vec<[u8
     let envelope_path = data_dir.join(CONTROL_KEY_FILE);
     if let Some(envelope) = read_private_record_optional::<WrappedDatabaseKey>(&envelope_path)? {
         database_keys.push(
-            keys.unwrap_database_key(b"control.db/v2", &envelope)
+            unwrap_key_for_preserved_reader(keys, b"control.db/v2", &envelope)
                 .context("cannot unwrap preserved control database key")?,
         );
     }
@@ -3241,12 +3243,33 @@ fn preserved_control_keys(data_dir: &Path, keys: &KeyMaterial) -> Result<Vec<[u8
     Ok(database_keys)
 }
 
-/// Even an interrupted installation with no database must preserve and
-/// authenticate an existing key envelope before claiming startup ownership.
+/// Current mutable startup accepts original key envelopes only. Native-policy
+/// envelopes remain inspectable; they cannot claim startup ownership before
+/// the explicit birth/enrollment/physical opening path is implemented.
 #[cfg(target_os = "linux")]
 pub(crate) fn validate_preserved_control_key(data_dir: &Path, keys: &KeyMaterial) -> Result<()> {
-    let _ = preserved_control_keys(data_dir, keys)?;
+    if let Some(envelope) =
+        read_private_record_optional::<WrappedDatabaseKey>(&data_dir.join(CONTROL_KEY_FILE))?
+    {
+        keys.unwrap_database_key(b"control.db/v2", &envelope)
+            .context("current mutable startup cannot discard a native I/O key policy; preserved inspection remains available")?;
+    }
     Ok(())
+}
+
+/// A read-only caller may recover bytes without granting file/work capacity.
+/// Validate the complete authenticated policy even though inspection does not
+/// install it. Mutable startup must retain policy through a distinct path.
+fn unwrap_key_for_preserved_reader(
+    keys: &KeyMaterial,
+    database_id: &[u8],
+    envelope: &WrappedDatabaseKey,
+) -> Result<[u8; 32]> {
+    Ok(if envelope.format_version == 2 {
+        keys.unwrap_native_database_key(database_id, envelope)?.0
+    } else {
+        keys.unwrap_database_key(database_id, envelope)?
+    })
 }
 
 #[cfg(any(not(target_os = "linux"), test))]

@@ -2893,6 +2893,25 @@ normal paged producers remain disabled.
       normal volume/paged production remain open. Producers stay disabled;
       full current-source/installed/R1/R2/R3/R5/R7 and deferred hardware gates
       remain open.
+    - [x] Inspect native-policy key envelopes without granting startup ownership.
+      Qualified `e40dda0` explicitly validates/decodes native envelopes in
+      control preserved snapshots/key snapshots/stores and preserved parity.
+      Read-only recovery grants no physical/work capacity. Linux mutable key
+      validation remains v1-only and now precedes permissive inspection for
+      existing catalog preflight and admitted writer handoff; original mutable
+      control open/rekey dispatch stays byte-identical. Four new standard/
+      Btrfs cases preserve closed/WAL-only/live inputs, fixed/variable READY
+      data and receipt/activation evidence, reject bad key records before
+      callbacks and reject existing/missing native-policy startup before lock/
+      permission/timestamp changes. All volume85/source-policy16/legacy-export51,
+      native reader4, privileged alias2 and native original manifest-resume1
+      pass: 155 distinct cases in 159 executions. Strict workspace/all-target
+      Clippy, format, independent 448-input/fresh-driver/archive/exact-case audits
+      and owned native cleanup pass. Evidence:
+      `/tmp/mb-m6-native-policy-inspection-qual-lal21imp`. Native v2 publication,
+      fresh birth/restart, shared managed ownership, old-writer/copy adoption,
+      global/enclosing admission and normal producers remain open, alongside
+      complete current-source/installed/R1/R2/R3/R5/R7 and deferred hardware gates.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted

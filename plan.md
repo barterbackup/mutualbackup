@@ -6694,3 +6694,29 @@ an installed artifact, diagnose any historical liveness observation or close
 the required fault matrix. The original first-90-second coverage failure,
 900-second native capture timeout and 5,400-second relay-only stall stay separate
 and open. R5/R7 and the remaining R1/R2/R3/Milestone 6 gates remain open.
+
+### 2026-10-16 — Inspect native-policy key envelopes without startup ownership
+
+Qualified `e40dda0` adds explicit read-only decoding of authenticated native
+key envelopes for control snapshots and preserved parity. It validates the
+complete policy before opening SQL, then recovers bytes without granting native
+file/work capacity. Linux mutable admission keeps original v1-only key decoding
+and checks it before the newly permissive inspector, including existing catalogs.
+Native-policy state therefore rejects before node lock creation or permission
+changes until its dedicated birth/enrollment path exists.
+
+Four new cases pass on the standard filesystem and Btrfs: closed, WAL-only and
+live control/parity inputs remain preserved; fixed/variable data and receipt/
+activation evidence stay exact; malformed/context/owner/length/version records
+reject before callbacks; generic startup rejects both existing and missing
+native-policy catalogs before ownership changes. All 85 volume, 16 source-policy
+and 51 legacy inspection/export cases pass. Provisioned bind/renamed-root and
+original manifest-only restart coverage also passes: 155 distinct cases in
+159 executions. Strict workspace/all-target Clippy, format, independent
+448-input/fresh-driver/source/archive/exact-case audits and owned native cleanup
+pass. Evidence: `/tmp/mb-m6-native-policy-inspection-qual-lal21imp`.
+
+This is read-only format support with retained mutable rejection. Native-policy
+publication, fresh atomic birth/restart, copy/old-writer adoption, aggregate/
+enclosing reservations and normal volume/paged production remain open. R1/R2/
+R3/R5/R7 and complete current-source/installed/deferred hardware gates stay open.
