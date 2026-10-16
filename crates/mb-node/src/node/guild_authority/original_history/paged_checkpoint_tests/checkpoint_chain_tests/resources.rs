@@ -101,6 +101,15 @@ pub(super) fn configure(node: &mut Node) {
         .advance_checkpoint_acquisition_work_admission()
         .unwrap()
     {}
+    let scratch =
+        mb_store::ScratchStorageLimits::for_database(mb_core::CATALOG_MAX_STREAM_BYTES * 4)
+            .unwrap();
+    node.configure_catalog_scratch_pool_policy(mb_store::CatalogScratchPoolPolicy {
+        format_version: 1,
+        physical_bytes: scratch.max_physical_bytes.checked_mul(64).unwrap(),
+        jobs: 64,
+    })
+    .unwrap();
     let budget = rebuild_budget(node);
     let limit = budget.checked_add(plan.job_work).unwrap();
     node.configure_catalog_traversal_pool_policy(mb_store::CatalogTraversalPoolPolicy {
@@ -135,4 +144,17 @@ pub(super) fn rebuild_budget(node: &Node) -> Work {
         result = result.checked_add(per_checkpoint).unwrap();
     }
     result
+}
+
+/// Completed proofs retain their scratch slots after traversal work is released.
+/// A second full-pool declaration must fail while any original VFS stays live.
+pub(super) fn scratch_held(node: &Node) {
+    let usage = node.catalog_scratch_pool_usage().unwrap().unwrap();
+    assert!(usage.open_jobs > 0);
+    assert!(usage.reserved_physical_bytes > 0);
+    assert!(matches!(
+        node.control
+            .reserve_catalog_scratch(usage.policy.physical_bytes),
+        Err(mb_store::CatalogStoreError::ScratchPoolExhausted)
+    ));
 }

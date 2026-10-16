@@ -68,6 +68,8 @@ mod paged_sector;
 mod retained_source_quota;
 mod retention_journal;
 mod revision_quota;
+mod scratch_pool;
+pub use scratch_pool::{CatalogScratchLease, CatalogScratchPoolPolicy, CatalogScratchPoolUsage};
 mod source;
 mod storage_quota;
 pub use bundle::{
@@ -178,6 +180,14 @@ pub enum CatalogStoreError {
     UnsupportedTraversalOwnership,
     #[error("catalog traversal work locks are unsupported on this filesystem")]
     UnsupportedTraversalFilesystem,
+    #[error(
+        "catalog scratch pool is not configured; enroll its physical-byte and job limits before resource-backed scratch work"
+    )]
+    ScratchPoolRequired,
+    #[error(
+        "catalog scratch pool is exhausted; reclaim stopped scratch declarations or finish active work"
+    )]
+    ScratchPoolExhausted,
     #[error(
         "retained data-source quota is exhausted; finish cancelled-source cleanup or increase the dataset limit"
     )]
@@ -768,7 +778,8 @@ pub(super) fn acquisition_work_schema(
     checkpoint_acquisition::work_admission::schema(cx)
 }
 pub(super) fn validate_acquisition_work(cx: &Connection) -> Result<(), DatabaseError> {
-    checkpoint_acquisition::work_admission::validate_open(cx)
+    checkpoint_acquisition::work_admission::validate_open(cx)?;
+    scratch_pool::validate_open(cx)
 }
 
 #[cfg(test)]

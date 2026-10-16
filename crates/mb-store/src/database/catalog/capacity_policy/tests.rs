@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+mod scratch;
+
 use super::super::paged_revision::tests::{fixture, publish};
 use super::*;
 use mb_core::{

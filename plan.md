@@ -6342,3 +6342,26 @@ activation and normal paged integration remain open. Normal producers stay
 disabled. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and native Windows/macOS
 qualification remain user-deferred. A complete current-source qualification is
 still required with the initial-coverage diagnostics before installed jobs.
+
+Aggregate scratch physical declarations (implementation pending qualification, 2026-10-16):
+A separate immutable scratch-pool policy binds aggregate physical-byte/job limits
+to the existing resource policy. Admission reserves each VFS's full declared
+physical ceiling before file creation. Paired bounded counters and declarations
+are checked against at most 64 slots. Distinct OFD lock classes retain the original
+traversal names/bytes and prevent live scratch reclamation. The VFS owns its token
+until every anonymous file closes; stopped declarations retain debt until bounded
+reclamation. No borrowed or additional SQLite connection owns the token.
+
+Resource-backed new paged scratch requires explicit enrollment. Existing resource
+catalogs remain readable; unsupported physical platforms fail before a funded
+scratch job starts. Per-file fallocate, checkpoint-copy reservation and shared
+filesystem headroom remain mandatory. Pool declarations are aggregate ceilings,
+not a promise of free blocks or authority to publish data. Traversal work credits
+and persistent SQL/WAL/volume physical admission remain separate.
+
+The isolated branch includes concurrency, fault, copy, token-lifetime, constructor,
+SIGKILL and both-layout retained recovery cases. They are unexecuted; only format
+and diff checks have run. Do not treat this as qualified or enable producers.
+The main `d8e0581` complete source gate stays frozen and independent. Full physical
+admission, distributed current activation, normal paged production/retention/seed
+recovery and the enclosing R1/R2/R3/R5/R7 gates remain open.

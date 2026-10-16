@@ -3,7 +3,7 @@
 use super::*;
 
 mod live;
-mod live_lock;
+pub(in crate::database::catalog) mod live_lock;
 mod live_owner;
 mod pool;
 pub use live::CatalogCheckpointRecoveryWork;

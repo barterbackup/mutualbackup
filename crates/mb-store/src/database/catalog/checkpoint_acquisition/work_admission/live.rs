@@ -112,14 +112,14 @@ fn entry(
     Ok(Some(result))
 }
 fn scope(cx: &Connection, id: Uuid) -> Result<Option<Spec>, CatalogStoreError> {
-    match entry(cx, id, false, live_lock::read(cx)?)? {
+    match entry(cx, id, false, live_lock::read(cx, live_lock::TRAVERSAL)?)? {
         Some(Entry::Current(s)) => Ok(Some(s)),
         None => Ok(None),
         _ => Err(DatabaseError::Integrity.into()),
     }
 }
 fn scopes(cx: &Connection) -> Result<Vec<Entry>, CatalogStoreError> {
-    let domain = live_lock::read(cx)?;
+    let domain = live_lock::read(cx, live_lock::TRAVERSAL)?;
     let mut query=cx.prepare("SELECT CASE WHEN length(record_id)=16 THEN record_id END,kind FROM protocol_records WHERE kind IN (?1,?2) ORDER BY record_id,kind LIMIT ?3")?;
     let mut rows = query.query(params![
         SCOPE,
@@ -167,7 +167,7 @@ fn release(cx: &Connection, old: Ledger, e: Entry) -> Result<(), CatalogStoreErr
         cx,
         e.id(),
         matches!(e, Entry::Legacy(_)),
-        live_lock::read(cx)?,
+        live_lock::read(cx, live_lock::TRAVERSAL)?,
     )? != Some(e)
     {
         return Err(DatabaseError::Integrity.into());
@@ -224,7 +224,7 @@ impl CatalogCheckpointRecoveryWork<'_> {
                         && scope(cx, s.id)? == Some(s) =>
                 {
                     let token = self.token.as_ref().ok_or(DatabaseError::Integrity)?;
-                    if live_lock::read(cx)? != Some(token.domain) {
+                    if live_lock::read(cx, live_lock::TRAVERSAL)? != Some(token.domain) {
                         return Err(DatabaseError::Integrity.into());
                     }
                     token.check(self.store)
@@ -255,7 +255,7 @@ impl CatalogCheckpointRecoveryWork<'_> {
             let tx =
                 Transaction::new_unchecked(&self.store.connection, TransactionBehavior::Immediate)?;
             let old = read(&tx)?.ok_or(DatabaseError::Integrity)?;
-            if live_lock::read(&tx)? != Some(token.domain) {
+            if live_lock::read(&tx, live_lock::TRAVERSAL)? != Some(token.domain) {
                 return Err(DatabaseError::Integrity.into());
             }
             release(&tx, old, Entry::Current(s))?;
@@ -321,7 +321,7 @@ impl ControlStore {
                 has_scopes = true;
             }
         }
-        let token = FileLock::admit(&tx, self, has_scopes)?;
+        let token = FileLock::admit(&tx, self, has_scopes, live_lock::TRAVERSAL)?;
         let mut slot = None;
         for index in 0..CATALOG_ACQUISITION_WORK_JOBS {
             if !used[index as usize] && token.try_slot(index as u8)? {
@@ -371,7 +371,7 @@ impl ControlStore {
             return Ok(false);
         };
         let database = Identity::database(self)?;
-        let domain = live_lock::read(&tx)?;
+        let domain = live_lock::read(&tx, live_lock::TRAVERSAL)?;
         let mut token = None;
         for e in scopes(&tx)? {
             let abandoned = match e {
@@ -382,7 +382,7 @@ impl ControlStore {
                         domain.permits_copy_reclamation()
                     } else {
                         if token.is_none() {
-                            token = Some(FileLock::existing(self, domain)?);
+                            token = Some(FileLock::existing(self, domain, live_lock::TRAVERSAL)?);
                         }
                         token
                             .as_ref()

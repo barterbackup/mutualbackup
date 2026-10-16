@@ -399,6 +399,7 @@ macro_rules! cases {
             for (kind,bytes) in names.into_iter().zip(links){receiver.control.put_record(kind,middle_owner.as_bytes(),&bytes).unwrap();}
             resources::released(&receiver);
             let rebuilt=session.rebuild_checkpoint_proof_with_observer(rebuild_budget,|_| {
+                resources::scratch_held(&receiver);
                 let usage=receiver.checkpoint_acquisition_work_usage()?.unwrap();
                 assert_eq!(usage.reserved,rebuild_budget);assert_eq!(usage.open_jobs,1);
                 assert!(!receiver.reclaim_abandoned_checkpoint_recovery_work()?);

@@ -1502,6 +1502,23 @@ impl Node {
         Ok(self.control.configure_catalog_resource_policy(policy)?)
     }
 
+    /// Bound simultaneous scratch physical declarations independently from
+    /// traversal work. Actual Linux extents/headroom remain checked by the VFS.
+    pub fn configure_catalog_scratch_pool_policy(
+        &self,
+        policy: mb_store::CatalogScratchPoolPolicy,
+    ) -> Result<()> {
+        Ok(self.control.configure_catalog_scratch_pool_policy(policy)?)
+    }
+
+    pub fn catalog_scratch_pool_usage(&self) -> Result<Option<mb_store::CatalogScratchPoolUsage>> {
+        Ok(self.control.catalog_scratch_pool_usage()?)
+    }
+
+    pub fn reclaim_abandoned_catalog_scratch(&self) -> Result<bool> {
+        Ok(self.control.reclaim_abandoned_catalog_scratch()?)
+    }
+
     /// Set cumulative traversal credits separately from each checkpoint's
     /// represented capacity. Resource backing and old-job adoption must be active.
     pub fn configure_catalog_traversal_pool_policy(

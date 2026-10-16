@@ -95,6 +95,7 @@ struct State {
     headroom_bytes: u64,
     allocated_bytes: Mutex<u64>,
     checkpoints: Vec<(File, std::ffi::OsString)>,
+    lease: Option<crate::CatalogScratchLease>,
 }
 
 struct DiskFile {
@@ -117,6 +118,22 @@ impl ScratchVfs {
         headroom_bytes: u64,
         checkpoint_paths: &[PathBuf],
     ) -> Result<Self, DatabaseError> {
+        Self::new_with_lease(
+            directory,
+            max_physical_bytes,
+            headroom_bytes,
+            checkpoint_paths,
+            None,
+        )
+    }
+
+    pub(super) fn new_with_lease(
+        directory: &Path,
+        max_physical_bytes: u64,
+        headroom_bytes: u64,
+        checkpoint_paths: &[PathBuf],
+        lease: Option<crate::CatalogScratchLease>,
+    ) -> Result<Self, DatabaseError> {
         // Initialize through rusqlite before finding SQLite's default VFS.
         drop(rusqlite::Connection::open_in_memory()?);
         let directory = super::directory::open_directory_file(directory)?;
@@ -124,6 +141,11 @@ impl ScratchVfs {
             return Err(DatabaseError::ScratchUnavailable);
         }
         let device = domain_for_file(&directory)?;
+        if let Some(lease) = &lease {
+            lease
+                .check_domain(device, max_physical_bytes)
+                .map_err(|_| DatabaseError::ScratchUnavailable)?;
+        }
         let (allocation_lock, lock_path) = shared_allocation_lock()?;
         let mut checkpoints = Vec::new();
         for path in checkpoint_paths {
@@ -156,6 +178,7 @@ impl ScratchVfs {
             headroom_bytes,
             allocated_bytes: Mutex::new(0),
             checkpoints,
+            lease,
         });
         // The callbacks receiving a VFS pointer delegate with the original VFS
         // pointer, preserving its application data. File I/O is entirely ours.
@@ -230,6 +253,14 @@ impl Drop for AllocationLock<'_> {
 
 impl DiskFile {
     fn allocate(&mut self, end: u64) -> c_int {
+        let state = unsafe { &*self.state };
+        if state
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.check(state.max_physical_bytes).is_err())
+        {
+            return ffi::SQLITE_IOERR_WRITE;
+        }
         if end <= self.allocated {
             return ffi::SQLITE_OK;
         }
