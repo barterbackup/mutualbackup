@@ -6630,3 +6630,27 @@ quiescent enrollment, parity volume coverage and normal paged integration remain
 open. Partial creation/restart is still caller-owned. Producers stay disabled;
 complete current-source/installed/R5/R7 gates and user-deferred dense 1 TiB and
 native Windows/macOS qualification remain open.
+
+### 2026-10-16 — Extend runtime physical admission to parity SQL catalogs
+
+Qualified `efbe298` gives `ParityStore` the same explicit Linux runtime
+physical creation/existing-open APIs and VFS ownership as control catalogs.
+The shared private helpers preserve descriptor pinning and admit all native
+SQL file-family growth before data I/O. Existing generic parity constructors
+retain their behavior. Durable/global/enclosing volume policy and old-writer
+adoption remain separate work; normal volume producers are not switched.
+
+Four new cases pass on both the standard filesystem and Btrfs: fixed/variable
+READY bytes and receipt/activation evidence survive reopen and ordinary reads;
+a late physical allocation refusal rolls back the entire staged object and
+retries; existing/wrong-volume/missing-main opens preserve data; and future
+publication retains the original directory after rename. Fourteen combined
+Btrfs control/parity cases also pass, including real ENOSPC and stopped shared
+extent refusal. Focused qualification passes 177 distinct cases/executions on
+this source, including 67 ordinary database, 12 directory, three descriptor and
+81 Node volume cases. Strict workspace/all-target Clippy, format, fresh-driver/
+source/archive/exact-case audits and native cleanup pass. Evidence:
+`/tmp/mb-m6-parity-sql-integration-mcrfxq_2` and
+`/tmp/mb-m6-physical-io-btrfs-h7oknki6`. This increment does not replace the
+complete current-source/installed gate or close R1/R2/R3/R5/R7. Producers stay
+disabled; user-deferred dense capacity and native platform gates remain open.

@@ -504,6 +504,7 @@ impl ParityStore {
         initialize_or_validate_parity(&mut connection, volume)?;
         Ok(Self {
             connection,
+            physical_vfs: None,
             path,
             directory: Some(directory.clone()),
         })
@@ -538,6 +539,7 @@ impl ParityStore {
         initialize_or_validate_parity(&mut connection, volume)?;
         Ok(Self {
             connection,
+            physical_vfs: None,
             path,
             directory: Some(directory.clone()),
         })

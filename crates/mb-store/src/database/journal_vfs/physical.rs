@@ -2,7 +2,7 @@
 //! until its owning ControlStore has closed its connection and native files.
 use super::*;
 use crate::database::{
-    ControlStore, DatabaseDirectory, DatabasePhysicalIoLimits,
+    ControlStore, DatabaseDirectory, DatabasePhysicalIoLimits, ParityStore,
     physical_io::{self, Pool, Role},
 };
 use std::collections::BTreeMap;
@@ -324,29 +324,7 @@ impl ControlStore {
         key: &[u8; 32],
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Self, DatabaseError> {
-        let path = directory.leaf(name)?;
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let mut sibling = name.to_os_string();
-            sibling.push(suffix);
-            match std::fs::symlink_metadata(directory.leaf(sibling)?) {
-                Ok(_) => return Err(DatabaseError::Conflict),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let vfs = PhysicalVfs::new(directory, limits)?;
-        // This is a new empty inode, before any SQLite descriptor or lock can
-        // exist. Never truncate a pre-existing catalog to enroll this mode.
-        let created = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .mode(0o600)
-            .open(&path)?;
-        created.sync_all()?;
-        directory.file().sync_all()?;
-        vfs.pool.pin_created_main(&created)?;
-        drop(created);
+        let (vfs, path) = create(directory, name, limits)?;
         Self::connect_physical(directory, path, key, vfs)
     }
 
@@ -359,9 +337,7 @@ impl ControlStore {
         key: &[u8; 32],
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Self, DatabaseError> {
-        let path = directory.leaf(name)?;
-        let vfs = PhysicalVfs::new(directory, limits)?;
-        vfs.pool.pin_main_path(&path)?;
+        let (vfs, path) = existing(directory, name, limits)?;
         Self::connect_physical(directory, path, key, vfs)
     }
 
@@ -371,18 +347,119 @@ impl ControlStore {
         key: &[u8; 32],
         vfs: PhysicalVfs,
     ) -> Result<Self, DatabaseError> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let connection = Connection::open_with_flags_and_vfs(
-            &path,
-            flags,
-            vfs._name
-                .to_str()
-                .map_err(|_| DatabaseError::PhysicalIoUnavailable)?,
-        )?;
-        let mut connection = crate::database::configure_encrypted(connection, key)?;
+        let mut connection = connect(&path, key, &vfs)?;
         crate::database::initialize_or_validate_control(&mut connection)?;
+        Ok(Self {
+            connection,
+            physical_vfs: Some(vfs),
+            path,
+            directory: Some(directory.clone()),
+        })
+    }
+
+    pub fn physical_io_allocated_bytes(&self) -> Result<Option<u64>, DatabaseError> {
+        self.physical_vfs
+            .as_ref()
+            .map(|vfs| vfs.pool.usage())
+            .transpose()
+    }
+}
+
+fn create(
+    directory: &DatabaseDirectory,
+    name: &OsStr,
+    limits: DatabasePhysicalIoLimits,
+) -> Result<(PhysicalVfs, std::path::PathBuf), DatabaseError> {
+    let path = directory.leaf(name)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sibling = name.to_os_string();
+        sibling.push(suffix);
+        match std::fs::symlink_metadata(directory.leaf(sibling)?) {
+            Ok(_) => return Err(DatabaseError::Conflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let vfs = PhysicalVfs::new(directory, limits)?;
+    // This is a new empty inode, before any SQLite descriptor or lock can
+    // exist. Never truncate a pre-existing catalog to enroll this mode.
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&path)?;
+    created.sync_all()?;
+    directory.file().sync_all()?;
+    vfs.pool.pin_created_main(&created)?;
+    drop(created);
+    Ok((vfs, path))
+}
+fn existing(
+    directory: &DatabaseDirectory,
+    name: &OsStr,
+    limits: DatabasePhysicalIoLimits,
+) -> Result<(PhysicalVfs, std::path::PathBuf), DatabaseError> {
+    let path = directory.leaf(name)?;
+    let vfs = PhysicalVfs::new(directory, limits)?;
+    vfs.pool.pin_main_path(&path)?;
+    Ok((vfs, path))
+}
+fn connect(
+    path: &std::path::Path,
+    key: &[u8; 32],
+    vfs: &PhysicalVfs,
+) -> Result<Connection, DatabaseError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let connection = Connection::open_with_flags_and_vfs(
+        path,
+        flags,
+        vfs._name
+            .to_str()
+            .map_err(|_| DatabaseError::PhysicalIoUnavailable)?,
+    )?;
+    crate::database::configure_encrypted(connection, key)
+}
+
+impl ParityStore {
+    /// Create a new caller-owned parity catalog with runtime native file
+    /// admission. Durable volume policy, old writers and enclosing operations
+    /// still require independent enrollment and reservations.
+    pub fn create_physical_in_directory_with_key(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        volume: &[u8; 16],
+        key: &[u8; 32],
+        limits: DatabasePhysicalIoLimits,
+    ) -> Result<Self, DatabaseError> {
+        let (vfs, path) = create(directory, name, limits)?;
+        Self::connect_physical(directory, path, volume, key, vfs)
+    }
+
+    /// Open an existing caller-owned parity catalog under runtime ceilings.
+    /// This does not migrate persistent volume policy or enroll old writers.
+    pub fn open_physical_existing_in_directory_with_key(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        volume: &[u8; 16],
+        key: &[u8; 32],
+        limits: DatabasePhysicalIoLimits,
+    ) -> Result<Self, DatabaseError> {
+        let (vfs, path) = existing(directory, name, limits)?;
+        Self::connect_physical(directory, path, volume, key, vfs)
+    }
+
+    fn connect_physical(
+        directory: &DatabaseDirectory,
+        path: std::path::PathBuf,
+        volume: &[u8; 16],
+        key: &[u8; 32],
+        vfs: PhysicalVfs,
+    ) -> Result<Self, DatabaseError> {
+        let mut connection = connect(&path, key, &vfs)?;
+        crate::database::initialize_or_validate_parity(&mut connection, volume)?;
         Ok(Self {
             connection,
             physical_vfs: Some(vfs),

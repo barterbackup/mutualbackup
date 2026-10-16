@@ -652,3 +652,6 @@ pub(super) fn sqlite_code(error: DatabaseError, fallback: i32) -> i32 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parity_tests;
