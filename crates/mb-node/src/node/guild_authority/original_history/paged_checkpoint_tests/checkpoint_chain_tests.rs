@@ -391,6 +391,15 @@ macro_rules! cases {
             let rebuild_budget=resources::rebuild_budget(&receiver);resources::released(&receiver);
             assert!(session.rebuild_checkpoint_recovery_proof(Work::default()).is_err());
             assert!(session.rebuild_checkpoint_recovery_proof(Work{bytes:512<<20,..rebuild_budget}).is_err());
+            for _ in 0..64 { if !receiver.reclaim_abandoned_catalog_scratch().unwrap() { break; } }
+            assert!(!receiver.reclaim_abandoned_catalog_scratch().unwrap());
+            let scratch_before=receiver.catalog_scratch_pool_usage().unwrap();
+            // Setup and its first guard fit, but complete scratch admission does
+            // not. The old single lookup allowance would create a stack lease
+            // before later source-budget rejection, leaving new physical debt.
+            assert!(session.rebuild_checkpoint_recovery_proof(Work{bytes:128<<20,..rebuild_budget}).is_err());
+            assert_eq!(receiver.catalog_scratch_pool_usage().unwrap(),scratch_before);
+            resources::released(&receiver);
             assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
             let names=["catalog-checkpoint-ancestry-link-v1","catalog-checkpoint-ancestry-link-guard-v1"];
             let links=names.map(|kind|receiver.control.get_record_bounded(kind,middle_owner.as_bytes(),1024).unwrap().unwrap());
