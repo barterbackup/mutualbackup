@@ -1,3 +1,6 @@
+mod native_database;
+pub use native_database::NativeDatabaseIoPolicy;
+
 use std::fmt;
 use std::str::FromStr;
 
