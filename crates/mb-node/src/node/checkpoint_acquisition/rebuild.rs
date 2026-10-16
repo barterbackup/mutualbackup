@@ -60,10 +60,14 @@ impl RetainedCheckpointRestore {
         mut after_proof: impl FnMut(u64) -> Result<()>,
     ) -> Result<RecoveredCheckpointProof> {
         let control = &self.reader.control;
-        // The fixed-size tip lookup and reservation's before/after integrity
-        // scans are bounded setup work. Reserve before any scratch or ancestry
-        // traversal; no SQLite writer stays open across validation.
-        let setup = LOOKUP_WORK.checked_add(LOOKUP_WORK)?;
+        // Prepay the tip lookup, admission scans and short release writer,
+        // including Drop's cleanup retry after a failed explicit finish. Eight
+        // bounded read batches cover these even with all 64 slots occupied.
+        // Reserve before scratch or ancestry; validation holds no SQL writer.
+        let mut setup = Work::default();
+        for _ in 0..8 {
+            setup = setup.checked_add(LOOKUP_WORK)?;
+        }
         budget.remaining_after(setup)?;
         let selected = control
             .checkpoint_recovery_tip()?

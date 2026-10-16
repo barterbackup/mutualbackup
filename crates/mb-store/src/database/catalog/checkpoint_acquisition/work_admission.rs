@@ -3,6 +3,7 @@
 use super::*;
 
 mod live;
+mod live_lock;
 mod live_owner;
 mod pool;
 pub use live::CatalogCheckpointRecoveryWork;
@@ -116,14 +117,18 @@ fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
     let Some(bytes) = bytes else {
         pool::require_unconfigured(cx)?;
         let orphan: bool = cx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1,?2,?3,?4,?5,?6))",
+            "SELECT EXISTS(SELECT 1 FROM protocol_records WHERE kind IN (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10))",
             params![
                 LEASE,
                 LEASE_GUARD,
                 HELD,
                 HELD_GUARD,
                 live::SCOPE,
-                live::SCOPE_GUARD
+                live::SCOPE_GUARD,
+                live::LEGACY_SCOPE,
+                live::LEGACY_GUARD,
+                live_lock::KINDS[0],
+                live_lock::KINDS[1]
             ],
             |r| r.get(0),
         )?;

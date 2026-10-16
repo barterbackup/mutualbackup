@@ -3,6 +3,7 @@ use crate::database::{
     DatabaseJournalQuota, DatabasePageQuota, DatabaseRecordQuota, DatabaseRecordQuotaState,
 };
 use mb_core::{CatalogCapacityPolicy, CodingProfile};
+#[cfg(target_os = "linux")]
 mod live;
 
 fn capacity(cert: &Certificate) -> CatalogCapacityPolicy {
