@@ -7990,3 +7990,79 @@ policy still require integration. Normal paged producers remain disabled. Full
 current-source/installed gates, normal capture/retention/seed recovery and the
 three separate unexplained R5 observations remain open. Dense 1 TiB and native
 Windows/macOS qualification remain user-deferred.
+
+### 2026-10-16 — Fund runtime native SQL extents before native growth
+
+Qualified `1f3333d` introduces `DatabasePhysicalIoLimits` and explicit Linux
+control-catalog creation/existing-open APIs. These select a private owning VFS
+before encryption/schema initialization. The limits independently bound main,
+journal, SHM, temporary, total allocated bytes and tracked inodes, with explicit
+free-space headroom. The ordinary logical catalog APIs keep their original
+behavior and platform scope. These limits are runtime ceilings; they do not
+enroll other writers or reserve an enclosing operation.
+
+Each native file binds its borrowed descriptor to an O_PATH inode pin. Main
+creation syncs the new inode and directory and pins the intended identity
+before closing the pre-SQL I/O description. Existing opens pin without another
+main I/O descriptor close. Paginated FIEMAP inspection rejects known sharing,
+inline, encoded, delayed or ambiguous allocations before SQL initialization.
+Btrfs files acquire NoCow only while empty; nonempty files cannot be converted
+in place. Before each write/growth/map, rounded 64 KiB coverage must be private
+or must first be allocated with KEEP_SIZE. Shared UID/filesystem allocation
+locking serializes free-space admission with scratch. Failed partial allocation
+remains charged; native writes and truncations refresh actual st_blocks.
+Closed linked journals keep their charge. Unlinked inodes release credit only
+after native close and final ownership-pin retirement. No external live-database
+punch, reflink or zeroing is used.
+
+Actual Btrfs traces and a separate six-case primitive probe showed that writing
+a 512-byte header can replace the first preallocated data block with inline
+metadata, even with NoCow and 64 KiB preallocation. The VFS funds and preextends
+short journal headers to one filesystem block. The main database EOF remains
+un-padded. The native SHM first-opener path holds SQLite's exclusive DMS lock,
+resets its stale index, calls admission and only then extends a full-block zero
+marker. Other native connections retain the original three-byte marker path.
+Local opcodes 1044/1045 expose the existing SHM descriptor and register this
+native initialization callback. Only the defining C unit knows unixFile layout.
+Anonymous temporary descriptors transfer directly to native fillInUnixFile;
+normal native O_NOFOLLOW deliberately rejects procfs symlink reopening. Both
+amalgamations have byte-identical local changes, and only the same four original
+upstream files differ. Original package/archive/license hashes and dependency
+versions remain unchanged.
+
+The initial temporary-file failure and two initial Btrfs setup failures retain
+exact sources and executables. A later shared-file test correctly refused
+writes but then attempted an unfundable rollback through those same extents;
+the failed fixture is preserved. Known sharing now rejects existing-open before
+SQL work or journal creation. The positive stopped-catalog reflink fixture
+confirms unchanged original/copy bytes and no new side files. Its reflink occurs
+only after both SQL connections close. A separate owned 4 GiB loop fixture
+fills the real filesystem to kernel ENOSPC, refuses a transaction with original
+records intact, releases only its filler and successfully retries. Four child
+processes exit without destructors after uncommitted spills in WAL, DELETE,
+PERSIST and TRUNCATE modes; the ordinary bundled adapter recovers exact committed
+records and accepts future writes. Both standard filesystem and Btrfs runs also
+cover main/WAL/SHM backing, late family quota rollback, closed PERSIST journals,
+actual anonymous SQL temporary spill, directory rename and ordinary reopen.
+
+Frozen qualification passes all 590 ordinary Store cases (31 ignored there,
+including the two explicit native physical cases run separately), actual
+namespace/OverlayFS probes, Node retained chains2/volumes81/snapshots36 and a
+fresh-process repeat. Provisioned Btrfs passes the ten physical cases plus
+native descriptor3/funded scratch1/traversal25/snapshot8/retained recovery4.
+The complete focused inventory is 725 distinct cases in 764 executions. Strict
+locked workspace/all-target Clippy, plain SQLite amalgamation syntax and format
+pass. Independent audit verifies all 445 inputs/source archive, both fresh
+drivers, exact case inventories, original vendor files/dependency versions,
+identical C changes, previous negative artifacts and owned mount/loop/image
+cleanup. Evidence: `/tmp/mb-m6-physical-sql-integration-s53h9st1`;
+`/tmp/mb-m6-physical-io-btrfs-r2siostk`.
+
+Persistent/global policy, old-writer/quiescent migration, enclosing metadata/
+work/payload quotas, checkpoint/rebuild copies and parity volume integration
+remain open. Failed partial creation is still caller-owned. Concurrent external
+administrative snapshots are not adopted into a persistent funding protocol.
+No normal paged producer is enabled. This focused qualification does not replace
+complete current-source/installed qualification, resolve the three separate R5
+observations or close R1/R2/R3/R5/R7. Dense 1 TiB and native Windows/macOS runs
+remain user-deferred.
