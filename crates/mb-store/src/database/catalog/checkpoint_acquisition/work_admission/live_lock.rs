@@ -42,6 +42,10 @@ impl Identity {
         // with different device/inode values and independent lock domains.
         let directory = FileLock::directory(store)?;
         FileLock::local_filesystem(directory.file())?;
+        let native = crate::database::native_file::main_file(&store.connection)?;
+        if !FileLock::local_filesystem_type(native.filesystem) {
+            return Err(CatalogStoreError::UnsupportedTraversalFilesystem);
+        }
         let metadata = std::fs::metadata(&store.path).map_err(DatabaseError::from)?;
         if metadata.dev()
             != directory
@@ -70,6 +74,10 @@ impl Identity {
             || moved != 0
             || !metadata.is_file()
             || metadata.nlink() != 1
+            || !native.regular
+            || native.links != 1
+            || native.device != metadata.dev()
+            || native.inode != metadata.ino()
         {
             return Err(DatabaseError::Conflict.into());
         }
@@ -344,16 +352,21 @@ impl FileLock {
         }
         // OFD ownership must stay local to this kernel. Remote lock recovery
         // after a network partition cannot establish that old work has stopped.
-        let local = [
+        if !Self::local_filesystem_type(unsafe { info.assume_init() }.f_type as u32) {
+            return Err(CatalogStoreError::UnsupportedTraversalFilesystem);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local_filesystem_type(filesystem: u32) -> bool {
+        [
             libc::BTRFS_SUPER_MAGIC as u32,
             libc::EXT4_SUPER_MAGIC as u32,
             0x5846_5342,
             libc::TMPFS_MAGIC as u32,
-        ];
-        if !local.contains(&(unsafe { info.assume_init() }.f_type as u32)) {
-            return Err(CatalogStoreError::UnsupportedTraversalFilesystem);
-        }
-        Ok(())
+        ]
+        .contains(&filesystem)
     }
 
     pub(in crate::database::catalog) fn admit(

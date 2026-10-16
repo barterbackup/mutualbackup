@@ -23,6 +23,8 @@ mod catalog;
 mod directory;
 mod journal_quota;
 mod journal_vfs;
+#[cfg(target_os = "linux")]
+mod native_file;
 mod packing_output_retirement;
 mod page_quota;
 #[cfg(target_os = "linux")]

@@ -9,7 +9,7 @@ members = [
     "vendor/libp2p-request-response",
     "vendor/portmapper",
 ]
-exclude = ["vendor/cbor4ii"]
+exclude = ["vendor/cbor4ii", "vendor/libsqlite3-sys"]
 resolver = "2"
 
 [workspace.package]
@@ -95,3 +95,6 @@ portmapper = { path = "vendor/portmapper" }
 # Versioned tuple visitors select their field count from the signed version.
 # Accept shorter definite CBOR arrays only when the visitor consumes them fully.
 cbor4ii = { path = "vendor/cbor4ii" }
+# Borrow the actual native Unix file through a checked C file-control opcode.
+# Additional main-file opens/closes would disturb SQLite's POSIX locks.
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }

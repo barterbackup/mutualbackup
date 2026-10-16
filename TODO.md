@@ -2809,6 +2809,25 @@ normal paged producers remain disabled.
       upgrade, restore/relocation policy, physical SQL/WAL/volume backing and
       normal paged integration remain open. Producers stay disabled; full
       current-source/installed, R5/R7 and deferred hardware gates stay open.
+    - [x] Obtain borrowed native SQL descriptors without disturbing locks.
+      Qualified `6e90abf` adds local C opcode 1043 to the pinned bundled Linux
+      Unix VFS. It borrows existing main/WAL descriptors; Rust uses no private
+      C layout, global syscall hook or extra main descriptor close. Native
+      ownership checks actual file identity/link count/filesystem alongside
+      existing path/directory checks. All original vendor hashes/licenses are
+      preserved, only four upstream files change, and dependency versions stay
+      unchanged. Three SQLCipher tests cover replacement paths, WAL/null/memory
+      handling and independent rollback-writer exclusion across 128 inspections.
+      Initial three-case and combined qualification pass: all 582 ordinary Store,
+      namespace/OverlayFS, Node recovery2/volume81/snapshot36, Btrfs descriptors3/
+      traversal25/funded-scratch1/snapshot8/retained4; 715 distinct cases in
+      746 executions. Strict workspace/all-target Clippy, format, independent
+      442-input/two-driver/archive/upstream/exact-case audits and native cleanup
+      pass. Evidence: `/tmp/mb-m6-native-sql-file-qual-zssj11g9` and
+      `/tmp/mb-m6-native-sql-integration-jfhn_muh`. Physical main/journal/SHM/
+      temporary/volume backing, old-writer/quiescent policy, enclosing admission,
+      normal paged integration and current-source/installed/R5/R7 remain open.
+      Producers stay disabled; deferred hardware qualification is unchanged.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted
