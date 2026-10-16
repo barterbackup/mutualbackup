@@ -20,6 +20,7 @@ pub(crate) fn admit_native_control_writer(
     let path = data_dir.join("control.db");
     let guard =
         mb_store::DatabaseOpenGuard::capture(&path, &[std::ffi::OsStr::new("control.key")])?;
+    crate::volume::validate_preserved_control_key(data_dir, keys)?;
     let mut admitted_key = None;
     if guard.requires_existing_catalog() {
         crate::volume::with_inspected_control_key_snapshot(
@@ -64,6 +65,7 @@ pub(crate) fn require_native_source_state_from_catalog(
             Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
+        crate::volume::validate_preserved_control_key(data_dir, keys)?;
         crate::volume::with_inspected_control_snapshot(data_dir, keys, |control| {
             require_native_source_state(control, keys)
         })
