@@ -19365,7 +19365,7 @@ pub(crate) mod tests {
                 .join(candidate.anchor_id.to_string());
             let denied = candidate_root.join("nested/dense");
             let permissions = std::fs::metadata(&denied).unwrap().permissions();
-            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
             let denied_error = std::fs::File::open(&denied).unwrap_err();
             assert_eq!(denied_error.kind(), std::io::ErrorKind::PermissionDenied);
             let error = crate::snapshot::reanchor_recovered_revision(
