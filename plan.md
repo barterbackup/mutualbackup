@@ -6343,28 +6343,39 @@ disabled. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and native Windows/macO
 qualification remain user-deferred. A complete current-source qualification is
 still required with the initial-coverage diagnostics before installed jobs.
 
-Aggregate scratch physical declarations (implementation pending qualification, 2026-10-16):
-A separate immutable scratch-pool policy binds aggregate physical-byte/job limits
-to the existing resource policy. Admission reserves each VFS's full declared
-physical ceiling before file creation. Paired bounded counters and declarations
-are checked against at most 64 slots. Distinct OFD lock classes retain the original
-traversal names/bytes and prevent live scratch reclamation. The VFS owns its token
-until every anonymous file closes; stopped declarations retain debt until bounded
-reclamation. No borrowed or additional SQLite connection owns the token.
+Funded scratch ownership review (correction pending qualification, 2026-10-16):
+The isolated aggregate scratch component reserves complete physical ceilings
+and job slots from a paired immutable pool bound to the resource policy. Actual
+fallocate, checkpoint-copy and shared headroom checks remain independent.
+Retained-proof reconstruction prepays bounded declaration/reclamation and
+volume-registry work before creating each scratch index or ancestry stack.
 
-Resource-backed new paged scratch requires explicit enrollment. Existing resource
-catalogs remain readable; unsupported physical platforms fail before a funded
-scratch job starts. Per-file fallocate, checkpoint-copy reservation and shared
-filesystem headroom remain mandatory. Pool declarations are aggregate ceilings,
-not a promise of free blocks or authority to publish data. Traversal work credits
-and persistent SQL/WAL/volume physical admission remain separate. Retained proof
-reconstruction prepays the bounded pool/reclamation and volume-registry scans
-before each scratch index/stack. The prefix-budget case requires no new physical
-debt before later source validation. These checks remain unexecuted.
+Preceding source `309d0e1` passes 643 distinct cases in 683 executions: 558
+ordinary Store cases, both actual PID/OverlayFS probes, both resource-backed
+three-generation recovery layouts and 81 ordinary volume cases. Strict locked
+workspace/all-target Clippy and format pass. Independent execution audit verifies
+409 inputs, both drivers, exact case inventories and unmounted OverlayFS.
+This positive did not authorize integration. Review identified missing lifetime
+proof after the original SQLite connection closes. Two exact regressions on
+`4bf685d` reproduce a lease accepting a recreated database with the same inode,
+and a new full-pool grant after a valid empty-ledger restore while an original
+lease remains live. Both failed source/binary/log identities are preserved.
 
-The isolated branch includes concurrency, fault, copy, token-lifetime, constructor,
-SIGKILL and both-layout retained recovery cases. They are unexecuted; only format
-and diff checks have run. Do not treat this as qualified or enable producers.
-The main `d8e0581` complete source gate stays frozen and independent. Full physical
-admission, distributed current activation, normal paged production/retention/seed
-recovery and the enclosing R1/R2/R3/R5/R7 gates remain open.
+The correction pins the original database inode with an O_PATH capability,
+without retaining another SQLite connection or an ordinary main-file I/O
+handle. Closing an ordinary descriptor would release native POSIX locks; an
+independent rollback-mode writer test covers the pin close. Both scratch and
+traversal admission now probe every unrepresented kernel slot before choosing
+one. Missing live declarations cause refusal instead of replacement grants,
+even when a valid restored ledger retains some other scopes. Probes release
+unused slots; original domain, declaration, signed and wire encodings stay intact.
+The correction and new regressions remain unqualified; do not merge or enable
+producers until the new source/executable checks pass.
+
+Evidence: `/tmp/mb-m6-scratch-meter-qual-omuq5vui` and
+`/tmp/mb-m6-scratch-owner-red-0zn7e2qb`. This component bounds funded declarations
+only. It cannot fence older binaries or adopt already-live anonymous unfunded
+scratch. Quiescent enrollment/adoption, all-producer/global physical admission,
+persistent SQL/WAL/volume backing, distributed activation and normal paged
+production/retention/seed recovery remain open. R1/R2/R3/R5/R7 and M6 remain
+open; dense 1 TiB and native Windows/macOS qualification remain user-deferred.

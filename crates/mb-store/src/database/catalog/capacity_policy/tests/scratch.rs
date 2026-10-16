@@ -517,3 +517,99 @@ fn scratch_empty_restored_ledger_cannot_rebind_while_original_kernel_slot_is_liv
     assert_eq!(usage(&restored), (9, 1));
     next.check(9).unwrap();
 }
+
+#[test]
+fn scratch_partial_restored_ledger_cannot_skip_an_unrecorded_live_slot() {
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let path = temp.path().join("control.db");
+    let snapshot = temp.path().join("one-lease.db");
+    let represented = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    let checkpoint: (u32, u32, u32) = store
+        .connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint.0, 0);
+    std::fs::copy(&path, &snapshot).unwrap();
+    let unrecorded = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    drop(store);
+    std::fs::copy(&snapshot, &path).unwrap();
+    let restored = ControlStore::open(&path, &keys()).unwrap();
+    assert_eq!(usage(&restored), (3, 1));
+    assert!(matches!(
+        restored.reserve_catalog_scratch(6),
+        Err(CatalogStoreError::UnrecordedLiveCatalogWork)
+    ));
+    assert_eq!(usage(&restored), (3, 1));
+    represented.check(3).unwrap();
+    unrecorded.check(3).unwrap();
+    drop(unrecorded);
+    let next = restored.reserve_catalog_scratch(6).unwrap().unwrap();
+    assert_eq!(usage(&restored), (9, 2));
+    represented.check(3).unwrap();
+    next.check(6).unwrap();
+}
+
+#[test]
+fn scratch_identity_pin_close_preserves_another_sqlite_connections_posix_writer_lock() {
+    const CHILD: &str = "MB_SCRATCH_PIN_SQLITE_CHILD";
+    const CASE: &str = "database::catalog::capacity_policy::tests::scratch::scratch_identity_pin_close_preserves_another_sqlite_connections_posix_writer_lock";
+    if let Some(path) = std::env::var_os(CHILD) {
+        // ControlStore::open changes journal_mode to WAL. Use a raw child
+        // connection so SHM locks cannot mask loss of the main POSIX lock.
+        let connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "key", hex::encode(keys().database_key(b"control.db")))
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA cipher_compatibility=4; PRAGMA cipher_page_size=4096;")
+            .unwrap();
+        connection
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
+                r.get::<_, u64>(0)
+            })
+            .unwrap();
+        connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let error = connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect_err("original rollback-mode writer lost its main-file POSIX lock");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        return;
+    }
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 1))
+        .unwrap();
+    let mut lease = Some(store.reserve_catalog_scratch(3).unwrap().unwrap());
+    let mode: String = store
+        .connection
+        .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let writer =
+        Transaction::new_unchecked(&store.connection, TransactionBehavior::Immediate).unwrap();
+    for after_close in [false, true] {
+        if after_close {
+            drop(lease.take());
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([CASE, "--exact", "--nocapture"])
+            .env(CHILD, temp.path().join("control.db"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child writer exclusion failed after_close={after_close}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    writer.rollback().unwrap();
+}

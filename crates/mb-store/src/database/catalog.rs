@@ -189,6 +189,10 @@ pub enum CatalogStoreError {
     )]
     ScratchPoolExhausted,
     #[error(
+        "catalog work is still live outside this declaration set; finish or stop that work before retrying"
+    )]
+    UnrecordedLiveCatalogWork,
+    #[error(
         "retained data-source quota is exhausted; finish cancelled-source cleanup or increase the dataset limit"
     )]
     RetainedSourceQuotaExceeded,

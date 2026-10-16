@@ -234,6 +234,8 @@ fn release(cx: &Connection, ledger: Ledger, spec: Spec) -> Result<(), CatalogSto
 /// can return the declaration. Live slots cannot be cancelled or reclaimed.
 pub struct CatalogScratchLease {
     spec: Spec,
+    #[cfg(target_os = "linux")]
+    _database_identity: std::fs::File,
     token: FileLock,
 }
 impl CatalogScratchLease {
@@ -373,19 +375,15 @@ impl ControlStore {
         for spec in scopes {
             used[spec.slot as usize] = true;
         }
-        let mut slot = None;
-        for index in 0..SLOTS {
-            if !used[index as usize] && token.try_slot(index as u8)? {
-                slot = Some(index as u8);
-                break;
-            }
-        }
+        let slot = token.claim_slot(&used)?;
+        #[cfg(target_os = "linux")]
+        let database_identity = token.pin_database()?;
         let spec = Spec {
             version: 1,
             id: Uuid::new_v4(),
             physical_bytes,
             domain: token.domain.id,
-            slot: slot.ok_or(DatabaseError::CapacityExceeded)?,
+            slot,
         };
         for kind in [LEASE, LEASE_GUARD] {
             insert_exact(&tx, kind, spec.id.as_bytes(), &encoded(&spec)?)?;
@@ -393,7 +391,12 @@ impl ControlStore {
         write(&tx, old, next)?;
         token.check(self)?;
         tx.commit()?;
-        Ok(Some(CatalogScratchLease { spec, token }))
+        Ok(Some(CatalogScratchLease {
+            spec,
+            #[cfg(target_os = "linux")]
+            _database_identity: database_identity,
+            token,
+        }))
     }
 
     /// Reclaim at most one stopped VFS declaration. Process IDs and ages grant

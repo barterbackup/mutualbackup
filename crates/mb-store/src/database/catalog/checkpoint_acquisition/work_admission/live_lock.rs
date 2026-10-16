@@ -375,6 +375,76 @@ impl FileLock {
         }
     }
 
+    /// Hold the original inode after the SQLite connection closes. O_PATH
+    /// cannot perform file I/O, and closing it does not remove POSIX locks held
+    /// by another native SQLite connection. An ordinary main-file descriptor
+    /// must never be substituted here.
+    #[cfg(target_os = "linux")]
+    pub(in crate::database::catalog) fn pin_database(
+        &self,
+    ) -> Result<std::fs::File, CatalogStoreError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        self.check_owned()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&self.database_path)
+            .map_err(DatabaseError::from)?;
+        let metadata = file.metadata().map_err(DatabaseError::from)?;
+        if !metadata.is_file()
+            || (metadata.dev(), metadata.ino())
+                != (self.domain.database.device, self.domain.database.inode)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        self.check_owned()?;
+        Ok(file)
+    }
+
+    /// A valid older snapshot may omit still-live newer scopes. Probe every
+    /// unrepresented slot under the caller's writer instead of skipping busy
+    /// slots and granting replacement credits elsewhere. Retain only the new
+    /// slot; represented declarations keep their own ownership or debt.
+    pub(in crate::database::catalog) fn claim_slot(
+        &self,
+        used: &[bool; CATALOG_ACQUISITION_WORK_JOBS as usize],
+    ) -> Result<u8, CatalogStoreError> {
+        let mut selected = None;
+        for slot in 0..CATALOG_ACQUISITION_WORK_JOBS as u8 {
+            if used[slot as usize] {
+                continue;
+            }
+            if !self.try_slot(slot)? {
+                return Err(CatalogStoreError::UnrecordedLiveCatalogWork);
+            }
+            if selected.is_none() {
+                selected = Some(slot);
+            } else {
+                self.unlock_slot(slot)?;
+            }
+        }
+        selected.ok_or(DatabaseError::CapacityExceeded.into())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unlock_slot(&self, slot: u8) -> Result<(), CatalogStoreError> {
+        use std::os::fd::AsRawFd;
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_UNLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = slot.into();
+        lock.l_len = 1;
+        if unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_OFD_SETLK, &lock) } != 0 {
+            return Err(DatabaseError::from(std::io::Error::last_os_error()).into());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn unlock_slot(&self, _: u8) -> Result<(), CatalogStoreError> {
+        Err(CatalogStoreError::UnsupportedTraversalOwnership)
+    }
+
     /// Check an owned allocation token without retaining or reopening SQLite.
     /// No main-file descriptor is opened/closed, preserving native POSIX locks.
     pub(in crate::database::catalog) fn check_owned(&self) -> Result<(), CatalogStoreError> {
@@ -433,6 +503,33 @@ impl FileLock {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_admission_rejects_unrepresented_owners_and_releases_unused_probes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+        for class in [TRAVERSAL, SCRATCH] {
+            let first = FileLock::open(&store, None, true, class).unwrap();
+            assert_eq!(first.claim_slot(&[false; 64]).unwrap(), 0);
+            assert!(first.try_slot(7).unwrap());
+            let mut used = [false; 64];
+            used[0] = true;
+            for expected in [[false; 64], used] {
+                let observer = FileLock::open(&store, Some(first.domain), false, class).unwrap();
+                assert!(matches!(
+                    observer.claim_slot(&expected),
+                    Err(CatalogStoreError::UnrecordedLiveCatalogWork)
+                ));
+            }
+            first.unlock_slot(7).unwrap();
+            let next = FileLock::open(&store, Some(first.domain), false, class).unwrap();
+            assert_eq!(next.claim_slot(&used).unwrap(), 1);
+            let observer = FileLock::open(&store, Some(first.domain), false, class).unwrap();
+            assert!(!observer.try_slot(0).unwrap());
+            assert!(!observer.try_slot(1).unwrap());
+            assert!(observer.try_slot(2).unwrap());
+        }
+    }
 
     #[test]
     fn separate_work_classes_keep_independent_domains_and_kernel_slots() {

@@ -322,20 +322,14 @@ impl ControlStore {
             }
         }
         let token = FileLock::admit(&tx, self, has_scopes, live_lock::TRAVERSAL)?;
-        let mut slot = None;
-        for index in 0..CATALOG_ACQUISITION_WORK_JOBS {
-            if !used[index as usize] && token.try_slot(index as u8)? {
-                slot = Some(index as u8);
-                break;
-            }
-        }
+        let slot = token.claim_slot(&used)?;
         let s = Spec {
             version: 2,
             id: Uuid::new_v4(),
             selected,
             budget,
             domain: token.domain.id,
-            slot: slot.ok_or(DatabaseError::CapacityExceeded)?,
+            slot,
         };
         let bytes = canonical_bytes(&s)?;
         for kind in [SCOPE, SCOPE_GUARD] {

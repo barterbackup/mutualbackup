@@ -2720,25 +2720,32 @@ shared resource admission and normal paged production/retention/recovery.
       `/tmp/mb-m6-live-overlay-red-s_dep78t`.
       Physical SQL/WAL/page/payload/scratch backing, other producers, distributed
       activation and normal paged integration remain open. Producers stay disabled.
-    - [ ] Qualify aggregate physical scratch-pool admission.
-      The isolated `codex/m6-physical-admission` implementation reserves whole
-      per-VFS physical ceilings and job slots from a separate paired ledger bound
-      to the existing resource policy. Distinct kernel lock classes preserve
-      traversal wire/local identities. The VFS owns its noncloneable lease through
-      final file close; normal drop and process death leave bounded reclaimable
-      debt. Resource-backed new scratch requires explicit pool enrollment, while
-      existing catalogs remain readable. Actual extent allocation, checkpoint-copy
-      reserves and shared filesystem headroom remain enforced independently.
-      Retained-proof work metering now prepays bounded admission/reclamation and
-      registry scans before every scratch index/stack; a prefix-budget fixture
-      requires unchanged scratch debt on early refusal. This is unexecuted.
-      Source includes byte/job concurrency, atomic ABORT/IGNORE faults, corrupted
-      pairs/markers, copies, owned VFS lifetime, constructor failure, SIGKILL and
-      both retained-recovery-layout checks. These tests have NOT run. Only format
-      and diff checks have passed; do not merge or advertise this increment until
-      type/build, ownership/VFS and recovery qualification pass. Main `d8e0581`
-      stays frozen for its separate complete source qualification. Persistent
-      database/volume physical admission and normal paged integration remain open.
+    - [ ] Qualify funded scratch declarations with replacement-safe ownership.
+      The separate pool reserves full per-VFS physical ceilings and job slots,
+      retains kernel ownership through final file close, and leaves bounded
+      reclaimable debt. Actual extent allocation, checkpoint-copy reserves and
+      shared headroom stay mandatory. Retained-proof admission prepays bounded
+      pool/reclamation and registry scans before creating each scratch index.
+      Preceding source `309d0e1` passes 643 distinct cases in 683 executions:
+      Store 558, both real ownership probes, both resource-backed retained
+      recovery layouts and 81 volume cases, plus strict workspace Clippy/format.
+      The independent execution audit verifies 409 inputs and both drivers;
+      OverlayFS cleanup is verified. Integration was withheld after review.
+      Two regressions on `4bf685d` then reproduce acceptance of a recycled
+      database inode and a whole-pool grant after restoring an empty ledger
+      while the old kernel lease is still live. Preserve both negative cases
+      and the earlier positives; a suite pass does not qualify those behaviors.
+      The corrected implementation holds the original inode with O_PATH and
+      probes every unrepresented kernel slot before selecting one, including
+      partial restored ledgers. It adds an independent DELETE-mode SQLite
+      writer-exclusion check for closing the pin. These corrections await
+      runtime and ownership qualification; do not merge or enable producers.
+      Evidence: `/tmp/mb-m6-scratch-meter-qual-omuq5vui` and
+      `/tmp/mb-m6-scratch-owner-red-0zn7e2qb`.
+      This bounds funded declarations only: older binaries and already-live
+      anonymous unfunded scratch are not fenced/adopted. Complete quiescent
+      enrollment/adoption, all-producer/global physical admission, persistent
+      SQL/WAL/volume backing and normal paged integration remain open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted
