@@ -1326,6 +1326,21 @@ requirements. The recorded implementation and runtime results that follow the
 current correction queue are historical, including any superseded statements
 that guarded completion is required.
 
+Follow-up source review on 2026-10-16 of `4065dba..7c63600` confirms progress
+toward M6 through shared traversal/scratch ownership, retained-anchor preservation
+and explicit native SQL physical admission. No new severe defect was confirmed
+in the reviewed paths, including the local SQLite/SQLCipher extensions and key
+policy dispatch. The physical Store APIs and authenticated format-2 readers are
+not yet normal persistent startup enrollment; mutable Node startup still rejects
+format 2. Complete durable creation/restart/adoption and shared resource
+reservations before enabling normal paged producers. `TODO.md` now tracks those
+next integration steps and the stale vendored bridge contract explicitly.
+The later complete-source pass on `d8e0581` and ordinary Node pass on `efbe298`
+are recorded historical evidence, not qualification of all current merged code
+or an installed artifact. R5 causal diagnosis and the other M6 gates remain open.
+The tree was clean at review start; no builds, tests or runtime probes ran in
+this pass.
+
 Source review on 2026-10-16 of `28e863c..fb19875` confirms the retained-writer
 recovery correction. Original key authentication remains in body admission;
 both layouts run the complete predecessor transition before publication, so new
@@ -1639,27 +1654,28 @@ availability/activation, normal backup/retention/seed recovery and R5/R7 stay
 open. Producers stay disabled; hardware runs remain user-deferred. See ADR 0002
 and `/tmp/mb-m6-packing-output-custody-h2mugql5`.
 
-R3-RETAINED-WRITER-RECOVERY and the Linux parity-volume handoff now have focused
-passing evidence below. Diagnose the first 90-second network-coverage timeout
-that blocked complete source qualification on `c2c82ef`, using the `fb19875`
-diagnostics without extending deadlines or weakening protection. Preserve the
-earlier native capture/packing timeout and historical relay-only stall separately;
-the later diagnostic positives establish no cause. Complete exact-source
-qualification before resuming installed candidate gates. Continue the remaining
-R1 safe-upgrade/recovery contract and complete shared R2/R3 resource admission,
-including SQL/WAL/page, scratch,
-traversal and physical reservations for R3-SINGLE-OWNER-METADATA. Individual
-quota and acquisition increments do not close the required single-owner 1 TiB
-policy. Finish distributed availability/current activation, remaining checkpoint
-ownership joins and normal paged capture/packing/checkpoint/retention and
-seed-only recovery under that policy before enabling producers or claiming
-retained-capacity completion. R5 topology/signature diagnosis and repeated
-validation should continue alongside them. R4 evacuation and R6 packaging are
-complete; preserve their regressions under R7 exact release-artifact validation.
-Complete all applicable corrections before Milestone 7 compatibility freeze.
-Native Windows/macOS work remains in
-the roadmap; a narrower production platform scope requires an explicit product
-decision rather than treating missing platform support as complete.
+R3-RETAINED-WRITER-RECOVERY and the Linux parity-volume handoff have focused
+passing evidence below. The complete-source prerequisite subsequently passed
+on `d8e0581`, followed by further source changes; `efbe298` also has a complete
+ordinary Node pass. Require fresh qualification of the merged source before
+installed candidate gates. Preserve and diagnose the original 90-second initial
+coverage failure, 900-second native timeout and historical relay-only stall
+separately; later positives establish no cause and do not close R5.
+
+Prioritize durable native-policy creation/restart and quiescent existing/copy
+adoption, then integrate complete shared SQL/WAL/SHM/temporary, scratch, payload
+and checkpoint-copy reservations across normal operations and volumes. Current
+per-connection physical limits and traversal/scratch ledgers are increments
+toward R3-SINGLE-OWNER-METADATA, not complete single-owner 1 TiB admission.
+Continue the remaining R1 safe-upgrade/recovery contract. Finish distributed
+availability/current activation, checkpoint ownership joins and normal paged
+capture/packing/checkpoint/retention/seed-only recovery under the complete policy
+before enabling producers or claiming retained-capacity completion. R5 diagnosis
+and R7 release qualification continue alongside this integration. R4 evacuation
+and R6 packaging are complete; preserve their regressions. Complete all applicable
+corrections before Milestone 7 compatibility freeze. Native Windows/macOS work
+remains in the roadmap; a narrower production platform scope requires an explicit
+product decision rather than treating missing platform support as complete.
 
 On 2026-10-10 the user deferred the real dense 1 TiB recovery run and native
 Windows/macOS qualification until the tool and other items are ready and

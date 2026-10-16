@@ -98,6 +98,23 @@ still required. None of these positives diagnoses the original initial-coverage,
 native-capture or relay-only observations. R1/R2/R3/R5/R7 and M6 remain open;
 normal paged producers remain disabled.
 
+Follow-up source review on 2026-10-16 of `4065dba..7c63600` finds substantive
+progress in shared traversal/scratch ownership, native SQL allocation control
+and preservation of retained recovery anchors. No new severe defect was
+confirmed in the reviewed ownership, recovery, physical VFS/local vendor patch
+or key-policy paths. Native physical admission still uses explicit Store APIs;
+ordinary Node/control/parity startup does not yet enroll a persistent policy.
+Format-2 key envelopes support authenticated read-only inspection, while mutable
+startup deliberately rejects them. These are foundations for the remaining
+R2/R3 gate, not production activation. Prioritize durable native-policy
+creation/restart/adoption and complete shared reservations, then connect normal
+paged production/retention/recovery. The `d8e0581` complete-source pass and
+`efbe298` ordinary Node pass are historical evidence; qualify the current merged
+source and installed artifact separately. R5's three unexplained observations
+remain open, as do R1 and the deferred dense-capacity/platform requirements.
+The tree was clean at review start. This pass ran no builds, tests or runtime
+probes; recorded execution claims were not independently rerun.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -2912,6 +2929,29 @@ normal paged producers remain disabled.
       fresh birth/restart, shared managed ownership, old-writer/copy adoption,
       global/enclosing admission and normal producers remain open, alongside
       complete current-source/installed/R1/R2/R3/R5/R7 and deferred hardware gates.
+    - [ ] Connect native I/O policy to durable control/parity startup ownership.
+      Publish the authenticated policy/key and initial ownership through an
+      interruption-safe creation/restart protocol; retain policy enforcement
+      through ordinary writable opens, rekey and reopen. Define quiescent
+      enrollment of existing catalogs and restored/copied inputs so old writers
+      cannot bypass admission or obtain duplicate live capacity. Preserve v1
+      compatibility and read-only recovery; do not remove the current v2 mutable
+      rejection before that path exists. Qualify interrupted publication,
+      partial creation, missing/replaced files, owner restart and copy adoption
+      with exact original data and admission limits preserved.
+    - [ ] Compose native SQL/WAL/SHM/temporary, scratch and payload reservations
+      across normal operations and volumes, including checkpoint/rebuild copies
+      and headroom. Per-connection physical ceilings and separate traversal or
+      scratch ledgers do not establish this complete shared policy. Bind it to
+      ordinary producers and restart/retirement before enabling normal paged
+      backup; retain the required single-owner 1 TiB geometry and history target.
+    - [ ] Refresh the vendored SQLite bridge contract before release review.
+      `vendor/libsqlite3-sys/MUTUALBACKUP.md` describes the original 1043 native
+      descriptor lookup but omits the later 1044 SHM descriptor, 1045 SHM
+      initialization callback and anonymous temporary-descriptor transfer API.
+      Document their lifetime/ownership and native lock requirements, and narrow
+      the no-I/O/no-open-or-close statement to descriptor lookup. This is a
+      documentation correction, not a confirmed defect in the reviewed bridge.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted
@@ -5349,7 +5389,7 @@ normal paged producers remain disabled.
     starting installed jobs. Retain the earlier 900-second native capture/packing
     timeout and the historical 5,400-second relay-only stall separately; a later
     pass does not establish a common cause or close either investigation.
-    Current-source prerequisite passes on `d8e0581` (2026-10-16): all
+    The source prerequisite passed on `d8e0581` (2026-10-16): all
     1,613 distinct cases run freshly on one frozen source/executable set.
     The complete Node suite passes all 594 ordinary cases, including this exact
     previously failing fixture; Core 210, Store 547, Git 131, process 23, all
@@ -5358,8 +5398,9 @@ normal paged producers remain disabled.
     Strict workspace Clippy, formatting, builds and independent 407-input/
     23-executable audit pass; native cleanup and old failure preservation are
     verified. Read-only host/thread telemetry covers the latter run. No deadline,
-    payload or protection assertion changed. This satisfies the complete-source
-    prerequisite, but does not diagnose any of the three distinct historical
+    payload or protection assertion changed. This satisfied the complete-source
+    prerequisite for that source; subsequent changes require fresh combined
+    qualification. It does not diagnose any of the three distinct historical
     observations or close this item/R5/R7. No installed jobs ran; 121 ignored
     cases remain unexecuted. Evidence:
     `/tmp/mb-m6-shared-traversal-qual-s1de_h23`.
