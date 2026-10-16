@@ -422,11 +422,6 @@ pub(crate) fn stable_source_for_catalog_migration(
     }
 }
 
-struct PendingAnchor {
-    manifest: mb_store::StableAnchorManifest,
-    committed: bool,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct CaptureIntent {
     format_version: u16,
@@ -1041,20 +1036,6 @@ pub(crate) fn abandon_recovered_anchor_capture(
     Ok(())
 }
 
-impl PendingAnchor {
-    fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for PendingAnchor {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.manifest.remove();
-        }
-    }
-}
-
 pub(crate) struct WriterCredentials<'a> {
     pub epoch: u64,
     pub secret: &'a [u8; 32],
@@ -1172,17 +1153,14 @@ pub(crate) fn prepare_revision(
         source_root,
     )?;
     let result = (|| {
-        let mut anchor = PendingAnchor {
-            manifest: intent
-                .plan
-                .capture(control)
-                .context("capture source anchor")?,
-            committed: false,
-        };
-        canonical_size_bounded(&anchor.manifest, V1_MAX_CATALOG_BYTES / 2)
+        let anchor = intent
+            .plan
+            .capture(control)
+            .context("capture source anchor")?;
+        canonical_size_bounded(&anchor, V1_MAX_CATALOG_BYTES / 2)
             .context("captured source catalog exceeds the v1 bounded-object limit")?;
-        validate_capture_sector_budget(&anchor.manifest)?;
-        let anchor_area = revision_anchor_area(control, &anchor.manifest)?;
+        validate_capture_sector_budget(&anchor)?;
+        let anchor_area = revision_anchor_area(control, &anchor)?;
         let encryption_key = keys.guild_data_key(&guild_id);
         let content_id_key = keys.guild_content_id_key(&guild_id);
         let mut data_references = Vec::new();
@@ -1193,7 +1171,7 @@ pub(crate) fn prepare_revision(
         let mut prepared_links = BTreeMap::<NativeFileId, u64>::new();
         let mut next_link_group = 0_u64;
 
-        for entry in &anchor.manifest.entries {
+        for entry in &anchor.entries {
             match entry {
                 CapturedEntry::Directory {
                     path,
@@ -1218,7 +1196,7 @@ pub(crate) fn prepare_revision(
                     modified_secs,
                     modified_nanos,
                 } => {
-                    let locator = anchor.manifest.file_locator_path(path)?;
+                    let locator = anchor.file_locator_path(path)?;
                     let mut file = open_revision_anchor(&locator, &anchor_area)
                         .context("open captured anchor file")?;
                     let mut remaining = *logical_len;
@@ -1291,7 +1269,7 @@ pub(crate) fn prepare_revision(
                         });
                         continue;
                     }
-                    let locator = anchor.manifest.file_locator_path(path)?;
+                    let locator = anchor.file_locator_path(path)?;
                     let private_extents = prepare_sparse_file(
                         &mut recipe_records,
                         keys,
@@ -1347,9 +1325,9 @@ pub(crate) fn prepare_revision(
             canonical_bytes_bounded(
                 &GitPrivateMetadataV5 {
                     format_version: 5,
-                    root_mode: anchor.manifest.root_mode,
-                    root_modified_secs: anchor.manifest.root_modified_secs,
-                    root_modified_nanos: anchor.manifest.root_modified_nanos,
+                    root_mode: anchor.root_mode,
+                    root_modified_secs: anchor.root_modified_secs,
+                    root_modified_nanos: anchor.root_modified_nanos,
                     entries: private_entries,
                     git,
                 },
@@ -1360,9 +1338,9 @@ pub(crate) fn prepare_revision(
             canonical_bytes_bounded(
                 &PrivateMetadata {
                     format_version: 3,
-                    root_mode: anchor.manifest.root_mode,
-                    root_modified_secs: anchor.manifest.root_modified_secs,
-                    root_modified_nanos: anchor.manifest.root_modified_nanos,
+                    root_mode: anchor.root_mode,
+                    root_modified_secs: anchor.root_modified_secs,
+                    root_modified_nanos: anchor.root_modified_nanos,
                     entries: private_entries,
                 },
                 V1_MAX_CATALOG_BYTES,
@@ -1427,13 +1405,13 @@ pub(crate) fn prepare_revision(
         records.extend([
             (
                 ANCHOR_AREA_LOCATION_KIND.to_owned(),
-                anchor.manifest.area.area_id.as_bytes().to_vec(),
+                anchor.area.area_id.as_bytes().to_vec(),
                 canonical_bytes(&RawLocalPath(anchor_area.clone()))?,
             ),
             (
                 "anchor-manifest".to_owned(),
                 revision_id.as_bytes().to_vec(),
-                canonical_bytes(&anchor.manifest)?,
+                canonical_bytes(&anchor)?,
             ),
             (
                 "user-revision".to_owned(),
@@ -1453,9 +1431,8 @@ pub(crate) fn prepare_revision(
                 canonical_bytes(&captured_change_sequence)?,
             ));
         }
-        remember_anchor_area_location(control, anchor.manifest.area.area_id, &anchor_area)?;
+        remember_anchor_area_location(control, anchor.area.area_id, &anchor_area)?;
         control.finalize_capture_records(revision_id.as_bytes(), &records)?;
-        anchor.commit();
         if git_graph.is_some() {
             // A crash here leaves a harmless intent; startup reconciliation
             // retires it after observing the committed revision.
@@ -2158,16 +2135,15 @@ pub(crate) fn reanchor_recovered_revision(
             (intent, bytes)
         }
     };
-    let mut anchor = PendingAnchor {
-        manifest: intent
-            .plan
-            .capture(control)
-            .context("capture recovered source anchor")?,
-        committed: false,
-    };
+    // The already durable intent owns this candidate, including any retained
+    // pins transferred by an earlier interrupted retry. Validation errors must
+    // keep its bytes; checked abandonment/retirement performs physical cleanup.
+    let anchor = intent
+        .plan
+        .capture(control)
+        .context("capture recovered source anchor")?;
     #[cfg(test)]
     if INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE.with(|interrupt| interrupt.replace(false)) {
-        anchor.commit();
         bail!("injected interruption after recovered-anchor capture");
     }
     let (mut records, anchor_area) = recovered_anchor_records(
@@ -2176,12 +2152,12 @@ pub(crate) fn reanchor_recovered_revision(
         guild_id,
         revision,
         &metadata,
-        &anchor.manifest,
+        &anchor,
         git_backup.as_ref(),
         git_repository.as_ref(),
     )?;
     if let Some(old) = intent.replaced_anchor.as_ref()
-        && old.anchor_id != anchor.manifest.anchor_id
+        && old.anchor_id != anchor.anchor_id
     {
         records.push((
             ANCHOR_RETIREMENT_KIND.to_owned(),
@@ -2189,11 +2165,10 @@ pub(crate) fn reanchor_recovered_revision(
             canonical_bytes(old)?,
         ));
     }
-    // The durable intent now owns this completed anchor. Keep it for an exact
-    // retry if the following SQL transaction fails or the process stops.
-    anchor.commit();
+    // Keep intent ownership through partial retained-source transfer and the
+    // final flat-recipe publication, including failed writers and process loss.
     replace_retained_recovery_sources(control, keys, &records)?;
-    remember_anchor_area_location(control, anchor.manifest.area.area_id, &anchor_area)?;
+    remember_anchor_area_location(control, anchor.area.area_id, &anchor_area)?;
     control.finalize_recovery_anchor_records(
         revision.value.revision_id.as_bytes(),
         &intent_bytes,

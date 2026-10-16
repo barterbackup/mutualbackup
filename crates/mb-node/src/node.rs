@@ -18932,18 +18932,28 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn native_capture_migrates_and_restores_retained_paged_sparse_tree() {
-        native_retained_paged_sparse_tree_with_quota(true);
+        native_retained_paged_sparse_tree_with_quota(true, false);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn native_existing_paged_sources_adopt_quotas_and_restore_after_source_loss() {
-        native_retained_paged_sparse_tree_with_quota(false);
+        native_retained_paged_sparse_tree_with_quota(false, false);
     }
 
     #[cfg(target_os = "linux")]
-    fn native_retained_paged_sparse_tree_with_quota(quotas_before_migration: bool) {
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn native_paged_recovery_keeps_pinned_anchor_after_retry_validation_error() {
+        native_retained_paged_sparse_tree_with_quota(true, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_retained_paged_sparse_tree_with_quota(
+        quotas_before_migration: bool,
+        retry_validation_error: bool,
+    ) {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let root =
@@ -19315,6 +19325,91 @@ pub(crate) mod tests {
                 (current.generation == 1).then_some(current)
             })
             .unwrap();
+        if retry_validation_error {
+            let intent_bytes = node
+                .control
+                .get_record(
+                    "recovery-anchor-intent",
+                    legacy.value.revision_id.as_bytes(),
+                )
+                .unwrap()
+                .unwrap();
+            type Intent = (
+                u16,
+                [u8; 32],
+                Uuid,
+                PathBuf,
+                mb_store::SourceCapturePlan,
+                Option<mb_store::StableAnchorManifest>,
+            );
+            let (version, owner_guild, revision_id, source, plan, replaced): Intent =
+                decode_canonical(&intent_bytes).unwrap();
+            assert_eq!(version, 2);
+            assert_eq!(owner_guild, guild);
+            assert_eq!(revision_id, legacy.value.revision_id);
+            assert_eq!(source, ordinary.canonicalize().unwrap());
+            assert_eq!(replaced, Some(old_manifest.clone()));
+            let candidate = plan.captured_manifest(&node.control).unwrap();
+            assert_eq!(candidate.anchor_id, partial.anchor);
+            assert!(
+                crate::PagedPrivateMetadata::native_data_source_available(
+                    &node.control,
+                    &node.keys,
+                    &partial,
+                )
+                .unwrap()
+            );
+            let candidate_root = candidate
+                .area
+                .path_hint
+                .join(candidate.anchor_id.to_string());
+            let denied = candidate_root.join("nested/dense");
+            let permissions = std::fs::metadata(&denied).unwrap().permissions();
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let denied_error = std::fs::File::open(&denied).unwrap_err();
+            assert_eq!(denied_error.kind(), std::io::ErrorKind::PermissionDenied);
+            let error = crate::snapshot::reanchor_recovered_revision(
+                &node.control,
+                &node.keys,
+                guild,
+                &legacy,
+                &ordinary,
+            )
+            .unwrap_err();
+            eprintln!("recovery retry validation error: {error:#}");
+            assert!(
+                format!("{error:#}").contains("Permission denied"),
+                "{error:#}"
+            );
+            assert!(
+                candidate_root.is_dir(),
+                "validation error removed a recovery anchor already pinned by a retained owner"
+            );
+            std::fs::set_permissions(&denied, permissions).unwrap();
+            assert_eq!(
+                node.control
+                    .get_record(
+                        "recovery-anchor-intent",
+                        legacy.value.revision_id.as_bytes()
+                    )
+                    .unwrap(),
+                Some(intent_bytes)
+            );
+            assert_eq!(
+                node.control
+                    .paged_revision_data_source(partial.catalog.bundle.id, partial.source.sector.id)
+                    .unwrap(),
+                Some(partial.clone())
+            );
+            assert!(
+                crate::PagedPrivateMetadata::native_data_source_available(
+                    &node.control,
+                    &node.keys,
+                    &partial,
+                )
+                .unwrap()
+            );
+        }
         // Lose the restored tree too. Its already captured bytes must remain
         // owned while a fresh restore retries the interrupted transfer.
         for directory in [ordinary.join("nested"), ordinary.join("nested/deeper")] {

@@ -6491,3 +6491,30 @@ new combined complete-source and installed qualification remain required. R5's
 initial-coverage, native-capture and historical relay-only observations remain
 separate and unexplained. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and
 native Windows/macOS qualification remain user-deferred.
+
+### 2026-10-16 — Preserve retained recovery anchors on retry errors
+
+Actual native `090ee7e` partially transfers retained ownership, verifies the
+replacement is readable/pinned, then retries after a temporary payload EACCES.
+The destructor deletes that still-owned replacement; the intended assertion
+fails after admission preflights. Qualified `956a238` removes that destructor
+and leaves ownership with the already durable capture/recovery intent. Checked
+plan discard, abandonment and retirement retain their original pin guards.
+
+The regression now preserves exact binding/generation and readable bytes, then
+finishes fresh recovery/retirement. All 36 ordinary snapshots and eleven native
+snapshot/retained cases pass: 47 distinct cases in 48 executions. Strict locked
+workspace/all-target Clippy, formatting and independent 410-input/one-driver/
+exact-case/fresh-compiler audit pass. Native cleanup and original failure
+source/driver/image preservation verify. The fixture's sole lexical adjustment
+is decimal zero to octal `0o000`, with identical permission bits. Evidence:
+`/tmp/mb-m6-pinned-retry-red-rebuilt-zzocozlf` and
+`/tmp/mb-m6-intent-owned-recovery-qual-octal-6qg68qcl`.
+
+The initial copied cached driver ran zero cases and was rejected by inventory;
+explicit rebuild produced the real negative. The first positive attempt stopped
+at the fixture literal lint before tests. These are separate control records.
+Other cleanup/replay consumers, operational backoff, complete R1/R2/R3 admission
+and normal paged integration remain open; producers stay disabled. Full current
+source/installed, R5 causal and remaining M6 gates remain open. Dense 1 TiB and
+native Windows/macOS qualification remain user-deferred.
