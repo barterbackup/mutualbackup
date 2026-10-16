@@ -7703,54 +7703,56 @@ complete-source or installed-artifact gate and explains none of the original
 initial-coverage/native-capture/relay-only observations. Dense 1 TiB and native
 Windows/macOS qualification remain user-deferred.
 
-Funded scratch ownership binding (correction pending qualification, 2026-10-16):
-The aggregate scratch component reserves full VFS physical ceilings and job
-slots; actual fallocate, checkpoint-copy reserves and shared filesystem headroom
-remain mandatory. Retained-proof callers prepay bounded declaration/reclamation
-and volume-registry work before creating their scratch indexes and stack.
+Funded scratch ownership binding (focused qualification, 2026-10-16):
+The separate pool reserves full per-VFS physical ceilings and job slots before
+anonymous scratch creation. Actual fallocate, checkpoint-copy reserves and
+shared headroom remain mandatory. Retained-proof callers prepay bounded
+pool/reclamation and volume-registry work before scratch indexes and stack.
 
-Preceding `309d0e1` passes 643 distinct cases in 683 executions (Store558, actual
-kernel probes2, Node retained recovery2 and volume81), strict workspace Clippy
-and format. Independent execution audit verifies409 inputs, both drivers and
-OverlayFS cleanup. Integration was withheld after review. Two real regressions
-on `4bf685d` reproduce acceptance of a recycled database inode and a full-pool
-grant after restoring an empty ledger while an old lease remains live. The first
-O_PATH/unused-slot correction is also insufficient: `ecfc26e` reproduces an old
-small declaration impersonating a later full-pool owner of the same reused slot.
-All exact failed sources, executables and logs remain preserved.
+Review withheld `309d0e1` despite its643 distinct passing cases. Exact regressions
+on `4bf685d` show a lease accepting a recycled main-file inode and an empty-ledger
+restore granting over a live reservation. The first O_PATH/unused-slot correction
+still fails on `ecfc26e`: an old small declaration impersonates a later full-pool
+owner of its reused slot. All three failed source/driver/log identities remain
+preserved; the earlier positive remains separate evidence.
 
-The new correction pins the original main inode through O_PATH, whose close
-must preserve other SQLite POSIX locks. Each scope additionally holds an OFD
-lock on an empty UUID-named owner file, bound by exact device/inode in its local
-declaration. One private directory per class has at most one file per aggregate
-slot (64 total), including failed-admission/crash orphans. Under the existing
-writer, a bounded scan verifies every live owner's UUID/identity against the
-current declaration set and checks aggregate liveness. Dead debt remains charged;
-missing/reused live owners refuse new grants. All unused aggregate slots are
-also probed. The selected slot replaces only a stopped prior empty owner file;
-file/directory entries are synced before committing. Guards check both owner
-and aggregate mappings. Reclamation still requires a free aggregate slot or
-proven independent copy. Existing files are inspected through O_PATH before
-ordinary I/O, avoiding a substituted SQLite main-file descriptor.
+Corrected `ad2c2e9` pins the original main inode with O_PATH and binds each scope
+to a separately locked UUID owner file plus exact device/inode. A private
+directory per class holds at most one empty owner file per slot (64 total),
+including crash orphans. Under the existing writer, bounded scans compare all
+live owner files with current declarations and aggregate liveness; unknown or
+reused owners refuse new grants. Dead debt stays charged. All unused aggregate
+slots are also probed. The selected slot replaces only a stopped prior owner;
+file/directory entries are synced before committing. Guards check both mappings
+through final close. Reclamation still requires a free aggregate slot or proven
+independent copy. Existing files are inspected through O_PATH before ordinary
+I/O, avoiding a substituted SQLite main-file descriptor.
 
-New domain version3, scratch declaration2 and traversal declaration3 bind owner
-identity locally. Explicit old/new codecs preserve original canonical bytes and
-lease hashes. Old kernel declarations remain readable/debt and block new grants
-until stopped and drained; version1 copies and old process envelopes retain
-unproven debt. Proven version2/3 copies keep independent reclamation. No signed,
-wire, original resource-policy or per-checkpoint admission format changes.
+Domain3, scratch declaration2 and traversal declaration3 append local ownership.
+Explicit codecs preserve original bytes/hashes; old kernel debt blocks new
+grants until stopped and drained. Version1 copies and old process envelopes
+keep unproven debt; proven2/3 copies retain independent reclamation. Original
+resource-policy, signed/wire and per-checkpoint admission formats stay intact.
 
-New cases cover both pools' reused slots, valid partial restore, owner-file
-replacement, bounded churn, actual legacy byte/hash replay and an independent
-DELETE-mode SQLCipher writer after pin close. Strict Store/all-target Clippy and
-format pass. Runtime/native/ownership checks remain pending; do not merge or
-enable producers. Evidence: `/tmp/mb-m6-scratch-meter-qual-omuq5vui`,
+All18 scratch cases pass, including all three reproduced failures, partial
+restores, owner replacement, bounded churn, original legacy replay and independent
+DELETE-mode writer exclusion after pin close. All5 lock,20 work,7 scratch/VFS
+and both actual namespace/OverlayFS probes pass. Node retained recovery2,
+volume81 and ordinary snapshot36 pass; Btrfs funded scratch and all8 native
+snapshot cases pass: 179 distinct cases in181 executions. Strict locked
+workspace/all-target Clippy and format pass. Independent audit verifies410
+inputs, both executed drivers, exact case inventories, unchanged qualified
+standalone source code and preserved negative artifacts. Owned OverlayFS and
+Btrfs mounts, loop and image are verified cleaned. Evidence:
+`/tmp/mb-m6-owned-scope-qual-n2wz8784`; original negatives at
 `/tmp/mb-m6-scratch-owner-red-0zn7e2qb` and
 `/tmp/mb-m6-scratch-reused-slot-red-lqv6lhm4`.
 
-This governs funded declarations only. Older unfunded producers and already-live
-anonymous scratch are not fenced/adopted. Complete quiescent enrollment/adoption,
-all-producer/global physical admission, persistent SQL/WAL/volume backing,
-distributed activation and normal paged production/retention/recovery remain
-open with R1/R2/R3/R5/R7 and M6. Dense 1 TiB and native Windows/macOS
+This qualifies new funded ownership within preserved local bookkeeping. Complete
+old-writer/quiescent enrollment, database relocation/restore policy, all-producer/
+global physical admission, persistent SQL/WAL/volume backing, distributed
+activation and normal paged production/retention/recovery remain open. No
+producer is enabled. This is focused integration, not a complete current-source
+or installed-artifact gate, and diagnoses none of the three historical R5
+observations. R1/R2/R3/R5/R7 and M6 remain open; dense1TiB and native Windows/macOS
 qualification remain user-deferred.
