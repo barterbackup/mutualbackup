@@ -151,15 +151,24 @@ fn scratch_byte_and_job_limits_compete_across_connections_without_stealing_live_
 #[test]
 fn scratch_policy_enrollment_faults_roll_back_and_exact_replay_is_immutable() {
     for action in ["ABORT,'fixture'", "IGNORE"] {
-        for target in ["guard", "marker"] {
+        for target in ["guard", "marker", "domain", "domain-guard"] {
             let (temp, store) = setup();
             let trigger = if target == "guard" {
                 format!(
                     "CREATE TEMP TRIGGER refuse_scratch BEFORE INSERT ON protocol_records WHEN NEW.kind='catalog-scratch-pool-guard-v1' BEGIN SELECT RAISE({action}); END"
                 )
-            } else {
+            } else if target == "marker" {
                 format!(
                     "CREATE TEMP TRIGGER refuse_scratch BEFORE INSERT ON meta WHEN NEW.key='catalog_scratch_pool_version' BEGIN SELECT RAISE({action}); END"
+                )
+            } else {
+                let kind = if target == "domain" {
+                    "catalog-scratch-domain-v1"
+                } else {
+                    "catalog-scratch-domain-guard-v1"
+                };
+                format!(
+                    "CREATE TEMP TRIGGER refuse_scratch BEFORE INSERT ON protocol_records WHEN NEW.kind='{kind}' BEGIN SELECT RAISE({action}); END"
                 )
             };
             store.connection.execute_batch(&trigger).unwrap();
@@ -581,6 +590,124 @@ fn scratch_restored_prelease_database_move_cannot_hide_a_live_owner() {
 #[test]
 fn scratch_restored_prelease_database_hard_link_cannot_hide_a_live_owner() {
     restored_prelease_snapshot_cannot_relocate_live_ownership(true);
+}
+
+#[test]
+fn scratch_legacy_unanchored_pool_is_readable_but_cannot_grant_or_automatically_upgrade() {
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let encoded = store
+        .get_record("catalog-scratch-pool-v1", b"store")
+        .unwrap()
+        .unwrap();
+    type Pool = (u16, CatalogScratchPoolPolicy, [u8; 32], u64, u32);
+    let (version, policy, resource, bytes, jobs): Pool =
+        mb_core::decode_canonical(&encoded).unwrap();
+    assert_eq!(version, 2);
+    let legacy = mb_core::canonical_bytes(&(1_u16, policy, resource, bytes, jobs)).unwrap();
+    let tx = rusqlite::Transaction::new_unchecked(
+        &store.connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
+    for kind in ["catalog-scratch-pool-v1", "catalog-scratch-pool-guard-v1"] {
+        tx.execute(
+            "UPDATE protocol_records SET bytes=?1 WHERE kind=?2 AND record_id=?3",
+            params![legacy, kind, b"store"],
+        )
+        .unwrap();
+    }
+    tx.execute(
+        "UPDATE meta SET value=x'01' WHERE key='catalog_scratch_pool_version'",
+        [],
+    )
+    .unwrap();
+    tx.execute("DELETE FROM protocol_records WHERE kind IN ('catalog-scratch-domain-v1','catalog-scratch-domain-guard-v1')", []).unwrap();
+    tx.commit().unwrap();
+    drop(store);
+    let store = ControlStore::open(temp.path().join("control.db"), &keys()).unwrap();
+    assert_eq!(usage(&store), (0, 0));
+    assert!(!store.reclaim_abandoned_catalog_scratch().unwrap());
+    assert!(matches!(
+        store.reserve_catalog_scratch(3),
+        Err(CatalogStoreError::UnanchoredScratchPool)
+    ));
+    assert!(matches!(
+        store.configure_catalog_scratch_pool_policy(pool(9, 2)),
+        Err(CatalogStoreError::UnanchoredScratchPool)
+    ));
+    assert_eq!(usage(&store), (0, 0));
+    assert_eq!(
+        store
+            .get_record("catalog-scratch-pool-v1", b"store")
+            .unwrap(),
+        Some(legacy)
+    );
+    assert!(
+        store
+            .records("catalog-scratch-domain-v1")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn scratch_enrolled_pool_requires_its_domain_even_before_the_first_declaration() {
+    let (temp, store) = setup();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    assert_eq!(store.records("catalog-scratch-domain-v1").unwrap().len(), 1);
+    assert_eq!(usage(&store), (0, 0));
+    store.connection.execute("DELETE FROM protocol_records WHERE kind IN ('catalog-scratch-domain-v1','catalog-scratch-domain-guard-v1')", []).unwrap();
+    assert!(store.catalog_scratch_pool_usage().is_err());
+    assert!(store.reserve_catalog_scratch(3).is_err());
+    assert!(ControlStore::open(temp.path().join("control.db"), &keys()).is_err());
+}
+
+#[test]
+fn scratch_whole_directory_relocation_preserves_live_declarations_and_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original");
+    let moved = temp.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+    let mut store = ControlStore::open(original.join("control.db"), &keys()).unwrap();
+    backing(&store);
+    store.configure_catalog_capacity_policy(policy()).unwrap();
+    let resources = resource_policy();
+    resource_backing(&mut store, resources);
+    store.configure_catalog_resource_policy(resources).unwrap();
+    store
+        .configure_catalog_scratch_pool_policy(pool(9, 2))
+        .unwrap();
+    let first = store.reserve_catalog_scratch(3).unwrap().unwrap();
+    drop(store);
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+    std::fs::write(original.join("sentinel"), b"preserve").unwrap();
+    first.check(3).unwrap();
+    let store = ControlStore::open(moved.join("control.db"), &keys()).unwrap();
+    assert!(!store.reclaim_abandoned_catalog_scratch().unwrap());
+    let second = store.reserve_catalog_scratch(6).unwrap().unwrap();
+    assert_eq!(usage(&store), (9, 2));
+    assert!(matches!(
+        store.reserve_catalog_scratch(1),
+        Err(CatalogStoreError::ScratchPoolExhausted)
+    ));
+    first.check(3).unwrap();
+    second.check(6).unwrap();
+    drop(first);
+    drop(second);
+    assert!(store.reclaim_abandoned_catalog_scratch().unwrap());
+    assert!(store.reclaim_abandoned_catalog_scratch().unwrap());
+    assert_eq!(usage(&store), (0, 0));
+    assert_eq!(std::fs::read_dir(&original).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(original.join("sentinel")).unwrap(),
+        b"preserve"
+    );
 }
 
 #[test]

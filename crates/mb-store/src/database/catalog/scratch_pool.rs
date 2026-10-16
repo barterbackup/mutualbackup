@@ -220,8 +220,9 @@ fn read(cx: &Connection) -> Result<Option<Ledger>, CatalogStoreError> {
     };
     let ledger: Ledger = decode(&bytes)?;
     ledger.policy.validate()?;
-    if marker != Some(Some(vec![1]))
-        || ledger.version != 1
+    if !matches!(ledger.version, 1 | 2)
+        || marker != Some(Some(vec![ledger.version as u8]))
+        || (ledger.version == 2 && live_lock::read(cx, live_lock::SCRATCH)?.is_none())
         || resource(cx)? != Some(ledger.resource)
         || ledger.reserved > ledger.policy.physical_bytes
         || ledger.jobs > ledger.policy.jobs
@@ -319,8 +320,15 @@ impl CatalogScratchLease {
 
 impl ControlStore {
     /// Enroll only after the immutable resource policy and its backing exist.
-    /// Existing catalogs without this optional envelope remain readable, but
-    /// resource-backed new scratch requires explicit enrollment.
+    /// Record the local ownership domain in the same writer as the policy,
+    /// before even the first declaration can outlive this connection. Moving
+    /// only the main file cannot then detach an enrolled snapshot from its
+    /// original lock rendezvous. Preserve the directory and ownership files
+    /// when relocating an enrolled catalog.
+    ///
+    /// Older pools without a recorded domain remain readable but cannot be
+    /// automatically upgraded: their live ownership may be at an unknown old
+    /// location. Existing catalogs without a pool remain readable too.
     pub fn configure_catalog_scratch_pool_policy(
         &self,
         policy: CatalogScratchPoolPolicy,
@@ -334,9 +342,12 @@ impl ControlStore {
             if old.policy != policy {
                 return Err(DatabaseError::Conflict.into());
             }
+            live_lock::read(&tx, live_lock::SCRATCH)?
+                .ok_or(CatalogStoreError::UnanchoredScratchPool)?;
         } else {
+            let token = FileLock::admit(&tx, self, false, live_lock::SCRATCH)?;
             let ledger = Ledger {
-                version: 1,
+                version: 2,
                 policy,
                 resource: resource(&tx)?.ok_or(DatabaseError::NotReady)?,
                 reserved: 0,
@@ -347,12 +358,13 @@ impl ControlStore {
             }
             if tx.execute(
                 "INSERT INTO meta(key,value) VALUES (?1,?2)",
-                params![MARKER, &[1_u8][..]],
+                params![MARKER, &[2_u8][..]],
             )? != 1
                 || read(&tx)? != Some(ledger)
             {
                 return Err(DatabaseError::Integrity.into());
             }
+            token.check(self)?;
         }
         tx.commit()?;
         Ok(())
@@ -391,6 +403,8 @@ impl ControlStore {
         // Compose this probe with a caller's existing read/write snapshot.
         let configured = snapshot(self, |cx| {
             if read(cx)?.is_some() {
+                live_lock::read(cx, live_lock::SCRATCH)?
+                    .ok_or(CatalogStoreError::UnanchoredScratchPool)?;
                 return Ok(true);
             }
             if capacity_policy::resource_policy(cx)?.is_some() {
@@ -413,6 +427,8 @@ impl ControlStore {
             tx.commit()?;
             return Ok(None);
         };
+        live_lock::read(&tx, live_lock::SCRATCH)?
+            .ok_or(CatalogStoreError::UnanchoredScratchPool)?;
         let next = Ledger {
             reserved: old
                 .reserved

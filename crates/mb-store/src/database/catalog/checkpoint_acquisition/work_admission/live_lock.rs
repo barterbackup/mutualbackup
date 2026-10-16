@@ -66,7 +66,11 @@ impl Identity {
                 (&mut moved as *mut i32).cast(),
             )
         };
-        if status != rusqlite::ffi::SQLITE_OK || moved != 0 || !metadata.is_file() {
+        if status != rusqlite::ffi::SQLITE_OK
+            || moved != 0
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+        {
             return Err(DatabaseError::Conflict.into());
         }
         Ok(Self {
@@ -431,6 +435,7 @@ impl FileLock {
             .map_err(DatabaseError::from)?;
         let metadata = file.metadata().map_err(DatabaseError::from)?;
         if !metadata.is_file()
+            || metadata.nlink() != 1
             || (metadata.dev(), metadata.ino())
                 != (self.domain.database.device, self.domain.database.inode)
         {
@@ -503,6 +508,7 @@ impl FileLock {
             let metadata = std::fs::metadata(&self.database_path).map_err(DatabaseError::from)?;
             if Self::process()? != self.creator
                 || !metadata.is_file()
+                || metadata.nlink() != 1
                 || (metadata.dev(), metadata.ino())
                     != (self.domain.database.device, self.domain.database.inode)
             {
@@ -552,6 +558,27 @@ impl FileLock {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_linked_main_files_cannot_create_or_use_funded_ownership_domains() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let alias = temp.path().join("alias.db");
+        let store = ControlStore::open_with_key(&path, &[7; 32]).unwrap();
+        let traversal = FileLock::open(&store, None, true, TRAVERSAL).unwrap();
+        let scratch = FileLock::open(&store, None, true, SCRATCH).unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        for (token, class) in [(&traversal, TRAVERSAL), (&scratch, SCRATCH)] {
+            assert!(token.check(&store).is_err());
+            assert!(token.check_owned().is_err());
+            assert!(FileLock::open(&store, None, true, class).is_err());
+        }
+        std::fs::remove_file(&alias).unwrap();
+        for token in [&traversal, &scratch] {
+            token.check(&store).unwrap();
+            token.check_owned().unwrap();
+        }
+    }
 
     #[test]
     fn slot_admission_rejects_unrepresented_owners_and_releases_unused_probes() {
