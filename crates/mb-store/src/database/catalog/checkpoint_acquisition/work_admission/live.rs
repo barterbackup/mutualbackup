@@ -1,6 +1,6 @@
 //! Disposable complete-proof traversal reservations. A permit accounts work;
 //! it grants no certificate, history, page, payload or publication authority.
-use super::live_lock::{self, FileLock, Identity};
+use super::live_lock::{self, FileLock, Identity, SlotOwner};
 use super::live_owner::Owner;
 use super::*;
 
@@ -9,7 +9,7 @@ pub(super) const SCOPE_GUARD: &str = "catalog-live-recovery-work-guard-v2";
 pub(super) const LEGACY_SCOPE: &str = "catalog-live-recovery-work-v1";
 pub(super) const LEGACY_GUARD: &str = "catalog-live-recovery-work-guard-v1";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Spec {
     version: u16,
     id: Uuid,
@@ -17,6 +17,73 @@ struct Spec {
     budget: Work,
     domain: Uuid,
     slot: u8,
+    owner: Option<Identity>,
+}
+impl Serialize for Spec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.owner {
+            Some(owner) => (
+                self.version,
+                self.id,
+                self.selected,
+                self.budget,
+                self.domain,
+                self.slot,
+                owner,
+            )
+                .serialize(serializer),
+            None => (
+                self.version,
+                self.id,
+                self.selected,
+                self.budget,
+                self.domain,
+                self.slot,
+            )
+                .serialize(serializer),
+        }
+    }
+}
+impl Spec {
+    fn decode(bytes: &[u8]) -> Result<Self, CatalogStoreError> {
+        type Owned = (
+            u16,
+            Uuid,
+            CatalogCheckpointRecoveryTip,
+            Work,
+            Uuid,
+            u8,
+            Identity,
+        );
+        if let Ok((3, id, selected, budget, domain, slot, owner)) = canonical::<Owned>(bytes) {
+            if owner.inode == 0 {
+                return Err(DatabaseError::Integrity.into());
+            }
+            return Ok(Self {
+                version: 3,
+                id,
+                selected,
+                budget,
+                domain,
+                slot,
+                owner: Some(owner),
+            });
+        }
+        type Original = (u16, Uuid, CatalogCheckpointRecoveryTip, Work, Uuid, u8);
+        let (version, id, selected, budget, domain, slot): Original = canonical(bytes)?;
+        if version != 2 {
+            return Err(DatabaseError::Integrity.into());
+        }
+        Ok(Self {
+            version,
+            id,
+            selected,
+            budget,
+            domain,
+            slot,
+            owner: None,
+        })
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct LegacySpec {
@@ -91,9 +158,8 @@ fn entry(
         }
         Entry::Legacy(spec)
     } else {
-        let spec: Spec = canonical(&bytes)?;
-        if spec.version != 2
-            || u32::from(spec.slot) >= CATALOG_ACQUISITION_WORK_JOBS
+        let spec = Spec::decode(&bytes)?;
+        if u32::from(spec.slot) >= CATALOG_ACQUISITION_WORK_JOBS
             || domain.is_none_or(|d| d.id != spec.domain)
         {
             return Err(DatabaseError::Integrity.into());
@@ -112,14 +178,14 @@ fn entry(
     Ok(Some(result))
 }
 fn scope(cx: &Connection, id: Uuid) -> Result<Option<Spec>, CatalogStoreError> {
-    match entry(cx, id, false, live_lock::read(cx)?)? {
+    match entry(cx, id, false, live_lock::read(cx, live_lock::TRAVERSAL)?)? {
         Some(Entry::Current(s)) => Ok(Some(s)),
         None => Ok(None),
         _ => Err(DatabaseError::Integrity.into()),
     }
 }
 fn scopes(cx: &Connection) -> Result<Vec<Entry>, CatalogStoreError> {
-    let domain = live_lock::read(cx)?;
+    let domain = live_lock::read(cx, live_lock::TRAVERSAL)?;
     let mut query=cx.prepare("SELECT CASE WHEN length(record_id)=16 THEN record_id END,kind FROM protocol_records WHERE kind IN (?1,?2) ORDER BY record_id,kind LIMIT ?3")?;
     let mut rows = query.query(params![
         SCOPE,
@@ -167,7 +233,7 @@ fn release(cx: &Connection, old: Ledger, e: Entry) -> Result<(), CatalogStoreErr
         cx,
         e.id(),
         matches!(e, Entry::Legacy(_)),
-        live_lock::read(cx)?,
+        live_lock::read(cx, live_lock::TRAVERSAL)?,
     )? != Some(e)
     {
         return Err(DatabaseError::Integrity.into());
@@ -205,6 +271,7 @@ fn release(cx: &Connection, old: Ledger, e: Entry) -> Result<(), CatalogStoreErr
 pub struct CatalogCheckpointRecoveryWork<'a> {
     store: &'a ControlStore,
     spec: Option<Spec>,
+    owner: Option<SlotOwner>,
     token: Option<FileLock>,
     closed: bool,
 }
@@ -224,10 +291,11 @@ impl CatalogCheckpointRecoveryWork<'_> {
                         && scope(cx, s.id)? == Some(s) =>
                 {
                     let token = self.token.as_ref().ok_or(DatabaseError::Integrity)?;
-                    if live_lock::read(cx)? != Some(token.domain) {
+                    if live_lock::read(cx, live_lock::TRAVERSAL)? != Some(token.domain) {
                         return Err(DatabaseError::Integrity.into());
                     }
-                    token.check(self.store)
+                    token.check(self.store)?;
+                    self.owner.as_ref().ok_or(DatabaseError::Integrity)?.check()
                 }
                 _ => Err(DatabaseError::NotReady.into()),
             }
@@ -252,10 +320,14 @@ impl CatalogCheckpointRecoveryWork<'_> {
         if let Some(s) = self.spec {
             let token = self.token.as_ref().ok_or(DatabaseError::Integrity)?;
             token.check(self.store)?;
+            self.owner
+                .as_ref()
+                .ok_or(DatabaseError::Integrity)?
+                .check()?;
             let tx =
                 Transaction::new_unchecked(&self.store.connection, TransactionBehavior::Immediate)?;
             let old = read(&tx)?.ok_or(DatabaseError::Integrity)?;
-            if live_lock::read(&tx)? != Some(token.domain) {
+            if live_lock::read(&tx, live_lock::TRAVERSAL)? != Some(token.domain) {
                 return Err(DatabaseError::Integrity.into());
             }
             release(&tx, old, Entry::Current(s))?;
@@ -263,6 +335,7 @@ impl CatalogCheckpointRecoveryWork<'_> {
         } else {
             self.check()?;
         }
+        self.owner.take();
         self.token.take();
         self.closed = true;
         Ok(())
@@ -293,6 +366,7 @@ impl ControlStore {
             return Ok(CatalogCheckpointRecoveryWork {
                 store: self,
                 spec: None,
+                owner: None,
                 token: None,
                 closed: false,
             });
@@ -315,27 +389,28 @@ impl ControlStore {
         let entries = scopes(&tx)?;
         let mut used = [false; CATALOG_ACQUISITION_WORK_JOBS as usize];
         let mut has_scopes = false;
+        let mut expected = [None; CATALOG_ACQUISITION_WORK_JOBS as usize];
         for e in entries {
             if let Entry::Current(s) = e {
+                let owner = s.owner.ok_or(DatabaseError::NotReady)?;
                 used[s.slot as usize] = true;
+                expected[s.slot as usize] = Some((s.id, owner));
                 has_scopes = true;
             }
         }
-        let token = FileLock::admit(&tx, self, has_scopes)?;
-        let mut slot = None;
-        for index in 0..CATALOG_ACQUISITION_WORK_JOBS {
-            if !used[index as usize] && token.try_slot(index as u8)? {
-                slot = Some(index as u8);
-                break;
-            }
-        }
+        let token = FileLock::admit(&tx, self, has_scopes, live_lock::TRAVERSAL)?;
+        token.validate_owners(&expected)?;
+        let slot = token.claim_slot(&used)?;
+        let id = Uuid::new_v4();
+        let owner = token.create_owner(slot, id)?;
         let s = Spec {
-            version: 2,
-            id: Uuid::new_v4(),
+            version: 3,
+            id,
             selected,
             budget,
             domain: token.domain.id,
-            slot: slot.ok_or(DatabaseError::CapacityExceeded)?,
+            slot,
+            owner: Some(owner.identity),
         };
         let bytes = canonical_bytes(&s)?;
         for kind in [SCOPE, SCOPE_GUARD] {
@@ -349,10 +424,12 @@ impl ControlStore {
         if scope(&tx, s.id)? != Some(s) {
             return Err(DatabaseError::Integrity.into());
         }
+        owner.check()?;
         tx.commit()?;
         Ok(CatalogCheckpointRecoveryWork {
             store: self,
             spec: Some(s),
+            owner: Some(owner),
             token: Some(token),
             closed: false,
         })
@@ -371,7 +448,7 @@ impl ControlStore {
             return Ok(false);
         };
         let database = Identity::database(self)?;
-        let domain = live_lock::read(&tx)?;
+        let domain = live_lock::read(&tx, live_lock::TRAVERSAL)?;
         let mut token = None;
         for e in scopes(&tx)? {
             let abandoned = match e {
@@ -382,7 +459,7 @@ impl ControlStore {
                         domain.permits_copy_reclamation()
                     } else {
                         if token.is_none() {
-                            token = Some(FileLock::existing(self, domain)?);
+                            token = Some(FileLock::existing(self, domain, live_lock::TRAVERSAL)?);
                         }
                         token
                             .as_ref()

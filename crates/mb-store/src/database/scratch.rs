@@ -92,6 +92,33 @@ impl RecordScratchStore {
         Self::open(Some(vfs), limits.max_database_bytes, connection)
     }
 
+    /// Consume one noncloneable aggregate reservation. Its kernel slot stays
+    /// held until every anonymous database/journal file has closed. Construction
+    /// failure leaves reclaimable debt rather than credit without ownership.
+    #[cfg(target_os = "linux")]
+    pub fn new_in_with_reserved_checkpoint_space(
+        directory: impl AsRef<std::path::Path>,
+        limits: ScratchStorageLimits,
+        database_paths: &[std::path::PathBuf],
+        lease: crate::CatalogScratchLease,
+    ) -> Result<Self, DatabaseError> {
+        let vfs = ScratchVfs::new_with_lease(
+            directory.as_ref(),
+            limits.max_physical_bytes,
+            limits.headroom_bytes,
+            database_paths,
+            Some(lease),
+        )?;
+        let connection = Connection::open_with_flags_and_vfs(
+            ":memory:",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            vfs.name(),
+        )?;
+        Self::open(Some(vfs), limits.max_database_bytes, connection)
+    }
+
     fn open(
         // Keep the VFS parameter before the connection: early errors drop
         // parameters in reverse order, closing SQLite before its borrowed VFS.

@@ -1,20 +1,41 @@
 //! Kernel ownership of traversal slots. The separate empty file avoids the
 //! SQLite POSIX-lock hazard of opening/closing another main-file descriptor.
 use super::*;
+mod slot_owner;
+pub(in crate::database::catalog) use slot_owner::SlotOwner;
 
-const DOMAIN: &str = "catalog-live-work-domain-v1";
-const DOMAIN_GUARD: &str = "catalog-live-work-domain-guard-v1";
-pub(super) const KINDS: [&str; 2] = [DOMAIN, DOMAIN_GUARD];
+#[derive(Clone, Copy)]
+pub(in crate::database::catalog) struct Class {
+    pub(in crate::database::catalog) kinds: [&'static str; 2],
+    tag: &'static str,
+}
+pub(in crate::database::catalog) const TRAVERSAL: Class = Class {
+    kinds: [
+        "catalog-live-work-domain-v1",
+        "catalog-live-work-domain-guard-v1",
+    ],
+    tag: "work",
+};
+pub(in crate::database::catalog) const SCRATCH: Class = Class {
+    kinds: [
+        "catalog-scratch-domain-v1",
+        "catalog-scratch-domain-guard-v1",
+    ],
+    tag: "scratch",
+};
+pub(in crate::database::catalog) const KINDS: [&str; 2] = TRAVERSAL.kinds;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(super) struct Identity {
-    pub(super) device: u64,
-    pub(super) inode: u64,
+pub(in crate::database::catalog) struct Identity {
+    pub(in crate::database::catalog) device: u64,
+    pub(in crate::database::catalog) inode: u64,
 }
 
 impl Identity {
     #[cfg(target_os = "linux")]
-    pub(super) fn database(store: &ControlStore) -> Result<Self, CatalogStoreError> {
+    pub(in crate::database::catalog) fn database(
+        store: &ControlStore,
+    ) -> Result<Self, CatalogStoreError> {
         use std::os::unix::fs::MetadataExt;
         // A different reported identity proves a copy only on a supported
         // local filesystem. Layered/remote views can alias the same database
@@ -55,32 +76,37 @@ impl Identity {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn database(_: &ControlStore) -> Result<Self, CatalogStoreError> {
+    pub(in crate::database::catalog) fn database(
+        _: &ControlStore,
+    ) -> Result<Self, CatalogStoreError> {
         Err(CatalogStoreError::UnsupportedTraversalOwnership)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(super) struct Domain {
+pub(in crate::database::catalog) struct Domain {
     version: u16,
-    pub(super) id: Uuid,
-    pub(super) database: Identity,
+    pub(in crate::database::catalog) id: Uuid,
+    pub(in crate::database::catalog) database: Identity,
     file: Identity,
 }
 
 impl Domain {
-    pub(super) fn permits_copy_reclamation(self) -> bool {
+    pub(in crate::database::catalog) fn permits_copy_reclamation(self) -> bool {
         // v1 did not establish a non-layered local filesystem identity.
-        self.version == 2
+        matches!(self.version, 2 | 3)
     }
 }
 
-pub(super) fn read(cx: &Connection) -> Result<Option<Domain>, CatalogStoreError> {
-    let Some(bytes) = paired(cx, DOMAIN, DOMAIN_GUARD, KEY)? else {
+pub(in crate::database::catalog) fn read(
+    cx: &Connection,
+    class: Class,
+) -> Result<Option<Domain>, CatalogStoreError> {
+    let Some(bytes) = paired(cx, class.kinds[0], class.kinds[1], KEY)? else {
         return Ok(None);
     };
     let domain: Domain = canonical(&bytes)?;
-    if !matches!(domain.version, 1 | 2)
+    if !matches!(domain.version, 1..=3)
         || domain.id.is_nil()
         || domain.database.inode == 0
         || domain.file.inode == 0
@@ -90,9 +116,14 @@ pub(super) fn read(cx: &Connection) -> Result<Option<Domain>, CatalogStoreError>
     Ok(Some(domain))
 }
 
-fn write(cx: &Connection, old: Option<Domain>, next: Domain) -> Result<(), CatalogStoreError> {
+fn write(
+    cx: &Connection,
+    old: Option<Domain>,
+    next: Domain,
+    class: Class,
+) -> Result<(), CatalogStoreError> {
     let bytes = canonical_bytes(&next)?;
-    for kind in KINDS {
+    for kind in class.kinds {
         if let Some(old) = old {
             if cx.execute(
                 "UPDATE protocol_records SET bytes=?3 WHERE kind=?1 AND record_id=?2 AND bytes=?4",
@@ -105,20 +136,22 @@ fn write(cx: &Connection, old: Option<Domain>, next: Domain) -> Result<(), Catal
             insert_exact(cx, kind, KEY, &bytes)?;
         }
     }
-    if read(cx)? != Some(next) {
+    if read(cx, class)? != Some(next) {
         return Err(DatabaseError::Integrity.into());
     }
     Ok(())
 }
 
-pub(super) struct FileLock {
+pub(in crate::database::catalog) struct FileLock {
+    #[cfg(target_os = "linux")]
+    database_path: std::path::PathBuf,
     #[cfg(target_os = "linux")]
     file: std::fs::File,
     #[cfg(target_os = "linux")]
     directory: crate::database::DatabaseDirectory,
     #[cfg(target_os = "linux")]
     path: std::path::PathBuf,
-    pub(super) domain: Domain,
+    pub(in crate::database::catalog) domain: Domain,
     #[cfg(target_os = "linux")]
     creator: (u32, u64, u64),
 }
@@ -151,14 +184,18 @@ impl FileLock {
         store: &ControlStore,
         domain: Option<Domain>,
         rotate: bool,
+        class: Class,
     ) -> Result<Self, CatalogStoreError> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
         let database = Identity::database(store)?;
         let directory = Self::directory(store)?;
         Self::local_filesystem(directory.file())?;
         let path = directory.leaf(format!(
-            ".mutualbackup-work-{:x}-{:x}.lock",
-            database.device, database.inode
+            ".mutualbackup-{}-{:x}-{:x}.lock",
+            class.tag, database.device, database.inode
         ))?;
         let options = || {
             let mut options = std::fs::OpenOptions::new();
@@ -169,32 +206,62 @@ impl FileLock {
                 .mode(0o600);
             options
         };
+        let existing = || -> Result<std::fs::File, CatalogStoreError> {
+            // Inspect through O_PATH before any I/O descriptor is opened.
+            // A substituted hard link to SQLite's main file must not cause
+            // close(2) to remove that connection's native POSIX locks.
+            let pin = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(DatabaseError::from)?;
+            let metadata = pin.metadata().map_err(DatabaseError::from)?;
+            if !metadata.is_file()
+                || metadata.len() != 0
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o7777 != 0o600
+                || metadata.dev() != database.device
+                || (metadata.dev(), metadata.ino()) == (database.device, database.inode)
+            {
+                return Err(DatabaseError::Conflict.into());
+            }
+            Ok(std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(format!("/proc/self/fd/{}", pin.as_raw_fd()))
+                .map_err(DatabaseError::from)?)
+        };
         let file = if rotate {
             match options().create_new(true).open(&path) {
                 Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    options().open(&path).map_err(DatabaseError::from)?
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => existing()?,
                 Err(error) => return Err(DatabaseError::from(error).into()),
             }
         } else {
-            options().open(&path).map_err(DatabaseError::from)?
+            existing()?
         };
         let metadata = file.metadata().map_err(DatabaseError::from)?;
         let file_id = Identity {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
+        if domain.is_some_and(|old| old.database == database && old.file != file_id) {
+            // An empty restored ledger cannot authorize replacing a recorded
+            // rendezvous while an old description might still own its slots.
+            return Err(DatabaseError::Conflict.into());
+        }
         let next = match domain {
             Some(domain)
                 if domain.database == database
                     && domain.file == file_id
-                    && (!rotate || domain.version == 2) =>
+                    && (!rotate || domain.version == 3) =>
             {
                 domain
             }
             _ if rotate => Domain {
-                version: 2,
+                version: 3,
                 id: Uuid::new_v4(),
                 database,
                 file: file_id,
@@ -202,6 +269,8 @@ impl FileLock {
             _ => return Err(DatabaseError::Conflict.into()),
         };
         let result = Self {
+            database_path: directory
+                .leaf(store.path.file_name().ok_or(DatabaseError::Conflict)?)?,
             file,
             directory,
             path,
@@ -227,7 +296,12 @@ impl FileLock {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn open(_: &ControlStore, _: Option<Domain>, _: bool) -> Result<Self, CatalogStoreError> {
+    fn open(
+        _: &ControlStore,
+        _: Option<Domain>,
+        _: bool,
+        _: Class,
+    ) -> Result<Self, CatalogStoreError> {
         Err(CatalogStoreError::UnsupportedTraversalOwnership)
     }
 
@@ -278,32 +352,41 @@ impl FileLock {
         Ok(())
     }
 
-    pub(super) fn admit(
+    pub(in crate::database::catalog) fn admit(
         cx: &Connection,
         store: &ControlStore,
         has_scopes: bool,
+        class: Class,
     ) -> Result<Self, CatalogStoreError> {
-        let old = read(cx)?;
+        let old = read(cx, class)?;
         let database = Identity::database(store)?;
-        if has_scopes && old.is_none_or(|d| d.database != database) {
+        if has_scopes && old.is_none_or(|d| d.database != database || d.version != 3) {
             return Err(DatabaseError::NotReady.into());
         }
-        let file = Self::open(store, old, !has_scopes)?;
+        let file = Self::open(store, old, !has_scopes, class)?;
         if old != Some(file.domain) {
-            write(cx, old, file.domain)?;
+            // Covers unknown owners omitted by a restored pre-admission
+            // snapshot, including owners whose files predate the ledger.
+            file.require_idle_slots()?;
+            file.validate_owners(&[None; CATALOG_ACQUISITION_WORK_JOBS as usize])?;
+            write(cx, old, file.domain, class)?;
         }
         Ok(file)
     }
 
-    pub(super) fn existing(
+    pub(in crate::database::catalog) fn existing(
         store: &ControlStore,
         domain: Domain,
+        class: Class,
     ) -> Result<Self, CatalogStoreError> {
-        Self::open(store, Some(domain), false)
+        Self::open(store, Some(domain), false, class)
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn check(&self, store: &ControlStore) -> Result<(), CatalogStoreError> {
+    pub(in crate::database::catalog) fn check(
+        &self,
+        store: &ControlStore,
+    ) -> Result<(), CatalogStoreError> {
         if Self::process()? != self.creator || Identity::database(store)? != self.domain.database {
             return Err(DatabaseError::NotReady.into());
         }
@@ -311,12 +394,133 @@ impl FileLock {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn check(&self, _: &ControlStore) -> Result<(), CatalogStoreError> {
+    pub(in crate::database::catalog) fn check(
+        &self,
+        _: &ControlStore,
+    ) -> Result<(), CatalogStoreError> {
         Err(CatalogStoreError::UnsupportedTraversalOwnership)
     }
 
+    pub(in crate::database::catalog) fn allocation_domain(
+        &self,
+    ) -> Result<[u8; 32], CatalogStoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(crate::physical_allocation_domain(self.directory.path())?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(CatalogStoreError::UnsupportedTraversalOwnership)
+        }
+    }
+
+    /// Hold the original inode after the SQLite connection closes. O_PATH
+    /// cannot perform file I/O, and closing it does not remove POSIX locks held
+    /// by another native SQLite connection. An ordinary main-file descriptor
+    /// must never be substituted here.
     #[cfg(target_os = "linux")]
-    pub(super) fn try_slot(&self, slot: u8) -> Result<bool, CatalogStoreError> {
+    pub(in crate::database::catalog) fn pin_database(
+        &self,
+    ) -> Result<std::fs::File, CatalogStoreError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        self.check_owned()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&self.database_path)
+            .map_err(DatabaseError::from)?;
+        let metadata = file.metadata().map_err(DatabaseError::from)?;
+        if !metadata.is_file()
+            || (metadata.dev(), metadata.ino())
+                != (self.domain.database.device, self.domain.database.inode)
+        {
+            return Err(DatabaseError::Conflict.into());
+        }
+        self.check_owned()?;
+        Ok(file)
+    }
+
+    /// A valid older snapshot may omit still-live newer scopes. Probe every
+    /// unrepresented slot under the caller's writer instead of skipping busy
+    /// slots and granting replacement credits elsewhere. Retain only the new
+    /// slot; represented declarations keep their own ownership or debt.
+    pub(in crate::database::catalog) fn claim_slot(
+        &self,
+        used: &[bool; CATALOG_ACQUISITION_WORK_JOBS as usize],
+    ) -> Result<u8, CatalogStoreError> {
+        let mut selected = None;
+        for slot in 0..CATALOG_ACQUISITION_WORK_JOBS as u8 {
+            if used[slot as usize] {
+                continue;
+            }
+            if !self.try_slot(slot)? {
+                return Err(CatalogStoreError::UnrecordedLiveCatalogWork);
+            }
+            if selected.is_none() {
+                selected = Some(slot);
+            } else {
+                self.unlock_slot(slot)?;
+            }
+        }
+        selected.ok_or(DatabaseError::CapacityExceeded.into())
+    }
+
+    fn require_idle_slots(&self) -> Result<(), CatalogStoreError> {
+        for slot in 0..CATALOG_ACQUISITION_WORK_JOBS as u8 {
+            if !self.try_slot(slot)? {
+                return Err(CatalogStoreError::UnrecordedLiveCatalogWork);
+            }
+            self.unlock_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unlock_slot(&self, slot: u8) -> Result<(), CatalogStoreError> {
+        use std::os::fd::AsRawFd;
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_UNLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = slot.into();
+        lock.l_len = 1;
+        if unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_OFD_SETLK, &lock) } != 0 {
+            return Err(DatabaseError::from(std::io::Error::last_os_error()).into());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn unlock_slot(&self, _: u8) -> Result<(), CatalogStoreError> {
+        Err(CatalogStoreError::UnsupportedTraversalOwnership)
+    }
+
+    /// Check an owned allocation token without retaining or reopening SQLite.
+    /// No main-file descriptor is opened/closed, preserving native POSIX locks.
+    pub(in crate::database::catalog) fn check_owned(&self) -> Result<(), CatalogStoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&self.database_path).map_err(DatabaseError::from)?;
+            if Self::process()? != self.creator
+                || !metadata.is_file()
+                || (metadata.dev(), metadata.ino())
+                    != (self.domain.database.device, self.domain.database.inode)
+            {
+                return Err(DatabaseError::NotReady.into());
+            }
+            self.check_file()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(CatalogStoreError::UnsupportedTraversalOwnership)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::database::catalog) fn try_slot(
+        &self,
+        slot: u8,
+    ) -> Result<bool, CatalogStoreError> {
         use std::os::fd::AsRawFd;
         if u32::from(slot) >= CATALOG_ACQUISITION_WORK_JOBS {
             return Err(DatabaseError::Integrity.into());
@@ -340,7 +544,7 @@ impl FileLock {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn try_slot(&self, _: u8) -> Result<bool, CatalogStoreError> {
+    pub(in crate::database::catalog) fn try_slot(&self, _: u8) -> Result<bool, CatalogStoreError> {
         Err(CatalogStoreError::UnsupportedTraversalOwnership)
     }
 }
@@ -350,16 +554,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slot_admission_rejects_unrepresented_owners_and_releases_unused_probes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+        for class in [TRAVERSAL, SCRATCH] {
+            let first = FileLock::open(&store, None, true, class).unwrap();
+            assert_eq!(first.claim_slot(&[false; 64]).unwrap(), 0);
+            assert!(first.try_slot(7).unwrap());
+            let mut used = [false; 64];
+            used[0] = true;
+            for expected in [[false; 64], used] {
+                let observer = FileLock::open(&store, Some(first.domain), false, class).unwrap();
+                assert!(matches!(
+                    observer.claim_slot(&expected),
+                    Err(CatalogStoreError::UnrecordedLiveCatalogWork)
+                ));
+            }
+            first.unlock_slot(7).unwrap();
+            let next = FileLock::open(&store, Some(first.domain), false, class).unwrap();
+            assert_eq!(next.claim_slot(&used).unwrap(), 1);
+            let observer = FileLock::open(&store, Some(first.domain), false, class).unwrap();
+            assert!(!observer.try_slot(0).unwrap());
+            assert!(!observer.try_slot(1).unwrap());
+            assert!(observer.try_slot(2).unwrap());
+        }
+    }
+
+    #[test]
+    fn separate_work_classes_keep_independent_domains_and_kernel_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
+        let traversal = FileLock::open(&store, None, true, TRAVERSAL).unwrap();
+        let scratch = FileLock::open(&store, None, true, SCRATCH).unwrap();
+        assert_ne!(traversal.path, scratch.path);
+        assert_ne!(traversal.domain.id, scratch.domain.id);
+        assert!(traversal.try_slot(0).unwrap());
+        assert!(scratch.try_slot(0).unwrap());
+        let observer = FileLock::open(&store, Some(scratch.domain), false, SCRATCH).unwrap();
+        assert!(!observer.try_slot(0).unwrap());
+        drop(traversal);
+        assert!(!observer.try_slot(0).unwrap());
+        scratch.check_owned().unwrap();
+        drop(scratch);
+        assert!(observer.try_slot(0).unwrap());
+    }
+
+    #[test]
     fn another_loaded_module_cannot_reclaim_a_live_process_scope() {
         let temp = tempfile::tempdir().unwrap();
         let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
-        let first = FileLock::open(&store, None, true).unwrap();
+        let first = FileLock::open(&store, None, true, TRAVERSAL).unwrap();
         assert!(first.try_slot(7).unwrap());
-        let other = FileLock::open(&store, Some(first.domain), false).unwrap();
+        let other = FileLock::open(&store, Some(first.domain), false, TRAVERSAL).unwrap();
         assert!(!other.try_slot(7).unwrap());
         assert!(other.try_slot(8).unwrap());
         drop(other);
-        let observer = FileLock::open(&store, Some(first.domain), false).unwrap();
+        let observer = FileLock::open(&store, Some(first.domain), false, TRAVERSAL).unwrap();
         assert!(!observer.try_slot(7).unwrap());
         assert!(observer.try_slot(8).unwrap());
         drop(first);
@@ -379,13 +629,13 @@ mod tests {
             &[7; 32],
         )
         .unwrap();
-        let first = FileLock::open(&store, None, true).unwrap();
+        let first = FileLock::open(&store, None, true, TRAVERSAL).unwrap();
         assert!(first.try_slot(0).unwrap());
         std::fs::rename(&original, &moved).unwrap();
         std::fs::create_dir(&original).unwrap();
         std::fs::write(original.join("sentinel"), b"preserve").unwrap();
         first.check(&store).unwrap();
-        let other = FileLock::open(&store, Some(first.domain), false).unwrap();
+        let other = FileLock::open(&store, Some(first.domain), false, TRAVERSAL).unwrap();
         assert!(!other.try_slot(0).unwrap());
         assert_eq!(std::fs::read_dir(&original).unwrap().count(), 1);
         assert_eq!(
@@ -398,13 +648,13 @@ mod tests {
     fn replaced_traversal_lock_file_cannot_steal_slots_or_overwrite_the_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let store = ControlStore::open_with_key(temp.path().join("control.db"), &[7; 32]).unwrap();
-        let first = FileLock::open(&store, None, true).unwrap();
+        let first = FileLock::open(&store, None, true, TRAVERSAL).unwrap();
         assert!(first.try_slot(0).unwrap());
         let saved = temp.path().join("saved");
         std::fs::rename(&first.path, &saved).unwrap();
         std::fs::write(&first.path, b"preserve this replacement").unwrap();
         assert!(first.check(&store).is_err());
-        assert!(FileLock::open(&store, Some(first.domain), false).is_err());
+        assert!(FileLock::open(&store, Some(first.domain), false, TRAVERSAL).is_err());
         assert_eq!(
             std::fs::read(&first.path).unwrap(),
             b"preserve this replacement"

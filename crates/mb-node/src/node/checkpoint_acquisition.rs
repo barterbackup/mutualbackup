@@ -451,8 +451,12 @@ impl RetainedCheckpointRestore {
                 )?
                 .context("acquisition has no original genesis")?,
         )?;
-        let scratch =
-            || crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4);
+        let scratch = || -> Result<_> {
+            if let ProofInput::Retained { meter, .. } = input {
+                meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
+            }
+            crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4)
+        };
         let mut source = HistoryPrefix {
             control,
             sequence: trust.event_sequence,

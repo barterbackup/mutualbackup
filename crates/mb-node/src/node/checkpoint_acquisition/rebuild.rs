@@ -86,9 +86,9 @@ impl RetainedCheckpointRestore {
             Ok(())
         };
         current()?;
-        // Scratch admission also enumerates the separately bounded volume
-        // registry and its checkpoint/headroom descriptors.
-        meter.charge(LOOKUP_WORK)?;
+        // Prepay the complete scratch-pool scans/reclamation and separately
+        // bounded volume registry before reserving or creating the stack.
+        meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
         let stack = crate::volume::paged_scratch_store(
             control,
             budget.bytes.min(mb_core::CATALOG_MAX_STREAM_BYTES * 4),

@@ -777,7 +777,60 @@ fn legacy_kernel_domains_preserve_copied_debt_and_upgrade_only_without_scopes() 
         .unwrap()
         .unwrap();
     let mut domain: Domain = mb_core::decode_canonical(&bytes).unwrap();
-    assert_eq!(domain.0, 2);
+    assert_eq!(domain.0, 3);
+    // Preserve the complete original kernel-scope layout and its original
+    // lease hash, rather than merely changing the new envelope's version.
+    let (scope_id, bound) = store
+        .next_record_bounded("catalog-live-recovery-work-v2", None, 16, 4096)
+        .unwrap()
+        .unwrap();
+    type BoundScope = (
+        u16,
+        Uuid,
+        CatalogCheckpointRecoveryTip,
+        Work,
+        Uuid,
+        u8,
+        (u64, u64),
+    );
+    let (version, id, tip, budget, domain_id, slot, _): BoundScope =
+        mb_core::decode_canonical(&bound).unwrap();
+    assert_eq!(version, 3);
+    let original = (2_u16, id, tip, budget, domain_id, slot);
+    let original_bytes = mb_core::canonical_bytes(&original).unwrap();
+    let original_lease = mb_core::canonical_bytes(&(
+        1_u16,
+        mb_core::canonical_hash_bounded(&original, 4096).unwrap(),
+        budget,
+        true,
+    ))
+    .unwrap();
+    for kind in [
+        "catalog-live-recovery-work-v2",
+        "catalog-live-recovery-work-guard-v2",
+    ] {
+        store
+            .connection
+            .execute(
+                "UPDATE protocol_records SET bytes=?1 WHERE kind=?2 AND record_id=?3",
+                params![original_bytes, kind, scope_id],
+            )
+            .unwrap();
+    }
+    for kind in [
+        "catalog-acquisition-work-lease-v1",
+        "catalog-acquisition-work-lease-guard-v1",
+        "catalog-acquisition-work-held-v1",
+        "catalog-acquisition-work-held-guard-v1",
+    ] {
+        store
+            .connection
+            .execute(
+                "UPDATE protocol_records SET bytes=?1 WHERE kind=?2 AND record_id=?3",
+                params![original_lease, kind, scope_id],
+            )
+            .unwrap();
+    }
     domain.0 = 1;
     let bytes = mb_core::canonical_bytes(&domain).unwrap();
     for kind in kinds {
@@ -830,7 +883,7 @@ fn legacy_kernel_domains_preserve_copied_debt_and_upgrade_only_without_scopes() 
         .unwrap()
         .unwrap();
     let upgraded: Domain = mb_core::decode_canonical(&bytes).unwrap();
-    assert_eq!(upgraded.0, 2);
+    assert_eq!(upgraded.0, 3);
     assert_ne!(upgraded.1, domain.1);
     assert_eq!((upgraded.2, upgraded.3), (domain.2, domain.3));
     current.check().unwrap();
@@ -850,6 +903,96 @@ fn legacy_kernel_domains_preserve_copied_debt_and_upgrade_only_without_scopes() 
     assert_eq!(
         copied.checkpoint_acquisition_work_usage().unwrap().unwrap(),
         held
+    );
+}
+
+#[test]
+fn restored_work_scope_cannot_impersonate_a_later_owner_of_its_kernel_slot() {
+    let (mut fixture, history) = real_checkpoint();
+    let proof = individual(&mut fixture, &history);
+    let cert = Certificate::Individual(proof.certificate().clone());
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = ControlStore::open(temp.path().join("control.db"), &history.keys[0]).unwrap();
+    configure(&mut store, &cert, 16);
+    activate(&store);
+    let kinds = [
+        "catalog-acquisition-work-v1",
+        "catalog-acquisition-work-guard-v1",
+        "catalog-live-recovery-work-v2",
+        "catalog-live-recovery-work-guard-v2",
+        "catalog-acquisition-work-lease-v1",
+        "catalog-acquisition-work-lease-guard-v1",
+        "catalog-acquisition-work-held-v1",
+        "catalog-acquisition-work-held-guard-v1",
+        "catalog-live-work-domain-v1",
+        "catalog-live-work-domain-guard-v1",
+    ];
+    let limit = store
+        .checkpoint_acquisition_work_usage()
+        .unwrap()
+        .unwrap()
+        .limit;
+    let amount = base(&cert);
+    let mut stopped = store
+        .begin_checkpoint_recovery_work(selected(&cert), amount)
+        .unwrap();
+    let snapshot: Vec<_> = kinds
+        .iter()
+        .map(|kind| (*kind, store.records(kind).unwrap()))
+        .collect();
+    let before = store.checkpoint_acquisition_work_usage().unwrap().unwrap();
+    stopped.finish().unwrap();
+    drop(stopped);
+    let actual = store
+        .begin_checkpoint_recovery_work(selected(&cert), limit)
+        .unwrap();
+    actual.check().unwrap();
+    // Restore valid paired derived rows through SQLite, preserving its live
+    // connection and counters. The later owner must not become the old scope.
+    let tx = rusqlite::Transaction::new_unchecked(
+        &store.connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
+    for (kind, records) in &snapshot {
+        tx.execute("DELETE FROM protocol_records WHERE kind=?1", [kind])
+            .unwrap();
+        for (id, bytes) in records {
+            tx.execute(
+                "INSERT INTO protocol_records(kind,record_id,bytes) VALUES(?1,?2,?3)",
+                params![kind, id, bytes],
+            )
+            .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        store.checkpoint_acquisition_work_usage().unwrap().unwrap(),
+        before
+    );
+    assert!(actual.check().is_err());
+    assert!(matches!(
+        store.begin_checkpoint_recovery_work(selected(&cert), amount),
+        Err(CatalogStoreError::UnrecordedLiveCatalogWork)
+    ));
+    assert_eq!(
+        store.checkpoint_acquisition_work_usage().unwrap().unwrap(),
+        before
+    );
+    drop(actual);
+    assert!(store.reclaim_abandoned_checkpoint_recovery_work().unwrap());
+    let mut next = store
+        .begin_checkpoint_recovery_work(selected(&cert), limit)
+        .unwrap();
+    next.check().unwrap();
+    next.finish().unwrap();
+    assert_eq!(
+        store
+            .checkpoint_acquisition_work_usage()
+            .unwrap()
+            .unwrap()
+            .reserved,
+        Work::default()
     );
 }
 

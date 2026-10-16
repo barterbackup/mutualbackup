@@ -3655,6 +3655,19 @@ fn validate_volume_object_record_id(record_id: &[u8], receipt: &VolumeReceipt) -
     Ok(())
 }
 
+/// Conservative work credit for one complete scratch admission. A funded
+/// reservation performs at most eight bounded ledger/declaration passes,
+/// including one dead-scope reclamation and readback. Each sees at most 64
+/// paired 1 KiB declarations plus fixed resource/quota schemas. The separate
+/// volume registry has at most 1,023 entries in a 4 MiB row. Reserve before any
+/// of those scans, not from unused payload/page credits after construction.
+pub(crate) const PAGED_SCRATCH_ADMISSION_WORK: mb_core::CatalogCodingTraversalBudget =
+    mb_core::CatalogCodingTraversalBudget {
+        bytes: 64 * 1024 * 1024,
+        records: 32 * 1024,
+        page_occurrences: 0,
+    };
+
 /// Keep paged scratch on the catalog filesystem and protect every configured
 /// parity headroom on that device plus current database checkpoint-copy space.
 pub(crate) fn paged_scratch_store(
@@ -3688,16 +3701,33 @@ pub(crate) fn paged_scratch_store(
                 checkpoints.push(record.path.join(&record.database_file));
             }
         }
-        Ok(
-            mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
-                directory,
-                limits,
-                &checkpoints,
-            )?,
-        )
+        match control.reserve_catalog_scratch(limits.max_physical_bytes)? {
+            Some(lease) => Ok(
+                mb_store::RecordScratchStore::new_in_with_reserved_checkpoint_space(
+                    directory,
+                    limits,
+                    &checkpoints,
+                    lease,
+                )?,
+            ),
+            None => Ok(
+                mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
+                    directory,
+                    limits,
+                    &checkpoints,
+                )?,
+            ),
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let limits = mb_store::ScratchStorageLimits::for_database(max_database_bytes)?;
+        if control
+            .reserve_catalog_scratch(limits.max_physical_bytes)?
+            .is_some()
+        {
+            bail!("resource-backed physical scratch allocation is unsupported on this platform");
+        }
         Ok(mb_store::RecordScratchStore::new(max_database_bytes)?)
     }
 }
