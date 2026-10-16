@@ -7637,3 +7637,32 @@ activation and normal paged integration remain open. Normal producers stay
 disabled. R1/R2/R3/R5/R7 and M6 remain open; dense 1 TiB and native Windows/macOS
 qualification remain user-deferred. A complete current-source qualification is
 still required with the initial-coverage diagnostics before installed jobs.
+
+Complete current debug-source qualification (2026-10-16):
+`d8e0581` passes 1,613 distinct fresh cases across all 19 ordinary
+workspace drivers, three bulk-memory gates, both provisioned kernel ownership
+probes (PID namespaces and OverlayFS), and four native capture/recovery cases.
+The ordinary suites pass Core 210, Store 547, Git 131, Node 594 and process
+acceptance 23; all other ordinary targets pass. No executable-result reuse was
+needed. Format, strict locked workspace/all-target Clippy, four program builds
+and the real default-volume directory-swap probe pass. Independent audit verifies
+all 407 frozen source inputs and 23 executed programs/drivers, original failure
+artifacts, auxiliary WIP and installed roots. Native mount/image/loop cleanup
+is verified. 121 ignored cases remain unexecuted; this is the recorded Linux
+source slice, not the complete R7 native/upgrade/multi-volume/Tor/platform matrix.
+
+The previously failing initial coverage case passes inside this complete Node
+run with its original 90-second deadline, payload and protection assertions.
+The long native capture/packing lifecycle passes in 644.67 seconds under its
+original 900-second limit. A low-cost read-only sampler records CPU/thread
+scheduling, memory and I/O for the latter part of the run. These positives do
+not explain the earlier initial-coverage failure, native timeout or historical
+5,400-second relay-only stall; preserve their separate source/binary/log evidence.
+R5 causal diagnosis remains open. No installed candidate was built or tested.
+
+Evidence: `/tmp/mb-m6-shared-traversal-qual-s1de_h23`; independent `final-audit.json`, full per-case inventories,
+source and binary manifests, native phase logs and `runtime-resources.jsonl`.
+The isolated scratch-pool/work-accounting branch remains unqualified and is not
+part of this source set. R1/R2/R3/R5/R7, shared physical admission, distributed
+activation and normal paged production/retention/recovery remain open. Dense
+1 TiB and native Windows/macOS qualification remain user-deferred.

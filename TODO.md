@@ -5086,6 +5086,20 @@ shared resource admission and normal paged production/retention/recovery.
     starting installed jobs. Retain the earlier 900-second native capture/packing
     timeout and the historical 5,400-second relay-only stall separately; a later
     pass does not establish a common cause or close either investigation.
+    Current-source prerequisite passes on `d8e0581` (2026-10-16): all
+    1,613 distinct cases run freshly on one frozen source/executable set.
+    The complete Node suite passes all 594 ordinary cases, including this exact
+    previously failing fixture; Core 210, Store 547, Git 131, process 23, all
+    other ordinary targets, bulk3, kernel2 and native4 also pass. The native
+    lifecycle completes in 644.67 seconds under the original 900-second bound.
+    Strict workspace Clippy, formatting, builds and independent 407-input/
+    23-executable audit pass; native cleanup and old failure preservation are
+    verified. Read-only host/thread telemetry covers the latter run. No deadline,
+    payload or protection assertion changed. This satisfies the complete-source
+    prerequisite, but does not diagnose any of the three distinct historical
+    observations or close this item/R5/R7. No installed jobs ran; 121 ignored
+    cases remain unexecuted. Evidence:
+    `/tmp/mb-m6-shared-traversal-qual-s1de_h23`.
   - [x] Preserve and instrument the initial checkpoint coverage timeout.
     Full source qualification and first-coverage diagnostics (2026-10-15):
     The complete C2 source gate on `c2c82ef` failed. All four provisioned native
