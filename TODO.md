@@ -2729,6 +2729,9 @@ shared resource admission and normal paged production/retention/recovery.
       debt. Resource-backed new scratch requires explicit pool enrollment, while
       existing catalogs remain readable. Actual extent allocation, checkpoint-copy
       reserves and shared filesystem headroom remain enforced independently.
+      Retained-proof work metering now prepays bounded admission/reclamation and
+      registry scans before every scratch index/stack; a prefix-budget fixture
+      requires unchanged scratch debt on early refusal. This is unexecuted.
       Source includes byte/job concurrency, atomic ABORT/IGNORE faults, corrupted
       pairs/markers, copies, owned VFS lifetime, constructor failure, SIGKILL and
       both retained-recovery-layout checks. These tests have NOT run. Only format

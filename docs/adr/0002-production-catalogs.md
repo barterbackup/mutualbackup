@@ -7652,7 +7652,10 @@ catalogs remain readable; unsupported physical platforms fail before a funded
 scratch job starts. Per-file fallocate, checkpoint-copy reservation and shared
 filesystem headroom remain mandatory. Pool declarations are aggregate ceilings,
 not a promise of free blocks or authority to publish data. Traversal work credits
-and persistent SQL/WAL/volume physical admission remain separate.
+and persistent SQL/WAL/volume physical admission remain separate. Retained proof
+reconstruction prepays the bounded pool/reclamation and volume-registry scans
+before each scratch index/stack. The prefix-budget case requires no new physical
+debt before later source validation. These checks remain unexecuted.
 
 The isolated branch includes concurrency, fault, copy, token-lifetime, constructor,
 SIGKILL and both-layout retained recovery cases. They are unexecuted; only format
