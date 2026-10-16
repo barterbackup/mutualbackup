@@ -7666,3 +7666,23 @@ The isolated scratch-pool/work-accounting branch remains unqualified and is not
 part of this source set. R1/R2/R3/R5/R7, shared physical admission, distributed
 activation and normal paged production/retention/recovery remain open. Dense
 1 TiB and native Windows/macOS qualification remain user-deferred.
+
+Standalone durable capture/recovery consumers (correction pending qualification, 2026-10-16):
+A fresh-process regression on `e870e53` reproduces standalone reanchoring
+swallowing Pending from old-anchor relocation and attempting a replacement
+capture. The exact source/executable and failing child trace are preserved at
+`/tmp/mb-m6-durable-source-red-corrected-42eyraqx`. An earlier wrong module
+selector executed no cases; its separate artifacts remain for inspection.
+
+The correction resolves dense/sparse standalone capture and recovered anchor
+reads through the catalog's durable cursor. A second rename returns to that
+resolver rather than launching a process-local scan in a file loop. Pending
+old-anchor reuse requests retry and preserves its original ownership. Recovery
+verifies signed metadata and bytes before completing assistance; final records
+retain the discovered path rather than restoring the stale immutable hint.
+The regression supplies a real restored tree and retries in fresh processes
+across 5,000 entries, requiring unchanged original manifests/recipes while
+pending, exact-byte recovery and discovery-journal cleanup. These corrected
+runtime/native checks remain unexecuted. Best-effort cleanup, retry/backoff,
+other consumers/filesystems/platforms and the full R1/R2/R3/R5/R7 gates remain
+open. Dense 1 TiB and native Windows/macOS qualification remain user-deferred.

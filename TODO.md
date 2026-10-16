@@ -4669,6 +4669,21 @@ shared resource admission and normal paged production/retention/recovery.
     Validation: all 150 ordinary store tests pass (26 provisioned tests remain
     ignored), including existing reset/CAS and pin-transfer regressions. This
     slice does not qualify other discovery consumers/platforms or the full M6 gate.
+  - [ ] Qualify durable standalone capture/recovery source reads.
+    A fresh-process regression on `e870e53` reproduces old reanchoring treating
+    pending relocation as unavailable data and attempting a new reflink capture.
+    The exact old source, driver and child failure are preserved at
+    `/tmp/mb-m6-durable-source-red-corrected-42eyraqx`; the earlier selector-only
+    failure ran no cases and is retained separately. The pending correction
+    routes dense/sparse standalone capture and recovered-anchor reads through
+    the catalog cursor, preserves Pending during old-anchor reuse, and stores
+    the discovered area instead of overwriting it with the stale original hint.
+    The new case retries across fresh processes through a 5,000-entry namespace,
+    preserving the old manifest/recipes while pending and requiring exact-byte
+    completion and journal cleanup. Runtime/native/ownership qualification is
+    still pending; do not merge this correction yet. Best-effort cleanup,
+    operational backoff, other consumers/platforms and the enclosing gates remain
+    open under the integration task below.
   - [ ] Complete stable anchor relocation discovery integration. Extend durable
     progress to remaining standalone capture/recovery and best-effort cleanup
     call paths; complete consumer lifecycle qualification;
