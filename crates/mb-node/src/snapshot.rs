@@ -4975,13 +4975,22 @@ mod metadata_compatibility_tests {
                 &keys.database_key(b"control.db"),
             )
             .unwrap();
-            let revision = decode_canonical(
+            let revision: SignedRecord<UserRevision> = decode_canonical(
                 &control
                     .get_record("fixture-revision", b"revision")
                     .unwrap()
                     .unwrap(),
             )
             .unwrap();
+            let bytes = control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap();
+            let manifest = decode_canonical(&bytes).unwrap();
+            let (metadata, _) =
+                load_private_metadata_with_git(&control, &keys, guild, &revision).unwrap();
+            validate_recovered_manifest(&metadata, &manifest)
+                .expect("fixture must pass original source metadata admission before discovery");
             match reanchor_recovered_revision(
                 &control,
                 &keys,
@@ -5072,14 +5081,38 @@ mod metadata_compatibility_tests {
             root_mode: metadata.root_mode,
             root_modified_secs: metadata.root_modified_secs,
             root_modified_nanos: metadata.root_modified_nanos,
-            entries: vec![CapturedEntry::File {
+            entries: vec![CapturedEntry::FileV2 {
                 path: "payload".into(),
                 mode: 0o644,
                 logical_len: payload.len() as u64,
                 modified_secs: 1,
                 modified_nanos: 0,
+                native_id: {
+                    use std::os::unix::fs::MetadataExt;
+                    mb_store::NativeFileId {
+                        filesystem_id: mb_store::filesystem_identity(&moved).unwrap().stable_id,
+                        inode: fs::metadata(moved.join(anchor_id.to_string()).join("payload"))
+                            .unwrap()
+                            .ino(),
+                    }
+                },
+                data_extents: vec![FileExtent {
+                    offset: 0,
+                    logical_len: payload.len() as u64,
+                }],
             }],
         };
+        validate_recovered_manifest(&metadata, &manifest).unwrap();
+        let (mut verified, _) = manifest
+            .file_locator("payload".into())
+            .unwrap()
+            .open_at_known_area(Some(&moved))
+            .unwrap()
+            .unwrap();
+        let mut verified_bytes = Vec::new();
+        verified.read_to_end(&mut verified_bytes).unwrap();
+        assert_eq!(verified_bytes, payload);
+        drop(verified);
         let original = canonical_bytes(&manifest).unwrap();
         let database = state.join("control.db");
         let control = ControlStore::open(&database, &keys).unwrap();

@@ -6373,21 +6373,22 @@ activation and normal paged production/retention/recovery remain open. Dense
 1 TiB and native Windows/macOS qualification remain user-deferred.
 
 Standalone durable capture/recovery consumers (correction pending qualification, 2026-10-16):
-A fresh-process regression on `e870e53` reproduces standalone reanchoring
-swallowing Pending from old-anchor relocation and attempting a replacement
-capture. The exact source/executable and failing child trace are preserved at
-`/tmp/mb-m6-durable-source-red-corrected-42eyraqx`. An earlier wrong module
-selector executed no cases; its separate artifacts remain for inspection.
+The proposed correction resolves dense/sparse standalone capture and recovered
+anchor reads through the catalog cursor, preserves Pending during old-anchor
+reuse, and retains the discovered path after source verification. A second
+rename returns to the durable resolver instead of starting another process-local
+scan in a file loop. Best-effort cleanup and operational retry/backoff remain open.
 
-The correction resolves dense/sparse standalone capture and recovered anchor
-reads through the catalog's durable cursor. A second rename returns to that
-resolver rather than launching a process-local scan in a file loop. Pending
-old-anchor reuse requests retry and preserves its original ownership. Recovery
-verifies signed metadata and bytes before completing assistance; final records
-retain the discovered path rather than restoring the stale immutable hint.
-The regression supplies a real restored tree and retries in fresh processes
-across 5,000 entries, requiring unchanged original manifests/recipes while
-pending, exact-byte recovery and discovery-journal cleanup. These corrected
-runtime/native checks remain unexecuted. Best-effort cleanup, retry/backoff,
-other consumers/filesystems/platforms and the full R1/R2/R3/R5/R7 gates remain
-open. Dense 1 TiB and native Windows/macOS qualification remain user-deferred.
+Initial regression fixtures supplied CapturedEntry::File instead of native
+reanchoring's required FileV2. Their fallback failures therefore establish no
+production cause. Preserve source/binary/log evidence at
+`/tmp/mb-m6-durable-source-red-corrected-42eyraqx` and
+`/tmp/mb-m6-durable-source-green-62zfw61w` as invalid-fixture observations.
+The earlier wrong module selector ran no cases and is separately preserved.
+The corrected fixture carries real native file identity/extents, verifies its
+bytes, and passes original metadata admission in both parent and fresh child
+before recovery. It supplies a real restored tree and retries across a
+5,000-entry namespace. Compare original and corrected implementations before
+claiming diagnosis or qualification. Normal/native checks remain pending;
+R1/R2/R3/R5/R7 and other consumer/platform gates remain open. Dense 1 TiB and
+native Windows/macOS qualification remain user-deferred.
