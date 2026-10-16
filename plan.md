@@ -6567,3 +6567,26 @@ verify. Evidence: `/tmp/mb-m6-traversal-enrollment-red-xyq8st3b` and
 complete restore/relocation policy, physical SQL/WAL/volume backing, normal paged
 integration, R5 causes and current-source/installed R7 remain open. Producers
 stay disabled; dense 1 TiB and native Windows/macOS remain user-deferred.
+
+### 2026-10-16 — Borrow native SQL descriptors without changing locks
+
+Qualified `6e90abf` adds a pinned C file-control extension that borrows the
+existing Linux Unix-VFS descriptor. Native ownership now verifies the actual
+main file's identity, link count and filesystem alongside the path/directory
+checks. Rust uses no private native-file layout, global syscall hook, or extra
+main descriptor whose close could release SQLite's POSIX locks. The original
+SQLite/SQLCipher/OpenSSL versions and feature declarations are preserved; the
+vendor archive and all original files have recorded checksums.
+
+All 582 ordinary Store cases, namespace/OverlayFS probes, Node recovery2/
+volume81/snapshot36, funded Btrfs scratch/traversal, eight native snapshots and
+four retained recovery cases pass. The three new descriptor cases also repeat
+on Btrfs: 715 distinct cases in 746 executions. Strict locked workspace/all-
+target Clippy, format and independent 442-input/two-driver/source/archive/
+upstream-provenance/native-cleanup audits pass. Evidence:
+`/tmp/mb-m6-native-sql-file-qual-zssj11g9` and
+`/tmp/mb-m6-native-sql-integration-jfhn_muh`. This is a descriptor/identity
+prerequisite; physical SQL/WAL/SHM/temporary/volume reservation, complete
+old-writer/quiescent policy, normal paged integration, full current-source/
+installed qualification and R5 causes remain open. Producers stay disabled;
+dense 1 TiB and native Windows/macOS qualification remain user-deferred.
