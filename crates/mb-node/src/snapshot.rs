@@ -4900,7 +4900,7 @@ mod metadata_compatibility_tests {
     #[test]
     fn recovered_source_discovery_survives_fresh_processes_without_replacing_the_anchor() {
         const CHILD: &str = "MB_RECOVERED_DISCOVERY_CHILD";
-        const CASE: &str = "snapshot::tests::recovered_source_discovery_survives_fresh_processes_without_replacing_the_anchor";
+        const CASE: &str = "snapshot::metadata_compatibility_tests::recovered_source_discovery_survives_fresh_processes_without_replacing_the_anchor";
         let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([49; 32]));
         let guild = [50; 32];
         if let Some(directory) = std::env::var_os(CHILD) {
