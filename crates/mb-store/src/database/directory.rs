@@ -299,6 +299,7 @@ impl DatabaseDirectory {
         guard: Option<&DatabaseOpenGuard>,
     ) -> Result<(Connection, PathBuf), DatabaseError> {
         let path = self.leaf(name)?;
+        super::native_owner::reject_managed_path(&path)?;
         if let Some(guard) = guard {
             guard.verify_unchanged(&path)?;
         }

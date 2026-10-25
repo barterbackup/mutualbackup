@@ -312,6 +312,13 @@ pub(super) unsafe fn shm_map(
 }
 
 impl ControlStore {
+    pub(in crate::database) fn open_owned_native(
+        owner: &Arc<crate::database::native_owner::OwnerState>,
+    ) -> Result<Self, DatabaseError> {
+        let (vfs, path) = owned(owner)?;
+        Self::connect_physical(&owner.directory, path, owner.key(), vfs)
+    }
+
     /// Create an owned new SQL catalog with runtime physical I/O ceilings.
     /// Connections in this process to the same main inode share identical
     /// ceilings. The caller owns partial creation/restart and still owes
@@ -372,6 +379,7 @@ fn create(
     limits: DatabasePhysicalIoLimits,
 ) -> Result<(PhysicalVfs, std::path::PathBuf), DatabaseError> {
     let path = directory.leaf(name)?;
+    crate::database::native_owner::reject_managed_path(&path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sibling = name.to_os_string();
         sibling.push(suffix);
@@ -403,10 +411,22 @@ fn existing(
     limits: DatabasePhysicalIoLimits,
 ) -> Result<(PhysicalVfs, std::path::PathBuf), DatabaseError> {
     let path = directory.leaf(name)?;
+    crate::database::native_owner::reject_managed_path(&path)?;
     let pool = Pool::new(directory, name, limits)?;
     pool.pin_main_path(&path)?;
     let vfs = PhysicalVfs::new(pool.share()?)?;
     Ok((vfs, path))
+}
+fn owned(
+    owner: &Arc<crate::database::native_owner::OwnerState>,
+) -> Result<(PhysicalVfs, std::path::PathBuf), DatabaseError> {
+    owner.verify_current()?;
+    let path = owner.directory.leaf(&owner.name)?;
+    let pool = Pool::new_owned(owner.clone())?;
+    pool.pin_main_path(&path)?;
+    let pool = pool.share()?;
+    pool.admit_family_paths()?;
+    Ok((PhysicalVfs::new(pool)?, path))
 }
 fn connect(
     path: &std::path::Path,
@@ -423,10 +443,22 @@ fn connect(
             .to_str()
             .map_err(|_| DatabaseError::PhysicalIoUnavailable)?,
     )?;
-    crate::database::configure_encrypted(connection, key)
+    if vfs.pool.owner.is_some() {
+        crate::database::configure_encrypted_native(connection, key)
+    } else {
+        crate::database::configure_encrypted(connection, key)
+    }
 }
 
 impl ParityStore {
+    pub(in crate::database) fn open_owned_native(
+        owner: &Arc<crate::database::native_owner::OwnerState>,
+        volume: &[u8; 16],
+    ) -> Result<Self, DatabaseError> {
+        let (vfs, path) = owned(owner)?;
+        Self::connect_physical(&owner.directory, path, volume, owner.key(), vfs)
+    }
+
     /// Create a new caller-owned parity catalog with runtime native file
     /// admission shared by native connections in this process. Durable volume
     /// policy, cross-process/old writers and enclosing operations still require

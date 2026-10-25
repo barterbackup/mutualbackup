@@ -3987,12 +3987,14 @@ dependencies = [
  "hex",
  "libc",
  "mb-core",
+ "rand 0.8.8",
  "rusqlite",
  "serde",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]

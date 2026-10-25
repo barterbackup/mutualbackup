@@ -25,6 +25,8 @@ mod journal_quota;
 mod journal_vfs;
 #[cfg(target_os = "linux")]
 mod native_file;
+#[cfg(target_os = "linux")]
+mod native_owner;
 mod packing_output_retirement;
 mod page_quota;
 #[cfg(target_os = "linux")]
@@ -95,6 +97,8 @@ pub use catalog::{
 #[cfg(target_os = "linux")]
 pub use directory::{DatabaseDirectory, DatabaseOpenGuard};
 pub use journal_quota::{DatabaseJournalQuota, DatabaseJournalQuotaUsage};
+#[cfg(target_os = "linux")]
+pub use native_owner::NativeDatabaseOwner;
 pub use page_quota::{DatabasePageQuota, DatabasePageQuotaUsage};
 #[cfg(target_os = "linux")]
 pub use physical_io::DatabasePhysicalIoLimits;
@@ -106,6 +110,7 @@ pub use scratch::{RecordScratchStore, ScratchStorageLimits};
 pub use scratch_space::physical_allocation_domain;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
+const NATIVE_IO_SQL_MARKER: &str = "native_io_birth_v1";
 const CHECKPOINT_GENERATION_KIND: &str = "guild-checkpoint-generation";
 const CHECKPOINT_LEGACY_EPOCH_KIND: &str = "guild-checkpoint-legacy-epoch";
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
@@ -134,6 +139,16 @@ pub enum DatabaseError {
         "native database storage is unsupported, shared, or lacks the declared physical backing"
     )]
     PhysicalIoUnavailable,
+    #[error(
+        "native database ownership is invalid or changed; preserve the catalog and its ownership records; copied or existing catalogs require explicit adoption"
+    )]
+    NativeOwnershipInvalid,
+    #[error("native database ownership is held by another live owner")]
+    NativeOwnershipBusy,
+    #[error(
+        "this catalog requires its managed native database opener; generic writers and unmanaged rekey are not admitted"
+    )]
+    NativeOwnershipRequired,
     #[error("SQLCipher page HMAC is disabled")]
     HmacDisabled,
     #[error("stored object failed root or length verification")]
@@ -256,6 +271,10 @@ impl ControlStore {
     }
 
     pub fn rekey(self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+        #[cfg(target_os = "linux")]
+        if self.native_database_owner().is_some() {
+            return Err(DatabaseError::NativeOwnershipRequired);
+        }
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         self.connection
@@ -2368,6 +2387,10 @@ impl ParityStore {
     }
 
     pub fn rekey(self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+        #[cfg(target_os = "linux")]
+        if self.native_database_owner().is_some() {
+            return Err(DatabaseError::NativeOwnershipRequired);
+        }
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         self.connection
@@ -4789,6 +4812,8 @@ fn checkpoint_row(
 }
 
 fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseError> {
+    #[cfg(target_os = "linux")]
+    native_owner::reject_managed_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         set_private_directory(parent)?;
@@ -4798,6 +4823,8 @@ fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseErr
 }
 
 fn open_encrypted_existing(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseError> {
+    #[cfg(target_os = "linux")]
+    native_owner::reject_managed_path(path)?;
     let connection = journal_vfs::connect(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -4816,6 +4843,23 @@ fn configure_encrypted_connection(
     connection: Connection,
     key: &[u8; 32],
     read_only: bool,
+) -> Result<Connection, DatabaseError> {
+    configure_encrypted_connection_policy(connection, key, read_only, false)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_encrypted_native(
+    connection: Connection,
+    key: &[u8; 32],
+) -> Result<Connection, DatabaseError> {
+    configure_encrypted_connection_policy(connection, key, false, true)
+}
+
+fn configure_encrypted_connection_policy(
+    connection: Connection,
+    key: &[u8; 32],
+    read_only: bool,
+    native_owner_admitted: bool,
 ) -> Result<Connection, DatabaseError> {
     connection.pragma_update(None, "key", hex::encode(key))?;
     connection.execute_batch(
@@ -4845,6 +4889,9 @@ fn configure_encrypted_connection(
         return Err(DatabaseError::HmacDisabled);
     }
     connection.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+    if !read_only && !native_owner_admitted && has_native_sql_marker(&connection)? {
+        return Err(DatabaseError::NativeOwnershipRequired);
+    }
     page_quota::register(&connection)?;
     page_quota::apply(&connection)?;
     journal_quota::register(&connection)?;
@@ -4857,6 +4904,24 @@ fn configure_encrypted_connection(
         )?;
     }
     Ok(connection)
+}
+
+// The marker is a persistent format boundary even on platforms that cannot
+// acquire a native lease. A copied main must never become a generic writer.
+fn has_native_sql_marker(connection: &Connection) -> Result<bool, DatabaseError> {
+    let meta: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !meta {
+        return Ok(false);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [NATIVE_IO_SQL_MARKER],
+        |r| r.get(0),
+    )?)
 }
 
 fn verify_rekeyed_database(path: &Path, key: &[u8; 32]) -> Result<(), DatabaseError> {

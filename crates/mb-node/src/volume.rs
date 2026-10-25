@@ -3238,6 +3238,23 @@ fn preserved_control_keys(data_dir: &Path, keys: &KeyMaterial) -> Result<Vec<[u8
             unwrap_key_for_preserved_reader(keys, b"control.db/v2", &envelope)
                 .context("cannot unwrap preserved control database key")?,
         );
+    } else {
+        match mb_store::NativeDatabaseOwner::require_unmanaged_path(data_dir.join("control.db")) {
+            Err(DatabaseError::NativeOwnershipRequired) => {
+                let directory = mb_store::DatabaseDirectory::open(data_dir)?;
+                database_keys.push(
+                    mb_store::NativeDatabaseOwner::recovery_key(
+                        &directory,
+                        std::ffi::OsStr::new("control.db"),
+                        keys,
+                        b"control.db/v2",
+                    )?
+                    .0,
+                );
+            }
+            Err(error) => return Err(error.into()),
+            Ok(()) => {}
+        }
     }
     database_keys.push(keys.database_key(b"control.db"));
     Ok(database_keys)
@@ -3248,6 +3265,7 @@ fn preserved_control_keys(data_dir: &Path, keys: &KeyMaterial) -> Result<Vec<[u8
 /// the explicit birth/enrollment/physical opening path is implemented.
 #[cfg(target_os = "linux")]
 pub(crate) fn validate_preserved_control_key(data_dir: &Path, keys: &KeyMaterial) -> Result<()> {
+    mb_store::NativeDatabaseOwner::require_unmanaged_path(data_dir.join("control.db"))?;
     if let Some(envelope) =
         read_private_record_optional::<WrappedDatabaseKey>(&data_dir.join(CONTROL_KEY_FILE))?
     {

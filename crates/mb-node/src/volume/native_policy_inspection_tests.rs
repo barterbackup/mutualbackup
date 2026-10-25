@@ -15,6 +15,56 @@ fn policy() -> NativeDatabaseIoPolicy {
         files: 16,
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_birth_control_recovers_without_an_external_key_and_rejects_node_startup() {
+    let temp = TempDir::new().unwrap();
+    let seed = Seed::from_bytes([74; 32]);
+    let keys = KeyMaterial::from_seed(&seed);
+    let directory = mb_store::DatabaseDirectory::open(temp.path()).unwrap();
+    let store = ControlStore::create_native_in_directory(
+        &directory,
+        std::ffi::OsStr::new("control.db"),
+        &keys,
+        b"control.db/v2",
+        policy(),
+    )
+    .unwrap();
+    store
+        .put_record(
+            "native-policy-fixture",
+            b"retained",
+            b"recover from seed and birth",
+        )
+        .unwrap();
+    let before = footprint(temp.path());
+    with_inspected_control_snapshot(temp.path(), &keys, |reader| {
+        assert_eq!(
+            reader.get_record("native-policy-fixture", b"retained")?,
+            Some(b"recover from seed and birth".to_vec())
+        );
+        Ok(())
+    })
+    .unwrap();
+    let error = crate::Node::lock_data_dir_with_seed(temp.path(), &seed)
+        .err()
+        .expect("normal startup must not grant an unmanaged native writer");
+    assert!(
+        format!("{error:#}").contains("managed native database opener"),
+        "{error:#}"
+    );
+    assert!(!temp.path().join(CONTROL_KEY_FILE).exists());
+    assert!(!temp.path().join(".node.lock").exists());
+    assert_eq!(footprint(temp.path()), before);
+    drop(store);
+    fs::remove_file(temp.path().join("control.db")).unwrap();
+    let before = footprint(temp.path());
+    assert!(crate::Node::lock_data_dir_with_seed(temp.path(), &seed).is_err());
+    assert!(!temp.path().join(CONTROL_KEY_FILE).exists());
+    assert!(!temp.path().join(".node.lock").exists());
+    assert_eq!(footprint(temp.path()), before);
+}
 #[derive(Debug, Eq, PartialEq)]
 struct FileFootprint {
     inode: u64,

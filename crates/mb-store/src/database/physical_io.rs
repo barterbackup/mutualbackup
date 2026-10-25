@@ -88,6 +88,7 @@ pub(super) struct Pool {
     pub(super) limits: DatabasePhysicalIoLimits,
     pub(super) directory: DatabaseDirectory,
     main_name: OsString,
+    pub(super) owner: Option<Arc<super::native_owner::OwnerState>>,
     allocation_lock: File,
     lock_path: PathBuf,
     main: Mutex<Option<File>>,
@@ -109,6 +110,26 @@ impl Pool {
         main_name: &OsStr,
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Arc<Self>, DatabaseError> {
+        Self::with_owner(directory, main_name, limits, None)
+    }
+
+    pub(super) fn new_owned(
+        owner: Arc<super::native_owner::OwnerState>,
+    ) -> Result<Arc<Self>, DatabaseError> {
+        Self::with_owner(
+            &owner.directory,
+            &owner.name,
+            owner.limits(),
+            Some(owner.clone()),
+        )
+    }
+
+    fn with_owner(
+        directory: &DatabaseDirectory,
+        main_name: &OsStr,
+        limits: DatabasePhysicalIoLimits,
+        owner: Option<Arc<super::native_owner::OwnerState>>,
+    ) -> Result<Arc<Self>, DatabaseError> {
         limits.validate()?;
         directory.leaf(main_name)?;
         let (allocation_lock, lock_path) = super::scratch_space::shared_allocation_lock()?;
@@ -116,6 +137,7 @@ impl Pool {
             limits,
             directory: directory.clone(),
             main_name: main_name.to_owned(),
+            owner,
             allocation_lock,
             lock_path,
             main: Mutex::new(None),
@@ -140,6 +162,8 @@ impl Pool {
             if self.limits != existing.limits
                 || self.main_name != existing.main_name
                 || (directory.dev(), directory.ino()) != (original.dev(), original.ino())
+                || self.owner.as_ref().map(|owner| owner.identity())
+                    != existing.owner.as_ref().map(|owner| owner.identity())
             {
                 return Err(DatabaseError::Conflict);
             }
@@ -188,6 +212,13 @@ impl Pool {
         if !pin.metadata()?.is_file() {
             return Err(DatabaseError::PhysicalIoUnavailable);
         }
+        if let Some(owner) = &self.owner {
+            owner.verify_current()?;
+            let m = pin.metadata()?;
+            if (m.dev(), m.ino()) != owner.main_identity() {
+                return Err(DatabaseError::NativeOwnershipInvalid);
+            }
+        }
         let mut main = self
             .main
             .lock()
@@ -210,6 +241,9 @@ impl Pool {
             }
         }
         let guard = AllocationGuard(&self.allocation_lock);
+        if let Some(owner) = &self.owner {
+            owner.verify_current()?;
+        }
         let expected = self.allocation_lock.metadata()?;
         let current = std::fs::symlink_metadata(&self.lock_path)?;
         if !current.is_dir() || (expected.dev(), expected.ino()) != (current.dev(), current.ino()) {
@@ -218,6 +252,70 @@ impl Pool {
         self.allocation_lock
             .set_modified(std::time::SystemTime::now())?;
         Ok(guard)
+    }
+
+    /// Charge every retained linked SQL-family file before a managed reopen,
+    /// including a rollback journal SQLite might not open in WAL mode. O_PATH
+    /// never opens/closes an independent native I/O description or its locks.
+    pub(super) fn admit_family_paths(&self) -> Result<(), DatabaseError> {
+        let mut files = self
+            .files
+            .lock()
+            .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+        let _allocation = self.allocation_guard()?;
+        self.refresh(&mut files)?;
+        let device = self.directory.file().metadata()?.dev();
+        for (suffix, role) in [
+            ("", Role::Main),
+            ("-wal", Role::Journal),
+            ("-journal", Role::Journal),
+            ("-shm", Role::Shm),
+        ] {
+            let mut name = self.main_name.clone();
+            name.push(suffix);
+            let pin = match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(self.directory.leaf(name)?)
+            {
+                Ok(pin) => pin,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let m = pin.metadata()?;
+            if !m.is_file()
+                || m.nlink() != 1
+                || m.dev() != device
+                || m.uid() != unsafe { libc::geteuid() }
+                || m.mode() & 0o077 != 0
+            {
+                return Err(DatabaseError::PhysicalIoUnavailable);
+            }
+            let id = (m.dev(), m.ino());
+            if let Some(entry) = files.get(&id) {
+                if entry.role != role {
+                    return Err(DatabaseError::PhysicalIoUnavailable);
+                }
+            } else {
+                if files.len() >= self.limits.files as usize {
+                    return Err(DatabaseError::CapacityExceeded);
+                }
+                files.insert(
+                    id,
+                    Entry {
+                        pin,
+                        role,
+                        open: 0,
+                        bytes: m
+                            .blocks()
+                            .checked_mul(512)
+                            .ok_or(DatabaseError::CapacityExceeded)?,
+                    },
+                );
+            }
+        }
+        self.refresh(&mut files)?;
+        Ok(())
     }
 
     fn refresh(&self, files: &mut BTreeMap<Identity, Entry>) -> Result<u64, DatabaseError> {
