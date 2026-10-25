@@ -8397,6 +8397,7 @@ async fn execute_delegated_coding(
 ) -> Result<SignedRecord<CodingVerificationTranscript>> {
     let plan = job.plan.clone();
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    add_coding_peer_addresses(node.clone(), p2p, &plan, local_id).await?;
     let estimate = coding_transfer_estimate(&plan.value)?;
     tracing::debug!(
         attempt_id = ?plan.value.attempt_id,
@@ -8557,6 +8558,56 @@ async fn execute_delegated_coding(
             .await?
     };
     Ok(transcript)
+}
+
+// A new coordinator can know only its delegator's connection. Load the
+// assigned participants' current roster hints before its first remote RPC.
+// Normal address admission preserves signed endpoint authority and Tor policy.
+async fn add_coding_peer_addresses(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    plan: &SignedRecord<CodingAttemptPlan>,
+    local_id: NodeId,
+) -> Result<()> {
+    let mut targets = plan
+        .value
+        .geometry
+        .information
+        .iter()
+        .filter(|role| !role.sector.virtual_zero)
+        .map(|role| role.owner)
+        .chain(plan.value.geometry.parity.iter().map(|role| role.holder))
+        .chain([plan.value.delegator, plan.value.verification_coordinator])
+        .collect::<BTreeSet<_>>();
+    targets.remove(&local_id);
+    let guild_id = plan.value.geometry.guild_id;
+    let membership_epoch = plan.value.membership_epoch;
+    let peers = node_blocking(node, move |node| {
+        let guild = node
+            .guild_summary()?
+            .context("delegated coding requires an installed guild roster")?;
+        anyhow::ensure!(
+            guild.guild_id == guild_id && guild.membership_epoch == Some(membership_epoch),
+            "delegated coding roster authority changed before participant routing"
+        );
+        Ok(guild
+            .peers
+            .into_iter()
+            .filter(|peer| targets.contains(&peer.member.node_id))
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    for peer in peers {
+        let target = peer.member.node_id;
+        for endpoint in peer.endpoints {
+            if let Ok(address) = endpoint.parse()
+                && let Err(error) = p2p.add_peer_address(target, address).await
+            {
+                tracing::debug!(%target, %error, "coding participant endpoint hint was rejected");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn submit_delegated_coding_result(
@@ -29103,6 +29154,15 @@ mod tests {
     }
 
     async fn uncovered_activations_unblock_live_checkpoint_wait_fixture(offline_spare: bool) {
+        uncovered_activations_with_topology(offline_spare, true).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_coding_coordinator_registers_roster_routes_before_first_rpc() {
+        uncovered_activations_with_topology(true, false).await;
+    }
+
+    async fn uncovered_activations_with_topology(offline_spare: bool, dht_maintenance: bool) {
         let temp = tempfile::tempdir().unwrap();
         let seeds = (201_u8..206)
             .map(|byte| Seed::from_bytes([byte; 32]))
@@ -29131,6 +29191,7 @@ mod tests {
                 .unwrap();
             let mut cfg = config(node.lock().unwrap().keys().node_id());
             cfg.enable_relay_server = false;
+            cfg.enable_dht_maintenance = dht_maintenance;
             let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
             clients.push(client);
             network_tasks.push(tokio::spawn(event_loop.run()));
@@ -29352,6 +29413,46 @@ mod tests {
             healthy.value.verification_coordinator,
             successor.value.coding_coordinator
         );
+        if !dht_maintenance {
+            assert_eq!(healthy.value.coding_coordinator, keys[1].node_id());
+            assert_eq!(healthy.value.verification_coordinator, keys[3].node_id());
+            // Exercise the real worker against a fresh routing table without
+            // polling its swarm. Discovery cannot incidentally supply a route
+            // before we inspect the first application request.
+            let mut cfg = config(keys[1].node_id());
+            cfg.enable_relay_server = false;
+            cfg.enable_dht_maintenance = false;
+            let (probe, mut routing) = build_p2p(nodes[1].clone(), cfg).unwrap();
+            let job = DelegatedCodingJob {
+                format_version: 1,
+                plan: healthy.clone(),
+                state: DelegatedCodingJobState::Running,
+                transcript: None,
+                error: None,
+            };
+            let execution = execute_delegated_coding(nodes[1].clone(), &probe, &job);
+            tokio::pin!(execution);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let command = tokio::select! {
+                        result = &mut execution => panic!("worker ended before its first RPC: {result:?}"),
+                        command = routing.commands.recv() => command.unwrap(),
+                    };
+                    if let Command::Request { recipient, .. } = &command {
+                        assert_eq!(*recipient, healthy.value.verification_coordinator);
+                        let peer = recipient.libp2p_peer_id().unwrap();
+                        assert!(
+                            !routing.retained_peer_addresses(peer).is_empty(),
+                            "first verifier RPC requires the installed roster route"
+                        );
+                        break;
+                    }
+                    routing.handle_command(command).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
         let coverage_trace = super::super::coding_trace::Session::start(
             &nodes,
             offline_spare,
