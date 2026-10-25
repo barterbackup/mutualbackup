@@ -3007,14 +3007,39 @@ enclosing reservations remain required. No release or platform gate closes.
       restored/host-relocated adoption, ownership-bookkeeping/global/enclosing
       funding and normal paged producers remain open. No host-reboot, complete
       workspace test, installed-artifact or deferred platform claim is made.
+    - [x] Connect explicit Linux native Node birth to ordinary managed runtime.
+      Code `859ce70` persists original control/parity policies, keys and default
+      volume identity through signed creation/readiness records and one atomic
+      SQL registry/profile publication. Ordinary Node/control/parity opens,
+      readers and configuration retain native ownership and physical ceilings.
+      Read-only admission precedes permission changes/recovery; separate
+      inspection capabilities cannot retain or unlock writer leases. Main,
+      journal, profile and manifest guards reach the actual native descriptor.
+      Empty/absent creation handoff and Btrfs empty-main NoCow/ctime regressions
+      have preserved negative sources/binaries/logs and passing final cases;
+      shared-extent capacity-error compatibility is preserved too.
+      All 622 ordinary Store cases and 60 Btrfs executions pass (642 distinct
+      cases in 682 executions). Strict workspace/all-target Clippy, format,
+      399-input/two-executable/source-archive identity and owned mount/loop
+      cleanup pass. Evidence: `/tmp/mb-native-node-qual-rx_jdsbb`, final `*-r3`,
+      `native-r3` and `focused-audit.json`. Three detached negative images remain.
+      Full ordinary Node qualification is running with four threads, the
+      documented 5,000-second overall bound and 65,536 available descriptors.
+      The intermediate default-concurrency/1,024-descriptor failure is retained;
+      no complete Node/workspace or installed pass is claimed yet. Default
+      initialization remains v1; explicit CLI/default policy selection,
+      additional native volume birth, managed rekey, safe adoption, host reboot
+      and complete enclosing funding remain open. Normal paged producers stay
+      disabled. This closes no enclosing R1/R2/R3/R5/R7 or deferred hardware gate.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement
       through ordinary writable opens, rekey and reopen. Define quiescent
       enrollment of existing catalogs and restored/copied inputs so old writers
       cannot bypass admission or obtain duplicate live capacity. Preserve v1
-      compatibility and read-only recovery; do not remove the current v2 mutable
-      rejection before that path exists. Qualify interrupted publication,
+      compatibility and read-only recovery; retain generic v2 mutable rejection
+      outside authenticated managed paths. Complete ordinary policy selection
+      and additional native volume birth as well. Qualify interrupted publication,
       partial creation, missing/replaced files, owner restart and copy adoption
       with exact original data and admission limits preserved.
     - [ ] Compose native SQL/WAL/SHM/temporary, scratch and payload reservations

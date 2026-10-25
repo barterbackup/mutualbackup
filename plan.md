@@ -1663,10 +1663,13 @@ coverage failure, 900-second native timeout and historical relay-only stall
 separately; later positives establish no cause and do not close R5.
 
 The explicit Store birth/same-host process-restart foundation is qualified in
-`9047752` below. Complete ordinary Node/control/parity startup integration,
-managed rekey and quiescent existing/restore/host-relocation adoption, then
-integrate complete shared SQL/WAL/SHM/temporary, scratch, payload
-and checkpoint-copy reservations across normal operations and volumes. Current
+`9047752` below. Code `859ce70` connects explicit Linux Node birth to ordinary
+managed control/parity opens and readers; its focused qualification is recorded
+below and the complete ordinary Node run is in progress. Complete ordinary
+initialization policy selection, additional native volume birth, managed rekey
+and quiescent existing/restore/host-relocation adoption, then integrate complete
+shared SQL/WAL/SHM/temporary, scratch, payload and checkpoint-copy reservations
+across normal operations and volumes. Current
 process-local native physical pools and traversal/scratch ledgers are increments
 toward R3-SINGLE-OWNER-METADATA, not complete single-owner 1 TiB admission.
 Continue the remaining R1 safe-upgrade/recovery contract. Finish distributed
@@ -6821,3 +6824,57 @@ checkpoint/rebuild reservations. Normal paged production stays disabled. Full
 workspace tests, installed artifacts, host reboot and deferred platform/capacity
 qualification are not claimed. R1/R2/R3/R5/R7 and the remaining M6 gates stay
 open; these passes diagnose none of the historical liveness observations.
+
+### 2026-10-25 — Native Node birth and ordinary managed runtime
+
+Code `859ce70` adds explicit Linux `Node::create_native` creation/resume with
+caller-declared control/parity policies. An immutable signed profile persists
+the original parent, volume UUID and both policies before SQL. Signed readiness
+binds both original wrapped keys after the registry/profile transaction commits.
+Ordinary Node opens validate this profile and inspect supported source state
+read-only before lock/permission changes or SQL recovery. Control/parity readers
+and configuration retain native owner handles and physical ceilings. Managed
+configuration refuses implicit legacy volume creation; coding capacity hints
+respect physical admission. Generic mutable native-key rejection remains outside
+these authenticated paths. Existing default initialization still selects v1.
+
+Read-only Store inspections carry pinned authenticated evidence without writer
+claims or allocation credits. A distinct open description owns the kernel lease,
+so retaining or dropping inspection handles cannot retain or unlock writers.
+Admitted creation and reopen fence main/journal/private inputs through the
+actual native main descriptor before SQL configuration. Six Node publication
+points qualify both injected failure and actual process death, stable original
+identity/key/policy, ordinary reopen, control configuration and fixed parity ACKs,
+reader lifetime exclusion, wrong seed/policy, copy/legacy refusal, withdrawn
+source rejection and control/parity handoff substitution.
+
+Two discovered defects have preserved negative source/executable/log evidence.
+An empty/absent creation handoff could publish more startup state after withdrawn
+records appeared; the unchanged regression now checks no post-handoff mutation.
+Btrfs NoCow initialization changed an empty partial main's ctime before descriptor
+admission, causing a false conflict. Main initialization now follows the guard,
+with writes/truncation blocked until it completes. The existing SQLite capacity
+error contract for shared extents is preserved; its intermediate failure is also
+archived. The same creation and physical regressions pass on the final source.
+
+All 622 ordinary Store cases and 60 disposable Btrfs executions pass: 21 physical,
+21 ownership, five preserved inspection, nine bootstrap, three runtime and one
+parity handoff. The focused audit verifies 642 distinct cases in 682 executions,
+399 code inputs, two exact executables/source archive, strict workspace/all-target
+Clippy, format and owned mount/loop cleanup. Evidence:
+`/tmp/mb-native-node-qual-rx_jdsbb`, final `*-r3` logs, `native-r3` and
+`focused-audit.json`. The three detached negative images remain preserved.
+
+The complete ordinary Node run is still in progress on these exact binaries,
+with four threads and the documented 5,000-second overall bound. Its initial
+intermediate default-concurrency attempt exhausted the 1,024-descriptor process
+limit; that log, descriptor inventory, source and binary are preserved. The
+current runner provides 65,536 descriptors and retains individual test deadlines.
+No complete ordinary Node/workspace or installed-artifact pass is claimed yet.
+This observation diagnoses none of the separate historical R5 timeouts.
+
+Complete fresh CLI/default policy selection and additional native volume birth,
+managed rekey, quiescent old-writer/restore/host-relocation adoption, host reboot
+and enclosing ownership-bookkeeping/SQL/scratch/payload/checkpoint funding.
+Normal paged producers stay disabled. R1/R2/R3/R5/R7 and the user-deferred native
+platform/dense-capacity gates remain open.
