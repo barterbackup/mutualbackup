@@ -45,6 +45,8 @@ use crate::{
     node::{NodeReader, NodeReaderConfig},
 };
 
+#[cfg(test)]
+mod coding_trace;
 mod p2p;
 mod port_mapping;
 mod tor;
@@ -712,7 +714,21 @@ fn process_peer_request(
         }
 
         let mutation_kind = request.mutation_kind();
+        #[cfg(test)]
+        let trace = coding_trace::Job::queued(
+            &service.writer,
+            mutation_kind.unwrap_or("writer-read"),
+            None,
+        );
+        #[cfg(test)]
+        if let Some(trace) = &trace {
+            trace.phase("scheduled");
+        }
         let mut node_guard = service.writer.lock().map_err(lock_error)?;
+        #[cfg(test)]
+        if let Some(trace) = &trace {
+            trace.phase("locked");
+        }
         #[cfg(test)]
         let local_node_id = node_guard.keys().node_id();
         #[cfg(test)]

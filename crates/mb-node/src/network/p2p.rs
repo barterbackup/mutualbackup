@@ -512,6 +512,10 @@ enum Command {
     Status {
         response: oneshot::Sender<P2pStatus>,
     },
+    #[cfg(test)]
+    CoverageRoutingSnapshot {
+        response: oneshot::Sender<serde_json::Value>,
+    },
     CodingPathObservation {
         targets: Vec<NodeId>,
         response: oneshot::Sender<Result<CodingPathObservation>>,
@@ -3781,6 +3785,16 @@ impl P2pClient {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn coverage_routing_snapshot(&self) -> Result<serde_json::Value> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::CoverageRoutingSnapshot { response })
+            .await
+            .context("libp2p event loop stopped")?;
+        receiver.await.context("coverage routing snapshot was lost")
+    }
+
     pub async fn status(&self) -> Result<P2pStatus> {
         let (response, receiver) = oneshot::channel();
         self.commands
@@ -5724,6 +5738,30 @@ impl P2pEventLoop {
                     .refresh_coding_path_observations()
                     .and_then(|()| self.service.coding_path_observation(&targets));
                 let _ = response.send(result);
+            }
+            #[cfg(test)]
+            Command::CoverageRoutingSnapshot { response } => {
+                let now = tokio::time::Instant::now();
+                let describe = |pending: &PendingRequest| {
+                    let tier = self.selected_transport_tier(pending.peer);
+                    serde_json::json!({
+                        "recipient": pending.recipient.to_string(), "peer": pending.peer.to_string(),
+                        "request_id": hex::encode(pending.request_id),
+                        "kind": pending.request.value.request.mutation_kind(),
+                        "attempts": pending.attempts,
+                        "remaining_ms": pending.deadline.saturating_duration_since(now).as_millis(),
+                        "tier": tier, "connected": self.swarm.is_connected(&pending.peer),
+                        "policy_connection": self.selected_application_connection(pending.peer, tier).map(|c| c.to_string()),
+                        "retained_addresses": self.retained_peer_addresses(pending.peer).iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        "learned_authority": self.learned_addresses.get(&pending.peer).map(|a| format!("{:?}", a.authority)),
+                    })
+                };
+                let snapshot = serde_json::json!({
+                    "peer": self.swarm.local_peer_id().to_string(),
+                    "queued": self.queued_requests.iter().map(describe).collect::<Vec<_>>(),
+                    "dispatched": self.pending_requests.values().map(describe).collect::<Vec<_>>(),
+                });
+                let _ = response.send(snapshot);
             }
             Command::Status { response } => {
                 let mut listen_addresses = self
@@ -16612,6 +16650,7 @@ async fn publish_p2p_checkpoint_object(
     Ok(holders)
 }
 
+#[cfg(not(test))]
 async fn node_blocking<T, F>(node: Arc<Mutex<Node>>, operation: F) -> Result<T>
 where
     T: Send + 'static,
@@ -16625,6 +16664,37 @@ where
     })
     .await
     .context("node worker failed")?
+}
+
+#[cfg(test)]
+#[track_caller]
+fn node_blocking<T, F>(node: Arc<Mutex<Node>>, operation: F) -> impl Future<Output = Result<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Node) -> Result<T> + Send + 'static,
+{
+    let source = std::panic::Location::caller();
+    async move {
+        let trace =
+            super::coding_trace::Job::queued(&node, std::any::type_name::<F>(), Some(source));
+        tokio::task::spawn_blocking(move || {
+            if let Some(trace) = &trace {
+                trace.phase("scheduled");
+            }
+            let mut node = node
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node state lock is poisoned"))?;
+            if let Some(trace) = &trace {
+                trace.phase("locked");
+            }
+            let result = operation(&mut node);
+            drop(node);
+            drop(trace);
+            result
+        })
+        .await
+        .context("node worker failed")?
+    }
 }
 
 fn fail_dht_pending(pending: PendingDht, message: &str) {
@@ -29282,6 +29352,12 @@ mod tests {
             healthy.value.verification_coordinator,
             successor.value.coding_coordinator
         );
+        let coverage_trace = super::super::coding_trace::Session::start(
+            &nodes,
+            offline_spare,
+            checkpoint.hash().unwrap(),
+            healthy.value.attempt_id,
+        );
         let coding_tasks = nodes
             .iter()
             .zip(clients.iter())
@@ -29294,6 +29370,35 @@ mod tests {
             wait_for_variable_coding_groups(nodes[0].clone(), checkpoint.clone()),
         )
         .await;
+        if let Some(trace) = &coverage_trace {
+            let outcome = match &coverage {
+                Ok(Ok(())) => "complete",
+                Ok(Err(_)) => "error",
+                Err(_) => "timeout",
+            };
+            let path = trace.save(outcome).unwrap();
+            eprintln!("first coverage trace: {}", path.display());
+            if outcome != "complete" {
+                let routes = futures::future::join_all(clients.iter().map(|client| async move {
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        client.coverage_routing_snapshot(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(snapshot)) => snapshot,
+                        other => serde_json::json!({"snapshot_error": format!("{other:?}")}),
+                    }
+                }))
+                .await;
+                std::fs::write(
+                    path.with_extension("network.json"),
+                    serde_json::to_vec_pretty(&routes).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        drop(coverage_trace);
         if !matches!(&coverage, Ok(Ok(()))) {
             let progress = nodes
                 .iter()
