@@ -400,13 +400,28 @@ pub(crate) fn prepare(
         last_error: None,
         configured: true,
     };
+    #[cfg(test)]
+    BEFORE_REGISTRY_PUBLICATION.with(|hook| {
+        if let Some(operation) = hook.borrow_mut().take() {
+            operation(&control);
+        }
+    });
     let records = load_volume_records(&control)?;
     anyhow::ensure!(
         records.is_empty() || records == [record.clone()],
         "unfinished native Node has unexpected volume ownership"
     );
     control.with_record_transaction(|| -> Result<()> {
-        store_volume_records(&control, &[record])?;
+        let registry = vec![record];
+        let bytes = canonical_bytes(&registry)?;
+        store_volume_records(&control, &registry)?;
+        anyhow::ensure!(
+            control
+                .get_record("node-config", b"storage-volumes")?
+                .as_deref()
+                == Some(bytes.as_slice()),
+            "native Node volume registry publication was ignored or changed"
+        );
         let bytes = digest(&profile)?;
         let existing = control.get_record(PROFILE_KIND, b"ready")?;
         anyhow::ensure!(
@@ -452,9 +467,13 @@ enum Step {
     Ready,
 }
 #[cfg(test)]
+type RegistryPublicationHook = Box<dyn FnOnce(&ControlStore)>;
+
+#[cfg(test)]
 thread_local! {
     static INTERRUPT: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
     static BEFORE_CONTROL_CREATION_WRITER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_REGISTRY_PUBLICATION: std::cell::RefCell<Option<RegistryPublicationHook>> = const { std::cell::RefCell::new(None) };
 }
 fn interruption(step: Step) -> Result<()> {
     #[cfg(test)]

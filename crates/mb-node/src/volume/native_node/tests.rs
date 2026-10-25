@@ -178,6 +178,83 @@ fn native_node_resumes_each_interrupted_publication_with_original_identity_and_p
 }
 
 #[test]
+fn native_node_registry_publication_requires_exact_durable_bytes() {
+    for action in [
+        "SELECT RAISE(IGNORE)",
+        "UPDATE protocol_records SET bytes = X'00' WHERE kind = 'node-config' AND record_id = X'73746f726167652d766f6c756d6573'",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([88; 32]);
+        let keys = KeyMaterial::from_seed(&seed);
+        INTERRUPT.with(|next| next.set(Some(Step::Control)));
+        assert!(Node::create_native(temp.path(), seed.clone(), policy()).is_err());
+        let before = footprint(temp.path());
+        let open_control = || {
+            let directory = DatabaseDirectory::open(temp.path()).unwrap();
+            ControlStore::open_native_existing_in_directory(
+                &directory,
+                OsStr::new("control.db"),
+                &keys,
+                b"control.db/v2",
+            )
+            .unwrap()
+        };
+        BEFORE_REGISTRY_PUBLICATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |control| {
+                let timing = if action.starts_with("SELECT") {
+                    "BEFORE"
+                } else {
+                    "AFTER"
+                };
+                control.database_shell_statement(
+                    &format!("CREATE TEMP TRIGGER alter_registry {timing} INSERT ON protocol_records WHEN NEW.kind = 'node-config' AND NEW.record_id = X'73746f726167652d766f6c756d6573' BEGIN {action}; END"),
+                    false,
+                ).unwrap();
+            }));
+        });
+        let error = Node::create_native(temp.path(), seed.clone(), policy()).err();
+        if temp.path().join(READY_FILE).exists() {
+            let root = temp.keep();
+            panic!(
+                "native Node published readiness without its exact registry: {error:?}; preserved={}",
+                root.display()
+            );
+        }
+        let error = error.expect("registry fault must fail native creation");
+        assert!(
+            format!("{error:#}").contains("volume registry publication"),
+            "{error:#}"
+        );
+        let control = open_control();
+        assert!(
+            control
+                .get_record("node-config", b"storage-volumes")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            control
+                .get_record(PROFILE_KIND, b"ready")
+                .unwrap()
+                .is_none()
+        );
+        drop(control);
+        let node = Node::create_native(temp.path(), seed.clone(), policy()).unwrap();
+        assert_eq!(node.storage_status().unwrap().len(), 1);
+        assert_original_births(temp.path(), &before);
+        drop(node);
+        assert_eq!(
+            Node::open(temp.path(), seed)
+                .unwrap()
+                .storage_status()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
 fn native_node_resumes_after_actual_process_death_at_every_publication() {
     for step in [
         Step::Profile,
