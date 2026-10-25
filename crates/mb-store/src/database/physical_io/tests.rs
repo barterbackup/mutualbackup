@@ -29,6 +29,279 @@ fn allocated(path: impl AsRef<std::path::Path>) -> u64 {
     std::fs::metadata(path).unwrap().blocks() * 512
 }
 
+fn open_second(temp: &tempfile::TempDir, limits: DatabasePhysicalIoLimits) -> ControlStore {
+    let directory = DatabaseDirectory::open(temp.path()).unwrap();
+    ControlStore::open_physical_existing_in_directory_with_key(
+        &directory,
+        std::ffi::OsStr::new("control.db"),
+        &[7; 32],
+        limits,
+    )
+    .unwrap()
+}
+
+fn spill(store: &ControlStore, rows: u32) -> Result<(), DatabaseError> {
+    store.connection.execute_batch(
+        "PRAGMA temp_store=FILE; PRAGMA temp.cache_size=8;
+         CREATE TEMP TABLE IF NOT EXISTS shared_spill(bytes BLOB);",
+    )?;
+    // These transactions modify only the private temporary database. A main
+    // RESERVED writer lock would serialize/fail the allocation race for an
+    // unrelated reason before the shared temporary allowance is exercised.
+    let tx = Transaction::new_unchecked(&store.connection, TransactionBehavior::Deferred)?;
+    let payload = vec![3u8; 32768];
+    for _ in 0..rows {
+        tx.execute("INSERT INTO temp.shared_spill VALUES (?1)", [&payload])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[test]
+fn native_connections_share_temporary_credits_until_the_owning_native_file_closes() {
+    let mut budget = limits();
+    budget.temporary_bytes = 6 << 20;
+    budget.total_bytes = 32 << 20;
+    let (temp, first) = setup(budget);
+    let second = open_second(&temp, budget);
+    spill(&first, 128).unwrap();
+    let before = first.physical_io_allocated_bytes().unwrap().unwrap();
+    assert!(before > 4 << 20);
+    assert_eq!(
+        second.physical_io_allocated_bytes().unwrap(),
+        Some(before),
+        "the second connection must account for the first anonymous spill"
+    );
+    let error = spill(&second, 128).expect_err("both spills cannot claim the full allowance");
+    assert!(
+        matches!(error, DatabaseError::Sql(ref e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)),
+        "{error:?}"
+    );
+    let rows: u32 = second
+        .connection
+        .query_row("SELECT count(*) FROM temp.shared_spill", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "refused spill rolls back the complete transaction");
+    let charged = second.physical_io_allocated_bytes().unwrap().unwrap();
+    assert_eq!(first.physical_io_allocated_bytes().unwrap(), Some(charged));
+    drop(first);
+    let released = second.physical_io_allocated_bytes().unwrap().unwrap();
+    assert!(charged - released >= 4 << 20);
+    spill(&second, 128).unwrap();
+    assert_eq!(
+        second
+            .connection
+            .query_row("SELECT count(*) FROM temp.shared_spill", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        128
+    );
+}
+
+#[test]
+fn native_connections_share_file_slots_and_reclaim_only_closed_anonymous_files() {
+    let mut budget = limits();
+    budget.files = 4; // main, WAL, SHM, and one anonymous spill
+    let (temp, first) = setup(budget);
+    let second = open_second(&temp, budget);
+    spill(&first, 64).unwrap();
+    let error = spill(&second, 64).expect_err("a second anonymous file exceeds the shared slots");
+    assert!(
+        matches!(error, DatabaseError::Sql(ref e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)),
+        "{error:?}"
+    );
+    drop(first);
+    spill(&second, 64).unwrap();
+}
+
+#[test]
+fn native_connections_enforce_the_combined_total_before_individual_role_limits() {
+    let mut budget = limits();
+    budget.main_bytes = 4 << 20;
+    budget.journal_bytes = 8 << 20;
+    budget.temporary_bytes = 16 << 20;
+    let (temp, first) = setup(budget);
+    first
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint=0")
+        .unwrap();
+    let retained = vec![11; 3 << 20];
+    first.put_record("physical", b"keep", &retained).unwrap();
+    let second = open_second(&temp, budget);
+    spill(&first, 208).unwrap();
+    let error = spill(&second, 208).expect_err("combined file families exceed the total ceiling");
+    assert!(
+        matches!(error, DatabaseError::Sql(ref e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)),
+        "{error:?}"
+    );
+    let charged = first.physical_io_allocated_bytes().unwrap().unwrap();
+    assert_eq!(second.physical_io_allocated_bytes().unwrap(), Some(charged));
+    let visible = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| allocated(e.unwrap().path()))
+        .sum::<u64>();
+    assert!(charged <= budget.total_bytes);
+    assert!(
+        charged - visible + CHUNK < budget.temporary_bytes,
+        "the independent temporary role still has room for another allocation"
+    );
+    assert_eq!(
+        second.get_record("physical", b"keep").unwrap(),
+        Some(retained)
+    );
+    drop(first);
+    spill(&second, 208).unwrap();
+}
+
+#[test]
+fn concurrent_native_reopens_cannot_grant_two_complete_temporary_allowances() {
+    let mut budget = limits();
+    budget.temporary_bytes = 6 << 20;
+    budget.total_bytes = 32 << 20;
+    let (temp, first) = setup(budget);
+    first.put_record("physical", b"keep", b"original").unwrap();
+    drop(first);
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let finish = Arc::new(std::sync::Barrier::new(3));
+    std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|_| {
+                let (start, finish) = (start.clone(), finish.clone());
+                let temp = &temp;
+                scope.spawn(move || {
+                    start.wait();
+                    let store = DatabaseDirectory::open(temp.path()).and_then(|directory| {
+                        ControlStore::open_physical_existing_in_directory_with_key(
+                            &directory,
+                            std::ffi::OsStr::new("control.db"),
+                            &[7; 32],
+                            budget,
+                        )
+                    });
+                    match store {
+                        Ok(store) => {
+                            let result = spill(&store, 128);
+                            // Retain native files until both grants have been attempted.
+                            finish.wait();
+                            result
+                        }
+                        Err(error) => {
+                            finish.wait();
+                            Err(error)
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        finish.wait();
+        let mut successes = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(()) => successes += 1,
+                Err(DatabaseError::Sql(e)) => {
+                    assert_eq!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DiskFull));
+                }
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+        assert!(
+            successes <= 1,
+            "two grants exceed the shared temporary ceiling"
+        );
+    });
+    let reopened = open_second(&temp, budget);
+    assert_eq!(
+        reopened.get_record("physical", b"keep").unwrap(),
+        Some(b"original".to_vec())
+    );
+    spill(&reopened, 128).unwrap();
+}
+
+#[test]
+fn native_live_main_rejects_conflicting_limits_before_any_sql_open() {
+    let (temp, first) = setup(limits());
+    first.put_record("physical", b"keep", b"original").unwrap();
+    let family = || {
+        std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), std::fs::read(e.path()).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = family();
+    let directory = DatabaseDirectory::open(temp.path()).unwrap();
+    for budget in [
+        DatabasePhysicalIoLimits {
+            total_bytes: 32 << 20,
+            ..limits()
+        },
+        DatabasePhysicalIoLimits {
+            files: 8,
+            ..limits()
+        },
+        DatabasePhysicalIoLimits {
+            headroom_bytes: 1 << 20,
+            ..limits()
+        },
+    ] {
+        assert!(matches!(
+            ControlStore::open_physical_existing_in_directory_with_key(
+                &directory,
+                std::ffi::OsStr::new("control.db"),
+                &[7; 32],
+                budget,
+            ),
+            Err(DatabaseError::Conflict)
+        ));
+        assert_eq!(family(), before);
+    }
+    first
+        .put_record("physical", b"retry", b"still usable")
+        .unwrap();
+}
+
+#[test]
+fn native_shared_pool_follows_its_directory_and_rejects_a_second_journal_namespace() {
+    let (temp, first) = setup(limits());
+    let moved = temp.path().join("moved");
+    std::fs::create_dir(&moved).unwrap();
+    // A new path spelling for the same held directory remains one family.
+    let alias = moved.join("..");
+    let directory = DatabaseDirectory::open(&alias).unwrap();
+    let second = ControlStore::open_physical_existing_in_directory_with_key(
+        &directory,
+        std::ffi::OsStr::new("control.db"),
+        &[7; 32],
+        limits(),
+    )
+    .unwrap();
+    spill(&first, 64).unwrap();
+    assert_eq!(
+        first.physical_io_allocated_bytes().unwrap(),
+        second.physical_io_allocated_bytes().unwrap()
+    );
+    drop(second);
+    // Moving a live main into another leaf must not create different WAL/SHM
+    // names for the same native main inode.
+    std::fs::rename(temp.path().join("control.db"), temp.path().join("other.db")).unwrap();
+    assert!(matches!(
+        ControlStore::open_physical_existing_in_directory_with_key(
+            &directory,
+            std::ffi::OsStr::new("other.db"),
+            &[7; 32],
+            limits(),
+        ),
+        Err(DatabaseError::Conflict)
+    ));
+    std::fs::rename(temp.path().join("other.db"), temp.path().join("control.db")).unwrap();
+    first
+        .put_record("physical", b"retry", b"original family")
+        .unwrap();
+}
+
 #[test]
 fn native_runtime_allocates_main_wal_and_shm_without_extending_to_their_ceiling() {
     let (temp, store) = setup(limits());

@@ -1,5 +1,6 @@
-//! Per-connection native physical I/O. The private registered VFS stays alive
-//! until its owning ControlStore has closed its connection and native files.
+//! Private connection VFS adapters share process-local physical credits for
+//! one main inode. Each registered VFS stays alive until its owning store has
+//! closed its connection and native files.
 use super::*;
 use crate::database::{
     ControlStore, DatabaseDirectory, DatabasePhysicalIoLimits, ParityStore,
@@ -27,11 +28,7 @@ pub(in crate::database) struct PhysicalVfs {
 unsafe impl Send for PhysicalVfs {}
 
 impl PhysicalVfs {
-    fn new(
-        directory: &DatabaseDirectory,
-        limits: DatabasePhysicalIoLimits,
-    ) -> Result<Self, DatabaseError> {
-        let pool = Pool::new(directory, limits)?;
+    fn new(pool: Arc<Pool>) -> Result<Self, DatabaseError> {
         let parent = register()?;
         let name = CString::new(format!("mutualbackup-physical-{}", uuid::Uuid::new_v4()))
             .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
@@ -316,8 +313,10 @@ pub(super) unsafe fn shm_map(
 
 impl ControlStore {
     /// Create an owned new SQL catalog with runtime physical I/O ceilings.
-    /// The caller owns partial creation/restart and still owes persistent
-    /// policy, old-writer enrollment and enclosing operation reservations.
+    /// Connections in this process to the same main inode share identical
+    /// ceilings. The caller owns partial creation/restart and still owes
+    /// persistent policy, cross-process/old-writer enrollment and enclosing
+    /// operation reservations.
     pub fn create_physical_in_directory_with_key(
         directory: &DatabaseDirectory,
         name: &OsStr,
@@ -329,6 +328,8 @@ impl ControlStore {
     }
 
     /// Open a caller-owned existing catalog under explicit runtime ceilings.
+    /// Other native connections in this process must use the same ceilings
+    /// and journal namespace and share their aggregate physical allowance.
     /// This does not perform old-writer enrollment or persistent policy
     /// migration. Nonempty Btrfs files must already have NoCow enabled.
     pub fn open_physical_existing_in_directory_with_key(
@@ -380,7 +381,7 @@ fn create(
             Err(error) => return Err(error.into()),
         }
     }
-    let vfs = PhysicalVfs::new(directory, limits)?;
+    let pool = Pool::new(directory, name, limits)?;
     // This is a new empty inode, before any SQLite descriptor or lock can
     // exist. Never truncate a pre-existing catalog to enroll this mode.
     let created = OpenOptions::new()
@@ -391,8 +392,9 @@ fn create(
         .open(&path)?;
     created.sync_all()?;
     directory.file().sync_all()?;
-    vfs.pool.pin_created_main(&created)?;
+    pool.pin_created_main(&created)?;
     drop(created);
+    let vfs = PhysicalVfs::new(pool.share()?)?;
     Ok((vfs, path))
 }
 fn existing(
@@ -401,8 +403,9 @@ fn existing(
     limits: DatabasePhysicalIoLimits,
 ) -> Result<(PhysicalVfs, std::path::PathBuf), DatabaseError> {
     let path = directory.leaf(name)?;
-    let vfs = PhysicalVfs::new(directory, limits)?;
-    vfs.pool.pin_main_path(&path)?;
+    let pool = Pool::new(directory, name, limits)?;
+    pool.pin_main_path(&path)?;
+    let vfs = PhysicalVfs::new(pool.share()?)?;
     Ok((vfs, path))
 }
 fn connect(
@@ -425,8 +428,9 @@ fn connect(
 
 impl ParityStore {
     /// Create a new caller-owned parity catalog with runtime native file
-    /// admission. Durable volume policy, old writers and enclosing operations
-    /// still require independent enrollment and reservations.
+    /// admission shared by native connections in this process. Durable volume
+    /// policy, cross-process/old writers and enclosing operations still require
+    /// independent enrollment and reservations.
     pub fn create_physical_in_directory_with_key(
         directory: &DatabaseDirectory,
         name: &OsStr,
@@ -439,6 +443,7 @@ impl ParityStore {
     }
 
     /// Open an existing caller-owned parity catalog under runtime ceilings.
+    /// Connections in this process share the same immutable live allowance.
     /// This does not migrate persistent volume policy or enroll old writers.
     pub fn open_physical_existing_in_directory_with_key(
         directory: &DatabaseDirectory,

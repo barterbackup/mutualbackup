@@ -51,6 +51,83 @@ fn variable(bytes: usize) -> VariableParityObject {
 }
 
 #[test]
+fn native_parity_connections_share_physical_credits_and_preserve_ready_evidence() {
+    let mut budget = limits();
+    budget.temporary_bytes = 6 << 20;
+    let (temp, mut first) = setup(budget);
+    let object = fixed();
+    first
+        .stage_and_publish_ack(&object, b"shared-pool acknowledgement", 1 << 20)
+        .unwrap();
+    let directory = DatabaseDirectory::open(temp.path()).unwrap();
+    let second = ParityStore::open_physical_existing_in_directory_with_key(
+        &directory,
+        std::ffi::OsStr::new("parity.db"),
+        &[3; 16],
+        &[7; 32],
+        budget,
+    )
+    .unwrap();
+    for store in [&first, &second] {
+        store
+            .connection
+            .execute_batch(
+                "PRAGMA temp_store=FILE; PRAGMA temp.cache_size=8;
+                 CREATE TEMP TABLE shared_spill(bytes BLOB);",
+            )
+            .unwrap();
+    }
+    let spill = |store: &ParityStore| -> Result<(), DatabaseError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &store.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        for _ in 0..128 {
+            tx.execute("INSERT INTO temp.shared_spill VALUES (zeroblob(32768))", [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    };
+    spill(&first).unwrap();
+    assert_eq!(
+        first.physical_io_allocated_bytes().unwrap(),
+        second.physical_io_allocated_bytes().unwrap()
+    );
+    let error = spill(&second).expect_err("parity temporaries share the complete allowance");
+    assert!(
+        matches!(error, DatabaseError::Sql(ref e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)),
+        "{error:?}"
+    );
+    assert!(
+        second
+            .publication_is_complete(&object, b"shared-pool acknowledgement")
+            .unwrap()
+    );
+    drop(first);
+    spill(&second).unwrap();
+    assert_eq!(
+        second
+            .load_ready(&object.group_id, object.shard_index)
+            .unwrap(),
+        object
+    );
+    drop(second);
+    let reopened = ParityStore::open_physical_existing_in_directory_with_key(
+        &directory,
+        std::ffi::OsStr::new("parity.db"),
+        &[3; 16],
+        &[7; 32],
+        budget,
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .publication_is_complete(&object, b"shared-pool acknowledgement")
+            .unwrap()
+    );
+}
+
+#[test]
 fn native_parity_preserves_fixed_and_variable_ready_evidence_after_reopen() {
     let (temp, mut store) = setup(limits());
     let fixed = fixed();

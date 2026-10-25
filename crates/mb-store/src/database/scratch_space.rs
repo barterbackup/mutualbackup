@@ -53,6 +53,18 @@ pub(super) fn shared_allocation_lock() -> Result<(File, PathBuf), DatabaseError>
     // exclusion. Descriptor/path identity is rechecked after each acquisition.
     let uid = unsafe { libc::geteuid() };
     let path = PathBuf::from(format!("/tmp/.mutualbackup-scratch-allocation-{uid}"));
+    // Only the process-isolated lock probe selects its own rendezvous. Holding
+    // the production rendezvous in that fixture stalls unrelated parallel tests
+    // and lets their allocations starve the child's bounded resume assertion.
+    #[cfg(test)]
+    let path = std::env::var_os("MB_SCRATCH_ALLOCATION_LOCK_PROBE_DIRECTORY")
+        .map(PathBuf::from)
+        .unwrap_or(path);
+    allocation_lock_at(path)
+}
+
+fn allocation_lock_at(path: PathBuf) -> Result<(File, PathBuf), DatabaseError> {
+    let uid = unsafe { libc::geteuid() };
     match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -707,7 +719,8 @@ mod tests {
             }
         }
         let temp = tempfile::tempdir().unwrap();
-        let (lock, _) = shared_allocation_lock().unwrap();
+        let probe_lock = temp.path().join("allocation-lock");
+        let (lock, _) = allocation_lock_at(probe_lock.clone()).unwrap();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
         let guard = AllocationLock(&lock);
         let mut child = ChildGuard(
@@ -720,6 +733,7 @@ mod tests {
                 ])
                 .env("MB_SCRATCH_LIFECYCLE_CHILD", temp.path())
                 .env("MB_SCRATCH_ALLOCATION_LOCK_PROBE", "1")
+                .env("MB_SCRATCH_ALLOCATION_LOCK_PROBE_DIRECTORY", &probe_lock)
                 .stdout(Stdio::null())
                 .spawn()
                 .unwrap(),

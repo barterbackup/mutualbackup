@@ -3,12 +3,13 @@
 //! These ceilings do not enroll older writers or reserve an enclosing job.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::{DatabaseDirectory, DatabaseError};
 
@@ -69,6 +70,11 @@ pub(super) enum Role {
 
 type Identity = (u64, u64);
 
+// Native connections to one main inode share all file-family credits in this
+// process. Weak entries grant no lifetime or persistent ownership by themselves.
+// Cross-process enrollment remains the caller's responsibility.
+static LIVE_POOLS: Mutex<BTreeMap<Identity, Weak<Pool>>> = Mutex::new(BTreeMap::new());
+
 struct Entry {
     // O_PATH pins preserve identity and closed-but-linked allocation without
     // the main-file POSIX-lock side effect of another I/O descriptor's close.
@@ -81,6 +87,7 @@ struct Entry {
 pub(super) struct Pool {
     pub(super) limits: DatabasePhysicalIoLimits,
     pub(super) directory: DatabaseDirectory,
+    main_name: OsString,
     allocation_lock: File,
     lock_path: PathBuf,
     main: Mutex<Option<File>>,
@@ -99,18 +106,66 @@ impl Drop for AllocationGuard<'_> {
 impl Pool {
     pub(super) fn new(
         directory: &DatabaseDirectory,
+        main_name: &OsStr,
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Arc<Self>, DatabaseError> {
         limits.validate()?;
+        directory.leaf(main_name)?;
         let (allocation_lock, lock_path) = super::scratch_space::shared_allocation_lock()?;
         Ok(Arc::new(Self {
             limits,
             directory: directory.clone(),
+            main_name: main_name.to_owned(),
             allocation_lock,
             lock_path,
             main: Mutex::new(None),
             files: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    /// Publish/reuse only after pinning the intended main inode, before native
+    /// SQLite opens it. Different ceilings or journal namespaces cannot create
+    /// a second live allowance for that inode. O_PATH pins prevent inode reuse
+    /// while an old pool or any of its native bindings is still alive.
+    pub(super) fn share(self: &Arc<Self>) -> Result<Arc<Self>, DatabaseError> {
+        let identity = self.main_metadata()?;
+        let mut pools = LIVE_POOLS
+            .lock()
+            .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+        pools.retain(|_, pool| pool.strong_count() != 0);
+        let id = (identity.dev(), identity.ino());
+        if let Some(existing) = pools.get(&id).and_then(Weak::upgrade) {
+            let directory = self.directory.file().metadata()?;
+            let original = existing.directory.file().metadata()?;
+            if self.limits != existing.limits
+                || self.main_name != existing.main_name
+                || (directory.dev(), directory.ino()) != (original.dev(), original.ino())
+            {
+                return Err(DatabaseError::Conflict);
+            }
+            return Ok(existing);
+        }
+        pools.insert(id, Arc::downgrade(self));
+        Ok(Arc::clone(self))
+    }
+
+    fn main_metadata(&self) -> Result<std::fs::Metadata, DatabaseError> {
+        let main = self
+            .main
+            .lock()
+            .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+        let metadata = main
+            .as_ref()
+            .ok_or(DatabaseError::PhysicalIoUnavailable)?
+            .metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+        Ok(metadata)
     }
 
     pub(super) fn pin_main_path(&self, path: &Path) -> Result<(), DatabaseError> {
@@ -270,6 +325,14 @@ impl Pool {
             .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
         let _allocation = self.allocation_guard()?;
         self.refresh(&mut files)?;
+        // Reusing a pool must not weaken a new native open's extent checks.
+        // In particular a stopped main can have gained shared extents while
+        // another connection still retains the original pool.
+        if !files.contains_key(&id) && files.len() >= self.limits.files as usize {
+            return Err(DatabaseError::CapacityExceeded);
+        }
+        initialize_private_file(descriptor, metadata.len(), metadata.blocks())?;
+        validate_private_allocations(descriptor)?;
         if let Some(entry) = files.get_mut(&id) {
             if entry.role != role {
                 return Err(DatabaseError::PhysicalIoUnavailable);
@@ -279,11 +342,6 @@ impl Pool {
                 .checked_add(1)
                 .ok_or(DatabaseError::CapacityExceeded)?;
         } else {
-            if files.len() >= self.limits.files as usize {
-                return Err(DatabaseError::CapacityExceeded);
-            }
-            initialize_private_file(descriptor, metadata.len(), metadata.blocks())?;
-            validate_private_allocations(descriptor)?;
             files.insert(
                 id,
                 Entry {
