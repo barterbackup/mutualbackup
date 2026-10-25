@@ -100,6 +100,24 @@ pub struct DatabaseOpenGuard {
 
 impl DatabaseOpenGuard {
     pub fn capture(path: &Path, private_files: &[&OsStr]) -> Result<Self, DatabaseError> {
+        Self::capture_inner(path, private_files, false)
+    }
+
+    /// Capture fresh/partial native creation, including a bound empty main.
+    /// Empty images must have no journals. Ordinary admission still rejects
+    /// empty existing catalogs; only explicit creation should use this token.
+    pub fn capture_native_creation(
+        path: &Path,
+        private_files: &[&OsStr],
+    ) -> Result<Self, DatabaseError> {
+        Self::capture_inner(path, private_files, true)
+    }
+
+    fn capture_inner(
+        path: &Path,
+        private_files: &[&OsStr],
+        allow_empty: bool,
+    ) -> Result<Self, DatabaseError> {
         if private_files.len() > 16 {
             return Err(DatabaseError::Conflict);
         }
@@ -125,7 +143,8 @@ impl DatabaseOpenGuard {
             .try_into()
             .map_err(|_| DatabaseError::Conflict)?;
         let main = OpenFileVersion::capture(path)?;
-        if main.as_ref().is_some_and(|file| file.size == 0)
+        if (main.as_ref().is_some_and(|file| file.size == 0)
+            && (!allow_empty || journals.iter().any(Option::is_some)))
             || (main.is_none() && journals.iter().any(Option::is_some))
         {
             return Err(DatabaseError::IncompatibleSchema);
@@ -203,7 +222,26 @@ impl DatabaseOpenGuard {
         Ok(())
     }
 
-    fn verify_opened(&self, path: &Path, connection: &Connection) -> Result<(), DatabaseError> {
+    pub(super) fn verify_native_creation_before_open(
+        &self,
+        path: &Path,
+    ) -> Result<(), DatabaseError> {
+        if self.main.is_some() {
+            return self.verify_unchanged(path);
+        }
+        // Native birth may publish the new bound main, but may not initialize
+        // SQL or change any previously admitted input before descriptor check.
+        if !OpenFileVersion::capture(path)?.is_some_and(|file| file.size == 0) {
+            return Err(DatabaseError::Conflict);
+        }
+        self.verify_other_inputs(path)
+    }
+
+    pub(super) fn verify_opened(
+        &self,
+        path: &Path,
+        connection: &Connection,
+    ) -> Result<(), DatabaseError> {
         if self.main.is_some() {
             self.verify_unchanged(path)?;
         } else {

@@ -16,10 +16,17 @@ use crate::control::ProtectedRoot;
 pub(crate) fn admit_native_control_writer(
     data_dir: &Path,
     keys: &KeyMaterial,
-) -> Result<(mb_store::DatabaseOpenGuard, Option<[u8; 32]>)> {
+) -> Result<(
+    mb_store::DatabaseOpenGuard,
+    Option<[u8; 32]>,
+    Option<mb_store::NativeDatabaseInspection>,
+)> {
     let path = data_dir.join("control.db");
-    let guard =
-        mb_store::DatabaseOpenGuard::capture(&path, &[std::ffi::OsStr::new("control.key")])?;
+    let guard = crate::volume::native_node::control_guard(&path)?;
+    if let Some(inspection) = crate::volume::native_node::control_inspection(data_dir, keys)? {
+        inspect_managed_control(data_dir, keys, &inspection, &guard)?;
+        return Ok((guard, Some(*inspection.database_key()), Some(inspection)));
+    }
     crate::volume::validate_preserved_control_key(data_dir, keys)?;
     let mut admitted_key = None;
     if guard.requires_existing_catalog() {
@@ -38,7 +45,32 @@ pub(crate) fn admit_native_control_writer(
         require_native_source_state_from_catalog(data_dir, keys)?;
     }
     guard.verify_unchanged(&path)?;
-    Ok((guard, admitted_key))
+    Ok((guard, admitted_key, None))
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_managed_control(
+    data_dir: &Path,
+    keys: &KeyMaterial,
+    inspection: &mb_store::NativeDatabaseInspection,
+    guard: &mb_store::DatabaseOpenGuard,
+) -> Result<()> {
+    let (control, inputs) = ControlStore::open_preserved_read_only_with_keys(
+        data_dir.join("control.db"),
+        &[*inspection.database_key()],
+    )?;
+    control.with_read_only_snapshot(|| {
+        control.verify_open_guard(guard)?;
+        require_native_source_state(&control, keys)?;
+        inspection.verify_control(&control)?;
+        crate::volume::native_node::verify_control_profile(data_dir, keys, &control)?;
+        control.verify_open_guard(guard)?;
+        Ok(())
+    })?;
+    inputs.verify_unchanged()?;
+    inspection.verify_current()?;
+    guard.verify_unchanged(&data_dir.join("control.db"))?;
+    Ok(())
 }
 
 /// Reject withdrawn state before any catalog writer, migration or replay opens.
@@ -50,6 +82,10 @@ pub(crate) fn require_native_source_state_from_catalog(
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        if let Some(inspection) = crate::volume::native_node::control_inspection(data_dir, keys)? {
+            let guard = crate::volume::native_node::control_guard(&data_dir.join("control.db"))?;
+            return inspect_managed_control(data_dir, keys, &inspection, &guard);
+        }
         match std::fs::symlink_metadata(data_dir.join("control.db")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let guard = mb_store::DatabaseOpenGuard::capture(&data_dir.join("control.db"), &[])
@@ -197,7 +233,9 @@ mod tests {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
             }
             let before = directory_bytes(temp.path());
-            let (guard, selected) = admit_native_control_writer(temp.path(), &keys).unwrap();
+            let (guard, selected, native) =
+                admit_native_control_writer(temp.path(), &keys).unwrap();
+            assert!(native.is_none());
             assert_eq!(selected, Some(database_key), "{mode}");
             guard.verify_unchanged(&path).unwrap();
             assert_eq!(directory_bytes(temp.path()), before, "{mode}");

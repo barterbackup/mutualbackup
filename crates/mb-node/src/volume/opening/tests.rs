@@ -477,3 +477,72 @@ fn volume_admission_rechecks_the_published_key_before_creating_a_database() {
         assert_eq!(files(temp.path()), observed.borrow_mut().take().unwrap());
     }
 }
+
+#[test]
+fn managed_parity_handoff_rejects_main_journal_manifest_and_birth_substitution() {
+    use crate::volume::native_node::tests::{footprint, policy};
+    for substitution in ["main", "wal", "manifest", "birth"] {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([88; 32]);
+        drop(crate::Node::create_native(temp.path(), seed.clone(), policy()).unwrap());
+        let keys = KeyMaterial::from_seed(&seed);
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        let control = ControlStore::open_native_existing_in_directory(
+            &directory,
+            OsStr::new("control.db"),
+            &keys,
+            b"control.db/v2",
+        )
+        .unwrap();
+        let record = load_volume_records(&control).unwrap().remove(0);
+        drop(control);
+        let key = keys
+            .unwrap_native_database_key(
+                &volume_database_id(record.volume_id),
+                &record.wrapped_database_key,
+            )
+            .unwrap()
+            .0;
+        let observed = Rc::new(RefCell::new(None));
+        let captured = observed.clone();
+        let visible = temp.path().to_owned();
+        BEFORE_VOLUME_WRITER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                match substitution {
+                    "main" => {
+                        fs::rename(visible.join("parity.db"), visible.join("original.db")).unwrap();
+                        fs::copy(visible.join("original.db"), visible.join("parity.db")).unwrap();
+                    }
+                    "wal" => {
+                        fs::write(visible.join("parity.db-wal"), b"unadmitted journal").unwrap()
+                    }
+                    "manifest" => {
+                        let file = visible.join(VOLUME_MANIFEST_FILE);
+                        fs::rename(&file, visible.join("original-manifest")).unwrap();
+                        fs::copy(visible.join("original-manifest"), file).unwrap();
+                    }
+                    "birth" => {
+                        let name = format!(
+                            ".mutualbackup-native-{}",
+                            blake3::hash(b"parity.db").to_hex()
+                        );
+                        let file = visible.join(name).join("birth");
+                        fs::rename(&file, file.with_file_name("original-birth")).unwrap();
+                        fs::copy(file.with_file_name("original-birth"), file).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                *captured.borrow_mut() = Some(footprint(&visible));
+            }))
+        });
+        assert!(
+            open_volume_store_in_directory(&record, &key, &keys, &directory).is_err(),
+            "{substitution}"
+        );
+        assert_eq!(
+            footprint(temp.path()),
+            observed.borrow_mut().take().unwrap(),
+            "{substitution}"
+        );
+    }
+}

@@ -312,11 +312,20 @@ pub(super) unsafe fn shm_map(
 }
 
 impl ControlStore {
+    pub(in crate::database) fn open_owned_native_admitted(
+        owner: &Arc<crate::database::native_owner::OwnerState>,
+        guard: &crate::database::DatabaseOpenGuard,
+    ) -> Result<Self, DatabaseError> {
+        guard.verify_native_creation_before_open(&owner.directory.leaf(&owner.name)?)?;
+        let (vfs, path) = owned(owner)?;
+        Self::connect_physical(&owner.directory, path, owner.key(), vfs, Some(guard))
+    }
+
     pub(in crate::database) fn open_owned_native(
         owner: &Arc<crate::database::native_owner::OwnerState>,
     ) -> Result<Self, DatabaseError> {
         let (vfs, path) = owned(owner)?;
-        Self::connect_physical(&owner.directory, path, owner.key(), vfs)
+        Self::connect_physical(&owner.directory, path, owner.key(), vfs, None)
     }
 
     /// Create an owned new SQL catalog with runtime physical I/O ceilings.
@@ -331,7 +340,7 @@ impl ControlStore {
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Self, DatabaseError> {
         let (vfs, path) = create(directory, name, limits)?;
-        Self::connect_physical(directory, path, key, vfs)
+        Self::connect_physical(directory, path, key, vfs, None)
     }
 
     /// Open a caller-owned existing catalog under explicit runtime ceilings.
@@ -346,7 +355,7 @@ impl ControlStore {
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Self, DatabaseError> {
         let (vfs, path) = existing(directory, name, limits)?;
-        Self::connect_physical(directory, path, key, vfs)
+        Self::connect_physical(directory, path, key, vfs, None)
     }
 
     fn connect_physical(
@@ -354,8 +363,9 @@ impl ControlStore {
         path: std::path::PathBuf,
         key: &[u8; 32],
         vfs: PhysicalVfs,
+        guard: Option<&crate::database::DatabaseOpenGuard>,
     ) -> Result<Self, DatabaseError> {
-        let mut connection = connect(&path, key, &vfs)?;
+        let mut connection = connect(&path, key, &vfs, guard)?;
         crate::database::initialize_or_validate_control(&mut connection)?;
         Ok(Self {
             connection,
@@ -432,6 +442,7 @@ fn connect(
     path: &std::path::Path,
     key: &[u8; 32],
     vfs: &PhysicalVfs,
+    guard: Option<&crate::database::DatabaseOpenGuard>,
 ) -> Result<Connection, DatabaseError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -443,6 +454,14 @@ fn connect(
             .to_str()
             .map_err(|_| DatabaseError::PhysicalIoUnavailable)?,
     )?;
+    if let Some(guard) = guard {
+        guard.verify_opened(path, &connection)?;
+    }
+    initialize_main(&connection).map_err(|error| {
+        // Preserve the native xOpen admission error contract after moving
+        // main initialization behind the descriptor/source guard.
+        sql_error(physical_io::sqlite_code(error, ffi::SQLITE_CANTOPEN))
+    })?;
     if vfs.pool.owner.is_some() {
         crate::database::configure_encrypted_native(connection, key)
     } else {
@@ -450,13 +469,62 @@ fn connect(
     }
 }
 
+/// Complete physical initialization only after the actual opened descriptor
+/// passes admission. In particular, setting NoCow on a partial empty Btrfs
+/// main changes ctime. SQL configuration/recovery must follow this step.
+fn initialize_main(connection: &Connection) -> Result<(), DatabaseError> {
+    let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
+    let code = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast(),
+        )
+    };
+    if code != ffi::SQLITE_OK {
+        return Err(sql_error(code));
+    }
+    if file.is_null() || unsafe { !ptr::eq((*file).pMethods, &METHODS) } {
+        return Err(DatabaseError::PhysicalIoUnavailable);
+    }
+    // This newly opened, unconfigured connection keeps the wrapper and its
+    // native descriptor alive and has no concurrent/reentrant SQLite call.
+    unsafe { (*(*file.cast::<File>()).state).physical.as_mut() }
+        .ok_or(DatabaseError::PhysicalIoUnavailable)?
+        .initialize_main()
+}
+
 impl ParityStore {
+    pub fn physical_io_write_available_bytes(&self) -> Result<Option<u64>, DatabaseError> {
+        self.physical_vfs
+            .as_ref()
+            .map(|vfs| vfs.pool.write_available())
+            .transpose()
+    }
+    pub(in crate::database) fn open_owned_native_admitted(
+        owner: &Arc<crate::database::native_owner::OwnerState>,
+        volume: &[u8; 16],
+        guard: &crate::database::DatabaseOpenGuard,
+    ) -> Result<Self, DatabaseError> {
+        guard.verify_native_creation_before_open(&owner.directory.leaf(&owner.name)?)?;
+        let (vfs, path) = owned(owner)?;
+        Self::connect_physical(
+            &owner.directory,
+            path,
+            volume,
+            owner.key(),
+            vfs,
+            Some(guard),
+        )
+    }
+
     pub(in crate::database) fn open_owned_native(
         owner: &Arc<crate::database::native_owner::OwnerState>,
         volume: &[u8; 16],
     ) -> Result<Self, DatabaseError> {
         let (vfs, path) = owned(owner)?;
-        Self::connect_physical(&owner.directory, path, volume, owner.key(), vfs)
+        Self::connect_physical(&owner.directory, path, volume, owner.key(), vfs, None)
     }
 
     /// Create a new caller-owned parity catalog with runtime native file
@@ -471,7 +539,7 @@ impl ParityStore {
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Self, DatabaseError> {
         let (vfs, path) = create(directory, name, limits)?;
-        Self::connect_physical(directory, path, volume, key, vfs)
+        Self::connect_physical(directory, path, volume, key, vfs, None)
     }
 
     /// Open an existing caller-owned parity catalog under runtime ceilings.
@@ -485,7 +553,7 @@ impl ParityStore {
         limits: DatabasePhysicalIoLimits,
     ) -> Result<Self, DatabaseError> {
         let (vfs, path) = existing(directory, name, limits)?;
-        Self::connect_physical(directory, path, volume, key, vfs)
+        Self::connect_physical(directory, path, volume, key, vfs, None)
     }
 
     fn connect_physical(
@@ -494,8 +562,9 @@ impl ParityStore {
         volume: &[u8; 16],
         key: &[u8; 32],
         vfs: PhysicalVfs,
+        guard: Option<&crate::database::DatabaseOpenGuard>,
     ) -> Result<Self, DatabaseError> {
-        let mut connection = connect(&path, key, &vfs)?;
+        let mut connection = connect(&path, key, &vfs, guard)?;
         crate::database::initialize_or_validate_parity(&mut connection, volume)?;
         Ok(Self {
             connection,

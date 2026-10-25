@@ -125,11 +125,17 @@ struct Record {
 #[derive(Clone)]
 pub struct NativeDatabaseOwner(pub(super) Arc<OwnerState>);
 
+/// Authenticated, pinned admission evidence. Inspection holds no writable lease
+/// or allocation credits; the admitted opener rechecks it before native SQL.
+#[derive(Clone)]
+pub struct NativeDatabaseInspection(Arc<OwnerState>);
+
 pub(super) struct OwnerState {
     pub(super) directory: DatabaseDirectory,
     pub(super) name: OsString,
     lease_name: OsString,
     lease: DatabaseDirectory,
+    claim: Option<File>,
     parent_id: FileIdentity,
     lease_id: FileIdentity,
     main: File,
@@ -364,7 +370,17 @@ impl OwnerState {
             // Each returned connection checks its SQL marker after opening.
             return Ok(state);
         }
-        if unsafe { libc::flock(lease.file().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        // Keep the claim on its own open description. Read-only directory
+        // capabilities may be retained after an inspection; those must neither
+        // retain nor unlock a later writer's flock.
+        let claim = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lease_path)?;
+        if FileIdentity::of(&claim.metadata()?) != lease_id {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        if unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let e = std::io::Error::last_os_error();
             return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 DatabaseError::NativeOwnershipBusy
@@ -397,7 +413,7 @@ impl OwnerState {
             publish(&lease, c"birth", &encode(&signed)?)?;
             interruption(Interruption::Birth)?;
         }
-        let (birth, birth_bytes, birth_record): (Birth, _, _) =
+        let (birth, birth_bytes, _birth_record): (Birth, _, _) =
             read(&lease, c"birth", keys, BIRTH_DOMAIN)?;
         if birth.version != 1
             || birth.parent != parent_id
@@ -411,7 +427,7 @@ impl OwnerState {
         let (key, policy) = keys
             .unwrap_native_database_key(database_id, &birth.envelope)
             .map_err(invalid)?;
-        let key = Zeroizing::new(key);
+        let _key = Zeroizing::new(key);
         if create.is_some_and(|expected| expected != policy) {
             return Err(DatabaseError::NativeOwnershipInvalid);
         }
@@ -462,6 +478,55 @@ impl OwnerState {
             publish(&lease, c"main", &encode(&signed)?)?;
             interruption(Interruption::MainBinding)?;
         }
+        let state = Self::read_bound(directory, name, keys, database_id, kind, Some(claim), false)?;
+        if state.birth_hash != birth_hash || state.policy != policy {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        state.verify_current()?;
+        if state.ready.load(Ordering::Acquire) {
+            state.preflight_sql()?;
+        }
+        // Register partial creation too: a second in-process opener must not
+        // acquire the same directory's reused open description and its flock.
+        owners.insert((lease_id.device, lease_id.inode), Arc::downgrade(&state));
+        Ok(state)
+    }
+
+    fn read_bound(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        keys: &KeyMaterial,
+        database_id: &[u8],
+        kind: Kind,
+        claim: Option<File>,
+        require_ready: bool,
+    ) -> Result<Arc<Self>, DatabaseError> {
+        let path = directory.leaf(name)?;
+        native_filesystem(directory)?;
+        let lease_name = lease_name(name);
+        let lease = DatabaseDirectory::open(&directory.leaf(&lease_name)?)?;
+        let parent_id = FileIdentity::of(&directory.file().metadata()?);
+        let lease_id = FileIdentity::of(&lease.file().metadata()?);
+        let (birth, birth_bytes, birth_record): (Birth, _, _) =
+            read(&lease, c"birth", keys, BIRTH_DOMAIN)?;
+        if birth.version != 1
+            || birth.parent != parent_id
+            || birth.lease != lease_id
+            || birth.main_name != name.as_bytes()
+            || birth.database_id != database_id
+            || birth.kind != kind
+        {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        let (key, policy) = keys
+            .unwrap_native_database_key(database_id, &birth.envelope)
+            .map_err(invalid)?;
+        let key = Zeroizing::new(key);
+        let birth_hash = hash(&birth_bytes);
+        let ready_exists = exists(&lease, OsStr::new("ready"))?;
+        if require_ready && !ready_exists {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
         let (main, main_bytes, main_record): (Main, _, _) =
             read(&lease, c"main", keys, MAIN_DOMAIN)?;
         if main.version != 1 || main.birth != birth_hash {
@@ -503,6 +568,7 @@ impl OwnerState {
             name: name.to_owned(),
             lease_name,
             lease,
+            claim,
             parent_id,
             lease_id,
             main: main_pin,
@@ -517,12 +583,6 @@ impl OwnerState {
             pid: std::process::id(),
         });
         state.verify_current()?;
-        if ready_exists {
-            state.preflight_sql()?;
-        }
-        // Register partial creation too: a second in-process opener must not
-        // acquire the same directory's reused open description and its flock.
-        owners.insert((lease_id.device, lease_id.inode), Arc::downgrade(&state));
         Ok(state)
     }
 
@@ -532,6 +592,11 @@ impl OwnerState {
         }
         let parent = self.directory.file().metadata()?;
         let lease = self.lease.file().metadata()?;
+        if let Some(claim) = &self.claim
+            && FileIdentity::of(&claim.metadata()?) != self.lease_id
+        {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
         let visible =
             fs::symlink_metadata(self.directory.leaf(&self.lease_name)?).map_err(invalid)?;
         let main = self.main.metadata()?;
@@ -569,6 +634,12 @@ impl OwnerState {
 
     pub(super) fn identity(&self) -> Identity {
         (self.lease_id.device, self.lease_id.inode)
+    }
+    pub(super) fn require_claim(&self) -> Result<(), DatabaseError> {
+        if self.claim.is_none() {
+            return Err(DatabaseError::NativeOwnershipRequired);
+        }
+        self.verify_current()
     }
     pub(super) fn main_identity(&self) -> Identity {
         (self.main_id.device, self.main_id.inode)
@@ -664,6 +735,12 @@ impl OwnerState {
 }
 
 impl NativeDatabaseOwner {
+    pub fn parity_volume_id(&self) -> Option<[u8; 16]> {
+        match self.0.birth.kind {
+            Kind::Parity(id) => Some(id),
+            Kind::Control => None,
+        }
+    }
     /// Mutable product preflight must run before key publication, directory
     /// permission changes or lock creation, including a birth with no main yet.
     pub fn require_unmanaged_path(path: impl AsRef<Path>) -> Result<(), DatabaseError> {
@@ -725,7 +802,251 @@ impl NativeDatabaseOwner {
     }
 }
 
+impl NativeDatabaseInspection {
+    pub fn is_ready(&self) -> bool {
+        self.0.ready.load(Ordering::Acquire)
+    }
+    pub fn verify_current(&self) -> Result<(), DatabaseError> {
+        self.0.verify_current()
+    }
+    pub fn policy(&self) -> NativeDatabaseIoPolicy {
+        self.0.policy
+    }
+    pub fn wrapped_key(&self) -> &WrappedDatabaseKey {
+        &self.0.birth.envelope
+    }
+    pub fn database_key(&self) -> &[u8; 32] {
+        self.0.key()
+    }
+
+    pub fn verify_control(&self, store: &ControlStore) -> Result<(), DatabaseError> {
+        if self.0.birth.kind != Kind::Control {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        self.0.marker(&store.connection, false)?;
+        self.verify_current()
+    }
+
+    pub fn verify_parity(&self, store: &ParityStore) -> Result<(), DatabaseError> {
+        if !matches!(self.0.birth.kind, Kind::Parity(_)) {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        self.0.marker(&store.connection, false)?;
+        self.verify_current()
+    }
+
+    fn claim_admitted(
+        &self,
+        directory: &DatabaseDirectory,
+        keys: &KeyMaterial,
+        guard: &super::DatabaseOpenGuard,
+        resume: bool,
+    ) -> Result<Arc<OwnerState>, DatabaseError> {
+        self.verify_current()?;
+        if (!resume && !self.is_ready())
+            || FileIdentity::of(&directory.file().metadata()?) != self.0.parent_id
+            || !guard.requires_existing_catalog()
+        {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        let path = directory.leaf(&self.0.name)?;
+        guard.verify_unchanged(&path)?;
+        let state = OwnerState::begin(
+            directory,
+            &self.0.name,
+            keys,
+            &self.0.birth.database_id,
+            self.0.birth.kind,
+            resume.then_some(self.0.policy),
+        )?;
+        if state.birth_hash != self.0.birth_hash
+            || state.main_hash != self.0.main_hash
+            || state.identity() != self.0.identity()
+        {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        self.verify_current()?;
+        guard.verify_unchanged(&path)?;
+        Ok(state)
+    }
+
+    /// Consume a read-only policy/source admission before any native SQL
+    /// recovery, journal-mode change or schema migration. Native xOpen checks
+    /// the same guard again against its actual opened main descriptor.
+    pub fn open_control_admitted(
+        &self,
+        directory: &DatabaseDirectory,
+        keys: &KeyMaterial,
+        guard: &super::DatabaseOpenGuard,
+    ) -> Result<ControlStore, DatabaseError> {
+        if self.0.birth.kind != Kind::Control {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        let state = self.claim_admitted(directory, keys, guard, false)?;
+        let store = ControlStore::open_owned_native_admitted(&state, guard)?;
+        state.marker(&store.connection, false)?;
+        self.verify_current()?;
+        Ok(store)
+    }
+
+    pub fn open_parity_admitted(
+        &self,
+        directory: &DatabaseDirectory,
+        keys: &KeyMaterial,
+        guard: &super::DatabaseOpenGuard,
+    ) -> Result<ParityStore, DatabaseError> {
+        let Kind::Parity(volume) = self.0.birth.kind else {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        };
+        let state = self.claim_admitted(directory, keys, guard, false)?;
+        let store = ParityStore::open_owned_native_admitted(&state, &volume, guard)?;
+        state.marker(&store.connection, false)?;
+        self.verify_current()?;
+        Ok(store)
+    }
+    /// Resume an already inspected committed schema without dropping the
+    /// source-admission guard while finishing the native birth.
+    pub fn resume_control_admitted(
+        &self,
+        directory: &DatabaseDirectory,
+        keys: &KeyMaterial,
+        guard: &super::DatabaseOpenGuard,
+    ) -> Result<ControlStore, DatabaseError> {
+        if self.0.birth.kind != Kind::Control {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        let state = self.claim_admitted(directory, keys, guard, true)?;
+        let store = ControlStore::open_owned_native_admitted(&state, guard)?;
+        state.marker(&store.connection, true)?;
+        state.finish(keys)?;
+        self.verify_current()?;
+        Ok(store)
+    }
+}
+
 impl ControlStore {
+    /// Read-only preflight for an explicitly authorized fresh creation/resume.
+    /// None means no SQL can yet have been initialized. Bound partial births
+    /// return evidence for inspection of any already committed control schema.
+    pub fn inspect_native_creation_in_directory(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        keys: &KeyMaterial,
+        database_id: &[u8],
+        policy: NativeDatabaseIoPolicy,
+    ) -> Result<Option<NativeDatabaseInspection>, DatabaseError> {
+        policy.validate().map_err(invalid)?;
+        let path = directory.leaf(name)?;
+        if !exists(directory, &lease_name(name))? {
+            family_absent(directory, name)?;
+            return Ok(None);
+        }
+        let lease = DatabaseDirectory::open(&directory.leaf(lease_name(name))?)?;
+        if !exists(&lease, OsStr::new("birth"))? {
+            family_absent(directory, name)?;
+            if fs::read_dir(lease.path())?.next().is_some() {
+                return Err(DatabaseError::NativeOwnershipInvalid);
+            }
+            return Ok(None);
+        }
+        let (birth, _, _): (Birth, _, _) = read(&lease, c"birth", keys, BIRTH_DOMAIN)?;
+        if birth.version != 1
+            || birth.parent != FileIdentity::of(&directory.file().metadata()?)
+            || birth.lease != FileIdentity::of(&lease.file().metadata()?)
+            || birth.kind != Kind::Control
+            || birth.main_name != name.as_bytes()
+            || birth.database_id != database_id
+        {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        let (key, declared) = keys
+            .unwrap_native_database_key(database_id, &birth.envelope)
+            .map_err(invalid)?;
+        let _key = Zeroizing::new(key);
+        if declared != policy {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        if !exists(&lease, OsStr::new("main"))? {
+            if exists(&lease, OsStr::new("ready"))? {
+                return Err(DatabaseError::NativeOwnershipInvalid);
+            }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut sibling = name.to_owned();
+                sibling.push(suffix);
+                if exists(directory, &sibling)? {
+                    return Err(DatabaseError::NativeOwnershipInvalid);
+                }
+            }
+            if exists(directory, name)? {
+                let m = fs::symlink_metadata(path)?;
+                if !m.is_file()
+                    || m.len() != 0
+                    || m.nlink() != 1
+                    || m.uid() != unsafe { libc::geteuid() }
+                    || m.mode() & 0o077 != 0
+                {
+                    return Err(DatabaseError::NativeOwnershipInvalid);
+                }
+            }
+            return Ok(None);
+        }
+        let state = OwnerState::read_bound(
+            directory,
+            name,
+            keys,
+            database_id,
+            Kind::Control,
+            None,
+            false,
+        )?;
+        if state.policy != policy {
+            return Err(DatabaseError::NativeOwnershipInvalid);
+        }
+        Ok(Some(NativeDatabaseInspection(state)))
+    }
+
+    pub fn inspect_native_existing_in_directory(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        keys: &KeyMaterial,
+        database_id: &[u8],
+    ) -> Result<NativeDatabaseInspection, DatabaseError> {
+        Ok(NativeDatabaseInspection(OwnerState::read_bound(
+            directory,
+            name,
+            keys,
+            database_id,
+            Kind::Control,
+            None,
+            true,
+        )?))
+    }
+    /// Fresh/partial creation after read-only source admission. Recheck the
+    /// original empty/absent main and private inputs before claiming ownership,
+    /// and its actual opened descriptor before SQL initialization or recovery.
+    pub fn create_native_admitted_in_directory(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        keys: &KeyMaterial,
+        database_id: &[u8],
+        policy: NativeDatabaseIoPolicy,
+        guard: &super::DatabaseOpenGuard,
+    ) -> Result<Self, DatabaseError> {
+        guard.verify_unchanged(&directory.leaf(name)?)?;
+        let state = OwnerState::begin(
+            directory,
+            name,
+            keys,
+            database_id,
+            Kind::Control,
+            Some(policy),
+        )?;
+        let store = Self::open_owned_native_admitted(&state, guard)?;
+        state.marker(&store.connection, true)?;
+        state.finish(keys)?;
+        Ok(store)
+    }
+
     /// Create/resume a fresh native birth. Existing generic catalogs and copies
     /// are never enrolled. A completed birth is reopened with its original key
     /// and immutable limits; supplied policy changes reject before SQL writes.
@@ -773,6 +1094,23 @@ impl ControlStore {
 }
 
 impl ParityStore {
+    pub fn inspect_native_existing_in_directory(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        volume: &[u8; 16],
+        keys: &KeyMaterial,
+        database_id: &[u8],
+    ) -> Result<NativeDatabaseInspection, DatabaseError> {
+        Ok(NativeDatabaseInspection(OwnerState::read_bound(
+            directory,
+            name,
+            keys,
+            database_id,
+            Kind::Parity(*volume),
+            None,
+            true,
+        )?))
+    }
     /// Fresh parity birth/resume under the same immutable native ownership
     /// protocol as control catalogs. No legacy key fallback or automatic copy
     /// adoption is permitted on this path.

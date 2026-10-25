@@ -834,3 +834,223 @@ fn native_birth_child() {
         other => panic!("unknown child mode {other}"),
     }
 }
+
+#[test]
+fn read_only_native_inspections_never_hold_or_release_a_writer_claim() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = DatabaseDirectory::open(temp.path()).unwrap();
+    let store = create(&directory);
+    let inspect = || {
+        ControlStore::inspect_native_existing_in_directory(
+            &directory,
+            OsStr::new("control.db"),
+            &keys(),
+            b"control.db/v2",
+        )
+        .unwrap()
+    };
+    let before = footprint(temp.path());
+    let inspection = inspect();
+    assert_eq!(footprint(temp.path()), before);
+    assert!(inspection.0.require_claim().is_err());
+    assert!(child_status(&mut run_child(temp.path(), "busy")).success());
+    drop(inspect());
+    assert!(child_status(&mut run_child(temp.path(), "busy")).success());
+    drop(store);
+    assert!(child_status(&mut run_child(temp.path(), "open")).success());
+    inspection.verify_current().unwrap();
+    let reopened = reopen(&directory).unwrap();
+    drop(inspection);
+    assert!(child_status(&mut run_child(temp.path(), "busy")).success());
+    drop(reopened);
+    let inspection = inspect();
+    assert!(child_status(&mut run_child(temp.path(), "open")).success());
+    inspection.verify_current().unwrap();
+}
+
+#[test]
+fn admitted_native_open_rejects_changed_sql_and_private_inputs_without_mutation() {
+    for change in ["main", "wal", "private"] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        let store = create(&directory);
+        store.put_record("admission", b"keep", b"original").unwrap();
+        drop(store);
+        fs::write(temp.path().join("profile"), b"original").unwrap();
+        let inspection = ControlStore::inspect_native_existing_in_directory(
+            &directory,
+            OsStr::new("control.db"),
+            &keys(),
+            b"control.db/v2",
+        )
+        .unwrap();
+        let path = temp.path().join("control.db");
+        let guard =
+            super::super::DatabaseOpenGuard::capture(&path, &[OsStr::new("profile")]).unwrap();
+        match change {
+            "main" => {
+                fs::rename(&path, temp.path().join("original.db")).unwrap();
+                fs::copy(temp.path().join("original.db"), &path).unwrap();
+            }
+            "wal" => fs::write(temp.path().join("control.db-wal"), b"unadmitted").unwrap(),
+            "private" => fs::write(temp.path().join("profile"), b"changed").unwrap(),
+            _ => unreachable!(),
+        }
+        let before = footprint(temp.path());
+        assert!(
+            inspection
+                .open_control_admitted(&directory, &keys(), &guard)
+                .is_err(),
+            "{change}"
+        );
+        assert_eq!(footprint(temp.path()), before, "{change}");
+    }
+}
+
+#[test]
+fn read_only_partial_native_inspection_admits_schema_before_finishing_birth() {
+    for point in [
+        Interruption::Schema,
+        Interruption::MarkerWrite,
+        Interruption::SqlMarker,
+        Interruption::Ready,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        INTERRUPT.with(|next| next.set(Some(point)));
+        assert!(
+            ControlStore::create_native_in_directory(
+                &directory,
+                OsStr::new("control.db"),
+                &keys(),
+                b"control.db/v2",
+                policy()
+            )
+            .is_err()
+        );
+        let before = footprint(temp.path());
+        let inspection = ControlStore::inspect_native_creation_in_directory(
+            &directory,
+            OsStr::new("control.db"),
+            &keys(),
+            b"control.db/v2",
+            policy(),
+        )
+        .unwrap()
+        .unwrap();
+        let path = temp.path().join("control.db");
+        let guard = super::super::DatabaseOpenGuard::capture(&path, &[]).unwrap();
+        let (reader, inputs) =
+            ControlStore::inspect_native_creation_snapshot(&path, inspection.database_key())
+                .unwrap();
+        let reader = reader.unwrap();
+        reader.verify_open_guard(&guard).unwrap();
+        inputs.verify_unchanged().unwrap();
+        drop(reader);
+        assert_eq!(footprint(temp.path()), before, "{point:?}");
+        let store = inspection
+            .resume_control_admitted(&directory, &keys(), &guard)
+            .unwrap();
+        store
+            .put_record("admitted-resume", b"keep", b"complete")
+            .unwrap();
+        drop(store);
+        assert_eq!(
+            reopen(&directory)
+                .unwrap()
+                .get_record("admitted-resume", b"keep")
+                .unwrap(),
+            Some(b"complete".to_vec())
+        );
+    }
+}
+
+#[test]
+fn admitted_native_creation_preserves_absent_and_partial_empty_main_guards() {
+    for point in [
+        None,
+        Some(Interruption::Birth),
+        Some(Interruption::EmptyMain),
+        Some(Interruption::MainBinding),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        if let Some(point) = point {
+            INTERRUPT.with(|next| next.set(Some(point)));
+            assert!(
+                ControlStore::create_native_in_directory(
+                    &directory,
+                    OsStr::new("control.db"),
+                    &keys(),
+                    b"control.db/v2",
+                    policy()
+                )
+                .is_err()
+            );
+        }
+        let path = temp.path().join("control.db");
+        let guard = super::super::DatabaseOpenGuard::capture_native_creation(&path, &[]).unwrap();
+        let store = ControlStore::create_native_admitted_in_directory(
+            &directory,
+            OsStr::new("control.db"),
+            &keys(),
+            b"control.db/v2",
+            policy(),
+            &guard,
+        )
+        .unwrap();
+        store
+            .put_record("creation", b"keep", b"original policy")
+            .unwrap();
+        assert_eq!(store.native_database_owner().unwrap().policy(), policy());
+        drop(store);
+        assert_eq!(
+            reopen(&directory)
+                .unwrap()
+                .get_record("creation", b"keep")
+                .unwrap(),
+            Some(b"original policy".to_vec())
+        );
+    }
+}
+
+#[test]
+fn admitted_native_creation_rejects_newly_populated_empty_or_absent_inputs() {
+    for empty in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DatabaseDirectory::open(temp.path()).unwrap();
+        if empty {
+            INTERRUPT.with(|next| next.set(Some(Interruption::MainBinding)));
+            assert!(
+                ControlStore::create_native_in_directory(
+                    &directory,
+                    OsStr::new("control.db"),
+                    &keys(),
+                    b"control.db/v2",
+                    policy()
+                )
+                .is_err()
+            );
+        }
+        let path = temp.path().join("control.db");
+        let guard = super::super::DatabaseOpenGuard::capture_native_creation(&path, &[]).unwrap();
+        let store = create(&directory);
+        store
+            .put_record("unadmitted", b"keep", b"original")
+            .unwrap();
+        drop(store);
+        let before = footprint(temp.path());
+        assert!(
+            ControlStore::create_native_admitted_in_directory(
+                &directory,
+                OsStr::new("control.db"),
+                &keys(),
+                b"control.db/v2",
+                policy(),
+                &guard
+            )
+            .is_err()
+        );
+        assert_eq!(footprint(temp.path()), before);
+    }
+}

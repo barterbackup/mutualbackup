@@ -452,6 +452,9 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, bytes: i64) -> c_int
         }
         #[cfg(target_os = "linux")]
         if let Some(binding) = &(*file.state).physical {
+            if let Err(error) = binding.require_initialized() {
+                return super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_TRUNCATE);
+            }
             let mut previous = 0i64;
             let code = ((*(*file.parent).pMethods).xFileSize.expect("native size"))(
                 file.parent,

@@ -98,7 +98,7 @@ pub use catalog::{
 pub use directory::{DatabaseDirectory, DatabaseOpenGuard};
 pub use journal_quota::{DatabaseJournalQuota, DatabaseJournalQuotaUsage};
 #[cfg(target_os = "linux")]
-pub use native_owner::NativeDatabaseOwner;
+pub use native_owner::{NativeDatabaseInspection, NativeDatabaseOwner};
 pub use page_quota::{DatabasePageQuota, DatabasePageQuotaUsage};
 #[cfg(target_os = "linux")]
 pub use physical_io::DatabasePhysicalIoLimits;

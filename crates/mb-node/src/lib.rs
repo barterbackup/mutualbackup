@@ -35,6 +35,8 @@ pub use paged_data::{PagedAnchorSectorSource, PagedDataSource, PagedLegacyDataAu
 mod snapshot;
 mod source_policy;
 mod volume;
+#[cfg(target_os = "linux")]
+pub use volume::NativeNodeStoragePolicy;
 mod watcher;
 mod wire;
 

@@ -889,6 +889,8 @@ pub(crate) struct NodeReaderConfig {
     control_database_key: [u8; 32],
     #[cfg(target_os = "linux")]
     control_directory: Option<mb_store::DatabaseDirectory>,
+    #[cfg(target_os = "linux")]
+    native_control_owner: Option<mb_store::NativeDatabaseOwner>,
     volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
     // Keep the claim while this handle can open or use a writable catalog.
     _data_dir_lease: DataDirLease,
@@ -925,13 +927,17 @@ impl NodeReaderConfig {
                     && owned.len() == 0,
                 "node data lock changed before opening a reader"
             );
-            ControlStore::open_existing_in_directory_with_key(
-                self.control_directory
-                    .as_ref()
-                    .context("node control directory is not held")?,
-                std::ffi::OsStr::new("control.db"),
-                &self.control_database_key,
-            )?
+            if let Some(owner) = &self.native_control_owner {
+                owner.open_control()?
+            } else {
+                ControlStore::open_existing_in_directory_with_key(
+                    self.control_directory
+                        .as_ref()
+                        .context("node control directory is not held")?,
+                    std::ffi::OsStr::new("control.db"),
+                    &self.control_database_key,
+                )?
+            }
         };
         #[cfg(not(target_os = "linux"))]
         let control = ControlStore::open_with_key(&self.control_path, &self.control_database_key)?;
@@ -1406,13 +1412,33 @@ impl Node {
         Self::open_locked(locked, seed)
     }
 
+    /// Explicit fresh native enrollment/resume. Existing generic catalogs and
+    /// copied native roots are never adopted by this operation.
+    #[cfg(target_os = "linux")]
+    pub fn create_native(
+        data_dir: impl AsRef<Path>,
+        seed: Seed,
+        policy: crate::NativeNodeStoragePolicy,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref();
+        let keys = KeyMaterial::from_seed(&seed);
+        crate::volume::native_node::preflight_create(data_dir, &keys, policy)?;
+        let locked = Self::lock_data_dir(data_dir)?;
+        locked.require_current_identity()?;
+        crate::volume::native_node::preflight_create(&locked.path, &keys, policy)?;
+        locked.make_private()?;
+        let directory = mb_store::DatabaseDirectory::from_file(locked.lease.directory.clone())?;
+        crate::volume::native_node::prepare(&directory, &locked.path, &keys, policy)?;
+        Self::open_locked(locked, seed)
+    }
+
     pub fn open_locked(locked: LockedDataDir, seed: Seed) -> Result<Self> {
         let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
         #[cfg(target_os = "linux")]
         locked.require_current_identity()?;
         #[cfg(target_os = "linux")]
-        let (admission, admitted_key) =
+        let (admission, admitted_key, native_inspection) =
             crate::source_policy::admit_native_control_writer(&data_dir, &keys)?;
         #[cfg(not(target_os = "linux"))]
         crate::source_policy::require_native_source_state_from_catalog(&data_dir, &keys)?;
@@ -1426,12 +1452,24 @@ impl Node {
         #[cfg(target_os = "linux")]
         locked.require_current_identity()?;
         #[cfg(target_os = "linux")]
-        let (mut control, control_database_key) = crate::volume::open_control_store_in_directory(
-            &mb_store::DatabaseDirectory::from_file(locked.lease.directory.clone())?,
-            &keys,
-            &admission,
-            admitted_key.as_ref(),
-        )?;
+        let (mut control, control_database_key) = if let Some(inspection) = native_inspection {
+            let key = *inspection.database_key();
+            (
+                inspection.open_control_admitted(
+                    &mb_store::DatabaseDirectory::from_file(locked.lease.directory.clone())?,
+                    &keys,
+                    &admission,
+                )?,
+                key,
+            )
+        } else {
+            crate::volume::open_control_store_in_directory(
+                &mb_store::DatabaseDirectory::from_file(locked.lease.directory.clone())?,
+                &keys,
+                &admission,
+                admitted_key.as_ref(),
+            )?
+        };
         #[cfg(not(target_os = "linux"))]
         let (mut control, control_database_key) =
             crate::volume::open_control_store(&data_dir, &keys)?;
@@ -3524,6 +3562,8 @@ impl Node {
             control_database_key: self.control_database_key,
             #[cfg(target_os = "linux")]
             control_directory: self.control.directory().cloned(),
+            #[cfg(target_os = "linux")]
+            native_control_owner: self.control.native_database_owner(),
             volume_readers: self.volume_readers.clone(),
             _data_dir_lease: self._data_dir_lock.lease.clone(),
         }
@@ -29981,3 +30021,6 @@ pub(crate) mod tests {
         fs::remove_dir_all(run_root).unwrap();
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod native_storage_tests;

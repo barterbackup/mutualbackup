@@ -116,6 +116,7 @@ impl Pool {
     pub(super) fn new_owned(
         owner: Arc<super::native_owner::OwnerState>,
     ) -> Result<Arc<Self>, DatabaseError> {
+        owner.require_claim()?;
         Self::with_owner(
             &owner.directory,
             &owner.name,
@@ -382,6 +383,28 @@ impl Pool {
         self.refresh(&mut files)
     }
 
+    /// Conservative additional main/journal allocation for admission hints.
+    /// Existing reusable journal space is not a new reservation; the native
+    /// writer remains authoritative for each actual allocation.
+    pub(super) fn write_available(&self) -> Result<u64, DatabaseError> {
+        let mut files = self
+            .files
+            .lock()
+            .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+        let _allocation = self.allocation_guard()?;
+        let total = self.refresh(&mut files)?;
+        let mut available = self.limits.total_bytes.saturating_sub(total);
+        for role in [Role::Main, Role::Journal] {
+            let used = files
+                .values()
+                .filter(|entry| entry.role == role)
+                .try_fold(0u64, |sum, entry| sum.checked_add(entry.bytes))
+                .ok_or(DatabaseError::CapacityExceeded)?;
+            available = available.min(self.limits.ceiling(role).saturating_sub(used));
+        }
+        Ok(available)
+    }
+
     /// The descriptor is owned by a live native sqlite3_file. It must stay
     /// open until Binding::close is called after that native file closes.
     pub(super) unsafe fn bind(
@@ -429,8 +452,13 @@ impl Pool {
         if !files.contains_key(&id) && files.len() >= self.limits.files as usize {
             return Err(DatabaseError::CapacityExceeded);
         }
-        initialize_private_file(descriptor, metadata.len(), metadata.blocks())?;
-        validate_private_allocations(descriptor)?;
+        // The native main descriptor must pass its source-admission guard
+        // before NoCow initialization changes its ctime. No main mutation is
+        // allowed until connect finishes that initialization after xOpen.
+        if role != Role::Main {
+            initialize_private_file(descriptor, metadata.len(), metadata.blocks())?;
+            validate_private_allocations(descriptor)?;
+        }
         if let Some(entry) = files.get_mut(&id) {
             if entry.role != role {
                 return Err(DatabaseError::PhysicalIoUnavailable);
@@ -462,6 +490,7 @@ impl Pool {
             descriptor,
             id,
             role,
+            initialized: role != Role::Main,
             closed: false,
         })
     }
@@ -472,16 +501,46 @@ pub(super) struct Binding {
     descriptor: RawFd,
     id: Identity,
     role: Role,
+    initialized: bool,
     closed: bool,
 }
 
 impl Binding {
+    pub(super) fn initialize_main(&mut self) -> Result<(), DatabaseError> {
+        if self.role != Role::Main || self.closed {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+        let files = self
+            .pool
+            .files
+            .lock()
+            .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
+        let _allocation = self.pool.allocation_guard()?;
+        let metadata = files
+            .get(&self.id)
+            .ok_or(DatabaseError::PhysicalIoUnavailable)?
+            .pin
+            .metadata()?;
+        initialize_private_file(self.descriptor, metadata.len(), metadata.blocks())?;
+        validate_private_allocations(self.descriptor)?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub(super) fn require_initialized(&self) -> Result<(), DatabaseError> {
+        if !self.initialized || self.closed {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+        Ok(())
+    }
+
     pub(super) fn block_size(&self) -> Result<u64, DatabaseError> {
         allocation_block_size(self.descriptor)
     }
     /// Allocate and validate the complete rounded write range before native
     /// data I/O. Known sharing/encoded/delayed/unknown extents grant no backing.
     pub(super) fn fund(&self, offset: u64, end: u64) -> Result<(), DatabaseError> {
+        self.require_initialized()?;
         if offset > end || end > self.pool.limits.ceiling(self.role) {
             return Err(DatabaseError::CapacityExceeded);
         }

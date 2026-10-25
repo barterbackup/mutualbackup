@@ -23,8 +23,12 @@ mod opening;
 mod packing_output_cleanup;
 #[cfg(target_os = "linux")]
 use opening::{initialize_volume, open_volume_store};
+#[cfg(target_os = "linux")]
+pub(crate) mod native_node;
 #[cfg(test)]
 mod native_policy_inspection_tests;
+#[cfg(target_os = "linux")]
+pub use native_node::NativeNodeStoragePolicy;
 #[cfg(test)]
 mod packing_payload_tests;
 
@@ -425,10 +429,19 @@ pub(crate) struct VolumeReaderConfig {
     pub database_key: [u8; 32],
     #[cfg(target_os = "linux")]
     directory: Option<mb_store::DatabaseDirectory>,
+    #[cfg(target_os = "linux")]
+    native_owner: Option<mb_store::NativeDatabaseOwner>,
 }
 
 impl VolumeReaderConfig {
     pub(crate) fn open(&self) -> std::result::Result<ParityStore, mb_store::DatabaseError> {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &self.native_owner {
+            if owner.parity_volume_id() != Some(*self.volume_id.as_bytes()) {
+                return Err(DatabaseError::NativeOwnershipInvalid);
+            }
+            return owner.open_parity();
+        }
         #[cfg(target_os = "linux")]
         if let Some(directory) = &self.directory {
             return ParityStore::open_existing_in_directory_with_key(
@@ -537,6 +550,11 @@ impl StorageVolumes {
         });
         if records.is_empty() {
             #[cfg(target_os = "linux")]
+            anyhow::ensure!(
+                control.native_database_owner().is_none(),
+                "managed Node volume ownership is missing; preserve the original profile and registry"
+            );
+            #[cfg(target_os = "linux")]
             let record = match control.directory() {
                 Some(directory) => opening::initialize_volume_in_directory(
                     data_dir,
@@ -558,12 +576,9 @@ impl StorageVolumes {
         let mut canonical_paths = BTreeSet::new();
         for mut record in records {
             validate_volume_record(&record)?;
-            let database_key = keys
-                .unwrap_database_key(
-                    &volume_database_id(record.volume_id),
-                    &record.wrapped_database_key,
-                )
-                .context("cannot unwrap parity database key")?;
+            let database_key =
+                unwrap_mutable_volume_key(&keys, record.volume_id, &record.wrapped_database_key)
+                    .context("cannot unwrap parity database key")?;
             let mut store = None;
             if record.path.is_dir() {
                 let path = record.path.canonicalize().with_context(|| {
@@ -648,6 +663,25 @@ impl StorageVolumes {
         } else {
             paths.to_vec()
         };
+        #[cfg(target_os = "linux")]
+        if control.native_database_owner().is_some() {
+            for requested_path in &requested {
+                if !requested_path.is_dir()
+                    && self.volumes.values().any(|v| {
+                        v.record.path == *requested_path
+                            && v.record.wrapped_database_key.format_version == 2
+                    })
+                {
+                    continue;
+                }
+                let manifest = read_volume_manifest(requested_path, &self.keys)?
+                    .context("managed Node requires an explicitly initialized native volume")?;
+                anyhow::ensure!(
+                    manifest.wrapped_database_key.format_version == 2,
+                    "managed Node cannot enroll a legacy volume without quiescent adoption"
+                );
+            }
+        }
         let mut configured = BTreeSet::new();
         for requested_path in requested {
             let path = match require_online_directory(&requested_path) {
@@ -777,8 +811,9 @@ impl StorageVolumes {
                     record.volume_id
                 );
             }
-            let database_key = self.keys.unwrap_database_key(
-                &volume_database_id(record.volume_id),
+            let database_key = unwrap_mutable_volume_key(
+                &self.keys,
+                record.volume_id,
                 &record.wrapped_database_key,
             )?;
             let store = open_volume_store_for_control(
@@ -926,6 +961,8 @@ impl StorageVolumes {
                         database_key: volume.database_key,
                         #[cfg(target_os = "linux")]
                         directory: store.directory().cloned(),
+                        #[cfg(target_os = "linux")]
+                        native_owner: store.native_database_owner(),
                     })
             })
             .collect()
@@ -3290,6 +3327,20 @@ fn unwrap_key_for_preserved_reader(
     })
 }
 
+fn unwrap_mutable_volume_key(
+    keys: &KeyMaterial,
+    volume_id: Uuid,
+    envelope: &WrappedDatabaseKey,
+) -> Result<[u8; 32]> {
+    #[cfg(target_os = "linux")]
+    if envelope.format_version == 2 {
+        return Ok(keys
+            .unwrap_native_database_key(&volume_database_id(volume_id), envelope)?
+            .0);
+    }
+    Ok(keys.unwrap_database_key(&volume_database_id(volume_id), envelope)?)
+}
+
 #[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn open_control_store(
     data_dir: &Path,
@@ -4189,6 +4240,13 @@ fn add_volume_coding_capacity(
         .saturating_sub(record.headroom_bytes)
         .saturating_sub(store.used_bytes()?)
         / u64::from(shard_size);
+    #[cfg(target_os = "linux")]
+    let logical = match store.physical_io_write_available_bytes()? {
+        Some(available) => {
+            logical.min(available / physical_write_reservation(shard_size as usize, 0))
+        }
+        None => logical,
+    };
     let device = fs::metadata(&record.path)?.dev();
     let available = fs2::available_space(&record.path)?;
     let entry = devices.entry(device).or_default();
@@ -4200,7 +4258,20 @@ fn add_volume_coding_capacity(
     );
     entry.reserved_bytes = entry
         .reserved_bytes
-        .saturating_add(record.headroom_bytes)
+        .saturating_add({
+            #[cfg(target_os = "linux")]
+            {
+                record.headroom_bytes.max(
+                    store
+                        .native_database_owner()
+                        .map_or(0, |owner| owner.policy().headroom_bytes),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                record.headroom_bytes
+            }
+        })
         .saturating_add(store.checkpoint_reservation_bytes()?);
     Ok(())
 }

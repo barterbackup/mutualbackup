@@ -409,22 +409,44 @@ pub(super) fn open_control(
     database_keys: &[[u8; 32]],
 ) -> Result<(ControlStore, PreservedReadGuard)> {
     open(path, database_keys, |connection| {
-        if meta_value(&connection, "database_kind")?.as_deref() != Some(b"control") {
-            return Err(DatabaseError::IncompatibleSchema.into());
-        }
-        let schema = meta_value(&connection, "schema_version")?
-            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-            .map(u32::from_be_bytes)
-            .context("preserved catalog schema is unavailable")?;
-        validate_control_schema(&connection, schema)?;
-        Ok(ControlStore {
-            connection,
-            physical_vfs: None,
-            path: path.to_path_buf(),
-            #[cfg(target_os = "linux")]
-            directory: None,
-        })
+        control_reader(path, connection)
     })
+}
+
+fn control_reader(path: &Path, connection: Connection) -> Result<ControlStore> {
+    if meta_value(&connection, "database_kind")?.as_deref() != Some(b"control") {
+        return Err(DatabaseError::IncompatibleSchema.into());
+    }
+    let schema = meta_value(&connection, "schema_version")?
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_be_bytes)
+        .context("preserved catalog schema is unavailable")?;
+    validate_control_schema(&connection, schema)?;
+    Ok(ControlStore {
+        connection,
+        physical_vfs: None,
+        path: path.to_path_buf(),
+        #[cfg(target_os = "linux")]
+        directory: None,
+    })
+}
+
+impl ControlStore {
+    /// Inspect a signed native birth without initializing/migrating SQL. None
+    /// means the committed image is still tableless, rather than an unknown or
+    /// partially decoded control schema.
+    pub fn inspect_native_creation_snapshot(
+        path: impl AsRef<Path>,
+        key: &[u8; 32],
+    ) -> Result<(Option<Self>, PreservedReadGuard)> {
+        let path = path.as_ref();
+        open(path, &[*key], |connection| {
+            if !super::database_has_tables(&connection)? {
+                return Ok(None);
+            }
+            Ok(Some(control_reader(path, connection)?))
+        })
+    }
 }
 
 pub(super) fn inspect<T>(

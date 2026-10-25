@@ -136,6 +136,26 @@ pub(super) fn initialize_volume_in_directory(
     require_current_directory(directory, root)?;
     let root = root.to_path_buf();
     let manifest = read_volume_manifest(&directory.path(), keys)?;
+    if let Some(manifest) = &manifest
+        && manifest.wrapped_database_key.format_version == 2
+    {
+        let key =
+            unwrap_mutable_volume_key(keys, manifest.volume_id, &manifest.wrapped_database_key)?;
+        let record = VolumeRecord {
+            format_version: 1,
+            volume_id: manifest.volume_id,
+            path: root.clone(),
+            database_file: manifest.database_file.clone(),
+            wrapped_database_key: manifest.wrapped_database_key.clone(),
+            state: StorageVolumeState::Online,
+            budget_bytes,
+            headroom_bytes,
+            last_error: None,
+            configured: true,
+        };
+        open_volume_store_in_directory(&record, &key, keys, directory)?;
+        return Ok(record);
+    }
     let (manifest, publish) = match manifest {
         Some(manifest) => (manifest, false),
         None => {
@@ -264,6 +284,32 @@ pub(super) fn open_volume_store_in_directory(
             && manifest.wrapped_database_key == record.wrapped_database_key,
         "parity volume manifest conflicts with the control registry"
     );
+    if record.wrapped_database_key.format_version == 2 {
+        let inspection = ParityStore::inspect_native_existing_in_directory(
+            directory,
+            OsStr::new(&record.database_file),
+            record.volume_id.as_bytes(),
+            keys,
+            &volume_database_id(record.volume_id),
+        )?;
+        anyhow::ensure!(
+            inspection.wrapped_key() == &record.wrapped_database_key
+                && inspection.database_key() == database_key,
+            "native parity policy/key differs from its registry"
+        );
+        let (reader, inputs) = ParityStore::open_preserved_read_only_with_keys(
+            &path,
+            record.volume_id.as_bytes(),
+            &[*database_key],
+        )?;
+        reader.verify_open_guard(&guard)?;
+        inspection.verify_parity(&reader)?;
+        inputs.verify_unchanged()?;
+        drop(reader);
+        before_writer();
+        require_current_directory(directory, &record.path)?;
+        return Ok(inspection.open_parity_admitted(directory, keys, &guard)?);
+    }
     let legacy_key = keys.database_key(&legacy_volume_database_id(record.volume_id));
     let selected = admit_key(
         directory,
