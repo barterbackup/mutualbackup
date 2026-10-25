@@ -125,6 +125,17 @@ cross-process/old-writer/copy adoption and enclosing reservations remain next;
 normal Node startup still rejects native-policy keys and paged producers stay
 disabled. R1/R2/R3/R5/R7 and the remaining M6 gates stay open.
 
+Further implementation on 2026-10-25: `9047752` adds signed, durable native
+Store births and same-host process leases for new control/parity catalogs.
+617 ordinary Store, 153 focused Node and 42 provisioned Btrfs executions pass
+(772 distinct cases); strict workspace Clippy, formatting and cleanup pass.
+This supplies an explicit Store creation/restart path, not ordinary Node/volume
+activation or existing-state adoption. Normal startup still rejects managed
+births/native-policy keys before key/lock/permission changes, while inspection
+can recover a birth's key without an external control.key. Complete Node/volume
+integration, managed rekey, old-writer/restore/host-relocation adoption and
+enclosing reservations remain required. No release or platform gate closes.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -2962,6 +2973,40 @@ disabled. R1/R2/R3/R5/R7 and the remaining M6 gates stay open.
       These explicit APIs still require durable/cross-process ownership;
       generic writers, normal startup, copy adoption, global/enclosing
       reservations and normal paged production remain open.
+    - [x] Qualify fresh native Store birth and same-host process ownership.
+      `9047752` adds explicit new control/parity creation/resume and existing-
+      native open APIs. A private lease directory holds one kernel claim;
+      immutable signed birth/main/ready records bind the original parent,
+      lease/main inodes, kind, database identity and format-2 key policy. The
+      key is synced before SQL, the main binding before initialization, and
+      readiness follows a checked SQL birth marker. Native connections and
+      reusable handles retain the lease and one physical pool through close.
+      Linked old journals are charged before SQL work. Owner mappings are
+      rechecked before physical allocation. Generic writers and unmanaged
+      rekey reject; the SQL marker also fences a bare main copy on platforms
+      without the lease implementation. Read-only birth-key recovery grants
+      no ownership and leaves copied inputs readable without adopting them.
+      Sixteen new Store cases cover seven error/crash publication points,
+      actual process death and all four native journal modes, process exclusion
+      through the last handle, original policy/key/data and fixed parity ACKs,
+      missing/replaced/damaged records/main files, normal parent handoff,
+      directory-copy refusal, real temporary/retained-journal admission and
+      concurrent data writes. An initial implementation falsely invalidated a
+      reusable handle after normal main/WAL changes; its exact negative source,
+      binary and log are retained. Reuse now validates the live lease/immutable
+      records and the opened SQL binding; first acquisition retains preflight.
+      A Node case verifies recovery without control.key and startup rejection
+      before mutation with both present and missing main files.
+      All 617 ordinary Store, volume86/source-policy16/legacy-export51 Node,
+      and 42 Btrfs executions pass (772 distinct cases). Strict workspace/
+      all-target Clippy, format, 396-input/two-executable identity audit and
+      owned mount/loop/image cleanup pass. Evidence:
+      `/tmp/mb-native-owner-qual-cnl11s9t`, final `*-current` and `current-btrfs`
+      records. This qualifies same-host process restart and explicit Store APIs.
+      Ordinary Node/control/parity startup, managed rekey, quiescent old-writer/
+      restored/host-relocated adoption, ownership-bookkeeping/global/enclosing
+      funding and normal paged producers remain open. No host-reboot, complete
+      workspace test, installed-artifact or deferred platform claim is made.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement

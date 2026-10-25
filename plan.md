@@ -1662,8 +1662,10 @@ installed candidate gates. Preserve and diagnose the original 90-second initial
 coverage failure, 900-second native timeout and historical relay-only stall
 separately; later positives establish no cause and do not close R5.
 
-Prioritize durable native-policy creation/restart and quiescent existing/copy
-adoption, then integrate complete shared SQL/WAL/SHM/temporary, scratch, payload
+The explicit Store birth/same-host process-restart foundation is qualified in
+`9047752` below. Complete ordinary Node/control/parity startup integration,
+managed rekey and quiescent existing/restore/host-relocation adoption, then
+integrate complete shared SQL/WAL/SHM/temporary, scratch, payload
 and checkpoint-copy reservations across normal operations and volumes. Current
 process-local native physical pools and traversal/scratch ledgers are increments
 toward R3-SINGLE-OWNER-METADATA, not complete single-owner 1 TiB admission.
@@ -6775,3 +6777,47 @@ volume startup and normal paged integration remain open. Keep native-key mutable
 rejection and disabled normal producers until those paths exist. R1/R2/R3/R5/R7,
 complete workspace/installed qualification and deferred hardware gates remain
 open; no historical liveness observation is diagnosed by these passes.
+
+### 2026-10-25 — Durable native Store birth and process leases
+
+Qualified code `9047752` adds explicit fresh control/parity creation/resume and
+native reopen APIs. A private directory holds the exclusive kernel lease.
+Three atomically published signed records bind the parent, lease/main inode,
+database kind/identity and original format-2 key/policy. Birth/key publication
+precedes SQL, main binding precedes initialization, and readiness follows the
+paired SQL marker. Connections and reusable handles retain the original lease
+and shared physical pool; immutable record mappings are checked before more
+allocation. Retained linked journal tails count before SQL opens. Native journal
+recovery remains under that lease and its original policy, and every returned
+connection verifies its SQL binding. Generic writers and unmanaged rekey fail
+closed; the SQL marker remains a format boundary on other platforms too.
+
+Sixteen new Store cases cover seven partial/error and actual process-death
+publication points, hot transactions in DELETE/TRUNCATE/PERSIST/WAL modes,
+last-handle process exclusion, unchanged key/policy/data and fixed parity ACKs,
+record/main replacement and damage, parent handoff, directory-copy refusal with
+read-only recovery, temporary and retained-journal admission and concurrent
+normal writes. An initial reusable-handle preflight mistook main/WAL data
+changes for invalid ownership. Its exact failing source/binary/log are retained;
+the unchanged regression passes with live-lease reuse and per-connection SQL
+binding checks. A new Node case recovers from the birth without control.key,
+while mutable startup rejects before key/lock/permission changes, including a
+missing main. Original v1 envelope bytes and ordinary startup dispatch remain
+supported; no ordinary native-policy writer is enabled by this increment.
+
+All 617 ordinary Store cases, 86 volume, 16 source-policy and 51 legacy Node
+cases pass. Disposable Btrfs passes 21 physical, 16 ownership and five inspection
+cases, including actual ENOSPC and stopped-sharing refusal: 772 distinct cases
+in 812 final executions. Formatting, strict workspace/all-target Clippy,
+396-input/two-executable/source-archive audit and independent owned mount/loop/
+image cleanup pass. Evidence: `/tmp/mb-native-owner-qual-cnl11s9t`, final
+`*-current` logs, `current-btrfs` and `audit.json`.
+
+This is an explicit Store foundation with same-host process-restart evidence.
+Complete normal Node/volume creation/restart, managed rekey and old-writer/
+restore/host-relocation adoption next. The fixed ownership bookkeeping also
+needs enclosing funding alongside SQL/WAL/SHM/temporary, scratch, payload and
+checkpoint/rebuild reservations. Normal paged production stays disabled. Full
+workspace tests, installed artifacts, host reboot and deferred platform/capacity
+qualification are not claimed. R1/R2/R3/R5/R7 and the remaining M6 gates stay
+open; these passes diagnose none of the historical liveness observations.
