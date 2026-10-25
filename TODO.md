@@ -3037,6 +3037,22 @@ enclosing reservations remain required. No release or platform gate closes.
       additional native volume birth, managed rekey, safe adoption, host reboot
       and complete enclosing funding remain open. Normal paged producers stay
       disabled. This closes no enclosing R1/R2/R3/R5/R7 or deferred hardware gate.
+    - [x] Verify native Node volume-registry publication before signed readiness.
+      A temporary ignored-insert fault on the actual startup connection exposed
+      signed readiness with no durable registry; normal reopen and explicit
+      resume then both failed. The original 12-file fixture, exact negative
+      source/executable and log remain under
+      `/tmp/mb-native-node-qual-rx_jdsbb/native-registry`.
+      `27128c3` compares exact canonical registry bytes inside the existing SQL
+      transaction before publishing the SQL profile or signed readiness. The
+      identical regression covers ignored and replaced bytes, rollback of both
+      registry/profile rows, retry and ordinary reopen with original births.
+      Isolated implementation `2df623f` passes 19 ordinary and the same 19 Btrfs
+      cases; strict all-Node-test Clippy and format pass. The independent
+      `publication-audit.json` verifies 400 inputs, both source/executable and
+      dependency identities, unchanged regression source, preserved negatives
+      and mount/loop/image cleanup. Complete qualification of the merged routing
+      and registry corrections remains required; no installed result is claimed.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement

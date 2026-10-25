@@ -6949,3 +6949,31 @@ Complete current-source qualification is still required before installed work;
 the old full-source run remains a failed historical result. The original
 900-second native capture and 5,400-second relay-only observations, the complete
 R5 fault matrix and R1/R2/R3/R5/R7 remain open. Normal paged producers stay disabled.
+
+
+### 2026-10-25 — Fence native Node readiness with the durable volume registry
+
+An ignored registry insert on the actual native startup connection reproduced
+signed readiness without the required volume registry. Startup returned an error,
+but the signed file then prevented both normal open and explicit creation resume.
+The 12-file failed fixture and exact source/executable/log are preserved under
+`/tmp/mb-native-node-qual-rx_jdsbb/native-registry`. An earlier persistent-trigger
+probe was correctly rejected by schema preflight and is not evidence for this
+publication defect.
+
+`27128c3` reads back exact canonical registry bytes inside the existing SQL
+transaction, before the SQL profile and signed readiness. Ignored or changed
+bytes abort that transaction. Identical before/after regression source proves
+rejection before readiness, rollback of both registry/profile rows, successful
+retry and ordinary reopen with original identities and policies. The isolated
+implementation branch `2df623f` passes 19 ordinary and the same 19 disposable
+Btrfs cases, with strict all-Node-test Clippy and formatting. Independent
+`publication-audit.json` checks 400 inputs, exact source archives, dependencies
+and executables, unchanged test source, the preserved negative and removal of
+the owned image, mount and loop device.
+
+The merged routing and registry fixes still require complete current-source
+qualification before installed jobs. Existing R1/R2/R3/R5/R7, native CLI/default
+policy selection, additional volume birth, managed rekey/adoption, enclosing
+funding and deferred platform/capacity gates remain open. Paged producers remain
+disabled.
