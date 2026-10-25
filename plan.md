@@ -1665,8 +1665,9 @@ separately; later positives establish no cause and do not close R5.
 The explicit Store birth/same-host process-restart foundation is qualified in
 `9047752` below. Code `859ce70` connects explicit Linux Node birth to ordinary
 managed control/parity opens and readers; its focused qualification is recorded
-below and the complete ordinary Node run is in progress. Complete ordinary
-initialization policy selection, additional native volume birth, managed rekey
+below. The complete ordinary Node run fails the initial-coverage liveness
+fixture as recorded below; diagnose it before installed qualification. Complete
+ordinary initialization policy selection, additional native volume birth, managed rekey
 and quiescent existing/restore/host-relocation adoption, then integrate complete
 shared SQL/WAL/SHM/temporary, scratch, payload and checkpoint-copy reservations
 across normal operations and volumes. Current
@@ -6865,16 +6866,54 @@ Clippy, format and owned mount/loop cleanup. Evidence:
 `/tmp/mb-native-node-qual-rx_jdsbb`, final `*-r3` logs, `native-r3` and
 `focused-audit.json`. The three detached negative images remain preserved.
 
-The complete ordinary Node run is still in progress on these exact binaries,
-with four threads and the documented 5,000-second overall bound. Its initial
+The complete ordinary Node run subsequently finished on these exact binaries
+with 612 passed, one failed and 32 ignored in 3,096.10 seconds. The first
+90-second coverage wait of `offline_first_spare_renews_live_checkpoint_coverage`
+failed before fault injection. Four threads and the documented 5,000-second
+overall bound were retained. Its initial
 intermediate default-concurrency attempt exhausted the 1,024-descriptor process
 limit; that log, descriptor inventory, source and binary are preserved. The
 current runner provides 65,536 descriptors and retains individual test deadlines.
-No complete ordinary Node/workspace or installed-artifact pass is claimed yet.
-This observation diagnoses none of the separate historical R5 timeouts.
+The source gate remains failed; no complete ordinary Node/workspace or
+installed-artifact pass is claimed. `node-negative-audit.json` verifies all
+612 passing/one failing/32 ignored identities, 399 unchanged code inputs and
+both exact executables/archive, 620 process samples (maximum 287 descriptors)
+and a 35-file unchanged preserved fixture snapshot. This is separate from the
+initial descriptor-exhaustion attempt and diagnoses none of the historical R5
+timeouts. Investigation continues on the preserved initial-coverage failure.
 
 Complete fresh CLI/default policy selection and additional native volume birth,
 managed rekey, quiescent old-writer/restore/host-relocation adoption, host reboot
 and enclosing ownership-bookkeeping/SQL/scratch/payload/checkpoint funding.
 Normal paged producers stay disabled. R1/R2/R3/R5/R7 and the user-deferred native
 platform/dense-capacity gates remain open.
+
+### 2026-10-25 — Reproduce and trace initial coding coverage failure
+
+The full ordinary Node prerequisite on `859ce70` fails the unchanged first
+90-second wait of `offline_first_spare_renews_live_checkpoint_coverage` while
+all five nodes are online. The original fixture `/tmp/.tmpnnElGg` has no remaining
+open descriptors and a read-only 35-file forensic copy under
+`/tmp/mb-native-node-qual-rx_jdsbb/r5-initial-coverage`; original/copy hashes and
+the exact failed source/executable identities are verified. Read-only decoding
+shows the healthy launch dispatched and the coordinator job Running, with no
+verifier commitment. All five coding worker tasks remained live at timeout.
+
+Diagnostic code `2303e79` adds opt-in bounded test traces of blocking-pool
+scheduling, node-mutex acquisition/release and peer mutations, plus queued/
+dispatched routing snapshots. No key or payload bytes are recorded. Production
+behavior, fixture payloads, the 90-second deadline and protection assertions are
+unchanged. Diagnostic compilation reuses the exact dependency artifacts selected
+by the failed Node target's Cargo fingerprint; commands, source archives, runtime
+feature/dependency hashes and diagnostic executables are retained. All-Node-test
+Clippy passes using those dependencies.
+
+An isolated traced run reproduces the first-wait failure with 19,295 events,
+zero dropped events and 90.001716 seconds of coverage observation. No individual
+mutex hold exceeds 0.85 seconds. The coordinator finishes its initial local work
+at 4.787 seconds and then waits on its first verifier RPC; no verifier mutation
+arrives. Unmodified isolated and subsequent traced positives remain diagnostic
+comparisons, not fixes or complete qualification. Capturing the failed request's
+routing/endpoint state is the next step; no cause is asserted yet. The distinct
+900-second native capture timeout, 5,400-second relay-only stall, complete R5 fault
+matrix and installed gates remain open.

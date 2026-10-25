@@ -3023,10 +3023,16 @@ enclosing reservations remain required. No release or platform gate closes.
       399-input/two-executable/source-archive identity and owned mount/loop
       cleanup pass. Evidence: `/tmp/mb-native-node-qual-rx_jdsbb`, final `*-r3`,
       `native-r3` and `focused-audit.json`. Three detached negative images remain.
-      Full ordinary Node qualification is running with four threads, the
-      documented 5,000-second overall bound and 65,536 available descriptors.
-      The intermediate default-concurrency/1,024-descriptor failure is retained;
-      no complete Node/workspace or installed pass is claimed yet. Default
+      Full ordinary Node qualification finished with 612 passed, one failed
+      and 32 ignored in 3,096.10 seconds: the unchanged first 90-second coverage
+      wait of `offline_first_spare_renews_live_checkpoint_coverage` failed before
+      fault injection. Four threads, the documented 5,000-second overall bound
+      and 65,536 available descriptors were retained. The independent negative
+      audit verifies 399 unchanged inputs/two executables/archive, every case,
+      620 process samples (maximum 287 descriptors) and the unchanged 35-file
+      fixture snapshot. The intermediate default-concurrency/1,024-descriptor
+      failure is retained separately; the complete source gate remains failed.
+      No complete Node/workspace or installed pass is claimed. Default
       initialization remains v1; explicit CLI/default policy selection,
       additional native volume birth, managed rekey, safe adoption, host reboot
       and complete enclosing funding remain open. Normal paged producers stay
@@ -5522,6 +5528,25 @@ enclosing reservations remain required. No release or platform gate closes.
     historical observations. The original first-90-second coverage failure,
     900-second native capture timeout, 5,400-second relay-only stall and complete
     R5 fault matrix remain open. No installed jobs ran.
+  - [ ] Diagnose the fresh `859ce70` first-coverage failure on preserved state.
+    The full four-thread ordinary Node run has 612 passes/one failure/32 ignored
+    in 3,096.10 seconds. It fails the original first 90-second coverage wait,
+    before offline-spare injection, with every coding worker live. Independent
+    `node-negative-audit.json` verifies unchanged code/archive/executables, all
+    test identities, 620 process samples (287 maximum descriptors) and a stable
+    read-only copy of all 35 fixture files. Evidence:
+    `/tmp/mb-native-node-qual-rx_jdsbb/r5-initial-coverage`, original
+    `/tmp/.tmpnnElGg` and parent `node-negative-audit.json`.
+    Diagnostic `2303e79` retains the original deadline, payload and assertions
+    and adds opt-in bounded lock/work/RPC routing traces. An isolated negative
+    records 19,295 events without dropping any: maximum individual mutex hold
+    0.85 seconds, coordinator local work ending at 4.787 seconds, then no
+    verifier mutation before the 90-second deadline. Read-only job decoding
+    confirms dispatched/Running durable ownership and no verifier commitment.
+    Unmodified/traced positives are comparisons only. Capture the stalled
+    request's endpoint/connection state and correct the demonstrated cause;
+    no cause, full-source pass or installed result is claimed yet. Keep the
+    separate native 900-second and relay-only 5,400-second observations open.
   - [x] Preserve and instrument the initial checkpoint coverage timeout.
     Full source qualification and first-coverage diagnostics (2026-10-15):
     The complete C2 source gate on `c2c82ef` failed. All four provisioned native
