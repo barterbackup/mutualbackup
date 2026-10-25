@@ -5528,7 +5528,7 @@ enclosing reservations remain required. No release or platform gate closes.
     historical observations. The original first-90-second coverage failure,
     900-second native capture timeout, 5,400-second relay-only stall and complete
     R5 fault matrix remain open. No installed jobs ran.
-  - [ ] Diagnose the fresh `859ce70` first-coverage failure on preserved state.
+  - [x] Reproduce and correct missing participant routes at the first coding RPC.
     The full four-thread ordinary Node run has 612 passes/one failure/32 ignored
     in 3,096.10 seconds. It fails the original first 90-second coverage wait,
     before offline-spare injection, with every coding worker live. Independent
@@ -5543,9 +5543,23 @@ enclosing reservations remain required. No release or platform gate closes.
     0.85 seconds, coordinator local work ending at 4.787 seconds, then no
     verifier mutation before the 90-second deadline. Read-only job decoding
     confirms dispatched/Running durable ownership and no verifier commitment.
-    Unmodified/traced positives are comparisons only. Capture the stalled
-    request's endpoint/connection state and correct the demonstrated cause;
-    no cause, full-source pass or installed result is claimed yet. Keep the
+    Unmodified/traced positives remain comparisons. A fresh disabled-maintenance
+    reproduction captures the first verifier challenge queued at coordinator 1
+    with zero dial attempts, no connection and no retained endpoint; read-only
+    roster decoding proves verifier 3's endpoint is already installed there.
+    `f543658` registers the assigned participants' current guild/epoch roster
+    hints before delegated execution, through normal endpoint/Tor admission.
+    A deterministic regression exercises the real worker against an unpolled
+    fresh routing table: identical test bytes fail on the previous implementation
+    at the missing route and pass with the fix, then complete the full unchanged
+    coverage/renewal/backup assertions. Both original coverage fixtures also
+    pass together; seven endpoint-authority/Tor/retry cases and all-Node-test
+    strict Clippy pass (10 distinct passing cases). Three passing coverage traces
+    finish in 18.99/23.86/24.42 seconds without dropped events. The independent
+    `routing-audit.json` verifies 400 code inputs, exact source/dependency/binary
+    identities and identical before/after test modules. Full current-source and
+    installed qualification remain required. This establishes the reproduced
+    missing-route path, not the cause of every historical timeout; keep the
     separate native 900-second and relay-only 5,400-second observations open.
   - [x] Preserve and instrument the initial checkpoint coverage timeout.
     Full source qualification and first-coverage diagnostics (2026-10-15):

@@ -6917,3 +6917,35 @@ comparisons, not fixes or complete qualification. Capturing the failed request's
 routing/endpoint state is the next step; no cause is asserted yet. The distinct
 900-second native capture timeout, 5,400-second relay-only stall, complete R5 fault
 matrix and installed gates remain open.
+
+
+### 2026-10-25 — Register delegated coding participant routes
+
+`f543658` corrects a reproduced first-coverage routing omission. A delegated
+coordinator can receive its plan over the delegator connection while having no
+application route to the independent verifier. The negative trace captures a
+queued challenge request with zero dial attempts, no connection and no retained
+address; read-only decoding confirms that the coordinator's installed roster
+already contains the verifier endpoint. Delegated execution now registers only
+its assigned nonvirtual information owners, parity holders, delegator and
+verifier from the current guild/epoch roster. Existing address admission retains
+signed endpoint replacement/withdrawal authority, bounded caches and Tor policy.
+
+The new regression exercises the real worker against an unpolled fresh routing
+table and checks the route before its first RPC, so incidental discovery cannot
+mask the omission. Identical test-module bytes fail on the prior implementation
+at that assertion and pass with the fix, then complete the full original coverage,
+offline-spare renewal and backup checks in 114.23 seconds. Both original coverage
+fixtures pass together in 127.11 seconds; seven endpoint-authority, Tor and retry
+cases pass too. The three initial coverage waits finish in 18.99/23.86/24.42
+seconds under the unchanged 90-second deadline, with zero dropped trace events.
+All-Node-test strict Clippy and formatting pass. The independent routing audit
+verifies 400 code inputs, source archives, exact dependencies/executables and
+identical before/after test modules. Evidence:
+`/tmp/mb-native-node-qual-rx_jdsbb/r5-initial-coverage`, `routing-*` artifacts.
+
+This is a demonstrated routing correction with 10 distinct focused passing cases.
+Complete current-source qualification is still required before installed work;
+the old full-source run remains a failed historical result. The original
+900-second native capture and 5,400-second relay-only observations, the complete
+R5 fault matrix and R1/R2/R3/R5/R7 remain open. Normal paged producers stay disabled.
