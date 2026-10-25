@@ -1665,7 +1665,7 @@ separately; later positives establish no cause and do not close R5.
 Prioritize durable native-policy creation/restart and quiescent existing/copy
 adoption, then integrate complete shared SQL/WAL/SHM/temporary, scratch, payload
 and checkpoint-copy reservations across normal operations and volumes. Current
-per-connection physical limits and traversal/scratch ledgers are increments
+process-local native physical pools and traversal/scratch ledgers are increments
 toward R3-SINGLE-OWNER-METADATA, not complete single-owner 1 TiB admission.
 Continue the remaining R1 safe-upgrade/recovery contract. Finish distributed
 availability/current activation, checkpoint ownership joins and normal paged
@@ -6736,3 +6736,42 @@ This is read-only format support with retained mutable rejection. Native-policy
 publication, fresh atomic birth/restart, copy/old-writer adoption, aggregate/
 enclosing reservations and normal volume/paged production remain open. R1/R2/
 R3/R5/R7 and complete current-source/installed/deferred hardware gates stay open.
+
+### 2026-10-25 — Share native SQL physical admission across live connections
+
+Implemented `a4eeed8` shares explicit native control/parity allocation pools by
+pinned main inode within a process. Every connection accounts for the same
+main, journal, SHM, anonymous temporary, total and file-slot allowance. Different
+live limits or journal namespaces reject before SQLite opens. Native close
+releases anonymous allocation only after its last binding closes; weak registry
+entries grant no durable ownership. Reused bindings retain full private-extent
+inspection. Existing key envelopes, generic constructors and mutable native-key
+rejection remain unchanged.
+
+Seven identical regression sources fail against the preceding native allocator/
+VFS at `e23e4fa`, then pass after correction. They exercise independent temporary,
+total and slot exhaustion, rollback/retry after native close, concurrent opens,
+policy conflicts, aliases/journal namespaces and parity READY evidence/reopen.
+All 601 ordinary Store and 21 physical cases on disposable Btrfs pass: 603
+distinct cases, including actual filesystem exhaustion and stopped-sharing
+refusal. Formatting, strict Store/all-target Clippy, an independent 394-input/
+executable-identity audit and owned mount/loop/image cleanup pass. The separate
+cross-process allocation-lock probe also passes with its original deadline.
+
+The original negative binaries/sources/logs, first full-Store failure and
+undersized 1 GiB native image remain preserved. The latter failed the existing
+exhaustion fixture's greater-than-1-GiB assertion; fresh 4 GiB runs pass. The
+first full Store run exposed two fixture interactions: its global lock probe
+could be starved by other allocations, and the new temporary concurrency case
+unnecessarily acquired the main writer lock. Final test-only probe isolation
+and deferred temporary transactions retain the original deadlines and capacity
+assertions. Evidence: `/tmp/mb-native-pool-regression-8yffoabm`, final `*-r2`
+logs and `audit-r2.json`. The vendored bridge contract now also documents SHM
+callback/DMS ordering and temporary-descriptor transfer ownership.
+
+This is focused Store evidence. Durable policy/key birth/restart, cross-process
+and old-writer/copy adoption, aggregate enclosing reservations, ordinary Node/
+volume startup and normal paged integration remain open. Keep native-key mutable
+rejection and disabled normal producers until those paths exist. R1/R2/R3/R5/R7,
+complete workspace/installed qualification and deferred hardware gates remain
+open; no historical liveness observation is diagnosed by these passes.

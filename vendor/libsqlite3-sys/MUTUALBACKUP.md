@@ -14,7 +14,7 @@ syscall hook. Unsupported VFSes/platforms gain no new capability.
   an already open SHM descriptor from the main file's attached SHM node. It
   returns SQLITE_NOTFOUND before attachment and in builds without WAL.
 
-Both descriptor lookups return SQLITE_MISUSE for a null output argument and
+Supported descriptor lookups return SQLITE_MISUSE for a null output argument and
 SQLITE_NOTFOUND when the descriptor is unavailable. They perform no I/O,
 allocation, descriptor open/close or lock change. Their results are borrowed:
 keep the owning sqlite3_file alive, retain the mapped main-file connection for

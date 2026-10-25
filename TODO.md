@@ -115,6 +115,16 @@ remain open, as do R1 and the deferred dense-capacity/platform requirements.
 The tree was clean at review start. This pass ran no builds, tests or runtime
 probes; recorded execution claims were not independently rerun.
 
+Implementation follow-up on 2026-10-25: `a4eeed8` shares explicit native SQL
+physical admission across connections to one main inode in a process. All 601
+ordinary Store and 21 disposable Btrfs physical cases pass; seven new regression
+sources fail against the preceding allocator/VFS implementation. The SQLite
+bridge contract is also corrected. This is focused Store qualification, not a
+complete workspace or installed-artifact gate. Durable policy birth/restart,
+cross-process/old-writer/copy adoption and enclosing reservations remain next;
+normal Node startup still rejects native-policy keys and paged producers stay
+disabled. R1/R2/R3/R5/R7 and the remaining M6 gates stay open.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -2929,6 +2939,29 @@ probes; recorded execution claims were not independently rerun.
       fresh birth/restart, shared managed ownership, old-writer/copy adoption,
       global/enclosing admission and normal producers remain open, alongside
       complete current-source/installed/R1/R2/R3/R5/R7 and deferred hardware gates.
+    - [x] Share native physical admission across live process-local connections.
+      Implemented in `a4eeed8`: explicit control/parity native constructors
+      reuse a weakly registered pool by pinned main inode. All role, total and
+      file-slot ceilings remain shared until actual native close; unlinked
+      temporaries retain their allocation charge. Different limits, headroom
+      or journal namespaces reject before SQL open. Reused bindings still
+      inspect private extents. Seven identical regression sources fail against
+      the original allocator/VFS at `e23e4fa`, and pass after correction:
+      temporary/total/file-slot exhaustion, concurrent grants, live policy
+      conflicts, path aliases/journal names and parity READY evidence/reopen.
+      All 601 ordinary Store and 21 provisioned Btrfs physical cases pass,
+      including real ENOSPC and stopped-sharing refusal: 603 distinct cases.
+      Format, strict Store/all-target Clippy, 394-input/executable identity
+      audit and independent owned mount/loop/image cleanup pass. Preserve the
+      original negatives, undersized 1 GiB fixture failure and first full-Store
+      run. That run exposed probe contention on the shared allocation lock and
+      an unrelated main-writer lock in the new temporary concurrency fixture.
+      Final fixtures isolate only the test probe's rendezvous and use deferred
+      temporary transactions; original deadlines/assertions remain unchanged.
+      Evidence: `/tmp/mb-native-pool-regression-8yffoabm`, final `*-r2` records.
+      These explicit APIs still require durable/cross-process ownership;
+      generic writers, normal startup, copy adoption, global/enclosing
+      reservations and normal paged production remain open.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement
@@ -2941,7 +2974,7 @@ probes; recorded execution claims were not independently rerun.
       with exact original data and admission limits preserved.
     - [ ] Compose native SQL/WAL/SHM/temporary, scratch and payload reservations
       across normal operations and volumes, including checkpoint/rebuild copies
-      and headroom. Per-connection physical ceilings and separate traversal or
+      and headroom. Process-local native SQL pools and separate traversal or
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
