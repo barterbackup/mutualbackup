@@ -2945,13 +2945,15 @@ probes; recorded execution claims were not independently rerun.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
-    - [ ] Refresh the vendored SQLite bridge contract before release review.
-      `vendor/libsqlite3-sys/MUTUALBACKUP.md` describes the original 1043 native
-      descriptor lookup but omits the later 1044 SHM descriptor, 1045 SHM
-      initialization callback and anonymous temporary-descriptor transfer API.
-      Document their lifetime/ownership and native lock requirements, and narrow
-      the no-I/O/no-open-or-close statement to descriptor lookup. This is a
-      documentation correction, not a confirmed defect in the reviewed bridge.
+    - [x] Refresh the vendored SQLite bridge contract before release review.
+      On 2026-10-25, reconciled `vendor/libsqlite3-sys/MUTUALBACKUP.md` with
+      both bundled C implementations, the Rust declarations and physical VFS.
+      The contract now covers 1043 native and 1044 SHM descriptor borrowing,
+      1045 callback/context lifetime, exclusive DMS reset/allocation ordering,
+      and anonymous temporary-descriptor transfer including error cleanup.
+      The no-I/O/no-open-or-close guarantee applies only to descriptor lookup.
+      Validation: source inspection and `git diff --check`; no executable
+      changes or runtime qualification claim. Enclosing R2/R3/R7 remain open.
     - [x] Qualify paged recovery proof reconstruction after predecessor retirement.
       Reconstruct selected paged recovery authority after restart (2026-10-14):
       A bounded recovery operation walks exact archived predecessor links into an encrypted
