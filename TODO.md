@@ -3053,6 +3053,26 @@ enclosing reservations remain required. No release or platform gate closes.
       dependency identities, unchanged regression source, preserved negatives
       and mount/loop/image cleanup. Complete qualification of the merged routing
       and registry corrections remains required; no installed result is claimed.
+    - [x] **R3-VOLUME-CONFIGURATION / P1 — Publish runtime volume authority before
+      acknowledgement or live admission.** A public-API probe against `26659ff`
+      acknowledges an ignored 4 MiB to 8 MiB budget update, raises the live limit
+      and reopens at the old 4 MiB. Its exact source/library/executable and stable
+      five-file fixture are preserved at
+      `/tmp/mb-m6-volume-registry-repro-wlv5ibhn`.
+      `c442be6` verifies every registry publication inside a writer transaction;
+      native birth and configuration reuse their existing enclosing transaction.
+      Budgets, paths, handles and drain/reactivation eligibility are prepared and
+      become live after commit. Failed writes/late validation retain prior live
+      authority and readers; new-volume retry retains its original manifest.
+      Six identical regressions fail on the archived implementation and pass with
+      the fix. Both legacy and managed cases cover ignored/aborted/replaced writes,
+      actual capacity, exact data/acknowledgements, reopen and retry. All 100 existing
+      volume/native-runtime cases and 26 Btrfs executions pass: 107 distinct cases
+      in 132 executions. Strict all-Node-test Clippy, formatting, independent source/
+      dependency/executable/regression identity audit and owned mount/loop/image
+      cleanup pass. The isolated implementation is qualified in `audit.json` at
+      that evidence root. Complete merged-source/installed qualification and the
+      enclosing shared policy remain required; no R1/R2/R3/R5/R7 closure is claimed.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement

@@ -7009,3 +7009,32 @@ are not yet timed in that trace. Measure them and the acknowledgement path befor
 claiming a cause or fix. Keep the 60-second bound, actual activation completion,
 all signatures and data checks; no complete-source or installed pass is claimed.
 R1/R2/R3/R5/R7 and the separately preserved historical observations remain open.
+
+
+### 2026-10-26 — Commit volume configuration before live admission
+
+`c442be6` corrects the reproduced runtime volume-registry false acknowledgement.
+A probe on `26659ff` acknowledges an ignored 4 MiB to 8 MiB budget update and
+raises live admission, while reopening restores 4 MiB. Exact probe source,
+executable, baseline library and five-file fixture are retained under
+`/tmp/mb-m6-volume-registry-repro-wlv5ibhn`.
+
+Registry publication now verifies exact canonical bytes inside a writer
+transaction. Native birth and configuration call the checked publisher within
+their enclosing transaction. Candidate budgets, paths, opened/retained catalogs
+and drain/reactivation records become live after that commit. Errors retain the
+previous live authority and readers. An initialized but unenrolled extra volume
+can resume with its original manifest. Data formats, native physical ceilings,
+source admission and endpoint authority remain enforced.
+
+Six byte-identical regression sources fail on the archived implementation and
+pass with the fix. They cover legacy/managed ignored, aborted and altered writes,
+late validation, capacity, original data and acknowledgement evidence, reopen,
+new-volume retry, drain and reactivation. All 100 existing volume/native-runtime
+cases and 26 disposable Btrfs executions pass: 107 distinct cases in 132
+executions. Strict all-Node-test Clippy and formatting pass. `audit.json` verifies
+both source archives/executables/dependencies, unchanged regression source, the
+original negative and removal of the owned mount/loop/image. This qualifies the
+isolated implementation branch. The merged source still needs a complete passing
+gate after the restored blocked-launch investigation; no installed qualification
+or enclosing R1/R2/R3/R5/R7 closure is claimed. Paged producers stay disabled.
