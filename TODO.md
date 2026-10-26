@@ -5564,8 +5564,8 @@ enclosing reservations remain required. No release or platform gate closes.
     historical observations. The original first-90-second coverage failure,
     900-second native capture timeout, 5,400-second relay-only stall and complete
     R5 fault matrix remain open. No installed jobs ran.
-  - [ ] Diagnose the restored blocked-launch wait on `26659ff` before retrying
-    complete qualification. The frozen all-target run finishes with 1,703 passes,
+  - [x] Diagnose and correct executor starvation in the restored blocked-launch
+    fixture on `26659ff`; complete merged qualification remains required. The frozen all-target run finishes with 1,703 passes,
     one failure and 136 ignored across 19 targets. Node reports 614 passed, one
     failed and 32 ignored in 3,154.04 seconds; all other targets pass. The sole
     failure is the unchanged final 60-second wait in
@@ -5584,10 +5584,22 @@ enclosing reservations remain required. No release or platform gate closes.
     Its 8,316-event trace drops none: the coder is Complete and all five nodes
     have installed event sequence 3/two groups, while the owner still has an
     incomplete activation and an event-install response pending. The three
-    original timeout observations remain separate. Measure the synchronous
-    fixture polling and remaining acknowledgement path before asserting a cause;
-    do not lengthen the wait, weaken protection or treat installed data as a
-    passing activation/complete-source gate.
+    original timeout observations remain separate.
+    Observational polling traces measure 51.92 seconds spent blocking the shared
+    current-thread swarm executor during the restored wait, including 42.65
+    seconds holding the Node mutex. The healthy phase also blocks it for 22.74
+    seconds. `0585b72` runs both existing predicates through `node_blocking`, as
+    the production workers already do. Exact predicate comparisons and deadline/
+    interval checks pass; no payload, assertion, 60-second wait or signature
+    requirement changed. The isolated case passes in 151.92 seconds and all four
+    restart/retry cohort cases pass with four threads; restored polling spans
+    are 31.41 and 32.07 seconds. Strict all-Node-test Clippy and formatting pass.
+    `polling-audit.json` verifies four distinct cases/five positive executions,
+    source/dependency/executable identities, predicate equivalence, zero dropped
+    trace events and all 35 preserved negative fixture files. Evidence:
+    `/tmp/mb-m6-blocked-launch-diag-5g177s5b`. This closes the demonstrated fixture
+    scheduling defect; the complete combined source gate, historical native/
+    relay-only causes and enclosing R5/R7 remain open. No installed jobs ran.
   - [x] Reproduce and correct missing participant routes at the first coding RPC.
     The full four-thread ordinary Node run has 612 passes/one failure/32 ignored
     in 3,096.10 seconds. It fails the original first 90-second coverage wait,

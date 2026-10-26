@@ -7038,3 +7038,29 @@ original negative and removal of the owned mount/loop/image. This qualifies the
 isolated implementation branch. The merged source still needs a complete passing
 gate after the restored blocked-launch investigation; no installed qualification
 or enclosing R1/R2/R3/R5/R7 closure is claimed. Paged producers stay disabled.
+
+
+### 2026-10-26 — Keep restart status polling off the swarm executor
+
+The preserved blocked-launch trace led to a measured fixture scheduling defect.
+Both status loops synchronously acquired the Node mutex and ran catalog/coverage
+queries on the current-thread executor shared by all five swarms. Observational
+tracing records 51.92 seconds of executor blocking in the final restored-volume
+wait, including 42.65 seconds holding the mutex; healthy-phase polls block it for
+22.74 seconds. This prevents queued networking responses from making progress
+while the fixture checks their resulting state.
+
+`0585b72` moves the two existing predicates into `node_blocking`, matching the
+production workers. The predicates are byte-equivalent after wrapper/variable
+normalization, and their deadlines and 100 ms interval are unchanged. The
+isolated case passes in 151.92 seconds and the four-thread restart/retry cohort
+passes all four cases. Restored polling-to-completion spans are 31.41 and 32.07
+seconds. Strict all-Node-test Clippy and formatting pass. `polling-audit.json` in
+`/tmp/mb-m6-blocked-launch-diag-5g177s5b` verifies four distinct cases/five positive
+executions, exact archived source/dependencies/executables, unchanged predicates,
+zero dropped trace events and all 35 preserved negative fixture files.
+
+The demonstrated fixture scheduling defect is corrected. A fresh complete gate
+must qualify this correction with the merged volume-registry changes before
+installed jobs. This does not explain the separate historical native-capture or
+relay-only stalls, close R1/R2/R3/R5/R7, or enable normal paged producers.
