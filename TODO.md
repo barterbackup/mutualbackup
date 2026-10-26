@@ -136,6 +136,25 @@ can recover a birth's key without an external control.key. Complete Node/volume
 integration, managed rekey, old-writer/restore/host-relocation adoption and
 enclosing reservations remain required. No release or platform gate closes.
 
+Source review on 2026-10-26 of `76105a8..a581995` confirms progress from explicit
+Store APIs to durable native Node birth, ordinary managed opens/readers and
+additional native parity volumes. Shared process-local SQL credits, checked
+registry publication before live capacity, and scoped SQL shell authority address
+concrete correctness gaps. The earlier vendor bridge documentation item is done.
+Two P2 corrections remain: R3-NATIVE-RECORD-QUOTA-RESTART must resume interrupted
+parity record-quota adoption through the managed opener, and
+R5-VIRTUAL-ZERO-ROUTING must include virtual-zero owners whose signed openings
+are still required. Correct both before the next qualification/release gate.
+No new data-loss or unauthorized-publication defect was confirmed in the reviewed
+native ownership, admission and configuration paths. CLI/default policy selection,
+managed rekey/adoption, enclosing reservations and normal paged integration remain
+open. The `30cff18` complete-source pass predates `faeb44d`; require fresh merged
+source qualification and a corrected packaged musl build before installed runtime
+qualification. R1/R2/R3/R5/R7 and deferred hardware requirements remain open.
+The tree was clean at review start. This pass inspected source and regression
+definitions only; it ran no builds, tests or runtime probes and did not rerun the
+recorded qualification evidence.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -3117,17 +3136,39 @@ enclosing reservations remain required. No release or platform gate closes.
       pending. CLI/default policy selection, managed rekey/adoption, host reboot,
       enclosing funding and normal paged integration remain open; producers stay
       disabled and deferred hardware requirements are unchanged.
-    - [ ] Connect native I/O policy to durable control/parity startup ownership.
-      Publish the authenticated policy/key and initial ownership through an
-      interruption-safe creation/restart protocol; retain policy enforcement
-      through ordinary writable opens, rekey and reopen. Define quiescent
+    - [ ] **R3-NATIVE-RECORD-QUOTA-RESTART / P2 — Resume interrupted record-quota
+      adoption when reopening managed parity.** The format-2 branch in
+      `crates/mb-node/src/volume/opening.rs` returns the managed Store directly,
+      bypassing the `Adopting` resume loop in the legacy `open_admitted` path.
+      `Node::configure_volume_record_quota` adopts existing records in separately
+      committed bounded steps, so process death can leave that state durable.
+      Native Store initialization validates the schema but does not advance the
+      adoption cursor; common Node startup resumes only the control quota.
+      Reopening a managed volume can therefore retain an incomplete adoption
+      whose triggers reject ordinary parity writes and reservations, rather than
+      completing it before reconciliation. Keep the managed lease, physical
+      admission and original quota while resuming the same bounded cursor after
+      either parity opener. Extend
+      `node_startup_resumes_interrupted_record_quota_before_normal_reconciliation`
+      to managed default and additional volumes: interrupt adoption, reopen,
+      require Active before normal writes, and preserve exact payloads,
+      acknowledgements, original quota and native ownership/physical limits;
+      verify the completed counters. The existing regression uses legacy Node
+      creation only. This finding is source-confirmed; no new runtime reproduction
+      was run during this review.
+    - [ ] Complete managed native policy lifecycle and product enrollment.
+      Explicit Store/Node creation, same-host process restart, ordinary managed
+      opens/readers and additional native volume birth are implemented above.
+      Complete CLI/default policy selection, managed rekey and host-reboot
+      behavior while retaining authenticated policy and ownership. Define quiescent
       enrollment of existing catalogs and restored/copied inputs so old writers
       cannot bypass admission or obtain duplicate live capacity. Preserve v1
       compatibility and read-only recovery; retain generic v2 mutable rejection
-      outside authenticated managed paths. Complete ordinary policy selection
-      and CLI exposure of the qualified additional native volume API as well. Qualify interrupted publication,
-      partial creation, missing/replaced files, owner restart and copy adoption
-      with exact original data and admission limits preserved.
+      outside authenticated managed paths. Expose the qualified additional native
+      volume API through the CLI. Extend interruption/restart qualification to
+      rekey, host reboot and old-writer/restore/host-relocation adoption, including
+      partial publication and missing/replaced files, with exact original data
+      and admission limits preserved.
     - [ ] Compose native SQL/WAL/SHM/temporary, scratch and payload reservations
       across normal operations and volumes, including checkpoint/rebuild copies
       and headroom. Process-local native SQL pools and separate traversal or
@@ -5598,14 +5639,33 @@ enclosing reservations remain required. No release or platform gate closes.
   durable retry. Keep the historical evidence below; later successes do not
   explain the original 5,400-second outlier.
 
-  - [ ] Diagnose the initial-coverage qualification failure and complete the
-    exact-source gate before resuming installed qualification. The `c2c82ef`
-    ordinary Node run timed out in the first 90-second coverage wait of
+  - [ ] **R5-VIRTUAL-ZERO-ROUTING / P2 — Register every signed-opening participant
+    before delegated coding.** Source review of `a581995` finds that
+    `add_coding_peer_addresses` in `crates/mb-node/src/network/p2p.rs` filters
+    out virtual-zero information owners, but `execute_delegated_coding` later
+    requests `coding_opening` from every manifest role. The assigned zero owner
+    must sign its proof; the coordinator cannot substitute its local zero bytes.
+    The ordinary variable planner can assign a virtual lane to a peer distinct
+    from the coordinator, verifier, delegator and parity holders. If that peer's
+    authenticated roster endpoint has not entered the fresh coordinator's routing
+    table, the opening RPC has no route and a valid coding attempt can stall or
+    time out despite the new first-verifier routing fix. Register zero owners
+    through the same current guild/epoch, endpoint-authority and Tor admission.
+    Add a deterministic fresh-coordinator regression with a virtual-only remote
+    owner, no incidental discovery, and complete signed-opening/transcript/backup
+    assertions; retain existing deadlines and signature requirements. The current
+    1+1/no-zero routing fixture does not cover this case. This is a source finding,
+    not a runtime reproduction or a diagnosis of the historical timeout records.
+  - [ ] Resolve the remaining historical initial-coverage investigation and
+    qualify the current source before resuming installed qualification. The
+    `c2c82ef` ordinary Node run timed out in the first 90-second coverage wait of
     `offline_first_spare_renews_live_checkpoint_coverage`, with all five nodes
     online and before fault injection. Use the `fb19875` worker/attempt/authority
-    diagnostics to distinguish contention, stalled progress and an exited worker;
-    no cause has yet been established. Preserve the failed source/binary/log
-    identities and keep the original payload, deadlines and protection assertions.
+    diagnostics to distinguish contention, stalled progress and an exited worker.
+    The later `f543658` correction below establishes a reproduced missing-route
+    path; it does not establish the cause of every earlier timeout. Preserve the
+    failed source/binary/log identities and keep the original payload, deadlines
+    and protection assertions.
     The isolated and four-case positives are diagnostic evidence only. Require
     complete source qualification on one recorded source/artifact set before
     starting installed jobs. Retain the earlier 900-second native capture/packing
@@ -5640,10 +5700,11 @@ enclosing reservations remain required. No release or platform gate closes.
     900-second native capture timeout, 5,400-second relay-only stall and complete
     R5 fault matrix remain open. No installed jobs ran.
   - [x] Diagnose and correct executor starvation in the restored blocked-launch
-    fixture on `26659ff`; complete merged qualification remains required. The frozen all-target run finishes with 1,703 passes,
-    one failure and 136 ignored across 19 targets. Node reports 614 passed, one
-    failed and 32 ignored in 3,154.04 seconds; all other targets pass. The sole
-    failure is the unchanged final 60-second wait in
+    fixture on `26659ff`. The combined `30cff18` source pass is recorded under R7;
+    later changes still require current-source qualification. The frozen all-target
+    run finishes with 1,703 passes, one failure and 136 ignored across 19 targets.
+    Node reports 614 passed, one failed and 32 ignored in 3,154.04 seconds;
+    all other targets pass. The sole failure is the unchanged final 60-second wait in
     `blocked_launch_staging_yields_to_healthy_launch_after_reopen` after returning
     its information volume. All three first-coverage waits pass in 18.93/21.48/
     31.65 seconds with zero dropped events. The independent `negative-audit.json`

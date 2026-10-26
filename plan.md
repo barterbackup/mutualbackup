@@ -1326,6 +1326,25 @@ requirements. The recorded implementation and runtime results that follow the
 current correction queue are historical, including any superseded statements
 that guarded completion is required.
 
+Source review on 2026-10-26 of `76105a8..a581995` confirms progress in durable
+native Node/control/parity ownership, shared process-local SQL admission,
+transactional volume configuration and resumable additional native volumes.
+The reviewed ownership/configuration paths contain no newly confirmed data-loss
+or unauthorized-publication defect. Two P2 corrections are required:
+R3-NATIVE-RECORD-QUOTA-RESTART must resume interrupted parity record-quota adoption
+in the managed opener before reconciliation, and R5-VIRTUAL-ZERO-ROUTING must
+include virtual-zero owners whose signed openings are required. `TODO.md` records
+both source findings and regression requirements. Correct them before qualifying
+current source and installed artifacts; existing legacy quota-restart and 1+1
+routing regressions do not cover these cases.
+The `30cff18` complete-source pass is historical after the musl ioctl correction
+in `faeb44d`; the corrected packaged build and current merged qualification are
+still pending. CLI/default policy selection, managed rekey/adoption, enclosing
+funding, normal paged integration and R1/R2/R3/R5/R7 remain open. Deferred dense
+capacity and native-platform acceptance requirements are unchanged. The tree
+was clean at review start. This pass ran no builds, tests or runtime probes;
+execution claims below remain their separately recorded historical evidence.
+
 Follow-up source review on 2026-10-16 of `4065dba..7c63600` confirms progress
 toward M6 through shared traversal/scratch ownership, retained-anchor preservation
 and explicit native SQL physical admission. No new severe defect was confirmed
@@ -1654,25 +1673,25 @@ availability/activation, normal backup/retention/seed recovery and R5/R7 stay
 open. Producers stay disabled; hardware runs remain user-deferred. See ADR 0002
 and `/tmp/mb-m6-packing-output-custody-h2mugql5`.
 
-R3-RETAINED-WRITER-RECOVERY and the Linux parity-volume handoff have focused
-passing evidence below. The complete-source prerequisite subsequently passed
-on `d8e0581`, followed by further source changes; `efbe298` also has a complete
-ordinary Node pass. Require fresh qualification of the merged source before
-installed candidate gates. Preserve and diagnose the original 90-second initial
-coverage failure, 900-second native timeout and historical relay-only stall
-separately; later positives establish no cause and do not close R5.
+The latest complete-source prerequisite passed on `30cff18`, including ordinary
+Node/Store and the provisioned native cases recorded under R7. Its subsequent
+packaged musl build failed; `faeb44d` corrects the ioctl argument typing, with
+focused physical-I/O qualification only. Correct R3-NATIVE-RECORD-QUOTA-RESTART
+and R5-VIRTUAL-ZERO-ROUTING, then qualify the merged source and corrected packaged
+musl build before installed runtime gates. The reproduced first-verifier routing
+omission and restored-wait fixture starvation have corrections; keep the original
+initial-coverage evidence, 900-second native timeout, later Store runner timeout
+and historical relay-only stall separate. These fixes and later positives
+establish no common cause or complete R5 closure.
 
-The explicit Store birth/same-host process-restart foundation is qualified in
-`9047752` below. Code `859ce70` connects explicit Linux Node birth to ordinary
-managed control/parity opens and readers; its focused qualification is recorded
-below. The complete ordinary Node run fails the initial-coverage liveness
-fixture as recorded below; diagnose it before installed qualification. Complete
-ordinary initialization policy selection, additional native volume birth, managed rekey
-and quiescent existing/restore/host-relocation adoption, then integrate complete
-shared SQL/WAL/SHM/temporary, scratch, payload and checkpoint-copy reservations
-across normal operations and volumes. Current
-process-local native physical pools and traversal/scratch ledgers are increments
-toward R3-SINGLE-OWNER-METADATA, not complete single-owner 1 TiB admission.
+Explicit Store/Node birth, same-host process restart, ordinary managed opens/
+readers and additional native volume creation are now implemented. Complete
+CLI/default policy selection, managed rekey, host-reboot behavior and quiescent
+existing/restore/host-relocation adoption. Integrate complete shared reservations
+for ownership bookkeeping, SQL/WAL/SHM/temporary, scratch, payload and checkpoint
+copies across normal operations and volumes. Current process-local native
+physical pools and traversal/scratch ledgers are increments toward
+R3-SINGLE-OWNER-METADATA, not complete single-owner 1 TiB admission.
 Continue the remaining R1 safe-upgrade/recovery contract. Finish distributed
 availability/current activation, checkpoint ownership joins and normal paged
 capture/packing/checkpoint/retention/seed-only recovery under the complete policy
