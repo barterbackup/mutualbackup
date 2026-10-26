@@ -7093,3 +7093,24 @@ Store-test Clippy pass. The complete Store suite runs alone before merge;
 Btrfs and independent artifact/negative audits remain pending. The separate
 additional native volume feature is still uncommitted and unqualified. No
 complete-source/installed or enclosing R1/R2/R3/R5/R7 closure is claimed.
+
+
+### 2026-10-26 — Qualify scoped SQL shell inspection
+
+Isolated correction `3e2d84d` passes all 628 ordinary Store cases in 673.95
+seconds (675.32 runner), with four threads and the original 900-second bound.
+Its six byte-identical new regression sources fail on the archived baseline
+and pass after correction, including legacy/native control/parity data and
+original acknowledgement evidence. The same six cases pass on disposable
+Btrfs: 628 distinct cases in 640 positive executions. Strict all-Store-test
+Clippy and formatting pass.
+
+`audit.json` in `/tmp/mb-m6-shell-scope-fixy1x0y` verifies both source archives,
+exact dependencies/executables, unchanged regression source, every selected case,
+135 process samples and all 24 original/final negative fixtures (60 files).
+The owned Btrfs mount, loop association and image are independently absent.
+This closes the focused shell connection-state defect. It does not diagnose
+the earlier broad Store runner timeout or establish complete merged-workspace/
+installed qualification. The additional native parity-volume draft remains
+uncommitted and unqualified; R1/R2/R3/R5/R7 and normal paged integration remain
+open. No installed jobs ran.

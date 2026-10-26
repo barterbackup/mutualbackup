@@ -3073,21 +3073,26 @@ enclosing reservations remain required. No release or platform gate closes.
       cleanup pass. The isolated implementation is qualified in `audit.json` at
       that evidence root. Complete merged-source/installed qualification and the
       enclosing shared policy remain required; no R1/R2/R3/R5/R7 closure is claimed.
-    - [ ] **R3-SHELL-QUERY-SCOPE / P2 — Restore live connection authority after
+    - [x] **R3-SHELL-QUERY-SCOPE / P2 — Restore live connection authority after
       read-only SQL shell inspection.** Six independent regressions on `6926b75`
       reproduce the leak for successful control/parity reads, refused writes,
       preparation/step errors and an already query-only connection. Subsequent
       normal writers fail until reopen; inspection SQL can also clear a prior
       connection's query-only setting. Both legacy and native cases retain
-      original data and parity acknowledgements. Isolated correction `3e2d84d`
-      restores the previous setting after success/error and preserves it on
-      unwinding. The six byte-identical final cases pass and strict all-Store-test
-      Clippy passes. Complete Store qualification is running alone under the same
-      four threads and 900-second bound before merging; disposable Btrfs coverage
-      and independent source/artifact/negative audit remain pending. Original and
-      final negative runs preserve 24 fixtures/60 files, with read-only copies.
-      Evidence: `/tmp/mb-m6-shell-scope-fixy1x0y`. This was found by the separate
-      additional-volume draft; that feature is not yet qualified or merged.
+      original data and parity acknowledgements. Correction `3e2d84d` restores
+      the previous setting after success/error, with an unwinding fallback.
+      The six byte-identical final cases pass, along with all 628 ordinary Store
+      cases in 673.95 seconds (675.32 runner), four threads and the unchanged
+      900-second bound. The same six cases pass on disposable Btrfs: 628 distinct
+      cases in 640 positive executions. Strict all-Store-test Clippy and format
+      pass. `audit.json` verifies both archived sources/dependencies/executables,
+      identical regressions, all cases, 135 process samples, all 24 negative
+      fixtures/60 files and owned mount/loop/image cleanup. Evidence:
+      `/tmp/mb-m6-shell-scope-fixy1x0y`. This qualifies the isolated correction;
+      it does not establish the broad run's timeout cause or replace complete
+      current merged-source/installed qualification. The separate additional
+      native volume draft remains uncommitted and unqualified. Enclosing R3 and
+      R1/R2/R5/R7 remain open; normal paged producers stay disabled.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement
