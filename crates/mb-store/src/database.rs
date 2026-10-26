@@ -4973,6 +4973,45 @@ unsafe extern "C" fn shell_control_statement(
     rusqlite::ffi::SQLITE_OK
 }
 
+// Query-only inspection is scoped to this statement. In particular, failed
+// preparation/stepping must not disable the application's retained writer, and
+// inspection SQL must not clear a connection's pre-existing query-only state.
+struct ShellQueryOnly<'a> {
+    connection: &'a Connection,
+    previous: Option<bool>,
+}
+
+impl<'a> ShellQueryOnly<'a> {
+    fn enter(connection: &'a Connection, query_only: bool) -> Result<Self, DatabaseError> {
+        let previous = if query_only {
+            let previous = connection.pragma_query_value(None, "query_only", |row| row.get(0))?;
+            connection.pragma_update(None, "query_only", true)?;
+            Some(previous)
+        } else {
+            None
+        };
+        Ok(Self {
+            connection,
+            previous,
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), DatabaseError> {
+        if let Some(previous) = self.previous {
+            self.connection
+                .pragma_update(None, "query_only", previous)?;
+            self.previous = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ShellQueryOnly<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 fn database_shell_statement(
     connection: &Connection,
     sql: &str,
@@ -4980,9 +5019,16 @@ fn database_shell_statement(
 ) -> Result<DatabaseShellResult, DatabaseError> {
     page_quota::apply(connection)?;
     journal_quota::apply(connection)?;
-    if query_only {
-        connection.pragma_update(None, "query_only", true)?;
-    }
+    let mut scope = ShellQueryOnly::enter(connection, query_only)?;
+    let result = database_shell_statement_scoped(connection, sql);
+    scope.restore()?;
+    result
+}
+
+fn database_shell_statement_scoped(
+    connection: &Connection,
+    sql: &str,
+) -> Result<DatabaseShellResult, DatabaseError> {
     let configured = journal_quota::configured(connection)?;
     let mut control_statement = false;
     let mut statement = if configured {
@@ -8404,3 +8450,6 @@ mod tests {
         assert_eq!(store.discard_staged_attempt(&attempt_id).unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+mod shell_scope_tests;
