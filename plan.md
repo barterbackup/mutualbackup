@@ -7064,3 +7064,32 @@ The demonstrated fixture scheduling defect is corrected. A fresh complete gate
 must qualify this correction with the merged volume-registry changes before
 installed jobs. This does not explain the separate historical native-capture or
 relay-only stalls, close R1/R2/R3/R5/R7, or enable normal paged producers.
+
+
+### 2026-10-26 — Preserve Store runner timeout and isolate SQL shell scope
+
+The combined ordinary gate on `6926b75` stops at the original 900-second Store
+runner bound. Nine completed targets pass all 387 ordinary cases; 567 Store
+successes and no failed case are observed, with 55 ordinary cases lacking a
+successful status. Node, supplemental and installed stages did not start.
+Auxiliary compilation overlapped Store execution, so rerun Store alone under
+its same four threads and bound before drawing a contention conclusion. The
+independent `negative-audit.json` in
+`/tmp/mb-m6-volume-polling-qual-mpx6kjx9` verifies all 455 frozen tracked inputs,
+the source archive, all 23 executable physical/hash identities and every
+completed target inventory. This remains a failed complete-source prerequisite.
+
+An additional-volume draft independently exposes a live SQL connection defect:
+read-only shell queries leave `query_only` enabled, disabling subsequent normal
+writers until reopen. A read-only inspection statement can also clear a prior
+query-only connection setting. Six regressions reproduce both legacy and native
+control/parity cases on the archived baseline while preserving original data
+and acknowledgement evidence. Original and final negatives retain 24 fixtures/
+60 files, copied read-only under `/tmp/mb-m6-shell-scope-fixy1x0y`.
+
+Isolated code `3e2d84d` restores the previous setting after success/error, with an
+unwinding fallback. All six byte-identical final regressions and strict all-
+Store-test Clippy pass. The complete Store suite runs alone before merge;
+Btrfs and independent artifact/negative audits remain pending. The separate
+additional native volume feature is still uncommitted and unqualified. No
+complete-source/installed or enclosing R1/R2/R3/R5/R7 closure is claimed.

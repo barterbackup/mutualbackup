@@ -3073,6 +3073,21 @@ enclosing reservations remain required. No release or platform gate closes.
       cleanup pass. The isolated implementation is qualified in `audit.json` at
       that evidence root. Complete merged-source/installed qualification and the
       enclosing shared policy remain required; no R1/R2/R3/R5/R7 closure is claimed.
+    - [ ] **R3-SHELL-QUERY-SCOPE / P2 — Restore live connection authority after
+      read-only SQL shell inspection.** Six independent regressions on `6926b75`
+      reproduce the leak for successful control/parity reads, refused writes,
+      preparation/step errors and an already query-only connection. Subsequent
+      normal writers fail until reopen; inspection SQL can also clear a prior
+      connection's query-only setting. Both legacy and native cases retain
+      original data and parity acknowledgements. Isolated correction `3e2d84d`
+      restores the previous setting after success/error and preserves it on
+      unwinding. The six byte-identical final cases pass and strict all-Store-test
+      Clippy passes. Complete Store qualification is running alone under the same
+      four threads and 900-second bound before merging; disposable Btrfs coverage
+      and independent source/artifact/negative audit remain pending. Original and
+      final negative runs preserve 24 fixtures/60 files, with read-only copies.
+      Evidence: `/tmp/mb-m6-shell-scope-fixy1x0y`. This was found by the separate
+      additional-volume draft; that feature is not yet qualified or merged.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement
@@ -5600,6 +5615,16 @@ enclosing reservations remain required. No release or platform gate closes.
     `/tmp/mb-m6-blocked-launch-diag-5g177s5b`. This closes the demonstrated fixture
     scheduling defect; the complete combined source gate, historical native/
     relay-only causes and enclosing R5/R7 remain open. No installed jobs ran.
+    The subsequent combined run on `6926b75` stops at the unchanged 900-second
+    Store runner bound, before Node or supplemental execution. Nine completed
+    targets pass all 387 ordinary cases; Store records 567 successful cases and
+    no failed case before termination, leaving 55 without successful status.
+    Auxiliary compilation overlapped this stage; its causal contribution is
+    unestablished. `negative-audit.json` at
+    `/tmp/mb-m6-volume-polling-qual-mpx6kjx9` verifies all 455 frozen inputs/archive,
+    23 exact executable identities and the completed case inventory. Preserve
+    this failed run and require fresh complete current-source qualification;
+    neither the polling fixture nor the workspace is claimed fully qualified.
   - [x] Reproduce and correct missing participant routes at the first coding RPC.
     The full four-thread ordinary Node run has 612 passes/one failure/32 ignored
     in 3,096.10 seconds. It fails the original first 90-second coverage wait,
