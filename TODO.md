@@ -5302,6 +5302,37 @@ enclosing reservations remain required. No release or platform gate closes.
   Git interop and no-duplicate-payload checks. Bound test timeouts, retain
   per-peer diagnostics, and independently audit mount/image/loop/network cleanup.
 
+  - [x] Qualify the merged native startup, volume configuration and shell-scope
+    source prerequisite on `30cff18`. All 1,725 ordinary cases pass, including
+    all 628 Store cases under the unchanged 900-second runner and all 630 Node
+    cases. Bulk payloads above 512 MiB and provisioned physical/ownership/native
+    lifecycle/recovery checks bring the total to 1,737 distinct cases in 1,811
+    positive executions. The independent audit verifies all 458 tracked inputs,
+    the source archive, 23 executable identities, 19 target inventories, 570
+    Node samples, five complete coverage traces with no dropped events, preserved
+    negatives and owned filesystem cleanup. Restored coverage completes within
+    36.06 seconds of its first restored predicate, under the original 60-second
+    bound. Evidence: `/tmp/mb-m6-native-extra-full-qual-aatzujf4/audit.json`.
+    The other 125 ignored cases remain unexecuted. This is historical source
+    evidence after the portability correction below, not installed qualification
+    or closure of the separate native/relay timeout observations or M6.
+  - [ ] Qualify native physical SQL on the packaged musl target. The pinned
+    release build on `30cff18` fails at FIEMAP because musl's `libc::ioctl`
+    request is `c_int`, while the new allocator casts it to glibc's `c_ulong`.
+    `negative-build-audit.json` in `/tmp/mb-m6-installed-30cff18-24xko1zm`
+    binds the failed build to the same 458 immutable source inputs. No installed
+    runtime test or filesystem provisioning started. An earlier stalled fetch
+    attempt is retained separately; all 775 locally cached crate archives match
+    the locked checksums and were imported into their fixed-output Nix paths.
+    Correction `faeb44d` infers the target request type from explicit 32-bit
+    ioctl bits in FIEMAP and the existing closed-reflink regression. The same
+    21 physical cases pass on owned Btrfs, with strict all-Store-target Clippy,
+    formatting and independent archive/executable/unchanged-assertion/payload/
+    deadline/cleanup audit. Evidence: `/tmp/mb-m6-ioctl-portability-ra41ei6j`.
+    The corrected musl build and fresh merged-source prerequisite remain
+    required before installed runtime qualification. R1/R2/R3/R5/R7 remain open;
+    normal paged producers stay disabled and deferred hardware gates unchanged.
+
   - [x] Port the five-peer format-7 checkpoint fixture to native Git capture and
     normal Git commands. Preserve exact CRLF/NUL blob OIDs and bytes, branches,
     tags and commit pins, checkpoint grace protection, physical history-anchor

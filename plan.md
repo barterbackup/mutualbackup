@@ -7146,3 +7146,35 @@ CLI/default policy selection, managed rekey and quiescent old-writer/restore/
 host-relocation adoption, host reboot and ownership-bookkeeping/SQL/scratch/
 payload/checkpoint funding remain open. Normal paged producers stay disabled;
 R1/R2/R3/R5/R7 and the deferred dense 1 TiB/native-platform gates remain open.
+
+
+### 2026-10-26 — Pass merged native source gate and correct musl ioctl typing
+
+The complete source prerequisite on `30cff18` passes 1,737 distinct cases in
+1,811 positive executions, including all 1,725 ordinary cases, three payloads
+above 512 MiB, and the provisioned ownership, physical I/O, native volume,
+configuration and four native recovery checks. Store passes its original
+900-second runner bound and Node passes all 630 ordinary cases. All five
+coverage traces complete with no dropped events; the restored predicate spans
+36.06 seconds under its original 60-second bound. The independent audit in
+`/tmp/mb-m6-native-extra-full-qual-aatzujf4` binds 458 tracked inputs, the archive,
+23 executables, 19 target inventories, preserved negative evidence and owned
+mount/loop/image removal. The other 125 ignored cases remain unexecuted.
+
+The subsequent pinned static musl build fails in FIEMAP: musl declares an
+`ioctl` request as `c_int`, while the allocator passes glibc's `c_ulong`.
+`negative-build-audit.json` in `/tmp/mb-m6-installed-30cff18-24xko1zm` verifies
+the failed build's immutable source against all 458 qualified inputs. No
+installed runtime jobs or filesystem provisioning started. The initial stalled
+fetch is separately preserved; importing 775 checksum-verified cached archives
+lets the same pinned offline compilation reach the actual source defect.
+
+Correction `faeb44d` preserves the ioctl's explicit 32-bit request bits and
+infers the target libc argument type. The existing closed-reflink regression
+uses the same portable conversion. All 21 physical I/O cases pass on disposable
+Btrfs; strict all-Store-target Clippy, formatting and independent source/archive/
+binary/unchanged-assertion/payload/deadline/cleanup audit pass under
+`/tmp/mb-m6-ioctl-portability-ra41ei6j`. Corrected musl compilation and a fresh
+merged-source prerequisite remain before installed runtime qualification. The
+`30cff18` source pass is historical evidence after this correction. Enclosing
+R1/R2/R3/R5/R7, normal paged integration and deferred hardware gates remain open.
