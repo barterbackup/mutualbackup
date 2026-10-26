@@ -1094,6 +1094,34 @@ impl ControlStore {
 }
 
 impl ParityStore {
+    /// Fresh parity creation/resume while retaining the caller's pinned
+    /// private creation/manifest inputs through the actual native descriptor.
+    pub fn create_native_admitted_in_directory(
+        directory: &DatabaseDirectory,
+        name: &OsStr,
+        volume: &[u8; 16],
+        keys: &KeyMaterial,
+        database_id: &[u8],
+        policy: NativeDatabaseIoPolicy,
+        guard: &super::DatabaseOpenGuard,
+    ) -> Result<Self, DatabaseError> {
+        guard.verify_unchanged(&directory.leaf(name)?)?;
+        let state = OwnerState::begin(
+            directory,
+            name,
+            keys,
+            database_id,
+            Kind::Parity(*volume),
+            Some(policy),
+        )?;
+        let store = Self::open_owned_native_admitted(&state, volume, guard)?;
+        interruption(Interruption::Schema)?;
+        state.marker(&store.connection, true)?;
+        interruption(Interruption::SqlMarker)?;
+        state.finish(keys)?;
+        Ok(store)
+    }
+
     pub fn inspect_native_existing_in_directory(
         directory: &DatabaseDirectory,
         name: &OsStr,

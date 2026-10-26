@@ -36,7 +36,7 @@ mod snapshot;
 mod source_policy;
 mod volume;
 #[cfg(target_os = "linux")]
-pub use volume::NativeNodeStoragePolicy;
+pub use volume::{NativeNodeStoragePolicy, NativeParityVolumePolicy};
 mod watcher;
 mod wire;
 

@@ -29,6 +29,10 @@ pub(crate) mod native_node;
 mod native_policy_inspection_tests;
 #[cfg(target_os = "linux")]
 pub use native_node::NativeNodeStoragePolicy;
+#[cfg(target_os = "linux")]
+mod native_volume;
+#[cfg(target_os = "linux")]
+pub use native_volume::NativeParityVolumePolicy;
 #[cfg(test)]
 mod packing_payload_tests;
 

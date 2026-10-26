@@ -3637,6 +3637,22 @@ impl Node {
         self.refresh_volume_readers()
     }
 
+    /// Explicitly create/resume an additional native parity volume in an empty
+    /// existing directory. Original policy and identity survive interruption;
+    /// an already registered volume retains its current configuration/state.
+    #[cfg(target_os = "linux")]
+    pub fn create_native_storage_volume(
+        &mut self,
+        path: impl AsRef<Path>,
+        policy: crate::NativeParityVolumePolicy,
+    ) -> Result<Uuid> {
+        let id = self
+            .volumes
+            .create_native_volume(&self.control, path.as_ref(), policy)?;
+        self.refresh_volume_readers()?;
+        Ok(id)
+    }
+
     pub fn configure_retention(&self, revisions_per_root: u32) -> Result<()> {
         if revisions_per_root == 0 || revisions_per_root > 1_024 {
             anyhow::bail!("retention must keep between 1 and 1024 revisions per root");
