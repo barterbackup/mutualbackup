@@ -762,7 +762,9 @@ fn read_extents(descriptor: RawFd, start: u64, length: u64) -> Result<Fiemap, Da
         reserved: 0,
         extents: [Extent::default(); 128],
     };
-    if unsafe { libc::ioctl(descriptor, 0xC020_660B as libc::c_ulong, &mut map) } != 0 {
+    // glibc and musl expose different request types for the same Linux ioctl
+    // bits. Infer the libc argument type without changing the FIEMAP request.
+    if unsafe { libc::ioctl(descriptor, 0xC020_660B_u32 as _, &mut map) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
     if map.mapped > map.count {

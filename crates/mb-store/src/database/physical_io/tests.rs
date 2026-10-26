@@ -695,13 +695,7 @@ fn closed_reflinked_native_catalog_refuses_shared_backing_before_main_write() {
     // Both SQL connections are closed. This creates known shared extents in
     // a stopped fixture; no live database is reflinked or modified externally.
     assert_eq!(
-        unsafe {
-            libc::ioctl(
-                copy.as_raw_fd(),
-                0x4004_9409 as libc::c_ulong,
-                source.as_raw_fd(),
-            )
-        },
+        unsafe { libc::ioctl(copy.as_raw_fd(), 0x4004_9409_u32 as _, source.as_raw_fd(),) },
         0
     );
     copy.sync_all().unwrap();
