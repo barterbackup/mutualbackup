@@ -412,16 +412,7 @@ pub(crate) fn prepare(
         "unfinished native Node has unexpected volume ownership"
     );
     control.with_record_transaction(|| -> Result<()> {
-        let registry = vec![record];
-        let bytes = canonical_bytes(&registry)?;
-        store_volume_records(&control, &registry)?;
-        anyhow::ensure!(
-            control
-                .get_record("node-config", b"storage-volumes")?
-                .as_deref()
-                == Some(bytes.as_slice()),
-            "native Node volume registry publication was ignored or changed"
-        );
+        store_volume_records_in_transaction(&control, &[record])?;
         let bytes = digest(&profile)?;
         let existing = control.get_record(PROFILE_KIND, b"ready")?;
         anyhow::ensure!(

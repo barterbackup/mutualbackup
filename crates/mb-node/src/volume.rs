@@ -467,6 +467,55 @@ struct StorageVolume {
     store: Option<ParityStore>,
 }
 
+// Configuration can open new catalogs before its control transaction, but
+// existing catalogs and placement authority stay live until that commit.
+enum ConfiguredStore {
+    Existing,
+    Opened(Box<ParityStore>),
+    Closed,
+}
+
+struct ConfiguredVolume {
+    record: VolumeRecord,
+    database_key: [u8; 32],
+    store: ConfiguredStore,
+}
+
+impl ConfiguredVolume {
+    fn from_existing(volume: &StorageVolume) -> Self {
+        Self {
+            record: volume.record.clone(),
+            database_key: volume.database_key,
+            store: if volume.store.is_some() {
+                ConfiguredStore::Existing
+            } else {
+                ConfiguredStore::Closed
+            },
+        }
+    }
+
+    fn has_store(&self) -> bool {
+        !matches!(self.store, ConfiguredStore::Closed)
+    }
+
+    fn install(self, previous: Option<StorageVolume>) -> StorageVolume {
+        let store = match self.store {
+            ConfiguredStore::Existing => {
+                previous
+                    .expect("existing catalog comes from the unchanged live volume map")
+                    .store
+            }
+            ConfiguredStore::Opened(store) => Some(*store),
+            ConfiguredStore::Closed => None,
+        };
+        StorageVolume {
+            record: self.record,
+            database_key: self.database_key,
+            store,
+        }
+    }
+}
+
 pub(crate) struct StorageVolumes {
     keys: Arc<KeyMaterial>,
     default_path: PathBuf,
@@ -682,6 +731,12 @@ impl StorageVolumes {
                 );
             }
         }
+        let previous = control.get_record("node-config", b"storage-volumes")?;
+        let mut staged = self
+            .volumes
+            .iter()
+            .map(|(id, volume)| (*id, ConfiguredVolume::from_existing(volume)))
+            .collect::<BTreeMap<_, _>>();
         let mut configured = BTreeSet::new();
         for requested_path in requested {
             let path = match require_online_directory(&requested_path) {
@@ -693,8 +748,7 @@ impl StorageVolumes {
                             requested_path.display()
                         );
                     }
-                    let Some(volume) = self
-                        .volumes
+                    let Some(volume) = staged
                         .values_mut()
                         .find(|volume| volume.record.path == requested_path)
                     else {
@@ -704,7 +758,7 @@ impl StorageVolumes {
                     volume.record.headroom_bytes = headroom_bytes;
                     if volume.record.state == StorageVolumeState::Retired {
                         volume.record.configured = false;
-                        volume.store = None;
+                        volume.store = ConfiguredStore::Closed;
                         continue;
                     }
                     volume.record.configured = true;
@@ -714,7 +768,7 @@ impl StorageVolumes {
                         volume.record.state = StorageVolumeState::Offline;
                         volume.record.last_error = Some("configured volume is absent".to_owned());
                     }
-                    volume.store = None;
+                    volume.store = ConfiguredStore::Closed;
                     continue;
                 }
             };
@@ -724,8 +778,7 @@ impl StorageVolumes {
                     path.display()
                 );
             }
-            if let Some(volume) = self
-                .volumes
+            if let Some(volume) = staged
                 .values_mut()
                 .find(|volume| volume.record.path == path)
             {
@@ -739,15 +792,16 @@ impl StorageVolumes {
                 if matches!(
                     volume.record.state,
                     StorageVolumeState::Offline | StorageVolumeState::Draining
-                ) && volume.store.is_none()
+                ) && !volume.has_store()
                 {
-                    volume.store = Some(open_volume_store_for_control(
-                        &volume.record,
-                        &volume.database_key,
-                        &self.keys,
-                        control,
-                        &self.default_path,
-                    )?);
+                    volume.store =
+                        ConfiguredStore::Opened(Box::new(open_volume_store_for_control(
+                            &volume.record,
+                            &volume.database_key,
+                            &self.keys,
+                            control,
+                            &self.default_path,
+                        )?));
                 }
                 if volume.record.state == StorageVolumeState::Offline {
                     volume.record.state = StorageVolumeState::Online;
@@ -758,9 +812,9 @@ impl StorageVolumes {
                 continue;
             }
             if let Some(manifest) = read_volume_manifest(&path, &self.keys)?
-                && let Some(volume) = self.volumes.get_mut(&manifest.volume_id)
+                && let Some(volume) = staged.get_mut(&manifest.volume_id)
             {
-                if volume.store.is_some() {
+                if volume.has_store() {
                     bail!(
                         "parity volume UUID {} is available at more than one configured path",
                         manifest.volume_id
@@ -776,7 +830,7 @@ impl StorageVolumes {
                 volume.record.headroom_bytes = headroom_bytes;
                 if volume.record.state == StorageVolumeState::Retired {
                     volume.record.configured = false;
-                    volume.store = None;
+                    volume.store = ConfiguredStore::Closed;
                     continue;
                 }
                 volume.record.configured = true;
@@ -792,19 +846,19 @@ impl StorageVolumes {
                             volume.record.state = StorageVolumeState::Online;
                         }
                         volume.record.last_error = None;
-                        volume.store = Some(store);
+                        volume.store = ConfiguredStore::Opened(Box::new(store));
                     }
                     Err(error) => {
                         volume.record.state = StorageVolumeState::Failed;
                         volume.record.last_error = Some(truncated_error(&error));
-                        volume.store = None;
+                        volume.store = ConfiguredStore::Closed;
                     }
                 }
                 continue;
             }
             let record = initialize_volume(&path, None, budget_bytes, headroom_bytes, &self.keys)?;
-            if self.volumes.get(&record.volume_id).is_some_and(|existing| {
-                existing.store.is_some() || configured.contains(&existing.record.path)
+            if staged.get(&record.volume_id).is_some_and(|existing| {
+                existing.has_store() || configured.contains(&existing.record.path)
             }) {
                 bail!(
                     "parity volume UUID {} is available at more than one configured path",
@@ -823,27 +877,37 @@ impl StorageVolumes {
                 control,
                 &self.default_path,
             )?;
-            self.volumes.insert(
+            staged.insert(
                 record.volume_id,
-                StorageVolume {
+                ConfiguredVolume {
                     record,
                     database_key,
-                    store: Some(store),
+                    store: ConfiguredStore::Opened(Box::new(store)),
                 },
             );
         }
-        for volume in self.volumes.values_mut() {
+        for volume in staged.values_mut() {
             if !configured.contains(&volume.record.path) {
                 volume.record.configured = false;
                 if volume.record.state == StorageVolumeState::Online {
                     volume.record.state = StorageVolumeState::Offline;
                     volume.record.last_error = Some("volume is no longer configured".to_owned());
-                    volume.store = None;
+                    volume.store = ConfiguredStore::Closed;
                 }
             }
         }
         require_control_directory(control, &self.default_path)?;
-        self.persist(control)
+        let records = staged
+            .values()
+            .map(|v| v.record.clone())
+            .collect::<Vec<_>>();
+        publish_volume_configuration(control, previous.as_deref(), &records)?;
+        let mut original = std::mem::take(&mut self.volumes);
+        self.volumes = staged
+            .into_iter()
+            .map(|(id, volume)| (id, volume.install(original.remove(&id))))
+            .collect();
+        Ok(())
     }
 
     pub(crate) fn set_uniform_budget(
@@ -854,13 +918,28 @@ impl StorageVolumes {
         if budget_bytes == 0 {
             bail!("parity storage budget must be greater than zero");
         }
-        for volume in self.volumes.values_mut() {
-            volume.record.budget_bytes = budget_bytes;
-            if volume.record.headroom_bytes >= budget_bytes {
-                volume.record.headroom_bytes = 0;
+        require_control_directory(control, &self.default_path)?;
+        let previous = control.get_record("node-config", b"storage-volumes")?;
+        let mut records = self
+            .volumes
+            .values()
+            .map(|v| v.record.clone())
+            .collect::<Vec<_>>();
+        for record in &mut records {
+            record.budget_bytes = budget_bytes;
+            if record.headroom_bytes >= budget_bytes {
+                record.headroom_bytes = 0;
             }
         }
-        self.persist(control)
+        publish_volume_configuration(control, previous.as_deref(), &records)?;
+        for record in records {
+            let id = record.volume_id;
+            self.volumes
+                .get_mut(&id)
+                .expect("budget candidates come from the unchanged volume map")
+                .record = record;
+        }
+        Ok(())
     }
 
     pub(crate) fn statuses(&self) -> Result<Vec<StorageVolumeStatus>> {
@@ -2428,15 +2507,17 @@ impl StorageVolumes {
     }
 
     pub(crate) fn mark_draining(&mut self, control: &ControlStore, volume_id: Uuid) -> Result<()> {
+        let previous = control.get_record("node-config", b"storage-volumes")?;
         let volume = self
             .volumes
-            .get_mut(&volume_id)
+            .get(&volume_id)
             .context("unknown parity volume")?;
         if volume.store.is_none() {
             bail!("cannot drain an offline parity volume");
         }
-        volume.record.state = StorageVolumeState::Draining;
-        self.persist(control)
+        let mut record = volume.record.clone();
+        record.state = StorageVolumeState::Draining;
+        self.publish_record_configuration(control, previous.as_deref(), record)
     }
 
     #[cfg(test)]
@@ -2955,9 +3036,10 @@ impl StorageVolumes {
     }
 
     pub(crate) fn reactivate(&mut self, control: &ControlStore, volume_id: Uuid) -> Result<()> {
+        let previous = control.get_record("node-config", b"storage-volumes")?;
         let volume = self
             .volumes
-            .get_mut(&volume_id)
+            .get(&volume_id)
             .context("unknown parity volume")?;
         if volume.record.state != StorageVolumeState::Retired {
             bail!("only a completed retired volume can be reactivated");
@@ -2970,11 +3052,16 @@ impl StorageVolumes {
             control,
             &self.default_path,
         )?;
-        volume.record.configured = true;
-        volume.record.state = StorageVolumeState::Online;
-        volume.record.last_error = None;
-        volume.store = Some(store);
-        self.persist(control)
+        let mut record = volume.record.clone();
+        record.configured = true;
+        record.state = StorageVolumeState::Online;
+        record.last_error = None;
+        self.publish_record_configuration(control, previous.as_deref(), record)?;
+        self.volumes
+            .get_mut(&volume_id)
+            .expect("reactivated volume exists")
+            .store = Some(store);
+        Ok(())
     }
 
     fn receipt(
@@ -3143,6 +3230,37 @@ impl StorageVolumes {
                 self.store_cleanup_volumes(control, &record_id, &volumes)?;
             }
         }
+        Ok(())
+    }
+
+    fn publish_record_configuration(
+        &mut self,
+        control: &ControlStore,
+        previous: Option<&[u8]>,
+        record: VolumeRecord,
+    ) -> Result<()> {
+        require_control_directory(control, &self.default_path)?;
+        anyhow::ensure!(
+            self.volumes.contains_key(&record.volume_id),
+            "unknown parity volume"
+        );
+        let records = self
+            .volumes
+            .values()
+            .map(|volume| {
+                if volume.record.volume_id == record.volume_id {
+                    record.clone()
+                } else {
+                    volume.record.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        publish_volume_configuration(control, previous, &records)?;
+        let id = record.volume_id;
+        self.volumes
+            .get_mut(&id)
+            .expect("configuration retains the checked volume identity")
+            .record = record;
         Ok(())
     }
 
@@ -4179,12 +4297,42 @@ fn load_volume_records(control: &ControlStore) -> Result<Vec<VolumeRecord>> {
 }
 
 fn store_volume_records(control: &ControlStore, records: &[VolumeRecord]) -> Result<()> {
-    control.put_record(
-        "node-config",
-        b"storage-volumes",
-        &canonical_bytes(&records.to_vec())?,
-    )?;
+    control.with_record_transaction(|| store_volume_records_in_transaction(control, records))
+}
+
+// Used by native birth and configuration, which already hold the writer
+// transaction for the registry and its associated authority changes.
+fn store_volume_records_in_transaction(
+    control: &ControlStore,
+    records: &[VolumeRecord],
+) -> Result<()> {
+    let bytes = canonical_bytes(&records.to_vec())?;
+    control.put_record("node-config", b"storage-volumes", &bytes)?;
+    anyhow::ensure!(
+        control
+            .get_record("node-config", b"storage-volumes")?
+            .as_deref()
+            == Some(bytes.as_slice()),
+        "volume registry publication was ignored or changed"
+    );
     Ok(())
+}
+
+fn publish_volume_configuration(
+    control: &ControlStore,
+    previous: Option<&[u8]>,
+    records: &[VolumeRecord],
+) -> Result<()> {
+    control.with_record_transaction(|| -> Result<()> {
+        anyhow::ensure!(
+            control
+                .get_record("node-config", b"storage-volumes")?
+                .as_deref()
+                == previous,
+            "volume registry changed while preparing configuration"
+        );
+        store_volume_records_in_transaction(control, records)
+    })
 }
 
 fn volume_object_id(group_id: &[u8; 32], shard_index: u8) -> Vec<u8> {

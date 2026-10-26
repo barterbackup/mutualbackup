@@ -30024,3 +30024,6 @@ pub(crate) mod tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod native_storage_tests;
+
+#[cfg(test)]
+mod volume_configuration_tests;
