@@ -32865,6 +32865,14 @@ mod tests {
         } else {
             None
         };
+        let blocked_trace = blocked_launch.as_ref().and_then(|plan| {
+            super::super::coding_trace::Session::start(
+                &nodes,
+                false,
+                checkpoint.hash().unwrap(),
+                plan.value.attempt_id,
+            )
+        });
         for (index, node) in nodes.iter().enumerate().take(active_count) {
             if replanning == RetryReplanningCase::ExpiredDispatched && index == 3 {
                 continue;
@@ -32959,8 +32967,12 @@ mod tests {
                     .into_iter()
                     .map(|job| (job.complete, job.error))
                     .collect::<Vec<_>>();
+                let preserved = temp.keep();
+                let trace = blocked_trace
+                    .as_ref()
+                    .map(|trace| trace.save("blocked-initial-coverage-timeout"));
                 panic!(
-                    "coding worker did not finish checkpoint coverage; workers finished={:?}; jobs={:?}; observed errors={:?}; launch={:?}; retry={:?}; activation={:?}; coverage={:?}",
+                    "coding worker did not finish checkpoint coverage; workers finished={:?}; jobs={:?}; observed errors={:?}; launch={:?}; retry={:?}; activation={:?}; coverage={:?}; preserved={}; trace={trace:?}",
                     coding_tasks
                         .iter()
                         .map(tokio::task::JoinHandle::is_finished)
@@ -32970,7 +32982,8 @@ mod tests {
                     launch,
                     retry,
                     activations,
-                    coverage
+                    coverage,
+                    preserved.display()
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -32979,6 +32992,15 @@ mod tests {
             coding_tasks.iter().all(|task| !task.is_finished()),
             "coding workers must stay alive through ownership transfer"
         );
+        if let Some(trace) = &blocked_trace {
+            eprintln!(
+                "blocked launch healthy coverage trace: {}",
+                trace
+                    .save("blocked-healthy-coverage-complete")
+                    .unwrap()
+                    .display()
+            );
+        }
         if let Some(blocked) = &blocked_launch {
             {
                 let mut node = nodes[0].lock().unwrap();
@@ -33015,13 +33037,68 @@ mod tests {
                 if complete {
                     break;
                 }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "restored blocked launch did not activate"
-                );
+                if tokio::time::Instant::now() >= deadline {
+                    let preserved = temp.keep();
+                    let progress = nodes.iter().enumerate().map(|(index, node)| {
+                        match node.try_lock() {
+                            Ok(node) => {
+                                let launches = node.coding_launch_jobs_for_test().map(|jobs| jobs.into_iter().take(64).map(|job| (hex::encode(job.plan.value.attempt_id), job.plan.value.membership_epoch, job.plan.value.expires_at_unix_seconds, job.dispatched, job.error)).collect::<Vec<_>>());
+                                let delegated = node.delegated_coding_jobs_for_test().map(|jobs| jobs.into_iter().take(64).map(|job| (hex::encode(job.plan.value.attempt_id), job.state, job.error)).collect::<Vec<_>>());
+                                let activations = node.coding_activation_jobs_for_test().map(|jobs| jobs.into_iter().take(64).map(|job| (hex::encode(job.transcript.value.plan.value.attempt_id), job.complete, job.error)).collect::<Vec<_>>());
+                                let state = node.dynamic_guild_state().map(|state| state.map(|s| (s.membership_epoch, s.event_sequence, s.coding_groups.len())));
+                                format!("node={index}, launches={launches:?}, delegated={delegated:?}, activations={activations:?}, state={state:?}, storage={:?}", node.storage_status())
+                            }
+                            Err(error) => format!("node={index}, lock unavailable: {error}"),
+                        }
+                    }).collect::<Vec<_>>();
+                    let trace = if let Some(trace) = &blocked_trace {
+                        let path = trace.save("blocked-restoration-timeout").unwrap();
+                        let routes =
+                            futures::future::join_all(clients.iter().map(|client| async move {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    client.coverage_routing_snapshot(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(routes)) => routes,
+                                    other => {
+                                        serde_json::json!({"snapshot_error": format!("{other:?}")})
+                                    }
+                                }
+                            }))
+                            .await;
+                        std::fs::write(
+                            path.with_extension("network.json"),
+                            serde_json::to_vec_pretty(&routes).unwrap(),
+                        )
+                        .unwrap();
+                        Some(path)
+                    } else {
+                        None
+                    };
+                    panic!(
+                        "restored blocked launch did not activate; workers={:?}; progress={progress:?}; trace={trace:?}; preserved={}",
+                        coding_tasks
+                            .iter()
+                            .map(tokio::task::JoinHandle::is_finished)
+                            .collect::<Vec<_>>(),
+                        preserved.display()
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+        if let Some(trace) = &blocked_trace {
+            eprintln!(
+                "blocked launch restored coverage trace: {}",
+                trace
+                    .save("blocked-restoration-complete")
+                    .unwrap()
+                    .display()
+            );
+        }
+        drop(blocked_trace);
         {
             let mut node = nodes[0].lock().unwrap();
             if state.membership_epoch != 1 {
