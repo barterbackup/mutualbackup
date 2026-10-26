@@ -4950,25 +4950,39 @@ fn wal_checkpoint_reservation_bytes(path: &Path) -> Result<u64, DatabaseError> {
     }
 }
 
+struct ShellAuthorization {
+    query_only: bool,
+    control_statement: bool,
+}
+
 unsafe extern "C" fn shell_control_statement(
     data: *mut std::ffi::c_void,
     action: i32,
-    _: *const std::ffi::c_char,
+    name: *const std::ffi::c_char,
     _: *const std::ffi::c_char,
     _: *const std::ffi::c_char,
     _: *const std::ffi::c_char,
 ) -> i32 {
+    // SQLite supplies decoded pragma names, including quoted/schema-qualified
+    // forms. SQLCipher key operations run during preparation, so query_only
+    // and sqlite3_stmt_readonly cannot protect the catalog from these calls.
+    let authorization = unsafe { &mut *data.cast::<ShellAuthorization>() };
+    if authorization.query_only && action == rusqlite::ffi::SQLITE_PRAGMA && !name.is_null() {
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        if ["key", "rekey", "hexkey", "hexrekey", "textkey", "textrekey"]
+            .iter()
+            .any(|forbidden| name.eq_ignore_ascii_case(forbidden.as_bytes()))
+        {
+            return rusqlite::ffi::SQLITE_DENY;
+        }
+    }
     if matches!(
         action,
         rusqlite::ffi::SQLITE_TRANSACTION
             | rusqlite::ffi::SQLITE_SAVEPOINT
             | rusqlite::ffi::SQLITE_PRAGMA
     ) {
-        // This synchronous detector changes no authorization decisions. Its
-        // stack value is removed before the prepared statement is stepped.
-        unsafe {
-            *data.cast::<bool>() = true;
-        }
+        authorization.control_statement = true;
     }
     rusqlite::ffi::SQLITE_OK
 }
@@ -5020,7 +5034,7 @@ fn database_shell_statement(
     page_quota::apply(connection)?;
     journal_quota::apply(connection)?;
     let mut scope = ShellQueryOnly::enter(connection, query_only)?;
-    let result = database_shell_statement_scoped(connection, sql);
+    let result = database_shell_statement_scoped(connection, sql, query_only);
     scope.restore()?;
     result
 }
@@ -5028,17 +5042,21 @@ fn database_shell_statement(
 fn database_shell_statement_scoped(
     connection: &Connection,
     sql: &str,
+    query_only: bool,
 ) -> Result<DatabaseShellResult, DatabaseError> {
     let configured = journal_quota::configured(connection)?;
-    let mut control_statement = false;
-    let mut statement = if configured {
+    let mut authorization = ShellAuthorization {
+        query_only,
+        control_statement: false,
+    };
+    let mut statement = if configured || query_only {
         // This private connection has no application authorizer. Let SQLite
         // identify transaction/pragma statements rather than parsing SQL text.
         let code = unsafe {
             rusqlite::ffi::sqlite3_set_authorizer(
                 connection.handle(),
                 Some(shell_control_statement),
-                (&mut control_statement as *mut bool).cast(),
+                (&mut authorization as *mut ShellAuthorization).cast(),
             )
         };
         if code != rusqlite::ffi::SQLITE_OK {
@@ -5057,7 +5075,7 @@ fn database_shell_statement_scoped(
     };
     let transaction = if configured
         && !statement.readonly()
-        && !control_statement
+        && !authorization.control_statement
         && connection.is_autocommit()
     {
         Some(rusqlite::Transaction::new_unchecked(
@@ -8453,3 +8471,6 @@ mod tests {
 
 #[cfg(test)]
 mod shell_scope_tests;
+
+#[cfg(test)]
+mod shell_pragma_tests;
