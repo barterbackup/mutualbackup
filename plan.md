@@ -7114,3 +7114,35 @@ the earlier broad Store runner timeout or establish complete merged-workspace/
 installed qualification. The additional native parity-volume draft remains
 uncommitted and unqualified; R1/R2/R3/R5/R7 and normal paged integration remain
 open. No installed jobs ran.
+
+
+### 2026-10-26 — Create additional native parity volumes with resumable authority
+
+Code `afc3d77` adds explicit managed-Node `create_native_storage_volume` creation/
+resume. The signed creation profile fixes its parent, UUID and original I/O
+policy/budget before SQL. The original native birth, key and manifest survive
+interruption; the checked control-registry transaction precedes live placement.
+The caller's private-input guard reaches the actual native main descriptor.
+Repeating creation preserves later budgets and drain/retirement state. Existing
+legacy/copied/wrong-owner state and excess registry admission reject.
+
+Review reproduced an error that still wrote a fresh conflicting profile into
+an empty replacement of a known volume path. The original 19-file fixture,
+read-only copy, exact candidate and log remain under
+`/tmp/mb-m6-native-volume-replacement-kzzuv5xt`. Final preflight rejects that path
+before publication and retains the original pinned payload/acknowledgement.
+
+Nine focused cases and the same nine on disposable Btrfs pass. The surrounding
+115-case cohort passes all 106 existing volume, native-runtime and configuration
+cases: 115 distinct cases in 133 positive executions. Strict Store/Git/all-
+Node-test Clippy and formatting pass. `audit.json` under
+`/tmp/mb-m6-native-extra-volume-qual-rn_gatd1/v3` independently verifies all 458
+inputs/archive, exact dependencies/executables, unchanged prior assertions/
+payloads/deadlines, the preserved negative and owned mount/loop/image removal.
+Earlier candidates remain diagnostic evidence; this is focused qualification.
+
+A fresh complete merged-source gate is prepared before installed work. Ordinary
+CLI/default policy selection, managed rekey and quiescent old-writer/restore/
+host-relocation adoption, host reboot and ownership-bookkeeping/SQL/scratch/
+payload/checkpoint funding remain open. Normal paged producers stay disabled;
+R1/R2/R3/R5/R7 and the deferred dense 1 TiB/native-platform gates remain open.

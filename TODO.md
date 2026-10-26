@@ -3093,6 +3093,30 @@ enclosing reservations remain required. No release or platform gate closes.
       current merged-source/installed qualification. The separate additional
       native volume draft remains uncommitted and unqualified. Enclosing R3 and
       R1/R2/R5/R7 remain open; normal paged producers stay disabled.
+    - [x] Create/resume additional native parity volumes through the managed
+      Node API. Code `afc3d77` adds `create_native_storage_volume` with an explicit
+      original I/O policy and payload budget. A signed parent/UUID/policy profile
+      precedes SQL; the native birth and manifest retain that identity through
+      interruption. Placement authority becomes live after the checked control
+      registry transaction. Existing creation retries retain later budgets and
+      drain/retirement state; legacy/copied/wrong-owner inputs reject. Admission
+      checks the bounded registry before creating another identity. The caller's
+      profile/manifest guard reaches the actual native descriptor.
+      Review reproduced a conflicting profile written on error at an empty
+      replacement of a registered path. The exact negative executable/log and
+      19-file original/read-only copied fixture remain under
+      `/tmp/mb-m6-native-volume-replacement-kzzuv5xt`. Final creation rejects that
+      path before publication, preserving original pinned payload and ACK reads.
+      Nine focused and the same nine disposable Btrfs cases pass; all 106 existing
+      volume/native-runtime/configuration cases also pass in the 115-case cohort.
+      This is 115 distinct cases in 133 positive executions. Strict Store/Git/
+      all-Node-test Clippy, formatting and independent 458-input/source/dependency/
+      executable/negative-fixture/owned-cleanup audit pass. Evidence:
+      `/tmp/mb-m6-native-extra-volume-qual-rn_gatd1/v3`. Earlier candidates remain
+      diagnostic evidence. Complete merged-source/installed qualification is
+      pending. CLI/default policy selection, managed rekey/adoption, host reboot,
+      enclosing funding and normal paged integration remain open; producers stay
+      disabled and deferred hardware requirements are unchanged.
     - [ ] Connect native I/O policy to durable control/parity startup ownership.
       Publish the authenticated policy/key and initial ownership through an
       interruption-safe creation/restart protocol; retain policy enforcement
@@ -3101,7 +3125,7 @@ enclosing reservations remain required. No release or platform gate closes.
       cannot bypass admission or obtain duplicate live capacity. Preserve v1
       compatibility and read-only recovery; retain generic v2 mutable rejection
       outside authenticated managed paths. Complete ordinary policy selection
-      and additional native volume birth as well. Qualify interrupted publication,
+      and CLI exposure of the qualified additional native volume API as well. Qualify interrupted publication,
       partial creation, missing/replaced files, owner restart and copy adoption
       with exact original data and admission limits preserved.
     - [ ] Compose native SQL/WAL/SHM/temporary, scratch and payload reservations
