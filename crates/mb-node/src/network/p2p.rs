@@ -32902,9 +32902,10 @@ mod tests {
                     }
                 }
             }
-            let complete = {
-                let node = nodes[0].lock().unwrap();
-                node.validate_variable_checkpoint_coverage(&checkpoint, false)
+            let current_checkpoint = checkpoint.clone();
+            let complete = node_blocking(nodes[0].clone(), move |node| {
+                Ok(node
+                    .validate_variable_checkpoint_coverage(&current_checkpoint, false)
                     .is_ok()
                     && unrelated_group.is_none_or(|group_id| {
                         node.dynamic_guild_state()
@@ -32918,8 +32919,10 @@ mod tests {
                         .coding_activation_jobs_for_test()
                         .unwrap()
                         .iter()
-                        .all(|job| job.complete)
-            };
+                        .all(|job| job.complete))
+            })
+            .await
+            .unwrap();
             if complete {
                 break;
             }
@@ -33028,12 +33031,15 @@ mod tests {
                 .unwrap();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             loop {
-                let complete = {
-                    let node = nodes[0].lock().unwrap();
-                    node.claim_coding_launch().unwrap().is_none() && node.claim_coding_activation().unwrap().is_none()
+                let information_owner = blocked.value.geometry.information[0].owner;
+                let complete = node_blocking(nodes[0].clone(), move |node| {
+                    Ok(node.claim_coding_launch().unwrap().is_none()
+                        && node.claim_coding_activation().unwrap().is_none()
                         && node.dynamic_guild_state().unwrap().unwrap().coding_groups.iter().any(|retained|
-                            retained.group.roles.iter().any(|role| matches!(role, ShardRoleV2::Information(info) if info.owner == blocked.value.geometry.information[0].owner)))
-                };
+                            retained.group.roles.iter().any(|role| matches!(role, ShardRoleV2::Information(info) if info.owner == information_owner))))
+                })
+                .await
+                .unwrap();
                 if complete {
                     break;
                 }
