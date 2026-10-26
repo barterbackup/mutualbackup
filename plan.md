@@ -6977,3 +6977,35 @@ qualification before installed jobs. Existing R1/R2/R3/R5/R7, native CLI/default
 policy selection, additional volume birth, managed rekey/adoption, enclosing
 funding and deferred platform/capacity gates remain open. Paged producers remain
 disabled.
+
+
+### 2026-10-26 — Preserve the restored blocked-launch qualification failure
+
+The complete ordinary run on frozen `26659ff` reports 1,703 passed, one failed
+and 136 ignored across 19 test targets. Node has 614 passes/one failure/32 ignored
+in 3,154.04 seconds; Core 214, Store 622, Git 131, process 23 and the other targets
+pass. Formatting, strict workspace Clippy, Docker safety, packaging tests and all
+target builds pass. `negative-audit.json` under
+`/tmp/mb-m6-routing-registry-qual-32967msi` independently verifies all 454 tracked
+inputs/archive, 23 executable identities, complete case inventories, four threads,
+the original 5,000-second Node bound and 631 samples (287 maximum descriptors).
+The source gate is failed; supplemental/installed queues did not start.
+
+The sole failed case is the final 60-second restored-volume wait in
+`blocked_launch_staging_yields_to_healthy_launch_after_reopen`. The previous
+first-coverage fixtures and new routing regression pass, with initial waits of
+18.93/21.48/31.65 seconds and zero dropped events. The original blocked-launch
+branch removed its fixture. Test-only diagnostic `e99ba97` preserves future
+failures and bounded job/routing traces without changing payloads, assertions or
+deadlines. Its isolated negative repeats in 198.49 seconds and retains a stable
+35-file fixture at `/tmp/.tmpVo4svh`, copied read-only under
+`/tmp/mb-m6-blocked-launch-diag-5g177s5b`.
+
+At the deadline the coder is Complete, all five nodes have installed sequence 3
+and both coding groups, and the owner still has an incomplete activation and an
+event-install response pending. The trace has 8,316 events with no drops and no
+individual recorded operation longer than 1.91 seconds. Synchronous fixture polls
+are not yet timed in that trace. Measure them and the acknowledgement path before
+claiming a cause or fix. Keep the 60-second bound, actual activation completion,
+all signatures and data checks; no complete-source or installed pass is claimed.
+R1/R2/R3/R5/R7 and the separately preserved historical observations remain open.

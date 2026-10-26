@@ -5544,6 +5544,30 @@ enclosing reservations remain required. No release or platform gate closes.
     historical observations. The original first-90-second coverage failure,
     900-second native capture timeout, 5,400-second relay-only stall and complete
     R5 fault matrix remain open. No installed jobs ran.
+  - [ ] Diagnose the restored blocked-launch wait on `26659ff` before retrying
+    complete qualification. The frozen all-target run finishes with 1,703 passes,
+    one failure and 136 ignored across 19 targets. Node reports 614 passed, one
+    failed and 32 ignored in 3,154.04 seconds; all other targets pass. The sole
+    failure is the unchanged final 60-second wait in
+    `blocked_launch_staging_yields_to_healthy_launch_after_reopen` after returning
+    its information volume. All three first-coverage waits pass in 18.93/21.48/
+    31.65 seconds with zero dropped events. The independent `negative-audit.json`
+    verifies 454 unchanged tracked inputs/archive, 23 exact executables, every
+    case identity, four threads, the 5,000-second Node bound and 631 samples
+    (maximum 287 descriptors). Evidence:
+    `/tmp/mb-m6-routing-registry-qual-32967msi`. Supplemental/installed stages stop.
+    The original failure branch discarded its fixture. Diagnostic `e99ba97`
+    preserves future failures and adds bounded job/routing traces while keeping
+    payload, assertions and deadlines. Its isolated run reproduces the failure
+    in 198.49 seconds and keeps all 35 fixture files under `/tmp/.tmpVo4svh`, with
+    a read-only copy at `/tmp/mb-m6-blocked-launch-diag-5g177s5b/preserved-fixture`.
+    Its 8,316-event trace drops none: the coder is Complete and all five nodes
+    have installed event sequence 3/two groups, while the owner still has an
+    incomplete activation and an event-install response pending. The three
+    original timeout observations remain separate. Measure the synchronous
+    fixture polling and remaining acknowledgement path before asserting a cause;
+    do not lengthen the wait, weaken protection or treat installed data as a
+    passing activation/complete-source gate.
   - [x] Reproduce and correct missing participant routes at the first coding RPC.
     The full four-thread ordinary Node run has 612 passes/one failure/32 ignored
     in 3,096.10 seconds. It fails the original first 90-second coverage wait,
