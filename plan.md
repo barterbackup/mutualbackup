@@ -7324,3 +7324,38 @@ hashes, executables, negative fixtures and case evidence are retained under
 `/tmp/mb-native-extent-rollback-uwm1fnw9`. This focused correction does not prove
 the fresh complete-source or corrected installed-artifact gates, which remain
 required before closing the enclosing M6 requirements.
+
+### 2026-10-27 — Retain post-correction qualification timeouts
+
+The complete-source attempt on `f9aabb6` passes its preliminary format, Docker,
+packaging, strict workspace Clippy and locked all-target build checks. Nine
+ordinary targets pass 387 cases (including Core 210 and Git 131). Store exceeds
+the unchanged 900-second bound after 487 successful statuses and no failed-case
+status, leaving 153 of its 640 ordinary cases incomplete. Node, supplemental
+and installed jobs never start. The exact frozen executable, run alone with
+four workers, per-test timings and the same bound, also times out: 485 successes,
+no failed case, 155 incomplete. Neither result establishes a cause or reproduces
+the earlier allocation failure. Source/archive and all 23 executable identities
+are independently verified against the 461-input snapshot. Four candidate
+directories survive each run; their 21 and 19 files remain unchanged with
+read-only copies, without claiming case attribution. Evidence and continuation
+state: `/tmp/mb-post-extent-full-qual-hagnnduj`.
+
+The isolated timer's report measures only its killed timeout wrapper; do not
+use its zero CPU or small RSS values as Store metrics. Direct process sampling
+observes a Store high-water RSS of 96,244 KiB before the final unsampled interval.
+I/O waits and the absence of recorded CPU throttling are observations, not an
+established explanation for either timeout.
+
+The separate native-engine build experiment retains identical source, feature
+matrices, all 672 registered cases and Rust debug/overflow checks. Only the
+SQLite/SQLCipher package's optimization differs (`-O0` versus `-O2`). Four slow
+cases pass 16 A/B/B/A executions, averaging 73.89 seconds for the control and
+77.86 for the candidate; the same control varies from 66.97 to 80.80 seconds.
+There is no supported benefit, so reject the profile change. Binaries, compiler
+producers, profiles, timings and audit are retained under
+`/tmp/mb-sqlcipher-dev-optimization-12g42g38`. This experiment qualifies no
+acceptance scope. Workloads, encryption, durability, assertions, four workers
+and the original deadlines remain unchanged. Complete-source and installed
+qualification, the historical failures and the enclosing M6 requirements stay
+open; normal paged producers remain disabled.

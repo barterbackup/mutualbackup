@@ -214,6 +214,32 @@ This corrects the reproduced overcharge/retry defect, without attributing the
 unpreserved original failure to it or proving the complete-source prerequisite.
 A fresh complete-source gate must precede corrected installed qualification.
 
+Qualification follow-up on `f9aabb6` (2026-10-27): formatting, Docker safety,
+packaging tests, strict workspace Clippy and the locked all-target build pass.
+Nine ordinary targets pass 387 cases, including all 210 Core and 131 Git cases.
+Store again reaches its unchanged 900-second bound: 487 successes, no failed-case
+status, and 153 ordinary cases incomplete. Node, supplemental and installed jobs
+do not start. An isolated run of the exact frozen 640-case Store executable,
+with four workers and the same bound, also times out after 485 successes and no
+failed-case status. Its timing output does not reproduce the earlier allocation
+failure. The two runs retain four fixture candidates each (21 and 19 files),
+unchanged originals and read-only copies; case attribution remains unproven.
+Audits verify all 461 source inputs and 23 executable identities. Evidence:
+`/tmp/mb-post-extent-full-qual-hagnnduj`. The isolated outer timer reports only
+the killed timeout wrapper, so its CPU/RSS values are not Store measurements;
+the sampled Store high-water RSS is 96,244 KiB, with the final interval unsampled.
+
+A controlled native-engine optimization experiment does not support changing
+the build profile. Identical source, feature matrices, 672 registered cases,
+Rust debug assertions and overflow checks are retained between `-O0` and `-O2`
+SQLite/SQLCipher builds in a separate target directory. Four unchanged slow
+cases pass all 16 A/B/B/A executions. Mean wall times are 73.89 seconds for the
+control and 77.86 for the candidate; the unchanged control itself ranges from
+66.97 to 80.80 seconds. No improvement is established, and no profile change is
+applied. Evidence: `/tmp/mb-sqlcipher-dev-optimization-12g42g38`. Keep the timeout
+cause, complete-source prerequisite and corrected installed qualification open;
+do not relax workloads, encryption/durability settings, assertions or deadlines.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
