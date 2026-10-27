@@ -22,6 +22,24 @@ pub struct CatalogResourcePolicy {
 }
 
 impl CatalogResourcePolicy {
+    /// WAL-index bytes needed to support this policy's complete journal
+    /// declaration with the catalog's 4096-byte SQLCipher pages. Native extent
+    /// allocation rounds this separately from main and journal files.
+    pub fn minimum_wal_index_bytes(self) -> Result<u64, CatalogStoreError> {
+        // Bundled SQLite's walFramePage(): a 32 KiB index region holds 4096
+        // frames, except the first region's 136-byte header removes 34 slots.
+        // The WAL itself has a 32-byte header and 24-byte frame headers.
+        let frames = self.control_journal_bytes.saturating_sub(32) / (4096 + 24);
+        let regions = frames
+            .checked_add(34)
+            .ok_or(DatabaseError::CapacityExceeded)?
+            .div_ceil(4096)
+            .max(1);
+        Ok(regions
+            .checked_mul(32768)
+            .ok_or(DatabaseError::CapacityExceeded)?)
+    }
+
     pub fn minimum_database_extents(
         capacity: CatalogCapacityPolicy,
     ) -> Result<(u64, u64), CatalogStoreError> {
@@ -153,14 +171,17 @@ fn backing(cx: &Connection, p: CatalogResourcePolicy) -> Result<(), CatalogStore
                 .ok_or(DatabaseError::CapacityExceeded)?,
         )?;
         let journal = rounded(p.control_journal_bytes)?;
+        let shm = rounded(p.minimum_wal_index_bytes()?)?;
         // Logical backing must fit the active native file ceilings, including
-        // the shared main+journal allocation peak and native chunk rounding.
-        // This necessary bound does not reserve free filesystem blocks, SHM,
+        // the shared main+journal+WAL-index allocation peak and chunk rounding.
+        // This necessary bound does not reserve free filesystem blocks,
         // temporary work, scratch, checkpoint copies or other producers.
         if main > limits.main_bytes
             || journal > limits.journal_bytes
+            || shm > limits.shm_bytes
             || main
                 .checked_add(journal)
+                .and_then(|n| n.checked_add(shm))
                 .ok_or(DatabaseError::CapacityExceeded)?
                 > limits.total_bytes
         {

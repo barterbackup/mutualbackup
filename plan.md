@@ -7491,3 +7491,27 @@ This is a necessary native-pool compatibility bound, not filesystem, SHM,
 temporary, scratch, checkpoint-copy or cross-producer reservation. It does not
 close shared resource admission, R3, M6, normal paged activation, or the deferred
 dense 1 TiB/native-platform qualification requirements.
+
+
+### 2026-10-27 — Account for WAL-index backing in native resource admission
+
+The native resource check now includes the WAL index needed for the complete
+journal declaration, using the bundled SQLite frame/region geometry and separate
+64 KiB physical rounding. It rejects insufficient SHM ceilings and combined
+main/journal/index pools without changing existing policy encodings or native
+limits. The valid baseline reproduces accepting approximately 74 GB of WAL
+credits against only 64 KiB of SHM; its fixture/source/executable remain preserved.
+
+All 46 capacity-policy cases pass, including nine native/geometry cases and an
+actual 36 MiB protocol-record workload crossing the second WAL-index region,
+matching the calculated index length and preserving payloads through reopen.
+Physical-I/O passes 25 with two ignored; strict locked workspace/all-targets
+Clippy, format and diff checks pass. Retain the initial invalid-policy probe and
+the extra-table schema-refusal fixture alongside the corrected ordinary-record
+workload. Both original/read-only fixture pairs are unchanged. Evidence:
+`/tmp/mb-native-wal-index-qualification` (466-input fixed source archive).
+
+Keep the full shared filesystem/temporary/scratch/payload/checkpoint-copy and
+headroom reservation policy, ordinary production integration and R1/R2/R3/R5/R7
+open. This necessary database-family compatibility correction does not qualify
+the deferred dense 1 TiB or native-platform gates.

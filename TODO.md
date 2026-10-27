@@ -3326,6 +3326,28 @@ before installed qualification; this standalone target does not close R7 or M6.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
+      - [x] Bind declared WAL capacity to native WAL-index backing.
+        A valid resource policy could enroll roughly 74 GB of journal credits
+        against only 64 KiB of native SHM. The valid baseline refusal regression
+        reproduces acceptance and retains its original fixture, read-only copy,
+        source and executable. Resource backing now derives WAL-index geometry
+        from the bundled SQLite layout (4096-byte database pages, 24-byte frame
+        headers, 32 KiB index regions, first-region header), rounds its physical
+        extent separately, and checks both the SHM ceiling and combined
+        main/journal/index pool. Existing policy encodings and native limits
+        remain unchanged; incompatible declarations fail with CapacityExceeded.
+        Nine native/geometry cases pass within 46 capacity-policy cases,
+        including exact frame boundaries, role/shared-pool refusal, preserved
+        original data/accounting, and a real 36 MiB WAL-index growth/reopen.
+        Physical-I/O cases pass 25 with two ignored; strict locked workspace/
+        all-targets Clippy, format and diff checks pass. An initial invalid-policy
+        probe and an extra-table probe rejected by exact schema validation remain
+        recorded; the latter fixture and read-only copy are unchanged. The final
+        growth workload uses ordinary protocol rows with the same payload count.
+        Evidence: `/tmp/mb-native-wal-index-qualification`. This closes the
+        demonstrated WAL-index compatibility defect. The enclosing shared
+        filesystem/temporary/scratch/payload/copy reservations, normal producers,
+        R3/M6 and dense 1 TiB/native-platform qualification remain open.
     - [x] Refresh the vendored SQLite bridge contract before release review.
       On 2026-10-25, reconciled `vendor/libsqlite3-sys/MUTUALBACKUP.md` with
       both bundled C implementations, the Rust declarations and physical VFS.

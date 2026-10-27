@@ -4,6 +4,19 @@ use mb_core::NativeDatabaseIoPolicy;
 use std::ffi::OsStr;
 
 const CHUNK: u64 = 65536;
+const SHM: u64 = 1024 * 1024 * 1024;
+
+#[test]
+fn wal_index_geometry_accounts_for_first_region_header_and_full_frames() {
+    let mut p = resource_policy();
+    for (frames, regions) in [(0, 1), (4062, 1), (4063, 2), (8158, 2), (8159, 3)] {
+        p.control_journal_bytes = 32 + frames * 4120;
+        assert_eq!(p.minimum_wal_index_bytes().unwrap(), regions * 32768);
+        // An incomplete final frame does not need another index entry.
+        p.control_journal_bytes += 4119;
+        assert_eq!(p.minimum_wal_index_bytes().unwrap(), regions * 32768);
+    }
+}
 
 struct Fixture {
     directory: Option<tempfile::TempDir>,
@@ -36,7 +49,7 @@ fn io(main_bytes: u64, journal_bytes: u64, total_bytes: u64) -> NativeDatabaseIo
         policy_id: [81; 16],
         main_bytes,
         journal_bytes,
-        shm_bytes: CHUNK,
+        shm_bytes: SHM,
         temporary_bytes: CHUNK,
         total_bytes,
         headroom_bytes: 0,
@@ -77,8 +90,11 @@ fn refuses(io: NativeDatabaseIoPolicy, p: CatalogResourcePolicy) {
     assert!(store.catalog_resource_policy().unwrap().is_none());
     let refused = store.configure_catalog_resource_policy(p);
     assert!(
-        refused.is_err(),
-        "resource policy granted credits beyond native limits: io={io:?} resource={p:?}"
+        matches!(
+            refused,
+            Err(CatalogStoreError::Database(DatabaseError::CapacityExceeded))
+        ),
+        "expected native capacity refusal: {refused:?}; io={io:?} resource={p:?}"
     );
     assert_eq!(store.record_quota_usage().unwrap(), before);
     assert!(store.catalog_resource_policy().unwrap().is_none());
@@ -124,14 +140,20 @@ fn refuses(io: NativeDatabaseIoPolicy, p: CatalogResourcePolicy) {
 fn resource_policy_refuses_main_credits_beyond_native_ceiling() {
     let p = resource_policy();
     let (main, journal) = required(p);
-    refuses(io(main - CHUNK, journal, main + journal + 2 * CHUNK), p);
+    refuses(
+        io(main - CHUNK, journal, main + journal + SHM + 2 * CHUNK),
+        p,
+    );
 }
 
 #[test]
 fn resource_policy_refuses_journal_credits_beyond_native_ceiling() {
     let p = resource_policy();
     let (main, journal) = required(p);
-    refuses(io(main, journal - CHUNK, main + journal + 2 * CHUNK), p);
+    refuses(
+        io(main, journal - CHUNK, main + journal + SHM + 2 * CHUNK),
+        p,
+    );
 }
 
 #[test]
@@ -139,6 +161,26 @@ fn resource_policy_refuses_combined_credits_beyond_shared_native_pool() {
     let p = resource_policy();
     let (main, journal) = required(p);
     refuses(io(main, journal, main + journal - CHUNK), p);
+}
+
+#[test]
+fn resource_policy_refuses_wal_credits_beyond_native_index_ceiling() {
+    let p = resource_policy();
+    p.validate().unwrap();
+    let (main, journal) = required(p);
+    let mut policy = io(main, journal, main + journal + SHM + 2 * CHUNK);
+    policy.shm_bytes = CHUNK;
+    refuses(policy, p);
+}
+
+#[test]
+fn resource_policy_accounts_for_wal_index_in_shared_native_pool() {
+    let p = resource_policy();
+    let (main, journal) = required(p);
+    // Main and journal declarations fit together, but leave only one chunk
+    // for the much larger WAL index. Each role's own ceiling is sufficient.
+    assert!(p.minimum_wal_index_bytes().unwrap() > CHUNK);
+    refuses(io(main, journal, main + journal + CHUNK), p);
 }
 
 #[test]
@@ -156,7 +198,7 @@ fn resource_policy_accounts_for_separately_rounded_native_extents() {
 fn resource_policy_keeps_fitting_native_backing_across_reopen() {
     let p = resource_policy();
     let (main, journal) = required(p);
-    let policy = io(main, journal, main + journal + 2 * CHUNK);
+    let policy = io(main, journal, main + journal + SHM + 2 * CHUNK);
     let mut fixture = setup(policy, p);
     fixture
         .store
@@ -175,6 +217,63 @@ fn resource_policy_keeps_fitting_native_backing_across_reopen() {
     .unwrap();
     assert_eq!(reopened.catalog_resource_policy().unwrap(), Some(p));
     assert_eq!(reopened.native_database_owner().unwrap().policy(), policy);
+    assert_eq!(
+        reopened
+            .get_record("native-resource-original", b"one")
+            .unwrap(),
+        Some(b"original data".to_vec())
+    );
+}
+
+#[test]
+fn wal_index_geometry_matches_real_native_growth_and_preserves_reopen() {
+    let mut fixture = setup(
+        io(64 * 1024 * 1024, 128 * 1024 * 1024, SHM + 192 * 1024 * 1024),
+        resource_policy(),
+    );
+    let store = fixture.store.as_ref().unwrap();
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    let tx = Transaction::new_unchecked(&store.connection, TransactionBehavior::Immediate).unwrap();
+    for index in 0u8..36 {
+        tx.execute("INSERT INTO protocol_records(kind,record_id,bytes) VALUES ('wal-index-probe',?1,zeroblob(1048576))", [&[index][..]])
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    let directory = fixture.directory.as_ref().unwrap().path();
+    let wal = std::fs::metadata(directory.join("control.db-wal")).unwrap();
+    let shm = std::fs::metadata(directory.join("control.db-shm")).unwrap();
+    let mut observed = resource_policy();
+    observed.control_journal_bytes = wal.len();
+    assert!(wal.len() > 8158 * 4120 + 32);
+    assert!(shm.len() > CHUNK);
+    assert_eq!(observed.minimum_wal_index_bytes().unwrap(), shm.len());
+    fixture.store.take();
+    let directory = DatabaseDirectory::open(fixture.directory.as_ref().unwrap().path()).unwrap();
+    let reopened = ControlStore::open_native_existing_in_directory(
+        &directory,
+        OsStr::new("control.db"),
+        &keys(),
+        b"control.db/v2",
+    )
+    .unwrap();
+    let (rows, bytes): (u64, u64) = reopened
+        .connection
+        .query_row(
+            "SELECT count(*),sum(length(bytes)) FROM protocol_records WHERE kind='wal-index-probe'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((rows, bytes), (36, 36 * 1048576));
+    for index in [0, 35] {
+        assert_eq!(
+            reopened.get_record("wal-index-probe", &[index]).unwrap(),
+            Some(vec![0; 1048576])
+        );
+    }
     assert_eq!(
         reopened
             .get_record("native-resource-original", b"one")
