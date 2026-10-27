@@ -61,6 +61,7 @@ fn extent_metadata_refusal(during_write: bool, limit_chunks: u64, blocked_headro
     *vfs._state.allocated_bytes.lock().unwrap() = chunks * CHUNK;
     let mut output = SqlFile {
         base: ffi::sqlite3_file { pMethods: &METHODS },
+        arena: None,
         disk: Some(Box::new(DiskFile {
             file,
             state: &mut *vfs._state,

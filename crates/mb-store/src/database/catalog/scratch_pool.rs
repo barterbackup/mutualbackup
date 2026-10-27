@@ -1,6 +1,6 @@
-//! Aggregate admission for anonymous catalog scratch. A declaration reserves
-//! its complete physical ceiling before creating files; the scratch VFS still
-//! allocates actual extents and protects filesystem headroom on every growth.
+//! Aggregate credit admission for anonymous catalog scratch. A declaration
+//! retains its complete ceiling and ownership slot. When consumed, the scratch
+//! VFS funds its complete physical budget before returning a usable index.
 use super::checkpoint_acquisition::work_admission::live_lock::{
     self, FileLock, Identity, SlotOwner,
 };
@@ -285,8 +285,10 @@ fn release(cx: &Connection, ledger: Ledger, spec: Spec) -> Result<(), CatalogSto
     )
 }
 
-/// Owned solely by a scratch VFS. It retains no SQLite connection or borrowed
-/// store. The VFS closes its anonymous files before releasing the kernel slot.
+/// Credit token awaiting consumption by a scratch VFS. This token alone does
+/// not allocate filesystem space. The VFS funds its whole budget before use and
+/// closes its backing before releasing the kernel slot. The token retains no
+/// SQLite connection or borrowed store.
 /// After normal drop or process death, explicit/bounded admission reclamation
 /// can return the declaration. Live slots cannot be cancelled or reclaimed.
 pub struct CatalogScratchLease {

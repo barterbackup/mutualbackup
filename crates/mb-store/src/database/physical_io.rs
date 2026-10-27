@@ -717,7 +717,7 @@ impl Binding {
     }
 }
 
-fn initialize_private_file(
+pub(super) fn initialize_private_file(
     descriptor: RawFd,
     length: u64,
     blocks: u64,
@@ -905,6 +905,37 @@ fn private_missing_bytes(descriptor: RawFd, start: u64, end: u64) -> Result<u64,
             .ok_or(DatabaseError::CapacityExceeded)?;
     }
     Ok(missing)
+}
+
+/// Complete initialized private backing, with bounded FIEMAP pagination.
+/// Funded scratch rewrites must never split unwritten extents or trigger CoW.
+pub(super) fn validate_initialized_private_range(
+    descriptor: RawFd,
+    start: u64,
+    end: u64,
+) -> Result<(), DatabaseError> {
+    let mut cursor = start;
+    while cursor < end {
+        let map = read_extents(descriptor, cursor, end - cursor)?;
+        let previous = cursor;
+        for extent in &map.extents[..map.mapped as usize] {
+            validate_extent(descriptor, extent)?;
+            if extent.flags & 0x800 != 0 || extent.logical > cursor {
+                return Err(DatabaseError::PhysicalIoUnavailable);
+            }
+            cursor = cursor.max(
+                extent
+                    .logical
+                    .checked_add(extent.length)
+                    .ok_or(DatabaseError::PhysicalIoUnavailable)?
+                    .min(end),
+            );
+        }
+        if cursor <= previous {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn sqlite_code(error: DatabaseError, fallback: i32) -> i32 {

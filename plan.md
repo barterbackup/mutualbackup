@@ -7688,3 +7688,57 @@ backing, unreported filesystem metadata, cross-producer/volume reservations,
 policy/reboot/adoption lifecycle and normal paged production remain open. Keep
 R1/R2/R3/R5/R7/M6, current installed-artifact qualification and unchanged deferred
 dense/native-platform requirements open. Normal paged producers remain disabled.
+
+
+### 2026-10-27 — Back consumed scratch jobs with one private allocation
+
+An enrolled scratch VFS now funds its complete physical ceiling before returning
+a usable record index. One anonymous file is allocated, fully initialized and
+synced; bounded FIEMAP pagination verifies complete initialized private backing.
+Map and journal pages use authenticated on-disk radix trees within that file,
+with a committed recycled-page chain and roots/counters in RAM. Traversal buffers
+are fixed per level and no RAM table grows with scratch capacity. Logical file
+sizes remain independent. Rollback/truncation recycle held pages; only final VFS
+close releases the backing, before releasing kernel lease ownership. The global
+allocation lock is not held during the potentially large initialization write.
+Original database/physical ceilings and SQLCipher/durability settings remain.
+Large-file reads bound their byte count before usize conversion; this source
+correction does not claim native 32-bit qualification.
+Unleased legacy scratch retains its existing allocation-on-growth path.
+
+Both baseline admission tests fail: a 6,488,064-byte declaration returns an index
+with zero physical backing, including when only 1 MiB remains above headroom.
+Four corrected public cases prove backing before records, constant ownership
+through rollback, close/reclamation, early refusal/retry, exact SQLITE_FULL
+rollback and reuse, and safe inherited close. The development close baseline
+recycled live parent pages from a child, producing parent SQLITE_IOERR_DATA;
+lease/process checks now precede close mutations and allocator locking. Five
+additional tests cover radix boundaries, pruning, atomic complete exhaustion,
+zeroed reuse and rejected map/free-chain/data corruption. A public error oracle
+was corrected to expect SQLite's exact disk-full error; payloads and assertions
+remain intact. Four original failed fixtures and read-only copies, full source
+and executable snapshots, compiler diagnostics and probe logs are preserved.
+
+Final frozen Store passes 667 cases, 32 ignored, in 758.10 seconds under the
+original 900-second/four-worker/65,536-FD gate, including 50 capacity-policy cases.
+All 108 volume cases pass (eight ignored). Owned Btrfs passes the four public
+funding and five map cases, native scratch headroom workflow, five ordinary
+scratch lifecycle cases and the provisioned rewrite/rollback case. Strict locked
+workspace/all-targets Clippy, formatting and shell/diff checks pass. The Linux
+acceptance script includes the new Btrfs groups; that complete script and the
+ordinary Node/release suites were not rerun. The successful native mount, loop
+and image are removed. Evidence and final 476-input/source/executable freeze:
+`/tmp/mb-funded-scratch-final-qualification`; initial baselines, development
+failures and prior qualification: `/tmp/mb-funded-scratch-qualification`.
+
+A bare scratch lease still represents durable credits until consumed. Complete
+cross-producer/volume reservations, unreported filesystem metadata and managed
+old-writer/policy/reboot/adoption lifecycle remain open. Several enrolled Node
+callers still request a global 64 GiB database ceiling, roughly 192 GiB physical;
+those declarations now require real backing. Derive complete per-operation
+bounds from authenticated inputs and original enforced limits, including
+simultaneous proof/index lifetimes. Do not reduce signed inputs, global wire/work
+budgets or qualification bounds to fit the host. The large resource-chain Node
+cases and full installed pipeline require fresh qualification on this backend.
+Normal paged producers remain disabled. R1/R2/R3/R5/R7/M6 and unchanged deferred
+dense 1 TiB/native-platform requirements remain open.

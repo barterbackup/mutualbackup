@@ -93,8 +93,10 @@ impl RecordScratchStore {
     }
 
     /// Consume one noncloneable aggregate reservation. Its kernel slot stays
-    /// held until every anonymous database/journal file has closed. Construction
-    /// failure leaves reclaimable debt rather than credit without ownership.
+    /// held until every anonymous database/journal file has closed. Fund and
+    /// initialize the complete VFS physical budget before returning; database
+    /// and journal pages then consume that held backing. Construction failure
+    /// leaves reclaimable debt rather than credit without ownership.
     #[cfg(target_os = "linux")]
     pub fn new_in_with_reserved_checkpoint_space(
         directory: impl AsRef<std::path::Path>,

@@ -15,6 +15,8 @@ fi
 cargo clippy --workspace --all-targets --locked -- -D warnings
 bash scripts/sqlite-wal-admission-acceptance.sh
 TMPDIR="$MUTUALBACKUP_REFLINK_TEST_ROOT" cargo test -p mb-store --lib --locked database::physical_io::wal_commit_tests:: -- --nocapture --test-threads=1
+TMPDIR="$MUTUALBACKUP_REFLINK_TEST_ROOT" cargo test -p mb-store --lib --locked scratch::funded_tests -- --nocapture --test-threads=4
+TMPDIR="$MUTUALBACKUP_REFLINK_TEST_ROOT" cargo test -p mb-store --lib --locked database::scratch_space::arena -- --nocapture --test-threads=4
 cargo test -p mb-git --lib --locked -- --ignored --test-threads=1
 cargo test -p mb-git --test btrfs_space --locked -- --ignored --test-threads=1
 cargo test -p mb-node node::tests::git_repository_init_and_add_survive_daemon_reopen --locked -- --ignored --exact

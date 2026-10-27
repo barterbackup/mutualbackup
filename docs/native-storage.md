@@ -31,17 +31,31 @@ Checkpoint contention can return SQLite's normal busy error; retry after the
 checkpoint completes. These checks apply to new commits and do not adopt old
 unfunded WAL debt or replace the enclosing resource reservation policy.
 
-Linux disposable scratch budgets cover rounded data reservations and reported
-allocated blocks across every database and journal in the job. This includes
-ext4 extent-tree blocks, which can grow during allocation or writes. The runtime
+Linux scratch without an enrolled lease charges rounded data reservations and
+reported allocated blocks across every database and journal in the job. This
+includes ext4 extent-tree blocks, which can grow during allocation or writes. The runtime
 checks block usage after allocation, writes and syncs. An operation
 that exceeds its budget fails and releases only unused reservations beyond EOF;
 visible bytes remain available for rollback. Any excess that cannot be reclaimed
-remains charged until truncation or close.
-Headroom refusals remain pending across retries until space can be revalidated
-or the file releases all its blocks. This accounting does not physically
-fund unreported filesystem metadata or the complete scratch ceiling when a job
-is declared; that shared admission contract remains unfinished.
+remains charged until truncation or close. Headroom refusals remain pending
+across retries until space can be revalidated or the file releases all its blocks.
+
+Consuming an enrolled catalog scratch lease now funds and initializes the VFS's
+complete physical budget before construction succeeds. One anonymous file holds
+that backing until the job closes; database and journal pages share it through
+authenticated on-disk maps. Truncation and rollback recycle pages within the held
+file. They do not release its extents for another allocator to take. Map roots,
+counters and traversal buffers use bounded RAM, and inherited child processes
+cannot recycle the parent's live pages.
+
+The lease alone remains a durable credit declaration. Construction can fail
+before an index is usable and leave debt for bounded reclamation. Scratch without
+an enrolled lease retains allocation on growth. Unreported filesystem metadata,
+complete shared reservations and policy lifecycle remain unfinished. Several
+enrolled Node consumers still request roughly 192 GiB; those requests now need
+that backing rather than relying on a small initial index. Their operation-wide
+declarations and simultaneous resource peaks still require review before normal
+paged production can be enabled.
 
 Initialize the public identity and keep its recovery string outside the data
 directory, then create native catalogs while the daemon is stopped:

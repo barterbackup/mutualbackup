@@ -3326,6 +3326,62 @@ before installed qualification; this standalone target does not close R7 or M6.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
+      - [x] Physically fund a consumed catalog scratch budget before use.
+        Two baseline cases returned a usable index with zero physical backing
+        for a 6,488,064-byte declaration, including one with only 1 MiB available
+        above required headroom. Consuming a lease now allocates, initializes,
+        syncs and verifies one private anonymous backing file before constructor
+        success. Database/journal files consume authenticated on-disk radix maps
+        within it; truncation, rollback and close recycle pages without releasing
+        physical backing before the VFS closes. Roots/counters and fixed traversal
+        buffers replace a RAM page table. Map/free-chain/data commitments reject
+        corruption before following pointers or granting recycled pages. The
+        existing public SQLCipher pages, hard physical/database budgets, work
+        limits, signatures and durability settings remain unchanged. Large-file
+        reads bound their byte count before usize conversion; native 32-bit
+        qualification is not claimed. Legacy scratch without a lease retains
+        allocation on growth.
+        A development regression reproduced inherited close recycling a parent's
+        live pages and making its next read return SQLITE_IOERR_DATA. Close now
+        checks lease/process ownership before allocator mutation or locking;
+        the child returns SQLITE_IOERR_WRITE and the parent's exact bytes survive.
+        Four public cases cover full backing/rollback/release, early refusal and
+        retry, exact SQLITE_FULL rollback/reuse, and inherited close. Five map
+        cases cover node boundaries/pruning, complete exhaustion/zeroed reuse and
+        map, free-chain and data corruption. Full frozen Store passes 667 with
+        32 ignored in 758.10 seconds under the unchanged 900-second/
+        four-worker/65,536-FD gate, including all 50 capacity-policy cases.
+        All 108 volume cases pass (eight ignored). Owned Btrfs passes the four
+        public and five map cases, native headroom workflow, five legacy scratch
+        lifecycle cases and provisioned rewrite/rollback. Strict locked workspace/
+        all-targets Clippy, format and shell/diff checks pass. Linux acceptance
+        now includes both new Btrfs groups; the complete acceptance script and
+        full ordinary Node/release suites were not rerun. Four failed fixture originals
+        and read-only copies, sources, executables and compile/probe diagnostics
+        remain preserved, including the public error-oracle correction and unsafe
+        close development baseline. Final 476-input freeze and evidence:
+        `/tmp/mb-funded-scratch-final-qualification`; earlier baselines and failed
+        fixtures: `/tmp/mb-funded-scratch-qualification`. Successful mount/loop/
+        image removed.
+        The bare lease remains a credit token until consumption. This closes the
+        consumed VFS's missing physical backing; unreported filesystem metadata,
+        full durable producer/volume reservations, old-writer/policy lifecycle,
+        normal paged activation and R1/R2/R3/R5/R7/M6 remain open. Dense 1 TiB and
+        native-platform qualification remain deferred with unchanged requirements.
+      - [ ] Derive complete operation-wide scratch declarations for enrolled
+        Node consumers before normal paged activation. Several current callers
+        request the global 64 GiB database ceiling (roughly 192 GiB physical),
+        even for small authenticated inputs. The backing now really consumes that
+        request. Derive each history, authority, restore and ancestry-stack bound
+        from authenticated complete input declarations and enforced original
+        policy limits, including SQLite/map/journal overhead and simultaneous
+        retained-proof lifetimes. Reserve the complete operation before source
+        or output I/O, and test refusal, rollback, reopen and boundary recovery.
+        Keep original signed payloads, accepted data/work limits, assertions,
+        deadlines and worker/FD bounds. Do not lower global wire/work budgets or
+        substitute a small fixture cap to make funding pass. The large ordinary
+        Node resource-chain cases and full installed pipeline remain unqualified
+        on this new backend; their existing declarations were not changed.
       - [x] Charge reported scratch extent metadata and retain headroom refusals.
         Scratch allocation charged requested rounded data bytes without checking
         filesystem blocks after allocation, writes or syncs. Both ext4 baseline

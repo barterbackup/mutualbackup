@@ -1,5 +1,6 @@
 use super::*;
 use crate::{CatalogScratchPoolPolicy, RecordScratchStore, ScratchStorageLimits};
+mod funded_tests;
 
 fn setup() -> (tempfile::TempDir, ControlStore) {
     let temp = tempfile::tempdir().unwrap();

@@ -1,6 +1,8 @@
 //! Linux anonymous SQLite file I/O with physical allocation before writes.
 //! This VFS accepts only private temporary files. Durable databases continue to
-//! use SQLite's ordinary VFS. The registered adapter outlives its connection.
+//! use SQLite's ordinary VFS. Owned catalog leases fund one initialized backing
+//! file before use; other scratch files allocate on growth. The registered
+//! adapter outlives its connection.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fs::{File, OpenOptions};
@@ -15,6 +17,8 @@ use rusqlite::ffi;
 use uuid::Uuid;
 
 use super::DatabaseError;
+mod arena;
+use arena::{Arena, ArenaFile};
 
 const CHUNK: u64 = 64 * 1024;
 // Linux filesystem IDs are 32-bit; glibc and musl expose different f_type types.
@@ -121,6 +125,8 @@ struct State {
     max_physical_bytes: u64,
     headroom_bytes: u64,
     allocated_bytes: Mutex<u64>,
+    // Drop the backing before releasing the lease's kernel ownership slot.
+    arena: Option<Mutex<Arena>>,
     checkpoints: Vec<(File, std::ffi::OsString)>,
     lease: Option<crate::CatalogScratchLease>,
 }
@@ -138,6 +144,7 @@ struct DiskFile {
 struct SqlFile {
     base: ffi::sqlite3_file,
     disk: Option<Box<DiskFile>>,
+    arena: Option<Box<ArenaFile>>,
 }
 
 impl ScratchVfs {
@@ -206,9 +213,23 @@ impl ScratchVfs {
             max_physical_bytes,
             headroom_bytes,
             allocated_bytes: Mutex::new(0),
+            arena: None,
             checkpoints,
             lease,
         });
+        if let Some(lease) = &state.lease {
+            let arena = Arena::new(&state).map_err(|code| {
+                if code == ffi::SQLITE_FULL {
+                    DatabaseError::CapacityExceeded
+                } else {
+                    DatabaseError::ScratchUnavailable
+                }
+            })?;
+            lease
+                .check(max_physical_bytes)
+                .map_err(|_| DatabaseError::ScratchUnavailable)?;
+            state.arena = Some(Mutex::new(arena));
+        }
         // The callbacks receiving a VFS pointer delegate with the original VFS
         // pointer, preserving its application data. File I/O is entirely ours.
         let mut vfs = Box::new(unsafe { *original });
@@ -504,6 +525,20 @@ unsafe extern "C" fn open(
             return ffi::SQLITE_CANTOPEN;
         }
         let state = (*vfs).pAppData.cast::<State>();
+        if (*state).arena.is_some() {
+            ptr::write(
+                output.cast::<SqlFile>(),
+                SqlFile {
+                    base: ffi::sqlite3_file { pMethods: &METHODS },
+                    disk: None,
+                    arena: Some(Box::new(ArenaFile::new(state))),
+                },
+            );
+            if !out_flags.is_null() {
+                *out_flags = flags;
+            }
+            return ffi::SQLITE_OK;
+        }
         let directory = PathBuf::from(format!("/proc/self/fd/{}", (*state).directory.as_raw_fd()));
         let file = match tempfile::tempfile_in(directory) {
             Ok(file) => file,
@@ -538,6 +573,7 @@ unsafe extern "C" fn open(
                     physical_bytes: 0,
                     headroom_pending: false,
                 })),
+                arena: None,
             },
         );
         if !out_flags.is_null() {
@@ -550,6 +586,11 @@ unsafe extern "C" fn open(
 unsafe extern "C" fn close(file: *mut ffi::sqlite3_file) -> c_int {
     protect(|| unsafe {
         let file = &mut *file.cast::<SqlFile>();
+        if let Some(mut arena) = file.arena.take() {
+            let result = arena.close();
+            file.base.pMethods = ptr::null();
+            return result;
+        }
         if let Some(disk) = file.disk.take() {
             let state = &*disk.state;
             // Close the descriptor before releasing its accounting.
@@ -577,6 +618,12 @@ unsafe extern "C" fn read(
         }
         if amount == 0 {
             return ffi::SQLITE_OK;
+        }
+        if let Some(arena) = (&mut *file.cast::<SqlFile>()).arena.as_mut() {
+            return arena.read(
+                std::slice::from_raw_parts_mut(output.cast::<u8>(), amount as usize),
+                offset as u64,
+            );
         }
         let Some(disk) = (&*file.cast::<SqlFile>()).disk.as_ref() else {
             return ffi::SQLITE_IOERR_READ;
@@ -614,6 +661,12 @@ unsafe extern "C" fn write(
         if amount == 0 {
             return ffi::SQLITE_OK;
         }
+        if let Some(arena) = (&mut *file.cast::<SqlFile>()).arena.as_mut() {
+            return arena.write(
+                std::slice::from_raw_parts(input.cast::<u8>(), amount as usize),
+                offset as u64,
+            );
+        }
         let Some(disk) = (&mut *file.cast::<SqlFile>()).disk.as_mut() else {
             return ffi::SQLITE_IOERR_WRITE;
         };
@@ -642,6 +695,9 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int 
         if size < 0 {
             return ffi::SQLITE_IOERR_TRUNCATE;
         }
+        if let Some(arena) = (&mut *file.cast::<SqlFile>()).arena.as_mut() {
+            return arena.truncate(size as u64);
+        }
         let Some(disk) = (&mut *file.cast::<SqlFile>()).disk.as_mut() else {
             return ffi::SQLITE_IOERR_TRUNCATE;
         };
@@ -662,6 +718,9 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int 
 
 unsafe extern "C" fn sync(file: *mut ffi::sqlite3_file, _: c_int) -> c_int {
     protect(|| unsafe {
+        if let Some(arena) = (&mut *file.cast::<SqlFile>()).arena.as_mut() {
+            return arena.sync();
+        }
         let Some(disk) = (&mut *file.cast::<SqlFile>()).disk.as_mut() else {
             return ffi::SQLITE_IOERR_FSYNC;
         };
@@ -678,6 +737,10 @@ unsafe extern "C" fn sync(file: *mut ffi::sqlite3_file, _: c_int) -> c_int {
 }
 unsafe extern "C" fn file_size(file: *mut ffi::sqlite3_file, size: *mut i64) -> c_int {
     protect(|| unsafe {
+        if let Some(arena) = (&*file.cast::<SqlFile>()).arena.as_ref() {
+            *size = arena.size();
+            return ffi::SQLITE_OK;
+        }
         let Some(disk) = (&*file.cast::<SqlFile>()).disk.as_ref() else {
             return ffi::SQLITE_IOERR_FSTAT;
         };
