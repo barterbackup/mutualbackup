@@ -7742,3 +7742,22 @@ budgets or qualification bounds to fit the host. The large resource-chain Node
 cases and full installed pipeline require fresh qualification on this backend.
 Normal paged producers remain disabled. R1/R2/R3/R5/R7/M6 and unchanged deferred
 dense 1 TiB/native-platform requirements remain open.
+
+
+### 2026-10-27 — Qualify ordinary Node on physically funded scratch
+
+Exact code `c58d876` passes the complete ordinary Node suite: 636 passed,
+38 ignored, in 2,044.04 seconds under the unchanged 5,000-second/four-worker/
+65,536-FD gate. Both original recovery chains pass inside this invocation.
+Docker lab safety and all 11 packaged-acceptance verifier tests also pass.
+The 481-input source/executable audit and raw fixture-preservation evidence are
+in `/tmp/mb-scratch-node-full-qualification/audit.json`. The temporary runner
+subsequently failed to delete a permission-restricted restored directory; this
+is recorded separately from the successful child. Partial cleanup's surviving
+286 entries/161 files remain unchanged with verified read-only copies.
+
+This qualifies the ordinary Node slice on the funded scratch backend. Complete
+workspace, provisioned and installed qualification, enclosing shared resource
+admission and managed lifecycle remain open. The historical Store timeout and
+separate R5 stalls remain unexplained. Normal paged producers stay disabled;
+R1/R2/R3/R5/R7/M6 and unchanged deferred dense 1 TiB/Windows/macOS gates remain.

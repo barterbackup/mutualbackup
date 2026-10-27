@@ -3381,8 +3381,8 @@ before installed qualification; this standalone target does not close R7 or M6.
         Keep original signed payloads, accepted data/work limits, assertions,
         deadlines and worker/FD bounds. Do not lower global wire/work budgets or
         substitute a small fixture cap to make funding pass. The full ordinary
-        Node suite and installed pipeline remain unqualified on this backend;
-        component and original chain-case evidence is recorded below.
+        Node suite now passes on this backend as recorded below; complete
+        workspace, provisioned and installed qualification remain open.
         - [x] Derive publication's unique Git graph scratch declaration from
           authenticated object/blob/ref counts and complete raw object bytes.
           Count cumulative mutations, encoded values and kind/key bytes, then
@@ -3545,9 +3545,36 @@ before installed qualification; this standalone target does not close R7 or M6.
             owned-resource cleanup are recorded at
             `/tmp/mb-scratch-workspace-qualification/audit.json`. This closes proof-slot
             peak prepayment/reuse, not complete SQL/WAL/payload/shared-volume
-            composition, ordinary full Node/workspace, installed or lifecycle
-            qualification. R1/R2/R3/R5/R7/M6 and unchanged deferred dense 1 TiB
-            and Windows/macOS requirements remain open.
+            composition, complete workspace, installed or lifecycle qualification.
+            Full ordinary Node qualification follows below. R1/R2/R3/R5/R7/M6
+            and unchanged deferred dense 1 TiB and Windows/macOS requirements
+            remain open.
+          - [x] Qualify the complete ordinary Node suite on funded scratch.
+            Exact committed code `c58d876` passes all 636 ordinary cases, with
+            38 ignored, in 2,044.04 seconds. The original 5,000-second deadline,
+            four workers and 65,536-FD limit remain unchanged. Both original
+            individual/directory chains pass within this complete invocation,
+            as do public acquisition/seed-owned QUIC restore, retained-writer
+            recovery and all ordinary volume cases. The frozen 481-input source
+            archive and Node executable match the tested code; every expected
+            ordinary test has an explicit passing status. Docker lab safety and
+            all 11 packaged-acceptance verifier tests pass on the same source.
+            The temporary runner failed after the child passed, while deleting
+            a restored directory with restrictive permissions. Its successful
+            child branch had already checked the deadline and absence of live
+            descendants. Exact parent wall-clock duration was not persisted;
+            the stated duration is libtest's. Record the test pass separately
+            from the runner's exit-one cleanup failure. Partial cleanup had
+            already removed some entries; the 286 surviving entries (161 files
+            under 11 roots) are preserved unchanged with verified read-only
+            copies. No forensic database was opened. Evidence, process samples,
+            original runner/log and source/executable/raw-preservation audits:
+            `/tmp/mb-scratch-node-full-qualification/audit.json`.
+            This closes ordinary Node qualification for this code and backend,
+            not the complete workspace, provisioned, installed or policy gates.
+            No historical Store timeout or separate R5 stall is diagnosed.
+            Normal paged producers stay disabled; R1/R2/R3/R5/R7/M6 and the
+            unchanged user-deferred dense 1 TiB/Windows/macOS requirements remain.
       - [x] Charge reported scratch extent metadata and retain headroom refusals.
         Scratch allocation charged requested rounded data bytes without checking
         filesystem blocks after allocation, writes or syncs. Both ext4 baseline
