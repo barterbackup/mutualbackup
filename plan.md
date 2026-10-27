@@ -7295,3 +7295,32 @@ physical-I/O cohort runs pass against the original frozen dependency libraries
 resolution of the full-run failure or timeout. Complete-source qualification
 and corrected installed musl/runtime qualification remain open; no installed
 build or runtime has started.
+
+### 2026-10-27 — Reclaim refused native SQL tail reservations
+
+A complete diagnostic Store run before this correction passes all 634 ordinary
+cases in 845.16 seconds, under the unchanged 900-second runner. Its exact binary,
+per-case timings and source/dependency identities are retained. This positive
+does not explain the earlier timeout or the original unpreserved failed case.
+
+Separate ext4 fixtures reproduce a concrete accounting defect in main, journal
+and private temporary files. Their fifth extent needs a metadata block, both
+when allocating a new unwritten range and when writing into an existing
+reservation. All six regressions leave 516 KiB charged against a 512 KiB ceiling
+on the baseline. Original negative fixtures remain unchanged with read-only
+copies. Native allocation now trims reservations beyond the unchanged file
+length on overcharge, using the existing descriptor under SQLite's writer
+serialization. It preserves every visible byte, remeasures retained allocation
+even after cleanup failure, and returns the original capacity refusal. SHM is
+excluded because another connection's mapping/growth can overlap. No ceiling,
+payload, durability, existing assertion or acceptance deadline is relaxed.
+
+The identical six regressions and all 19 existing ordinary physical cases pass
+on ext4. Btrfs passes its 21 applicable physical cases, including actual ENOSPC,
+rollback/retry, stopped reflink refusal and subprocess crash recovery; the six
+ext4-specific cases return early there. Strict Store test Clippy, formatting,
+diff checks and owned mount/loop/image cleanup pass. Sources, linked dependency
+hashes, executables, negative fixtures and case evidence are retained under
+`/tmp/mb-native-extent-rollback-uwm1fnw9`. This focused correction does not prove
+the fresh complete-source or corrected installed-artifact gates, which remain
+required before closing the enclosing M6 requirements.

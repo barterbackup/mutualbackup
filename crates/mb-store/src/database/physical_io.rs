@@ -612,9 +612,7 @@ impl Binding {
                     break Err(DatabaseError::Io(error));
                 }
             };
-            // A failed allocation may retain a partial reservation. Keep those
-            // real blocks charged; never punch live database ranges to undo it.
-            self.pool.refresh(&mut files)?;
+            self.refresh_allocation(&mut files)?;
             result?;
         }
         if private_missing_bytes(self.descriptor, start, end)? != 0 {
@@ -630,8 +628,46 @@ impl Binding {
             .lock()
             .map_err(|_| DatabaseError::PhysicalIoUnavailable)?;
         let _allocation = self.pool.allocation_guard()?;
-        self.pool.refresh(&mut files)?;
+        self.refresh_allocation(&mut files)?;
         Ok(())
+    }
+
+    fn refresh_allocation(
+        &self,
+        files: &mut BTreeMap<Identity, Entry>,
+    ) -> Result<u64, DatabaseError> {
+        let charged = self.pool.refresh(files);
+        if !matches!(charged, Err(DatabaseError::CapacityExceeded)) || self.role == Role::Shm {
+            return charged;
+        }
+        // Extent-tree metadata can cost more than the admitted data blocks,
+        // both during fallocate and when writes split unwritten extents.
+        // Reclaim only reservations beyond EOF, preserving every visible byte.
+        // Native SQLite serializes main/journal writers; temporaries are
+        // private. SHM growth can overlap another connection's mapping, so
+        // never truncate SHM here. Never punch any live file range.
+        let length = files
+            .get(&self.id)
+            .ok_or(DatabaseError::PhysicalIoUnavailable)?
+            .pin
+            .metadata()?
+            .len();
+        let length = i64::try_from(length).map_err(|_| DatabaseError::CapacityExceeded)?;
+        let trimmed = loop {
+            if unsafe { libc::ftruncate(self.descriptor, length) } == 0 {
+                break Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                break Err(DatabaseError::Io(error));
+            }
+        };
+        // Remeasure even if truncation failed: retained blocks remain charged,
+        // and cleanup must never turn a refused operation into success.
+        let remaining = self.pool.refresh(files);
+        trimmed?;
+        remaining?;
+        Err(DatabaseError::CapacityExceeded)
     }
 
     /// Call after native xClose/xShmUnmap. Closed linked files remain charged;
@@ -872,3 +908,6 @@ mod tests;
 
 #[cfg(test)]
 mod parity_tests;
+
+#[cfg(test)]
+mod extent_failure_tests;

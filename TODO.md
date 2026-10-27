@@ -193,6 +193,27 @@ close the full-run failure. Production allocation, budgets, payloads, assertions
 and acceptance deadlines remain unchanged. Diagnose this failure before rerunning
 the complete prerequisite or starting installed qualification.
 
+Further diagnosis on 2026-10-27: a full diagnostic Store run with fixture
+preservation and per-test timing passes all 634 ordinary cases in 845.16 seconds
+under the original 900-second bound. It does not explain the prior timeout or
+failed case. Separate deterministic ext4 regressions establish a related defect:
+adding a fifth extent, through allocation or a write into an unwritten extent,
+adds a metadata block. A 512 KiB data reservation can therefore charge 516 KiB,
+leaving the pool over budget after refusal. All six main/journal/temporary
+regressions fail on the baseline; their original fixtures and read-only copies
+are preserved. Native allocation now reclaims reservations beyond unchanged EOF
+on overcharge, remeasures actual blocks, and still refuses the operation. It
+never punches visible ranges or truncates SHM, whose mappings can overlap.
+The identical six regressions pass with unchanged ceilings, existing bytes and
+small-retry checks. All 25 ordinary physical cases pass on ext4; the Btrfs cohort
+passes all 21 applicable cases, including actual ENOSPC/retry, stopped reflink
+refusal and subprocess crash recovery (the six ext4-only tests return early).
+Strict Store test Clippy, formatting and diff checks pass; owned native cleanup
+is verified. Evidence is under `/tmp/mb-native-extent-rollback-uwm1fnw9`.
+This corrects the reproduced overcharge/retry defect, without attributing the
+unpreserved original failure to it or proving the complete-source prerequisite.
+A fresh complete-source gate must precede corrected installed qualification.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
