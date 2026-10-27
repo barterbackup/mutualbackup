@@ -451,18 +451,27 @@ impl RetainedCheckpointRestore {
                 )?
                 .context("acquisition has no original genesis")?,
         )?;
-        let scratch = || -> Result<_> {
+        let scratch = |limits: mb_store::ScratchStorageLimits| -> Result<_> {
             if let ProofInput::Retained { meter, .. } = input {
                 meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
             }
-            crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4)
+            crate::volume::paged_scratch_store(control, limits.max_database_bytes)
         };
+        // Both complete indexes must be funded before the first history page
+        // is read. A second admission refusal cannot follow a consumed prefix.
+        let history_store = scratch(mb_store::CatalogGuildHistoryIndex::scratch_storage_limits(
+            trust.event_sequence,
+            budget,
+        )?)
+        .context("fund original-history checkpoint scratch")?;
+        let body_store = scratch(certificate.scratch_storage_limits(previous, budget)?)
+            .context("fund authority checkpoint scratch")?;
         let mut source = HistoryPrefix {
             control,
             sequence: trust.event_sequence,
         };
         let history = mb_store::CatalogGuildHistoryIndex::build(
-            scratch()?,
+            history_store,
             &installed.certificate,
             budget,
             if recovery.is_some() {
@@ -486,7 +495,7 @@ impl RetainedCheckpointRestore {
             certificate.authority(),
             &trust.members,
             budget,
-            scratch()?,
+            body_store,
             |scope, section, page| control.catalog_page(scope, section, page),
             |fence, _kind| {
                 let original = view

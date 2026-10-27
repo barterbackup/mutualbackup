@@ -51,6 +51,8 @@ mod ref_catalog;
 mod repository;
 #[cfg(target_os = "linux")]
 mod rm;
+#[cfg(all(test, target_os = "linux"))]
+mod scratch_test_fixture;
 mod stage;
 #[cfg(target_os = "linux")]
 mod status;
@@ -96,6 +98,8 @@ pub use odb::NativeOdb;
 pub use paged_catalog::{
     GIT_CATALOG_ROOT_BYTES, GitCatalogRoot, GitCatalogStream, GitCatalogWriteError,
 };
+#[cfg(target_os = "linux")]
+pub use paged_import::GitPagedImportPlan;
 #[cfg(target_os = "linux")]
 pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};
 pub use ref_catalog::{

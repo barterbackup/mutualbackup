@@ -3369,19 +3369,20 @@ before installed qualification; this standalone target does not close R7 or M6.
         normal paged activation and R1/R2/R3/R5/R7/M6 remain open. Dense 1 TiB and
         native-platform qualification remain deferred with unchanged requirements.
       - [ ] Derive complete operation-wide scratch declarations for enrolled
-        Node consumers before normal paged activation. Several current callers
-        request the global 64 GiB database ceiling (roughly 192 GiB physical),
-        even for small authenticated inputs. The backing now really consumes that
-        request. Derive each history, authority, restore and ancestry-stack bound
+        Node consumers before normal paged activation. Earlier callers requested
+        the global 64 GiB database ceiling (roughly 192 GiB physical), even for
+        small authenticated inputs; the component declarations below replace
+        those requests. Complete the enclosing job's admission and peak lifetime
+        plan, including each history, authority, restore and ancestry-stack bound
         from authenticated complete input declarations and enforced original
         policy limits, including SQLite/map/journal overhead and simultaneous
         retained-proof lifetimes. Reserve the complete operation before source
         or output I/O, and test refusal, rollback, reopen and boundary recovery.
         Keep original signed payloads, accepted data/work limits, assertions,
         deadlines and worker/FD bounds. Do not lower global wire/work budgets or
-        substitute a small fixture cap to make funding pass. The large ordinary
-        Node resource-chain cases and full installed pipeline remain unqualified
-        on this new backend; their existing declarations were not changed.
+        substitute a small fixture cap to make funding pass. The full ordinary
+        Node suite and installed pipeline remain unqualified on this backend;
+        component and original chain-case evidence is recorded below.
         - [x] Derive publication's unique Git graph scratch declaration from
           authenticated object/blob/ref counts and complete raw object bytes.
           Count cumulative mutations, encoded values and kind/key bytes, then
@@ -3402,16 +3403,76 @@ before installed qualification; this standalone target does not close R7 or M6.
           Strict locked workspace/all-target Clippy, format and diff checks
           pass. Frozen worktree sources, executables and run logs are in
           `/tmp/mb-scratch-plan-qualification/aggregate`; baseline and interim
-          failed images have verified read-only copies. The worktree includes
-          unfinished history/body/restore/stack sizing experiments; complete
-          operation and installed qualification remain open.
-        - [ ] Preflight Git import's complete expanded HEAD namespace before
+          failed images have verified read-only copies. At that freeze the
+          worktree included unfinished history/body/restore/stack sizing
+          experiments; complete operation and installed qualification stay open.
+        - [x] Preflight Git import's complete expanded HEAD namespace before
           recovering blobs or creating output. Unique graph counts alone do
           not bound the number of expanded paths through a shared-tree DAG.
           Count complete pending metadata/ref/index rows and bounded blob
           anchors, preserve the validated graph across admission, and fund
           simultaneous graph/staging/native/proof lifetimes. Keep the full
           ordinary recovery assertions, work limits and signed payloads.
+          The source now folds expanded file counts and cumulative path bytes
+          over unique validated trees, saturating only above the original HEAD
+          output limit. Empty shared subtrees are skipped without exponential
+          traversal. Oversized historical trees remain admissible when they are
+          not the selected HEAD. An opaque prepared import retains that graph;
+          its separately funded staging store includes complete metadata/ref/
+          HEAD rows, original bounded anchor/location envelopes and anchor joins.
+          Both stores plus the native index are admitted before output staging
+          or blob payload recovery. A live-version bound covers the reused path
+          frame stack, including old/new prefixes and pager balancing overhead.
+          Five geometry cases, ten graph cases and the new late-HEAD-ignore/
+          rollback/retry/reopen import case pass. Scalar row envelopes and both
+          pinned engines' depth/balancing assumptions are checked. The
+          original individual chain passes on the first preflight build in
+          396.48 seconds with all restore/fault/reopen/retirement assertions.
+          That source and the earlier 394.18-second negative run's two fixtures
+          and verified read-only image remain preserved under
+          `/tmp/mb-scratch-plan-qualification`. The earlier macro failure reports
+          an ambiguous call site; later phase diagnostics establish advancement
+          without reopening that failed image.
+          The reviewed source passes all 134 ordinary Git cases (66 ignored)
+          in 245.19 seconds and both complete original individual/directory
+          recovery chains on separately owned 8 GiB Btrfs filesystems in 486.11/
+          498.25 seconds. The original ABORT/IGNORE, ancestry, quota refusal,
+          scratch retention, reopen, rebuild, cancellation, retirement and exact
+          sparse/raw-name/CRLF/NUL Git restore checks remain intact. Runs use
+          65,536 FDs; Git uses four test workers and each chain case one worker.
+          Five geometry cases reuse the byte-identical frozen Store executable.
+          Strict locked workspace/all-target Clippy, formatting and diff checks
+          pass. All 478 source inputs and executable/source archives, four failed
+          image originals/read-only pairs and successful owned cleanup pass the
+          independent audit at
+          `/tmp/mb-scratch-plan-qualification/audit-reviewed.json`. Successful
+          mounts, loops and images are removed. Full Store/Node/workspace and
+          installed suites were not rerun; no native-platform or dense 1 TiB
+          qualification is transferred from these small original fixtures.
+        - [x] Replace enrolled Node's global-ceiling history/body, ancestry and
+          native restore requests with conservative complete phase declarations.
+          Trusted event counts and enforced work bound history writes; original
+          authenticated authority/source/packing/coding summaries bound body
+          joins. Both are funded before the first history payload/page replay.
+          An exact predecessor chain inserts/removes one bounded Source row per
+          generation. Native namespace count and encoded bytes bound entry,
+          directory, alias and inode/link rows; admission precedes namespace
+          scans and output staging. Original independent database, physical,
+          signed wire and work ceilings remain unchanged. Allocation errors now
+          identify the history/body/ancestry/native/Git phase. The complete
+          original chain cases above exercise both certificate layouts through
+          their actual enrolled funding and retained-proof lifetimes.
+        - [ ] Finish complete enclosing-job reservation and traversal accounting
+          across metadata preflight, history/body replay, ancestry rebuild and
+          full restore. Current phase declarations use trusted event counts,
+          authenticated authority/packing/coding summaries, exact generation
+          count and native namespace count/bytes. History and body are funded
+          together before history replay; the stack counts insertion and removal
+          of each generation row. Phase-local backing and retained proof leases
+          do not yet prepay the complete multi-generation peak or compose all
+          registry scans, native SQL/WAL/SHM, payload and cross-volume producers.
+          Preserve whole-job refusal, cancellation, restart, old-writer/rekey/
+          adoption/reboot, normal paged and dense 1 TiB/native-platform gates.
       - [x] Charge reported scratch extent metadata and retain headroom refusals.
         Scratch allocation charged requested rounded data bytes without checking
         filesystem blocks after allocation, writes or syncs. Both ext4 baseline

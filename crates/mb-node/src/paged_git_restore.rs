@@ -6,9 +6,40 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use mb_core::{CatalogScope, CatalogSection, KeyMaterial, SectorId, SectorRef, merkle_commit};
-use mb_git::{GitBlobCatalogReader, GitBlobRecord, GitCatalogRoot, GitRepository};
-use mb_store::{ControlStore, ImportedBlobCapturePlan, PinnedDirectory};
+use mb_git::{
+    GitBlobCatalogReader, GitBlobRecord, GitCatalogRoot, GitPagedImportPlan, GitRepository,
+};
+use mb_store::{ControlStore, ImportedBlobCapturePlan, PinnedDirectory, RecordScratchStore};
 use uuid::Uuid;
+
+pub(crate) struct Prepared {
+    scope: CatalogScope,
+    git: GitCatalogRoot,
+    plan: GitPagedImportPlan,
+    pending: RecordScratchStore,
+}
+
+pub(crate) fn prepare(
+    control: &ControlStore,
+    scope: CatalogScope,
+    git: &GitCatalogRoot,
+) -> Result<Prepared> {
+    let limits = git.import_graph_scratch_storage_limits()?;
+    let graph = crate::volume::paged_scratch_store(control, limits.max_database_bytes)
+        .context("fund Git import graph scratch")?;
+    let plan = GitPagedImportPlan::prepare(scope, git, graph, |page| {
+        Ok(control.catalog_page(scope, CatalogSection::GitGraph, page)?)
+    })?;
+    let limits = plan.scratch_storage_limits();
+    let pending = crate::volume::paged_scratch_store(control, limits.max_database_bytes)
+        .context("fund Git import pending-row scratch")?;
+    Ok(Prepared {
+        scope,
+        git: git.clone(),
+        plan,
+        pending,
+    })
+}
 
 struct Blobs<'a, F> {
     control: &'a ControlStore,
@@ -216,9 +247,14 @@ pub(crate) fn restore(
     keys: &KeyMaterial,
     original: (Uuid, CatalogScope, &GitCatalogRoot),
     output: (&PinnedDirectory, &Path),
+    prepared: Prepared,
     load: &mut impl FnMut(&SectorId) -> Result<Vec<u8>>,
 ) -> Result<()> {
     let (revision, scope, git) = original;
+    ensure!(
+        prepared.scope == scope && prepared.git == *git,
+        "Git import preflight differs from restore root"
+    );
     let (root, target) = output;
     let CatalogScope::Dataset {
         guild_id,
@@ -246,8 +282,6 @@ pub(crate) fn restore(
     let source = directory.create_child_directory("recovered-blob-source")?;
     directory.sync_all()?;
     let source_path = source.descriptor_path().canonicalize()?;
-    let scratch =
-        crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
     let mut blobs = Blobs {
         control,
         revision,
@@ -257,10 +291,9 @@ pub(crate) fn restore(
         encryption: keys.guild_data_key(&guild_id),
         load,
     };
-    repository.import_paged_backup_for_rename(
-        scope,
-        git,
-        &scratch,
+    repository.import_prepared_paged_backup_for_rename(
+        &prepared.plan,
+        &prepared.pending,
         target,
         |page| Ok(control.catalog_page(scope, CatalogSection::GitGraph, page)?),
         |oid| {

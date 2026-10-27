@@ -54,9 +54,11 @@ struct RestoreIndex<'a> {
 }
 
 impl<'a> RestoreIndex<'a> {
-    fn new(control: &'a ControlStore, target: [u8; 32]) -> Result<Self> {
-        let records =
-            crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
+    fn new(
+        control: &'a ControlStore,
+        target: [u8; 32],
+        records: RecordScratchStore,
+    ) -> Result<Self> {
         #[cfg(test)]
         if IGNORE_NEXT_INDEX_INSERT.with(|flag| flag.replace(false)) {
             records.database_shell_statement("CREATE TEMP TRIGGER ignore_restore_index BEFORE INSERT ON protocol_records WHEN NEW.kind LIKE 'paged-native-restore-entry-v1/%' BEGIN SELECT RAISE(IGNORE); END", false)?;
@@ -411,6 +413,47 @@ impl PagedPrivateMetadata {
         let private = snapshot
             .private
             .context("retained private roots are unavailable")?;
+        private.native.validate()?;
+        let namespace = private.native.namespace;
+        let mutations = namespace
+            .records
+            .records
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(16))
+            .context("restore mutation bound overflow")?;
+        // At most two encoded entries per namespace row, plus fixed inode/link
+        // fields. Recipes and file payload lengths do not expand this index.
+        let values = namespace
+            .records
+            .page
+            .byte_len
+            .checked_mul(2)
+            .and_then(|n| {
+                namespace
+                    .records
+                    .records
+                    .checked_mul(384)
+                    .and_then(|m| n.checked_add(m))
+            })
+            .context("restore record bound overflow")?;
+        let limits = mb_store::ScratchStorageLimits::for_record_writes(
+            values,
+            mutations,
+            (CATALOG_FILE_PATH_BYTES + 128) as u32,
+            mb_core::CATALOG_MAX_STREAM_BYTES * 4,
+        )?;
+        // Admission precedes namespace-page reads and restore output staging.
+        let records = crate::volume::paged_scratch_store(control, limits.max_database_bytes)
+            .context("fund native restore scratch")?;
+        let git_restore = if FULL {
+            private
+                .git
+                .as_ref()
+                .map(|git| crate::paged_git_restore::prepare(control, scope, git))
+                .transpose()?
+        } else {
+            None
+        };
         if FULL && private.git.is_some() {
             let mut namespace = CatalogFileReader::new(scope, private.native.namespace)?;
             while let Some(entry) = namespace.next_file(&mut |page| {
@@ -430,7 +473,7 @@ impl PagedPrivateMetadata {
             version,
             target,
             |root, target_id| {
-                let index = RestoreIndex::new(control, target_id)?;
+                let index = RestoreIndex::new(control, target_id, records)?;
                 index.clear_legacy()?;
                 index.records.with_record_transaction(|| {
                     private.build_native_restore::<FULL>(
@@ -451,6 +494,7 @@ impl PagedPrivateMetadata {
                                 keys,
                                 (revision_id, scope, git),
                                 (root, &future),
+                                git_restore.context("Git restore has no funded preflight")?,
                                 &mut load,
                             )?;
                         }

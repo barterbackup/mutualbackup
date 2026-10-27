@@ -54,6 +54,25 @@ impl ScratchStorageLimits {
         )
     }
 
+    /// Bound a repeatedly reused fixed record index by its simultaneous live
+    /// versions. Include both old and new overflow values during replacement,
+    /// and rows inserted before their predecessors are deleted. SQLite reuses
+    /// freelist pages before extending the file; the fixed balancing allowance
+    /// is additional to these versions. Final row count alone is insufficient.
+    pub fn for_live_record_versions(
+        value_bytes: u64,
+        versions: u64,
+        key_kind_bytes: u32,
+        database_ceiling: u64,
+    ) -> Result<Self, DatabaseError> {
+        Self::record_write_limits(
+            value_bytes,
+            versions,
+            u128::from(versions) * u128::from(key_kind_bytes),
+            database_ceiling,
+        )
+    }
+
     fn record_write_limits(
         value_bytes: u64,
         mutations: u64,

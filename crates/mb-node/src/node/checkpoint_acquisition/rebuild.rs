@@ -89,10 +89,16 @@ impl RetainedCheckpointRestore {
         // Prepay the complete scratch-pool scans/reclamation and separately
         // bounded volume registry before reserving or creating the stack.
         meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
-        let stack = crate::volume::paged_scratch_store(
-            control,
+        // An exact predecessor chain inserts and removes one bounded Source
+        // row per original generation. Keep the independent database/work caps.
+        let stack_limits = mb_store::ScratchStorageLimits::for_record_writes(
+            selected.generation.saturating_mul(SOURCE_BYTES as u64),
+            selected.generation.saturating_mul(2),
+            64,
             budget.bytes.min(mb_core::CATALOG_MAX_STREAM_BYTES * 4),
         )?;
+        let stack = crate::volume::paged_scratch_store(control, stack_limits.max_database_bytes)
+            .context("fund checkpoint ancestry stack scratch")?;
         let mut wanted = selected;
         loop {
             meter.guard()?;

@@ -7,6 +7,24 @@ use mb_core::{QuorumPagedCheckpoint, QuorumPagedCheckpointDirectory};
 use mb_store::CatalogPublicCheckpoint as Certificate;
 mod resources;
 
+struct PreservedTemp(Option<tempfile::TempDir>);
+impl std::ops::Deref for PreservedTemp {
+    type Target = tempfile::TempDir;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+impl Drop for PreservedTemp {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "SCRATCH_PLAN_NEGATIVE_FIXTURE {}",
+                self.0.take().unwrap().keep().display()
+            );
+        }
+    }
+}
+
 pub(super) fn quota(node: &Node) {
     if node.control.catalog_resource_policy().unwrap().is_some() {
         return;
@@ -303,9 +321,9 @@ macro_rules! cases {
     ($test:ident,$constructor:ident,$variant:ident,$layout:ident,$cancel:ident,$release:ident)=>{
         #[test]
         fn $test() {
-            let (original_temp,seed,mut original,mut keys)=fixture();let local=keys.iter().position(|key|key.node_id()==original.keys.node_id()).unwrap();keys.swap(0,local);
+            let (original_temp,seed,mut original,mut keys)=fixture();let original_temp=PreservedTemp(Some(original_temp));let local=keys.iter().position(|key|key.node_id()==original.keys.node_id()).unwrap();keys.swap(0,local);
             resources::configure(&mut original);
-            let (first,_captures)=$constructor(&mut original,&keys,true);let first=RecoveredCheckpointProof::$variant(Box::new(first));quota(&original);
+            let (first,_captures)=$constructor(&mut original,&keys,true);let first=RecoveredCheckpointProof::$variant(Box::new(first));quota(&original);eprintln!("SCRATCH_PLAN_PHASE initial proof built");
             let session=original.retained_checkpoint_restore().unwrap();let first_job=acquire(&session,970,&first,None);
             for action in ["ABORT","IGNORE"] {
                 let fault=if action=="ABORT" {",'test'"} else {""};
@@ -360,7 +378,7 @@ macro_rules! cases {
             while let Some(entry)=groups.next_group(&mut |page|original.control.catalog_page(scope,CatalogSection::Coding,page)).unwrap(){original.retain_recovered_checkpoint_payload(third_job.id,&third,entry.retained.group.id,1).unwrap();}
             original.control.cancel_checkpoint_acquisition(&next_job).unwrap();while original.control.release_checkpoint_acquisition_step(&next_job).unwrap(){}
             original.control.$cancel(next_job.id).unwrap();while original.control.$release(next_job.id).unwrap(){}
-            let receiver_temp=tempfile::tempdir().unwrap();let mut receiver=fresh_public_node(receiver_temp.path(),seed.clone(),&original);resources::configure(&mut receiver);quota(&receiver);
+            let receiver_temp=PreservedTemp(Some(tempfile::tempdir().unwrap()));let mut receiver=fresh_public_node(receiver_temp.path(),seed.clone(),&original);resources::configure(&mut receiver);quota(&receiver);
             let source=original.reader_config().open().unwrap();let session=receiver.retained_checkpoint_restore().unwrap();
             let certificate=first.certificate();let bytes=source.retained_paged_checkpoint_certificate(certificate.guild_id(),certificate.layout(),first_job.id,certificate.hash().unwrap()).unwrap();
             let expected=match &certificate {Certificate::Individual(c)=>mb_core::canonical_bytes(c).unwrap(),Certificate::Directory(c)=>mb_core::canonical_bytes(c).unwrap()};assert_eq!(bytes,expected);
@@ -407,6 +425,7 @@ macro_rules! cases {
             assert!(session.rebuild_checkpoint_recovery_proof(rebuild_budget).is_err());assert_eq!(receiver.control.checkpoint_recovery_tip().unwrap(),selected);
             for (kind,bytes) in names.into_iter().zip(links){receiver.control.put_record(kind,middle_owner.as_bytes(),&bytes).unwrap();}
             resources::released(&receiver);
+            eprintln!("SCRATCH_PLAN_PHASE rebuilding complete chain");
             let rebuilt=session.rebuild_checkpoint_proof_with_observer(rebuild_budget,|_| {
                 resources::scratch_held(&receiver);
                 let usage=receiver.checkpoint_acquisition_work_usage()?.unwrap();
@@ -420,6 +439,7 @@ macro_rules! cases {
 
             let mut revisions=mb_core::CatalogCheckpointAuthorityReader::new_with_budget(scope,next_certificate.authority(),next_job.budget).unwrap();let mut selected=None;
             while let Some(record)=revisions.next_record(&mut |page|receiver.control.catalog_page(scope,CatalogSection::Checkpoint,page)).unwrap() {if let R::PagedRevision(signed)=record {selected=Some(signed.value);}}
+            eprintln!("SCRATCH_PLAN_PHASE chain rebuilt; restoring selected snapshot");
             let revision=selected.unwrap();let target=receiver_temp.path().join("second-generation-restore");
             let request=RetainedSnapshotRestore {layout:mb_core::PagedCheckpointLayout::$layout,owner:next_remote.id,guild_id:next_certificate.guild_id(),snapshot:SnapshotInfo {protected_root_id:revision.protected_root_id,revision_id:revision.revision_id,sequence:revision.sequence,checkpoint_generation:next_certificate.generation(),checkpoint_hash:next_certificate.hash().unwrap()},budget:next_job.budget};
             session.restore(&request,&target,|entry,role| {

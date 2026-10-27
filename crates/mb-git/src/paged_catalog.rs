@@ -56,6 +56,33 @@ pub struct GitCatalogRoot {
 }
 
 impl GitCatalogRoot {
+    /// Graph validation plus the live path-frame stack needed during import.
+    /// Shared trees can expand into many paths; only live frames occupy this
+    /// stack, with depth bounded by both unique objects and path length.
+    pub fn import_graph_scratch_storage_limits(
+        &self,
+    ) -> Result<mb_store::ScratchStorageLimits, CatalogStoreError> {
+        let graph = self.graph_scratch_storage_limits()?;
+        let depth = self
+            .objects
+            .objects
+            .min(crate::stage::MAX_STAGE_PATH_BYTES as u64);
+        // Retain both old/new encoded prefixes during a frame replacement.
+        // Repeated DAG paths reuse these rows and the pager's freelist.
+        let frames = mb_store::ScratchStorageLimits::for_live_record_versions(
+            2 * depth * (crate::GIT_REF_NAME_BYTES as u64 + 128),
+            2 * depth,
+            64,
+            CATALOG_MAX_STREAM_BYTES * 4,
+        )?;
+        Ok(mb_store::ScratchStorageLimits::for_database(
+            graph
+                .max_database_bytes
+                .saturating_add(frames.max_database_bytes)
+                .min(CATALOG_MAX_STREAM_BYTES * 4),
+        )?)
+    }
+
     /// Complete unique-graph validation storage, before fetching its streams.
     /// This does not cover import's expanded HEAD namespace or blob capture.
     pub fn graph_scratch_storage_limits(

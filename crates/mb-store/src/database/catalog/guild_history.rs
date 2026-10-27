@@ -291,6 +291,30 @@ pub struct CatalogGuildHistoryIndex {
 }
 
 impl CatalogGuildHistoryIndex {
+    /// A complete replay declaration from the independently trusted event tip.
+    /// Each event mutates at most five rows, including final coding facts.
+    /// The work meter independently bounds every encoded write and mutation.
+    pub fn scratch_storage_limits(
+        event_sequence: u64,
+        budget: Work,
+    ) -> Result<crate::ScratchStorageLimits, CatalogStoreError> {
+        let events = u128::from(event_sequence);
+        let mutations = (5 * events + 3).min(u128::from(budget.records));
+        let per_event =
+            GUILD_AUTHORITY_SNAPSHOT_BYTES + GROUP_BYTES + RECOVERY_BYTES + 8 * ROW_BYTES;
+        let values = (GUILD_AUTHORITY_SNAPSHOT_BYTES as u128
+            + MARKER_BYTES as u128
+            + ROW_BYTES as u128
+            + events * per_event as u128)
+            .min(u128::from(budget.bytes));
+        Ok(crate::ScratchStorageLimits::for_record_writes(
+            values as u64,
+            mutations as u64,
+            104,
+            mb_core::CATALOG_MAX_STREAM_BYTES * 4,
+        )?)
+    }
+
     pub fn build(
         store: RecordScratchStore,
         genesis: &QuorumGuildGenesis,

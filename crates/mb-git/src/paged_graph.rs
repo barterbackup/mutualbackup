@@ -34,6 +34,10 @@ struct Node {
     unsafe_root: bool,
     tag_name_hash: [u8; 32],
     tag_name_len: u64,
+    // Saturated expanded leaf count and cumulative relative path bytes. These
+    // describe a tree DAG without enumerating every path through shared trees.
+    files: u64,
+    paths: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,6 +54,8 @@ struct Frame {
     oid: [u8; 20],
     next: u64,
     longest: u64,
+    files: u64,
+    paths: u64,
 }
 
 fn oid_bytes(oid: Oid) -> [u8; 20] {
@@ -193,6 +199,8 @@ impl GraphIndex<'_> {
                 oid,
                 next: 0,
                 longest: 0,
+                files: 0,
+                paths: 0,
             })?,
         )
     }
@@ -211,6 +219,8 @@ impl GraphIndex<'_> {
             if frame.next == node.edges {
                 node.state = 2;
                 node.longest_path = frame.longest;
+                node.files = frame.files;
+                node.paths = frame.paths;
                 self.store.replace_record_if_value(
                     NODES,
                     &frame.oid,
@@ -248,6 +258,21 @@ impl GraphIndex<'_> {
                 _ => anyhow::bail!("invalid graph visitation state"),
             }
             if node.kind == 2 {
+                let (files, paths) = if target.kind == 2 {
+                    (
+                        target.files,
+                        target.paths.saturating_add(
+                            target.files.saturating_mul(edge.name.len() as u64 + 1),
+                        ),
+                    )
+                } else {
+                    (1, edge.name.len() as u64)
+                };
+                frame.files = frame
+                    .files
+                    .saturating_add(files)
+                    .min(CATALOG_MAX_RECORDS.saturating_add(1));
+                frame.paths = frame.paths.saturating_add(paths);
                 let suffix = if target.kind == 2 && target.longest_path != 0 {
                     1 + target.longest_path
                 } else {
@@ -605,6 +630,8 @@ impl PendingObject {
                 unsafe_root: false,
                 tag_name_hash: [0; 32],
                 tag_name_len: 0,
+                files: 0,
+                paths: 0,
             },
             text: TextParser::new(),
             tree: TreeParser::default(),
@@ -700,6 +727,8 @@ impl GitCatalogRoot {
                         unsafe_root: false,
                         tag_name_hash: [0; 32],
                         tag_name_len: 0,
+                        files: 0,
+                        paths: 0,
                     })?,
                 )?;
             }
@@ -760,6 +789,38 @@ impl GitCatalogRoot {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn head_namespace(
+    root: &GitCatalogRoot,
+    store: &RecordScratchStore,
+) -> Result<(u64, u64)> {
+    let Some(head) = root.refs.selected_head else {
+        return Ok((0, 0));
+    };
+    let (commit, _): (Node, _) = row(store, NODES, &head)?;
+    ensure!(
+        commit.kind == 1 && commit.state == 2,
+        "unverified selected commit"
+    );
+    let (edge, _): (Edge, _) = row(store, EDGES, &edge_key(&head, 0))?;
+    let (tree, _): (Node, _) = row(store, NODES, &edge.target)?;
+    ensure!(
+        edge.kind == 2 && tree.kind == 2 && tree.state == 2,
+        "unverified HEAD tree"
+    );
+    ensure!(
+        tree.files <= CATALOG_MAX_RECORDS,
+        "expanded HEAD index exceeds its bound"
+    );
+    ensure!(
+        tree.files
+            .checked_mul(crate::stage::MAX_STAGE_PATH_BYTES as u64)
+            .is_some_and(|maximum| tree.paths <= maximum),
+        "invalid expanded HEAD path-byte summary"
+    );
+    Ok((tree.files, tree.paths))
+}
+
 /// Use only the complete semantic index produced for this root. This expands
 /// shared trees by path while keeping DFS frames on disk and bounds the actual
 /// index output independently of the number of unique graph objects.
@@ -769,6 +830,9 @@ pub(crate) fn for_each_head_entry(
     store: &RecordScratchStore,
     mut visit: impl FnMut(&[u8], [u8; 20], u32) -> Result<()>,
 ) -> Result<()> {
+    if head_namespace(root, store)?.0 == 0 {
+        return Ok(());
+    }
     #[derive(Serialize, Deserialize)]
     struct TreeFrame {
         oid: [u8; 20],
@@ -822,6 +886,10 @@ pub(crate) fn for_each_head_entry(
         store.replace_record_if_value(FRAMES, &key, &original, &encode(&frame)?)?;
         match edge.kind {
             2 => {
+                let (child, _): (Node, _) = row(store, NODES, &edge.target)?;
+                if child.files == 0 {
+                    continue;
+                }
                 ensure!(
                     depth < crate::stage::MAX_STAGE_PATH_BYTES as u64,
                     "HEAD tree depth exceeds its bound"
@@ -1001,6 +1069,106 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn head_preflight_counts_shared_paths_and_skips_exponentially_many_empty_paths() {
+        for (depth, empty, unborn) in [
+            (10, false, false),
+            (64, false, false),
+            (64, true, false),
+            (64, false, true),
+        ] {
+            let blob = oid_bytes(Oid::hash_object(ObjectType::Blob, b"x").unwrap());
+            let leaf = if empty {
+                object(2, Vec::new())
+            } else {
+                tree(b"x", blob, b"100644")
+            };
+            let mut child = leaf.1;
+            let mut objects = vec![leaf];
+            for _ in 0..depth {
+                let mut raw = tree(b"a", child, b"40000").2;
+                raw.extend(tree(b"b", child, b"40000").2);
+                let parent = object(2, raw);
+                child = parent.1;
+                objects.push(parent);
+            }
+            let tip = commit(child, None, b"shared\n");
+            let head = tip.1;
+            objects.push(tip);
+            let (mut root, pages) = catalog(
+                objects,
+                vec![(b"refs/heads/main", head)],
+                if empty { Vec::new() } else { vec![(blob, 1)] },
+            );
+            if unborn {
+                root.refs.head_branch = b"new-unborn".to_vec();
+                root.refs.selected_head = None;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join("root.cbor"),
+                mb_core::canonical_bytes(&root).unwrap(),
+            )
+            .unwrap();
+            for (hash, bytes) in &pages {
+                let name = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                std::fs::write(directory.path().join(name), bytes).unwrap();
+            }
+            let limits = root.import_graph_scratch_storage_limits().unwrap();
+            let store = RecordScratchStore::new_in(directory.path(), limits).unwrap();
+            let _fixture = crate::scratch_test_fixture::PreservedScratchFixture(Some(directory));
+            root.validate_graph_with_scratch(scope(), &store, |page| Ok(pages[&page.hash].clone()))
+                .unwrap();
+            let mut count = 0;
+            let mut path_bytes = 0;
+            let expanded = for_each_head_entry(&root, &store, |path, _, _| {
+                count += 1;
+                path_bytes += path.len() as u64;
+                Ok(())
+            });
+            if !empty && depth == 64 && !unborn {
+                assert!(head_namespace(&root, &store).is_err());
+                assert!(expanded.is_err());
+                assert_eq!(count, 0);
+            } else {
+                expanded.unwrap();
+                let expected = if empty || unborn {
+                    (0, 0)
+                } else {
+                    (1024, 1024 * 21)
+                };
+                assert_eq!(head_namespace(&root, &store).unwrap(), expected);
+                assert_eq!((count, path_bytes), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn graph_scalar_rows_fit_the_declared_value_envelopes() {
+        let node = Node {
+            kind: 4,
+            logical_len: u64::MAX,
+            edges: u64::MAX,
+            state: 2,
+            longest_path: u64::MAX,
+            unsafe_root: true,
+            tag_name_hash: [255; 32],
+            tag_name_len: u64::MAX,
+            files: u64::MAX,
+            paths: u64::MAX,
+        };
+        assert!(encode(&node).unwrap().len() <= 256);
+        let frame = Frame {
+            oid: [255; 20],
+            next: u64::MAX,
+            longest: u64::MAX,
+            files: u64::MAX,
+            paths: u64::MAX,
+        };
+        assert!(encode(&frame).unwrap().len() <= 256);
+    }
+
     #[test]
     fn paged_graph_validates_shared_dags_nested_tags_raw_names_and_unborn_heads() {
         let blob = oid_bytes(Oid::hash_object(ObjectType::Blob, b"raw\r\n\0").unwrap());
@@ -1171,6 +1339,8 @@ mod tests {
                 unsafe_root: false,
                 tag_name_hash: [0; 32],
                 tag_name_len: 0,
+                files: 0,
+                paths: 0,
             };
             graph
                 .edge(

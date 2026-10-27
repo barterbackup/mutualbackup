@@ -176,3 +176,41 @@ fn record_geometry_assumptions_match_both_pinned_btree_engines() {
         assert!(source.contains("MemPage *apNew[NB+2]"));
     }
 }
+
+#[test]
+fn live_record_versions_bound_repeated_freelist_and_overflow_reuse() {
+    let directory = tempfile::tempdir().unwrap();
+    let limits =
+        ScratchStorageLimits::for_live_record_versions(16 * 32768, 16, 4160, 64 << 30).unwrap();
+    let store = RecordScratchStore::new_in(directory.path(), limits).unwrap();
+    let _fixture = Fixture(Some(directory));
+    for round in 0..200u64 {
+        store
+            .with_record_transaction(|| -> Result<(), DatabaseError> {
+                for index in 0..8u64 {
+                    let mut key = vec![0x61; 4096];
+                    key[..8].copy_from_slice(&index.to_be_bytes());
+                    if round != 0 {
+                        store.delete_record_if_value(
+                            "reuse",
+                            &key,
+                            &vec![(round - 1) as u8; 32768],
+                        )?;
+                    }
+                    assert!(store.put_record_if_absent(
+                        "reuse",
+                        &key,
+                        &vec![round as u8; 32768]
+                    )?);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let pages: u64 = store
+            .records
+            .connection
+            .pragma_query_value(Some("scratch"), "page_count", |row| row.get(0))
+            .unwrap();
+        assert!(pages * 4096 <= limits.max_database_bytes);
+    }
+}

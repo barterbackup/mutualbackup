@@ -92,6 +92,79 @@ impl CatalogPublicCheckpoint {
             Self::Directory(c) => c.checkpoint.coding,
         }
     }
+    /// Bound the complete authority/packing/coding/transition scratch index
+    /// from authenticated complete root declarations, without fetching pages.
+    /// This sizing result is not a certificate or an authorization token.
+    pub fn scratch_storage_limits(
+        &self,
+        previous: Option<CatalogCheckpointPrevious<'_>>,
+        budget: Work,
+    ) -> Result<crate::ScratchStorageLimits, CatalogStoreError> {
+        match self {
+            Self::Individual(c) => c.checkpoint.validate_header(budget)?,
+            Self::Directory(c) => c.checkpoint.validate_header(budget)?,
+        }
+        let authority = self.authority();
+        // Every nested sector occurrence contains a 32-byte SectorId, whether
+        // in a legacy envelope or a paged sector frame. There is no run form.
+        let source_occurrences = (u128::from(authority.summary.source_bytes)
+            + u128::from(authority.summary.legacy_bytes))
+            / 32;
+        let packing = match self {
+            Self::Individual(c) => {
+                u128::from(c.checkpoint.packed_sources.sources)
+                    + u128::from(c.checkpoint.packed_sources.chunks)
+                    + u128::from(c.checkpoint.packed_sectors.sectors)
+                    + 2
+            }
+            Self::Directory(c) => {
+                let s = c.checkpoint.packing.summary;
+                u128::from(s.sources)
+                    + u128::from(s.source_chunks)
+                    + u128::from(s.sectors)
+                    + u128::from(s.source_parts)
+                    + u128::from(s.sector_parts)
+            }
+        };
+        let coding = self.coding().summary;
+        let coding_items = u128::from(coding.forests)
+            + u128::from(coding.coding.groups)
+            + u128::from(coding.coding.information_roles)
+            + u128::from(coding.coding.parity_roles)
+            + u128::from(coding.coding.fragments);
+        let legacy_previous = match previous {
+            Some(CatalogCheckpointPrevious::Legacy { certificate, .. }) => {
+                let c = &certificate.checkpoint;
+                (c.writer_fences.len() as u128
+                    + c.revision_tombstones.len() as u128
+                    + c.revisions.len() as u128)
+                    * 2
+            }
+            _ => 0,
+        };
+        // At most eight mutations per declared body/source/packing/coding
+        // item cover identities, heads, source/object joins, placements,
+        // coverage and transition-used rows. Include all completion markers.
+        let mutations = 64
+            + 8 * (u128::from(authority.records.records)
+                + source_occurrences
+                + packing
+                + coding_items
+                + legacy_previous);
+        // Scalar rows are <=512 bytes. Revision records are copied once from
+        // the complete authority stream; snapshots/descriptors get separate
+        // fixed envelopes, including the largest 256-member snapshot.
+        let values = mutations * 512
+            + u128::from(authority.records.page.byte_len)
+            + 16 * mb_core::PAGED_QUORUM_CHECKPOINT_BYTES as u128
+            + 8 * (256 * 512 + 512);
+        Ok(crate::ScratchStorageLimits::for_record_writes(
+            values.min(u128::from(u64::MAX)) as u64,
+            mutations.min(u128::from(u64::MAX)) as u64,
+            168,
+            mb_core::CATALOG_MAX_STREAM_BYTES * 4,
+        )?)
+    }
     pub fn work(&self) -> Result<Work, CatalogStoreError> {
         Ok(match self {
             Self::Individual(c) => c.checkpoint.represented_work()?,
