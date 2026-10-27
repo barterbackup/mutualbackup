@@ -5,6 +5,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(all(test, target_os = "linux"))]
+mod scratch_headroom_tests;
+
 use anyhow::{Context, Result, bail};
 use mb_core::{
     KeyMaterial, MerkleCommitment, MerkleRangeProof, NodeId, SignedRecord, WrappedDatabaseKey,
@@ -3883,7 +3886,8 @@ pub(crate) const PAGED_SCRATCH_ADMISSION_WORK: mb_core::CatalogCodingTraversalBu
     };
 
 /// Keep paged scratch on the catalog filesystem and protect every configured
-/// parity headroom on that device plus current database checkpoint-copy space.
+/// parity headroom on that device, the native control catalog's authenticated
+/// headroom, and current database checkpoint-copy space.
 pub(crate) fn paged_scratch_store(
     control: &ControlStore,
     max_database_bytes: u64,
@@ -3897,6 +3901,13 @@ pub(crate) fn paged_scratch_store(
             .unwrap_or(Path::new("."));
         let device = mb_store::physical_allocation_domain(directory)?;
         let mut limits = mb_store::ScratchStorageLimits::for_database(max_database_bytes)?;
+        if let Some(owner) = control.native_database_owner() {
+            owner.verify_current()?;
+            limits.headroom_bytes = limits
+                .headroom_bytes
+                .checked_add(owner.policy().headroom_bytes)
+                .context("scratch control headroom overflow")?;
+        }
         let mut checkpoints = vec![control.path().to_path_buf()];
         let (records, _) = load_bounded_volume_records(control)?;
         for record in records {

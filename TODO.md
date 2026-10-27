@@ -3326,6 +3326,28 @@ before installed qualification; this standalone target does not close R7 or M6.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
+      - [x] Protect managed native control headroom from paged scratch growth.
+        `paged_scratch_store` now verifies the live native owner and adds its
+        authenticated control headroom to the existing scratch/parity/checkpoint
+        protection with checked arithmetic. A real 32 MiB scratch transaction on
+        owned Btrfs previously left 352,976,896 available bytes against a declared
+        368,050,176-byte control reserve. The unchanged disk-backed workload now
+        fails with SQLITE_FULL; after releasing the same pressure file and syncing
+        Btrfs, it succeeds with all 32 exact payloads. Original control records and
+        policy survive ordinary writes and reopen. The 20-second retry deadline
+        is unchanged; syncfs commits deferred extent frees before that check.
+        The provisioned Linux script now runs this ignored physical case.
+        The focused case passes in 3.43 seconds. All 106 surrounding volume cases
+        passed (five ignored) on identical production/test sources; only the
+        excluded new regression changed afterward. Final strict locked workspace/
+        all-targets Clippy, format, shell syntax and diff checks pass. Four failed
+        image/file fixtures and their read-only copies remain unchanged, including
+        insufficient cached-write probes and the missing-free-barrier probe.
+        Source/executable snapshots, case-reuse and owned cleanup evidence:
+        `/tmp/mb-native-scratch-headroom-qualification`. This closes the managed
+        control/scratch headroom omission; shared cross-producer reservations,
+        copied/read-only policy adoption, normal paged activation and the enclosing
+        R3/M6/platform/dense requirements remain open.
       - [x] Bind declared WAL capacity to native WAL-index backing.
         A valid resource policy could enroll roughly 74 GB of journal credits
         against only 64 KiB of native SHM. The valid baseline refusal regression

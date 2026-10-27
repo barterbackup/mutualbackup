@@ -7515,3 +7515,30 @@ Keep the full shared filesystem/temporary/scratch/payload/checkpoint-copy and
 headroom reservation policy, ordinary production integration and R1/R2/R3/R5/R7
 open. This necessary database-family compatibility correction does not qualify
 the deferred dense 1 TiB or native-platform gates.
+
+
+### 2026-10-27 — Preserve native control headroom during paged scratch growth
+
+Normal paged scratch creation now verifies a managed control catalog's owner and
+includes its authenticated headroom in the existing physical-allocation reserve.
+A provisioned Btrfs regression demonstrates the old 32 MiB transaction consuming
+15,073,280 bytes of that reserve. The same transaction now receives SQLITE_FULL;
+releasing the pressure file and committing Btrfs frees with syncfs permits a fresh
+successful scratch transaction containing all 32 exact payloads. Original control
+records, ordinary writes and the immutable native policy survive reopen. The
+physical case is wired into the provisioned Linux acceptance script.
+
+Final focused qualification passes in 3.43 seconds. The 106 surrounding volume
+cases pass with five ignored on the same production sources; an archive comparison
+confirms only the excluded regression changed before final qualification. Strict
+locked workspace/all-targets Clippy, formatting, shell syntax and diff checks pass.
+Retain the two insufficient cached-write probes, the meaningful physical baseline
+and the deferred-free probe as four original/read-only image and file pairs. Raw
+inventory/image hashes confirm they remain unchanged; no forensic SQL opens were
+used. The successful filesystem mount/loop/image are removed. Evidence and the
+467-input source snapshot: `/tmp/mb-native-scratch-headroom-qualification`.
+
+This closes the native managed-control/scratch headroom omission. Complete shared
+SQL/temporary/scratch/payload/checkpoint-copy reservations across volumes, policy
+lifecycle/adoption, normal paged production/retention/recovery and the full remaining
+R1/R2/R3/R5/R7, M6 and deferred dense/native-platform requirements remain open.
