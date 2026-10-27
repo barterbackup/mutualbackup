@@ -22,6 +22,8 @@ fn paged_scratch_preserves_native_control_headroom_and_retries_after_space_retur
     let root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT").expect("provisioned filesystem");
     let fixture = Fixture(Some(tempfile::tempdir_in(root).unwrap()));
     let root = fixture.0.as_ref().unwrap().path();
+    let filesystem = File::open(root).unwrap();
+    assert_eq!(unsafe { libc::syncfs(filesystem.as_raw_fd()) }, 0);
     let pressure = root.join("space-pressure");
     let mut file = File::create(&pressure).unwrap();
     let block = vec![0; 1024 * 1024];
@@ -29,6 +31,8 @@ fn paged_scratch_preserves_native_control_headroom_and_retries_after_space_retur
         file.write_all(&block).unwrap();
     }
     file.sync_all().unwrap();
+    assert!(file.metadata().unwrap().blocks() * 512 >= 64 << 20);
+    assert_eq!(unsafe { libc::syncfs(file.as_raw_fd()) }, 0);
     drop(file);
     let available = fs2::available_space(root).unwrap();
     let policy = NativeDatabaseIoPolicy {

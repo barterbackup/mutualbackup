@@ -8,6 +8,9 @@ use std::sync::Arc;
 #[cfg(all(test, target_os = "linux"))]
 mod scratch_headroom_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+mod allocation_domain_tests;
+
 use anyhow::{Context, Result, bail};
 use mb_core::{
     KeyMaterial, MerkleCommitment, MerkleRangeProof, NodeId, SignedRecord, WrappedDatabaseKey,
@@ -4392,8 +4395,38 @@ struct DeviceCodingCapacity {
     reserved_bytes: u64,
 }
 
+// Btrfs subvolumes have distinct st_dev values but share physical free space.
+// Reuse the same allocation-domain identity as the scratch allocator. Other
+// platforms retain their existing device accounting pending qualification.
+#[cfg(target_os = "linux")]
+type AllocationDomain = [u8; 32];
+#[cfg(not(target_os = "linux"))]
+type AllocationDomain = u64;
+
+fn control_allocation_domain(store: &ControlStore) -> Result<AllocationDomain> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(store.physical_allocation_domain()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(fs::metadata(store.path())?.dev())
+    }
+}
+
+fn parity_allocation_domain(store: &ParityStore) -> Result<AllocationDomain> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(store.physical_allocation_domain()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(fs::metadata(store.path())?.dev())
+    }
+}
+
 fn add_volume_coding_capacity(
-    devices: &mut BTreeMap<u64, DeviceCodingCapacity>,
+    devices: &mut BTreeMap<AllocationDomain, DeviceCodingCapacity>,
     record: &VolumeRecord,
     store: &ParityStore,
     shard_size: u32,
@@ -4410,7 +4443,7 @@ fn add_volume_coding_capacity(
         }
         None => logical,
     };
-    let device = fs::metadata(&record.path)?.dev();
+    let device = parity_allocation_domain(store)?;
     let available = fs2::available_space(&record.path)?;
     let entry = devices.entry(device).or_default();
     entry.logical_shards = entry.logical_shards.saturating_add(logical);
@@ -4441,10 +4474,10 @@ fn add_volume_coding_capacity(
 
 fn device_coding_capacity(
     control: &ControlStore,
-    devices: &BTreeMap<u64, DeviceCodingCapacity>,
+    devices: &BTreeMap<AllocationDomain, DeviceCodingCapacity>,
     shard_size: u32,
 ) -> Result<u64> {
-    let control_device = fs::metadata(control.path())?.dev();
+    let control_device = control_allocation_domain(control)?;
     let control_checkpoint = control.checkpoint_reservation_bytes()?;
     let required_physical = physical_write_reservation(shard_size as usize, 0);
     Ok(devices
@@ -4479,7 +4512,7 @@ fn physical_write_reservation(payload_bytes: usize, acknowledgement_bytes: usize
 
 fn shared_checkpoint_reservation(control: &ControlStore, parity: &ParityStore) -> Result<u64> {
     let mut reservation = parity.checkpoint_reservation_bytes()?;
-    if fs::metadata(control.path())?.dev() == fs::metadata(parity.path())?.dev() {
+    if control_allocation_domain(control)? == parity_allocation_domain(parity)? {
         reservation = reservation.saturating_add(control.checkpoint_reservation_bytes()?);
     }
     Ok(reservation)
@@ -5817,7 +5850,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([204; 32])));
         let (control, _) = open_control_store(temp.path(), &keys).unwrap();
-        let device = fs::metadata(control.path()).unwrap().dev();
+        let device = control_allocation_domain(&control).unwrap();
         let checkpoint = control.checkpoint_reservation_bytes().unwrap();
         let per_shard = physical_write_reservation(V1_SECTOR_SIZE, 0);
         let devices = BTreeMap::from([(

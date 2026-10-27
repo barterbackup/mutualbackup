@@ -7542,3 +7542,38 @@ This closes the native managed-control/scratch headroom omission. Complete share
 SQL/temporary/scratch/payload/checkpoint-copy reservations across volumes, policy
 lifecycle/adoption, normal paged production/retention/recovery and the full remaining
 R1/R2/R3/R5/R7, M6 and deferred dense/native-platform requirements remain open.
+
+
+### 2026-10-27 — Share capacity and checkpoint accounting across Btrfs subvolumes
+
+Writer and reader coding capacity now share physical free space by allocation
+domain. Btrfs subvolume st_dev values no longer create duplicate allowances.
+Control/parity checkpoint co-location uses the same domain, including the control
+WAL across subvolumes. Database domain lookup borrows the original SQLite main
+file descriptor; directory/scratch and database lookups use one encoding. The
+pinned native C bridge is unchanged. Other platforms retain prior accounting.
+
+Both Btrfs baseline cases fail: 2,902 advertised shards against a 1,451 physical
+upper bound, and a missing 1,089,536-byte control checkpoint reserve. Corrected
+writer/reader capacity is 1,451; checkpoint reserve includes the original WAL.
+Both cases are in the provisioned Linux script. Three descriptor cases preserve
+identity and a separate process's writer exclusion through 128 domain queries;
+seven scratch and 25 physical-I/O cases also pass. The 106 surrounding volume
+cases pass (seven ignored) on identical production/ordinary test sources; only
+two excluded fixture files change before final physical qualification.
+
+Final physical cases pass both domain regressions and the existing headroom
+refusal/retry. The latter now verifies 64 MiB of real pressure-file allocation
+and commits filesystem state before measuring reserve capacity; 32 MiB payloads
+and the 20-second retry remain intact. Unprivileged syncfs commits subvolume
+cleanup; earlier denied B-tree-enumeration cleanup and headroom retry fixtures
+remain preserved. All five failed fixture copies and three original/read-only
+image pairs are unchanged. Strict locked workspace/all-targets Clippy, format,
+shell syntax and diff checks pass. The 468-input source/executable snapshot,
+source-reuse audit and owned mount/loop/image cleanup evidence are in
+`/tmp/mb-volume-allocation-domain-qualification`.
+
+Keep the complete durable SQL/temporary/scratch/payload/checkpoint-copy resource
+reservation policy, policy lifecycle/adoption, normal paged production and full
+R1/R2/R3/R5/R7/M6 and deferred dense/native-platform qualification open. This is
+a demonstrated physical-sharing correction, not complete global funding.

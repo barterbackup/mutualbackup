@@ -9,6 +9,22 @@ use rusqlite::{Connection, ffi};
 
 use super::DatabaseError;
 
+impl super::ControlStore {
+    /// Allocation domain of the actual admitted main file. Borrows SQLite's
+    /// descriptor without opening/closing native files or changing its locks.
+    pub fn physical_allocation_domain(&self) -> Result<[u8; 32], DatabaseError> {
+        super::scratch_space::domain_for_descriptor(main_descriptor(&self.connection)?)
+    }
+}
+
+impl super::ParityStore {
+    /// Allocation domain of the actual admitted main file, retaining SQLite's
+    /// original native descriptor and lock ownership throughout inspection.
+    pub fn physical_allocation_domain(&self) -> Result<[u8; 32], DatabaseError> {
+        super::scratch_space::domain_for_descriptor(main_descriptor(&self.connection)?)
+    }
+}
+
 pub(super) struct MainFile {
     pub device: u64,
     pub inode: u64,
@@ -119,11 +135,17 @@ mod tests {
             (original.dev(), original.ino(), 1)
         );
         assert!(before.regular);
+        let domain = store.physical_allocation_domain().unwrap();
+        assert_eq!(
+            domain,
+            super::super::physical_allocation_domain(temp.path()).unwrap()
+        );
         std::fs::rename(&path, &saved).unwrap();
         std::fs::write(&path, b"preserve this replacement").unwrap();
         let replacement = std::fs::metadata(&path).unwrap();
         assert_ne!(replacement.ino(), original.ino());
         let after = main_file(&store.connection).unwrap();
+        assert_eq!(store.physical_allocation_domain().unwrap(), domain);
         assert_eq!(
             (after.device, after.inode, after.links, after.filesystem),
             (before.device, before.inode, before.links, before.filesystem)
@@ -198,6 +220,10 @@ mod tests {
                 descriptor
             );
             let actual = main_file(&store.connection).unwrap();
+            assert_eq!(
+                store.physical_allocation_domain().unwrap(),
+                super::super::physical_allocation_domain(temp.path()).unwrap()
+            );
             let named = std::fs::metadata(&path).unwrap();
             assert_eq!((actual.device, actual.inode), (named.dev(), named.ino()));
         }

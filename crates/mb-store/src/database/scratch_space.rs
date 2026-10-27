@@ -5,7 +5,7 @@
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -28,6 +28,12 @@ pub fn physical_allocation_domain(path: impl AsRef<Path>) -> Result<[u8; 32], Da
 }
 
 fn domain_for_file(file: &File) -> Result<[u8; 32], DatabaseError> {
+    domain_for_descriptor(file.as_fd())
+}
+
+/// Inspect only the live borrowed file: do not duplicate, close, or reenter
+/// SQLite while this descriptor is borrowed from its main file.
+pub(super) fn domain_for_descriptor(file: BorrowedFd<'_>) -> Result<[u8; 32], DatabaseError> {
     let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error().into());
@@ -37,12 +43,21 @@ fn domain_for_file(file: &File) -> Result<[u8; 32], DatabaseError> {
     if unsafe { filesystem.assume_init() }.f_type as u32 == BTRFS_TYPE {
         digest.update(b"btrfs");
         digest.update(
-            &crate::anchor::btrfs_filesystem_uuid(file)
+            &crate::anchor::btrfs_filesystem_uuid(&file)
                 .map_err(|_| DatabaseError::ScratchUnavailable)?,
         );
     } else {
         digest.update(b"device");
-        digest.update(&file.metadata()?.dev().to_be_bytes());
+        let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(file.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let device = unsafe { info.assume_init() }.st_dev;
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "Linux stat widths vary by target ABI"
+        )]
+        digest.update(&(device as u64).to_be_bytes());
     }
     Ok(*digest.finalize().as_bytes())
 }

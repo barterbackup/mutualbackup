@@ -3326,6 +3326,34 @@ before installed qualification; this standalone target does not close R7 or M6.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
+      - [x] Account for shared Btrfs allocation across volume subvolumes.
+        Writer and reader coding capacity now group physical free space by the
+        existing allocation-domain identity, including Btrfs filesystem UUID,
+        rather than treating distinct subvolume st_dev values as independent
+        capacity. Checkpoint reservations use the same comparison and include
+        the control WAL when parity resides in another subvolume of that pool.
+        Store lookups borrow the admitted main descriptor through the existing
+        native bridge: no database opens/closes or SQLite lock changes. Other
+        platforms retain their prior device accounting pending qualification.
+        Both real Btrfs baselines fail: writer/reader report 2,902 shards against
+        a shared 1,451 upper bound; control checkpoint reservation omits 1,089,536
+        bytes. Both corrected cases pass with writer/reader capacity 1,451 and
+        complete checkpoint accounting; the Linux provisioned script runs them.
+        Descriptor identity and independent-process writer exclusion pass across
+        128 inspections. Store descriptor/scratch/physical suites pass 35 cases.
+        Surrounding volumes pass 106 with seven ignored; only the two excluded
+        fixture sources change afterward, verified by source hashes. Three final
+        physical cases pass, including the original 32 MiB headroom retry. Its
+        pressure fixture now verifies all 64 MiB allocated and commits filesystem
+        state before measuring; workload and 20-second deadline are unchanged.
+        Cleanup uses unprivileged syncfs; denied B-tree-enumerating cleanup and
+        the earlier headroom retry remain recorded. Five fixture directories and
+        three original/read-only filesystem image pairs are preserved unchanged.
+        Strict workspace/all-targets Clippy, format, shell syntax and diff checks
+        pass. Evidence: `/tmp/mb-volume-allocation-domain-qualification` (468
+        source inputs). This closes the demonstrated physical-sharing defects;
+        aggregate durable reservations, ordinary paged activation and enclosing
+        R1/R2/R3/R5/R7, M6 and dense/native-platform qualification remain open.
       - [x] Protect managed native control headroom from paged scratch growth.
         `paged_scratch_store` now verifies the live native owner and adds its
         authenticated control headroom to the existing scratch/parity/checkpoint

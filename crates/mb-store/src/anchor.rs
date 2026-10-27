@@ -3445,9 +3445,12 @@ const fn read_write_ioctl<T>(kind: u8, number: u8) -> libc::c_ulong {
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn ioctl_read<T>(file: &File, kind: u8, number: u8, value: *mut T) -> libc::c_long {
-    use std::os::fd::AsRawFd;
-
+unsafe fn ioctl_read<T>(
+    file: &impl std::os::fd::AsRawFd,
+    kind: u8,
+    number: u8,
+    value: *mut T,
+) -> libc::c_long {
     // `libc::ioctl` exposes a target-libc-specific request type (`c_ulong` on
     // glibc, `c_int` on musl). The Linux syscall ABI accepts the same unsigned
     // 32-bit encoded request on both, so keep this small UAPI shim portable.
@@ -3538,7 +3541,9 @@ fn ioctl_external_filesystem_uuid(file: &File) -> Result<Option<(u8, [u8; 16])>,
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn btrfs_filesystem_uuid(file: &File) -> Result<[u8; 16], AnchorError> {
+pub(crate) fn btrfs_filesystem_uuid(
+    file: &impl std::os::fd::AsRawFd,
+) -> Result<[u8; 16], AnchorError> {
     let mut info = std::mem::MaybeUninit::<BtrfsFsInfo>::zeroed();
     let result = unsafe { ioctl_read(file, 0x94, 31, info.as_mut_ptr()) };
     if result != 0 {

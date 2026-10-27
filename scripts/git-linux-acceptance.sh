@@ -23,6 +23,7 @@ cargo test -p mb-node network::p2p::tests::native_git_graph_recovers_from_format
 cargo test -p mb-node network::p2p::tests::virtual_zero_routing_tests::fresh_coordinator_routes_virtual_zero_openings_and_commits_backup --locked -- --ignored --exact --nocapture
 cargo test -p mb-node node::tests::source_backend_binding_reprobes_and_migrates --locked -- --ignored --exact
 cargo test -p mb-node volume::scratch_headroom_tests::paged_scratch_preserves_native_control_headroom_and_retries_after_space_returns --locked -- --ignored --exact --nocapture
+cargo test -p mb-node volume::allocation_domain_tests:: --locked -- --ignored --nocapture --test-threads=1
 cargo test -p mb-node snapshot::metadata_compatibility_tests::git_history_enters_encrypted_revision_sectors_without_changing_root_restore --locked -- --ignored --exact
 cargo test -p mutualbackup --test git_remote_helper --locked -- --ignored --test-threads=1
 TMPDIR="$MUTUALBACKUP_REFLINK_TEST_ROOT" cargo test -p mutualbackup --test prototype_acceptance --locked native_enrollment:: -- --nocapture --test-threads=2
