@@ -1,6 +1,9 @@
 #[cfg(target_os = "linux")]
 mod scratch;
 
+#[cfg(target_os = "linux")]
+mod native_backing;
+
 use super::super::paged_revision::tests::{fixture, publish};
 use super::*;
 use mb_core::{

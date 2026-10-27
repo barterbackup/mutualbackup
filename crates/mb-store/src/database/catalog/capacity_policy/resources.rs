@@ -138,6 +138,35 @@ pub(super) fn read(cx: &Connection) -> Result<Option<CatalogResourcePolicy>, Cat
 }
 
 fn backing(cx: &Connection, p: CatalogResourcePolicy) -> Result<(), CatalogStoreError> {
+    #[cfg(target_os = "linux")]
+    if let Some(limits) = crate::database::journal_vfs::physical_limits(cx)? {
+        let chunk = crate::database::physical_io::CHUNK;
+        let rounded = |bytes: u64| {
+            bytes
+                .div_ceil(chunk)
+                .checked_mul(chunk)
+                .ok_or(DatabaseError::CapacityExceeded)
+        };
+        let main = rounded(
+            p.control_pages
+                .checked_mul(4096)
+                .ok_or(DatabaseError::CapacityExceeded)?,
+        )?;
+        let journal = rounded(p.control_journal_bytes)?;
+        // Logical backing must fit the active native file ceilings, including
+        // the shared main+journal allocation peak and native chunk rounding.
+        // This necessary bound does not reserve free filesystem blocks, SHM,
+        // temporary work, scratch, checkpoint copies or other producers.
+        if main > limits.main_bytes
+            || journal > limits.journal_bytes
+            || main
+                .checked_add(journal)
+                .ok_or(DatabaseError::CapacityExceeded)?
+                > limits.total_bytes
+        {
+            return Err(DatabaseError::CapacityExceeded.into());
+        }
+    }
     record_quota::validate(cx)?;
     let records = record_quota::usage(cx)?.ok_or(DatabaseError::NotReady)?;
     let pages = page_quota::usage(cx)?.ok_or(DatabaseError::NotReady)?;

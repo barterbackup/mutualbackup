@@ -7468,3 +7468,26 @@ reboot, copied/restored/old-writer quiescent adoption, shared resource admission
 and normal paged production/retention/recovery, then require fresh combined gates.
 R1/R2/R3/R5/R7 and the deferred dense 1 TiB/native-platform requirements remain
 open; normal paged producers remain disabled.
+
+
+Native resource compatibility correction, 2026-10-27: catalog resource policies
+could enroll logical main/journal credits exceeding the active native role
+ceilings or their shared pool. Three baseline refusal regressions reproduced
+acceptance; the fitting policy survived reopen. The shared backing verifier now
+reads the original connection's immutable physical limits without opening or
+closing descriptors and checks separately rounded 64 KiB main/journal extents
+against both role ceilings and their combined pool. Refusal preserves policy
+absence, record accounting, original data and ordinary writes through reopen.
+Legacy/read-only logical views retain their existing behavior.
+
+Five focused native cases, including the separate-rounding boundary and fitting
+reopen, pass within all 42 capacity-policy cases. Physical-I/O cases pass 25 with
+two ignored; strict locked workspace/all-targets Clippy, format and diff checks
+pass. Baseline sources/executable and three unchanged original/read-only-copy
+fixture pairs are retained beside the fixed source archive and logs at
+`/tmp/mb-native-resource-backing-xihn3bvq`.
+
+This is a necessary native-pool compatibility bound, not filesystem, SHM,
+temporary, scratch, checkpoint-copy or cross-producer reservation. It does not
+close shared resource admission, R3, M6, normal paged activation, or the deferred
+dense 1 TiB/native-platform qualification requirements.

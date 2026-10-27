@@ -147,6 +147,47 @@ pub(super) fn current_limit(connection: &Connection) -> Result<u64, DatabaseErro
     })
 }
 
+/// Inspect this connection's immutable native pool without opening or closing
+/// descriptors. Preserved/legacy readers without physical admission retain
+/// their logical ledger view; this does not grant them a native writer.
+#[cfg(target_os = "linux")]
+pub(super) fn physical_limits(
+    connection: &Connection,
+) -> Result<Option<super::DatabasePhysicalIoLimits>, DatabaseError> {
+    let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
+    // SAFETY: SQLite owns the main file for this synchronous call. The output
+    // pointer remains valid while this connection is borrowed.
+    let code = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast(),
+        )
+    };
+    if code == ffi::SQLITE_NOTFOUND {
+        return Ok(None);
+    }
+    if code != ffi::SQLITE_OK {
+        return Err(sql_error(code));
+    }
+    // SAFETY: A non-null file belongs to the borrowed connection. Only our
+    // method table identifies a File allocation with the State prefix below.
+    unsafe {
+        if file.is_null() || !ptr::eq((*file).pMethods, &METHODS) {
+            return Ok(None);
+        }
+        let state = (*file.cast::<File>())
+            .state
+            .as_ref()
+            .ok_or(DatabaseError::PhysicalIoUnavailable)?;
+        match &state.physical {
+            Some(binding) => Ok(Some(binding.pool.limits)),
+            None => Ok(None),
+        }
+    }
+}
+
 pub(super) fn journal_bytes(connection: &Connection) -> Result<u64, DatabaseError> {
     let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
     // SQLite returns its own live journal file, including a WAL inherited from
