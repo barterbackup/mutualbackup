@@ -20,6 +20,7 @@ cargo test -p mb-node node::tests::git_linked_worktree_registration_survives_dae
 cargo test -p mb-node node::tests::git_prune_keeps_signed_revision_history_until_its_retirement --locked -- --ignored --exact
 cargo test -p mb-node lab::tests::seed_only_recovery_rebuilds_git_branches_and_exact_blobs --locked -- --ignored --exact
 cargo test -p mb-node network::p2p::tests::native_git_graph_recovers_from_format_seven_packed_checkpoint --locked -- --ignored --exact --nocapture
+cargo test -p mb-node network::p2p::tests::virtual_zero_routing_tests::fresh_coordinator_routes_virtual_zero_openings_and_commits_backup --locked -- --ignored --exact --nocapture
 cargo test -p mb-node node::tests::source_backend_binding_reprobes_and_migrates --locked -- --ignored --exact
 cargo test -p mb-node snapshot::metadata_compatibility_tests::git_history_enters_encrypted_revision_sectors_without_changing_root_restore --locked -- --ignored --exact
 cargo test -p mutualbackup --test git_remote_helper --locked -- --ignored --test-threads=1

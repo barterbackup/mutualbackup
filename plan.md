@@ -7233,3 +7233,40 @@ Next correct R5-VIRTUAL-ZERO-ROUTING before a fresh complete-source prerequisite
 and corrected packaged musl qualification. R1/R2/R3/R5/R7, enclosing capacity and
 normal paged integration remain open; deferred native-platform and dense 1 TiB
 requirements retain their original scope. No installed qualification ran here.
+
+
+### 2026-10-27 — Route virtual-zero owners before delegated coding
+
+The shared participant-routing helper now includes virtual-zero information
+owners. Their bulk input is synthesized locally, but their assigned signatures
+and activation participation still require authenticated routes. Current guild/
+epoch checks, endpoint admission and Tor policy remain in the same path.
+
+A real native two-file backup supplies the production planner's partially filled
+tail lane. The fixture selects a parity participant as coder and the delegator
+as verifier before dispatch, retaining the original geometry, inputs, ID and
+expiry. It then rebuilds an unpolled coding swarm. On the baseline both
+virtual-only remote owner routes are absent before the first RPC; the failure's
+original filesystem image and read-only 32-file copy remain preserved. Earlier
+fixture candidates remain diagnostic evidence separately.
+
+The identical corrected regression passes on disposable Btrfs in 85.98 seconds.
+It requires routes before the first RPC, both assigned owners' actual signed zero
+openings, verified transcript replay, completed activation, all remaining coding
+lanes and the complete committed format-7 backup. The committed job, verified
+checkpoint and transcript survive reopen, and both source files retain their
+exact bytes. The case is part of `scripts/git-linux-acceptance.sh`.
+
+All 12 surrounding routing, checkpoint retry, endpoint-authority and Tor-policy
+cases pass in 111.85 seconds; their three coverage traces complete with zero
+dropped events. Strict Node-test Clippy, formatting, shell syntax and diff checks
+pass. `audit.json` at `/tmp/mb-virtual-zero-routing-98lehtdr` verifies 460 source
+inputs, baseline/final archives and executables, 41 unchanged linked dependencies,
+identical regression source, the narrowly bounded production change, selected
+cases, negative evidence and owned mount/loop/positive-image cleanup.
+
+Both named P2 corrections from the 2026-10-26 review are now addressed. Require
+a fresh complete-source prerequisite before corrected packaged musl/runtime
+qualification. R1/R2/R3/R5/R7, the historical native/relay timeout investigations,
+normal paged integration and the deferred hardware/platform requirements remain
+open; this focused pass does not close them or enable paged producers.

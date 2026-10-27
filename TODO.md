@@ -165,6 +165,16 @@ R3-NATIVE-RECORD-QUOTA-RESTART below. R5-VIRTUAL-ZERO-ROUTING remains the next
 named correction before a fresh complete-source/packaged qualification gate.
 The enclosing R1/R2/R3/R5/R7 and remaining M6 requirements remain open.
 
+Further follow-up on 2026-10-27 closes the focused R5-VIRTUAL-ZERO-ROUTING
+correction below. A real native backup reproduces missing routes for both
+virtual-only owners before the fresh coordinator's first RPC. Registering all
+information owners corrects that failure; the identical Btrfs regression then
+obtains their signed openings and commits the complete format-7 backup through
+reopen. Twelve surrounding routing/authority/Tor cases also pass. Both named P2
+corrections from the 2026-10-26 review are now addressed. A fresh complete-source
+prerequisite and corrected packaged musl qualification remain next; the focused
+results do not close R1/R2/R3/R5/R7 or diagnose the separate historical stalls.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -5664,23 +5674,32 @@ The enclosing R1/R2/R3/R5/R7 and remaining M6 requirements remain open.
   durable retry. Keep the historical evidence below; later successes do not
   explain the original 5,400-second outlier.
 
-  - [ ] **R5-VIRTUAL-ZERO-ROUTING / P2 — Register every signed-opening participant
-    before delegated coding.** Source review of `a581995` finds that
-    `add_coding_peer_addresses` in `crates/mb-node/src/network/p2p.rs` filters
-    out virtual-zero information owners, but `execute_delegated_coding` later
-    requests `coding_opening` from every manifest role. The assigned zero owner
-    must sign its proof; the coordinator cannot substitute its local zero bytes.
-    The ordinary variable planner can assign a virtual lane to a peer distinct
-    from the coordinator, verifier, delegator and parity holders. If that peer's
-    authenticated roster endpoint has not entered the fresh coordinator's routing
-    table, the opening RPC has no route and a valid coding attempt can stall or
-    time out despite the new first-verifier routing fix. Register zero owners
-    through the same current guild/epoch, endpoint-authority and Tor admission.
-    Add a deterministic fresh-coordinator regression with a virtual-only remote
-    owner, no incidental discovery, and complete signed-opening/transcript/backup
-    assertions; retain existing deadlines and signature requirements. The current
-    1+1/no-zero routing fixture does not cover this case. This is a source finding,
-    not a runtime reproduction or a diagnosis of the historical timeout records.
+  - [x] **R5-VIRTUAL-ZERO-ROUTING / P2 — Register every signed-opening participant
+    before delegated coding.** The shared routing helper now includes virtual-zero
+    information owners through its existing current-guild/epoch, endpoint and Tor
+    admission. They skip bulk transfer but must sign their own challenge openings
+    and participate in activation. The production planner's native two-file backup
+    supplies a tail lane with two virtual-only remote owners. The fixture fixes
+    coordinator selection before dispatch, retaining geometry, inputs, attempt ID
+    and expiry, then rebuilds an unpolled coordinator swarm. The baseline fails
+    deterministically before its first RPC: both required owner routes are empty.
+    The original filesystem image and read-only 32-file fixture copy are retained.
+    The byte-identical final regression passes in 85.98 seconds: routes precede
+    the first RPC, each assigned owner signs its actual zero opening, transcript
+    replay verifies, activation completes, every remaining production lane finishes,
+    and the committed job and verified format-7 checkpoint survive reopen with
+    both original files unchanged. The case is now in `git-linux-acceptance.sh`.
+    All 12 surrounding routing, checkpoint retry, endpoint-authority and Tor-policy
+    cases pass in 111.85 seconds; all three coverage traces complete without dropped
+    events. Strict Node-test Clippy, formatting, shell syntax and diff checks pass.
+    `audit.json` at `/tmp/mb-virtual-zero-routing-98lehtdr` verifies 460 inputs,
+    both archived sources/executables, 41 unchanged linked dependencies, identical
+    regression source, the narrowly bounded production change, case results,
+    negative-copy/image hashes and owned mount/loop/positive-image cleanup. The
+    earlier fixture candidates are preserved as diagnostics, not reproductions
+    of this defect. This closes the focused routing defect; current complete-source/
+    installed qualification and the enclosing R5 historical-stall investigation
+    remain open. Existing deadlines and signature requirements are unchanged.
   - [ ] Resolve the remaining historical initial-coverage investigation and
     qualify the current source before resuming installed qualification. The
     `c2c82ef` ordinary Node run timed out in the first 90-second coverage wait of

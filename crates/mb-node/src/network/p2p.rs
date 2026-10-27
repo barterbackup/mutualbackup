@@ -8569,12 +8569,13 @@ async fn add_coding_peer_addresses(
     plan: &SignedRecord<CodingAttemptPlan>,
     local_id: NodeId,
 ) -> Result<()> {
+    // Virtual-zero roles skip payload transfer, but their owners must still
+    // sign challenge openings and participate in activation.
     let mut targets = plan
         .value
         .geometry
         .information
         .iter()
-        .filter(|role| !role.sector.virtual_zero)
         .map(|role| role.owner)
         .chain(plan.value.geometry.parity.iter().map(|role| role.holder))
         .chain([plan.value.delegator, plan.value.verification_coordinator])
@@ -16814,6 +16815,8 @@ fn remove_known_address(swarm: &mut Swarm<Behaviour>, peer: PeerId, address: &Mu
 
 #[cfg(test)]
 mod tests {
+    mod virtual_zero_routing_tests;
+
     use super::*;
     use futures::future::{Pending, Ready, ready};
     use libp2p::core::{Endpoint, transport::PortUse};
