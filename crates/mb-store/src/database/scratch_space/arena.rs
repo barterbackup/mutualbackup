@@ -45,6 +45,11 @@ pub(super) struct Arena {
 }
 
 impl Arena {
+    pub(super) fn is_idle(&self) -> Result<bool> {
+        self.check()?;
+        Ok(self.used == 0)
+    }
+
     pub(super) fn new(state: &State) -> Result<Self> {
         let file;
         let mut length = state.max_physical_bytes / CHUNK * CHUNK;

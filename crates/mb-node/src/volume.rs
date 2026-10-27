@@ -3911,6 +3911,74 @@ pub(crate) fn paged_scratch_stores<const N: usize>(
     control: &ControlStore,
     max_database_bytes: [u64; N],
 ) -> Result<[mb_store::RecordScratchStore; N]> {
+    paged_scratch_batch(
+        control,
+        max_database_bytes,
+        false,
+        |directory, limits, checkpoints, lease| {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(match lease {
+                    Some(lease) => {
+                        mb_store::RecordScratchStore::new_in_with_reserved_checkpoint_space(
+                            directory,
+                            limits,
+                            checkpoints,
+                            lease,
+                        )?
+                    }
+                    None => mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
+                        directory,
+                        limits,
+                        checkpoints,
+                    )?,
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (directory, checkpoints, lease);
+                Ok(mb_store::RecordScratchStore::new(
+                    limits.max_database_bytes,
+                )?)
+            }
+        },
+    )?
+    .context("scratch batch unexpectedly omitted unconfigured indexes")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn paged_scratch_workspaces<const N: usize>(
+    control: &ControlStore,
+    max_database_bytes: [u64; N],
+) -> Result<Option<[mb_store::ScratchWorkspace; N]>> {
+    paged_scratch_batch(
+        control,
+        max_database_bytes,
+        true,
+        |directory, limits, checkpoints, lease| {
+            Ok(
+                mb_store::ScratchWorkspace::new_in_with_reserved_checkpoint_space(
+                    directory,
+                    limits,
+                    checkpoints,
+                    lease.context("scratch workspace lacks owned credits")?,
+                )?,
+            )
+        },
+    )
+}
+
+fn paged_scratch_batch<const N: usize, T>(
+    control: &ControlStore,
+    max_database_bytes: [u64; N],
+    owned_only: bool,
+    mut build: impl FnMut(
+        &Path,
+        mb_store::ScratchStorageLimits,
+        &[PathBuf],
+        Option<mb_store::CatalogScratchLease>,
+    ) -> Result<T>,
+) -> Result<Option<[T; N]>> {
     ensure!(
         (1..=64).contains(&N),
         "scratch batch must contain one to 64 indexes"
@@ -3963,6 +4031,9 @@ pub(crate) fn paged_scratch_stores<const N: usize>(
             .map(|limit| limit.max_physical_bytes)
             .collect::<Vec<_>>();
         let leases = control.reserve_catalog_scratch_batch(&physical)?;
+        if owned_only && leases.is_none() {
+            return Ok(None);
+        }
         ensure!(
             leases.as_ref().is_none_or(|leases| leases.len() == N),
             "scratch batch admission changed its member count"
@@ -3970,24 +4041,15 @@ pub(crate) fn paged_scratch_stores<const N: usize>(
         let mut leases = leases.map(Vec::into_iter);
         let mut stores = Vec::with_capacity(N);
         for (index, limits) in limits.into_iter().enumerate() {
-            let store = match &mut leases {
-                Some(leases) => {
-                    mb_store::RecordScratchStore::new_in_with_reserved_checkpoint_space(
-                        directory,
-                        limits,
-                        &checkpoints,
-                        leases
-                            .next()
-                            .context("scratch batch lost an admitted member")?,
-                    )
-                }
-                None => mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
-                    directory,
-                    limits,
-                    &checkpoints,
+            let lease = match &mut leases {
+                Some(leases) => Some(
+                    leases
+                        .next()
+                        .context("scratch batch lost an admitted member")?,
                 ),
-            }
-            .with_context(|| {
+                None => None,
+            };
+            let store = build(directory, limits, &checkpoints, lease).with_context(|| {
                 format!(
                     "fund paged scratch member {index} ({} database bytes, {} physical bytes)",
                     limits.max_database_bytes, limits.max_physical_bytes
@@ -3997,6 +4059,7 @@ pub(crate) fn paged_scratch_stores<const N: usize>(
         }
         stores
             .try_into()
+            .map(Some)
             .map_err(|_| anyhow::anyhow!("scratch batch construction changed its member count"))
     }
     #[cfg(not(target_os = "linux"))]
@@ -4005,14 +4068,19 @@ pub(crate) fn paged_scratch_stores<const N: usize>(
             .iter()
             .map(|limit| limit.max_physical_bytes)
             .collect::<Vec<_>>();
-        if control.reserve_catalog_scratch_batch(&physical)?.is_some() {
+        let leases = control.reserve_catalog_scratch_batch(&physical)?;
+        if owned_only && leases.is_none() {
+            return Ok(None);
+        }
+        if leases.is_some() {
             bail!("resource-backed physical scratch allocation is unsupported on this platform");
         }
         limits
             .into_iter()
-            .map(|limit| mb_store::RecordScratchStore::new(limit.max_database_bytes))
+            .map(|limit| build(Path::new("."), limit, &[], None))
             .collect::<std::result::Result<Vec<_>, _>>()?
             .try_into()
+            .map(Some)
             .map_err(|_| anyhow::anyhow!("scratch batch construction changed its member count"))
     }
 }

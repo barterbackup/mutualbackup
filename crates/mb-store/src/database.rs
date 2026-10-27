@@ -105,6 +105,8 @@ pub use physical_io::DatabasePhysicalIoLimits;
 #[cfg(target_os = "linux")]
 pub use preserved_read::PreservedReadGuard;
 pub use record_quota::{DatabaseRecordQuota, DatabaseRecordQuotaState, DatabaseRecordQuotaUsage};
+#[cfg(target_os = "linux")]
+pub use scratch::ScratchWorkspace;
 pub use scratch::{RecordScratchStore, ScratchStorageLimits};
 #[cfg(target_os = "linux")]
 pub use scratch_space::physical_allocation_domain;

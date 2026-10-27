@@ -269,6 +269,30 @@ impl ScratchVfs {
         // Constructed solely from an ASCII prefix and UUID.
         self.name.to_str().expect("ASCII scratch VFS name")
     }
+
+    pub(super) fn check_reusable(&self) -> Result<(), DatabaseError> {
+        let state = &self._state;
+        // Check ownership before locking an allocator inherited across fork.
+        state
+            .lease
+            .as_ref()
+            .ok_or(DatabaseError::ScratchUnavailable)?
+            .check(state.max_physical_bytes)
+            .map_err(|_| DatabaseError::ScratchUnavailable)?;
+        let arena = state
+            .arena
+            .as_ref()
+            .ok_or(DatabaseError::ScratchUnavailable)?
+            .lock()
+            .map_err(|_| DatabaseError::ScratchUnavailable)?;
+        if !arena
+            .is_idle()
+            .map_err(|_| DatabaseError::ScratchUnavailable)?
+        {
+            return Err(DatabaseError::ScratchUnavailable);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ScratchVfs {

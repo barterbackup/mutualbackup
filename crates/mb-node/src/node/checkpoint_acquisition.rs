@@ -111,6 +111,8 @@ enum ProofInput<'a> {
         selected: mb_store::CatalogCheckpointRecoveryTip,
         previous: Option<&'a RecoveredCheckpointProof>,
         meter: &'a rebuild::RecoveryWorkMeter<'a>,
+        #[cfg(target_os = "linux")]
+        workspaces: Option<&'a [mb_store::ScratchWorkspace; 2]>,
     },
 }
 impl<'a> ProofInput<'a> {
@@ -456,22 +458,43 @@ impl RetainedCheckpointRestore {
             budget,
         )?;
         let body_limits = certificate.scratch_storage_limits(previous, budget)?;
+        #[cfg(target_os = "linux")]
+        let prepaid = match input {
+            ProofInput::Retained { workspaces, .. } => workspaces,
+            _ => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let prepaid: Option<()> = None;
         if let ProofInput::Retained { meter, .. } = input {
             // Preserve both original scan allowances, even though the batch
             // now reads the shared registry and claims the ledger only once.
-            meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
-            meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
+            if prepaid.is_none() {
+                meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
+                meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
+            }
         }
         // Reserve both byte/slot declarations atomically, then fund both
         // complete backing files before consuming the first history page.
-        let [history_store, body_store] = crate::volume::paged_scratch_stores(
-            control,
-            [
-                history_limits.max_database_bytes,
-                body_limits.max_database_bytes,
+        let open_fresh = || {
+            crate::volume::paged_scratch_stores(
+                control,
+                [
+                    history_limits.max_database_bytes,
+                    body_limits.max_database_bytes,
+                ],
+            )
+            .context("fund checkpoint history and authority scratch")
+        };
+        #[cfg(target_os = "linux")]
+        let [history_store, body_store] = match prepaid {
+            Some([history, body]) => [
+                history.open(history_limits.max_database_bytes)?,
+                body.open(body_limits.max_database_bytes)?,
             ],
-        )
-        .context("fund checkpoint history and authority scratch")?;
+            None => open_fresh()?,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let [history_store, body_store] = open_fresh()?;
         let mut source = HistoryPrefix {
             control,
             sequence: trust.event_sequence,

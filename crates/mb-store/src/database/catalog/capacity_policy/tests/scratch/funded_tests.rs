@@ -2,6 +2,7 @@ use super::*;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+mod workspace_tests;
 
 struct Fixture {
     directory: Option<tempfile::TempDir>,

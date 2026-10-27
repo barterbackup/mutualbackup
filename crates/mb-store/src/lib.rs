@@ -99,6 +99,8 @@ pub use database::{
 };
 #[cfg(target_os = "linux")]
 pub const GUARDED_REVISION_CAPTURE_KIND: &str = "guarded-view-revision-capture-v1";
+#[cfg(target_os = "linux")]
+pub use database::ScratchWorkspace;
 pub use source::{
     SourceBackendBinding, SourceBackendKind, SourceBlobImportPlan, SourceCapturePlan,
     SourceFileCaptureError, SourceFileCapturePlan, WITHDRAWN_GUARDED_BACKEND,

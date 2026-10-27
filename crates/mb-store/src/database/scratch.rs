@@ -9,6 +9,13 @@ use uuid::Uuid;
 
 use super::{ControlStore, DatabaseError, DatabaseShellResult, ProtocolRecordRow};
 
+#[cfg(target_os = "linux")]
+mod workspace;
+#[cfg(target_os = "linux")]
+pub use workspace::ScratchWorkspace;
+#[cfg(target_os = "linux")]
+use workspace::VfsOwner;
+
 /// Physical bounds for disposable indexes. Linux reserves actual filesystem
 /// extents before writes, sharing admission across scratch jobs on the mount.
 #[derive(Clone, Copy, Debug)]
@@ -119,7 +126,7 @@ pub struct RecordScratchStore {
     records: ControlStore,
     // Field order closes the SQLite connection before unregistering its VFS.
     #[cfg(target_os = "linux")]
-    _vfs: Option<ScratchVfs>,
+    _vfs: Option<VfsOwner>,
 }
 
 impl RecordScratchStore {
@@ -161,14 +168,7 @@ impl RecordScratchStore {
             limits.headroom_bytes,
             database_paths,
         )?;
-        let connection = Connection::open_with_flags_and_vfs(
-            ":memory:",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            vfs.name(),
-        )?;
-        Self::open(Some(vfs), limits.max_database_bytes, connection)
+        Self::open_vfs(vfs.into(), limits.max_database_bytes)
     }
 
     /// Consume one noncloneable aggregate reservation. Its kernel slot stays
@@ -190,20 +190,13 @@ impl RecordScratchStore {
             database_paths,
             Some(lease),
         )?;
-        let connection = Connection::open_with_flags_and_vfs(
-            ":memory:",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            vfs.name(),
-        )?;
-        Self::open(Some(vfs), limits.max_database_bytes, connection)
+        Self::open_vfs(vfs.into(), limits.max_database_bytes)
     }
 
     fn open(
         // Keep the VFS parameter before the connection: early errors drop
         // parameters in reverse order, closing SQLite before its borrowed VFS.
-        #[cfg(target_os = "linux")] vfs: Option<ScratchVfs>,
+        #[cfg(target_os = "linux")] vfs: Option<VfsOwner>,
         max_database_bytes: u64,
         connection: Connection,
     ) -> Result<Self, DatabaseError> {

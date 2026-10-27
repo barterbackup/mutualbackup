@@ -99,6 +99,8 @@ impl RetainedCheckpointRestore {
         )?;
         let stack = crate::volume::paged_scratch_store(control, stack_limits.max_database_bytes)
             .context("fund checkpoint ancestry stack scratch")?;
+        #[cfg(target_os = "linux")]
+        let mut maxima = [0u64; 4];
         let mut wanted = selected;
         loop {
             meter.guard()?;
@@ -115,6 +117,29 @@ impl RetainedCheckpointRestore {
             // publication, in addition to bounded custody/stack read credits.
             for _ in 0..8 {
                 meter.charge(source.budget)?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Only the previous/current proofs coexist. Plan alternating
+                // slots from complete original descriptors, without replaying
+                // history or fetching authority/packing/coding pages yet.
+                let lane = wanted
+                    .generation
+                    .checked_sub(1)
+                    .context("checkpoint generation is zero")?
+                    % 2;
+                let history = mb_store::CatalogGuildHistoryIndex::scratch_storage_limits(
+                    source.certificate.event_sequence(),
+                    source.budget,
+                )?;
+                // This exact chain has a root at generation one and all later
+                // predecessors are paged proofs, not legacy vector bridges.
+                let body = source
+                    .certificate
+                    .scratch_storage_limits(None, source.budget)?;
+                let offset = lane as usize * 2;
+                maxima[offset] = maxima[offset].max(history.max_database_bytes);
+                maxima[offset + 1] = maxima[offset + 1].max(body.max_database_bytes);
             }
             let bytes = mb_core::canonical_bytes_bounded(&source, SOURCE_BYTES)?;
             let key = wanted.generation.to_be_bytes();
@@ -150,6 +175,29 @@ impl RetainedCheckpointRestore {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        let prepaid = if control.catalog_resource_policy()?.is_some() {
+            let count = if selected.generation == 1 { 2 } else { 4 };
+            for _ in 0..count {
+                meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
+            }
+            // Fund every live-proof slot before the first history/payload page.
+            // Index closure returns its VFS to the prepaid slot; reuse never
+            // acquires another credit lease or initializes another backing.
+            Some(if count == 2 {
+                let pair =
+                    crate::volume::paged_scratch_workspaces(control, [maxima[0], maxima[1]])?
+                        .context("enrolled checkpoint rebuild lacks scratch ownership")?;
+                vec![pair]
+            } else {
+                let [history0, body0, history1, body1] =
+                    crate::volume::paged_scratch_workspaces(control, maxima)?
+                        .context("enrolled checkpoint rebuild lacks scratch ownership")?;
+                vec![[history0, body0], [history1, body1]]
+            })
+        } else {
+            None
+        };
         let mut previous: Option<RecoveredCheckpointProof> = None;
         let mut after: Option<[u8; 8]> = None;
         let mut generation = 0u64;
@@ -187,10 +235,15 @@ impl RetainedCheckpointRestore {
                     selected,
                     previous: previous.as_ref(),
                     meter: &meter,
+                    #[cfg(target_os = "linux")]
+                    workspaces: prepaid
+                        .as_ref()
+                        .map(|pairs| &pairs[((source.certificate.generation() - 1) % 2) as usize]),
                 },
                 previous.as_ref().map(RecoveredCheckpointProof::previous),
             )?;
             proof.verify()?;
+            stack.delete_record_if_value(STACK, &key, &bytes)?;
             generation = source.certificate.generation();
             after_proof(generation)?;
             current()?;

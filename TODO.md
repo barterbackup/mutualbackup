@@ -3511,11 +3511,43 @@ before installed qualification; this standalone target does not close R7 or M6.
           authenticated authority/packing/coding summaries, exact generation
           count and native namespace count/bytes. History and body are funded
           together before history replay; the stack counts insertion and removal
-          of each generation row. Phase-local backing and retained proof leases
-          do not yet prepay the complete multi-generation peak or compose all
-          registry scans, native SQL/WAL/SHM, payload and cross-volume producers.
+          of each generation row. Enrolled Linux rebuild now prepays the
+          retained history/body proof-slot peak, as detailed below. Complete
+          enclosing-job reservation still must compose all registry scans,
+          native SQL/WAL/SHM, payload and cross-volume producers.
           Preserve whole-job refusal, cancellation, restart, old-writer/rekey/
           adoption/reboot, normal paged and dense 1 TiB/native-platform gates.
+          - [x] Prepay and reuse enrolled rebuild's retained proof slots.
+            Metadata-only ancestry preflight computes each alternating lane's
+            maximum history/body database sizes from original source descriptors.
+            After the already funded ancestry stack, one atomic batch admits
+            and fully initializes two proof slots for generation one or four
+            for longer chains, before history/body replay. Successive indexes
+            reuse those physical backings and leases with fresh encryption keys
+            and each generation's original database ceiling. Replay admits no
+            additional scratch credits or backings. Consumed stack rows are
+            removed; the final proof retains its two active slots after the
+            enclosing workspace handles drop. Busy, inherited, poisoned or
+            corrupt slots fail closed; unhealthy allocators retire.
+            Four regressions cover backing identity and physical accounting,
+            fresh indexes, exclusive checkout and thread handoff, active-index
+            lifetime, per-checkout FULL rollback/retry, fork refusal and corrupt
+            recycled-page retirement. Both original individual/directory chain
+            cases retain their original payload, work, deadline and recovery/Git
+            byte assertions and additionally require exactly five live jobs and
+            unchanged pool debt throughout replay. They pass in 514.66/529.06
+            seconds. All 108 volume cases pass (eight ignored); owned Btrfs
+            passes 18 distinct workspace/batch/funded/arena/headroom cases in
+            22 executions. Full frozen Store passes 680 with 32 ignored in
+            782.82 seconds under the unchanged 900-second/four-worker/65,536-FD
+            gate. Strict locked workspace/all-target Clippy, formatting and
+            diff checks pass. The 481-input source/executable audit and successful
+            owned-resource cleanup are recorded at
+            `/tmp/mb-scratch-workspace-qualification/audit.json`. This closes proof-slot
+            peak prepayment/reuse, not complete SQL/WAL/payload/shared-volume
+            composition, ordinary full Node/workspace, installed or lifecycle
+            qualification. R1/R2/R3/R5/R7/M6 and unchanged deferred dense 1 TiB
+            and Windows/macOS requirements remain open.
       - [x] Charge reported scratch extent metadata and retain headroom refusals.
         Scratch allocation charged requested rounded data bytes without checking
         filesystem blocks after allocation, writes or syncs. Both ext4 baseline
