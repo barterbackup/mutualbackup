@@ -109,6 +109,11 @@ and moves are reconciled from durable control receipts, while an absent disk
 remains visibly offline. `storage list` reports logical use, physical database
 allocation, and filesystem availability; `storage reclaim [--volume UUID]`
 returns unused database and WAL allocation to the filesystem.
+On Linux, `init-native --data-dir DIR --policy FILE` creates or resumes managed
+native catalogs for a previously initialized, stopped node. `storage create-native
+DIR --policy FILE` adds a native parity volume through the live daemon. Both
+require explicit immutable policy files; see [native storage enrollment](docs/native-storage.md)
+for complete examples, daemon configuration and the existing-catalog boundary.
 `retention_revisions` keeps a signed suffix of each member's history. Retired
 prefixes remain represented by checkpoint tombstones, and local anchors and
 shards are collected only after a later checkpoint confirms they stayed

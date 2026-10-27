@@ -3277,16 +3277,49 @@ before installed qualification; this standalone target does not close R7 or M6.
     - [ ] Complete managed native policy lifecycle and product enrollment.
       Explicit Store/Node creation, same-host process restart, ordinary managed
       opens/readers and additional native volume birth are implemented above.
-      Complete CLI/default policy selection, managed rekey and host-reboot
-      behavior while retaining authenticated policy and ownership. Define quiescent
+      Explicit CLI policy selection and additional-volume creation are now
+      implemented below. Complete automatic/default enrollment policy, managed
+      rekey and host-reboot behavior while retaining authenticated policy and
+      ownership. Define quiescent
       enrollment of existing catalogs and restored/copied inputs so old writers
       cannot bypass admission or obtain duplicate live capacity. Preserve v1
       compatibility and read-only recovery; retain generic v2 mutable rejection
-      outside authenticated managed paths. Expose the qualified additional native
-      volume API through the CLI. Extend interruption/restart qualification to
+      outside authenticated managed paths. Extend interruption/restart
+      qualification to
       rekey, host reboot and old-writer/restore/host-relocation adoption, including
       partial publication and missing/replaced files, with exact original data
       and admission limits preserved.
+      - [x] Expose explicit fresh native creation/resume through the CLI.
+        Linux `init-native` requires the original initialized identity and a
+        stopped node, selecting immutable control/default-parity policies from
+        a bounded regular JSON file. `storage create-native` routes additional
+        volume creation through the unlocked daemon's existing checked API.
+        Both validate the complete explicit policy; operator files reject
+        unknown fields. The local schema carries raw Unix paths and exact policy
+        fields, and returns the original volume UUID on retries. Existing retired
+        volumes retain that state. Creation does not rewrite human-owned daemon
+        configuration; the CLI and documentation explain restart configuration.
+        Existing legacy catalogs and wrong identities are refused without
+        changing file bytes/modes; copied/restored adoption remains separate.
+        Sixteen focused cases pass: CLI seven, wire/schema seven and two process
+        cases. Both process cases pass on the default filesystem and owned Btrfs,
+        exercising actual CLI creation, a live-writer refusal, hostile IPC policy,
+        raw-byte volume paths, daemon reopen, retirement and retained original
+        data/identity/policy/birth/readiness. The process cases now run on the
+        provisioned filesystem in `git-linux-acceptance.sh` and are automatically
+        included in the installed process matrix. Strict locked workspace/all-target
+        Clippy, formatting, shell syntax, diff checks and the independent 465-input/
+        source-archive/five-process-executable/owned-cleanup audit pass. Evidence:
+        `/tmp/mb-native-cli-enrollment-chd__h8q/v2/audit.json`. The initial Clippy
+        test-only comparison failure remains recorded. The final change replaces
+        temporary owned path comparisons with borrowed comparisons; all five
+        process executables remain byte-identical to their Btrfs pass.
+        See [native storage enrollment](docs/native-storage.md) and complete JSON
+        examples. This qualifies the source CLI slice; it does not transfer the
+        earlier `c37acf2` installed evidence to this new source. Fresh complete-
+        source/installed qualification, automatic enrollment, rekey, host reboot,
+        quiescent adoption, shared admission and normal paged integration remain
+        open. The enclosing managed lifecycle item and R1/R2/R3/R5/R7 stay open.
     - [ ] Compose native SQL/WAL/SHM/temporary, scratch and payload reservations
       across normal operations and volumes, including checkpoint/rebuild copies
       and headroom. Process-local native SQL pools and separate traversal or

@@ -485,6 +485,12 @@ pub enum LocalRequest {
         #[cfg_attr(target_os = "linux", serde(with = "mb_store::raw_path_bytes"))]
         path: PathBuf,
     },
+    #[cfg(target_os = "linux")]
+    StorageCreateNative {
+        #[serde(with = "mb_store::raw_path_bytes")]
+        path: PathBuf,
+        policy: crate::NativeParityVolumePolicy,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -623,6 +629,10 @@ pub enum LocalResponse {
         changed_paths: u32,
     },
     GitLocated(Option<GitRepositoryInfo>),
+    #[cfg(target_os = "linux")]
+    StorageNativeCreated {
+        volume_id: Uuid,
+    },
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -659,6 +669,57 @@ mod tests {
         include_str!("../../../../protocol/vectors/local-root-added-response.json");
     const INVALID_VERSION: &str =
         include_str!("../../../../protocol/vectors/local-invalid-version.json");
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_volume_creation_preserves_raw_path_policy_and_response_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"/native-\xff/volume-\xfe".to_vec()));
+        let policy = crate::NativeParityVolumePolicy {
+            database: mb_core::NativeDatabaseIoPolicy {
+                format_version: 1,
+                policy_id: [37; 16],
+                main_bytes: 16 << 20,
+                journal_bytes: 8 << 20,
+                shm_bytes: 1 << 20,
+                temporary_bytes: 8 << 20,
+                total_bytes: 32 << 20,
+                headroom_bytes: 65536,
+                files: 32,
+            },
+            parity_budget_bytes: 8 << 20,
+        };
+        policy.validate().unwrap();
+        let envelope = LocalRequestEnvelope {
+            format_version: LOCAL_WIRE_FORMAT_VERSION,
+            request_id: [38; 16],
+            request: LocalRequest::StorageCreateNative {
+                path: path.clone(),
+                policy,
+            },
+        };
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &encoded).unwrap();
+        let decoded: LocalRequestEnvelope<LocalRequest> = serde_json::from_str(&encoded).unwrap();
+        assert!(
+            matches!(decoded.request, LocalRequest::StorageCreateNative { path: actual, policy: actual_policy } if actual == path && actual_policy == policy)
+        );
+        let volume_id = Uuid::from_bytes([39; 16]);
+        let response = LocalResponseEnvelope {
+            format_version: LOCAL_WIRE_FORMAT_VERSION,
+            request_id: envelope.request_id,
+            result: Ok(LocalResponse::StorageNativeCreated { volume_id }),
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
+        let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.request_id, envelope.request_id);
+        assert!(
+            matches!(decoded.result, Ok(LocalResponse::StorageNativeCreated { volume_id: actual }) if actual == volume_id)
+        );
+    }
 
     #[test]
     fn local_json_vectors_match_cddl_and_round_trip() {

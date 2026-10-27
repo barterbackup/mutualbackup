@@ -19,7 +19,8 @@ pub struct NativeParityVolumePolicy {
 }
 
 impl NativeParityVolumePolicy {
-    fn validate(self) -> Result<()> {
+    /// Validate the immutable database ceilings and logical parity budget.
+    pub fn validate(self) -> Result<()> {
         self.database.validate()?;
         anyhow::ensure!(
             self.parity_budget_bytes > self.database.headroom_bytes

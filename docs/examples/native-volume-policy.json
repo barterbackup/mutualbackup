@@ -1,0 +1,14 @@
+{
+  "database": {
+    "format_version": 1,
+    "policy_id": [19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19],
+    "main_bytes": 16777216,
+    "journal_bytes": 8388608,
+    "shm_bytes": 1048576,
+    "temporary_bytes": 8388608,
+    "total_bytes": 67108864,
+    "headroom_bytes": 65536,
+    "files": 32
+  },
+  "parity_budget_bytes": 8388608
+}

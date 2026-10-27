@@ -27,6 +27,7 @@ local-request =
   / "StorageMigrate"
   / { "StorageReactivate": { volume_id: uuid-text } }
   / "StorageReconcile"
+  / { "StorageCreateNative": { path: local-path, policy: native-parity-volume-policy } }
   / { "GuildAudit": { repair: bool } }
   / { "Unlock": { secret: bytes32-array } }
   / { "AddRoot": { path: local-path } }
@@ -132,6 +133,7 @@ local-response =
   / { "StorageMigrated": { objects: uint } }
   / "StorageReactivated"
   / "StorageReconciled"
+  / { "StorageNativeCreated": { volume_id: uuid-text } }
   / { "GuildAudited": guild-audit-report }
   / { "RootAdded": protected-root }
   / { "RootRemoved": { root_id: uuid-text } }
@@ -220,6 +222,23 @@ automatic-backup-status = {
   window_bytes: uint,
   retry_at_unix_seconds: null / uint,
   blocked_reason: null / tstr
+}
+
+native-database-io-policy = {
+  format_version: 1,
+  policy_id: bytes16-array,
+  main_bytes: uint,
+  journal_bytes: uint,
+  shm_bytes: uint,
+  temporary_bytes: uint,
+  total_bytes: uint,
+  headroom_bytes: uint,
+  files: uint
+}
+
+native-parity-volume-policy = {
+  database: native-database-io-policy,
+  parity_budget_bytes: uint
 }
 
 storage-volume-status = {

@@ -442,6 +442,14 @@ async fn handle_request(
             })
             .await
         }
+        #[cfg(target_os = "linux")]
+        LocalRequest::StorageCreateNative { path, policy } => {
+            blocking_node(node, move |node| {
+                node.create_native_storage_volume(path, policy)
+                    .map(|volume_id| LocalResponse::StorageNativeCreated { volume_id })
+            })
+            .await
+        }
         LocalRequest::GuildAudit { repair } => audit_guild(node, &p2p, repair)
             .await
             .map(LocalResponse::GuildAudited),

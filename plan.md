@@ -7433,3 +7433,38 @@ Close the focused R7 packaged-musl physical-SQL qualification item. Keep the
 enclosing R1/R2/R3/R5/R7, shared resource admission, policy enrollment/rekey,
 normal paged production/retention/recovery, historical unexplained failures and
 deferred dense 1 TiB/native-platform requirements open. Producers remain disabled.
+
+### 2026-10-27 — Expose explicit native catalog and volume creation through CLI
+
+Linux `init-native` now creates or resumes native catalogs for a previously
+initialized, stopped node using the original identity and explicit immutable
+control/default-parity policy. `storage create-native` invokes additional-volume
+birth through the live daemon. Bounded regular JSON policy files reject unknown
+fields; server-side policy/ownership admission remains authoritative. The local
+schema preserves raw Unix paths and exact policy fields. Retries return the same
+UUID and retain later configuration and retired state. Human-owned daemon
+configuration remains explicit; the CLI explains that new paths must be configured
+before restart. Documentation includes complete valid policy files and startup
+configuration within their ceilings.
+
+Seven CLI and seven wire/schema cases pass. Two process cases exercise genuine
+CLI native creation, policy mismatch, live-writer and legacy/identity refusal,
+hostile IPC policy, raw-byte volume paths, daemon reopen, retirement, original
+data and immutable metadata. Both pass on the default filesystem and owned
+Btrfs (40.02 seconds for the Btrfs pair), with cleanup verified. The native Linux
+acceptance script now runs these cases on its provisioned filesystem; ordinary
+installed process discovery includes them automatically. Strict locked workspace/
+all-targets Clippy, format, shell syntax and diff checks pass. The first Clippy
+failure was confined to new test assertions allocating paths for comparison;
+the corrected borrowed comparisons pass. The audit binds 465 inputs and both
+source snapshots and confirms all five process executables remain byte-identical
+to the passing Btrfs set. Evidence:
+`/tmp/mb-native-cli-enrollment-chd__h8q/v2/audit.json`.
+
+This is explicit source CLI enrollment, not existing-state adoption or a current
+installed-artifact qualification. Retain the earlier `c37acf2` source/release
+evidence as historical. Complete automatic/default policy, managed rekey, host
+reboot, copied/restored/old-writer quiescent adoption, shared resource admission
+and normal paged production/retention/recovery, then require fresh combined gates.
+R1/R2/R3/R5/R7 and the deferred dense 1 TiB/native-platform requirements remain
+open; normal paged producers remain disabled.

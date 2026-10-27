@@ -32,6 +32,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create or resume native catalogs for an initialized, stopped node (Linux).
+    #[cfg(target_os = "linux")]
+    InitNative {
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// JSON file defining immutable control/default-parity ceilings and budget.
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "seed_file")]
+        seed_stdin: bool,
+    },
     /// Initialize a node from a generated or user-supplied recovery string.
     Init {
         /// New, empty application state directory.
@@ -254,6 +267,14 @@ enum SnapshotCommand {
 
 #[derive(Debug, Subcommand)]
 enum StorageCommand {
+    /// Create or resume an additional native volume in an existing empty directory.
+    #[cfg(target_os = "linux")]
+    CreateNative {
+        path: PathBuf,
+        /// JSON file defining immutable database ceilings and parity budget.
+        #[arg(long)]
+        policy: PathBuf,
+    },
     /// List configured volumes and their durable state.
     List,
     /// Verify SQLCipher pages and every stored parity root.
@@ -460,6 +481,37 @@ async fn main() -> Result<()> {
         } => {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             print_identity(&derive_seed(&recovery).await?);
+        }
+        #[cfg(target_os = "linux")]
+        Command::InitNative {
+            data_dir,
+            policy,
+            seed_file,
+            seed_stdin,
+        } => {
+            let policy: mb_node::NativeNodeStoragePolicy = read_native_policy(&policy)?;
+            policy.validate()?;
+            let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
+            let seed = derive_seed(&recovery).await?;
+            let volume_id = tokio::task::spawn_blocking(move || {
+                let identity = mutualbackup::read_identity_manifest(&data_dir)?;
+                if identity.intent != InitializationIntent::New
+                    || identity.expected_node_id != KeyMaterial::from_seed(&seed).node_id()
+                {
+                    bail!("native creation requires the original initialized node identity");
+                }
+                let node = Node::create_native(&data_dir, seed, policy)?;
+                let default_path = data_dir.canonicalize()?;
+                let volumes = node.storage_status()?;
+                let default = volumes
+                    .iter()
+                    .find(|volume| volume.path == default_path)
+                    .context("native default volume is missing")?;
+                Ok::<_, anyhow::Error>(default.volume_id)
+            })
+            .await
+            .context("native creation worker failed")??;
+            println!("native default storage volume: {volume_id}");
         }
         Command::ReflinkProbe { path } => {
             probe_reflink(&path)?;
@@ -693,6 +745,15 @@ async fn main() -> Result<()> {
         },
         Command::Storage { command } => {
             let request = match command {
+                #[cfg(target_os = "linux")]
+                StorageCommand::CreateNative { path, policy } => {
+                    let policy: mb_node::NativeParityVolumePolicy = read_native_policy(&policy)?;
+                    policy.validate()?;
+                    let path = path.canonicalize().with_context(|| {
+                        format!("cannot resolve native volume directory {}", path.display())
+                    })?;
+                    LocalRequest::StorageCreateNative { path, policy }
+                }
                 StorageCommand::List => LocalRequest::StorageStatus,
                 StorageCommand::Scrub => LocalRequest::StorageScrub,
                 StorageCommand::Reclaim { volume } => {
@@ -730,6 +791,13 @@ async fn main() -> Result<()> {
                 }
                 LocalResponse::StorageReactivated => println!("storage volume reactivated"),
                 LocalResponse::StorageReconciled => println!("storage reconciliation complete"),
+                #[cfg(target_os = "linux")]
+                LocalResponse::StorageNativeCreated { volume_id } => {
+                    println!("native storage volume: {volume_id}");
+                    println!(
+                        "Configure this volume in parity_volumes before restarting the daemon."
+                    );
+                }
                 _ => bail!("daemon returned the wrong response to storage request"),
             }
         }
@@ -1113,6 +1181,38 @@ async fn derive_seed(recovery: &Zeroizing<String>) -> Result<Seed> {
     .context("recovery-string derivation worker failed")?
 }
 
+#[cfg(target_os = "linux")]
+fn read_native_policy<T: serde::de::DeserializeOwned + serde::Serialize>(
+    path: &std::path::Path,
+) -> Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const MAX_POLICY_BYTES: u64 = 16 * 1024;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("cannot open native storage policy {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_POLICY_BYTES {
+        bail!("native storage policy must be a regular JSON file of at most 16 KiB");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_POLICY_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_POLICY_BYTES {
+        bail!("native storage policy exceeds 16 KiB");
+    }
+    let policy: T = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid native storage policy {}", path.display()))?;
+    // These operator files select immutable ceilings. Reject misspelled or
+    // unsupported fields instead of silently signing a different policy.
+    let supplied: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if supplied != serde_json::to_value(&policy)? {
+        bail!("native storage policy contains unknown fields");
+    }
+    Ok(policy)
+}
+
 fn print_backup_job(job: &mb_node::BackupJob) {
     println!("root:       {}", job.descriptor.protected_root_id);
     println!("revision:   {}", job.descriptor.revision_id);
@@ -1129,6 +1229,87 @@ fn print_backup_job(job: &mb_node::BackupJob) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_policy_inputs_are_bounded_regular_files_and_options_are_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = directory.path().join("oversized.json");
+        fs::write(&oversized, vec![b' '; 16 * 1024 + 1]).unwrap();
+        assert!(read_native_policy::<mb_node::NativeNodeStoragePolicy>(&oversized).is_err());
+        assert!(read_native_policy::<mb_node::NativeNodeStoragePolicy>(directory.path()).is_err());
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = directory.path().join("policy.fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_native_policy::<mb_node::NativeNodeStoragePolicy>(&fifo).is_err());
+        let invalid = directory.path().join("invalid.json");
+        fs::write(&invalid, b"{}").unwrap();
+        assert!(read_native_policy::<mb_node::NativeNodeStoragePolicy>(&invalid).is_err());
+        let policy = mb_node::NativeParityVolumePolicy {
+            database: mb_core::NativeDatabaseIoPolicy {
+                format_version: 1,
+                policy_id: [41; 16],
+                main_bytes: 16 << 20,
+                journal_bytes: 8 << 20,
+                shm_bytes: 1 << 20,
+                temporary_bytes: 8 << 20,
+                total_bytes: 64 << 20,
+                headroom_bytes: 65536,
+                files: 32,
+            },
+            parity_budget_bytes: 8 << 20,
+        };
+        let mut encoded = serde_json::to_value(policy).unwrap();
+        fs::write(&invalid, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        assert_eq!(
+            read_native_policy::<mb_node::NativeParityVolumePolicy>(&invalid).unwrap(),
+            policy
+        );
+        encoded["database"]["main_btyes"] = (32_u64 << 20).into();
+        fs::write(&invalid, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        assert!(read_native_policy::<mb_node::NativeParityVolumePolicy>(&invalid).is_err());
+        let example: mb_node::NativeNodeStoragePolicy = serde_json::from_str(include_str!(
+            "../../../docs/examples/native-node-policy.json"
+        ))
+        .unwrap();
+        example.validate().unwrap();
+        let example: mb_node::NativeParityVolumePolicy = serde_json::from_str(include_str!(
+            "../../../docs/examples/native-volume-policy.json"
+        ))
+        .unwrap();
+        example.validate().unwrap();
+        assert!(
+            Cli::try_parse_from(["mutualbackup", "init-native", "--data-dir", "/data"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["mutualbackup", "storage", "create-native", "/extra"]).is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "mutualbackup",
+            "init-native",
+            "--data-dir",
+            "/data",
+            "--policy",
+            "/policy.json",
+            "--seed-file",
+            "/seed",
+            "--seed-stdin",
+        ]);
+        assert!(parsed.is_err());
+        let parsed = Cli::try_parse_from([
+            "mutualbackup",
+            "storage",
+            "create-native",
+            "/extra",
+            "--policy",
+            "/policy.json",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Command::Storage { command: StorageCommand::CreateNative { path, policy } } if path.as_path() == std::path::Path::new("/extra") && policy.as_path() == std::path::Path::new("/policy.json"))
+        );
+    }
 
     #[test]
     fn withdrawn_guarded_commands_are_not_exposed() {

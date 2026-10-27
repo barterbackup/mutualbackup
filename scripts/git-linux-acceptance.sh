@@ -24,5 +24,6 @@ cargo test -p mb-node network::p2p::tests::virtual_zero_routing_tests::fresh_coo
 cargo test -p mb-node node::tests::source_backend_binding_reprobes_and_migrates --locked -- --ignored --exact
 cargo test -p mb-node snapshot::metadata_compatibility_tests::git_history_enters_encrypted_revision_sectors_without_changing_root_restore --locked -- --ignored --exact
 cargo test -p mutualbackup --test git_remote_helper --locked -- --ignored --test-threads=1
+TMPDIR="$MUTUALBACKUP_REFLINK_TEST_ROOT" cargo test -p mutualbackup --test prototype_acceptance --locked native_enrollment:: -- --nocapture --test-threads=2
 cargo test -p mutualbackup --test prototype_acceptance --locked raw_unix_paths_survive_cli_daemon_and_git_checkout -- --ignored --exact
 bash scripts/network-smoke.sh "$MUTUALBACKUP_REFLINK_TEST_ROOT"

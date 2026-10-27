@@ -23,7 +23,8 @@ pub struct NativeNodeStoragePolicy {
 }
 
 impl NativeNodeStoragePolicy {
-    fn validate(&self) -> Result<()> {
+    /// Validate immutable catalog ceilings before attempting fresh enrollment.
+    pub fn validate(&self) -> Result<()> {
         self.control.validate()?;
         self.default_parity.validate()?;
         anyhow::ensure!(

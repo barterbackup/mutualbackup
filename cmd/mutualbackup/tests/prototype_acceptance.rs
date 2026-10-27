@@ -40,6 +40,10 @@ use peer_logs::PeerLogArchive;
 #[path = "support/signature_retry.rs"]
 mod signature_retry;
 
+#[cfg(target_os = "linux")]
+#[path = "support/native_enrollment.rs"]
+mod native_enrollment;
+
 fn uses_cargo_debug_programs() -> bool {
     cfg!(debug_assertions) && std::env::var_os("MUTUALBACKUP_TEST_BIN_DIR").is_none()
 }
